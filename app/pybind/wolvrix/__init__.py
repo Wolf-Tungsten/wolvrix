@@ -627,6 +627,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("export_compute_dag", "-export-compute-dag"),
         ("final_topo_policy", "-final-topo-policy"),
         ("post_dp_refine_policy", "-post-dp-refine-policy"),
+        ("kahn_level_pack_policy", "-kahn-level-pack-policy"),
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
@@ -637,6 +638,9 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("post_dp_refine_max_moves", "-post-dp-refine-max-moves"),
         ("post_dp_refine_max_moved_op_ppm", "-post-dp-refine-max-moved-op-ppm"),
         ("post_dp_refine_max_regression_ppm", "-post-dp-refine-max-regression-ppm"),
+        ("kahn_level_pack_max_moves", "-kahn-level-pack-max-moves"),
+        ("kahn_level_pack_max_moved_op_ppm", "-kahn-level-pack-max-moved-op-ppm"),
+        ("kahn_level_pack_max_regression_ppm", "-kahn-level-pack-max-regression-ppm"),
     ]
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),

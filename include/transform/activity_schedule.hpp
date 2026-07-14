@@ -41,6 +41,9 @@ namespace wolvrix::lib::transform
         std::size_t postDpRefineMaxMoves = 4096;
         std::size_t postDpRefineMaxMovedOpPpm = 10000;
         std::size_t postDpRefineMaxRegressionPpm = 10000;
+        std::size_t kahnLevelPackMaxMoves = 4096;
+        std::size_t kahnLevelPackMaxMovedOpPpm = 10000;
+        std::size_t kahnLevelPackMaxRegressionPpm = 10000;
         bool enableCoarsen = true;
         bool enableChainMerge = true;
         bool enableLocalSharedCompute = false;
@@ -48,6 +51,7 @@ namespace wolvrix::lib::transform
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
         std::string postDpRefinePolicy = "off";
+        std::string kahnLevelPackPolicy = "off";
         std::string finalTopoPolicy = "level-id";
         std::string exportComputeDagPath;
     };

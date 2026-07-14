@@ -638,6 +638,7 @@ namespace wolvrix::lib::transform
             std::uint64_t topoAfterCoarsenMs = 0;
             std::uint64_t buildClusterViewMs = 0;
             std::uint64_t dpSegmentMs = 0;
+            std::uint64_t kahnLevelPackMs = 0;
             std::uint64_t postDpRefineMs = 0;
             std::uint64_t flattenSegmentsMs = 0;
             std::uint64_t buildFinalSupernodesMs = 0;
@@ -654,6 +655,34 @@ namespace wolvrix::lib::transform
             std::size_t computeSupernodes = 0;
             std::size_t splitOversizeComputeNodes = 0;
             std::size_t splitOversizeComputeNodeSupernodes = 0;
+            std::size_t kahnLevelPackLevels = 0;
+            std::size_t kahnLevelPackLockedClusters = 0;
+            std::size_t kahnLevelPackSharedValues = 0;
+            std::size_t kahnLevelPackAffinityPairs = 0;
+            std::size_t kahnLevelPackCandidates = 0;
+            std::size_t kahnLevelPackSwaps = 0;
+            std::size_t kahnLevelPackMovedClusters = 0;
+            std::size_t kahnLevelPackMovedOps = 0;
+            std::size_t kahnLevelPackRejectedBudget = 0;
+            std::size_t kahnLevelPackRejectedLocked = 0;
+            std::size_t kahnLevelPackRejectedTopo = 0;
+            std::size_t kahnLevelPackRejectedSegmentCount = 0;
+            std::size_t kahnLevelPackRejectedSegmentShape = 0;
+            std::size_t kahnLevelPackRejectedPolicy = 0;
+            std::size_t kahnLevelPackBaselineSegments = 0;
+            std::size_t kahnLevelPackCandidateSegments = 0;
+            std::size_t kahnLevelPackBeforeComputeBae = 0;
+            std::size_t kahnLevelPackCandidateComputeBae = 0;
+            std::size_t kahnLevelPackAfterComputeBae = 0;
+            std::size_t kahnLevelPackBeforeDagEdges = 0;
+            std::size_t kahnLevelPackCandidateDagEdges = 0;
+            std::size_t kahnLevelPackAfterDagEdges = 0;
+            bool kahnLevelPackEvaluated = false;
+            bool kahnLevelPackCandidateBuilt = false;
+            bool kahnLevelPackAdopted = false;
+            bool kahnLevelPackSkippedOversize = false;
+            bool kahnLevelPackSkippedSplitSensitive = false;
+            bool kahnLevelPackFinalTopoValid = false;
             std::size_t postDpRefineRounds = 0;
             std::size_t postDpRefineCandidates = 0;
             std::size_t postDpRefineMoves = 0;
@@ -4868,6 +4897,624 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        PostDpPartitionMetrics recountPostDpPartitionMetrics(
+            const NodeClusterView &view,
+            const ClusterValueEdges &valueEdges,
+            const std::vector<std::vector<uint32_t>> &segments)
+        {
+            const std::vector<uint32_t> owners = postDpSegmentOwners(view, segments);
+            return {
+                .computeBae = recountPostDpComputeBae(valueEdges, owners, segments.size()),
+                .dagEdges = buildPostDpDagState(view, valueEdges, owners, segments.size()).edges,
+            };
+        }
+
+        bool partitionPolicyAccepts(std::string_view policy,
+                                    const PostDpPartitionMetrics &baseline,
+                                    const PostDpPartitionMetrics &current,
+                                    const PostDpPartitionMetrics &candidate,
+                                    std::size_t maxRegressionPpm)
+        {
+            const std::int64_t localBaeGain =
+                static_cast<std::int64_t>(current.computeBae) -
+                static_cast<std::int64_t>(candidate.computeBae);
+            const std::int64_t localDagGain =
+                static_cast<std::int64_t>(current.dagEdges) -
+                static_cast<std::int64_t>(candidate.dagEdges);
+            const std::int64_t globalBaeGain =
+                static_cast<std::int64_t>(baseline.computeBae) -
+                static_cast<std::int64_t>(candidate.computeBae);
+            const std::int64_t globalDagGain =
+                static_cast<std::int64_t>(baseline.dagEdges) -
+                static_cast<std::int64_t>(candidate.dagEdges);
+            const std::size_t baeRegressionBudget = static_cast<std::size_t>(
+                (static_cast<unsigned __int128>(baseline.computeBae) * maxRegressionPpm) /
+                1000000U);
+            const std::size_t dagRegressionBudget = static_cast<std::size_t>(
+                (static_cast<unsigned __int128>(baseline.dagEdges) * maxRegressionPpm) /
+                1000000U);
+
+            if (policy == "strict")
+            {
+                return localBaeGain >= 0 && localDagGain >= 0 &&
+                       (localBaeGain > 0 || localDagGain > 0);
+            }
+            if (policy == "bae-budget")
+            {
+                return localBaeGain > 0 &&
+                       candidate.dagEdges <= baseline.dagEdges + dagRegressionBudget;
+            }
+            if (policy == "balanced")
+            {
+                const __int128 localGain =
+                    static_cast<__int128>(localBaeGain) *
+                        std::max<std::size_t>(baseline.dagEdges, 1) +
+                    static_cast<__int128>(localDagGain) *
+                        std::max<std::size_t>(baseline.computeBae, 1);
+                const __int128 globalGain =
+                    static_cast<__int128>(globalBaeGain) *
+                        std::max<std::size_t>(baseline.dagEdges, 1) +
+                    static_cast<__int128>(globalDagGain) *
+                        std::max<std::size_t>(baseline.computeBae, 1);
+                return localGain > 0 && globalGain > 0 &&
+                       candidate.computeBae <= baseline.computeBae + baeRegressionBudget &&
+                       candidate.dagEdges <= baseline.dagEdges + dagRegressionBudget;
+            }
+            return false;
+        }
+
+        bool validateComputeSupernodeSegments(
+            const NodeClusterView &view,
+            const std::vector<std::vector<uint32_t>> &segments,
+            const std::vector<uint32_t> &nodeOpSizes,
+            std::size_t maxOps)
+        {
+            std::vector<uint8_t> seen(view.members.size(), 0U);
+            for (const auto &segment : segments)
+            {
+                if (segment.empty())
+                {
+                    return false;
+                }
+                std::size_t segmentOps = 0;
+                for (const uint32_t clusterId : segment)
+                {
+                    if (clusterId >= view.members.size() || seen[clusterId] != 0)
+                    {
+                        return false;
+                    }
+                    seen[clusterId] = 1U;
+                    segmentOps += clusterOpSize(view.members[clusterId], nodeOpSizes);
+                }
+                if (segmentOps > maxOps)
+                {
+                    return false;
+                }
+            }
+            return std::find(seen.begin(), seen.end(), uint8_t{0}) == seen.end();
+        }
+
+        bool validateClusterOrderPermutationAndTopo(
+            const NodeClusterView &view,
+            const std::vector<uint32_t> &order,
+            std::vector<uint32_t> *positionOut = nullptr)
+        {
+            if (order.size() != view.members.size())
+            {
+                return false;
+            }
+            std::vector<uint32_t> position(order.size(), kInvalidActivitySupernodeId);
+            for (uint32_t pos = 0; pos < order.size(); ++pos)
+            {
+                const uint32_t clusterId = order[pos];
+                if (clusterId >= position.size() ||
+                    position[clusterId] != kInvalidActivitySupernodeId)
+                {
+                    return false;
+                }
+                position[clusterId] = pos;
+            }
+            for (uint32_t from = 0; from < view.succs.size(); ++from)
+            {
+                for (const uint32_t to : view.succs[from])
+                {
+                    if (to >= position.size() || position[from] >= position[to])
+                    {
+                        return false;
+                    }
+                }
+            }
+            if (positionOut != nullptr)
+            {
+                *positionOut = std::move(position);
+            }
+            return true;
+        }
+
+        bool packKahnLevelClusters(
+            std::vector<std::vector<uint32_t>> &clusters,
+            NodeClusterView &view,
+            ClusterValueEdges &valueEdges,
+            std::vector<std::vector<uint32_t>> &segments,
+            const std::vector<uint32_t> &nodeOpSizes,
+            const ComputeRewriteBuild &rewrite,
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            std::size_t maxOps,
+            std::size_t splitNodeMaxOps,
+            ComputeNodeMaterializePerfStats &perf,
+            std::string &error)
+        {
+            if (options.kahnLevelPackPolicy == "off")
+            {
+                return true;
+            }
+
+            perf.kahnLevelPackEvaluated = true;
+            perf.kahnLevelPackBaselineSegments = segments.size();
+            const PostDpPartitionMetrics baselineMetrics =
+                recountPostDpPartitionMetrics(view, valueEdges, segments);
+            perf.kahnLevelPackBeforeComputeBae = baselineMetrics.computeBae;
+            perf.kahnLevelPackAfterComputeBae = baselineMetrics.computeBae;
+            perf.kahnLevelPackBeforeDagEdges = baselineMetrics.dagEdges;
+            perf.kahnLevelPackAfterDagEdges = baselineMetrics.dagEdges;
+            perf.kahnLevelPackFinalTopoValid = true;
+
+            const std::size_t clusterCount = view.members.size();
+            if (clusterCount < 3 || segments.empty())
+            {
+                return true;
+            }
+
+            std::vector<std::size_t> clusterOps(clusterCount, 0);
+            std::vector<uint8_t> locked(clusterCount, 0U);
+            std::size_t totalOps = 0;
+            for (uint32_t clusterId = 0; clusterId < clusterCount; ++clusterId)
+            {
+                clusterOps[clusterId] = clusterOpSize(view.members[clusterId], nodeOpSizes);
+                totalOps += clusterOps[clusterId];
+                if (clusterOps[clusterId] > maxOps)
+                {
+                    perf.kahnLevelPackSkippedOversize = true;
+                    return true;
+                }
+                for (const uint32_t nodeId : view.members[clusterId])
+                {
+                    if (nodeId >= rewrite.computeNodes.size())
+                    {
+                        error = "activity-schedule Kahn-level pack found an invalid compute node";
+                        return false;
+                    }
+                    const auto &node = rewrite.computeNodes[nodeId];
+                    if (node.indivisible || !node.intentGroup.empty())
+                    {
+                        locked[clusterId] = 1U;
+                    }
+                    if (options.splitOversizeComputeNodes && splitNodeMaxOps != 0 &&
+                        node.ops.size() > splitNodeMaxOps)
+                    {
+                        perf.kahnLevelPackSkippedSplitSensitive = true;
+                        return true;
+                    }
+                }
+            }
+            perf.kahnLevelPackLockedClusters =
+                std::count(locked.begin(), locked.end(), uint8_t{1});
+
+            std::vector<uint32_t> indegree(clusterCount, 0);
+            for (uint32_t from = 0; from < clusterCount; ++from)
+            {
+                for (const uint32_t to : view.succs[from])
+                {
+                    if (to >= clusterCount)
+                    {
+                        error = "activity-schedule Kahn-level pack found an invalid quotient edge";
+                        return false;
+                    }
+                    ++indegree[to];
+                }
+            }
+            std::set<uint32_t> ready;
+            for (uint32_t clusterId = 0; clusterId < clusterCount; ++clusterId)
+            {
+                if (indegree[clusterId] == 0)
+                {
+                    ready.insert(clusterId);
+                }
+            }
+            std::vector<uint32_t> level(clusterCount, 0);
+            std::size_t visited = 0;
+            while (!ready.empty())
+            {
+                const uint32_t clusterId = *ready.begin();
+                ready.erase(ready.begin());
+                ++visited;
+                for (const uint32_t succ : view.succs[clusterId])
+                {
+                    level[succ] = std::max(level[succ], level[clusterId] + 1);
+                    if (--indegree[succ] == 0)
+                    {
+                        ready.insert(succ);
+                    }
+                }
+            }
+            if (visited != clusterCount)
+            {
+                error = "activity-schedule Kahn-level pack found a cyclic quotient graph";
+                return false;
+            }
+            const uint32_t levelCount =
+                *std::max_element(level.begin(), level.end()) + 1;
+            perf.kahnLevelPackLevels = levelCount;
+            std::vector<std::vector<uint32_t>> levelSlots(levelCount);
+            std::vector<uint32_t> slotRankByPosition(clusterCount, 0);
+            for (uint32_t pos = 0; pos < clusterCount; ++pos)
+            {
+                const uint32_t clusterLevel = level[pos];
+                slotRankByPosition[pos] =
+                    static_cast<uint32_t>(levelSlots[clusterLevel].size());
+                levelSlots[clusterLevel].push_back(pos);
+            }
+
+            std::size_t affinityReserve = 0;
+            for (const auto &targetValues : valueEdges.targetValuesByCluster)
+            {
+                affinityReserve += targetValues.size();
+            }
+            std::unordered_map<uint64_t, std::size_t> affinityByPair;
+            affinityByPair.reserve(affinityReserve + 1);
+            std::vector<uint32_t> previousTargetByLevel(levelCount, 0);
+            std::vector<uint32_t> previousTargetStamp(levelCount, 0);
+            uint32_t fanoutStamp = 0;
+            for (const auto &fanout : valueEdges.valueFanouts)
+            {
+                ++fanoutStamp;
+                if (fanoutStamp == 0)
+                {
+                    std::fill(previousTargetStamp.begin(), previousTargetStamp.end(), 0);
+                    fanoutStamp = 1;
+                }
+                bool sharedAtLevel = false;
+                for (const uint32_t target : fanout.targetClusters)
+                {
+                    if (target >= clusterCount)
+                    {
+                        continue;
+                    }
+                    const uint32_t targetLevel = level[target];
+                    if (previousTargetStamp[targetLevel] == fanoutStamp)
+                    {
+                        const uint32_t lhs = std::min(previousTargetByLevel[targetLevel], target);
+                        const uint32_t rhs = std::max(previousTargetByLevel[targetLevel], target);
+                        ++affinityByPair[packClusterPair(lhs, rhs)];
+                        sharedAtLevel = true;
+                    }
+                    previousTargetByLevel[targetLevel] = target;
+                    previousTargetStamp[targetLevel] = fanoutStamp;
+                }
+                if (sharedAtLevel)
+                {
+                    ++perf.kahnLevelPackSharedValues;
+                }
+            }
+            perf.kahnLevelPackAffinityPairs = affinityByPair.size();
+
+            struct Peer
+            {
+                uint32_t cluster = 0;
+                std::size_t affinity = 0;
+            };
+            constexpr std::size_t kTopPeers = 32;
+            std::vector<std::vector<Peer>> peers(clusterCount);
+            for (const auto &[packed, affinity] : affinityByPair)
+            {
+                const uint32_t lhs = static_cast<uint32_t>(packed >> 32);
+                const uint32_t rhs = static_cast<uint32_t>(packed);
+                if (lhs >= clusterCount || rhs >= clusterCount || level[lhs] != level[rhs])
+                {
+                    continue;
+                }
+                peers[lhs].push_back({rhs, affinity});
+                peers[rhs].push_back({lhs, affinity});
+            }
+            for (auto &clusterPeers : peers)
+            {
+                std::sort(clusterPeers.begin(),
+                          clusterPeers.end(),
+                          [](const Peer &lhs, const Peer &rhs)
+                          {
+                              if (lhs.affinity != rhs.affinity)
+                              {
+                                  return lhs.affinity > rhs.affinity;
+                              }
+                              return lhs.cluster < rhs.cluster;
+                          });
+                if (clusterPeers.size() > kTopPeers)
+                {
+                    clusterPeers.resize(kTopPeers);
+                }
+            }
+
+            struct Candidate
+            {
+                uint32_t cluster = 0;
+                uint32_t peer = 0;
+                std::size_t affinity = 0;
+                uint32_t distance = 0;
+                bool packsBaselineSegment = false;
+            };
+            constexpr std::size_t kCandidatesPerCluster = 4;
+            const std::vector<uint32_t> baselineOwners =
+                postDpSegmentOwners(view, segments);
+            std::vector<Candidate> candidates;
+            for (uint32_t clusterId = 0; clusterId < clusterCount; ++clusterId)
+            {
+                const uint32_t clusterRank = slotRankByPosition[clusterId];
+                std::size_t added = 0;
+                for (const Peer &peer : peers[clusterId])
+                {
+                    const uint32_t peerRank = slotRankByPosition[peer.cluster];
+                    const uint32_t distance = clusterRank > peerRank
+                                                  ? clusterRank - peerRank
+                                                  : peerRank - clusterRank;
+                    if (distance > 1)
+                    {
+                        const uint32_t destinationRank =
+                            clusterRank < peerRank ? peerRank - 1 : peerRank + 1;
+                        const auto &slots = levelSlots[level[clusterId]];
+                        const uint32_t destinationPosition = slots[destinationRank];
+                        const bool packsBaselineSegment =
+                            destinationPosition < baselineOwners.size() &&
+                            peer.cluster < baselineOwners.size() &&
+                            baselineOwners[destinationPosition] == baselineOwners[peer.cluster];
+                        candidates.push_back({clusterId,
+                                              peer.cluster,
+                                              peer.affinity,
+                                              distance,
+                                              packsBaselineSegment});
+                        if (++added >= kCandidatesPerCluster)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            std::sort(candidates.begin(),
+                      candidates.end(),
+                      [](const Candidate &lhs, const Candidate &rhs)
+                      {
+                          if (lhs.affinity != rhs.affinity)
+                          {
+                              return lhs.affinity > rhs.affinity;
+                          }
+                          if (lhs.packsBaselineSegment != rhs.packsBaselineSegment)
+                          {
+                              return lhs.packsBaselineSegment > rhs.packsBaselineSegment;
+                          }
+                          if (lhs.distance != rhs.distance)
+                          {
+                              return lhs.distance > rhs.distance;
+                          }
+                          if (lhs.cluster != rhs.cluster)
+                          {
+                              return lhs.cluster < rhs.cluster;
+                          }
+                          return lhs.peer < rhs.peer;
+                      });
+            perf.kahnLevelPackCandidates = candidates.size();
+            if (candidates.empty())
+            {
+                return true;
+            }
+
+            const std::size_t movedOpBudget = static_cast<std::size_t>(
+                (static_cast<unsigned __int128>(totalOps) *
+                 options.kahnLevelPackMaxMovedOpPpm) /
+                1000000U);
+            std::vector<uint32_t> order(clusterCount, 0);
+            std::iota(order.begin(), order.end(), 0U);
+            std::vector<uint32_t> position = order;
+            std::vector<uint8_t> moved(clusterCount, 0U);
+            std::size_t movedClusters = 0;
+            std::size_t movedOps = 0;
+
+            const auto proposedPosition = [&](uint32_t clusterId,
+                                              uint32_t lhs,
+                                              uint32_t rhs)
+            {
+                if (clusterId == lhs)
+                {
+                    return position[rhs];
+                }
+                if (clusterId == rhs)
+                {
+                    return position[lhs];
+                }
+                return position[clusterId];
+            };
+            const auto swapPreservesTopo = [&](uint32_t lhs, uint32_t rhs)
+            {
+                const auto clusterPreservesTopo = [&](uint32_t clusterId)
+                {
+                    const uint32_t clusterPosition = proposedPosition(clusterId, lhs, rhs);
+                    for (const uint32_t pred : view.preds[clusterId])
+                    {
+                        if (pred >= clusterCount ||
+                            proposedPosition(pred, lhs, rhs) >= clusterPosition)
+                        {
+                            return false;
+                        }
+                    }
+                    for (const uint32_t succ : view.succs[clusterId])
+                    {
+                        if (succ >= clusterCount ||
+                            clusterPosition >= proposedPosition(succ, lhs, rhs))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                return clusterPreservesTopo(lhs) && clusterPreservesTopo(rhs);
+            };
+
+            for (const Candidate &candidate : candidates)
+            {
+                if (movedClusters + 2 > options.kahnLevelPackMaxMoves)
+                {
+                    ++perf.kahnLevelPackRejectedBudget;
+                    break;
+                }
+                if (candidate.cluster >= clusterCount || candidate.peer >= clusterCount ||
+                    moved[candidate.cluster] != 0)
+                {
+                    continue;
+                }
+                const uint32_t clusterPosition = position[candidate.cluster];
+                const uint32_t peerPosition = position[candidate.peer];
+                if (level[candidate.cluster] != level[candidate.peer] ||
+                    level[candidate.cluster] != level[order[clusterPosition]] ||
+                    level[candidate.peer] != level[order[peerPosition]])
+                {
+                    error = "activity-schedule Kahn-level pack lost a level slot";
+                    return false;
+                }
+                const uint32_t clusterRank = slotRankByPosition[clusterPosition];
+                const uint32_t peerRank = slotRankByPosition[peerPosition];
+                const uint32_t distance = clusterRank > peerRank
+                                              ? clusterRank - peerRank
+                                              : peerRank - clusterRank;
+                if (distance <= 1)
+                {
+                    continue;
+                }
+                const uint32_t destinationRank =
+                    clusterRank < peerRank ? peerRank - 1 : peerRank + 1;
+                const auto &slots = levelSlots[level[candidate.cluster]];
+                if (destinationRank >= slots.size())
+                {
+                    continue;
+                }
+                const uint32_t destinationPosition = slots[destinationRank];
+                const uint32_t rhs = order[destinationPosition];
+                if (rhs == candidate.cluster || rhs == candidate.peer || moved[rhs] != 0)
+                {
+                    continue;
+                }
+                if (locked[candidate.cluster] != 0 || locked[rhs] != 0)
+                {
+                    ++perf.kahnLevelPackRejectedLocked;
+                    continue;
+                }
+                const std::size_t swapOps = clusterOps[candidate.cluster] + clusterOps[rhs];
+                if (movedOps + swapOps > movedOpBudget)
+                {
+                    ++perf.kahnLevelPackRejectedBudget;
+                    continue;
+                }
+                if (!swapPreservesTopo(candidate.cluster, rhs))
+                {
+                    ++perf.kahnLevelPackRejectedTopo;
+                    continue;
+                }
+                std::swap(order[clusterPosition], order[destinationPosition]);
+                position[candidate.cluster] = destinationPosition;
+                position[rhs] = clusterPosition;
+                moved[candidate.cluster] = 1U;
+                moved[rhs] = 1U;
+                movedClusters += 2;
+                movedOps += swapOps;
+                ++perf.kahnLevelPackSwaps;
+            }
+
+            if (perf.kahnLevelPackSwaps == 0)
+            {
+                return true;
+            }
+            std::vector<uint32_t> exactPosition;
+            if (!validateClusterOrderPermutationAndTopo(view, order, &exactPosition))
+            {
+                ++perf.kahnLevelPackRejectedTopo;
+                return true;
+            }
+            std::size_t exactMovedClusters = 0;
+            std::size_t exactMovedOps = 0;
+            for (uint32_t clusterId = 0; clusterId < clusterCount; ++clusterId)
+            {
+                if (exactPosition[clusterId] != clusterId)
+                {
+                    ++exactMovedClusters;
+                    exactMovedOps += clusterOps[clusterId];
+                }
+            }
+            if (exactMovedClusters != movedClusters || exactMovedOps != movedOps ||
+                exactMovedClusters > options.kahnLevelPackMaxMoves ||
+                exactMovedOps > movedOpBudget)
+            {
+                error = "activity-schedule Kahn-level pack moved-cluster budget mismatch";
+                return false;
+            }
+            perf.kahnLevelPackMovedClusters = exactMovedClusters;
+            perf.kahnLevelPackMovedOps = exactMovedOps;
+
+            std::vector<std::vector<uint32_t>> candidateClusters;
+            candidateClusters.reserve(clusterCount);
+            for (const uint32_t clusterId : order)
+            {
+                candidateClusters.push_back(view.members[clusterId]);
+            }
+            NodeClusterView candidateView =
+                buildNodeClusterView(candidateClusters, rewrite.computeDag, rewrite.computeNodes.size());
+            ClusterValueEdges candidateValueEdges =
+                buildClusterValueEdges(candidateView, rewrite, graph);
+            std::vector<std::vector<uint32_t>> candidateSegments =
+                buildComputeSupernodeSegments(candidateView,
+                                              candidateValueEdges,
+                                              nodeOpSizes,
+                                              maxOps,
+                                              nullptr,
+                                              1.0);
+            perf.kahnLevelPackCandidateBuilt = true;
+            perf.kahnLevelPackCandidateSegments = candidateSegments.size();
+            if (candidateSegments.size() > segments.size())
+            {
+                ++perf.kahnLevelPackRejectedSegmentCount;
+                return true;
+            }
+            if (!validateComputeSupernodeSegments(candidateView,
+                                                  candidateSegments,
+                                                  nodeOpSizes,
+                                                  maxOps))
+            {
+                ++perf.kahnLevelPackRejectedSegmentShape;
+                return true;
+            }
+            const PostDpPartitionMetrics candidateMetrics =
+                recountPostDpPartitionMetrics(candidateView,
+                                              candidateValueEdges,
+                                              candidateSegments);
+            perf.kahnLevelPackCandidateComputeBae = candidateMetrics.computeBae;
+            perf.kahnLevelPackCandidateDagEdges = candidateMetrics.dagEdges;
+            if (!partitionPolicyAccepts(options.kahnLevelPackPolicy,
+                                        baselineMetrics,
+                                        baselineMetrics,
+                                        candidateMetrics,
+                                        options.kahnLevelPackMaxRegressionPpm))
+            {
+                ++perf.kahnLevelPackRejectedPolicy;
+                return true;
+            }
+
+            clusters = std::move(candidateClusters);
+            view = std::move(candidateView);
+            valueEdges = std::move(candidateValueEdges);
+            segments = std::move(candidateSegments);
+            perf.kahnLevelPackAfterComputeBae = candidateMetrics.computeBae;
+            perf.kahnLevelPackAfterDagEdges = candidateMetrics.dagEdges;
+            perf.kahnLevelPackAdopted = true;
+            return true;
+        }
+
         bool refinePostDpSegments(const NodeClusterView &view,
                                   const ClusterValueEdges &valueEdges,
                                   const std::vector<uint32_t> &nodeOpSizes,
@@ -4977,12 +5624,18 @@ namespace wolvrix::lib::transform
             std::vector<uint8_t> moved(view.members.size(), 0);
             std::size_t movedClusters = 0;
 
-            std::size_t currentBae =
-                recountPostDpComputeBae(valueEdges, ownerByCluster, segments.size());
+            const PostDpPartitionMetrics baselineMetrics =
+                recountPostDpPartitionMetrics(view, valueEdges, segments);
+            std::size_t currentBae = baselineMetrics.computeBae;
             PostDpDagState dagState =
                 buildPostDpDagState(view, valueEdges, ownerByCluster, segments.size());
-            const std::size_t baselineBae = currentBae;
-            const std::size_t baselineDag = dagState.edges;
+            const std::size_t baselineBae = baselineMetrics.computeBae;
+            const std::size_t baselineDag = baselineMetrics.dagEdges;
+            if (dagState.edges != baselineDag)
+            {
+                error = "activity-schedule post-DP refine baseline recount mismatch";
+                return false;
+            }
             perf.postDpRefineBeforeComputeBae = baselineBae;
             perf.postDpRefineBeforeDagEdges = baselineDag;
             perf.postDpRefineEvaluated = true;
@@ -5431,14 +6084,6 @@ namespace wolvrix::lib::transform
                        (rhs == kInvalidActivitySupernodeId || clusterOk(rhs));
             };
 
-            const std::size_t baeRegressionBudget = static_cast<std::size_t>(
-                (static_cast<unsigned __int128>(baselineBae) *
-                 options.postDpRefineMaxRegressionPpm) /
-                1000000U);
-            const std::size_t dagRegressionBudget = static_cast<std::size_t>(
-                (static_cast<unsigned __int128>(baselineDag) *
-                 options.postDpRefineMaxRegressionPpm) /
-                1000000U);
             const auto policyAccepts = [&](const ProposalEval &eval)
             {
                 if (eval.dagGain == std::numeric_limits<std::int64_t>::min())
@@ -5453,36 +6098,18 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
-                if (options.postDpRefinePolicy == "strict")
-                {
-                    return eval.baeGain >= 0 && eval.dagGain >= 0 &&
-                           (eval.baeGain > 0 || eval.dagGain > 0);
-                }
-                if (options.postDpRefinePolicy == "bae-budget")
-                {
-                    return eval.baeGain > 0 &&
-                           static_cast<std::size_t>(nextDag) <=
-                               baselineDag + dagRegressionBudget;
-                }
-                if (options.postDpRefinePolicy == "balanced")
-                {
-                    const __int128 localGain =
-                        static_cast<__int128>(eval.baeGain) *
-                            std::max<std::size_t>(baselineDag, 1) +
-                        static_cast<__int128>(eval.dagGain) *
-                            std::max<std::size_t>(baselineBae, 1);
-                    const __int128 globalGain =
-                        (static_cast<__int128>(baselineBae) - nextBae) *
-                            std::max<std::size_t>(baselineDag, 1) +
-                        (static_cast<__int128>(baselineDag) - nextDag) *
-                            std::max<std::size_t>(baselineBae, 1);
-                    return localGain > 0 && globalGain > 0 &&
-                           static_cast<std::size_t>(nextBae) <=
-                               baselineBae + baeRegressionBudget &&
-                           static_cast<std::size_t>(nextDag) <=
-                               baselineDag + dagRegressionBudget;
-                }
-                return false;
+                return partitionPolicyAccepts(
+                    options.postDpRefinePolicy,
+                    baselineMetrics,
+                    PostDpPartitionMetrics{
+                        .computeBae = currentBae,
+                        .dagEdges = dagState.edges,
+                    },
+                    PostDpPartitionMetrics{
+                        .computeBae = static_cast<std::size_t>(nextBae),
+                        .dagEdges = static_cast<std::size_t>(nextDag),
+                    },
+                    options.postDpRefineMaxRegressionPpm);
             };
 
             const auto proposalScore = [&](const ProposalEval &eval)
@@ -6896,7 +7523,7 @@ namespace wolvrix::lib::transform
             }
 
             const auto buildClusterViewStart = std::chrono::steady_clock::now();
-            const NodeClusterView clusterView =
+            NodeClusterView clusterView =
                 buildNodeClusterView(clusters, rewrite.computeDag, rewrite.computeNodes.size());
             if (perf)
             {
@@ -6909,7 +7536,7 @@ namespace wolvrix::lib::transform
                          coarsenShape.c_str());
 
             const auto dpSegmentStart = std::chrono::steady_clock::now();
-            const auto clusterValueEdges = buildClusterValueEdges(clusterView, rewrite, graph);
+            ClusterValueEdges clusterValueEdges = buildClusterValueEdges(clusterView, rewrite, graph);
             recordInitialComputeSupernodeStats(clusterView,
                                                clusterValueEdges,
                                                rewrite,
@@ -6928,6 +7555,27 @@ namespace wolvrix::lib::transform
                 perf->segments = segments.size();
             }
 
+            if (options.kahnLevelPackPolicy != "off")
+            {
+                const auto packStart = std::chrono::steady_clock::now();
+                if (!packKahnLevelClusters(clusters,
+                                           clusterView,
+                                           clusterValueEdges,
+                                           segments,
+                                           nodeOpSizes,
+                                           rewrite,
+                                           graph,
+                                           options,
+                                           maxOpsPerComputeSupernode,
+                                           maxOpsPerSplitComputeNode,
+                                           *perf,
+                                           error))
+                {
+                    return false;
+                }
+                perf->kahnLevelPackMs = elapsedMs(packStart);
+                perf->segments = segments.size();
+            }
             if (options.postDpRefinePolicy != "off")
             {
                 const auto refineStart = std::chrono::steady_clock::now();
@@ -7215,7 +7863,8 @@ namespace wolvrix::lib::transform
                 std::sort(fanout.begin(), fanout.end());
                 fanout.erase(std::unique(fanout.begin(), fanout.end()), fanout.end());
             }
-            if (perf->postDpRefineEvaluated && perf->splitOversizeComputeNodes == 0)
+            if ((perf->postDpRefineEvaluated || perf->kahnLevelPackEvaluated) &&
+                perf->splitOversizeComputeNodes == 0)
             {
                 std::size_t finalComputeBae = 0;
                 for (const auto &fanout : build.valueFanout)
@@ -7234,15 +7883,25 @@ namespace wolvrix::lib::transform
                 {
                     finalDagEdges += succs.size();
                 }
-                if (finalComputeBae != perf->postDpRefineAfterComputeBae ||
-                    finalDagEdges != perf->postDpRefineAfterDagEdges)
+                const std::size_t expectedComputeBae =
+                    perf->postDpRefineEvaluated
+                        ? perf->postDpRefineAfterComputeBae
+                        : perf->kahnLevelPackAfterComputeBae;
+                const std::size_t expectedDagEdges =
+                    perf->postDpRefineEvaluated
+                        ? perf->postDpRefineAfterDagEdges
+                        : perf->kahnLevelPackAfterDagEdges;
+                if (finalComputeBae != expectedComputeBae ||
+                    finalDagEdges != expectedDagEdges)
                 {
-                    error = "activity-schedule post-DP refine final recount mismatch: "
+                    error = std::string("activity-schedule ") +
+                            (perf->postDpRefineEvaluated ? "post-DP refine" : "Kahn-level pack") +
+                            " final recount mismatch: "
                             "predicted_compute_bae=" +
-                            std::to_string(perf->postDpRefineAfterComputeBae) +
+                            std::to_string(expectedComputeBae) +
                             " final_compute_bae=" + std::to_string(finalComputeBae) +
                             " predicted_dag_edges=" +
-                            std::to_string(perf->postDpRefineAfterDagEdges) +
+                            std::to_string(expectedDagEdges) +
                             " final_dag_edges=" + std::to_string(finalDagEdges);
                     return false;
                 }
@@ -7375,10 +8034,26 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.kahnLevelPackPolicy != "off" &&
+            options_.kahnLevelPackPolicy != "strict" &&
+            options_.kahnLevelPackPolicy != "bae-budget" &&
+            options_.kahnLevelPackPolicy != "balanced")
+        {
+            error("activity-schedule kahn_level_pack_policy must be off, strict, bae-budget, or balanced");
+            result.failed = true;
+            return result;
+        }
         if (options_.postDpRefineMaxMovedOpPpm > 1000000 ||
             options_.postDpRefineMaxRegressionPpm > 1000000)
         {
             error("activity-schedule post-DP refine ppm options must be <= 1000000");
+            result.failed = true;
+            return result;
+        }
+        if (options_.kahnLevelPackMaxMovedOpPpm > 1000000 ||
+            options_.kahnLevelPackMaxRegressionPpm > 1000000)
+        {
+            error("activity-schedule Kahn-level pack ppm options must be <= 1000000");
             result.failed = true;
             return result;
         }
@@ -7633,6 +8308,62 @@ namespace wolvrix::lib::transform
                 " split_supernodes=" +
                 std::to_string(materializePerf.splitOversizeComputeNodeSupernodes));
         logInfo("activity-schedule final topo policy: " + options_.finalTopoPolicy);
+        if (options_.kahnLevelPackPolicy != "off")
+        {
+            logInfo("activity-schedule Kahn-level pack detail: policy=" +
+                    options_.kahnLevelPackPolicy +
+                    " elapsed_ms=" + std::to_string(materializePerf.kahnLevelPackMs) +
+                    " levels=" + std::to_string(materializePerf.kahnLevelPackLevels) +
+                    " locked_clusters=" +
+                    std::to_string(materializePerf.kahnLevelPackLockedClusters) +
+                    " shared_values=" +
+                    std::to_string(materializePerf.kahnLevelPackSharedValues) +
+                    " affinity_pairs=" +
+                    std::to_string(materializePerf.kahnLevelPackAffinityPairs) +
+                    " candidates=" + std::to_string(materializePerf.kahnLevelPackCandidates) +
+                    " swaps=" + std::to_string(materializePerf.kahnLevelPackSwaps) +
+                    " moved_clusters=" +
+                    std::to_string(materializePerf.kahnLevelPackMovedClusters) +
+                    " moved_ops=" + std::to_string(materializePerf.kahnLevelPackMovedOps) +
+                    " rejected_budget=" +
+                    std::to_string(materializePerf.kahnLevelPackRejectedBudget) +
+                    " rejected_locked=" +
+                    std::to_string(materializePerf.kahnLevelPackRejectedLocked) +
+                    " rejected_topo=" +
+                    std::to_string(materializePerf.kahnLevelPackRejectedTopo) +
+                    " rejected_segment_count=" +
+                    std::to_string(materializePerf.kahnLevelPackRejectedSegmentCount) +
+                    " rejected_segment_shape=" +
+                    std::to_string(materializePerf.kahnLevelPackRejectedSegmentShape) +
+                    " rejected_policy=" +
+                    std::to_string(materializePerf.kahnLevelPackRejectedPolicy) +
+                    " baseline_segments=" +
+                    std::to_string(materializePerf.kahnLevelPackBaselineSegments) +
+                    " candidate_segments=" +
+                    std::to_string(materializePerf.kahnLevelPackCandidateSegments) +
+                    " compute_bae_before=" +
+                    std::to_string(materializePerf.kahnLevelPackBeforeComputeBae) +
+                    " compute_bae_candidate=" +
+                    std::to_string(materializePerf.kahnLevelPackCandidateComputeBae) +
+                    " compute_bae_after=" +
+                    std::to_string(materializePerf.kahnLevelPackAfterComputeBae) +
+                    " dag_edges_before=" +
+                    std::to_string(materializePerf.kahnLevelPackBeforeDagEdges) +
+                    " dag_edges_candidate=" +
+                    std::to_string(materializePerf.kahnLevelPackCandidateDagEdges) +
+                    " dag_edges_after=" +
+                    std::to_string(materializePerf.kahnLevelPackAfterDagEdges) +
+                    " candidate_built=" +
+                    std::string(materializePerf.kahnLevelPackCandidateBuilt ? "true" : "false") +
+                    " final_topo_valid=" +
+                    std::string(materializePerf.kahnLevelPackFinalTopoValid ? "true" : "false") +
+                    " skipped_oversize=" +
+                    std::string(materializePerf.kahnLevelPackSkippedOversize ? "true" : "false") +
+                    " skipped_split_sensitive=" +
+                    std::string(materializePerf.kahnLevelPackSkippedSplitSensitive ? "true" : "false") +
+                    " adopted=" +
+                    std::string(materializePerf.kahnLevelPackAdopted ? "true" : "false"));
+        }
         if (options_.postDpRefinePolicy != "off")
         {
             logInfo("activity-schedule post-DP refine detail: policy=" +

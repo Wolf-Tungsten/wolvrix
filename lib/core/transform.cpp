@@ -1184,6 +1184,18 @@ namespace wolvrix::lib::transform
                     options.finalTopoPolicy =
                         std::string(arg.substr(std::string_view("-final-topo-policy=").size()));
                 }
+                else if (arg == "-kahn-level-pack-policy")
+                {
+                    if (!parseStringArg("-kahn-level-pack-policy", options.kahnLevelPackPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-kahn-level-pack-policy="))
+                {
+                    options.kahnLevelPackPolicy =
+                        std::string(arg.substr(std::string_view("-kahn-level-pack-policy=").size()));
+                }
                 else if (arg == "-post-dp-refine-policy")
                 {
                     if (!parseStringArg("-post-dp-refine-policy", options.postDpRefinePolicy))
@@ -1275,6 +1287,68 @@ namespace wolvrix::lib::transform
                     catch (const std::exception &)
                     {
                         error = "invalid -post-dp-refine-max-regression-ppm value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-kahn-level-pack-max-moves")
+                {
+                    if (!parseSizeArg("-kahn-level-pack-max-moves", options.kahnLevelPackMaxMoves))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-kahn-level-pack-max-moves="))
+                {
+                    try
+                    {
+                        options.kahnLevelPackMaxMoves = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-kahn-level-pack-max-moves=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -kahn-level-pack-max-moves value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-kahn-level-pack-max-moved-op-ppm")
+                {
+                    if (!parseSizeArg("-kahn-level-pack-max-moved-op-ppm",
+                                      options.kahnLevelPackMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-kahn-level-pack-max-moved-op-ppm="))
+                {
+                    try
+                    {
+                        options.kahnLevelPackMaxMovedOpPpm = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-kahn-level-pack-max-moved-op-ppm=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -kahn-level-pack-max-moved-op-ppm value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-kahn-level-pack-max-regression-ppm")
+                {
+                    if (!parseSizeArg("-kahn-level-pack-max-regression-ppm",
+                                      options.kahnLevelPackMaxRegressionPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-kahn-level-pack-max-regression-ppm="))
+                {
+                    try
+                    {
+                        options.kahnLevelPackMaxRegressionPpm = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-kahn-level-pack-max-regression-ppm=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -kahn-level-pack-max-regression-ppm value";
                         return nullptr;
                     }
                 }

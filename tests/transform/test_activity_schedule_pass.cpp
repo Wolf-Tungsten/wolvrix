@@ -398,6 +398,37 @@ namespace
         return 0;
     }
 
+    int validateScheduleTopoOrder(const ScheduleView &schedule)
+    {
+        if (schedule.dag == nullptr || schedule.topoOrder == nullptr ||
+            schedule.dag->size() != schedule.topoOrder->size())
+        {
+            return fail("Expected schedule DAG and topo order to have matching sizes");
+        }
+        std::vector<uint32_t> position(schedule.topoOrder->size(), kInvalidActivitySupernodeId);
+        for (uint32_t pos = 0; pos < schedule.topoOrder->size(); ++pos)
+        {
+            const uint32_t supernode = (*schedule.topoOrder)[pos];
+            if (supernode >= position.size() ||
+                position[supernode] != kInvalidActivitySupernodeId)
+            {
+                return fail("Expected schedule topo order to be a permutation");
+            }
+            position[supernode] = pos;
+        }
+        for (uint32_t from = 0; from < schedule.dag->size(); ++from)
+        {
+            for (const uint32_t to : (*schedule.dag)[from])
+            {
+                if (to >= position.size() || position[from] >= position[to])
+                {
+                    return fail("Expected every schedule DAG edge to follow topo order");
+                }
+            }
+        }
+        return 0;
+    }
+
     std::string readFile(const std::filesystem::path &path)
     {
         std::ifstream in(path);
@@ -785,7 +816,8 @@ int main()
                                     .maxOpInComputeSupernode = 6,
                                     .maxOpInComputeNode = 2,
                                     .enableCoarsen = false,
-                                    .postDpRefinePolicy = "strict"}));
+                                    .postDpRefinePolicy = "strict",
+                                    .kahnLevelPackPolicy = "strict"}));
 
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
@@ -2550,6 +2582,536 @@ int main()
                 parseJsonDoubleField(*offSchedule.summaryStats, "dag_edges"))
         {
             return fail("Expected strict full-cap swap to reduce BAE and DAG edges");
+        }
+    }
+
+    {
+        currentCase = "Kahn-level strict packing";
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId p;
+            wolvrix::lib::grh::OperationId q;
+            wolvrix::lib::grh::OperationId a;
+            wolvrix::lib::grh::OperationId c;
+            wolvrix::lib::grh::OperationId b;
+            wolvrix::lib::grh::OperationId d;
+            wolvrix::lib::grh::OperationId write;
+            wolvrix::lib::grh::ValueId aValue;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("kahn_level_strict_pack");
+            design.markAsTop("kahn_level_strict_pack");
+
+            const auto pInput = makeValue(graph, "p_input", 8);
+            const auto qInput = makeValue(graph, "q_input", 8);
+            const auto aInput = makeValue(graph, "a_input", 8);
+            const auto bInput = makeValue(graph, "b_input", 8);
+            const auto cInput = makeValue(graph, "c_input", 8);
+            const auto dInput = makeValue(graph, "d_input", 8);
+            const auto enable = makeValue(graph, "enable", 1);
+            const auto mask = makeValue(graph, "mask", 8);
+            const auto clock = makeValue(graph, "clock", 1);
+            for (const auto &[name, value] :
+                 std::vector<std::pair<const char *, wolvrix::lib::grh::ValueId>>{
+                     {"p_input", pInput},
+                     {"q_input", qInput},
+                     {"a_input", aInput},
+                     {"b_input", bInput},
+                     {"c_input", cInput},
+                     {"d_input", dInput},
+                     {"enable", enable},
+                     {"mask", mask},
+                     {"clock", clock},
+                 })
+            {
+                graph.bindInputPort(name, value);
+            }
+
+            const auto makeDeclaredProducer = [&](const std::string &name,
+                                                  wolvrix::lib::grh::ValueId input)
+            {
+                const auto valueSymbol = graph.internSymbol(name + "_value");
+                graph.addDeclaredSymbol(valueSymbol);
+                const auto value = graph.createValue(valueSymbol, 8, false);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                return std::pair{op, value};
+            };
+            const auto makeTarget = [&](const std::string &name,
+                                        wolvrix::lib::grh::ValueId shared,
+                                        wolvrix::lib::grh::ValueId input)
+            {
+                const auto value = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, shared);
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                graph.bindOutputPort(name, value);
+                return std::pair{op, value};
+            };
+
+            const auto [p, pValue] = makeDeclaredProducer("p", pInput);
+            const auto [q, qValue] = makeDeclaredProducer("q", qInput);
+            const auto [a, aValue] = makeTarget("t0", pValue, aInput);
+            const auto [c, cValue] = makeTarget("t1", qValue, cInput);
+            const auto [b, bValue] = makeTarget("t2", pValue, bInput);
+            const auto [d, dValue] = makeTarget("t3", qValue, dInput);
+
+            const auto reg = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                   graph.internSymbol("state"));
+            graph.setAttr(reg, "width", static_cast<int64_t>(8));
+            graph.setAttr(reg, "isSigned", false);
+            const auto write = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol("state_write"));
+            graph.addOperand(write, enable);
+            graph.addOperand(write, aValue);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clock);
+            graph.setAttr(write, "regSymbol", std::string("state"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            return FixtureOps{p, q, a, c, b, d, write, aValue};
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   SessionStore &session,
+                                   const std::string *packPolicy,
+                                   std::size_t packMaxMoves,
+                                   std::size_t packMovedOpPpm,
+                                   const std::string *postPolicy)
+        {
+            ActivityScheduleOptions options;
+            options.path = "kahn_level_strict_pack";
+            options.maxOpInComputeSupernode = 2;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.declaredValueComputeNodeBoundary = true;
+            options.kahnLevelPackMaxMoves = packMaxMoves;
+            options.kahnLevelPackMaxMovedOpPpm = packMovedOpPpm;
+            options.postDpRefineMaxRounds = 1;
+            options.postDpRefineMaxMoves = 16;
+            options.postDpRefineMaxMovedOpPpm = 1000000;
+            if (packPolicy != nullptr)
+            {
+                options.kahnLevelPackPolicy = *packPolicy;
+            }
+            if (postPolicy != nullptr)
+            {
+                options.postDpRefinePolicy = *postPolicy;
+            }
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        const std::string offPolicy = "off";
+        const std::string strictPolicy = "strict";
+        wolvrix::lib::grh::Design defaultDesign;
+        buildFixture(defaultDesign);
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign, defaultSession, nullptr, 16, 1000000, nullptr))
+        {
+            return fail("Expected default Kahn-level packing fixture to succeed");
+        }
+        wolvrix::lib::grh::Design offDesign;
+        const FixtureOps offOps = buildFixture(offDesign);
+        SessionStore offSession;
+        if (!runFixture(offDesign, offSession, &offPolicy, 16, 1000000, nullptr))
+        {
+            return fail("Expected explicit-off Kahn-level packing fixture to succeed");
+        }
+        const auto defaultSchedule = loadSchedule(defaultSession, "kahn_level_strict_pack");
+        const auto offSchedule = loadSchedule(offSession, "kahn_level_strict_pack");
+        if (!schedulesEqual(defaultSchedule, offSchedule))
+        {
+            return fail("Expected default and explicit-off Kahn-level schedules to match");
+        }
+
+        wolvrix::lib::grh::Design zeroBudgetDesign;
+        buildFixture(zeroBudgetDesign);
+        SessionStore zeroBudgetSession;
+        if (!runFixture(zeroBudgetDesign, zeroBudgetSession, &strictPolicy, 0, 1000000, nullptr))
+        {
+            return fail("Expected zero-move Kahn-level packing fixture to succeed");
+        }
+        const auto zeroBudgetSchedule = loadSchedule(zeroBudgetSession, "kahn_level_strict_pack");
+        if (!schedulesEqual(offSchedule, zeroBudgetSchedule))
+        {
+            return fail("Expected zero-move Kahn-level packing to preserve the baseline schedule");
+        }
+
+        wolvrix::lib::grh::Design zeroMovedOpBudgetDesign;
+        buildFixture(zeroMovedOpBudgetDesign);
+        SessionStore zeroMovedOpBudgetSession;
+        if (!runFixture(zeroMovedOpBudgetDesign,
+                        zeroMovedOpBudgetSession,
+                        &strictPolicy,
+                        16,
+                        0,
+                        nullptr))
+        {
+            return fail("Expected zero moved-op Kahn-level packing fixture to succeed");
+        }
+        const auto zeroMovedOpBudgetSchedule =
+            loadSchedule(zeroMovedOpBudgetSession, "kahn_level_strict_pack");
+        if (!schedulesEqual(offSchedule, zeroMovedOpBudgetSchedule))
+        {
+            return fail("Expected zero moved-op Kahn-level packing to preserve the baseline schedule");
+        }
+
+        wolvrix::lib::grh::Design strictDesign;
+        const FixtureOps strictOps = buildFixture(strictDesign);
+        SessionStore strictSession;
+        if (!runFixture(strictDesign, strictSession, &strictPolicy, 16, 1000000, nullptr))
+        {
+            return fail("Expected strict Kahn-level packing fixture to succeed");
+        }
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign);
+        SessionStore repeatSession;
+        if (!runFixture(repeatDesign, repeatSession, &strictPolicy, 16, 1000000, nullptr))
+        {
+            return fail("Expected repeated strict Kahn-level packing fixture to succeed");
+        }
+        const auto strictSchedule = loadSchedule(strictSession, "kahn_level_strict_pack");
+        const auto repeatSchedule = loadSchedule(repeatSession, "kahn_level_strict_pack");
+        const auto *strictGraph = strictDesign.findGraph("kahn_level_strict_pack");
+        if (strictGraph == nullptr)
+        {
+            return fail("Expected strict Kahn-level fixture graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*strictGraph, strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateScheduleTopoOrder(strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!schedulesEqual(strictSchedule, repeatSchedule))
+        {
+            return fail("Expected strict Kahn-level packing to be deterministic");
+        }
+        const auto owner = [&](const ScheduleView &schedule, wolvrix::lib::grh::OperationId op)
+        {
+            return (*schedule.opToSupernode)[op.index - 1];
+        };
+        if (owner(offSchedule, offOps.a) == owner(offSchedule, offOps.b) ||
+            owner(offSchedule, offOps.c) == owner(offSchedule, offOps.d))
+        {
+            return fail("Expected baseline Kahn-level targets to remain interleaved: a=" +
+                        std::to_string(owner(offSchedule, offOps.a)) +
+                        " b=" + std::to_string(owner(offSchedule, offOps.b)) +
+                        " c=" + std::to_string(owner(offSchedule, offOps.c)) +
+                        " d=" + std::to_string(owner(offSchedule, offOps.d)));
+        }
+        if (owner(strictSchedule, strictOps.a) != owner(strictSchedule, strictOps.b) ||
+            owner(strictSchedule, strictOps.c) != owner(strictSchedule, strictOps.d))
+        {
+            return fail("Expected strict Kahn-level packing to colocate shared-value targets");
+        }
+        if (parseJsonDoubleField(*strictSchedule.summaryStats, "boundary_activation_edges") >=
+            parseJsonDoubleField(*offSchedule.summaryStats, "boundary_activation_edges"))
+        {
+            return fail("Expected strict Kahn-level packing to reduce BAE");
+        }
+        if (parseJsonDoubleField(*strictSchedule.summaryStats, "dag_edges") >
+            parseJsonDoubleField(*offSchedule.summaryStats, "dag_edges"))
+        {
+            return fail("Expected strict Kahn-level packing not to regress DAG edges");
+        }
+        const uint32_t writeSupernode = owner(strictSchedule, strictOps.write);
+        if (writeSupernode >= strictSchedule.supernodeKinds->size() ||
+            (*strictSchedule.supernodeKinds)[writeSupernode] != ActivityScheduleSupernodeKind::Commit ||
+            !hasFanoutTo(*strictSchedule.valueFanout, strictOps.aValue, writeSupernode))
+        {
+            return fail("Expected Kahn-level packing to preserve remapped compute-to-commit fanout");
+        }
+
+        wolvrix::lib::grh::Design combinedDesign;
+        buildFixture(combinedDesign);
+        SessionStore combinedSession;
+        if (!runFixture(combinedDesign,
+                        combinedSession,
+                        &strictPolicy,
+                        16,
+                        1000000,
+                        &strictPolicy))
+        {
+            return fail("Expected Kahn-level packing plus strict post-DP refine to succeed");
+        }
+        const auto combinedSchedule = loadSchedule(combinedSession, "kahn_level_strict_pack");
+        const auto *combinedGraph = combinedDesign.findGraph("kahn_level_strict_pack");
+        if (combinedGraph == nullptr)
+        {
+            return fail("Expected combined Kahn-level fixture graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*combinedGraph, combinedSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateScheduleTopoOrder(combinedSchedule); rc != 0)
+        {
+            return rc;
+        }
+    }
+
+    {
+        currentCase = "Kahn-level cross-slot topo guard";
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId a;
+            wolvrix::lib::grh::OperationId aChild;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("kahn_level_topo_guard");
+            design.markAsTop("kahn_level_topo_guard");
+            const auto rInput = makeValue(graph, "r_input", 8);
+            const auto qInput = makeValue(graph, "q_input", 8);
+            const auto other = makeValue(graph, "other", 8);
+            graph.bindInputPort("r_input", rInput);
+            graph.bindInputPort("q_input", qInput);
+            graph.bindInputPort("other", other);
+
+            const auto makeDeclaredProducer = [&](const std::string &name,
+                                                  wolvrix::lib::grh::ValueId input)
+            {
+                const auto valueSymbol = graph.internSymbol(name + "_value");
+                graph.addDeclaredSymbol(valueSymbol);
+                const auto value = graph.createValue(valueSymbol, 8, false);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                return value;
+            };
+            const auto rValue = makeDeclaredProducer("r", rInput);
+            const auto qValue = makeDeclaredProducer("q", qInput);
+            const auto makeTarget = [&](const std::string &name,
+                                        wolvrix::lib::grh::ValueId lhs,
+                                        wolvrix::lib::grh::ValueId rhs)
+            {
+                const auto value = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, lhs);
+                graph.addOperand(op, rhs);
+                graph.addResult(op, value);
+                graph.bindOutputPort(name, value);
+                return std::pair{op, value};
+            };
+            const auto [a, aValue] = makeTarget("t0", rValue, other);
+            const auto [aChild, aChildValue] = makeTarget("t1", aValue, other);
+            const auto [c, cValue] = makeTarget("t2", qValue, other);
+            const auto [b, bValue] = makeTarget("t3", rValue, other);
+            (void)c;
+            (void)cValue;
+            (void)b;
+            (void)bValue;
+            (void)aChildValue;
+            return FixtureOps{a, aChild};
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   SessionStore &session,
+                                   const std::string &policy)
+        {
+            ActivityScheduleOptions options;
+            options.path = "kahn_level_topo_guard";
+            options.maxOpInComputeSupernode = 2;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.declaredValueComputeNodeBoundary = true;
+            options.kahnLevelPackPolicy = policy;
+            options.kahnLevelPackMaxMoves = 16;
+            options.kahnLevelPackMaxMovedOpPpm = 1000000;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        wolvrix::lib::grh::Design offDesign;
+        buildFixture(offDesign);
+        SessionStore offSession;
+        if (!runFixture(offDesign, offSession, "off"))
+        {
+            return fail("Expected explicit-off Kahn-level topo-guard fixture to succeed");
+        }
+        wolvrix::lib::grh::Design strictDesign;
+        buildFixture(strictDesign);
+        SessionStore strictSession;
+        if (!runFixture(strictDesign, strictSession, "strict"))
+        {
+            return fail("Expected strict Kahn-level topo-guard fixture to succeed");
+        }
+        const auto offSchedule = loadSchedule(offSession, "kahn_level_topo_guard");
+        const auto strictSchedule = loadSchedule(strictSession, "kahn_level_topo_guard");
+        const auto *strictGraph = strictDesign.findGraph("kahn_level_topo_guard");
+        if (strictGraph == nullptr)
+        {
+            return fail("Expected Kahn-level topo-guard graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*strictGraph, strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateScheduleTopoOrder(strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (parseJsonDoubleField(*strictSchedule.summaryStats, "boundary_activation_edges") >
+                parseJsonDoubleField(*offSchedule.summaryStats, "boundary_activation_edges") ||
+            parseJsonDoubleField(*strictSchedule.summaryStats, "dag_edges") >
+                parseJsonDoubleField(*offSchedule.summaryStats, "dag_edges"))
+        {
+            return fail("Expected strict topo-guard fixture not to regress exact metrics");
+        }
+    }
+
+    {
+        currentCase = "Kahn-level high fanout bound";
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("kahn_level_high_fanout");
+            design.markAsTop("kahn_level_high_fanout");
+            const auto pInput = makeValue(graph, "p_input", 8);
+            const auto qInput = makeValue(graph, "q_input", 8);
+            const auto other = makeValue(graph, "other", 8);
+            graph.bindInputPort("p_input", pInput);
+            graph.bindInputPort("q_input", qInput);
+            graph.bindInputPort("other", other);
+            const auto makeDeclaredProducer = [&](const std::string &name,
+                                                  wolvrix::lib::grh::ValueId input)
+            {
+                const auto valueSymbol = graph.internSymbol(name + "_value");
+                graph.addDeclaredSymbol(valueSymbol);
+                const auto value = graph.createValue(valueSymbol, 8, false);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                return value;
+            };
+            const auto pValue = makeDeclaredProducer("p", pInput);
+            const auto qValue = makeDeclaredProducer("q", qInput);
+            for (std::size_t i = 0; i < 80; ++i)
+            {
+                const std::string name = "t" + std::string(i < 10 ? "0" : "") + std::to_string(i);
+                const auto value = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, (i & 1U) == 0 ? pValue : qValue);
+                graph.addOperand(op, other);
+                graph.addResult(op, value);
+                graph.bindOutputPort(name, value);
+            }
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design, SessionStore &session)
+        {
+            ActivityScheduleOptions options;
+            options.path = "kahn_level_high_fanout";
+            options.maxOpInComputeSupernode = 4;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.declaredValueComputeNodeBoundary = true;
+            options.kahnLevelPackPolicy = "strict";
+            options.kahnLevelPackMaxMoves = 4;
+            options.kahnLevelPackMaxMovedOpPpm = 1000000;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        wolvrix::lib::grh::Design design;
+        buildFixture(design);
+        SessionStore session;
+        if (!runFixture(design, session))
+        {
+            return fail("Expected bounded high-fanout Kahn-level packing to succeed");
+        }
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign);
+        SessionStore repeatSession;
+        if (!runFixture(repeatDesign, repeatSession))
+        {
+            return fail("Expected repeated high-fanout Kahn-level packing to succeed");
+        }
+        const auto schedule = loadSchedule(session, "kahn_level_high_fanout");
+        const auto repeatSchedule = loadSchedule(repeatSession, "kahn_level_high_fanout");
+        const auto *graph = design.findGraph("kahn_level_high_fanout");
+        if (graph == nullptr)
+        {
+            return fail("Expected high-fanout Kahn-level graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateScheduleTopoOrder(schedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!schedulesEqual(schedule, repeatSchedule))
+        {
+            return fail("Expected high-fanout Kahn-level packing to be deterministic");
+        }
+    }
+
+    {
+        currentCase = "Kahn-level option validation";
+        const auto runInvalid = [](const std::string &policy,
+                                   std::size_t movedOpPpm,
+                                   std::size_t regressionPpm)
+        {
+            wolvrix::lib::grh::Design design;
+            auto &graph = design.createGraph("kahn_level_invalid_options");
+            design.markAsTop("kahn_level_invalid_options");
+            const auto input = makeValue(graph, "input", 8);
+            graph.bindInputPort("input", input);
+            const auto output = makeValue(graph, "output", 8);
+            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                  graph.internSymbol("not"));
+            graph.addOperand(op, input);
+            graph.addResult(op, output);
+            graph.bindOutputPort("output", output);
+            ActivityScheduleOptions options;
+            options.path = "kahn_level_invalid_options";
+            options.kahnLevelPackPolicy = policy;
+            options.kahnLevelPackMaxMovedOpPpm = movedOpPpm;
+            options.kahnLevelPackMaxRegressionPpm = regressionPpm;
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return !result.success && diags.hasError();
+        };
+        if (!runInvalid("invalid", 10000, 10000))
+        {
+            return fail("Expected invalid Kahn-level packing policy to fail");
+        }
+        if (!runInvalid("off", 1000001, 10000))
+        {
+            return fail("Expected invalid Kahn-level moved-op ppm to fail");
+        }
+        if (!runInvalid("off", 10000, 1000001))
+        {
+            return fail("Expected invalid Kahn-level regression ppm to fail");
         }
     }
 

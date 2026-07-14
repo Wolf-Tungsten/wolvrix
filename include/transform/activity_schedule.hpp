@@ -37,12 +37,17 @@ namespace wolvrix::lib::transform
         std::size_t localSharedComputeMaxFanout = 4;
         std::size_t localSharedComputeMaxWidth = 256;
         std::size_t splitOversizeComputeNodeMaxOps = 0;
+        std::size_t postDpRefineMaxRounds = 1;
+        std::size_t postDpRefineMaxMoves = 4096;
+        std::size_t postDpRefineMaxMovedOpPpm = 10000;
+        std::size_t postDpRefineMaxRegressionPpm = 10000;
         bool enableCoarsen = true;
         bool enableChainMerge = true;
         bool enableLocalSharedCompute = false;
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
+        std::string postDpRefinePolicy = "off";
         std::string finalTopoPolicy = "level-id";
         std::string exportComputeDagPath;
     };

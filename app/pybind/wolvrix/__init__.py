@@ -626,12 +626,17 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("path", "-path"),
         ("export_compute_dag", "-export-compute-dag"),
         ("final_topo_policy", "-final-topo-policy"),
+        ("post_dp_refine_policy", "-post-dp-refine-policy"),
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
         ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
         ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
+        ("post_dp_refine_max_rounds", "-post-dp-refine-max-rounds"),
+        ("post_dp_refine_max_moves", "-post-dp-refine-max-moves"),
+        ("post_dp_refine_max_moved_op_ppm", "-post-dp-refine-max-moved-op-ppm"),
+        ("post_dp_refine_max_regression_ppm", "-post-dp-refine-max-regression-ppm"),
     ]
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),

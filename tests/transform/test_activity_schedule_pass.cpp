@@ -102,6 +102,31 @@ namespace
         };
     }
 
+    bool schedulesEqual(const ScheduleView &lhs, const ScheduleView &rhs)
+    {
+        if (lhs.supernodeToOps == nullptr || rhs.supernodeToOps == nullptr ||
+            lhs.opToSupernode == nullptr || rhs.opToSupernode == nullptr ||
+            lhs.dag == nullptr || rhs.dag == nullptr ||
+            lhs.valueFanout == nullptr || rhs.valueFanout == nullptr ||
+            lhs.topoOrder == nullptr || rhs.topoOrder == nullptr ||
+            lhs.stateReadSupernodes == nullptr || rhs.stateReadSupernodes == nullptr ||
+            lhs.supernodeKinds == nullptr || rhs.supernodeKinds == nullptr ||
+            lhs.computeNodesBySupernode == nullptr || rhs.computeNodesBySupernode == nullptr ||
+            lhs.summaryStats == nullptr || rhs.summaryStats == nullptr)
+        {
+            return false;
+        }
+        return *lhs.supernodeToOps == *rhs.supernodeToOps &&
+               *lhs.opToSupernode == *rhs.opToSupernode &&
+               *lhs.dag == *rhs.dag &&
+               *lhs.valueFanout == *rhs.valueFanout &&
+               *lhs.topoOrder == *rhs.topoOrder &&
+               *lhs.stateReadSupernodes == *rhs.stateReadSupernodes &&
+               *lhs.supernodeKinds == *rhs.supernodeKinds &&
+               *lhs.computeNodesBySupernode == *rhs.computeNodesBySupernode &&
+               *lhs.summaryStats == *rhs.summaryStats;
+    }
+
     bool hasFanoutTo(const ActivityScheduleValueFanout &fanout,
                      wolvrix::lib::grh::ValueId value,
                      uint32_t supernode)
@@ -759,7 +784,8 @@ int main()
             ActivityScheduleOptions{.path = "intent_dynamic_input",
                                     .maxOpInComputeSupernode = 6,
                                     .maxOpInComputeNode = 2,
-                                    .enableCoarsen = false}));
+                                    .enableCoarsen = false,
+                                    .postDpRefinePolicy = "strict"}));
 
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
@@ -2212,6 +2238,318 @@ int main()
             std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
         {
             return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
+        }
+    }
+
+    {
+        currentCase = "post-DP strict slack move";
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId p;
+            wolvrix::lib::grh::OperationId q;
+            wolvrix::lib::grh::OperationId r;
+            wolvrix::lib::grh::OperationId t;
+            wolvrix::lib::grh::OperationId u;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("post_dp_strict_slack_move");
+            design.markAsTop("post_dp_strict_slack_move");
+
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            const auto c = makeValue(graph, "c", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            graph.bindInputPort("c", c);
+
+            const auto makeNot = [&](const std::string &name,
+                                     wolvrix::lib::grh::ValueId operand)
+            {
+                const auto result = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, operand);
+                graph.addResult(op, result);
+                return std::pair{op, result};
+            };
+
+            const auto [p, pValue] = makeNot("p", a);
+            const auto [q, qValue] = makeNot("q", b);
+            const auto [r, rValue] = makeNot("r", c);
+            const auto [t, tValue] = makeNot("t", pValue);
+            const auto [u, uValue] = makeNot("u", rValue);
+            graph.bindOutputPort("q", qValue);
+            graph.bindOutputPort("t", tValue);
+            graph.bindOutputPort("u", uValue);
+            return FixtureOps{p, q, r, t, u};
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   SessionStore &session,
+                                   const std::string *policy)
+        {
+            ActivityScheduleOptions options;
+            options.path = "post_dp_strict_slack_move";
+            options.maxOpInComputeSupernode = 3;
+            options.maxOpInComputeNode = 1;
+            options.postDpRefineMaxRounds = 1;
+            options.postDpRefineMaxMoves = 16;
+            options.postDpRefineMaxMovedOpPpm = 1000000;
+            options.enableCoarsen = false;
+            if (policy != nullptr)
+            {
+                options.postDpRefinePolicy = *policy;
+            }
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        wolvrix::lib::grh::Design defaultDesign;
+        const FixtureOps defaultOps = buildFixture(defaultDesign);
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign, defaultSession, nullptr))
+        {
+            return fail("Expected default post-DP slack-move schedule to succeed");
+        }
+
+        wolvrix::lib::grh::Design offDesign;
+        buildFixture(offDesign);
+        SessionStore offSession;
+        const std::string offPolicy = "off";
+        if (!runFixture(offDesign, offSession, &offPolicy))
+        {
+            return fail("Expected explicit-off post-DP slack-move schedule to succeed");
+        }
+
+        const auto defaultSchedule = loadSchedule(defaultSession, "post_dp_strict_slack_move");
+        const auto offSchedule = loadSchedule(offSession, "post_dp_strict_slack_move");
+        const auto *defaultGraph = defaultDesign.findGraph("post_dp_strict_slack_move");
+        if (defaultGraph == nullptr)
+        {
+            return fail("Expected post-DP slack-move fixture graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*defaultGraph, defaultSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!schedulesEqual(defaultSchedule, offSchedule))
+        {
+            return fail("Expected default and explicit post-DP refine off session outputs to match");
+        }
+
+        const auto defaultOwner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*defaultSchedule.opToSupernode)[op.index - 1];
+        };
+        if (defaultOwner(defaultOps.p) != defaultOwner(defaultOps.q) ||
+            defaultOwner(defaultOps.p) == defaultOwner(defaultOps.r) ||
+            defaultOwner(defaultOps.r) != defaultOwner(defaultOps.t) ||
+            defaultOwner(defaultOps.r) != defaultOwner(defaultOps.u))
+        {
+            return fail("Expected plain DP slack fixture partition {p,q}/{r,t,u}");
+        }
+
+        wolvrix::lib::grh::Design strictDesign;
+        const FixtureOps strictOps = buildFixture(strictDesign);
+        SessionStore strictSession;
+        const std::string strictPolicy = "strict";
+        if (!runFixture(strictDesign, strictSession, &strictPolicy))
+        {
+            return fail("Expected strict post-DP slack-move schedule to succeed");
+        }
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign);
+        SessionStore repeatSession;
+        if (!runFixture(repeatDesign, repeatSession, &strictPolicy))
+        {
+            return fail("Expected repeated strict post-DP slack-move schedule to succeed");
+        }
+
+        const auto strictSchedule = loadSchedule(strictSession, "post_dp_strict_slack_move");
+        const auto repeatSchedule = loadSchedule(repeatSession, "post_dp_strict_slack_move");
+        const auto *strictGraph = strictDesign.findGraph("post_dp_strict_slack_move");
+        if (strictGraph == nullptr)
+        {
+            return fail("Expected strict post-DP slack-move fixture graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*strictGraph, strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!schedulesEqual(strictSchedule, repeatSchedule))
+        {
+            return fail("Expected strict post-DP slack move to be deterministic");
+        }
+        const auto strictOwner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*strictSchedule.opToSupernode)[op.index - 1];
+        };
+        if (strictOwner(strictOps.p) != strictOwner(strictOps.q) ||
+            strictOwner(strictOps.p) != strictOwner(strictOps.t) ||
+            strictOwner(strictOps.p) == strictOwner(strictOps.r) ||
+            strictOwner(strictOps.r) != strictOwner(strictOps.u))
+        {
+            return fail("Expected strict slack move to produce {p,q,t}/{r,u}");
+        }
+        if (parseJsonDoubleField(*strictSchedule.summaryStats, "boundary_activation_edges") >=
+                parseJsonDoubleField(*defaultSchedule.summaryStats, "boundary_activation_edges") ||
+            parseJsonDoubleField(*strictSchedule.summaryStats, "dag_edges") >=
+                parseJsonDoubleField(*defaultSchedule.summaryStats, "dag_edges"))
+        {
+            return fail("Expected strict slack move to reduce BAE and DAG edges");
+        }
+    }
+
+    {
+        currentCase = "post-DP strict full-cap swap";
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId p;
+            wolvrix::lib::grh::OperationId q;
+            wolvrix::lib::grh::OperationId r;
+            wolvrix::lib::grh::OperationId filler;
+            wolvrix::lib::grh::OperationId t;
+            wolvrix::lib::grh::OperationId u;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("post_dp_strict_full_cap_swap");
+            design.markAsTop("post_dp_strict_full_cap_swap");
+
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            const auto c = makeValue(graph, "c", 8);
+            const auto d = makeValue(graph, "d", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            graph.bindInputPort("c", c);
+            graph.bindInputPort("d", d);
+
+            const auto makeNot = [&](const std::string &name,
+                                     wolvrix::lib::grh::ValueId operand)
+            {
+                const auto result = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, operand);
+                graph.addResult(op, result);
+                return std::pair{op, result};
+            };
+
+            const auto [p, pValue] = makeNot("p", a);
+            const auto [q, qValue] = makeNot("q", b);
+            const auto [r, rValue] = makeNot("r", c);
+            const auto [filler, fillerValue] = makeNot("filler", d);
+            const auto [t, tValue] = makeNot("t", pValue);
+            const auto [u, uValue] = makeNot("u", rValue);
+            graph.bindOutputPort("q", qValue);
+            graph.bindOutputPort("filler", fillerValue);
+            graph.bindOutputPort("t", tValue);
+            graph.bindOutputPort("u", uValue);
+            return FixtureOps{p, q, r, filler, t, u};
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   SessionStore &session,
+                                   const std::string &policy)
+        {
+            ActivityScheduleOptions options;
+            options.path = "post_dp_strict_full_cap_swap";
+            options.maxOpInComputeSupernode = 3;
+            options.maxOpInComputeNode = 1;
+            options.postDpRefineMaxRounds = 1;
+            options.postDpRefineMaxMoves = 16;
+            options.postDpRefineMaxMovedOpPpm = 1000000;
+            options.enableCoarsen = false;
+            options.postDpRefinePolicy = policy;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        wolvrix::lib::grh::Design offDesign;
+        const FixtureOps offOps = buildFixture(offDesign);
+        SessionStore offSession;
+        if (!runFixture(offDesign, offSession, "off"))
+        {
+            return fail("Expected explicit-off post-DP full-cap schedule to succeed");
+        }
+        const auto offSchedule = loadSchedule(offSession, "post_dp_strict_full_cap_swap");
+        const auto *offGraph = offDesign.findGraph("post_dp_strict_full_cap_swap");
+        if (offGraph == nullptr)
+        {
+            return fail("Expected post-DP full-cap fixture graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*offGraph, offSchedule); rc != 0)
+        {
+            return rc;
+        }
+        const auto offOwner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*offSchedule.opToSupernode)[op.index - 1];
+        };
+        if (offOwner(offOps.p) != offOwner(offOps.q) ||
+            offOwner(offOps.p) != offOwner(offOps.filler) ||
+            offOwner(offOps.p) == offOwner(offOps.r) ||
+            offOwner(offOps.r) != offOwner(offOps.t) ||
+            offOwner(offOps.r) != offOwner(offOps.u))
+        {
+            return fail("Expected plain DP full-cap fixture partition {p,q,filler}/{r,t,u}");
+        }
+
+        wolvrix::lib::grh::Design strictDesign;
+        const FixtureOps strictOps = buildFixture(strictDesign);
+        SessionStore strictSession;
+        if (!runFixture(strictDesign, strictSession, "strict"))
+        {
+            return fail("Expected strict post-DP full-cap swap schedule to succeed");
+        }
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign);
+        SessionStore repeatSession;
+        if (!runFixture(repeatDesign, repeatSession, "strict"))
+        {
+            return fail("Expected repeated strict post-DP full-cap swap schedule to succeed");
+        }
+        const auto strictSchedule = loadSchedule(strictSession, "post_dp_strict_full_cap_swap");
+        const auto repeatSchedule = loadSchedule(repeatSession, "post_dp_strict_full_cap_swap");
+        const auto *strictGraph = strictDesign.findGraph("post_dp_strict_full_cap_swap");
+        if (strictGraph == nullptr)
+        {
+            return fail("Expected strict post-DP full-cap fixture graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*strictGraph, strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!schedulesEqual(strictSchedule, repeatSchedule))
+        {
+            return fail("Expected strict post-DP full-cap swap to be deterministic");
+        }
+        const auto strictOwner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*strictSchedule.opToSupernode)[op.index - 1];
+        };
+        if (strictOwner(strictOps.p) != strictOwner(strictOps.q) ||
+            strictOwner(strictOps.p) != strictOwner(strictOps.t) ||
+            strictOwner(strictOps.p) == strictOwner(strictOps.r) ||
+            strictOwner(strictOps.r) != strictOwner(strictOps.filler) ||
+            strictOwner(strictOps.r) != strictOwner(strictOps.u))
+        {
+            return fail("Expected strict full-cap swap to produce {p,q,t}/{r,filler,u}");
+        }
+        if (parseJsonDoubleField(*strictSchedule.summaryStats, "boundary_activation_edges") >=
+                parseJsonDoubleField(*offSchedule.summaryStats, "boundary_activation_edges") ||
+            parseJsonDoubleField(*strictSchedule.summaryStats, "dag_edges") >=
+                parseJsonDoubleField(*offSchedule.summaryStats, "dag_edges"))
+        {
+            return fail("Expected strict full-cap swap to reduce BAE and DAG edges");
         }
     }
 

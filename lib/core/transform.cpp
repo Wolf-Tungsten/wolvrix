@@ -1184,6 +1184,100 @@ namespace wolvrix::lib::transform
                     options.finalTopoPolicy =
                         std::string(arg.substr(std::string_view("-final-topo-policy=").size()));
                 }
+                else if (arg == "-post-dp-refine-policy")
+                {
+                    if (!parseStringArg("-post-dp-refine-policy", options.postDpRefinePolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-post-dp-refine-policy="))
+                {
+                    options.postDpRefinePolicy =
+                        std::string(arg.substr(std::string_view("-post-dp-refine-policy=").size()));
+                }
+                else if (arg == "-post-dp-refine-max-rounds")
+                {
+                    if (!parseSizeArg("-post-dp-refine-max-rounds", options.postDpRefineMaxRounds))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-post-dp-refine-max-rounds="))
+                {
+                    try
+                    {
+                        options.postDpRefineMaxRounds = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-post-dp-refine-max-rounds=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -post-dp-refine-max-rounds value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-post-dp-refine-max-moves")
+                {
+                    if (!parseSizeArg("-post-dp-refine-max-moves", options.postDpRefineMaxMoves))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-post-dp-refine-max-moves="))
+                {
+                    try
+                    {
+                        options.postDpRefineMaxMoves = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-post-dp-refine-max-moves=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -post-dp-refine-max-moves value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-post-dp-refine-max-moved-op-ppm")
+                {
+                    if (!parseSizeArg("-post-dp-refine-max-moved-op-ppm",
+                                      options.postDpRefineMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-post-dp-refine-max-moved-op-ppm="))
+                {
+                    try
+                    {
+                        options.postDpRefineMaxMovedOpPpm = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-post-dp-refine-max-moved-op-ppm=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -post-dp-refine-max-moved-op-ppm value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-post-dp-refine-max-regression-ppm")
+                {
+                    if (!parseSizeArg("-post-dp-refine-max-regression-ppm",
+                                      options.postDpRefineMaxRegressionPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-post-dp-refine-max-regression-ppm="))
+                {
+                    try
+                    {
+                        options.postDpRefineMaxRegressionPpm = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-post-dp-refine-max-regression-ppm=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -post-dp-refine-max-regression-ppm value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-split-oversize-compute-node-max-ops")
                 {
                     if (!parseSizeArg("-split-oversize-compute-node-max-ops",

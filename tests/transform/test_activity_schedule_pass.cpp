@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -2582,6 +2583,380 @@ int main()
                 parseJsonDoubleField(*offSchedule.summaryStats, "dag_edges"))
         {
             return fail("Expected strict full-cap swap to reduce BAE and DAG edges");
+        }
+    }
+
+    {
+        currentCase = "local shared compute clone";
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId shared;
+            wolvrix::lib::grh::OperationId first;
+            wolvrix::lib::grh::OperationId second;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design,
+                                     const std::string &name,
+                                     bool exposeOperandBoundary,
+                                     bool declaredResult,
+                                     bool sideEffect,
+                                     std::size_t consumerCount,
+                                     int32_t width)
+        {
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            const auto input = makeValue(graph, "input", width);
+            graph.bindInputPort("input", input);
+            const auto sharedSymbol = graph.internSymbol("shared_value");
+            if (declaredResult)
+            {
+                graph.addDeclaredSymbol(sharedSymbol);
+            }
+            const auto sharedValue = graph.createValue(sharedSymbol, width, false);
+            const auto shared = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol("shared"));
+            graph.addOperand(shared, input);
+            graph.addResult(shared, sharedValue);
+            if (sideEffect)
+            {
+                graph.setAttr(shared, "hasSideEffects", true);
+            }
+
+            std::vector<wolvrix::lib::grh::OperationId> consumers;
+            for (std::size_t i = 0; i < consumerCount; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto result = makeValue(graph, "consumer_value_" + suffix, width);
+                const auto kind = exposeOperandBoundary
+                                      ? wolvrix::lib::grh::OperationKind::kXor
+                                      : wolvrix::lib::grh::OperationKind::kNot;
+                const auto consumer = graph.createOperation(kind,
+                                                            graph.internSymbol("consumer_" + suffix));
+                graph.addOperand(consumer, sharedValue);
+                if (exposeOperandBoundary)
+                {
+                    graph.addOperand(consumer, input);
+                }
+                graph.addResult(consumer, result);
+                graph.bindOutputPort("out_" + suffix, result);
+                consumers.push_back(consumer);
+            }
+            return FixtureOps{shared, consumers.at(0), consumers.at(1)};
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   SessionStore &session,
+                                   const std::string &name,
+                                   std::optional<bool> enabled,
+                                   std::size_t maxClones,
+                                   std::size_t clonedOpPpm,
+                                   std::size_t maxFanout,
+                                   std::size_t maxWidth,
+                                   std::size_t maxNodeOps,
+                                   bool combineRefinements = false)
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 1;
+            options.maxOpInComputeNode = maxNodeOps;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            if (enabled.has_value())
+            {
+                options.enableLocalSharedCompute = *enabled;
+            }
+            options.localSharedComputeMaxClones = maxClones;
+            options.localSharedComputeMaxClonedOpPpm = clonedOpPpm;
+            options.localSharedComputeMaxFanout = maxFanout;
+            options.localSharedComputeMaxWidth = maxWidth;
+            if (combineRefinements)
+            {
+                options.kahnLevelPackPolicy = "strict";
+                options.kahnLevelPackMaxMoves = 16;
+                options.kahnLevelPackMaxMovedOpPpm = 1000000;
+                options.postDpRefinePolicy = "strict";
+                options.postDpRefineMaxMoves = 16;
+                options.postDpRefineMaxMovedOpPpm = 1000000;
+            }
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        constexpr std::string_view kName = "local_shared_compute_clone";
+        wolvrix::lib::grh::Design defaultDesign;
+        buildFixture(defaultDesign, std::string(kName), true, false, false, 2, 8);
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign, defaultSession, std::string(kName), std::nullopt,
+                        4096, 5000, 2, 64, 4))
+        {
+            return fail("Expected default local shared compute schedule to succeed");
+        }
+        wolvrix::lib::grh::Design explicitOffDesign;
+        buildFixture(explicitOffDesign, std::string(kName), true, false, false, 2, 8);
+        SessionStore explicitOffSession;
+        if (!runFixture(explicitOffDesign, explicitOffSession, std::string(kName), false,
+                        4096, 5000, 2, 64, 4))
+        {
+            return fail("Expected explicit-off local shared compute schedule to succeed");
+        }
+        if (!schedulesEqual(loadSchedule(defaultSession, std::string(kName)),
+                            loadSchedule(explicitOffSession, std::string(kName))))
+        {
+            return fail("Expected default and explicit-off local shared compute schedules to match");
+        }
+
+        wolvrix::lib::grh::Design enabledDesign;
+        const FixtureOps enabledOps =
+            buildFixture(enabledDesign, std::string(kName), true, false, false, 2, 8);
+        SessionStore enabledSession;
+        if (!runFixture(enabledDesign, enabledSession, std::string(kName), true,
+                        16, 1000000, 2, 64, 4))
+        {
+            return fail("Expected local shared compute clone schedule to succeed");
+        }
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign, std::string(kName), true, false, false, 2, 8);
+        SessionStore repeatSession;
+        if (!runFixture(repeatDesign, repeatSession, std::string(kName), true,
+                        16, 1000000, 2, 64, 4))
+        {
+            return fail("Expected repeated local shared compute clone schedule to succeed");
+        }
+        const auto enabledSchedule = loadSchedule(enabledSession, std::string(kName));
+        const auto repeatSchedule = loadSchedule(repeatSession, std::string(kName));
+        const auto *enabledGraph = enabledDesign.findGraph(std::string(kName));
+        if (enabledGraph == nullptr)
+        {
+            return fail("Expected local shared compute clone graph to exist");
+        }
+        if (const int rc = validateCommonScheduleShape(*enabledGraph, enabledSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateScheduleTopoOrder(enabledSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!schedulesEqual(enabledSchedule, repeatSchedule))
+        {
+            return fail("Expected local shared compute cloning to be deterministic");
+        }
+        if (enabledSchedule.summaryStats == nullptr ||
+            parseJsonDoubleField(*enabledSchedule.summaryStats,
+                                 "local_shared_compute_clones_in_compute_nodes") != 1.0)
+        {
+            return fail("Expected exactly one local shared compute clone");
+        }
+        std::vector<wolvrix::lib::grh::OperationId> sharedOps;
+        for (const auto opId : enabledGraph->operations())
+        {
+            if (enabledGraph->opKind(opId) == wolvrix::lib::grh::OperationKind::kNot)
+            {
+                sharedOps.push_back(opId);
+            }
+        }
+        if (sharedOps.size() != 2 || enabledSchedule.opToSupernode == nullptr ||
+            enabledSchedule.valueFanout == nullptr)
+        {
+            return fail("Expected original and cloned shared compute ops");
+        }
+        const auto owner = [&](wolvrix::lib::grh::OperationId opId)
+        {
+            return (*enabledSchedule.opToSupernode)[opId.index - 1];
+        };
+        const uint32_t firstOwner = owner(enabledOps.first);
+        const uint32_t secondOwner = owner(enabledOps.second);
+        if (firstOwner == secondOwner ||
+            !((owner(sharedOps[0]) == firstOwner && owner(sharedOps[1]) == secondOwner) ||
+              (owner(sharedOps[1]) == firstOwner && owner(sharedOps[0]) == secondOwner)))
+        {
+            return fail("Expected original and clone to be local to distinct consumers");
+        }
+        for (const auto sharedOp : sharedOps)
+        {
+            const auto results = enabledGraph->opResults(sharedOp);
+            if (results.size() != 1 ||
+                !(*enabledSchedule.valueFanout)[results.front().index - 1].empty())
+            {
+                return fail("Expected cloned shared result not to cross a supernode boundary");
+            }
+        }
+
+        const auto expectNoClone = [&](const std::string &name,
+                                       bool exposeBoundary,
+                                       bool declaredResult,
+                                       bool sideEffect,
+                                       std::size_t consumerCount,
+                                       int32_t width,
+                                       std::size_t maxClones,
+                                       std::size_t ppm,
+                                       std::size_t maxFanout,
+                                       std::size_t maxWidth,
+                                       std::size_t maxNodeOps) -> bool
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, name, exposeBoundary, declaredResult, sideEffect,
+                         consumerCount, width);
+            SessionStore session;
+            if (!runFixture(design, session, name, true, maxClones, ppm,
+                            maxFanout, maxWidth, maxNodeOps))
+            {
+                return false;
+            }
+            const auto schedule = loadSchedule(session, name);
+            const auto *graph = design.findGraph(name);
+            return graph != nullptr && graph->operations().size() == consumerCount + 1 &&
+                   schedule.summaryStats != nullptr &&
+                   parseJsonDoubleField(*schedule.summaryStats,
+                                        "local_shared_compute_clones_in_compute_nodes") == 0.0;
+        };
+        if (!expectNoClone("local_shared_clone_zero_count", true, false, false, 2, 8,
+                           0, 1000000, 2, 64, 4) ||
+            !expectNoClone("local_shared_clone_zero_ppm", true, false, false, 2, 8,
+                           16, 0, 2, 64, 4) ||
+            !expectNoClone("local_shared_clone_width", true, false, false, 2, 8,
+                           16, 1000000, 2, 4, 4) ||
+            !expectNoClone("local_shared_clone_fanout", true, false, false, 3, 8,
+                           16, 1000000, 2, 64, 4) ||
+            !expectNoClone("local_shared_clone_side_effect", true, false, true, 2, 8,
+                           16, 1000000, 2, 64, 4) ||
+            !expectNoClone("local_shared_clone_declared", true, true, false, 2, 8,
+                           16, 1000000, 2, 64, 4) ||
+            !expectNoClone("local_shared_clone_missing_boundary", false, false, false, 2, 8,
+                           16, 1000000, 2, 64, 4) ||
+            !expectNoClone("local_shared_clone_common_owner", true, false, false, 2, 8,
+                           16, 1000000, 2, 64, 1))
+        {
+            return fail("Expected bounded local shared compute rejection fixture not to clone");
+        }
+
+        wolvrix::lib::grh::Design combinedDesign;
+        buildFixture(combinedDesign, "local_shared_clone_combined", true, false, false, 2, 8);
+        SessionStore combinedSession;
+        if (!runFixture(combinedDesign, combinedSession, "local_shared_clone_combined", true,
+                        16, 1000000, 2, 64, 4, true))
+        {
+            return fail("Expected local shared clone with Kahn/post-DP refinements to succeed");
+        }
+        const auto combinedSchedule = loadSchedule(combinedSession, "local_shared_clone_combined");
+        const auto *combinedGraph = combinedDesign.findGraph("local_shared_clone_combined");
+        if (combinedGraph == nullptr ||
+            validateCommonScheduleShape(*combinedGraph, combinedSchedule) != 0 ||
+            combinedSchedule.summaryStats == nullptr ||
+            parseJsonDoubleField(*combinedSchedule.summaryStats,
+                                 "local_shared_compute_clones_in_compute_nodes") != 1.0)
+        {
+            return fail("Expected combined refinement schedule to retain the local clone");
+        }
+    }
+
+    {
+        currentCase = "local shared compute aggregate cap";
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("local_shared_compute_aggregate_cap");
+            design.markAsTop("local_shared_compute_aggregate_cap");
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            const auto makeShared = [&](const std::string &name,
+                                        wolvrix::lib::grh::ValueId operand)
+            {
+                const auto value = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, operand);
+                graph.addResult(op, value);
+                return value;
+            };
+            const auto s1 = makeShared("s1", a);
+            const auto s2 = makeShared("s2", b);
+            const auto makeLocal = [&](const std::string &name,
+                                       wolvrix::lib::grh::ValueId shared,
+                                       wolvrix::lib::grh::ValueId boundary)
+            {
+                const auto value = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, shared);
+                graph.addOperand(op, boundary);
+                graph.addResult(op, value);
+                graph.bindOutputPort(name, value);
+            };
+            makeLocal("left1", s1, a);
+            makeLocal("left2", s2, b);
+            const auto rightValue = makeValue(graph, "right_value", 32);
+            const auto right = graph.createOperation(wolvrix::lib::grh::OperationKind::kConcat,
+                                                     graph.internSymbol("right"));
+            graph.addOperand(right, s1);
+            graph.addOperand(right, a);
+            graph.addOperand(right, s2);
+            graph.addOperand(right, b);
+            graph.addResult(right, rightValue);
+            graph.bindOutputPort("right", rightValue);
+        };
+        wolvrix::lib::grh::Design design;
+        buildFixture(design);
+        ActivityScheduleOptions options;
+        options.path = "local_shared_compute_aggregate_cap";
+        options.maxOpInComputeNode = 2;
+        options.maxOpInComputeSupernode = 1;
+        options.enableCoarsen = false;
+        options.enableChainMerge = false;
+        options.enableLocalSharedCompute = true;
+        options.localSharedComputeMaxClones = 16;
+        options.localSharedComputeMaxClonedOpPpm = 1000000;
+        options.localSharedComputeMaxFanout = 2;
+        options.localSharedComputeMaxWidth = 64;
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+        PassDiagnostics diags;
+        const PassManagerResult result = manager.run(design, diags);
+        const auto schedule = loadSchedule(session, "local_shared_compute_aggregate_cap");
+        const auto *graph = design.findGraph("local_shared_compute_aggregate_cap");
+        if (!result.success || diags.hasError() || graph == nullptr ||
+            graph->operations().size() != 6 || schedule.summaryStats == nullptr ||
+            parseJsonDoubleField(*schedule.summaryStats,
+                                 "local_shared_compute_clones_in_compute_nodes") != 1.0)
+        {
+            return fail("Expected aggregate target cap to admit exactly one clone");
+        }
+        if (const int rc = validateCommonScheduleShape(*graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+    }
+
+    {
+        currentCase = "local shared compute option validation";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("local_shared_compute_invalid_options");
+        design.markAsTop("local_shared_compute_invalid_options");
+        const auto input = makeValue(graph, "input", 8);
+        graph.bindInputPort("input", input);
+        const auto output = makeValue(graph, "output", 8);
+        const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                              graph.internSymbol("not"));
+        graph.addOperand(op, input);
+        graph.addResult(op, output);
+        graph.bindOutputPort("output", output);
+        ActivityScheduleOptions options;
+        options.path = "local_shared_compute_invalid_options";
+        options.localSharedComputeMaxClonedOpPpm = 1000001;
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+        PassDiagnostics diags;
+        const PassManagerResult result = manager.run(design, diags);
+        if (result.success || !diags.hasError())
+        {
+            return fail("Expected invalid local shared compute cloned-op ppm to fail");
         }
     }
 

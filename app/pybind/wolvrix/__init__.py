@@ -633,6 +633,10 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
         ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
+        ("local_shared_compute_max_fanout", "-local-shared-compute-max-fanout"),
+        ("local_shared_compute_max_width", "-local-shared-compute-max-width"),
+        ("local_shared_compute_max_clones", "-local-shared-compute-max-clones"),
+        ("local_shared_compute_max_cloned_op_ppm", "-local-shared-compute-max-cloned-op-ppm"),
         ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
         ("post_dp_refine_max_rounds", "-post-dp-refine-max-rounds"),
         ("post_dp_refine_max_moves", "-post-dp-refine-max-moves"),
@@ -645,6 +649,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),
         ("enable_chain_merge", "-enable-chain-merge"),
+        ("enable_local_shared_compute", "-enable-local-shared-compute"),
         ("commit_guard_event_buckets", "-commit-guard-event-buckets"),
         ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
         ("declared_value_compute_node_boundary", "-declared-value-compute-node-boundary"),

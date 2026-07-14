@@ -6830,7 +6830,7 @@ namespace wolvrix::lib::transform
                                      const ActivityOpData &opData,
                                      std::vector<ActivityOpClass> &opClasses,
                                      const ValueCanonicalMap &canonicalValues,
-            ComputeRewriteBuild &out,
+                                     ComputeRewriteBuild &out,
                                      std::string &error)
         {
             out = ComputeRewriteBuild{};
@@ -7100,6 +7100,513 @@ namespace wolvrix::lib::transform
             for (const auto &node : out.computeNodes)
             {
                 out.stats.computeNodeOpsTotal += node.ops.size();
+            }
+            return true;
+        }
+
+        bool isCloneableLocalSharedComputeOpKind(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            using wolvrix::lib::grh::OperationKind;
+            switch (kind)
+            {
+            case OperationKind::kAdd:
+            case OperationKind::kSub:
+            case OperationKind::kEq:
+            case OperationKind::kNe:
+            case OperationKind::kCaseEq:
+            case OperationKind::kCaseNe:
+            case OperationKind::kWildcardEq:
+            case OperationKind::kWildcardNe:
+            case OperationKind::kLt:
+            case OperationKind::kLe:
+            case OperationKind::kGt:
+            case OperationKind::kGe:
+            case OperationKind::kAnd:
+            case OperationKind::kOr:
+            case OperationKind::kXor:
+            case OperationKind::kXnor:
+            case OperationKind::kNot:
+            case OperationKind::kLogicAnd:
+            case OperationKind::kLogicOr:
+            case OperationKind::kLogicNot:
+            case OperationKind::kReduceAnd:
+            case OperationKind::kReduceOr:
+            case OperationKind::kReduceXor:
+            case OperationKind::kReduceNor:
+            case OperationKind::kReduceNand:
+            case OperationKind::kReduceXnor:
+            case OperationKind::kShl:
+            case OperationKind::kLShr:
+            case OperationKind::kAShr:
+            case OperationKind::kMux:
+            case OperationKind::kAssign:
+            case OperationKind::kConcat:
+            case OperationKind::kReplicate:
+            case OperationKind::kSliceStatic:
+            case OperationKind::kSliceDynamic:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool hasLocalSharedCloneForbiddenAttr(const wolvrix::lib::grh::Operation &op)
+        {
+            for (const auto &attr : op.attrs())
+            {
+                if (std::string_view(attr.key).starts_with("regToMem.intent."))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        struct LocalSharedComputeCloneStats
+        {
+            std::size_t scanned = 0;
+            std::size_t eligible = 0;
+            std::size_t planned = 0;
+            std::size_t applied = 0;
+            std::size_t rejectedKind = 0;
+            std::size_t rejectedShape = 0;
+            std::size_t rejectedWidth = 0;
+            std::size_t rejectedFanout = 0;
+            std::size_t rejectedConsumerNodes = 0;
+            std::size_t rejectedIntent = 0;
+            std::size_t rejectedSideEffect = 0;
+            std::size_t rejectedDeclaredOrPort = 0;
+            std::size_t rejectedOperand = 0;
+            std::size_t rejectedCapacity = 0;
+            std::size_t rejectedBudget = 0;
+            std::size_t cloneLimit = 0;
+        };
+
+        struct LocalSharedComputeCloneRecord
+        {
+            wolvrix::lib::grh::OperationId sourceOp;
+            wolvrix::lib::grh::ValueId sourceValue;
+            wolvrix::lib::grh::OperationId cloneOp;
+            wolvrix::lib::grh::ValueId cloneValue;
+            std::vector<wolvrix::lib::grh::OperationId> originalUsers;
+            std::vector<wolvrix::lib::grh::OperationId> cloneUsers;
+        };
+
+        bool applyLocalSharedComputeClones(
+            wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const std::vector<ActivityOpClass> &opClasses,
+            const ComputeRewriteBuild &rewrite,
+            LocalSharedComputeCloneStats &stats,
+            std::vector<LocalSharedComputeCloneRecord> &records,
+            std::string &error)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+            using wolvrix::lib::grh::ValueUser;
+
+            stats = LocalSharedComputeCloneStats{};
+            records.clear();
+            const std::uint64_t baselineComputeOpCount =
+                static_cast<std::uint64_t>(std::count_if(
+                    opData.topoOps.begin(),
+                    opData.topoOps.end(),
+                    [&](OperationId opId)
+                    {
+                        return opId.index < opClasses.size() &&
+                               opClasses[opId.index] == ActivityOpClass::Compute;
+                    }));
+            const std::uint64_t clonePpm =
+                static_cast<std::uint64_t>(options.localSharedComputeMaxClonedOpPpm);
+            const bool ppmProductOverflows =
+                clonePpm != 0 &&
+                baselineComputeOpCount >
+                    std::numeric_limits<std::uint64_t>::max() / clonePpm;
+            const std::uint64_t ppmNumerator =
+                ppmProductOverflows
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : baselineComputeOpCount * clonePpm;
+            const std::uint64_t ppmLimit = ppmNumerator / 1000000ULL;
+            stats.cloneLimit = std::min<std::size_t>(
+                options.localSharedComputeMaxClones,
+                ppmLimit > std::numeric_limits<std::size_t>::max()
+                    ? std::numeric_limits<std::size_t>::max()
+                    : static_cast<std::size_t>(ppmLimit));
+            if (!options.enableLocalSharedCompute)
+            {
+                return true;
+            }
+
+            struct Plan
+            {
+                OperationId sourceOp;
+                ValueId sourceValue;
+                uint32_t cloneNode = kInvalidActivitySupernodeId;
+                std::vector<ValueUser> originalUses;
+                std::vector<ValueUser> cloneUses;
+                wolvrix::lib::grh::OperationKind kind;
+                std::vector<ValueId> operands;
+                std::vector<wolvrix::lib::grh::AttrKV> attrs;
+                std::optional<wolvrix::lib::grh::SrcLoc> opSrcLoc;
+                int32_t resultWidth = 0;
+                bool resultSigned = false;
+                wolvrix::lib::grh::ValueType resultType =
+                    wolvrix::lib::grh::ValueType::Logic;
+                std::optional<wolvrix::lib::grh::SrcLoc> resultSrcLoc;
+            };
+            std::vector<Plan> plans;
+            plans.reserve(stats.cloneLimit);
+            std::vector<std::size_t> plannedAddsByNode(rewrite.computeNodes.size(), 0);
+
+            for (const OperationId opId : opData.topoOps)
+            {
+                if (opId.index >= opClasses.size() ||
+                    opClasses[opId.index] != ActivityOpClass::Compute)
+                {
+                    continue;
+                }
+                ++stats.scanned;
+                if (!isCloneableLocalSharedComputeOpKind(graph.opKind(opId)))
+                {
+                    ++stats.rejectedKind;
+                    continue;
+                }
+                const auto op = graph.getOperation(opId);
+                if (opHasSideEffects(op))
+                {
+                    ++stats.rejectedSideEffect;
+                    continue;
+                }
+                if (hasLocalSharedCloneForbiddenAttr(op))
+                {
+                    ++stats.rejectedIntent;
+                    continue;
+                }
+                if (op.results().size() != 1)
+                {
+                    ++stats.rejectedShape;
+                    continue;
+                }
+                const ValueId value = op.results().front();
+                const auto valueInfo = graph.getValue(value);
+                if (valueInfo.type() != wolvrix::lib::grh::ValueType::Logic ||
+                    valueInfo.width() <= 0 ||
+                    static_cast<std::size_t>(valueInfo.width()) >
+                        options.localSharedComputeMaxWidth)
+                {
+                    ++stats.rejectedWidth;
+                    continue;
+                }
+                if (isDeclaredValue(graph, value) || valueInfo.isInput() ||
+                    valueInfo.isOutput() || valueInfo.isInout())
+                {
+                    ++stats.rejectedDeclaredOrPort;
+                    continue;
+                }
+
+                const std::vector<ValueUser> users(valueInfo.users().begin(),
+                                                   valueInfo.users().end());
+                std::map<uint32_t, std::vector<ValueUser>> usesByNode;
+                std::unordered_set<OperationId, OperationIdHash> uniqueUserOps;
+                bool invalidUser = false;
+                for (const auto &user : users)
+                {
+                    if (!user.operation.valid() || user.operation.index >= opClasses.size() ||
+                        opClasses[user.operation.index] != ActivityOpClass::Compute ||
+                        user.operation.index >= rewrite.computeNodeOfOp.size())
+                    {
+                        invalidUser = true;
+                        break;
+                    }
+                    const uint32_t nodeId = rewrite.computeNodeOfOp[user.operation.index];
+                    if (nodeId == kInvalidActivitySupernodeId ||
+                        nodeId >= rewrite.computeNodes.size())
+                    {
+                        invalidUser = true;
+                        break;
+                    }
+                    uniqueUserOps.insert(user.operation);
+                    usesByNode[nodeId].push_back(user);
+                }
+                if (uniqueUserOps.size() < 2 ||
+                    uniqueUserOps.size() > options.localSharedComputeMaxFanout)
+                {
+                    ++stats.rejectedFanout;
+                    continue;
+                }
+                if (invalidUser || usesByNode.size() != 2)
+                {
+                    ++stats.rejectedConsumerNodes;
+                    continue;
+                }
+                if (opId.index >= rewrite.computeNodeOfOp.size())
+                {
+                    ++stats.rejectedConsumerNodes;
+                    continue;
+                }
+                const uint32_t sourceNode = rewrite.computeNodeOfOp[opId.index];
+                if (sourceNode == kInvalidActivitySupernodeId ||
+                    sourceNode >= rewrite.computeNodes.size() ||
+                    usesByNode.find(sourceNode) == usesByNode.end())
+                {
+                    ++stats.rejectedConsumerNodes;
+                    continue;
+                }
+
+                auto nodeIt = usesByNode.begin();
+                const uint32_t firstNode = nodeIt->first;
+                ++nodeIt;
+                const uint32_t secondNode = nodeIt->first;
+                const uint32_t cloneNode = sourceNode == firstNode ? secondNode : firstNode;
+                const uint32_t originalNode = sourceNode;
+                const auto &sourceNodeInfo = rewrite.computeNodes[sourceNode];
+                const auto &cloneNodeInfo = rewrite.computeNodes[cloneNode];
+                const auto &originalNodeInfo = rewrite.computeNodes[originalNode];
+                if (sourceNodeInfo.indivisible || !sourceNodeInfo.intentGroup.empty() ||
+                    cloneNodeInfo.indivisible || !cloneNodeInfo.intentGroup.empty() ||
+                    originalNodeInfo.indivisible || !originalNodeInfo.intentGroup.empty())
+                {
+                    ++stats.rejectedIntent;
+                    continue;
+                }
+                const std::size_t maxNodeOps =
+                    options.maxOpInComputeNode == 0
+                        ? std::numeric_limits<std::size_t>::max()
+                        : options.maxOpInComputeNode;
+                if (plannedAddsByNode[cloneNode] >= maxNodeOps ||
+                    cloneNodeInfo.ops.size() > maxNodeOps - plannedAddsByNode[cloneNode] ||
+                    cloneNodeInfo.ops.size() + plannedAddsByNode[cloneNode] >= maxNodeOps)
+                {
+                    ++stats.rejectedCapacity;
+                    continue;
+                }
+
+                bool invalidOperand = false;
+                for (const ValueId operand : op.operands())
+                {
+                    const OperationId defOp = graph.valueDef(operand);
+                    bool local = false;
+                    if (defOp.valid() && defOp.index < opClasses.size() &&
+                        opClasses[defOp.index] == ActivityOpClass::Compute &&
+                        defOp.index < rewrite.computeNodeOfOp.size())
+                    {
+                        local = rewrite.computeNodeOfOp[defOp.index] == cloneNode;
+                    }
+                    if (!local && !vectorContainsValue(cloneNodeInfo.boundaryInputs, operand))
+                    {
+                        invalidOperand = true;
+                        break;
+                    }
+                }
+                if (invalidOperand)
+                {
+                    ++stats.rejectedOperand;
+                    continue;
+                }
+
+                ++stats.eligible;
+                if (plans.size() >= stats.cloneLimit)
+                {
+                    ++stats.rejectedBudget;
+                    continue;
+                }
+                Plan plan;
+                plan.sourceOp = opId;
+                plan.sourceValue = value;
+                plan.cloneNode = cloneNode;
+                plan.cloneUses = usesByNode.at(cloneNode);
+                for (const auto &[nodeId, nodeUses] : usesByNode)
+                {
+                    if (nodeId != cloneNode)
+                    {
+                        plan.originalUses.insert(plan.originalUses.end(),
+                                                 nodeUses.begin(),
+                                                 nodeUses.end());
+                    }
+                }
+                plan.kind = op.kind();
+                plan.operands.assign(op.operands().begin(), op.operands().end());
+                plan.attrs.assign(op.attrs().begin(), op.attrs().end());
+                plan.opSrcLoc = op.srcLoc();
+                plan.resultWidth = valueInfo.width();
+                plan.resultSigned = valueInfo.isSigned();
+                plan.resultType = valueInfo.type();
+                plan.resultSrcLoc = valueInfo.srcLoc();
+                plans.push_back(std::move(plan));
+                ++plannedAddsByNode[cloneNode];
+            }
+            stats.planned = plans.size();
+
+            records.reserve(plans.size());
+            for (const Plan &plan : plans)
+            {
+                OperationId cloneOp;
+                ValueId cloneValue;
+                try
+                {
+                    cloneOp = graph.createOperation(plan.kind, graph.makeInternalOpSym());
+                    if (plan.opSrcLoc)
+                    {
+                        graph.setOpSrcLoc(cloneOp, *plan.opSrcLoc);
+                    }
+                    for (const auto &attr : plan.attrs)
+                    {
+                        graph.setAttr(cloneOp, attr.key, attr.value);
+                    }
+                    for (const ValueId operand : plan.operands)
+                    {
+                        graph.addOperand(cloneOp, operand);
+                    }
+                    cloneValue = graph.createValue(graph.makeInternalValSym(),
+                                                   plan.resultWidth,
+                                                   plan.resultSigned,
+                                                   plan.resultType);
+                    if (plan.resultSrcLoc)
+                    {
+                        graph.setValueSrcLoc(cloneValue, *plan.resultSrcLoc);
+                    }
+                    graph.addResult(cloneOp, cloneValue);
+                    for (const auto &use : plan.cloneUses)
+                    {
+                        graph.replaceOperand(use.operation, use.operandIndex, cloneValue);
+                    }
+                }
+                catch (const std::exception &ex)
+                {
+                    error = "activity-schedule local shared compute clone apply failed source=" +
+                            describeOp(graph, plan.sourceOp) + ": " + ex.what();
+                    return false;
+                }
+
+                LocalSharedComputeCloneRecord record;
+                record.sourceOp = plan.sourceOp;
+                record.sourceValue = plan.sourceValue;
+                record.cloneOp = cloneOp;
+                record.cloneValue = cloneValue;
+                for (const auto &use : plan.originalUses)
+                {
+                    record.originalUsers.push_back(use.operation);
+                }
+                for (const auto &use : plan.cloneUses)
+                {
+                    record.cloneUsers.push_back(use.operation);
+                }
+                record.originalUsers = uniqueOpsPreservingOrder(record.originalUsers);
+                record.cloneUsers = uniqueOpsPreservingOrder(record.cloneUsers);
+                records.push_back(std::move(record));
+                ++stats.applied;
+            }
+            return true;
+        }
+
+        bool validateLocalSharedComputeCloneRewrite(
+            const ActivityScheduleOptions &options,
+            const ComputeRewriteBuild &baseline,
+            const ComputeRewriteBuild &candidate,
+            const std::vector<LocalSharedComputeCloneRecord> &records,
+            std::string &error)
+        {
+            if (baseline.commitNodes.size() != candidate.commitNodes.size())
+            {
+                error = "activity-schedule local shared compute clone changed commit node count";
+                return false;
+            }
+            for (std::size_t i = 0; i < baseline.commitNodes.size(); ++i)
+            {
+                if (baseline.commitNodes[i].ops != candidate.commitNodes[i].ops ||
+                    baseline.commitNodes[i].inputValues != candidate.commitNodes[i].inputValues)
+                {
+                    error = "activity-schedule local shared compute clone changed commit partition";
+                    return false;
+                }
+            }
+            if (candidate.stats.computeNodeCycleSplitIters >
+                baseline.stats.computeNodeCycleSplitIters)
+            {
+                error = "activity-schedule local shared compute clone increased compute-node cycle splitting";
+                return false;
+            }
+
+            std::unordered_map<wolvrix::lib::grh::OperationId,
+                               std::string,
+                               wolvrix::lib::grh::OperationIdHash>
+                baselineIntent;
+            for (const auto &node : baseline.computeNodes)
+            {
+                if (node.intentGroup.empty())
+                {
+                    continue;
+                }
+                for (const auto opId : node.ops)
+                {
+                    baselineIntent.emplace(opId, node.intentGroup);
+                }
+            }
+            std::unordered_map<wolvrix::lib::grh::OperationId,
+                               std::string,
+                               wolvrix::lib::grh::OperationIdHash>
+                candidateIntent;
+            for (const auto &node : candidate.computeNodes)
+            {
+                if (node.intentGroup.empty())
+                {
+                    continue;
+                }
+                for (const auto opId : node.ops)
+                {
+                    candidateIntent.emplace(opId, node.intentGroup);
+                }
+            }
+            if (baselineIntent != candidateIntent)
+            {
+                error = "activity-schedule local shared compute clone changed intent groups";
+                return false;
+            }
+
+            const auto ownerOf = [&](wolvrix::lib::grh::OperationId opId) -> uint32_t {
+                return opId.valid() && opId.index < candidate.computeNodeOfOp.size()
+                           ? candidate.computeNodeOfOp[opId.index]
+                           : kInvalidActivitySupernodeId;
+            };
+            for (const auto &record : records)
+            {
+                const uint32_t sourceNode = ownerOf(record.sourceOp);
+                const uint32_t cloneNode = ownerOf(record.cloneOp);
+                if (sourceNode == kInvalidActivitySupernodeId ||
+                    cloneNode == kInvalidActivitySupernodeId || sourceNode == cloneNode)
+                {
+                    error = "activity-schedule local shared compute clone did not split source owners";
+                    return false;
+                }
+                for (const auto userOp : record.originalUsers)
+                {
+                    if (ownerOf(userOp) != sourceNode)
+                    {
+                        error = "activity-schedule local shared compute original is not local to retained consumer";
+                        return false;
+                    }
+                }
+                for (const auto userOp : record.cloneUsers)
+                {
+                    if (ownerOf(userOp) != cloneNode)
+                    {
+                        error = "activity-schedule local shared compute clone is not local to rewritten consumer";
+                        return false;
+                    }
+                }
+            }
+            if (options.maxOpInComputeNode != 0)
+            {
+                for (const auto &node : candidate.computeNodes)
+                {
+                    if (!node.indivisible && node.ops.size() > options.maxOpInComputeNode)
+                    {
+                        error = "activity-schedule local shared compute clone exceeded compute node cap";
+                        return false;
+                    }
+                }
             }
             return true;
         }
@@ -8057,6 +8564,12 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.localSharedComputeMaxClonedOpPpm > 1000000)
+        {
+            error("activity-schedule local shared compute cloned-op ppm must be <= 1000000");
+            result.failed = true;
+            return result;
+        }
 
         const std::size_t maxOpsPerComputeSupernode = options_.maxOpInComputeSupernode;
         const std::size_t maxCommitOps = options_.maxOpInCommitSupernode;
@@ -8203,6 +8716,95 @@ namespace wolvrix::lib::transform
                 " commit_nodes=" + std::to_string(rewrite.commitNodes.size()) +
                 " cycle_split_iters=" + std::to_string(rewrite.stats.computeNodeCycleSplitIters) +
                 " elapsed_ms=" + std::to_string(computeNodeMs));
+
+        LocalSharedComputeCloneStats localSharedCloneStats;
+        std::vector<LocalSharedComputeCloneRecord> localSharedCloneRecords;
+        const auto localSharedCloneStart = std::chrono::steady_clock::now();
+        std::uint64_t localSharedCloneMs = 0;
+        if (options_.enableLocalSharedCompute)
+        {
+            logInfo("activity-schedule progress: local_shared_compute_clone start");
+            if (!applyLocalSharedComputeClones(*graph,
+                                               options_,
+                                               opData,
+                                               opClasses,
+                                               rewrite,
+                                               localSharedCloneStats,
+                                               localSharedCloneRecords,
+                                               buildError))
+            {
+                error(*graph, buildError);
+                result.failed = true;
+                return result;
+            }
+            if (!localSharedCloneRecords.empty())
+            {
+                graphChanged = true;
+                graph->freeze();
+                ActivityOpData clonedOpData = buildActivityOpData(*graph, buildError);
+                if (!buildError.empty())
+                {
+                    error(*graph, buildError);
+                    result.failed = true;
+                    return result;
+                }
+                std::vector<ActivityOpClass> clonedOpClasses =
+                    buildOpClasses(*graph, clonedOpData.maxOpIndex);
+                ComputeRewriteBuild clonedRewrite;
+                if (!buildComputeNodeRewrite(*graph,
+                                             options_,
+                                             clonedOpData,
+                                             clonedOpClasses,
+                                             canonicalValues,
+                                             clonedRewrite,
+                                             buildError))
+                {
+                    error(*graph, buildError);
+                    result.failed = true;
+                    return result;
+                }
+                clonedRewrite.stats.sourceClonesInComputeNodes =
+                    precloneStats.sourceClonesInComputeNodes;
+                clonedRewrite.stats.localSharedComputeClonesInComputeNodes =
+                    localSharedCloneStats.applied;
+                if (!validateLocalSharedComputeCloneRewrite(options_,
+                                                            rewrite,
+                                                            clonedRewrite,
+                                                            localSharedCloneRecords,
+                                                            buildError))
+                {
+                    error(*graph, buildError);
+                    result.failed = true;
+                    return result;
+                }
+                opData = std::move(clonedOpData);
+                opClasses = std::move(clonedOpClasses);
+                rewrite = std::move(clonedRewrite);
+            }
+            localSharedCloneMs = elapsedMs(localSharedCloneStart);
+            logInfo("activity-schedule progress: local_shared_compute_clone done" +
+                    std::string(" scanned=") + std::to_string(localSharedCloneStats.scanned) +
+                    " eligible=" + std::to_string(localSharedCloneStats.eligible) +
+                    " planned=" + std::to_string(localSharedCloneStats.planned) +
+                    " applied=" + std::to_string(localSharedCloneStats.applied) +
+                    " clone_limit=" + std::to_string(localSharedCloneStats.cloneLimit) +
+                    " rejected_kind=" + std::to_string(localSharedCloneStats.rejectedKind) +
+                    " rejected_shape=" + std::to_string(localSharedCloneStats.rejectedShape) +
+                    " rejected_width=" + std::to_string(localSharedCloneStats.rejectedWidth) +
+                    " rejected_fanout=" + std::to_string(localSharedCloneStats.rejectedFanout) +
+                    " rejected_consumer_nodes=" +
+                    std::to_string(localSharedCloneStats.rejectedConsumerNodes) +
+                    " rejected_intent=" + std::to_string(localSharedCloneStats.rejectedIntent) +
+                    " rejected_side_effect=" +
+                    std::to_string(localSharedCloneStats.rejectedSideEffect) +
+                    " rejected_declared_or_port=" +
+                    std::to_string(localSharedCloneStats.rejectedDeclaredOrPort) +
+                    " rejected_operand=" + std::to_string(localSharedCloneStats.rejectedOperand) +
+                    " rejected_capacity=" +
+                    std::to_string(localSharedCloneStats.rejectedCapacity) +
+                    " rejected_budget=" + std::to_string(localSharedCloneStats.rejectedBudget) +
+                    " elapsed_ms=" + std::to_string(localSharedCloneMs));
+        }
         if (!exportComputeDagJson(*graph, options_, rewrite, buildError))
         {
             error(*graph, buildError);
@@ -8287,6 +8889,8 @@ namespace wolvrix::lib::transform
 
         logInfo("activity-schedule timing(ms): build_op_data=" + std::to_string(buildOpDataMs) +
                 " compute_node_build=" + std::to_string(computeNodeMs) +
+                " local_shared_compute_clone=" +
+                std::to_string(localSharedCloneMs) +
                 " freeze_after_compute_node=" + std::to_string(freezeMs) +
                 " final_materialize=" + std::to_string(materializeMs) +
                 " export_session=" + std::to_string(exportMs) +

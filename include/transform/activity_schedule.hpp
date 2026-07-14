@@ -34,8 +34,10 @@ namespace wolvrix::lib::transform
         std::size_t maxOpInComputeSupernode = 128;
         std::size_t maxOpInComputeNode = 8192;
         std::size_t maxOpInCommitSupernode = 4096;
-        std::size_t localSharedComputeMaxFanout = 4;
-        std::size_t localSharedComputeMaxWidth = 256;
+        std::size_t localSharedComputeMaxFanout = 2;
+        std::size_t localSharedComputeMaxWidth = 64;
+        std::size_t localSharedComputeMaxClones = 4096;
+        std::size_t localSharedComputeMaxClonedOpPpm = 5000;
         std::size_t splitOversizeComputeNodeMaxOps = 0;
         std::size_t postDpRefineMaxRounds = 1;
         std::size_t postDpRefineMaxMoves = 4096;

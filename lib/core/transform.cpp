@@ -1024,6 +1024,48 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-local-shared-compute-max-clones")
+                {
+                    if (!parseSizeArg("-local-shared-compute-max-clones",
+                                      options.localSharedComputeMaxClones))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-local-shared-compute-max-clones="))
+                {
+                    try
+                    {
+                        options.localSharedComputeMaxClones = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-local-shared-compute-max-clones=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -local-shared-compute-max-clones value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-local-shared-compute-max-cloned-op-ppm")
+                {
+                    if (!parseSizeArg("-local-shared-compute-max-cloned-op-ppm",
+                                      options.localSharedComputeMaxClonedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-local-shared-compute-max-cloned-op-ppm="))
+                {
+                    try
+                    {
+                        options.localSharedComputeMaxClonedOpPpm = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-local-shared-compute-max-cloned-op-ppm=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -local-shared-compute-max-cloned-op-ppm value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-enable-coarsen")
                 {
                     if (!parseBoolArg("-enable-coarsen", options.enableCoarsen))

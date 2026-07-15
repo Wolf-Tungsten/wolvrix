@@ -14,6 +14,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 - 按 `ActivityOpClass::{Source,Sink,Compute,Declaration}` 分类 op
 - 将 `ActivityOpClass::Source` 到 compute op 的 use 前置 clone
 - 构造 compute node / commit node 中间模型
+- 可选地只读探测 third common-owner 双边本地化机会并输出细分统计
 - 可选地把严格受限的双消费者纯组合 op true-clone 到远端 consumer node，并完整重建中间模型
 - 在 compute-node cluster DAG 上执行 plain coarsen 和连续分段
 - 展开最终 `computeSupernode` / `commitSupernode` 调度模型
@@ -47,6 +48,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-local-shared-compute-max-width` | `64` | local shared compute clone 的 result value 宽度上限 |
 | `-local-shared-compute-max-clones` | `4096` | local shared compute graph clone 硬上限 |
 | `-local-shared-compute-max-cloned-op-ppm` | `5000` | clone 数占 baseline compute op 的 PPM 上限 |
+| `-local-shared-compute-common-owner-policy` | `off` | third common-owner opportunity policy：`off/probe`；`probe` 只输出 info log |
 | `-split-oversize-compute-node-max-ops` | `0` | 超大 compute node split 的 chunk 上限；为 0 时使用 `max-op-in-compute-supernode` |
 | `-disable-coarsen` | `false` | 关闭 plain coarsen |
 | `-disable-chain-merge` | `false` | 关闭 plain `out1` / `in1` chain merge；`siblings` 仍可执行 |
@@ -100,6 +102,11 @@ canonical value map。
 所有候选在 graph mutation 前先复制 kind、operands、attrs、source location 和 result
 metadata；apply 后完整 refreeze/rebuild，并校验 commit partition、intent groups、owner
 locality、cycle splitting 和 compute-node cap。`false` 路径不执行发现或二次 rebuild。
+
+`-local-shared-compute-common-owner-policy=probe` 在 baseline compute rewrite 上只读扫描
+source owner 位于第三个 common-expression node 的候选，细分 user/node owner、singleton、
+intent/indivisible、双边 operand locality、双边 capacity 和 projected removed pairs。它不创建
+op/value、不替换 operand、不重新 freeze，也不增加 session key 或 summary stats 字段。
 
 plain coarsen 每轮按以下顺序尝试合并：
 

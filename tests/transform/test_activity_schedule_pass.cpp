@@ -2651,7 +2651,9 @@ int main()
                                    std::size_t maxFanout,
                                    std::size_t maxWidth,
                                    std::size_t maxNodeOps,
-                                   bool combineRefinements = false)
+                                   bool combineRefinements = false,
+                                   std::string commonOwnerPolicy = "off",
+                                   std::string *capturedLog = nullptr)
         {
             ActivityScheduleOptions options;
             options.path = name;
@@ -2667,6 +2669,7 @@ int main()
             options.localSharedComputeMaxClonedOpPpm = clonedOpPpm;
             options.localSharedComputeMaxFanout = maxFanout;
             options.localSharedComputeMaxWidth = maxWidth;
+            options.localSharedComputeCommonOwnerPolicy = std::move(commonOwnerPolicy);
             if (combineRefinements)
             {
                 options.kahnLevelPackPolicy = "strict";
@@ -2678,6 +2681,18 @@ int main()
             }
             PassManager manager;
             manager.options().session = &session;
+            if (capturedLog != nullptr)
+            {
+                manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+                manager.options().logSink =
+                    [capturedLog](wolvrix::lib::LogLevel,
+                                  std::string_view,
+                                  std::string_view message)
+                    {
+                        capturedLog->append(message);
+                        capturedLog->push_back('\n');
+                    };
+            }
             manager.addPass(std::make_unique<ActivitySchedulePass>(options));
             PassDiagnostics diags;
             const PassManagerResult runResult = manager.run(design, diags);
@@ -2705,6 +2720,52 @@ int main()
                             loadSchedule(explicitOffSession, std::string(kName))))
         {
             return fail("Expected default and explicit-off local shared compute schedules to match");
+        }
+        wolvrix::lib::grh::Design probeDesign;
+        buildFixture(probeDesign, std::string(kName), true, false, false, 2, 8);
+        SessionStore probeSession;
+        std::string probeLog;
+        if (!runFixture(probeDesign, probeSession, std::string(kName), true,
+                        0, 1000000, 2, 64, 4, false, "probe", &probeLog))
+        {
+            return fail("Expected no-mutation common-owner probe schedule to succeed");
+        }
+        const auto *defaultGraph = defaultDesign.findGraph(std::string(kName));
+        const auto *explicitOffGraph = explicitOffDesign.findGraph(std::string(kName));
+        const auto *probeGraph = probeDesign.findGraph(std::string(kName));
+        const auto graphConnectivity = [](const wolvrix::lib::grh::Graph &graph)
+        {
+            std::ostringstream out;
+            for (const auto opId : graph.operations())
+            {
+                out << opId.index << ':' << static_cast<std::size_t>(graph.opKind(opId)) << '(';
+                for (const auto operand : graph.opOperands(opId))
+                {
+                    out << operand.index << ',';
+                }
+                out << ")->(";
+                for (const auto result : graph.opResults(opId))
+                {
+                    out << result.index << ',';
+                }
+                out << ");";
+            }
+            return out.str();
+        };
+        if (defaultGraph == nullptr || explicitOffGraph == nullptr || probeGraph == nullptr ||
+            defaultGraph->operations().size() != explicitOffGraph->operations().size() ||
+            defaultGraph->operations().size() != probeGraph->operations().size() ||
+            defaultGraph->values().size() != explicitOffGraph->values().size() ||
+            defaultGraph->values().size() != probeGraph->values().size() ||
+            graphConnectivity(*defaultGraph) != graphConnectivity(*explicitOffGraph) ||
+            graphConnectivity(*defaultGraph) != graphConnectivity(*probeGraph) ||
+            defaultSession.size() != explicitOffSession.size() ||
+            defaultSession.size() != probeSession.size() ||
+            !schedulesEqual(loadSchedule(defaultSession, std::string(kName)),
+                            loadSchedule(probeSession, std::string(kName))) ||
+            probeLog.find("common-owner probe:") == std::string::npos)
+        {
+            return fail("Expected default/off/probe graph and schedule identity");
         }
 
         wolvrix::lib::grh::Design enabledDesign;
@@ -2853,6 +2914,187 @@ int main()
     }
 
     {
+        currentCase = "local shared compute common-owner probe";
+        struct ProbeFixtureOptions
+        {
+            bool declaredLeft = true;
+            bool upstreamComputeOperand = false;
+            bool exposeSourceOperand = true;
+            std::size_t maxNodeOps = 2;
+        };
+        const auto buildProbeFixture = [](wolvrix::lib::grh::Design &design,
+                                          const std::string &name,
+                                          const ProbeFixtureOptions &fixture)
+        {
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            const auto sourceInput = makeValue(graph, "source_input", 8);
+            const auto consumerBoundary = fixture.exposeSourceOperand
+                                              ? sourceInput
+                                              : makeValue(graph, "consumer_boundary", 8);
+            graph.bindInputPort("source_input", sourceInput);
+            if (!fixture.exposeSourceOperand)
+            {
+                graph.bindInputPort("consumer_boundary", consumerBoundary);
+            }
+
+            auto sourceOperand = sourceInput;
+            if (fixture.upstreamComputeOperand)
+            {
+                const auto upstreamValue = makeValue(graph, "upstream_value", 8);
+                const auto upstream = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("upstream"));
+                graph.addOperand(upstream, sourceInput);
+                graph.addResult(upstream, upstreamValue);
+                sourceOperand = upstreamValue;
+            }
+            const auto sharedValue = makeValue(graph, "shared_value", 8);
+            const auto shared = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kNot,
+                graph.internSymbol("shared"));
+            graph.addOperand(shared, sourceOperand);
+            graph.addResult(shared, sharedValue);
+
+            const auto leftSymbol = graph.internSymbol("left_value");
+            if (fixture.declaredLeft)
+            {
+                graph.addDeclaredSymbol(leftSymbol);
+            }
+            const auto leftValue = graph.createValue(leftSymbol, 8, false);
+            const auto left = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kXor,
+                graph.internSymbol("left"));
+            graph.addOperand(left, sharedValue);
+            graph.addOperand(left, consumerBoundary);
+            graph.addResult(left, leftValue);
+
+            const auto rightValue = makeValue(graph, "right_value", 8);
+            const auto right = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kXor,
+                graph.internSymbol("right"));
+            graph.addOperand(right, sharedValue);
+            graph.addOperand(right, consumerBoundary);
+            graph.addResult(right, rightValue);
+            graph.bindOutputPort("right", rightValue);
+
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto leafValue = makeValue(graph, "left_leaf_value_" + suffix, 8);
+                const auto leaf = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("left_leaf_" + suffix));
+                graph.addOperand(leaf, leftValue);
+                graph.addResult(leaf, leafValue);
+                graph.bindOutputPort("left_out_" + suffix, leafValue);
+            }
+        };
+        const auto runProbeFixture = [&](const std::string &name,
+                                         const ProbeFixtureOptions &fixture,
+                                         std::string &log) -> bool
+        {
+            wolvrix::lib::grh::Design design;
+            buildProbeFixture(design, name, fixture);
+            const auto *beforeGraph = design.findGraph(name);
+            const std::size_t beforeOps = beforeGraph == nullptr ? 0 : beforeGraph->operations().size();
+            const std::size_t beforeValues = beforeGraph == nullptr ? 0 : beforeGraph->values().size();
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 1;
+            options.maxOpInComputeNode = fixture.maxNodeOps;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.enableLocalSharedCompute = true;
+            options.localSharedComputeMaxClones = 0;
+            options.localSharedComputeMaxClonedOpPpm = 1000000;
+            options.localSharedComputeMaxFanout = 2;
+            options.localSharedComputeMaxWidth = 64;
+            options.localSharedComputeCommonOwnerPolicy = "probe";
+            options.declaredValueComputeNodeBoundary = fixture.declaredLeft;
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+            manager.options().logSink =
+                [&log](wolvrix::lib::LogLevel,
+                       std::string_view,
+                       std::string_view message)
+                {
+                    log.append(message);
+                    log.push_back('\n');
+                };
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            const auto *afterGraph = design.findGraph(name);
+            return runResult.success && !runResult.changed && !diags.hasError() &&
+                   afterGraph != nullptr && afterGraph->operations().size() == beforeOps &&
+                   afterGraph->values().size() == beforeValues &&
+                   loadSchedule(session, name).summaryStats != nullptr;
+        };
+
+        std::string positiveLog;
+        if (!runProbeFixture("common_owner_probe_positive", {}, positiveLog) ||
+            parseStatField(positiveLog, "source_owner_third_common") != 1 ||
+            parseStatField(positiveLog, "third_common_singleton") != 1 ||
+            parseStatField(positiveLog, "result_boundary_both") != 1 ||
+            parseStatField(positiveLog, "operand_locality_both") != 1 ||
+            parseStatField(positiveLog, "capacity_both_pass") != 1 ||
+            parseStatField(positiveLog, "exact_eligible") != 1 ||
+            parseStatField(positiveLog, "projected_removed_pairs") != 2)
+        {
+            return fail("Expected singleton common-owner probe opportunity: " + positiveLog);
+        }
+
+        ProbeFixtureOptions multiOp;
+        multiOp.upstreamComputeOperand = true;
+        multiOp.maxNodeOps = 3;
+        std::string multiOpLog;
+        if (!runProbeFixture("common_owner_probe_multiop", multiOp, multiOpLog) ||
+            parseStatField(multiOpLog, "third_common_multiop") != 1 ||
+            parseStatField(multiOpLog, "exact_eligible") != 0)
+        {
+            return fail("Expected multi-op common-owner probe rejection: " + multiOpLog);
+        }
+
+        ProbeFixtureOptions nonCommonConsumerOwner;
+        nonCommonConsumerOwner.declaredLeft = false;
+        nonCommonConsumerOwner.maxNodeOps = 4;
+        std::string nonCommonConsumerOwnerLog;
+        if (!runProbeFixture("common_owner_probe_noncommon_consumer_owner",
+                             nonCommonConsumerOwner,
+                             nonCommonConsumerOwnerLog) ||
+            parseStatField(nonCommonConsumerOwnerLog, "source_owner_is_consumer") == 0 ||
+            parseStatField(nonCommonConsumerOwnerLog, "source_owner_third_common") != 0 ||
+            parseStatField(nonCommonConsumerOwnerLog, "exact_eligible") != 0)
+        {
+            return fail("Expected non-common source-owner-is-consumer probe rejection: " +
+                        nonCommonConsumerOwnerLog);
+        }
+
+        ProbeFixtureOptions missingLocality;
+        missingLocality.exposeSourceOperand = false;
+        std::string missingLocalityLog;
+        if (!runProbeFixture("common_owner_probe_locality", missingLocality, missingLocalityLog) ||
+            parseStatField(missingLocalityLog, "operand_locality_neither") != 1 ||
+            parseStatField(missingLocalityLog, "exact_eligible") != 0)
+        {
+            return fail("Expected common-owner operand-locality rejection: " + missingLocalityLog);
+        }
+
+        ProbeFixtureOptions noCapacity;
+        noCapacity.maxNodeOps = 1;
+        std::string noCapacityLog;
+        if (!runProbeFixture("common_owner_probe_capacity", noCapacity, noCapacityLog) ||
+            parseStatField(noCapacityLog, "capacity_both_fail") != 1 ||
+            parseStatField(noCapacityLog, "exact_eligible") != 0)
+        {
+            return fail("Expected common-owner capacity rejection: " + noCapacityLog);
+        }
+    }
+
+    {
         currentCase = "local shared compute aggregate cap";
         const auto buildFixture = [](wolvrix::lib::grh::Design &design)
         {
@@ -2957,6 +3199,19 @@ int main()
         if (result.success || !diags.hasError())
         {
             return fail("Expected invalid local shared compute cloned-op ppm to fail");
+        }
+
+        options.localSharedComputeMaxClonedOpPpm = 5000;
+        options.localSharedComputeCommonOwnerPolicy = "strict";
+        SessionStore policySession;
+        PassManager policyManager;
+        policyManager.options().session = &policySession;
+        policyManager.addPass(std::make_unique<ActivitySchedulePass>(options));
+        PassDiagnostics policyDiags;
+        const PassManagerResult policyResult = policyManager.run(design, policyDiags);
+        if (policyResult.success || !policyDiags.hasError())
+        {
+            return fail("Expected invalid local shared compute common-owner policy to fail");
         }
     }
 

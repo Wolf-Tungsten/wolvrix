@@ -628,6 +628,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("final_topo_policy", "-final-topo-policy"),
         ("post_dp_refine_policy", "-post-dp-refine-policy"),
         ("kahn_level_pack_policy", "-kahn-level-pack-policy"),
+        ("local_shared_compute_common_owner_policy", "-local-shared-compute-common-owner-policy"),
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),

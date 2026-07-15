@@ -52,6 +52,7 @@ namespace wolvrix::lib::transform
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
+        std::string localSharedComputeCommonOwnerPolicy = "off";
         std::string postDpRefinePolicy = "off";
         std::string kahnLevelPackPolicy = "off";
         std::string finalTopoPolicy = "level-id";

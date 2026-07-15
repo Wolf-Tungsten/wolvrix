@@ -7182,6 +7182,405 @@ namespace wolvrix::lib::transform
             std::size_t cloneLimit = 0;
         };
 
+        struct LocalSharedComputeCommonOwnerProbeStats
+        {
+            using CountMap = ActivityScheduleSummaryStats::KindCountMap;
+
+            std::size_t scanned = 0;
+            std::size_t preUserGuardEligible = 0;
+            std::size_t rejectedKind = 0;
+            std::size_t rejectedShape = 0;
+            std::size_t rejectedWidth = 0;
+            std::size_t rejectedIntent = 0;
+            std::size_t rejectedSideEffect = 0;
+            std::size_t rejectedDeclaredOrPort = 0;
+            std::size_t invalidOrNonComputeUser = 0;
+            std::size_t distinctUserOpsNotTwo = 0;
+            std::size_t consumerNodeCountZero = 0;
+            std::size_t consumerNodeCountOne = 0;
+            std::size_t consumerNodeCountTwo = 0;
+            std::size_t consumerNodeCountMoreThanTwo = 0;
+            std::size_t sourceOwnerInvalid = 0;
+            std::size_t sourceOwnerIsConsumer = 0;
+            std::size_t sourceOwnerThirdCommon = 0;
+            std::size_t sourceOwnerThirdNonCommon = 0;
+            std::size_t thirdCommonSingleton = 0;
+            std::size_t thirdCommonMultiOp = 0;
+            std::size_t thirdCommonSourceIntentOrIndivisible = 0;
+            std::size_t thirdCommonLeftIntentOrIndivisible = 0;
+            std::size_t thirdCommonRightIntentOrIndivisible = 0;
+            std::size_t thirdCommonAnyIntentOrIndivisible = 0;
+            std::size_t resultBoundaryBoth = 0;
+            std::size_t resultBoundaryLeftOnly = 0;
+            std::size_t resultBoundaryRightOnly = 0;
+            std::size_t resultBoundaryNeither = 0;
+            std::size_t operandLocalityBoth = 0;
+            std::size_t operandLocalityLeftOnly = 0;
+            std::size_t operandLocalityRightOnly = 0;
+            std::size_t operandLocalityNeither = 0;
+            std::size_t capacityBothPass = 0;
+            std::size_t capacityLeftFail = 0;
+            std::size_t capacityRightFail = 0;
+            std::size_t capacityBothFail = 0;
+            std::size_t exactEligible = 0;
+            std::size_t projectedRemovedPairs = 0;
+            CountMap thirdCommonByKind;
+            CountMap thirdCommonByResultWidth;
+            CountMap thirdCommonByOperandBits;
+            CountMap thirdCommonByLeftHeadroom;
+            CountMap thirdCommonByRightHeadroom;
+            CountMap eligibleByKind;
+            CountMap eligibleByResultWidth;
+            CountMap eligibleByOperandBits;
+        };
+
+        std::string localSharedProbeSizeBucket(std::size_t value)
+        {
+            if (value == 0)
+            {
+                return "0";
+            }
+            if (value == 1)
+            {
+                return "1";
+            }
+            if (value <= 4)
+            {
+                return "2-4";
+            }
+            if (value <= 16)
+            {
+                return "5-16";
+            }
+            if (value <= 64)
+            {
+                return "17-64";
+            }
+            if (value <= 256)
+            {
+                return "65-256";
+            }
+            if (value <= 1024)
+            {
+                return "257-1024";
+            }
+            return ">1024";
+        }
+
+        bool localSharedProbeOperandAvailable(
+            const wolvrix::lib::grh::Graph &graph,
+            const std::vector<ActivityOpClass> &opClasses,
+            const ComputeRewriteBuild &rewrite,
+            uint32_t nodeId,
+            wolvrix::lib::grh::ValueId operand)
+        {
+            if (nodeId >= rewrite.computeNodes.size())
+            {
+                return false;
+            }
+            const auto defOp = graph.valueDef(operand);
+            if (defOp.valid() && defOp.index < opClasses.size() &&
+                opClasses[defOp.index] == ActivityOpClass::Compute &&
+                defOp.index < rewrite.computeNodeOfOp.size() &&
+                rewrite.computeNodeOfOp[defOp.index] == nodeId)
+            {
+                return true;
+            }
+            return vectorContainsValue(rewrite.computeNodes[nodeId].boundaryInputs, operand);
+        }
+
+        LocalSharedComputeCommonOwnerProbeStats probeLocalSharedComputeCommonOwners(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const std::vector<ActivityOpClass> &opClasses,
+            const ComputeRewriteBuild &rewrite)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+            using wolvrix::lib::grh::ValueUser;
+
+            LocalSharedComputeCommonOwnerProbeStats stats;
+            const auto nodeRestricted = [](const ComputeNode &node)
+            {
+                return node.indivisible || !node.intentGroup.empty();
+            };
+            const auto classifySides = [](bool left,
+                                          bool right,
+                                          std::size_t &both,
+                                          std::size_t &leftOnly,
+                                          std::size_t &rightOnly,
+                                          std::size_t &neither)
+            {
+                if (left && right)
+                {
+                    ++both;
+                }
+                else if (left)
+                {
+                    ++leftOnly;
+                }
+                else if (right)
+                {
+                    ++rightOnly;
+                }
+                else
+                {
+                    ++neither;
+                }
+            };
+
+            for (const OperationId opId : opData.topoOps)
+            {
+                if (opId.index >= opClasses.size() ||
+                    opClasses[opId.index] != ActivityOpClass::Compute)
+                {
+                    continue;
+                }
+                ++stats.scanned;
+                if (!isCloneableLocalSharedComputeOpKind(graph.opKind(opId)))
+                {
+                    ++stats.rejectedKind;
+                    continue;
+                }
+                const auto op = graph.getOperation(opId);
+                if (opHasSideEffects(op))
+                {
+                    ++stats.rejectedSideEffect;
+                    continue;
+                }
+                if (hasLocalSharedCloneForbiddenAttr(op))
+                {
+                    ++stats.rejectedIntent;
+                    continue;
+                }
+                if (op.results().size() != 1)
+                {
+                    ++stats.rejectedShape;
+                    continue;
+                }
+                const ValueId value = op.results().front();
+                const auto valueInfo = graph.getValue(value);
+                if (valueInfo.type() != wolvrix::lib::grh::ValueType::Logic ||
+                    valueInfo.width() <= 0 ||
+                    static_cast<std::size_t>(valueInfo.width()) >
+                        options.localSharedComputeMaxWidth)
+                {
+                    ++stats.rejectedWidth;
+                    continue;
+                }
+                if (isDeclaredValue(graph, value) || valueInfo.isInput() ||
+                    valueInfo.isOutput() || valueInfo.isInout())
+                {
+                    ++stats.rejectedDeclaredOrPort;
+                    continue;
+                }
+                ++stats.preUserGuardEligible;
+
+                std::map<uint32_t, std::vector<ValueUser>> usesByNode;
+                std::unordered_set<OperationId, OperationIdHash> uniqueUserOps;
+                bool invalidUser = false;
+                for (const auto &user : valueInfo.users())
+                {
+                    if (!user.operation.valid() || user.operation.index >= opClasses.size() ||
+                        opClasses[user.operation.index] != ActivityOpClass::Compute ||
+                        user.operation.index >= rewrite.computeNodeOfOp.size())
+                    {
+                        invalidUser = true;
+                        continue;
+                    }
+                    const uint32_t nodeId = rewrite.computeNodeOfOp[user.operation.index];
+                    if (nodeId == kInvalidActivitySupernodeId ||
+                        nodeId >= rewrite.computeNodes.size())
+                    {
+                        invalidUser = true;
+                        continue;
+                    }
+                    uniqueUserOps.insert(user.operation);
+                    usesByNode[nodeId].push_back(user);
+                }
+                if (invalidUser)
+                {
+                    ++stats.invalidOrNonComputeUser;
+                    continue;
+                }
+                switch (usesByNode.size())
+                {
+                case 0:
+                    ++stats.consumerNodeCountZero;
+                    break;
+                case 1:
+                    ++stats.consumerNodeCountOne;
+                    break;
+                case 2:
+                    ++stats.consumerNodeCountTwo;
+                    break;
+                default:
+                    ++stats.consumerNodeCountMoreThanTwo;
+                    break;
+                }
+                if (uniqueUserOps.size() != 2)
+                {
+                    ++stats.distinctUserOpsNotTwo;
+                    continue;
+                }
+                if (usesByNode.size() != 2)
+                {
+                    continue;
+                }
+                if (opId.index >= rewrite.computeNodeOfOp.size())
+                {
+                    ++stats.sourceOwnerInvalid;
+                    continue;
+                }
+                const uint32_t sourceNode = rewrite.computeNodeOfOp[opId.index];
+                if (sourceNode == kInvalidActivitySupernodeId ||
+                    sourceNode >= rewrite.computeNodes.size())
+                {
+                    ++stats.sourceOwnerInvalid;
+                    continue;
+                }
+                if (usesByNode.contains(sourceNode))
+                {
+                    ++stats.sourceOwnerIsConsumer;
+                    continue;
+                }
+                const auto &sourceNodeInfo = rewrite.computeNodes[sourceNode];
+                if (!sourceNodeInfo.commonExpr)
+                {
+                    ++stats.sourceOwnerThirdNonCommon;
+                    continue;
+                }
+                ++stats.sourceOwnerThirdCommon;
+
+                auto nodeIt = usesByNode.begin();
+                const uint32_t leftNode = nodeIt->first;
+                ++nodeIt;
+                const uint32_t rightNode = nodeIt->first;
+                const auto &leftNodeInfo = rewrite.computeNodes[leftNode];
+                const auto &rightNodeInfo = rewrite.computeNodes[rightNode];
+                const bool singleton = sourceNodeInfo.ops.size() == 1 &&
+                                       sourceNodeInfo.ops.front() == opId;
+                if (singleton)
+                {
+                    ++stats.thirdCommonSingleton;
+                }
+                else
+                {
+                    ++stats.thirdCommonMultiOp;
+                }
+
+                const bool sourceRestricted = nodeRestricted(sourceNodeInfo);
+                const bool leftRestricted = nodeRestricted(leftNodeInfo);
+                const bool rightRestricted = nodeRestricted(rightNodeInfo);
+                stats.thirdCommonSourceIntentOrIndivisible += sourceRestricted ? 1 : 0;
+                stats.thirdCommonLeftIntentOrIndivisible += leftRestricted ? 1 : 0;
+                stats.thirdCommonRightIntentOrIndivisible += rightRestricted ? 1 : 0;
+                stats.thirdCommonAnyIntentOrIndivisible +=
+                    sourceRestricted || leftRestricted || rightRestricted ? 1 : 0;
+
+                const bool resultBoundaryLeft =
+                    vectorContainsValue(leftNodeInfo.boundaryInputs, value);
+                const bool resultBoundaryRight =
+                    vectorContainsValue(rightNodeInfo.boundaryInputs, value);
+                classifySides(resultBoundaryLeft,
+                              resultBoundaryRight,
+                              stats.resultBoundaryBoth,
+                              stats.resultBoundaryLeftOnly,
+                              stats.resultBoundaryRightOnly,
+                              stats.resultBoundaryNeither);
+
+                bool operandsLocalLeft = true;
+                bool operandsLocalRight = true;
+                std::size_t operandBits = 0;
+                for (const ValueId operand : op.operands())
+                {
+                    operandsLocalLeft &= localSharedProbeOperandAvailable(
+                        graph, opClasses, rewrite, leftNode, operand);
+                    operandsLocalRight &= localSharedProbeOperandAvailable(
+                        graph, opClasses, rewrite, rightNode, operand);
+                    const int32_t width = graph.getValue(operand).width();
+                    if (width > 0)
+                    {
+                        const std::size_t add = static_cast<std::size_t>(width);
+                        operandBits = add > std::numeric_limits<std::size_t>::max() - operandBits
+                                          ? std::numeric_limits<std::size_t>::max()
+                                          : operandBits + add;
+                    }
+                }
+                classifySides(operandsLocalLeft,
+                              operandsLocalRight,
+                              stats.operandLocalityBoth,
+                              stats.operandLocalityLeftOnly,
+                              stats.operandLocalityRightOnly,
+                              stats.operandLocalityNeither);
+
+                const std::size_t maxNodeOps =
+                    options.maxOpInComputeNode == 0
+                        ? std::numeric_limits<std::size_t>::max()
+                        : options.maxOpInComputeNode;
+                const bool capacityLeft = leftNodeInfo.ops.size() < maxNodeOps;
+                const bool capacityRight = rightNodeInfo.ops.size() < maxNodeOps;
+                if (capacityLeft && capacityRight)
+                {
+                    ++stats.capacityBothPass;
+                }
+                else if (!capacityLeft && capacityRight)
+                {
+                    ++stats.capacityLeftFail;
+                }
+                else if (capacityLeft && !capacityRight)
+                {
+                    ++stats.capacityRightFail;
+                }
+                else
+                {
+                    ++stats.capacityBothFail;
+                }
+
+                const std::string kind(wolvrix::lib::grh::toString(op.kind()));
+                const std::string resultWidth = widthBucket(
+                    static_cast<std::size_t>(valueInfo.width()));
+                const std::string operandBitsBucket = localSharedProbeSizeBucket(operandBits);
+                const auto headroomBucket = [&](std::size_t nodeOps)
+                {
+                    return options.maxOpInComputeNode == 0
+                               ? std::string("unlimited")
+                               : localSharedProbeSizeBucket(
+                                     nodeOps < options.maxOpInComputeNode
+                                         ? options.maxOpInComputeNode - nodeOps
+                                         : 0);
+                };
+                ++stats.thirdCommonByKind[kind];
+                ++stats.thirdCommonByResultWidth[resultWidth];
+                ++stats.thirdCommonByOperandBits[operandBitsBucket];
+                ++stats.thirdCommonByLeftHeadroom[headroomBucket(leftNodeInfo.ops.size())];
+                ++stats.thirdCommonByRightHeadroom[headroomBucket(rightNodeInfo.ops.size())];
+
+                const bool exactEligible = singleton &&
+                                           options.localSharedComputeMaxFanout >= 2 &&
+                                           !sourceRestricted &&
+                                           !leftRestricted &&
+                                           !rightRestricted &&
+                                           resultBoundaryLeft &&
+                                           resultBoundaryRight &&
+                                           operandsLocalLeft &&
+                                           operandsLocalRight &&
+                                           capacityLeft &&
+                                           capacityRight;
+                if (exactEligible)
+                {
+                    ++stats.exactEligible;
+                    stats.projectedRemovedPairs += 2;
+                    ++stats.eligibleByKind[kind];
+                    ++stats.eligibleByResultWidth[resultWidth];
+                    ++stats.eligibleByOperandBits[operandBitsBucket];
+                }
+            }
+            return stats;
+        }
+
         struct LocalSharedComputeCloneRecord
         {
             wolvrix::lib::grh::OperationId sourceOp;
@@ -8550,6 +8949,13 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.localSharedComputeCommonOwnerPolicy != "off" &&
+            options_.localSharedComputeCommonOwnerPolicy != "probe")
+        {
+            error("activity-schedule local_shared_compute_common_owner_policy must be off or probe");
+            result.failed = true;
+            return result;
+        }
         if (options_.postDpRefineMaxMovedOpPpm > 1000000 ||
             options_.postDpRefineMaxRegressionPpm > 1000000)
         {
@@ -8716,6 +9122,95 @@ namespace wolvrix::lib::transform
                 " commit_nodes=" + std::to_string(rewrite.commitNodes.size()) +
                 " cycle_split_iters=" + std::to_string(rewrite.stats.computeNodeCycleSplitIters) +
                 " elapsed_ms=" + std::to_string(computeNodeMs));
+
+        if (options_.localSharedComputeCommonOwnerPolicy == "probe")
+        {
+            const auto commonOwnerProbeStart = std::chrono::steady_clock::now();
+            logInfo("activity-schedule progress: local_shared_compute_common_owner_probe start");
+            const LocalSharedComputeCommonOwnerProbeStats probe =
+                probeLocalSharedComputeCommonOwners(*graph,
+                                                    options_,
+                                                    opData,
+                                                    opClasses,
+                                                    rewrite);
+            logInfo(
+                "activity-schedule local shared compute common-owner probe: scanned=" +
+                std::to_string(probe.scanned) +
+                " pre_user_guard_eligible=" + std::to_string(probe.preUserGuardEligible) +
+                " rejected_kind=" + std::to_string(probe.rejectedKind) +
+                " rejected_shape=" + std::to_string(probe.rejectedShape) +
+                " rejected_width=" + std::to_string(probe.rejectedWidth) +
+                " rejected_intent=" + std::to_string(probe.rejectedIntent) +
+                " rejected_side_effect=" + std::to_string(probe.rejectedSideEffect) +
+                " rejected_declared_or_port=" +
+                std::to_string(probe.rejectedDeclaredOrPort) +
+                " invalid_or_noncompute_user=" +
+                std::to_string(probe.invalidOrNonComputeUser) +
+                " distinct_user_ops_not_two=" +
+                std::to_string(probe.distinctUserOpsNotTwo) +
+                " consumer_nodes_0=" + std::to_string(probe.consumerNodeCountZero) +
+                " consumer_nodes_1=" + std::to_string(probe.consumerNodeCountOne) +
+                " consumer_nodes_2=" + std::to_string(probe.consumerNodeCountTwo) +
+                " consumer_nodes_gt2=" +
+                std::to_string(probe.consumerNodeCountMoreThanTwo) +
+                " source_owner_invalid=" + std::to_string(probe.sourceOwnerInvalid) +
+                " source_owner_is_consumer=" +
+                std::to_string(probe.sourceOwnerIsConsumer) +
+                " source_owner_third_common=" +
+                std::to_string(probe.sourceOwnerThirdCommon) +
+                " source_owner_third_noncommon=" +
+                std::to_string(probe.sourceOwnerThirdNonCommon) +
+                " third_common_singleton=" + std::to_string(probe.thirdCommonSingleton) +
+                " third_common_multiop=" + std::to_string(probe.thirdCommonMultiOp) +
+                " third_common_source_intent_or_indivisible=" +
+                std::to_string(probe.thirdCommonSourceIntentOrIndivisible) +
+                " third_common_left_intent_or_indivisible=" +
+                std::to_string(probe.thirdCommonLeftIntentOrIndivisible) +
+                " third_common_right_intent_or_indivisible=" +
+                std::to_string(probe.thirdCommonRightIntentOrIndivisible) +
+                " third_common_any_intent_or_indivisible=" +
+                std::to_string(probe.thirdCommonAnyIntentOrIndivisible) +
+                " result_boundary_both=" + std::to_string(probe.resultBoundaryBoth) +
+                " result_boundary_left_only=" +
+                std::to_string(probe.resultBoundaryLeftOnly) +
+                " result_boundary_right_only=" +
+                std::to_string(probe.resultBoundaryRightOnly) +
+                " result_boundary_neither=" + std::to_string(probe.resultBoundaryNeither) +
+                " operand_locality_both=" + std::to_string(probe.operandLocalityBoth) +
+                " operand_locality_left_only=" +
+                std::to_string(probe.operandLocalityLeftOnly) +
+                " operand_locality_right_only=" +
+                std::to_string(probe.operandLocalityRightOnly) +
+                " operand_locality_neither=" +
+                std::to_string(probe.operandLocalityNeither) +
+                " capacity_both_pass=" + std::to_string(probe.capacityBothPass) +
+                " capacity_left_fail=" + std::to_string(probe.capacityLeftFail) +
+                " capacity_right_fail=" + std::to_string(probe.capacityRightFail) +
+                " capacity_both_fail=" + std::to_string(probe.capacityBothFail) +
+                " exact_eligible=" + std::to_string(probe.exactEligible) +
+                " projected_removed_pairs=" +
+                std::to_string(probe.projectedRemovedPairs));
+            logInfo(
+                "activity-schedule local shared compute common-owner probe detail: "
+                "third_common_by_kind=" +
+                formatTopCounts(probe.thirdCommonByKind, 32) +
+                " third_common_by_result_width=" +
+                formatTopCounts(probe.thirdCommonByResultWidth, 16) +
+                " third_common_by_operand_bits=" +
+                formatTopCounts(probe.thirdCommonByOperandBits, 16) +
+                " third_common_by_left_headroom=" +
+                formatTopCounts(probe.thirdCommonByLeftHeadroom, 16) +
+                " third_common_by_right_headroom=" +
+                formatTopCounts(probe.thirdCommonByRightHeadroom, 16) +
+                " eligible_by_kind=" + formatTopCounts(probe.eligibleByKind, 32) +
+                " eligible_by_result_width=" +
+                formatTopCounts(probe.eligibleByResultWidth, 16) +
+                " eligible_by_operand_bits=" +
+                formatTopCounts(probe.eligibleByOperandBits, 16));
+            logInfo(
+                "activity-schedule progress: local_shared_compute_common_owner_probe done elapsed_ms=" +
+                std::to_string(elapsedMs(commonOwnerProbeStart)));
+        }
 
         LocalSharedComputeCloneStats localSharedCloneStats;
         std::vector<LocalSharedComputeCloneRecord> localSharedCloneRecords;

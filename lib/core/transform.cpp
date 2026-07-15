@@ -1066,6 +1066,19 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-local-shared-compute-common-owner-policy")
+                {
+                    if (!parseStringArg("-local-shared-compute-common-owner-policy",
+                                        options.localSharedComputeCommonOwnerPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-local-shared-compute-common-owner-policy="))
+                {
+                    options.localSharedComputeCommonOwnerPolicy = std::string(
+                        arg.substr(std::string_view("-local-shared-compute-common-owner-policy=").size()));
+                }
                 else if (arg == "-enable-coarsen")
                 {
                     if (!parseBoolArg("-enable-coarsen", options.enableCoarsen))

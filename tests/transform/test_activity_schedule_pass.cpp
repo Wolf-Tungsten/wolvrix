@@ -4126,6 +4126,139 @@ int main()
     }
 
     {
+        currentCase = "plain DP segment penalty options";
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph("dp_segment_penalty_options");
+            design.markAsTop("dp_segment_penalty_options");
+            const auto inA = makeValue(graph, "in_a", 8);
+            const auto inB1 = makeValue(graph, "in_b1", 8);
+            const auto inB2 = makeValue(graph, "in_b2", 8);
+            graph.bindInputPort("in_a", inA);
+            graph.bindInputPort("in_b1", inB1);
+            graph.bindInputPort("in_b2", inB2);
+            const auto makeNot = [&](const std::string &name,
+                                     wolvrix::lib::grh::ValueId operand)
+            {
+                const auto value = makeValue(graph, name + "_value", 8);
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                      graph.internSymbol(name));
+                graph.addOperand(op, operand);
+                graph.addResult(op, value);
+                return value;
+            };
+            const auto aValue = makeNot("a", inA);
+            const auto b1Value = makeNot("b1", inB1);
+            const auto b2Value = makeNot("b2", inB2);
+            const auto cValue = makeNot("c", b1Value);
+            const auto dValue = makeNot("d", b2Value);
+            const auto eValue = makeNot("e", b2Value);
+            graph.bindOutputPort("out_a", aValue);
+            graph.bindOutputPort("out_c", cValue);
+            graph.bindOutputPort("out_d", dValue);
+            graph.bindOutputPort("out_e", eValue);
+        };
+        const auto runFixture = [&](std::optional<std::size_t> penaltyPpm,
+                                    SessionStore &session,
+                                    bool expectSuccess)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design);
+            ActivityScheduleOptions options;
+            options.path = "dp_segment_penalty_options";
+            options.maxOpInComputeSupernode = 3;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            if (penaltyPpm)
+            {
+                options.dpSegmentPenaltyPpm = *penaltyPpm;
+            }
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return expectSuccess
+                       ? result.success && !diags.hasError()
+                       : !result.success && diags.hasError();
+        };
+
+        std::string parseError;
+        const std::vector<std::string_view> separatedArgs{
+            "-path", "dp_segment_penalty_options",
+            "-dp-segment-penalty-ppm", "500000"};
+        const std::vector<std::string_view> equalsArgs{
+            "-path=dp_segment_penalty_options",
+            "-dp-segment-penalty-ppm=2000000"};
+        if (makePass("activity-schedule", separatedArgs, parseError) == nullptr ||
+            makePass("activity-schedule", equalsArgs, parseError) == nullptr)
+        {
+            return fail("Expected both DP segment penalty CLI forms to parse");
+        }
+        const std::vector<std::string_view> malformedSeparatedArgs{
+            "-path", "dp_segment_penalty_options",
+            "-dp-segment-penalty-ppm", "500000x"};
+        const std::vector<std::string_view> malformedEqualsArgs{
+            "-path=dp_segment_penalty_options",
+            "-dp-segment-penalty-ppm=500000x"};
+        const std::vector<std::string_view> overflowArgs{
+            "-path=dp_segment_penalty_options",
+            "-dp-segment-penalty-ppm=999999999999999999999999999999999999"};
+        if (makePass("activity-schedule", malformedSeparatedArgs, parseError) != nullptr ||
+            makePass("activity-schedule", malformedEqualsArgs, parseError) != nullptr ||
+            makePass("activity-schedule", overflowArgs, parseError) != nullptr)
+        {
+            return fail("Expected malformed or overflowing DP segment penalty CLI values to fail");
+        }
+
+        SessionStore defaultSession;
+        SessionStore explicitDefaultSession;
+        if (!runFixture(std::nullopt, defaultSession, true) ||
+            !runFixture(1000000, explicitDefaultSession, true))
+        {
+            return fail("Expected default DP segment penalty schedules to succeed");
+        }
+        if (!schedulesEqual(loadSchedule(defaultSession, "dp_segment_penalty_options"),
+                            loadSchedule(explicitDefaultSession,
+                                         "dp_segment_penalty_options")))
+        {
+            return fail("Expected default and explicit DP segment penalty schedules to match");
+        }
+        SessionStore halfSession;
+        if (!runFixture(500000, halfSession, true))
+        {
+            return fail("Expected half DP segment penalty schedule to succeed");
+        }
+        const auto defaultSchedule =
+            loadSchedule(defaultSession, "dp_segment_penalty_options");
+        const auto halfSchedule =
+            loadSchedule(halfSession, "dp_segment_penalty_options");
+        if (defaultSchedule.summaryStats == nullptr || halfSchedule.summaryStats == nullptr ||
+            parseJsonDoubleField(*defaultSchedule.summaryStats,
+                                 "compute_supernodes") != 2.0 ||
+            parseJsonDoubleField(*defaultSchedule.summaryStats,
+                                 "compute_compute_value_pairs") != 2.0 ||
+            parseJsonDoubleField(*halfSchedule.summaryStats,
+                                 "compute_supernodes") != 3.0 ||
+            parseJsonDoubleField(*halfSchedule.summaryStats,
+                                 "compute_compute_value_pairs") != 1.0)
+        {
+            return fail("Expected half DP penalty to trade one supernode for one compute BAE");
+        }
+        SessionStore zeroSession;
+        if (!runFixture(0, zeroSession, true))
+        {
+            return fail("Expected zero DP segment penalty to be accepted");
+        }
+        SessionStore invalidSession;
+        if (!runFixture(1000000001, invalidSession, false))
+        {
+            return fail("Expected excessive DP segment penalty to fail");
+        }
+    }
+
+    {
         currentCase = "Kahn-level option validation";
         const auto runInvalid = [](const std::string &policy,
                                    std::size_t movedOpPpm,

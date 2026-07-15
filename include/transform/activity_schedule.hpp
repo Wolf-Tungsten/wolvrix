@@ -41,6 +41,7 @@ namespace wolvrix::lib::transform
         std::size_t localSharedComputeCommonOwnerMaxClones = 4096;
         std::size_t localSharedComputeCommonOwnerMaxClonedOpPpm = 5000;
         std::size_t splitOversizeComputeNodeMaxOps = 0;
+        std::size_t dpSegmentPenaltyPpm = 1000000;
         std::size_t postDpRefineMaxRounds = 1;
         std::size_t postDpRefineMaxMoves = 4096;
         std::size_t postDpRefineMaxMovedOpPpm = 10000;

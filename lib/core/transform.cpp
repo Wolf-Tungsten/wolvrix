@@ -1283,6 +1283,50 @@ namespace wolvrix::lib::transform
                     options.finalTopoPolicy =
                         std::string(arg.substr(std::string_view("-final-topo-policy=").size()));
                 }
+                else if (arg == "-dp-segment-penalty-ppm")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-dp-segment-penalty-ppm expects a value";
+                        return nullptr;
+                    }
+                    const std::string text(args[++i]);
+                    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+                    {
+                        error = "invalid -dp-segment-penalty-ppm value";
+                        return nullptr;
+                    }
+                    try
+                    {
+                        options.dpSegmentPenaltyPpm =
+                            static_cast<std::size_t>(std::stoull(text));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -dp-segment-penalty-ppm value";
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-dp-segment-penalty-ppm="))
+                {
+                    const std::string text(
+                        arg.substr(std::string_view("-dp-segment-penalty-ppm=").size()));
+                    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+                    {
+                        error = "invalid -dp-segment-penalty-ppm value";
+                        return nullptr;
+                    }
+                    try
+                    {
+                        options.dpSegmentPenaltyPpm =
+                            static_cast<std::size_t>(std::stoull(text));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -dp-segment-penalty-ppm value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-kahn-level-pack-policy")
                 {
                     if (!parseStringArg("-kahn-level-pack-policy", options.kahnLevelPackPolicy))

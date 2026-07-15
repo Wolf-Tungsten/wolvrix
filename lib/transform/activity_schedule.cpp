@@ -4723,7 +4723,7 @@ namespace wolvrix::lib::transform
                 }
                 if (dp[end] == kInf)
                 {
-                    dp[end] = dp[end - 1] + 1;
+                    dp[end] = dp[end - 1] + segmentPenalty;
                     prev[end] = end - 1;
                 }
             }
@@ -5474,7 +5474,8 @@ namespace wolvrix::lib::transform
                                               nodeOpSizes,
                                               maxOps,
                                               nullptr,
-                                              1.0);
+                                              static_cast<double>(options.dpSegmentPenaltyPpm) /
+                                                  1000000.0);
             perf.kahnLevelPackCandidateBuilt = true;
             perf.kahnLevelPackCandidateSegments = candidateSegments.size();
             if (candidateSegments.size() > segments.size())
@@ -9272,7 +9273,8 @@ namespace wolvrix::lib::transform
                                               nodeOpSizes,
                                               maxOpsPerComputeSupernode,
                                               nullptr,
-                                              1.0);
+                                              static_cast<double>(options.dpSegmentPenaltyPpm) /
+                                                  1000000.0);
             if (perf)
             {
                 perf->dpSegmentMs = elapsedMs(dpSegmentStart);
@@ -9806,6 +9808,12 @@ namespace wolvrix::lib::transform
         if (options_.localSharedComputeCommonOwnerMaxClonedOpPpm > 1000000)
         {
             error("activity-schedule common-owner cloned-op ppm must be <= 1000000");
+            result.failed = true;
+            return result;
+        }
+        if (options_.dpSegmentPenaltyPpm > 1000000000)
+        {
+            error("activity-schedule dp_segment_penalty_ppm must be <= 1000000000");
             result.failed = true;
             return result;
         }
@@ -10343,6 +10351,8 @@ namespace wolvrix::lib::transform
                 std::to_string(materializePerf.splitOversizeComputeNodes) +
                 " split_supernodes=" +
                 std::to_string(materializePerf.splitOversizeComputeNodeSupernodes));
+        logInfo("activity-schedule DP segment penalty: ppm=" +
+                std::to_string(options_.dpSegmentPenaltyPpm));
         logInfo("activity-schedule final topo policy: " + options_.finalTopoPolicy);
         if (options_.kahnLevelPackPolicy != "off")
         {

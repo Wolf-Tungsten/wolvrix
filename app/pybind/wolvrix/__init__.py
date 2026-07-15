@@ -659,6 +659,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("local_shared_compute_common_owner_max_clones", "-local-shared-compute-common-owner-max-clones"),
         ("local_shared_compute_common_owner_max_cloned_op_ppm", "-local-shared-compute-common-owner-max-cloned-op-ppm"),
         ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
+        ("dp_segment_penalty_ppm", "-dp-segment-penalty-ppm"),
         ("post_dp_refine_max_rounds", "-post-dp-refine-max-rounds"),
         ("post_dp_refine_max_moves", "-post-dp-refine-max-moves"),
         ("post_dp_refine_max_moved_op_ppm", "-post-dp-refine-max-moved-op-ppm"),

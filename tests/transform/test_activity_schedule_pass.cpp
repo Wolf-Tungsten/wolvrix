@@ -2920,6 +2920,7 @@ int main()
             bool declaredLeft = true;
             bool upstreamComputeOperand = false;
             bool exposeSourceOperand = true;
+            bool addTiedCommitSinks = false;
             std::size_t maxNodeOps = 2;
         };
         const auto buildProbeFixture = [](wolvrix::lib::grh::Design &design,
@@ -2955,6 +2956,15 @@ int main()
                 graph.internSymbol("shared"));
             graph.addOperand(shared, sourceOperand);
             graph.addResult(shared, sharedValue);
+            graph.setAttr(shared, "cloneTestMeta", static_cast<int64_t>(17));
+            graph.setOpSrcLoc(shared,
+                              wolvrix::lib::grh::SrcLoc{.file = "common_owner_probe.sv",
+                                                       .line = 17,
+                                                       .column = 3});
+            graph.setValueSrcLoc(sharedValue,
+                                 wolvrix::lib::grh::SrcLoc{.file = "common_owner_probe.sv",
+                                                          .line = 17,
+                                                          .column = 9});
 
             const auto leftSymbol = graph.internSymbol("left_value");
             if (fixture.declaredLeft)
@@ -2977,6 +2987,36 @@ int main()
             graph.addOperand(right, consumerBoundary);
             graph.addResult(right, rightValue);
             graph.bindOutputPort("right", rightValue);
+
+            if (fixture.addTiedCommitSinks)
+            {
+                const auto enable = makeValue(graph, "commit_enable", 1);
+                const auto mask = makeValue(graph, "commit_mask", 8);
+                const auto clock = makeValue(graph, "commit_clock", 1);
+                graph.bindInputPort("commit_enable", enable);
+                graph.bindInputPort("commit_mask", mask);
+                graph.bindInputPort("commit_clock", clock);
+                const auto reg = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegister,
+                    graph.internSymbol("commit_state"));
+                graph.setAttr(reg, "width", static_cast<int64_t>(8));
+                graph.setAttr(reg, "isSigned", false);
+                const auto addWrite = [&](const std::string &name,
+                                          wolvrix::lib::grh::ValueId data)
+                {
+                    const auto write = graph.createOperation(
+                        wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                        graph.internSymbol(name));
+                    graph.addOperand(write, enable);
+                    graph.addOperand(write, data);
+                    graph.addOperand(write, mask);
+                    graph.addOperand(write, clock);
+                    graph.setAttr(write, "regSymbol", std::string("commit_state"));
+                    graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+                };
+                addWrite("commit_write_left", leftValue);
+                addWrite("commit_write_right", rightValue);
+            }
 
             for (std::size_t i = 0; i < 2; ++i)
             {
@@ -3091,6 +3131,364 @@ int main()
             parseStatField(noCapacityLog, "exact_eligible") != 0)
         {
             return fail("Expected common-owner capacity rejection: " + noCapacityLog);
+        }
+
+        const auto runStrictFixture = [&](wolvrix::lib::grh::Design &design,
+                                          SessionStore &session,
+                                          const std::string &name,
+                                          std::size_t maxClones,
+                                          std::size_t clonedOpPpm,
+                                          std::string &log,
+                                          bool combineRefinements = false)
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 1;
+            options.maxOpInComputeNode = 2;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.enableLocalSharedCompute = true;
+            options.localSharedComputeMaxClones = 0;
+            options.localSharedComputeMaxClonedOpPpm = 1000000;
+            options.localSharedComputeMaxFanout = 2;
+            options.localSharedComputeMaxWidth = 64;
+            options.localSharedComputeCommonOwnerPolicy = "strict";
+            options.localSharedComputeCommonOwnerMaxClones = maxClones;
+            options.localSharedComputeCommonOwnerMaxClonedOpPpm = clonedOpPpm;
+            options.declaredValueComputeNodeBoundary = true;
+            if (combineRefinements)
+            {
+                options.kahnLevelPackPolicy = "strict";
+                options.kahnLevelPackMaxMoves = 16;
+                options.kahnLevelPackMaxMovedOpPpm = 1000000;
+                options.postDpRefinePolicy = "strict";
+                options.postDpRefineMaxMoves = 16;
+                options.postDpRefineMaxMovedOpPpm = 1000000;
+            }
+            PassManager manager;
+            manager.options().session = &session;
+            manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+            manager.options().logSink =
+                [&log](wolvrix::lib::LogLevel,
+                       std::string_view,
+                       std::string_view message)
+                {
+                    log.append(message);
+                    log.push_back('\n');
+                };
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return std::pair{runResult, diags.hasError()};
+        };
+
+        wolvrix::lib::grh::Design strictDesign;
+        buildProbeFixture(strictDesign, "common_owner_strict_positive", {});
+        const auto *strictBefore = strictDesign.findGraph("common_owner_strict_positive");
+        const std::size_t strictOpsBefore = strictBefore->operations().size();
+        const std::size_t strictValuesBefore = strictBefore->values().size();
+        SessionStore strictSession;
+        std::string strictLog;
+        const auto [strictResult, strictError] =
+            runStrictFixture(strictDesign,
+                             strictSession,
+                             "common_owner_strict_positive",
+                             16,
+                             1000000,
+                             strictLog);
+        const auto *strictGraph = strictDesign.findGraph("common_owner_strict_positive");
+        const auto strictSchedule = loadSchedule(strictSession, "common_owner_strict_positive");
+        if (!strictResult.success || !strictResult.changed || strictError || strictGraph == nullptr ||
+            strictGraph->operations().size() != strictOpsBefore + 1 ||
+            strictGraph->values().size() != strictValuesBefore + 1 ||
+            parseStatField(strictLog, "raw_eligible") != 1 ||
+            parseStatField(strictLog, "selected") != 1 ||
+            parseStatField(strictLog, "applied") != 1 ||
+            parseStatField(strictLog, "actual_localized_pairs") != 2 ||
+            parseStatField(strictLog, "graph_ops_delta") != 1 ||
+            parseStatField(strictLog, "graph_values_delta") != 1 ||
+            strictSchedule.summaryStats == nullptr ||
+            parseJsonDoubleField(*strictSchedule.summaryStats,
+                                 "local_shared_compute_clones_in_compute_nodes") != 1.0)
+        {
+            return fail("Expected strict common-owner clone to apply exactly once: " + strictLog);
+        }
+        if (const int rc = validateCommonScheduleShape(*strictGraph, strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateScheduleTopoOrder(strictSchedule); rc != 0)
+        {
+            return rc;
+        }
+        std::vector<wolvrix::lib::grh::OperationId> sharedOps;
+        for (const auto opId : strictGraph->operations())
+        {
+            const auto op = strictGraph->getOperation(opId);
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kNot &&
+                op.attr("cloneTestMeta").has_value())
+            {
+                sharedOps.push_back(opId);
+            }
+        }
+        if (sharedOps.size() != 2 || strictSchedule.opToSupernode == nullptr ||
+            strictSchedule.valueFanout == nullptr)
+        {
+            return fail("Expected metadata-preserving original/clone pair");
+        }
+        for (const auto opId : sharedOps)
+        {
+            const auto op = strictGraph->getOperation(opId);
+            const auto results = op.results();
+            if (!op.srcLoc() || op.srcLoc()->line != 17 || results.size() != 1)
+            {
+                return fail("Expected common-owner clone operation metadata to match");
+            }
+            const auto value = strictGraph->getValue(results.front());
+            if (!value.srcLoc() || value.srcLoc()->column != 9 || value.users().size() != 1 ||
+                !(*strictSchedule.valueFanout)[results.front().index - 1].empty())
+            {
+                return fail("Expected exact local user and no cross-supernode fanout");
+            }
+            const uint32_t opOwner = (*strictSchedule.opToSupernode)[opId.index - 1];
+            const uint32_t userOwner =
+                (*strictSchedule.opToSupernode)[value.users().front().operation.index - 1];
+            if (opOwner != userOwner)
+            {
+                return fail("Expected original/clone result to remain local to its user");
+            }
+        }
+
+        {
+            const std::string name = "common_owner_strict_fixed_commit_seed";
+            ProbeFixtureOptions tiedFixture;
+            tiedFixture.addTiedCommitSinks = true;
+            wolvrix::lib::grh::Design baselineDesign;
+            buildProbeFixture(baselineDesign, name, tiedFixture);
+            ActivityScheduleOptions baselineOptions;
+            baselineOptions.path = name;
+            baselineOptions.maxOpInComputeSupernode = 1;
+            baselineOptions.maxOpInComputeNode = 2;
+            baselineOptions.enableCoarsen = false;
+            baselineOptions.enableChainMerge = false;
+            baselineOptions.enableLocalSharedCompute = true;
+            baselineOptions.localSharedComputeMaxClones = 0;
+            baselineOptions.localSharedComputeMaxClonedOpPpm = 1000000;
+            baselineOptions.localSharedComputeMaxFanout = 2;
+            baselineOptions.localSharedComputeMaxWidth = 64;
+            baselineOptions.localSharedComputeCommonOwnerPolicy = "probe";
+            baselineOptions.declaredValueComputeNodeBoundary = true;
+            SessionStore baselineSession;
+            PassManager baselineManager;
+            baselineManager.options().session = &baselineSession;
+            baselineManager.addPass(std::make_unique<ActivitySchedulePass>(baselineOptions));
+            PassDiagnostics baselineDiags;
+            const PassManagerResult baselineResult =
+                baselineManager.run(baselineDesign, baselineDiags);
+
+            wolvrix::lib::grh::Design seededDesign;
+            buildProbeFixture(seededDesign, name, tiedFixture);
+            SessionStore seededSession;
+            std::string seededLog;
+            const auto [seededResult, seededError] =
+                runStrictFixture(seededDesign,
+                                 seededSession,
+                                 name,
+                                 16,
+                                 1000000,
+                                 seededLog);
+            const auto commitOpPartition = [](const ScheduleView &schedule)
+            {
+                std::vector<std::vector<uint32_t>> partition;
+                if (schedule.supernodeToOps == nullptr || schedule.supernodeKinds == nullptr)
+                {
+                    return partition;
+                }
+                for (std::size_t node = 0; node < schedule.supernodeToOps->size(); ++node)
+                {
+                    if ((*schedule.supernodeKinds)[node] !=
+                        ActivityScheduleSupernodeKind::Commit)
+                    {
+                        continue;
+                    }
+                    std::vector<uint32_t> ops;
+                    for (const auto opId : (*schedule.supernodeToOps)[node])
+                    {
+                        ops.push_back(opId.index);
+                    }
+                    partition.push_back(std::move(ops));
+                }
+                return partition;
+            };
+            const auto baselineSchedule = loadSchedule(baselineSession, name);
+            const auto seededSchedule = loadSchedule(seededSession, name);
+            const auto baselineCommit = commitOpPartition(baselineSchedule);
+            const auto seededCommit = commitOpPartition(seededSchedule);
+            if (!baselineResult.success || baselineDiags.hasError() ||
+                !seededResult.success || seededError || baselineCommit != seededCommit ||
+                baselineCommit.size() != 1 || baselineCommit.front().size() != 2 ||
+                baselineSchedule.summaryStats == nullptr || seededSchedule.summaryStats == nullptr ||
+                seededLog.find("fixed_commit_partition_seed_adopted=true") ==
+                    std::string::npos)
+            {
+                return fail("Expected strict clone rebuild to preserve exact tied commit partition: " +
+                            seededLog);
+            }
+            for (const std::string field : {"commit_sink_ops",
+                                            "commit_input_root_values",
+                                            "commit_event_key_runs",
+                                            "commit_event_keys"})
+            {
+                if (parseJsonDoubleField(*baselineSchedule.summaryStats, field) !=
+                    parseJsonDoubleField(*seededSchedule.summaryStats, field))
+                {
+                    return fail("Expected fixed commit seed to preserve commit summary field: " +
+                                std::string(field));
+                }
+            }
+        }
+
+        wolvrix::lib::grh::Design repeatStrictDesign;
+        buildProbeFixture(repeatStrictDesign, "common_owner_strict_positive", {});
+        SessionStore repeatStrictSession;
+        std::string repeatStrictLog;
+        const auto [repeatStrictResult, repeatStrictError] =
+            runStrictFixture(repeatStrictDesign,
+                             repeatStrictSession,
+                             "common_owner_strict_positive",
+                             16,
+                             1000000,
+                             repeatStrictLog);
+        if (!repeatStrictResult.success || repeatStrictError ||
+            !schedulesEqual(strictSchedule,
+                            loadSchedule(repeatStrictSession,
+                                         "common_owner_strict_positive")))
+        {
+            return fail("Expected strict common-owner cloning to be deterministic");
+        }
+
+        for (const auto &[name, maxClones, ppm] :
+             std::vector<std::tuple<std::string, std::size_t, std::size_t>>{
+                 {"common_owner_strict_zero_count", 0, 1000000},
+                 {"common_owner_strict_zero_ppm", 16, 0},
+             })
+        {
+            wolvrix::lib::grh::Design budgetDesign;
+            buildProbeFixture(budgetDesign, name, {});
+            const std::size_t beforeOps = budgetDesign.findGraph(name)->operations().size();
+            SessionStore budgetSession;
+            std::string budgetLog;
+            const auto [budgetResult, budgetError] =
+                runStrictFixture(budgetDesign,
+                                 budgetSession,
+                                 name,
+                                 maxClones,
+                                 ppm,
+                                 budgetLog);
+            if (!budgetResult.success || budgetResult.changed || budgetError ||
+                budgetDesign.findGraph(name)->operations().size() != beforeOps ||
+                parseStatField(budgetLog, "raw_eligible") != 1 ||
+                parseStatField(budgetLog, "selected") != 0 ||
+                parseStatField(budgetLog, "rejected_budget") != 1)
+            {
+                return fail("Expected strict common-owner zero budget identity: " + budgetLog);
+            }
+        }
+
+        {
+            const std::string name = "common_owner_strict_shared_target_cap";
+            wolvrix::lib::grh::Design capDesign;
+            auto &graph = capDesign.createGraph(name);
+            capDesign.markAsTop(name);
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            const auto makeShared = [&](const std::string &opName,
+                                        wolvrix::lib::grh::ValueId operand)
+            {
+                const auto value = makeValue(graph, opName + "_value", 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol(opName));
+                graph.addOperand(op, operand);
+                graph.addResult(op, value);
+                return value;
+            };
+            const auto sharedA = makeShared("shared_a", a);
+            const auto sharedB = makeShared("shared_b", b);
+            const auto makeTarget = [&](const std::string &opName, bool declared)
+            {
+                const auto symbol = graph.internSymbol(opName + "_value");
+                if (declared)
+                {
+                    graph.addDeclaredSymbol(symbol);
+                }
+                const auto value = graph.createValue(symbol, 32, false);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kConcat,
+                    graph.internSymbol(opName));
+                graph.addOperand(op, sharedA);
+                graph.addOperand(op, a);
+                graph.addOperand(op, sharedB);
+                graph.addOperand(op, b);
+                graph.addResult(op, value);
+                return value;
+            };
+            const auto leftValue = makeTarget("left", true);
+            const auto rightValue = makeTarget("right", false);
+            graph.bindOutputPort("right", rightValue);
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto value = makeValue(graph, "leaf_value_" + suffix, 32);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("leaf_" + suffix));
+                graph.addOperand(op, leftValue);
+                graph.addResult(op, value);
+                graph.bindOutputPort("leaf_" + suffix, value);
+            }
+            const std::size_t beforeOps = graph.operations().size();
+            SessionStore capSession;
+            std::string capLog;
+            const auto [capResult, capError] =
+                runStrictFixture(capDesign,
+                                 capSession,
+                                 name,
+                                 16,
+                                 1000000,
+                                 capLog);
+            if (!capResult.success || capError ||
+                capDesign.findGraph(name)->operations().size() != beforeOps + 1 ||
+                parseStatField(capLog, "raw_eligible") != 2 ||
+                parseStatField(capLog, "selected") != 1 ||
+                parseStatField(capLog, "rejected_capacity") != 1)
+            {
+                return fail("Expected shared-target cumulative cap to select one clone: " + capLog);
+            }
+        }
+
+        wolvrix::lib::grh::Design combinedStrictDesign;
+        buildProbeFixture(combinedStrictDesign, "common_owner_strict_combined", {});
+        SessionStore combinedStrictSession;
+        std::string combinedStrictLog;
+        const auto [combinedStrictResult, combinedStrictError] =
+            runStrictFixture(combinedStrictDesign,
+                             combinedStrictSession,
+                             "common_owner_strict_combined",
+                             16,
+                             1000000,
+                             combinedStrictLog,
+                             true);
+        if (!combinedStrictResult.success || combinedStrictError ||
+            parseStatField(combinedStrictLog, "applied") != 1 ||
+            validateCommonScheduleShape(*combinedStrictDesign.findGraph(
+                                            "common_owner_strict_combined"),
+                                        loadSchedule(combinedStrictSession,
+                                                     "common_owner_strict_combined")) != 0)
+        {
+            return fail("Expected strict common-owner clone with Kahn/post-DP shape");
         }
     }
 
@@ -3212,6 +3610,32 @@ int main()
         if (policyResult.success || !policyDiags.hasError())
         {
             return fail("Expected invalid local shared compute common-owner policy to fail");
+        }
+
+        options.enableLocalSharedCompute = true;
+        options.localSharedComputeMaxClones = 1;
+        SessionStore mixedSession;
+        PassManager mixedManager;
+        mixedManager.options().session = &mixedSession;
+        mixedManager.addPass(std::make_unique<ActivitySchedulePass>(options));
+        PassDiagnostics mixedDiags;
+        const PassManagerResult mixedResult = mixedManager.run(design, mixedDiags);
+        if (mixedResult.success || !mixedDiags.hasError())
+        {
+            return fail("Expected strict common-owner plus local-owner clone budget to fail");
+        }
+
+        options.localSharedComputeCommonOwnerPolicy = "off";
+        options.localSharedComputeCommonOwnerMaxClonedOpPpm = 1000001;
+        SessionStore ppmSession;
+        PassManager ppmManager;
+        ppmManager.options().session = &ppmSession;
+        ppmManager.addPass(std::make_unique<ActivitySchedulePass>(options));
+        PassDiagnostics ppmDiags;
+        const PassManagerResult ppmResult = ppmManager.run(design, ppmDiags);
+        if (ppmResult.success || !ppmDiags.hasError())
+        {
+            return fail("Expected invalid common-owner cloned-op ppm to fail");
         }
     }
 

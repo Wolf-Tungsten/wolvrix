@@ -48,7 +48,9 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-local-shared-compute-max-width` | `64` | local shared compute clone 的 result value 宽度上限 |
 | `-local-shared-compute-max-clones` | `4096` | local shared compute graph clone 硬上限 |
 | `-local-shared-compute-max-cloned-op-ppm` | `5000` | clone 数占 baseline compute op 的 PPM 上限 |
-| `-local-shared-compute-common-owner-policy` | `off` | third common-owner opportunity policy：`off/probe`；`probe` 只输出 info log |
+| `-local-shared-compute-common-owner-policy` | `off` | third common-owner policy：`off/probe/strict` |
+| `-local-shared-compute-common-owner-max-clones` | `4096` | strict common-owner graph clone 硬上限 |
+| `-local-shared-compute-common-owner-max-cloned-op-ppm` | `5000` | strict common-owner clone 数占 baseline compute op 的 PPM 上限 |
 | `-split-oversize-compute-node-max-ops` | `0` | 超大 compute node split 的 chunk 上限；为 0 时使用 `max-op-in-compute-supernode` |
 | `-disable-coarsen` | `false` | 关闭 plain coarsen |
 | `-disable-chain-merge` | `false` | 关闭 plain `out1` / `in1` chain merge；`siblings` 仍可执行 |
@@ -107,6 +109,16 @@ locality、cycle splitting 和 compute-node cap。`false` 路径不执行发现�
 source owner 位于第三个 common-expression node 的候选，细分 user/node owner、singleton、
 intent/indivisible、双边 operand locality、双边 capacity 和 projected removed pairs。它不创建
 op/value、不替换 operand、不重新 freeze，也不增加 session key 或 summary stats 字段。
+
+`strict` 复用相同 exact probe gate，并要求 `enable-local-shared-compute=true`、普通
+local-owner `max-clones=0`，以隔离两类 candidate。它按 op cost、operand bits、result
+width 和 topo/op id 稳定排序，在独立 hard/PPM budget 内处理两个 target 的累计 cap、
+source/target node role 与 source/user op role，再一次性 snapshot 和 apply。较早 consumer
+保留 original，较晚 consumer 改用 clone；apply 后完整 refreeze/rebuild并验证 graph
+增量、metadata、exact users、owner locality、commit/intent/cycle split/cap/topology。candidate
+rebuild 会先验证当前 sink 全集、每个 commit node 的 ordered inputs，以及按 event/cap 得到的
+normalized partition 都与 baseline 相容，再复用 baseline commit node 的 exact op/input order；
+最终 exact commit validator 保持不变，避免 compute clone 顺带改变 commit code layout。
 
 plain coarsen 每轮按以下顺序尝试合并：
 

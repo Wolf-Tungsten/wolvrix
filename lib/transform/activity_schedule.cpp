@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
@@ -6831,7 +6832,8 @@ namespace wolvrix::lib::transform
                                      std::vector<ActivityOpClass> &opClasses,
                                      const ValueCanonicalMap &canonicalValues,
                                      ComputeRewriteBuild &out,
-                                     std::string &error)
+                                     std::string &error,
+                                     const ComputeRewriteBuild *fixedCommitPartition = nullptr)
         {
             out = ComputeRewriteBuild{};
             out.canonicalValues = canonicalValues;
@@ -6883,35 +6885,149 @@ namespace wolvrix::lib::transform
                                                  maxCommitOps,
                                                  &canonicalValues,
                                                  options.commitGuardEventBuckets);
-            out.stats.commitSinkOps = sinkTopoPositions.size();
-            out.stats.commitEventKeyRuns = sinkPartition.clusters.size();
+            if (fixedCommitPartition != nullptr)
             {
-                std::unordered_set<std::string> uniqueEventKeys;
-                uniqueEventKeys.reserve(sinkTopoPositions.size());
-                for (const auto topoPos : sinkTopoPositions)
+                using wolvrix::lib::grh::OperationId;
+                using wolvrix::lib::grh::OperationIdHash;
+
+                std::unordered_set<OperationId, OperationIdHash> candidateSinkOps;
+                candidateSinkOps.reserve(sinkTopoPositions.size());
+                for (const uint32_t topoPos : sinkTopoPositions)
                 {
-                    const auto op = graph.getOperation(opData.topoOps[topoPos]);
-                    uniqueEventKeys.insert(normalizedSinkEventKey(graph, op, &canonicalValues));
+                    candidateSinkOps.insert(opData.topoOps[topoPos]);
                 }
-                out.stats.commitEventKeys = uniqueEventKeys.size();
-            }
-            for (const auto &cluster : sinkPartition.clusters)
-            {
-                CommitNode commit;
-                for (const auto topoPos : cluster)
+                std::unordered_set<OperationId, OperationIdHash> copiedSinkOps;
+                copiedSinkOps.reserve(candidateSinkOps.size());
+                for (std::size_t nodeIndex = 0;
+                     nodeIndex < fixedCommitPartition->commitNodes.size();
+                     ++nodeIndex)
                 {
-                    const auto sinkOp = opData.topoOps[topoPos];
-                    commit.ops.push_back(sinkOp);
-                    for (const auto operand : graph.opOperands(sinkOp))
+                    const auto &copied = fixedCommitPartition->commitNodes[nodeIndex];
+                    std::vector<wolvrix::lib::grh::ValueId> rebuiltInputs;
+                    for (const OperationId opId : copied.ops)
                     {
-                        if (!vectorContainsValue(commit.inputValues, operand))
+                        if (!opId.valid() || opId.graph != graph.id() ||
+                            opId.index >= opClasses.size() ||
+                            opClasses[opId.index] != ActivityOpClass::Sink ||
+                            candidateSinkOps.find(opId) == candidateSinkOps.end())
                         {
-                            commit.inputValues.push_back(operand);
-                            ++out.stats.commitInputRootValues;
+                            error = "activity-schedule fixed commit partition contains invalid or non-sink op node=" +
+                                    std::to_string(nodeIndex) + " op=" +
+                                    std::to_string(opId.index);
+                            return false;
+                        }
+                        if (!copiedSinkOps.insert(opId).second)
+                        {
+                            error = "activity-schedule fixed commit partition contains duplicate sink op=" +
+                                    std::to_string(opId.index);
+                            return false;
+                        }
+                        for (const auto operand : graph.opOperands(opId))
+                        {
+                            if (!vectorContainsValue(rebuiltInputs, operand))
+                            {
+                                rebuiltInputs.push_back(operand);
+                            }
                         }
                     }
+                    if (rebuiltInputs != copied.inputValues)
+                    {
+                        error = "activity-schedule fixed commit partition input values changed node=" +
+                                std::to_string(nodeIndex) + " copied=" +
+                                std::to_string(copied.inputValues.size()) + " rebuilt=" +
+                                std::to_string(rebuiltInputs.size());
+                        return false;
+                    }
                 }
-                out.commitNodes.push_back(std::move(commit));
+                if (copiedSinkOps != candidateSinkOps)
+                {
+                    error = "activity-schedule fixed commit partition does not exactly cover candidate sinks copied=" +
+                            std::to_string(copiedSinkOps.size()) + " candidate=" +
+                            std::to_string(candidateSinkOps.size());
+                    return false;
+                }
+
+                const auto normalizedFixedPartition = [&]()
+                {
+                    std::vector<std::vector<uint32_t>> partition;
+                    partition.reserve(fixedCommitPartition->commitNodes.size());
+                    for (const auto &node : fixedCommitPartition->commitNodes)
+                    {
+                        std::vector<uint32_t> ids;
+                        ids.reserve(node.ops.size());
+                        for (const OperationId opId : node.ops)
+                        {
+                            ids.push_back(opId.index);
+                        }
+                        std::sort(ids.begin(), ids.end());
+                        partition.push_back(std::move(ids));
+                    }
+                    std::sort(partition.begin(), partition.end());
+                    return partition;
+                }();
+                const auto normalizedCandidatePartition = [&]()
+                {
+                    std::vector<std::vector<uint32_t>> partition;
+                    partition.reserve(sinkPartition.clusters.size());
+                    for (const auto &cluster : sinkPartition.clusters)
+                    {
+                        std::vector<uint32_t> ids;
+                        ids.reserve(cluster.size());
+                        for (const uint32_t topoPos : cluster)
+                        {
+                            ids.push_back(opData.topoOps[topoPos].index);
+                        }
+                        std::sort(ids.begin(), ids.end());
+                        partition.push_back(std::move(ids));
+                    }
+                    std::sort(partition.begin(), partition.end());
+                    return partition;
+                }();
+                if (normalizedFixedPartition != normalizedCandidatePartition)
+                {
+                    error = "activity-schedule fixed commit partition violates candidate cap/event grouping";
+                    return false;
+                }
+
+                out.commitNodes = fixedCommitPartition->commitNodes;
+                out.stats.commitSinkOps = fixedCommitPartition->stats.commitSinkOps;
+                out.stats.commitEventKeyRuns = fixedCommitPartition->stats.commitEventKeyRuns;
+                out.stats.commitEventKeys = fixedCommitPartition->stats.commitEventKeys;
+                out.stats.commitInputRootValues =
+                    fixedCommitPartition->stats.commitInputRootValues;
+            }
+            else
+            {
+                out.stats.commitSinkOps = sinkTopoPositions.size();
+                out.stats.commitEventKeyRuns = sinkPartition.clusters.size();
+                {
+                    std::unordered_set<std::string> uniqueEventKeys;
+                    uniqueEventKeys.reserve(sinkTopoPositions.size());
+                    for (const auto topoPos : sinkTopoPositions)
+                    {
+                        const auto op = graph.getOperation(opData.topoOps[topoPos]);
+                        uniqueEventKeys.insert(normalizedSinkEventKey(graph, op, &canonicalValues));
+                    }
+                    out.stats.commitEventKeys = uniqueEventKeys.size();
+                }
+                for (const auto &cluster : sinkPartition.clusters)
+                {
+                    CommitNode commit;
+                    for (const auto topoPos : cluster)
+                    {
+                        const auto sinkOp = opData.topoOps[topoPos];
+                        commit.ops.push_back(sinkOp);
+                        for (const auto operand : graph.opOperands(sinkOp))
+                        {
+                            if (!vectorContainsValue(commit.inputValues, operand))
+                            {
+                                commit.inputValues.push_back(operand);
+                                ++out.stats.commitInputRootValues;
+                            }
+                        }
+                    }
+                    out.commitNodes.push_back(std::move(commit));
+                }
             }
 
             auto ensureRootValue = [&](wolvrix::lib::grh::ValueId value, bool commitRoot) {
@@ -7289,12 +7405,53 @@ namespace wolvrix::lib::transform
             return vectorContainsValue(rewrite.computeNodes[nodeId].boundaryInputs, operand);
         }
 
+        std::size_t localSharedCloneEstimatedOpCost(
+            wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            using wolvrix::lib::grh::OperationKind;
+            switch (kind)
+            {
+            case OperationKind::kAssign:
+            case OperationKind::kNot:
+            case OperationKind::kLogicNot:
+            case OperationKind::kReduceAnd:
+            case OperationKind::kReduceOr:
+            case OperationKind::kReduceXor:
+            case OperationKind::kReduceNor:
+            case OperationKind::kReduceNand:
+            case OperationKind::kReduceXnor:
+            case OperationKind::kSliceStatic:
+            case OperationKind::kSliceDynamic:
+                return 1;
+            case OperationKind::kMux:
+                return 3;
+            default:
+                return 2;
+            }
+        }
+
+        struct LocalSharedComputeCommonOwnerCandidate
+        {
+            wolvrix::lib::grh::OperationId sourceOp;
+            wolvrix::lib::grh::ValueId sourceValue;
+            uint32_t sourceNode = kInvalidActivitySupernodeId;
+            uint32_t leftNode = kInvalidActivitySupernodeId;
+            uint32_t rightNode = kInvalidActivitySupernodeId;
+            std::vector<wolvrix::lib::grh::ValueUser> leftUses;
+            std::vector<wolvrix::lib::grh::ValueUser> rightUses;
+            std::size_t estimatedOpCost = 0;
+            std::size_t operandBits = 0;
+            std::size_t resultWidth = 0;
+            uint32_t sourceTopoPos = kInvalidActivitySupernodeId;
+        };
+
         LocalSharedComputeCommonOwnerProbeStats probeLocalSharedComputeCommonOwners(
             const wolvrix::lib::grh::Graph &graph,
             const ActivityScheduleOptions &options,
             const ActivityOpData &opData,
             const std::vector<ActivityOpClass> &opClasses,
-            const ComputeRewriteBuild &rewrite)
+            const ComputeRewriteBuild &rewrite,
+            std::vector<LocalSharedComputeCommonOwnerCandidate> *eligibleCandidates = nullptr)
         {
             using wolvrix::lib::grh::OperationId;
             using wolvrix::lib::grh::OperationIdHash;
@@ -7576,9 +7733,306 @@ namespace wolvrix::lib::transform
                     ++stats.eligibleByKind[kind];
                     ++stats.eligibleByResultWidth[resultWidth];
                     ++stats.eligibleByOperandBits[operandBitsBucket];
+                    if (eligibleCandidates != nullptr)
+                    {
+                        LocalSharedComputeCommonOwnerCandidate candidate;
+                        candidate.sourceOp = opId;
+                        candidate.sourceValue = value;
+                        candidate.sourceNode = sourceNode;
+                        candidate.leftNode = leftNode;
+                        candidate.rightNode = rightNode;
+                        candidate.leftUses = usesByNode.at(leftNode);
+                        candidate.rightUses = usesByNode.at(rightNode);
+                        candidate.estimatedOpCost =
+                            localSharedCloneEstimatedOpCost(op.kind());
+                        candidate.operandBits = operandBits;
+                        candidate.resultWidth =
+                            static_cast<std::size_t>(valueInfo.width());
+                        candidate.sourceTopoPos =
+                            opId.index < opData.topoPosByOpIndex.size()
+                                ? opData.topoPosByOpIndex[opId.index]
+                                : kInvalidActivitySupernodeId;
+                        eligibleCandidates->push_back(std::move(candidate));
+                    }
                 }
             }
             return stats;
+        }
+
+        struct LocalSharedComputeCommonOwnerCloneStats
+        {
+            std::size_t rawEligible = 0;
+            std::size_t selected = 0;
+            std::size_t applied = 0;
+            std::size_t cloneLimit = 0;
+            std::size_t rejectedBudget = 0;
+            std::size_t rejectedCapacity = 0;
+            std::size_t rejectedRole = 0;
+            std::size_t rejectedDependency = 0;
+            std::size_t rejectedStale = 0;
+            std::size_t projectedRemovedPairs = 0;
+            std::size_t actualLocalizedPairs = 0;
+            std::size_t graphOpsBefore = 0;
+            std::size_t graphValuesBefore = 0;
+        };
+
+        struct LocalSharedComputeCommonOwnerClonePlan
+        {
+            wolvrix::lib::grh::OperationId sourceOp;
+            wolvrix::lib::grh::ValueId sourceValue;
+            wolvrix::lib::grh::OperationId cloneOp;
+            wolvrix::lib::grh::ValueId cloneValue;
+            uint32_t originalTargetNode = kInvalidActivitySupernodeId;
+            uint32_t cloneTargetNode = kInvalidActivitySupernodeId;
+            std::vector<wolvrix::lib::grh::ValueUser> originalUses;
+            std::vector<wolvrix::lib::grh::ValueUser> cloneUses;
+            wolvrix::lib::grh::OperationKind kind;
+            std::vector<wolvrix::lib::grh::ValueId> operands;
+            std::vector<wolvrix::lib::grh::AttrKV> attrs;
+            std::optional<wolvrix::lib::grh::SrcLoc> opSrcLoc;
+            int32_t resultWidth = 0;
+            bool resultSigned = false;
+            wolvrix::lib::grh::ValueType resultType =
+                wolvrix::lib::grh::ValueType::Logic;
+            std::optional<wolvrix::lib::grh::SrcLoc> resultSrcLoc;
+        };
+
+        std::size_t localSharedCommonOwnerCloneLimit(
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const std::vector<ActivityOpClass> &opClasses)
+        {
+            const std::uint64_t computeOps = static_cast<std::uint64_t>(std::count_if(
+                opData.topoOps.begin(),
+                opData.topoOps.end(),
+                [&](wolvrix::lib::grh::OperationId opId)
+                {
+                    return opId.index < opClasses.size() &&
+                           opClasses[opId.index] == ActivityOpClass::Compute;
+                }));
+            const std::uint64_t ppm = static_cast<std::uint64_t>(
+                options.localSharedComputeCommonOwnerMaxClonedOpPpm);
+            const bool overflow =
+                ppm != 0 && computeOps > std::numeric_limits<std::uint64_t>::max() / ppm;
+            const std::uint64_t numerator =
+                overflow ? std::numeric_limits<std::uint64_t>::max() : computeOps * ppm;
+            const std::uint64_t ppmLimit = numerator / 1000000ULL;
+            const std::size_t boundedPpmLimit =
+                ppmLimit > std::numeric_limits<std::size_t>::max()
+                    ? std::numeric_limits<std::size_t>::max()
+                    : static_cast<std::size_t>(ppmLimit);
+            return std::min(options.localSharedComputeCommonOwnerMaxClones,
+                            boundedPpmLimit);
+        }
+
+        bool applyLocalSharedComputeCommonOwnerClones(
+            wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const std::vector<ActivityOpClass> &opClasses,
+            const ComputeRewriteBuild &rewrite,
+            std::vector<LocalSharedComputeCommonOwnerCandidate> candidates,
+            LocalSharedComputeCommonOwnerCloneStats &stats,
+            std::vector<LocalSharedComputeCommonOwnerClonePlan> &plans,
+            std::string &error)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+
+            stats = LocalSharedComputeCommonOwnerCloneStats{};
+            plans.clear();
+            stats.rawEligible = candidates.size();
+            stats.cloneLimit = localSharedCommonOwnerCloneLimit(options, opData, opClasses);
+            stats.graphOpsBefore = graph.operations().size();
+            stats.graphValuesBefore = graph.values().size();
+
+            std::vector<uint32_t> nodeTopoPos(rewrite.computeNodes.size(),
+                                              kInvalidActivitySupernodeId);
+            for (uint32_t pos = 0; pos < rewrite.computeTopoOrder.size(); ++pos)
+            {
+                const uint32_t nodeId = rewrite.computeTopoOrder[pos];
+                if (nodeId < nodeTopoPos.size())
+                {
+                    nodeTopoPos[nodeId] = pos;
+                }
+            }
+            const auto orderedTargets = [&](const LocalSharedComputeCommonOwnerCandidate &candidate)
+            {
+                const auto key = [&](uint32_t nodeId)
+                {
+                    return std::pair{
+                        nodeId < nodeTopoPos.size() ? nodeTopoPos[nodeId]
+                                                   : kInvalidActivitySupernodeId,
+                        nodeId};
+                };
+                return key(candidate.leftNode) <= key(candidate.rightNode)
+                           ? std::pair{candidate.leftNode, candidate.rightNode}
+                           : std::pair{candidate.rightNode, candidate.leftNode};
+            };
+            std::stable_sort(
+                candidates.begin(),
+                candidates.end(),
+                [&](const auto &lhs, const auto &rhs)
+                {
+                    const auto lhsTargets = orderedTargets(lhs);
+                    const auto rhsTargets = orderedTargets(rhs);
+                    return std::tuple{lhs.estimatedOpCost,
+                                      lhs.operandBits,
+                                      lhs.resultWidth,
+                                      lhs.sourceTopoPos,
+                                      lhs.sourceOp.index,
+                                      lhsTargets.first,
+                                      lhsTargets.second} <
+                           std::tuple{rhs.estimatedOpCost,
+                                      rhs.operandBits,
+                                      rhs.resultWidth,
+                                      rhs.sourceTopoPos,
+                                      rhs.sourceOp.index,
+                                      rhsTargets.first,
+                                      rhsTargets.second};
+                });
+
+            std::vector<std::size_t> plannedAddsByNode(rewrite.computeNodes.size(), 0);
+            std::unordered_set<uint32_t> selectedSourceNodes;
+            std::unordered_set<uint32_t> selectedTargetNodes;
+            std::unordered_set<OperationId, OperationIdHash> selectedSourceOps;
+            std::unordered_set<OperationId, OperationIdHash> selectedUserOps;
+            const std::size_t maxNodeOps =
+                options.maxOpInComputeNode == 0
+                    ? std::numeric_limits<std::size_t>::max()
+                    : options.maxOpInComputeNode;
+
+            for (const auto &candidate : candidates)
+            {
+                const auto [earlyNode, lateNode] = orderedTargets(candidate);
+                if (selectedTargetNodes.contains(candidate.sourceNode) ||
+                    selectedSourceNodes.contains(earlyNode) ||
+                    selectedSourceNodes.contains(lateNode))
+                {
+                    ++stats.rejectedDependency;
+                    continue;
+                }
+                std::unordered_set<OperationId, OperationIdHash> candidateUsers;
+                for (const auto &use : candidate.leftUses)
+                {
+                    candidateUsers.insert(use.operation);
+                }
+                for (const auto &use : candidate.rightUses)
+                {
+                    candidateUsers.insert(use.operation);
+                }
+                bool roleConflict = selectedUserOps.contains(candidate.sourceOp);
+                for (const OperationId userOp : candidateUsers)
+                {
+                    roleConflict |= selectedSourceOps.contains(userOp);
+                }
+                if (roleConflict)
+                {
+                    ++stats.rejectedRole;
+                    continue;
+                }
+                const auto noCapacity = [&](uint32_t nodeId)
+                {
+                    return nodeId >= rewrite.computeNodes.size() ||
+                           plannedAddsByNode[nodeId] >= maxNodeOps ||
+                           rewrite.computeNodes[nodeId].ops.size() >=
+                               maxNodeOps - plannedAddsByNode[nodeId];
+                };
+                if (noCapacity(earlyNode) || noCapacity(lateNode))
+                {
+                    ++stats.rejectedCapacity;
+                    continue;
+                }
+                if (plans.size() >= stats.cloneLimit)
+                {
+                    ++stats.rejectedBudget;
+                    continue;
+                }
+
+                const auto op = graph.getOperation(candidate.sourceOp);
+                const auto value = graph.getValue(candidate.sourceValue);
+                LocalSharedComputeCommonOwnerClonePlan plan;
+                plan.sourceOp = candidate.sourceOp;
+                plan.sourceValue = candidate.sourceValue;
+                plan.originalTargetNode = earlyNode;
+                plan.cloneTargetNode = lateNode;
+                plan.originalUses = earlyNode == candidate.leftNode
+                                        ? candidate.leftUses
+                                        : candidate.rightUses;
+                plan.cloneUses = lateNode == candidate.leftNode
+                                     ? candidate.leftUses
+                                     : candidate.rightUses;
+                plan.kind = op.kind();
+                plan.operands.assign(op.operands().begin(), op.operands().end());
+                plan.attrs.assign(op.attrs().begin(), op.attrs().end());
+                plan.opSrcLoc = op.srcLoc();
+                plan.resultWidth = value.width();
+                plan.resultSigned = value.isSigned();
+                plan.resultType = value.type();
+                plan.resultSrcLoc = value.srcLoc();
+                plans.push_back(std::move(plan));
+                ++plannedAddsByNode[earlyNode];
+                ++plannedAddsByNode[lateNode];
+                selectedSourceNodes.insert(candidate.sourceNode);
+                selectedTargetNodes.insert(earlyNode);
+                selectedTargetNodes.insert(lateNode);
+                selectedSourceOps.insert(candidate.sourceOp);
+                selectedUserOps.insert(candidateUsers.begin(), candidateUsers.end());
+            }
+            stats.selected = plans.size();
+            stats.projectedRemovedPairs = plans.size() * 2;
+
+            for (auto &plan : plans)
+            {
+                try
+                {
+                    plan.cloneOp = graph.createOperation(plan.kind, graph.makeInternalOpSym());
+                    if (plan.opSrcLoc)
+                    {
+                        graph.setOpSrcLoc(plan.cloneOp, *plan.opSrcLoc);
+                    }
+                    for (const auto &attr : plan.attrs)
+                    {
+                        graph.setAttr(plan.cloneOp, attr.key, attr.value);
+                    }
+                    for (const ValueId operand : plan.operands)
+                    {
+                        graph.addOperand(plan.cloneOp, operand);
+                    }
+                    plan.cloneValue = graph.createValue(graph.makeInternalValSym(),
+                                                        plan.resultWidth,
+                                                        plan.resultSigned,
+                                                        plan.resultType);
+                    if (plan.resultSrcLoc)
+                    {
+                        graph.setValueSrcLoc(plan.cloneValue, *plan.resultSrcLoc);
+                    }
+                    graph.addResult(plan.cloneOp, plan.cloneValue);
+                    for (const auto &use : plan.cloneUses)
+                    {
+                        const auto operands = graph.opOperands(use.operation);
+                        if (use.operandIndex >= operands.size() ||
+                            operands[use.operandIndex] != plan.sourceValue)
+                        {
+                            ++stats.rejectedStale;
+                            error = "activity-schedule common-owner clone selected use became stale";
+                            return false;
+                        }
+                        graph.replaceOperand(use.operation,
+                                             use.operandIndex,
+                                             plan.cloneValue);
+                    }
+                }
+                catch (const std::exception &ex)
+                {
+                    error = "activity-schedule common-owner clone apply failed source=" +
+                            describeOp(graph, plan.sourceOp) + ": " + ex.what();
+                    return false;
+                }
+                ++stats.applied;
+            }
+            return true;
         }
 
         struct LocalSharedComputeCloneRecord
@@ -7907,17 +8361,190 @@ namespace wolvrix::lib::transform
             const std::vector<LocalSharedComputeCloneRecord> &records,
             std::string &error)
         {
+            const auto opIds = [](const std::vector<wolvrix::lib::grh::OperationId> &ops)
+            {
+                std::vector<uint32_t> out;
+                out.reserve(ops.size());
+                for (const auto opId : ops)
+                {
+                    out.push_back(opId.index);
+                }
+                return out;
+            };
+            const auto valueIds = [](const std::vector<wolvrix::lib::grh::ValueId> &values)
+            {
+                std::vector<uint32_t> out;
+                out.reserve(values.size());
+                for (const auto valueId : values)
+                {
+                    out.push_back(valueId.index);
+                }
+                return out;
+            };
+            const auto asSet = [](std::vector<uint32_t> ids)
+            {
+                std::sort(ids.begin(), ids.end());
+                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                return ids;
+            };
+            const auto sampleIds = [](const std::vector<uint32_t> &ids)
+            {
+                std::ostringstream out;
+                out << "[";
+                const std::size_t limit = std::min<std::size_t>(ids.size(), 8);
+                for (std::size_t i = 0; i < limit; ++i)
+                {
+                    if (i != 0)
+                    {
+                        out << ",";
+                    }
+                    out << ids[i];
+                }
+                if (ids.size() > limit)
+                {
+                    out << ",...";
+                }
+                out << "]";
+                return out.str();
+            };
+            const auto firstDiff = [](const std::vector<uint32_t> &lhs,
+                                      const std::vector<uint32_t> &rhs)
+            {
+                const std::size_t common = std::min(lhs.size(), rhs.size());
+                std::size_t pos = 0;
+                while (pos < common && lhs[pos] == rhs[pos])
+                {
+                    ++pos;
+                }
+                std::ostringstream out;
+                out << "pos=" << pos << " baseline=";
+                if (pos < lhs.size())
+                {
+                    out << lhs[pos];
+                }
+                else
+                {
+                    out << "<end>";
+                }
+                out << " candidate=";
+                if (pos < rhs.size())
+                {
+                    out << rhs[pos];
+                }
+                else
+                {
+                    out << "<end>";
+                }
+                return out.str();
+            };
+            const auto globalOpSet = [&](const ComputeRewriteBuild &build)
+            {
+                std::vector<uint32_t> ids;
+                for (const auto &node : build.commitNodes)
+                {
+                    const auto nodeIds = opIds(node.ops);
+                    ids.insert(ids.end(), nodeIds.begin(), nodeIds.end());
+                }
+                return asSet(std::move(ids));
+            };
+            const auto globalInputSet = [&](const ComputeRewriteBuild &build)
+            {
+                std::vector<uint32_t> ids;
+                for (const auto &node : build.commitNodes)
+                {
+                    const auto nodeIds = valueIds(node.inputValues);
+                    ids.insert(ids.end(), nodeIds.begin(), nodeIds.end());
+                }
+                return asSet(std::move(ids));
+            };
+            const auto normalizedOpPartition = [&](const ComputeRewriteBuild &build)
+            {
+                std::vector<std::vector<uint32_t>> partition;
+                partition.reserve(build.commitNodes.size());
+                for (const auto &node : build.commitNodes)
+                {
+                    auto ids = opIds(node.ops);
+                    std::sort(ids.begin(), ids.end());
+                    partition.push_back(std::move(ids));
+                }
+                std::sort(partition.begin(), partition.end());
+                return partition;
+            };
+            const auto normalizedInputPartition = [&](const ComputeRewriteBuild &build)
+            {
+                std::vector<std::vector<uint32_t>> partition;
+                partition.reserve(build.commitNodes.size());
+                for (const auto &node : build.commitNodes)
+                {
+                    auto ids = valueIds(node.inputValues);
+                    std::sort(ids.begin(), ids.end());
+                    partition.push_back(std::move(ids));
+                }
+                std::sort(partition.begin(), partition.end());
+                return partition;
+            };
+            const auto appendGlobalCommitDiagnostics = [&](std::ostringstream &out)
+            {
+                const auto baselineOps = globalOpSet(baseline);
+                const auto candidateOps = globalOpSet(candidate);
+                const auto baselineInputs = globalInputSet(baseline);
+                const auto candidateInputs = globalInputSet(candidate);
+                out << " global_sink_op_set_equal=" << (baselineOps == candidateOps ? "true" : "false")
+                    << " global_sink_op_counts=" << baselineOps.size() << "/" << candidateOps.size()
+                    << " global_input_value_set_equal="
+                    << (baselineInputs == candidateInputs ? "true" : "false")
+                    << " global_input_value_counts=" << baselineInputs.size() << "/"
+                    << candidateInputs.size()
+                    << " normalized_op_partition_equal="
+                    << (normalizedOpPartition(baseline) == normalizedOpPartition(candidate)
+                            ? "true"
+                            : "false")
+                    << " normalized_input_partition_equal="
+                    << (normalizedInputPartition(baseline) == normalizedInputPartition(candidate)
+                            ? "true"
+                            : "false");
+            };
             if (baseline.commitNodes.size() != candidate.commitNodes.size())
             {
-                error = "activity-schedule local shared compute clone changed commit node count";
+                std::ostringstream out;
+                out << "activity-schedule local shared compute clone changed commit node count"
+                    << " baseline_nodes=" << baseline.commitNodes.size()
+                    << " candidate_nodes=" << candidate.commitNodes.size();
+                appendGlobalCommitDiagnostics(out);
+                error = out.str();
                 return false;
             }
             for (std::size_t i = 0; i < baseline.commitNodes.size(); ++i)
             {
-                if (baseline.commitNodes[i].ops != candidate.commitNodes[i].ops ||
-                    baseline.commitNodes[i].inputValues != candidate.commitNodes[i].inputValues)
+                const bool opsEqual = baseline.commitNodes[i].ops == candidate.commitNodes[i].ops;
+                const bool inputsEqual =
+                    baseline.commitNodes[i].inputValues == candidate.commitNodes[i].inputValues;
+                if (!opsEqual || !inputsEqual)
                 {
-                    error = "activity-schedule local shared compute clone changed commit partition";
+                    const auto baselineOps = opIds(baseline.commitNodes[i].ops);
+                    const auto candidateOps = opIds(candidate.commitNodes[i].ops);
+                    const auto baselineInputs = valueIds(baseline.commitNodes[i].inputValues);
+                    const auto candidateInputs = valueIds(candidate.commitNodes[i].inputValues);
+                    std::ostringstream out;
+                    out << "activity-schedule local shared compute clone changed commit partition"
+                        << " node=" << i
+                        << " ops_equal=" << (opsEqual ? "true" : "false")
+                        << " inputs_equal=" << (inputsEqual ? "true" : "false")
+                        << " op_sizes=" << baselineOps.size() << "/" << candidateOps.size()
+                        << " input_sizes=" << baselineInputs.size() << "/"
+                        << candidateInputs.size()
+                        << " op_set_equal="
+                        << (asSet(baselineOps) == asSet(candidateOps) ? "true" : "false")
+                        << " input_set_equal="
+                        << (asSet(baselineInputs) == asSet(candidateInputs) ? "true" : "false")
+                        << " baseline_ops=" << sampleIds(baselineOps)
+                        << " candidate_ops=" << sampleIds(candidateOps)
+                        << " op_first_diff={" << firstDiff(baselineOps, candidateOps) << "}"
+                        << " baseline_inputs=" << sampleIds(baselineInputs)
+                        << " candidate_inputs=" << sampleIds(candidateInputs)
+                        << " input_first_diff={" << firstDiff(baselineInputs, candidateInputs) << "}";
+                    appendGlobalCommitDiagnostics(out);
+                    error = out.str();
                     return false;
                 }
             }
@@ -8003,6 +8630,197 @@ namespace wolvrix::lib::transform
                     if (!node.indivisible && node.ops.size() > options.maxOpInComputeNode)
                     {
                         error = "activity-schedule local shared compute clone exceeded compute node cap";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool localSharedCloneSrcLocEqual(
+            const std::optional<wolvrix::lib::grh::SrcLoc> &lhs,
+            const std::optional<wolvrix::lib::grh::SrcLoc> &rhs)
+        {
+            if (lhs.has_value() != rhs.has_value())
+            {
+                return false;
+            }
+            if (!lhs)
+            {
+                return true;
+            }
+            return lhs->file == rhs->file && lhs->line == rhs->line &&
+                   lhs->column == rhs->column && lhs->endLine == rhs->endLine &&
+                   lhs->endColumn == rhs->endColumn && lhs->origin == rhs->origin &&
+                   lhs->pass == rhs->pass && lhs->note == rhs->note;
+        }
+
+        bool localSharedCloneAttrsEqual(
+            std::span<const wolvrix::lib::grh::AttrKV> lhs,
+            const std::vector<wolvrix::lib::grh::AttrKV> &rhs)
+        {
+            if (lhs.size() != rhs.size())
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < lhs.size(); ++i)
+            {
+                if (lhs[i].key != rhs[i].key || lhs[i].value != rhs[i].value)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool localSharedCloneUsersEqual(
+            std::span<const wolvrix::lib::grh::ValueUser> actual,
+            const std::vector<wolvrix::lib::grh::ValueUser> &expected)
+        {
+            const auto key = [](const wolvrix::lib::grh::ValueUser &user)
+            {
+                return std::tuple{user.operation.index,
+                                  user.operation.generation,
+                                  user.operandIndex};
+            };
+            std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> actualKeys;
+            std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> expectedKeys;
+            actualKeys.reserve(actual.size());
+            expectedKeys.reserve(expected.size());
+            for (const auto &user : actual)
+            {
+                actualKeys.push_back(key(user));
+            }
+            for (const auto &user : expected)
+            {
+                expectedKeys.push_back(key(user));
+            }
+            std::sort(actualKeys.begin(), actualKeys.end());
+            std::sort(expectedKeys.begin(), expectedKeys.end());
+            return actualKeys == expectedKeys;
+        }
+
+        bool validateLocalSharedComputeCommonOwnerCloneRewrite(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ComputeRewriteBuild &baseline,
+            const ComputeRewriteBuild &candidate,
+            const std::vector<LocalSharedComputeCommonOwnerClonePlan> &plans,
+            LocalSharedComputeCommonOwnerCloneStats &stats,
+            std::string &error)
+        {
+            std::vector<LocalSharedComputeCloneRecord> records;
+            records.reserve(plans.size());
+            for (const auto &plan : plans)
+            {
+                LocalSharedComputeCloneRecord record;
+                record.sourceOp = plan.sourceOp;
+                record.sourceValue = plan.sourceValue;
+                record.cloneOp = plan.cloneOp;
+                record.cloneValue = plan.cloneValue;
+                for (const auto &use : plan.originalUses)
+                {
+                    record.originalUsers.push_back(use.operation);
+                }
+                for (const auto &use : plan.cloneUses)
+                {
+                    record.cloneUsers.push_back(use.operation);
+                }
+                record.originalUsers = uniqueOpsPreservingOrder(record.originalUsers);
+                record.cloneUsers = uniqueOpsPreservingOrder(record.cloneUsers);
+                records.push_back(std::move(record));
+            }
+            if (!validateLocalSharedComputeCloneRewrite(options,
+                                                        baseline,
+                                                        candidate,
+                                                        records,
+                                                        error))
+            {
+                return false;
+            }
+            if (graph.operations().size() != stats.graphOpsBefore + plans.size() ||
+                graph.values().size() != stats.graphValuesBefore + plans.size())
+            {
+                error = "activity-schedule common-owner clone graph growth mismatch";
+                return false;
+            }
+
+            const auto ownerOf = [&](wolvrix::lib::grh::OperationId opId) -> uint32_t
+            {
+                return opId.valid() && opId.index < candidate.computeNodeOfOp.size()
+                           ? candidate.computeNodeOfOp[opId.index]
+                           : kInvalidActivitySupernodeId;
+            };
+            stats.actualLocalizedPairs = 0;
+            for (const auto &plan : plans)
+            {
+                const auto sourceOp = graph.getOperation(plan.sourceOp);
+                const auto cloneOp = graph.getOperation(plan.cloneOp);
+                const auto sourceValue = graph.getValue(plan.sourceValue);
+                const auto cloneValue = graph.getValue(plan.cloneValue);
+                if (sourceOp.kind() != plan.kind || cloneOp.kind() != plan.kind ||
+                    std::vector<wolvrix::lib::grh::ValueId>(sourceOp.operands().begin(),
+                                                           sourceOp.operands().end()) != plan.operands ||
+                    std::vector<wolvrix::lib::grh::ValueId>(cloneOp.operands().begin(),
+                                                           cloneOp.operands().end()) != plan.operands ||
+                    !localSharedCloneAttrsEqual(sourceOp.attrs(), plan.attrs) ||
+                    !localSharedCloneAttrsEqual(cloneOp.attrs(), plan.attrs) ||
+                    !localSharedCloneSrcLocEqual(sourceOp.srcLoc(), plan.opSrcLoc) ||
+                    !localSharedCloneSrcLocEqual(cloneOp.srcLoc(), plan.opSrcLoc) ||
+                    sourceValue.width() != plan.resultWidth ||
+                    cloneValue.width() != plan.resultWidth ||
+                    sourceValue.isSigned() != plan.resultSigned ||
+                    cloneValue.isSigned() != plan.resultSigned ||
+                    sourceValue.type() != plan.resultType ||
+                    cloneValue.type() != plan.resultType ||
+                    !localSharedCloneSrcLocEqual(sourceValue.srcLoc(), plan.resultSrcLoc) ||
+                    !localSharedCloneSrcLocEqual(cloneValue.srcLoc(), plan.resultSrcLoc))
+                {
+                    error = "activity-schedule common-owner clone metadata mismatch";
+                    return false;
+                }
+                if (!localSharedCloneUsersEqual(sourceValue.users(), plan.originalUses) ||
+                    !localSharedCloneUsersEqual(cloneValue.users(), plan.cloneUses))
+                {
+                    error = "activity-schedule common-owner clone user set mismatch";
+                    return false;
+                }
+                const uint32_t sourceOwner = ownerOf(plan.sourceOp);
+                const uint32_t cloneOwner = ownerOf(plan.cloneOp);
+                if (sourceOwner == kInvalidActivitySupernodeId ||
+                    cloneOwner == kInvalidActivitySupernodeId || sourceOwner == cloneOwner)
+                {
+                    error = "activity-schedule common-owner clone owner mismatch";
+                    return false;
+                }
+                stats.actualLocalizedPairs += 2;
+            }
+
+            if (candidate.computeTopoOrder.size() != candidate.computeNodes.size())
+            {
+                error = "activity-schedule common-owner clone compute topo size mismatch";
+                return false;
+            }
+            std::vector<uint32_t> topoPos(candidate.computeNodes.size(),
+                                          kInvalidActivitySupernodeId);
+            for (uint32_t pos = 0; pos < candidate.computeTopoOrder.size(); ++pos)
+            {
+                const uint32_t nodeId = candidate.computeTopoOrder[pos];
+                if (nodeId >= topoPos.size() ||
+                    topoPos[nodeId] != kInvalidActivitySupernodeId)
+                {
+                    error = "activity-schedule common-owner clone compute topo invalid";
+                    return false;
+                }
+                topoPos[nodeId] = pos;
+            }
+            for (uint32_t source = 0; source < candidate.computeDag.size(); ++source)
+            {
+                for (const uint32_t target : candidate.computeDag[source])
+                {
+                    if (target >= topoPos.size() || topoPos[source] >= topoPos[target])
+                    {
+                        error = "activity-schedule common-owner clone compute topo edge invalid";
                         return false;
                     }
                 }
@@ -8950,9 +9768,18 @@ namespace wolvrix::lib::transform
             return result;
         }
         if (options_.localSharedComputeCommonOwnerPolicy != "off" &&
-            options_.localSharedComputeCommonOwnerPolicy != "probe")
+            options_.localSharedComputeCommonOwnerPolicy != "probe" &&
+            options_.localSharedComputeCommonOwnerPolicy != "strict")
         {
-            error("activity-schedule local_shared_compute_common_owner_policy must be off or probe");
+            error("activity-schedule local_shared_compute_common_owner_policy must be off, probe, or strict");
+            result.failed = true;
+            return result;
+        }
+        if (options_.localSharedComputeCommonOwnerPolicy == "strict" &&
+            (!options_.enableLocalSharedCompute ||
+             options_.localSharedComputeMaxClones != 0))
+        {
+            error("activity-schedule strict common-owner cloning requires enable_local_shared_compute=true and local_shared_compute_max_clones=0");
             result.failed = true;
             return result;
         }
@@ -8973,6 +9800,12 @@ namespace wolvrix::lib::transform
         if (options_.localSharedComputeMaxClonedOpPpm > 1000000)
         {
             error("activity-schedule local shared compute cloned-op ppm must be <= 1000000");
+            result.failed = true;
+            return result;
+        }
+        if (options_.localSharedComputeCommonOwnerMaxClonedOpPpm > 1000000)
+        {
+            error("activity-schedule common-owner cloned-op ppm must be <= 1000000");
             result.failed = true;
             return result;
         }
@@ -9212,11 +10045,115 @@ namespace wolvrix::lib::transform
                 std::to_string(elapsedMs(commonOwnerProbeStart)));
         }
 
+        if (options_.localSharedComputeCommonOwnerPolicy == "strict")
+        {
+            const auto commonOwnerCloneStart = std::chrono::steady_clock::now();
+            logInfo("activity-schedule progress: local_shared_compute_common_owner_clone start");
+            std::vector<LocalSharedComputeCommonOwnerCandidate> candidates;
+            const LocalSharedComputeCommonOwnerProbeStats probe =
+                probeLocalSharedComputeCommonOwners(*graph,
+                                                    options_,
+                                                    opData,
+                                                    opClasses,
+                                                    rewrite,
+                                                    &candidates);
+            LocalSharedComputeCommonOwnerCloneStats commonStats;
+            std::vector<LocalSharedComputeCommonOwnerClonePlan> commonPlans;
+            if (!applyLocalSharedComputeCommonOwnerClones(*graph,
+                                                         options_,
+                                                         opData,
+                                                         opClasses,
+                                                         rewrite,
+                                                         std::move(candidates),
+                                                         commonStats,
+                                                         commonPlans,
+                                                         buildError))
+            {
+                error(*graph, buildError);
+                result.failed = true;
+                return result;
+            }
+            if (!commonPlans.empty())
+            {
+                graphChanged = true;
+                graph->freeze();
+                ActivityOpData clonedOpData = buildActivityOpData(*graph, buildError);
+                if (!buildError.empty())
+                {
+                    error(*graph, buildError);
+                    result.failed = true;
+                    return result;
+                }
+                std::vector<ActivityOpClass> clonedOpClasses =
+                    buildOpClasses(*graph, clonedOpData.maxOpIndex);
+                ComputeRewriteBuild clonedRewrite;
+                if (!buildComputeNodeRewrite(*graph,
+                                             options_,
+                                             clonedOpData,
+                                             clonedOpClasses,
+                                             canonicalValues,
+                                             clonedRewrite,
+                                             buildError,
+                                             &rewrite))
+                {
+                    error(*graph, buildError);
+                    result.failed = true;
+                    return result;
+                }
+                logInfo("activity-schedule local shared compute common-owner strict: fixed_commit_partition_seed_adopted=true commit_nodes=" +
+                        std::to_string(clonedRewrite.commitNodes.size()));
+                clonedRewrite.stats.sourceClonesInComputeNodes =
+                    precloneStats.sourceClonesInComputeNodes;
+                clonedRewrite.stats.localSharedComputeClonesInComputeNodes =
+                    commonStats.applied;
+                if (!validateLocalSharedComputeCommonOwnerCloneRewrite(*graph,
+                                                                       options_,
+                                                                       rewrite,
+                                                                       clonedRewrite,
+                                                                       commonPlans,
+                                                                       commonStats,
+                                                                       buildError))
+                {
+                    error(*graph, buildError);
+                    result.failed = true;
+                    return result;
+                }
+                opData = std::move(clonedOpData);
+                opClasses = std::move(clonedOpClasses);
+                rewrite = std::move(clonedRewrite);
+            }
+            logInfo(
+                "activity-schedule local shared compute common-owner strict: raw_eligible=" +
+                std::to_string(probe.exactEligible) +
+                " selected=" + std::to_string(commonStats.selected) +
+                " applied=" + std::to_string(commonStats.applied) +
+                " clone_limit=" + std::to_string(commonStats.cloneLimit) +
+                " rejected_budget=" + std::to_string(commonStats.rejectedBudget) +
+                " rejected_capacity=" + std::to_string(commonStats.rejectedCapacity) +
+                " rejected_role=" + std::to_string(commonStats.rejectedRole) +
+                " rejected_dependency=" + std::to_string(commonStats.rejectedDependency) +
+                " rejected_stale=" + std::to_string(commonStats.rejectedStale) +
+                " projected_removed_pairs=" +
+                std::to_string(commonStats.projectedRemovedPairs) +
+                " actual_localized_pairs=" +
+                std::to_string(commonStats.actualLocalizedPairs) +
+                " graph_ops_before=" + std::to_string(commonStats.graphOpsBefore) +
+                " graph_ops_after=" + std::to_string(graph->operations().size()) +
+                " graph_ops_delta=" + std::to_string(commonStats.applied) +
+                " graph_values_before=" + std::to_string(commonStats.graphValuesBefore) +
+                " graph_values_after=" + std::to_string(graph->values().size()) +
+                " graph_values_delta=" + std::to_string(commonStats.applied));
+            logInfo(
+                "activity-schedule progress: local_shared_compute_common_owner_clone done elapsed_ms=" +
+                std::to_string(elapsedMs(commonOwnerCloneStart)));
+        }
+
         LocalSharedComputeCloneStats localSharedCloneStats;
         std::vector<LocalSharedComputeCloneRecord> localSharedCloneRecords;
         const auto localSharedCloneStart = std::chrono::steady_clock::now();
         std::uint64_t localSharedCloneMs = 0;
-        if (options_.enableLocalSharedCompute)
+        if (options_.enableLocalSharedCompute &&
+            options_.localSharedComputeCommonOwnerPolicy != "strict")
         {
             logInfo("activity-schedule progress: local_shared_compute_clone start");
             if (!applyLocalSharedComputeClones(*graph,

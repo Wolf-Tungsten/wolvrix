@@ -1066,6 +1066,50 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-local-shared-compute-common-owner-max-clones")
+                {
+                    if (!parseSizeArg("-local-shared-compute-common-owner-max-clones",
+                                      options.localSharedComputeCommonOwnerMaxClones))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-local-shared-compute-common-owner-max-clones="))
+                {
+                    try
+                    {
+                        options.localSharedComputeCommonOwnerMaxClones =
+                            static_cast<std::size_t>(std::stoull(std::string(arg.substr(
+                                std::string_view("-local-shared-compute-common-owner-max-clones=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -local-shared-compute-common-owner-max-clones value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-local-shared-compute-common-owner-max-cloned-op-ppm")
+                {
+                    if (!parseSizeArg("-local-shared-compute-common-owner-max-cloned-op-ppm",
+                                      options.localSharedComputeCommonOwnerMaxClonedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-local-shared-compute-common-owner-max-cloned-op-ppm="))
+                {
+                    try
+                    {
+                        options.localSharedComputeCommonOwnerMaxClonedOpPpm =
+                            static_cast<std::size_t>(std::stoull(std::string(arg.substr(
+                                std::string_view("-local-shared-compute-common-owner-max-cloned-op-ppm=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -local-shared-compute-common-owner-max-cloned-op-ppm value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-local-shared-compute-common-owner-policy")
                 {
                     if (!parseStringArg("-local-shared-compute-common-owner-policy",

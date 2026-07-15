@@ -9777,12 +9777,13 @@ namespace wolvrix::lib::transform
             CountMap selectedByMaxWidth;
         };
 
-        FinalFaninPullbackProbeStats probeFinalFaninPullback(
+        FinalFaninPullbackProbeStats evaluateFinalFaninPullback(
             const wolvrix::lib::grh::Graph &graph,
             const ActivityScheduleOptions &options,
             const ComputeRewriteBuild &rewrite,
             const ActivityScheduleBuild &build,
-            const ComputeNodeMaterializePerfStats &materializePerf)
+            const ComputeNodeMaterializePerfStats &materializePerf,
+            std::vector<FinalFaninPullbackCandidate> *selectedCandidates = nullptr)
         {
             using wolvrix::lib::grh::OperationId;
             using wolvrix::lib::grh::OperationIdHash;
@@ -9791,6 +9792,10 @@ namespace wolvrix::lib::transform
             using wolvrix::lib::grh::ValueType;
 
             FinalFaninPullbackProbeStats stats;
+            if (selectedCandidates != nullptr)
+            {
+                selectedCandidates->clear();
+            }
             const std::size_t computeSupernodeCap =
                 options.maxOpInComputeSupernode == 0
                     ? std::numeric_limits<std::size_t>::max()
@@ -10310,11 +10315,573 @@ namespace wolvrix::lib::transform
                 ++stats.selected;
                 stats.movedOps += candidate.opCount;
                 stats.projectedBaeGain += candidate.gain;
+                if (selectedCandidates != nullptr)
+                {
+                    selectedCandidates->push_back(candidate);
+                }
                 ++stats.selectedByGain[std::to_string(candidate.gain)];
                 ++stats.selectedByNodeOps[std::to_string(candidate.opCount)];
                 ++stats.selectedByMaxWidth[std::to_string(candidate.maxValueWidth)];
             }
             return stats;
+        }
+
+        struct FinalFaninPullbackStrictStats
+        {
+            std::size_t applied = 0;
+            std::size_t computeBaeBefore = 0;
+            std::size_t computeBaeAfter = 0;
+            std::size_t computeCommitBefore = 0;
+            std::size_t computeCommitAfter = 0;
+            std::size_t dagEdgesBefore = 0;
+            std::size_t dagEdgesAfter = 0;
+            std::size_t actualBaeGain = 0;
+            bool supernodesValid = false;
+            bool kindsValid = false;
+            bool scheduledOpsValid = false;
+            bool capacityValid = false;
+            bool commitValid = false;
+            bool computePartitionValid = false;
+            bool dagValid = false;
+            bool topoValid = false;
+            bool stateReadValid = false;
+            bool computeCommitValid = false;
+            bool baeGainValid = false;
+        };
+
+        std::size_t countFinalScheduleDagEdges(const ActivityScheduleBuild &build)
+        {
+            return std::accumulate(
+                build.dag.begin(),
+                build.dag.end(),
+                std::size_t{0},
+                [](std::size_t count, const auto &succs) { return count + succs.size(); });
+        }
+
+        std::vector<uint64_t> finalScheduleCommitValuePairs(const ActivityScheduleBuild &build)
+        {
+            std::vector<uint64_t> pairs;
+            for (std::size_t valueIndex = 0; valueIndex < build.valueFanout.size(); ++valueIndex)
+            {
+                for (const uint32_t target : build.valueFanout[valueIndex])
+                {
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Commit)
+                    {
+                        pairs.push_back((static_cast<uint64_t>(valueIndex + 1) << 32) |
+                                        target);
+                    }
+                }
+            }
+            std::sort(pairs.begin(), pairs.end());
+            return pairs;
+        }
+
+        bool rebuildFinalScheduleDerivedNoSplit(const wolvrix::lib::grh::Graph &graph,
+                                                ActivityScheduleBuild &build,
+                                                std::string &error)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::ValueId;
+
+            if (build.supernodeToOps.size() != build.supernodeKinds.size() ||
+                build.supernodeToOps.size() != build.computeNodesBySupernode.size())
+            {
+                error = "activity-schedule final-fanin pullback strict rebuild shape mismatch";
+                return false;
+            }
+
+            std::size_t maxOpIndex = 0;
+            for (const OperationId opId : graph.operations())
+            {
+                maxOpIndex = std::max<std::size_t>(maxOpIndex, opId.index);
+            }
+            build.opToSupernode.assign(maxOpIndex, kInvalidActivitySupernodeId);
+            std::vector<uint32_t> supernodeOfOp(maxOpIndex + 1,
+                                                kInvalidActivitySupernodeId);
+            for (uint32_t supernode = 0; supernode < build.supernodeToOps.size(); ++supernode)
+            {
+                for (const OperationId opId : build.supernodeToOps[supernode])
+                {
+                    if (!opId.valid() || opId.index > maxOpIndex)
+                    {
+                        error = "activity-schedule final-fanin pullback strict rebuild invalid op";
+                        return false;
+                    }
+                    if (supernodeOfOp[opId.index] != kInvalidActivitySupernodeId)
+                    {
+                        error = "activity-schedule final-fanin pullback strict rebuild duplicate op=" +
+                                std::to_string(opId.index);
+                        return false;
+                    }
+                    build.opToSupernode[opId.index - 1] = supernode;
+                    supernodeOfOp[opId.index] = supernode;
+                }
+            }
+
+            build.dag.assign(build.supernodeToOps.size(), {});
+            build.valueFanout.clear();
+            build.valueSourceKind.clear();
+            build.valueSourceSupernode.clear();
+            if (!graph.values().empty())
+            {
+                build.valueFanout.assign(graph.values().back().index, {});
+                build.valueSourceKind.assign(graph.values().back().index + 1,
+                                             wolvrix::lib::grh::OperationKind::kConstant);
+                build.valueSourceSupernode.assign(graph.values().back().index + 1,
+                                                  kInvalidActivitySupernodeId);
+                for (const ValueId value : graph.values())
+                {
+                    if (!value.valid() || value.index >= build.valueSourceKind.size())
+                    {
+                        continue;
+                    }
+                    const OperationId def = graph.valueDef(value);
+                    if (!def.valid())
+                    {
+                        continue;
+                    }
+                    build.valueSourceKind[value.index] = graph.opKind(def);
+                    if (def.index < supernodeOfOp.size())
+                    {
+                        build.valueSourceSupernode[value.index] = supernodeOfOp[def.index];
+                    }
+                }
+            }
+
+            std::unordered_set<uint64_t> seenEdges;
+            const auto addDependency = [&](ValueId value,
+                                           uint32_t target,
+                                           bool includeNoDefFanout)
+            {
+                if (!value.valid() || target >= build.supernodeToOps.size())
+                {
+                    return;
+                }
+                const OperationId def = graph.valueDef(value);
+                if (!def.valid())
+                {
+                    if (includeNoDefFanout && value.index > 0 &&
+                        value.index <= build.valueFanout.size())
+                    {
+                        build.valueFanout[value.index - 1].push_back(target);
+                    }
+                    return;
+                }
+                if (def.index >= supernodeOfOp.size())
+                {
+                    return;
+                }
+                const uint32_t source = supernodeOfOp[def.index];
+                if (source == kInvalidActivitySupernodeId || source == target)
+                {
+                    return;
+                }
+                if (source < build.supernodeKinds.size() &&
+                    build.supernodeKinds[source] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    return;
+                }
+                const uint64_t packed = (static_cast<uint64_t>(source) << 32) | target;
+                if (seenEdges.insert(packed).second)
+                {
+                    build.dag[source].push_back(target);
+                }
+                if (value.index > 0 && value.index <= build.valueFanout.size())
+                {
+                    build.valueFanout[value.index - 1].push_back(target);
+                }
+            };
+
+            for (uint32_t supernode = 0; supernode < build.supernodeToOps.size(); ++supernode)
+            {
+                for (const OperationId opId : build.supernodeToOps[supernode])
+                {
+                    const auto op = graph.getOperation(opId);
+                    for (const ValueId operand : op.operands())
+                    {
+                        if (graph.valueDef(operand).valid())
+                        {
+                            addDependency(operand, supernode, false);
+                        }
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            addDependency(*indexValue, supernode, true);
+                        }
+                    }
+                }
+            }
+            for (auto &succs : build.dag)
+            {
+                std::sort(succs.begin(), succs.end());
+                succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+            }
+            for (auto &fanout : build.valueFanout)
+            {
+                std::sort(fanout.begin(), fanout.end());
+                fanout.erase(std::unique(fanout.begin(), fanout.end()), fanout.end());
+            }
+
+            build.stateReadSupernodes.clear();
+            for (uint32_t supernode = 0; supernode < build.supernodeToOps.size(); ++supernode)
+            {
+                if (build.supernodeKinds[supernode] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    continue;
+                }
+                for (const OperationId opId : build.supernodeToOps[supernode])
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto stateSymbol = stateSymbolForReadOp(op);
+                    if (stateSymbol && !stateSymbol->empty())
+                    {
+                        build.stateReadSupernodes[*stateSymbol].push_back(supernode);
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        for (const auto &storageSymbol :
+                             regToMemIntentSliceStorageReadSymbols(graph, op))
+                        {
+                            build.stateReadSupernodes[storageSymbol].push_back(supernode);
+                        }
+                    }
+                }
+            }
+            for (auto &[_, supernodes] : build.stateReadSupernodes)
+            {
+                std::sort(supernodes.begin(), supernodes.end());
+                supernodes.erase(std::unique(supernodes.begin(), supernodes.end()),
+                                 supernodes.end());
+            }
+
+            try
+            {
+                build.topoOrder = topoOrderForDag(build.dag);
+            }
+            catch (const std::exception &ex)
+            {
+                error = std::string("activity-schedule final-fanin pullback strict topo rebuild failed: ") +
+                        ex.what();
+                return false;
+            }
+            if (build.topoOrder.size() != build.supernodeToOps.size())
+            {
+                error = "activity-schedule final-fanin pullback strict topo rebuild missing supernodes";
+                return false;
+            }
+            return true;
+        }
+
+        bool applyFinalFaninPullbackStrict(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const ComputeRewriteBuild &rewrite,
+            const ActivityScheduleBuild &baseline,
+            const std::vector<FinalFaninPullbackCandidate> &selected,
+            std::size_t projectedBaeGain,
+            ActivityScheduleBuild &build,
+            FinalFaninPullbackStrictStats &stats,
+            std::string &error)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+
+            stats = FinalFaninPullbackStrictStats{};
+            ActivityScheduleBuild candidate = baseline;
+            const std::size_t computeSupernodeCap =
+                options.maxOpInComputeSupernode == 0
+                    ? std::numeric_limits<std::size_t>::max()
+                    : options.maxOpInComputeSupernode;
+            std::set<uint32_t> touchedSupernodes;
+
+            for (const auto &move : selected)
+            {
+                if (move.computeNode >= rewrite.computeNodes.size() ||
+                    move.source >= candidate.supernodeToOps.size() ||
+                    move.target >= candidate.supernodeToOps.size() ||
+                    move.source == move.target ||
+                    candidate.supernodeKinds[move.source] != ActivityScheduleSupernodeKind::Compute ||
+                    candidate.supernodeKinds[move.target] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    error = "activity-schedule final-fanin pullback strict invalid selected owner node=" +
+                            std::to_string(move.computeNode);
+                    return false;
+                }
+                const auto &nodeOps = rewrite.computeNodes[move.computeNode].ops;
+                if (nodeOps.size() != move.opCount || nodeOps != move.touchedOps)
+                {
+                    error = "activity-schedule final-fanin pullback strict stale selected node=" +
+                            std::to_string(move.computeNode);
+                    return false;
+                }
+
+                auto &sourceOps = candidate.supernodeToOps[move.source];
+                auto &targetOps = candidate.supernodeToOps[move.target];
+                std::unordered_set<OperationId, OperationIdHash> moveOps(nodeOps.begin(),
+                                                                         nodeOps.end());
+                const std::size_t targetMatches = static_cast<std::size_t>(std::count_if(
+                    targetOps.begin(),
+                    targetOps.end(),
+                    [&](OperationId op) { return moveOps.contains(op); }));
+                const bool sourceAlreadyContains = std::any_of(
+                    sourceOps.begin(),
+                    sourceOps.end(),
+                    [&](OperationId op) { return moveOps.contains(op); });
+                if (targetMatches != nodeOps.size() || sourceAlreadyContains ||
+                    targetOps.size() <= nodeOps.size() ||
+                    sourceOps.size() > computeSupernodeCap ||
+                    nodeOps.size() > computeSupernodeCap - sourceOps.size())
+                {
+                    error = "activity-schedule final-fanin pullback strict move precondition failed node=" +
+                            std::to_string(move.computeNode) +
+                            " source=" + std::to_string(move.source) +
+                            " target=" + std::to_string(move.target);
+                    return false;
+                }
+
+                auto &sourceNodes = candidate.computeNodesBySupernode[move.source];
+                auto &targetNodes = candidate.computeNodesBySupernode[move.target];
+                const std::size_t targetNodeMatches = static_cast<std::size_t>(
+                    std::count(targetNodes.begin(), targetNodes.end(), move.computeNode));
+                if (targetNodeMatches != 1 ||
+                    std::find(sourceNodes.begin(), sourceNodes.end(), move.computeNode) !=
+                        sourceNodes.end())
+                {
+                    error = "activity-schedule final-fanin pullback strict node partition precondition failed node=" +
+                            std::to_string(move.computeNode);
+                    return false;
+                }
+
+                targetOps.erase(std::remove_if(targetOps.begin(),
+                                               targetOps.end(),
+                                               [&](OperationId op) { return moveOps.contains(op); }),
+                                targetOps.end());
+                sourceOps.insert(sourceOps.end(), nodeOps.begin(), nodeOps.end());
+                targetNodes.erase(std::remove(targetNodes.begin(),
+                                              targetNodes.end(),
+                                              move.computeNode),
+                                  targetNodes.end());
+                sourceNodes.push_back(move.computeNode);
+                touchedSupernodes.insert(move.source);
+                touchedSupernodes.insert(move.target);
+                ++stats.applied;
+            }
+
+            for (const uint32_t supernode : touchedSupernodes)
+            {
+                std::vector<OperationId> orderedOps;
+                if (!topoSortLocalOps(graph,
+                                      candidate.supernodeToOps[supernode],
+                                      orderedOps,
+                                      error))
+                {
+                    error = "activity-schedule final-fanin pullback strict local topo failed supernode=" +
+                            std::to_string(supernode) + ": " + error;
+                    return false;
+                }
+                if (orderedOps.size() != candidate.supernodeToOps[supernode].size())
+                {
+                    error = "activity-schedule final-fanin pullback strict local topo lost ops supernode=" +
+                            std::to_string(supernode);
+                    return false;
+                }
+                candidate.supernodeToOps[supernode] = std::move(orderedOps);
+            }
+
+            if (!rebuildFinalScheduleDerivedNoSplit(graph, candidate, error))
+            {
+                return false;
+            }
+
+            stats.supernodesValid =
+                candidate.supernodeToOps.size() == baseline.supernodeToOps.size();
+            if (!stats.supernodesValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: supernode count";
+                return false;
+            }
+            stats.kindsValid = candidate.supernodeKinds == baseline.supernodeKinds;
+            if (!stats.kindsValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: supernode kinds";
+                return false;
+            }
+
+            std::vector<OperationId> baselineOps;
+            std::vector<OperationId> candidateOps;
+            std::unordered_set<OperationId, OperationIdHash> uniqueCandidateOps;
+            bool candidateHasDuplicate = false;
+            for (const auto &ops : baseline.supernodeToOps)
+            {
+                baselineOps.insert(baselineOps.end(), ops.begin(), ops.end());
+            }
+            for (const auto &ops : candidate.supernodeToOps)
+            {
+                candidateOps.insert(candidateOps.end(), ops.begin(), ops.end());
+                for (const OperationId op : ops)
+                {
+                    candidateHasDuplicate |= !uniqueCandidateOps.insert(op).second;
+                }
+            }
+            const auto opLess = [](OperationId lhs, OperationId rhs)
+            {
+                return lhs.index < rhs.index;
+            };
+            std::sort(baselineOps.begin(), baselineOps.end(), opLess);
+            std::sort(candidateOps.begin(), candidateOps.end(), opLess);
+            stats.scheduledOpsValid = !candidateHasDuplicate && baselineOps == candidateOps;
+            if (!stats.scheduledOpsValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: scheduled ops";
+                return false;
+            }
+
+            stats.capacityValid = true;
+            stats.commitValid = true;
+            for (uint32_t supernode = 0; supernode < candidate.supernodeToOps.size(); ++supernode)
+            {
+                if (candidate.supernodeKinds[supernode] == ActivityScheduleSupernodeKind::Compute)
+                {
+                    stats.capacityValid &= !candidate.supernodeToOps[supernode].empty() &&
+                                           candidate.supernodeToOps[supernode].size() <=
+                                               computeSupernodeCap;
+                }
+                else
+                {
+                    stats.commitValid &= candidate.supernodeToOps[supernode] ==
+                                         baseline.supernodeToOps[supernode];
+                }
+            }
+            if (!stats.capacityValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: compute capacity";
+                return false;
+            }
+            if (!stats.commitValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: commit partition";
+                return false;
+            }
+
+            std::vector<std::size_t> computeNodeUses(rewrite.computeNodes.size(), 0);
+            stats.computePartitionValid =
+                candidate.computeNodesBySupernode.size() == candidate.supernodeToOps.size();
+            for (uint32_t supernode = 0;
+                 stats.computePartitionValid &&
+                 supernode < candidate.computeNodesBySupernode.size();
+                 ++supernode)
+            {
+                const auto &nodeIds = candidate.computeNodesBySupernode[supernode];
+                if (candidate.supernodeKinds[supernode] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    stats.computePartitionValid &= nodeIds.empty();
+                    continue;
+                }
+                std::unordered_set<OperationId, OperationIdHash> expectedOps;
+                for (const uint32_t nodeId : nodeIds)
+                {
+                    if (nodeId >= rewrite.computeNodes.size())
+                    {
+                        stats.computePartitionValid = false;
+                        break;
+                    }
+                    ++computeNodeUses[nodeId];
+                    for (const OperationId op : rewrite.computeNodes[nodeId].ops)
+                    {
+                        stats.computePartitionValid &= expectedOps.insert(op).second;
+                    }
+                }
+                std::unordered_set<OperationId, OperationIdHash> actualOps(
+                    candidate.supernodeToOps[supernode].begin(),
+                    candidate.supernodeToOps[supernode].end());
+                stats.computePartitionValid &= expectedOps == actualOps &&
+                                               actualOps.size() ==
+                                                   candidate.supernodeToOps[supernode].size();
+            }
+            stats.computePartitionValid &= std::all_of(
+                computeNodeUses.begin(),
+                computeNodeUses.end(),
+                [](std::size_t uses) { return uses == 1; });
+            for (const auto &move : selected)
+            {
+                const auto &sourceNodes = candidate.computeNodesBySupernode[move.source];
+                const auto &targetNodes = candidate.computeNodesBySupernode[move.target];
+                stats.computePartitionValid &=
+                    std::count(sourceNodes.begin(), sourceNodes.end(), move.computeNode) == 1 &&
+                    std::find(targetNodes.begin(), targetNodes.end(), move.computeNode) ==
+                        targetNodes.end();
+            }
+            if (!stats.computePartitionValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: compute-node partition";
+                return false;
+            }
+
+            stats.dagEdgesBefore = countFinalScheduleDagEdges(baseline);
+            stats.dagEdgesAfter = countFinalScheduleDagEdges(candidate);
+            stats.dagValid = candidate.dag == baseline.dag;
+            stats.topoValid = candidate.topoOrder == baseline.topoOrder;
+            stats.stateReadValid =
+                candidate.stateReadSupernodes == baseline.stateReadSupernodes;
+            if (!stats.dagValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: DAG before=" +
+                        std::to_string(stats.dagEdgesBefore) +
+                        " after=" + std::to_string(stats.dagEdgesAfter);
+                return false;
+            }
+            if (!stats.topoValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: topo order";
+                return false;
+            }
+            if (!stats.stateReadValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: state-read sets";
+                return false;
+            }
+
+            const ActivityScheduleSummaryStats baselineSummary =
+                buildActivityScheduleSummaryStats(baseline, rewrite, opData, graph);
+            const ActivityScheduleSummaryStats candidateSummary =
+                buildActivityScheduleSummaryStats(candidate, rewrite, opData, graph);
+            stats.computeBaeBefore = baselineSummary.computeComputeValuePairs;
+            stats.computeBaeAfter = candidateSummary.computeComputeValuePairs;
+            stats.computeCommitBefore = baselineSummary.computeCommitValuePairs;
+            stats.computeCommitAfter = candidateSummary.computeCommitValuePairs;
+            stats.computeCommitValid =
+                stats.computeCommitBefore == stats.computeCommitAfter &&
+                finalScheduleCommitValuePairs(baseline) ==
+                    finalScheduleCommitValuePairs(candidate);
+            if (!stats.computeCommitValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: compute-commit before=" +
+                        std::to_string(stats.computeCommitBefore) +
+                        " after=" + std::to_string(stats.computeCommitAfter);
+                return false;
+            }
+            stats.actualBaeGain =
+                stats.computeBaeBefore >= stats.computeBaeAfter
+                    ? stats.computeBaeBefore - stats.computeBaeAfter
+                    : 0;
+            stats.baeGainValid = stats.computeBaeBefore >= stats.computeBaeAfter &&
+                                 stats.actualBaeGain == projectedBaeGain;
+            if (!stats.baeGainValid)
+            {
+                error = "activity-schedule final-fanin pullback strict invariant failed: BAE predicted=" +
+                        std::to_string(projectedBaeGain) +
+                        " actual=" + std::to_string(stats.actualBaeGain) +
+                        " before=" + std::to_string(stats.computeBaeBefore) +
+                        " after=" + std::to_string(stats.computeBaeAfter);
+                return false;
+            }
+
+            build = std::move(candidate);
+            return true;
         }
 
     } // namespace
@@ -10354,9 +10921,17 @@ namespace wolvrix::lib::transform
             return result;
         }
         if (options_.finalFaninPullbackPolicy != "off" &&
-            options_.finalFaninPullbackPolicy != "probe")
+            options_.finalFaninPullbackPolicy != "probe" &&
+            options_.finalFaninPullbackPolicy != "strict")
         {
-            error("activity-schedule final_fanin_pullback_policy must be off or probe");
+            error("activity-schedule final_fanin_pullback_policy must be off, probe, or strict");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalFaninPullbackPolicy == "strict" &&
+            options_.finalTopoPolicy != "level-id")
+        {
+            error("activity-schedule strict final-fanin pullback requires final_topo_policy=level-id");
             result.failed = true;
             return result;
         }
@@ -10907,7 +11482,7 @@ namespace wolvrix::lib::transform
         {
             const auto probeStart = std::chrono::steady_clock::now();
             const FinalFaninPullbackProbeStats probe =
-                probeFinalFaninPullback(*graph, options_, rewrite, build, materializePerf);
+                evaluateFinalFaninPullback(*graph, options_, rewrite, build, materializePerf);
             const std::uint64_t probeMs = elapsedMs(probeStart);
             logInfo("activity-schedule final-fanin pullback probe: policy=" +
                     options_.finalFaninPullbackPolicy +
@@ -10977,6 +11552,129 @@ namespace wolvrix::lib::transform
                     " selected_by_gain=" + formatTopCounts(probe.selectedByGain, 32) +
                     " selected_by_node_ops=" + formatTopCounts(probe.selectedByNodeOps, 32) +
                     " selected_by_max_width=" + formatTopCounts(probe.selectedByMaxWidth, 32));
+        }
+        else if (options_.finalFaninPullbackPolicy == "strict")
+        {
+            if (materializePerf.splitOversizeComputeNodes != 0)
+            {
+                error(*graph,
+                      "activity-schedule strict final-fanin pullback does not support split compute nodes: split_nodes=" +
+                          std::to_string(materializePerf.splitOversizeComputeNodes) +
+                          " split_supernodes=" +
+                          std::to_string(materializePerf.splitOversizeComputeNodeSupernodes));
+                result.failed = true;
+                return result;
+            }
+            const auto strictStart = std::chrono::steady_clock::now();
+            const ActivityScheduleBuild baselineBuild = build;
+            std::vector<FinalFaninPullbackCandidate> selectedCandidates;
+            const FinalFaninPullbackProbeStats evaluation =
+                evaluateFinalFaninPullback(*graph,
+                                           options_,
+                                           rewrite,
+                                           baselineBuild,
+                                           materializePerf,
+                                           &selectedCandidates);
+            if (evaluation.skippedOversize || evaluation.skippedFinalTopo ||
+                evaluation.selected != selectedCandidates.size())
+            {
+                error(*graph,
+                      "activity-schedule strict final-fanin pullback evaluator gate failed: selected=" +
+                          std::to_string(evaluation.selected) +
+                          " plans=" + std::to_string(selectedCandidates.size()) +
+                          " skipped_oversize=" +
+                          std::string(evaluation.skippedOversize ? "true" : "false") +
+                          " skipped_final_topo=" +
+                          std::string(evaluation.skippedFinalTopo ? "true" : "false"));
+                result.failed = true;
+                return result;
+            }
+            FinalFaninPullbackStrictStats strictStats;
+            std::string strictError;
+            if (!applyFinalFaninPullbackStrict(*graph,
+                                               options_,
+                                               opData,
+                                               rewrite,
+                                               baselineBuild,
+                                               selectedCandidates,
+                                               evaluation.projectedBaeGain,
+                                               build,
+                                               strictStats,
+                                               strictError))
+            {
+                error(*graph, strictError);
+                result.failed = true;
+                return result;
+            }
+            const std::uint64_t strictMs = elapsedMs(strictStart);
+            logInfo("activity-schedule final-fanin pullback strict: policy=" +
+                    options_.finalFaninPullbackPolicy +
+                    " max_node_ops=" +
+                    std::to_string(options_.finalFaninPullbackMaxNodeOps) +
+                    " max_value_width=" +
+                    std::to_string(options_.finalFaninPullbackMaxValueWidth) +
+                    " min_gain=" + std::to_string(options_.finalFaninPullbackMinGain) +
+                    " max_moves=" + std::to_string(options_.finalFaninPullbackMaxMoves) +
+                    " max_moved_op_ppm=" +
+                    std::to_string(options_.finalFaninPullbackMaxMovedOpPpm) +
+                    " scanned=" + std::to_string(evaluation.scanned) +
+                    " pure=" + std::to_string(evaluation.pure) +
+                    " common_source=" + std::to_string(evaluation.commonSource) +
+                    " exact_eligible=" + std::to_string(evaluation.exactEligible) +
+                    " selected=" + std::to_string(evaluation.selected) +
+                    " applied=" + std::to_string(strictStats.applied) +
+                    " moved_ops=" + std::to_string(evaluation.movedOps) +
+                    " moved_op_limit=" + std::to_string(evaluation.movedOpLimit) +
+                    " eligible_projected_bae_gain=" +
+                    std::to_string(evaluation.eligibleProjectedBaeGain) +
+                    " projected_bae_gain=" +
+                    std::to_string(evaluation.projectedBaeGain) +
+                    " actual_bae_gain=" + std::to_string(strictStats.actualBaeGain) +
+                    " compute_bae_before=" +
+                    std::to_string(strictStats.computeBaeBefore) +
+                    " compute_bae_after=" +
+                    std::to_string(strictStats.computeBaeAfter) +
+                    " compute_commit_before=" +
+                    std::to_string(strictStats.computeCommitBefore) +
+                    " compute_commit_after=" +
+                    std::to_string(strictStats.computeCommitAfter) +
+                    " dag_edges_before=" + std::to_string(strictStats.dagEdgesBefore) +
+                    " dag_edges_after=" + std::to_string(strictStats.dagEdgesAfter) +
+                    " elapsed_ms=" + std::to_string(strictMs));
+            logInfo("activity-schedule final-fanin pullback strict validators: supernodes=" +
+                    std::string(strictStats.supernodesValid ? "true" : "false") +
+                    " kinds=" + std::string(strictStats.kindsValid ? "true" : "false") +
+                    " scheduled_ops=" +
+                    std::string(strictStats.scheduledOpsValid ? "true" : "false") +
+                    " capacity=" + std::string(strictStats.capacityValid ? "true" : "false") +
+                    " commit=" + std::string(strictStats.commitValid ? "true" : "false") +
+                    " compute_partition=" +
+                    std::string(strictStats.computePartitionValid ? "true" : "false") +
+                    " dag=" + std::string(strictStats.dagValid ? "true" : "false") +
+                    " topo=" + std::string(strictStats.topoValid ? "true" : "false") +
+                    " state_read=" +
+                    std::string(strictStats.stateReadValid ? "true" : "false") +
+                    " compute_commit=" +
+                    std::string(strictStats.computeCommitValid ? "true" : "false") +
+                    " bae_gain=" + std::string(strictStats.baeGainValid ? "true" : "false"));
+            logInfo("activity-schedule final-fanin pullback strict selection: rejected_move_limit=" +
+                    std::to_string(evaluation.rejectedSelectionMoveLimit) +
+                    " rejected_budget=" +
+                    std::to_string(evaluation.rejectedSelectionBudget) +
+                    " rejected_capacity=" +
+                    std::to_string(evaluation.rejectedSelectionCapacity) +
+                    " rejected_target_empty=" +
+                    std::to_string(evaluation.rejectedSelectionTargetEmpty) +
+                    " rejected_node_overlap=" +
+                    std::to_string(evaluation.rejectedSelectionNodeOverlap) +
+                    " rejected_value_overlap=" +
+                    std::to_string(evaluation.rejectedSelectionValueOverlap) +
+                    " eligible_by_gain=" + formatTopCounts(evaluation.eligibleByGain, 32) +
+                    " selected_by_gain=" + formatTopCounts(evaluation.selectedByGain, 32) +
+                    " selected_by_node_ops=" +
+                    formatTopCounts(evaluation.selectedByNodeOps, 32) +
+                    " selected_by_max_width=" +
+                    formatTopCounts(evaluation.selectedByMaxWidth, 32));
         }
 
         const std::string keyPrefix = options_.path + ".activity_schedule.";

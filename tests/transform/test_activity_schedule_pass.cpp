@@ -4315,6 +4315,7 @@ int main()
             bool bindCandidateOutput = false;
             bool declareCandidate = false;
             bool addCommitConsumer = false;
+            bool addUnrelatedStateCommit = false;
             bool fillSourceCapacity = false;
             bool candidateUsesNoDef = false;
             bool candidateUsesTargetPredecessor = false;
@@ -4334,6 +4335,23 @@ int main()
         {
             auto &graph = design.createGraph(name);
             design.markAsTop(name);
+            std::optional<wolvrix::lib::grh::ValueId> unrelatedStateRead;
+            if (fixture.addUnrelatedStateCommit)
+            {
+                const auto reg = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegister,
+                    graph.internSymbol("unrelated_state"));
+                graph.setAttr(reg, "width", static_cast<int64_t>(8));
+                graph.setAttr(reg, "isSigned", false);
+                const auto value = makeValue(graph, "unrelated_state_read_value", 8);
+                const auto read = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                    graph.internSymbol("unrelated_state_read"));
+                graph.addResult(read, value);
+                graph.setAttr(read, "regSymbol", std::string("unrelated_state"));
+                graph.bindOutputPort("unrelated_state_read", value);
+                unrelatedStateRead = value;
+            }
             std::vector<wolvrix::lib::grh::ValueId> sourceValues;
             FaninFixtureOps ops;
             for (std::size_t i = 0; i < fixture.sourceCount; ++i)
@@ -4454,7 +4472,9 @@ int main()
             graph.addResult(ops.tail, tailValue);
 
             auto output = tailValue;
-            for (std::size_t i = 0; i < fixture.sourceCount - 2; ++i)
+            const std::size_t tailChainCount =
+                fixture.sourceCount - 2 + (fixture.addUnrelatedStateCommit ? 1 : 0);
+            for (std::size_t i = 0; i < tailChainCount; ++i)
             {
                 const std::string suffix = std::to_string(i);
                 const auto value = makeValue(graph, "tail_chain_value_" + suffix, 8);
@@ -4466,6 +4486,25 @@ int main()
                 output = value;
             }
             graph.bindOutputPort("output", output);
+
+            if (unrelatedStateRead)
+            {
+                const auto enable = makeValue(graph, "unrelated_commit_enable", 1);
+                const auto mask = makeValue(graph, "unrelated_commit_mask", 8);
+                const auto clock = makeValue(graph, "unrelated_commit_clock", 1);
+                graph.bindInputPort("unrelated_commit_enable", enable);
+                graph.bindInputPort("unrelated_commit_mask", mask);
+                graph.bindInputPort("unrelated_commit_clock", clock);
+                const auto write = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                    graph.internSymbol("unrelated_commit_write"));
+                graph.addOperand(write, enable);
+                graph.addOperand(write, *unrelatedStateRead);
+                graph.addOperand(write, mask);
+                graph.addOperand(write, clock);
+                graph.setAttr(write, "regSymbol", std::string("unrelated_state"));
+                graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            }
 
             if (fixture.addCommitConsumer)
             {
@@ -4499,7 +4538,8 @@ int main()
                                     std::string *log = nullptr,
                                     std::size_t maxSupernodeOps = 5,
                                     std::size_t maxMoves = 4096,
-                                    std::size_t movedOpPpm = 1000000)
+                                    std::size_t movedOpPpm = 1000000,
+                                    std::size_t dpSegmentPenaltyPpm = 1000000)
         {
             ActivityScheduleOptions options;
             options.path = name;
@@ -4516,6 +4556,7 @@ int main()
             options.finalFaninPullbackMinGain = 3;
             options.finalFaninPullbackMaxMoves = maxMoves;
             options.finalFaninPullbackMaxMovedOpPpm = movedOpPpm;
+            options.dpSegmentPenaltyPpm = dpSegmentPenaltyPpm;
             PassManager manager;
             manager.options().session = &session;
             if (log != nullptr)
@@ -4634,6 +4675,247 @@ int main()
             parseStatField(probeLog, "moved_ops") != 1)
         {
             return fail("Expected four-input final-fanin projected gain three: " + probeLog);
+        }
+
+        const auto commitPartition = [](const ScheduleView &schedule)
+        {
+            std::vector<std::vector<wolvrix::lib::grh::OperationId>> partition;
+            if (schedule.supernodeToOps == nullptr || schedule.supernodeKinds == nullptr)
+            {
+                return partition;
+            }
+            for (std::size_t node = 0; node < schedule.supernodeToOps->size(); ++node)
+            {
+                if ((*schedule.supernodeKinds)[node] ==
+                    ActivityScheduleSupernodeKind::Commit)
+                {
+                    partition.push_back((*schedule.supernodeToOps)[node]);
+                }
+            }
+            return partition;
+        };
+        const auto scheduleOwner = [](const ScheduleView &schedule,
+                                      wolvrix::lib::grh::OperationId op)
+        {
+            return schedule.opToSupernode == nullptr || op.index == 0 ||
+                           op.index - 1 >= schedule.opToSupernode->size()
+                       ? kInvalidActivitySupernodeId
+                       : (*schedule.opToSupernode)[op.index - 1];
+        };
+
+        wolvrix::lib::grh::Design strictDesign;
+        const FaninFixtureOps strictOps =
+            buildFixture(strictDesign, std::string(kName), {});
+        SessionStore strictSession;
+        std::string strictLog;
+        if (!runFixture(strictDesign, std::string(kName), "strict", strictSession, &strictLog))
+        {
+            return fail("Expected strict final-fanin pullback schedule to succeed: " + strictLog);
+        }
+        const auto strictSchedule = loadSchedule(strictSession, std::string(kName));
+        const auto *strictGraph = strictDesign.findGraph(std::string(kName));
+        if (strictGraph == nullptr ||
+            validateCommonScheduleShape(*strictGraph, strictSchedule) != 0 ||
+            strictSchedule.supernodeToOps == nullptr || strictSchedule.supernodeKinds == nullptr ||
+            strictSchedule.computeNodesBySupernode == nullptr ||
+            offSchedule.computeNodesBySupernode == nullptr || offSchedule.summaryStats == nullptr ||
+            strictSchedule.summaryStats == nullptr)
+        {
+            return fail("Expected complete strict final-fanin schedule outputs");
+        }
+        const uint32_t strictSourceOwner = scheduleOwner(strictSchedule,
+                                                         strictOps.sources.front());
+        const uint32_t strictCandidateOwner = scheduleOwner(strictSchedule,
+                                                            strictOps.candidate);
+        const uint32_t strictTailOwner = scheduleOwner(strictSchedule, strictOps.tail);
+        if (strictSourceOwner != sourceOwner || strictCandidateOwner != sourceOwner ||
+            strictTailOwner != targetOwner ||
+            !std::all_of(strictOps.sources.begin(),
+                         strictOps.sources.end(),
+                         [&](const auto op)
+                         {
+                             return scheduleOwner(strictSchedule, op) == sourceOwner;
+                         }) ||
+            (*strictSchedule.supernodeToOps)[sourceOwner].size() != 5 ||
+            (*strictSchedule.supernodeToOps)[targetOwner].size() != 4)
+        {
+            return fail("Expected strict final-fanin candidate owner move from target to source");
+        }
+        std::vector<uint32_t> addedComputeNodes;
+        for (const uint32_t node :
+             (*strictSchedule.computeNodesBySupernode)[sourceOwner])
+        {
+            if (std::find((*offSchedule.computeNodesBySupernode)[sourceOwner].begin(),
+                          (*offSchedule.computeNodesBySupernode)[sourceOwner].end(),
+                          node) ==
+                (*offSchedule.computeNodesBySupernode)[sourceOwner].end())
+            {
+                addedComputeNodes.push_back(node);
+            }
+        }
+        std::vector<uint32_t> removedComputeNodes;
+        for (const uint32_t node : (*offSchedule.computeNodesBySupernode)[targetOwner])
+        {
+            if (std::find((*strictSchedule.computeNodesBySupernode)[targetOwner].begin(),
+                          (*strictSchedule.computeNodesBySupernode)[targetOwner].end(),
+                          node) ==
+                (*strictSchedule.computeNodesBySupernode)[targetOwner].end())
+            {
+                removedComputeNodes.push_back(node);
+            }
+        }
+        if (addedComputeNodes.size() != 1 || addedComputeNodes != removedComputeNodes)
+        {
+            return fail("Expected strict final-fanin to move one complete compute node");
+        }
+        const double offBae =
+            parseJsonDoubleField(*offSchedule.summaryStats, "boundary_activation_edges");
+        const double strictBae =
+            parseJsonDoubleField(*strictSchedule.summaryStats, "boundary_activation_edges");
+        const double offComputeBae =
+            parseJsonDoubleField(*offSchedule.summaryStats, "compute_compute_value_pairs");
+        const double strictComputeBae =
+            parseJsonDoubleField(*strictSchedule.summaryStats,
+                                 "compute_compute_value_pairs");
+        if (offSchedule.supernodeToOps->size() != strictSchedule.supernodeToOps->size() ||
+            *offSchedule.supernodeKinds != *strictSchedule.supernodeKinds ||
+            *offSchedule.dag != *strictSchedule.dag ||
+            *offSchedule.topoOrder != *strictSchedule.topoOrder ||
+            *offSchedule.stateReadSupernodes != *strictSchedule.stateReadSupernodes ||
+            commitPartition(offSchedule) != commitPartition(strictSchedule) ||
+            offBae != strictBae + 3.0 || offComputeBae != strictComputeBae + 3.0)
+        {
+            return fail("Expected strict final-fanin to preserve schedule structure and reduce BAE by three");
+        }
+        if (strictLog.find("activity-schedule final-fanin pullback strict:") ==
+                std::string::npos ||
+            parseStatField(strictLog, "exact_eligible") != 1 ||
+            parseStatField(strictLog, "selected") != 1 ||
+            parseStatField(strictLog, "applied") != 1 ||
+            parseStatField(strictLog, "projected_bae_gain") != 3 ||
+            parseStatField(strictLog, "actual_bae_gain") != 3 ||
+            parseStatField(strictLog, "compute_bae_before") !=
+            parseStatField(strictLog, "compute_bae_after") + 3 ||
+            parseStatField(strictLog, "dag_edges_before") !=
+                parseStatField(strictLog, "dag_edges_after") ||
+            strictLog.find(
+                "activity-schedule final-fanin pullback strict validators: "
+                "supernodes=true kinds=true scheduled_ops=true capacity=true commit=true "
+                "compute_partition=true dag=true topo=true state_read=true "
+                "compute_commit=true bae_gain=true") == std::string::npos)
+        {
+            return fail("Expected strict final-fanin projected and actual gain accounting: " +
+                        strictLog);
+        }
+
+        wolvrix::lib::grh::Design repeatStrictDesign;
+        buildFixture(repeatStrictDesign, std::string(kName), {});
+        SessionStore repeatStrictSession;
+        std::string repeatStrictLog;
+        if (!runFixture(repeatStrictDesign,
+                        std::string(kName),
+                        "strict",
+                        repeatStrictSession,
+                        &repeatStrictLog) ||
+            !schedulesEqual(strictSchedule,
+                            loadSchedule(repeatStrictSession, std::string(kName))) ||
+            parseStatField(repeatStrictLog, "applied") != 1 ||
+            parseStatField(repeatStrictLog, "actual_bae_gain") != 3)
+        {
+            return fail("Expected deterministic strict final-fanin pullback");
+        }
+
+        for (const auto &[name, maxMoves, movedOpPpm] :
+             std::vector<std::tuple<std::string, std::size_t, std::size_t>>{
+                 {"final_fanin_pullback_strict_zero_moves", 0, 1000000},
+                 {"final_fanin_pullback_strict_zero_ppm", 4096, 0},
+             })
+        {
+            wolvrix::lib::grh::Design budgetDesign;
+            buildFixture(budgetDesign, std::string(kName), {});
+            SessionStore budgetSession;
+            std::string budgetLog;
+            if (!runFixture(budgetDesign,
+                            std::string(kName),
+                            "strict",
+                            budgetSession,
+                            &budgetLog,
+                            5,
+                            maxMoves,
+                            movedOpPpm) ||
+                !schedulesEqual(offSchedule,
+                                loadSchedule(budgetSession, std::string(kName))) ||
+                parseStatField(budgetLog, "selected") != 0 ||
+                parseStatField(budgetLog, "applied") != 0 ||
+                parseStatField(budgetLog, "actual_bae_gain") != 0)
+            {
+                return fail("Expected strict final-fanin zero-budget identity for " + name +
+                            ": " + budgetLog);
+            }
+        }
+
+        {
+            const std::string name = "final_fanin_pullback_state_commit";
+            FaninFixtureOptions fixture;
+            fixture.addUnrelatedStateCommit = true;
+            wolvrix::lib::grh::Design stateOffDesign;
+            buildFixture(stateOffDesign, name, fixture);
+            SessionStore stateOffSession;
+            if (!runFixture(stateOffDesign,
+                            name,
+                            "off",
+                            stateOffSession,
+                            nullptr,
+                            6,
+                            4096,
+                            1000000,
+                            10000000))
+            {
+                return fail("Expected state/commit strict baseline schedule to succeed");
+            }
+            wolvrix::lib::grh::Design stateStrictDesign;
+            buildFixture(stateStrictDesign, name, fixture);
+            SessionStore stateStrictSession;
+            std::string stateStrictLog;
+            if (!runFixture(stateStrictDesign,
+                            name,
+                            "strict",
+                            stateStrictSession,
+                            &stateStrictLog,
+                            6,
+                            4096,
+                            1000000,
+                            10000000))
+            {
+                return fail("Expected state/commit strict schedule to succeed: " +
+                            stateStrictLog);
+            }
+            const auto stateOffSchedule = loadSchedule(stateOffSession, name);
+            const auto stateStrictSchedule = loadSchedule(stateStrictSession, name);
+            const auto stateOffCommit = commitPartition(stateOffSchedule);
+            if (stateOffSchedule.stateReadSupernodes == nullptr ||
+                stateOffSchedule.stateReadSupernodes->empty() || stateOffCommit.empty() ||
+                stateOffSchedule.summaryStats == nullptr ||
+                stateStrictSchedule.summaryStats == nullptr ||
+                stateOffSchedule.supernodeToOps->size() !=
+                    stateStrictSchedule.supernodeToOps->size() ||
+                *stateOffSchedule.supernodeKinds != *stateStrictSchedule.supernodeKinds ||
+                *stateOffSchedule.dag != *stateStrictSchedule.dag ||
+                *stateOffSchedule.topoOrder != *stateStrictSchedule.topoOrder ||
+                *stateOffSchedule.stateReadSupernodes !=
+                    *stateStrictSchedule.stateReadSupernodes ||
+                stateOffCommit != commitPartition(stateStrictSchedule) ||
+                parseJsonDoubleField(*stateOffSchedule.summaryStats,
+                                     "boundary_activation_edges") !=
+                    parseJsonDoubleField(*stateStrictSchedule.summaryStats,
+                                         "boundary_activation_edges") +
+                        3.0 ||
+                parseStatField(stateStrictLog, "applied") != 1 ||
+                parseStatField(stateStrictLog, "actual_bae_gain") != 3)
+            {
+                return fail("Expected strict final-fanin nonempty state/commit identity: " +
+                            stateStrictLog);
+            }
         }
 
         wolvrix::lib::grh::Design repeatDesign;
@@ -4879,6 +5161,7 @@ int main()
                 return fail("Expected hidden reg-to-mem index to make one input non-removable: " +
                             log);
             }
+
         }
 
         {
@@ -4914,6 +5197,7 @@ int main()
                 middle = value;
             }
             graph.bindOutputPort("middle", middle);
+            std::vector<wolvrix::lib::grh::OperationId> candidateOps;
             for (std::size_t group = 0; group < 2; ++group)
             {
                 const std::string prefix = "group_" + std::to_string(group) + "_";
@@ -4926,6 +5210,7 @@ int main()
                     graph.addOperand(candidate, sourceValues[i]);
                 }
                 graph.addResult(candidate, candidateValue);
+                candidateOps.push_back(candidate);
                 auto output = makeValue(graph, prefix + "tail_value", 8);
                 const auto tail = graph.createOperation(
                     wolvrix::lib::grh::OperationKind::kNot,
@@ -4966,6 +5251,66 @@ int main()
                 parseStatField(log, "rejected_selection_capacity") != 1)
             {
                 return fail("Expected cumulative source capacity to select one candidate: " + log);
+            }
+
+            const auto probeCapacitySchedule = loadSchedule(session, name);
+            ActivityScheduleOptions strictOptions = options;
+            strictOptions.finalFaninPullbackPolicy = "strict";
+            SessionStore strictCapacitySession;
+            std::string strictCapacityLog;
+            PassManager strictManager;
+            strictManager.options().session = &strictCapacitySession;
+            strictManager.options().logLevel = wolvrix::lib::LogLevel::Info;
+            strictManager.options().logSink =
+                [&strictCapacityLog](wolvrix::lib::LogLevel,
+                                     std::string_view,
+                                     std::string_view message)
+                {
+                    strictCapacityLog.append(message);
+                    strictCapacityLog.push_back('\n');
+                };
+            strictManager.addPass(std::make_unique<ActivitySchedulePass>(strictOptions));
+            PassDiagnostics strictDiags;
+            const PassManagerResult strictResult = strictManager.run(design, strictDiags);
+            const auto strictCapacitySchedule =
+                loadSchedule(strictCapacitySession, name);
+            const uint32_t capacitySource = scheduleOwner(probeCapacitySchedule, source);
+            std::size_t movedCandidates = 0;
+            bool unmovedCandidateStable = true;
+            for (const auto candidate : candidateOps)
+            {
+                const uint32_t before = scheduleOwner(probeCapacitySchedule, candidate);
+                const uint32_t after = scheduleOwner(strictCapacitySchedule, candidate);
+                if (before != capacitySource && after == capacitySource)
+                {
+                    ++movedCandidates;
+                }
+                else if (before != after)
+                {
+                    unmovedCandidateStable = false;
+                }
+            }
+            if (!strictResult.success || strictResult.changed || strictDiags.hasError() ||
+                movedCandidates != 1 || !unmovedCandidateStable ||
+                parseStatField(strictCapacityLog, "exact_eligible") != 2 ||
+                parseStatField(strictCapacityLog, "selected") != 1 ||
+                parseStatField(strictCapacityLog, "applied") != 1 ||
+                strictCapacityLog.find(" projected_bae_gain=3") == std::string::npos ||
+                parseStatField(strictCapacityLog, "actual_bae_gain") != 3 ||
+                parseStatField(strictCapacityLog, "rejected_capacity") != 1 ||
+                probeCapacitySchedule.supernodeToOps->size() !=
+                    strictCapacitySchedule.supernodeToOps->size() ||
+                *probeCapacitySchedule.supernodeKinds !=
+                    *strictCapacitySchedule.supernodeKinds ||
+                *probeCapacitySchedule.dag != *strictCapacitySchedule.dag ||
+                *probeCapacitySchedule.topoOrder != *strictCapacitySchedule.topoOrder ||
+                *probeCapacitySchedule.stateReadSupernodes !=
+                    *strictCapacitySchedule.stateReadSupernodes ||
+                commitPartition(probeCapacitySchedule) !=
+                    commitPartition(strictCapacitySchedule))
+            {
+                return fail("Expected strict cumulative capacity to apply only selected move: " +
+                            strictCapacityLog);
             }
         }
 
@@ -5062,9 +5407,40 @@ int main()
             const PassManagerResult result = manager.run(design, diags);
             return !result.success && diags.hasError();
         };
-        if (!runInvalid("strict", 5000) || !runInvalid("off", 1000001))
+        const auto runStrictGuardFailure = [&](const std::string &name,
+                                               const std::string &finalTopoPolicy,
+                                               bool forceActualSplit)
         {
-            return fail("Expected invalid final-fanin policy and moved-op ppm to fail");
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, name, {});
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 5;
+            options.maxOpInComputeNode = forceActualSplit ? 2 : 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.finalTopoPolicy = finalTopoPolicy;
+            options.finalFaninPullbackPolicy = "strict";
+            options.finalFaninPullbackMaxMovedOpPpm = 1000000;
+            options.splitOversizeComputeNodes = forceActualSplit;
+            options.splitOversizeComputeNodeMaxOps = forceActualSplit ? 1 : 0;
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return !result.success && diags.hasError();
+        };
+        if (!runInvalid("invalid", 5000) || !runInvalid("off", 1000001) ||
+            !runStrictGuardFailure("final_fanin_pullback_strict_non_level",
+                                   "level-op",
+                                   false) ||
+            !runStrictGuardFailure("final_fanin_pullback_strict_actual_split",
+                                   "level-id",
+                                   true))
+        {
+            return fail("Expected invalid final-fanin options and strict guards to fail");
         }
     }
 

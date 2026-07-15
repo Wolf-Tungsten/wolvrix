@@ -300,6 +300,11 @@ class Session:
         input_fullpass_specialization: bool | None = None,
         posedge_fullpass_specialization: bool | None = None,
         full_active_word_consume: bool | None = None,
+        pure_event_compute_word_bypass: bool | None = None,
+        pure_event_compute_word_profile: bool | None = None,
+        pure_event_word_pack_policy: str | None = None,
+        pure_event_word_pack_max_moved_supernode_ppm: int | None = None,
+        pure_event_word_pack_max_changed_word_ppm: int | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
@@ -307,7 +312,10 @@ class Session:
                 sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
                 sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
                 input_fullpass_specialization is not None or posedge_fullpass_specialization is not None or
-                full_active_word_consume is not None):
+                full_active_word_consume is not None or pure_event_compute_word_bypass is not None or
+                pure_event_compute_word_profile is not None or pure_event_word_pack_policy is not None or
+                pure_event_word_pack_max_moved_supernode_ppm is not None or
+                pure_event_word_pack_max_changed_word_ppm is not None):
             named_args = dict(named_args)
         if max_cpp_file_bytes is not None:
             named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
@@ -329,6 +337,16 @@ class Session:
             named_args["posedge_fullpass_specialization"] = posedge_fullpass_specialization
         if full_active_word_consume is not None:
             named_args["full_active_word_consume"] = full_active_word_consume
+        if pure_event_compute_word_bypass is not None:
+            named_args["pure_event_compute_word_bypass"] = pure_event_compute_word_bypass
+        if pure_event_compute_word_profile is not None:
+            named_args["pure_event_compute_word_profile"] = pure_event_compute_word_profile
+        if pure_event_word_pack_policy is not None:
+            named_args["pure_event_word_pack_policy"] = pure_event_word_pack_policy
+        if pure_event_word_pack_max_moved_supernode_ppm is not None:
+            named_args["pure_event_word_pack_max_moved_supernode_ppm"] = pure_event_word_pack_max_moved_supernode_ppm
+        if pure_event_word_pack_max_changed_word_ppm is not None:
+            named_args["pure_event_word_pack_max_changed_word_ppm"] = pure_event_word_pack_max_changed_word_ppm
         _compile_emit_grhsim_cpp_kwargs(named_args)
         success, diagnostics = _native.session_emit_grhsim_cpp(
             self._capsule,
@@ -737,6 +755,30 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
     if full_active_word_consume is not None:
         if not isinstance(full_active_word_consume, bool):
             raise ValueError("emit_grhsim_cpp full_active_word_consume must be a bool")
+    pure_event_compute_word_bypass = local.pop("pure_event_compute_word_bypass", None)
+    if pure_event_compute_word_bypass is not None:
+        if not isinstance(pure_event_compute_word_bypass, bool):
+            raise ValueError("emit_grhsim_cpp pure_event_compute_word_bypass must be a bool")
+    pure_event_compute_word_profile = local.pop("pure_event_compute_word_profile", None)
+    if pure_event_compute_word_profile is not None:
+        if not isinstance(pure_event_compute_word_profile, bool):
+            raise ValueError("emit_grhsim_cpp pure_event_compute_word_profile must be a bool")
+    pure_event_word_pack_policy = local.pop("pure_event_word_pack_policy", None)
+    if pure_event_word_pack_policy is not None:
+        if not isinstance(pure_event_word_pack_policy, str):
+            raise ValueError("emit_grhsim_cpp pure_event_word_pack_policy must be a string")
+        if pure_event_word_pack_policy not in {"off", "probe", "targeted"}:
+            raise ValueError(
+                "emit_grhsim_cpp pure_event_word_pack_policy must be one of: off, probe, targeted"
+            )
+    for key in (
+        "pure_event_word_pack_max_moved_supernode_ppm",
+        "pure_event_word_pack_max_changed_word_ppm",
+    ):
+        value = local.pop(key, None)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 1_000_000:
+                raise ValueError(f"emit_grhsim_cpp {key} must be an integer between 0 and 1000000")
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 
 

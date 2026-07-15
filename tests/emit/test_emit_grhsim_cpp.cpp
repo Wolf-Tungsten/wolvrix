@@ -68,6 +68,44 @@ namespace
         return count;
     }
 
+    std::optional<std::uint64_t> jsonUnsignedField(std::string_view json, std::string_view name)
+    {
+        const std::string key = "\"" + std::string(name) + "\"";
+        const std::size_t keyPos = json.find(key);
+        if (keyPos == std::string_view::npos)
+        {
+            return std::nullopt;
+        }
+        const std::size_t colonPos = json.find(':', keyPos + key.size());
+        if (colonPos == std::string_view::npos)
+        {
+            return std::nullopt;
+        }
+        const std::size_t valuePos = json.find_first_not_of(" \t\r\n", colonPos + 1u);
+        if (valuePos == std::string_view::npos || json[valuePos] < '0' || json[valuePos] > '9')
+        {
+            return std::nullopt;
+        }
+        const std::size_t valueEnd = json.find_first_not_of("0123456789", valuePos);
+        try
+        {
+            return std::stoull(std::string(json.substr(valuePos, valueEnd - valuePos)));
+        }
+        catch (const std::exception &)
+        {
+            return std::nullopt;
+        }
+    }
+
+    bool diagnosticsContain(const EmitDiagnostics &diagnostics, std::string_view needle)
+    {
+        return std::any_of(diagnostics.messages().begin(),
+                           diagnostics.messages().end(),
+                           [&](const EmitDiagnostic &message) {
+                               return message.message.find(needle) != std::string::npos;
+                           });
+    }
+
     std::size_t findMatchingBrace(std::string_view text, std::size_t openBrace)
     {
         if (openBrace == std::string_view::npos || openBrace >= text.size() || text[openBrace] != '{')
@@ -1024,7 +1062,13 @@ namespace
                                   std::optional<bool> pureEventComputeWordBypass = std::nullopt,
                                   std::optional<bool> pureEventComputeWordProfile = std::nullopt,
                                   std::size_t schedBatchMaxOps = 8u,
-                                  std::size_t schedBatchMaxEstimatedLines = 96u)
+                                  std::size_t schedBatchMaxEstimatedLines = 96u,
+                                  std::optional<std::string_view> pureEventWordPackPolicy = std::nullopt,
+                                  std::optional<std::size_t> pureEventWordPackMaxMovedSupernodePpm = std::nullopt,
+                                  std::optional<std::size_t> pureEventWordPackMaxChangedWordPpm = std::nullopt,
+                                  bool removeActivityScheduleDag = false,
+                                  std::optional<std::string_view> pureEventWordPackMaxMovedSupernodePpmRaw = std::nullopt,
+                                  std::optional<std::string_view> pureEventWordPackMaxChangedWordPpmRaw = std::nullopt)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1034,6 +1078,10 @@ namespace
         if (!runActivitySchedule(design, session, std::move(scheduleOptions)))
         {
             return false;
+        }
+        if (removeActivityScheduleDag)
+        {
+            session.erase("top.activity_schedule.dag");
         }
 
         std::filesystem::create_directories(outDir);
@@ -1075,6 +1123,30 @@ namespace
         if (pureEventComputeWordProfile)
         {
             options.attributes["pure_event_compute_word_profile"] = *pureEventComputeWordProfile ? "1" : "0";
+        }
+        if (pureEventWordPackPolicy)
+        {
+            options.attributes["pure_event_word_pack_policy"] = std::string(*pureEventWordPackPolicy);
+        }
+        if (pureEventWordPackMaxMovedSupernodePpm)
+        {
+            options.attributes["pure_event_word_pack_max_moved_supernode_ppm"] =
+                std::to_string(*pureEventWordPackMaxMovedSupernodePpm);
+        }
+        if (pureEventWordPackMaxChangedWordPpm)
+        {
+            options.attributes["pure_event_word_pack_max_changed_word_ppm"] =
+                std::to_string(*pureEventWordPackMaxChangedWordPpm);
+        }
+        if (pureEventWordPackMaxMovedSupernodePpmRaw)
+        {
+            options.attributes["pure_event_word_pack_max_moved_supernode_ppm"] =
+                std::string(*pureEventWordPackMaxMovedSupernodePpmRaw);
+        }
+        if (pureEventWordPackMaxChangedWordPpmRaw)
+        {
+            options.attributes["pure_event_word_pack_max_changed_word_ppm"] =
+                std::string(*pureEventWordPackMaxChangedWordPpmRaw);
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -1887,6 +1959,7 @@ namespace
         kHomogeneous,
         kOnceOnly,
         kMultiEvent,
+        kAlternatingEvents,
     };
 
     Design buildPureEventWordBypassDesign(PureEventWordFixtureMode mode,
@@ -1919,7 +1992,10 @@ namespace
             graph.addOperand(task, one);
             graph.addOperand(task, format);
             graph.addOperand(task, data);
-            graph.addOperand(task, clk);
+            graph.addOperand(task,
+                             mode == PureEventWordFixtureMode::kAlternatingEvents && (index % 2u) != 0u
+                                 ? auxClk
+                                 : clk);
             std::vector<std::string> edges{"posedge"};
             if (mode == PureEventWordFixtureMode::kMultiEvent)
             {
@@ -1934,6 +2010,88 @@ namespace
             graph.setAttr(task, "hasSideEffects", true);
             graph.setAttr(task, "eventEdge", std::move(edges));
         }
+        return design;
+    }
+
+    Design buildPureEventWordPackEstimatedLineDriftDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId auxClk = makeLogicValue(graph, "aux_clk", 1);
+        ValueId data = makeLogicValue(graph, "data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("aux_clk", auxClk);
+        graph.bindInputPort("data", data);
+        graph.bindOutputPort("data_out", data);
+
+        OperationId clkReg = graph.createOperation(OperationKind::kRegister,
+                                                   graph.internSymbol("pack_estimate_clk_reg"));
+        graph.setAttr(clkReg, "width", static_cast<int64_t>(8));
+        graph.setAttr(clkReg, "isSigned", false);
+        graph.setAttr(clkReg, "initValue", std::string("8'h03"));
+        OperationId auxReg = graph.createOperation(OperationKind::kRegister,
+                                                   graph.internSymbol("pack_estimate_aux_reg"));
+        graph.setAttr(auxReg, "width", static_cast<int64_t>(8));
+        graph.setAttr(auxReg, "isSigned", false);
+        graph.setAttr(auxReg, "initValue", std::string("8'h05"));
+        ValueId one = addConstant(graph, "pack_estimate_one_op", "pack_estimate_one", 1, "1'b1");
+        ValueId mask = addConstant(graph, "pack_estimate_mask_op", "pack_estimate_mask", 8, "8'hff");
+        ValueId format = addConstant(graph,
+                                     "pack_estimate_format_op",
+                                     "pack_estimate_format",
+                                     0,
+                                     "\"pack-estimate=%0d\"",
+                                     ValueType::String);
+
+        constexpr std::size_t taskCount = 31u;
+        for (std::size_t index = 0; index < taskCount; ++index)
+        {
+            const bool useAux = (index % 2u) != 0u || index + 1u == taskCount;
+            const std::string suffix = std::to_string(index);
+            ValueId q = makeLogicValue(graph, "pack_estimate_q_" + suffix, 8);
+            OperationId read = graph.createOperation(
+                OperationKind::kRegisterReadPort,
+                graph.internSymbol("pack_estimate_read_" + suffix));
+            graph.addResult(read, q);
+            graph.setAttr(read,
+                          "regSymbol",
+                          std::string(useAux ? "pack_estimate_aux_reg" : "pack_estimate_clk_reg"));
+
+            OperationId task = graph.createOperation(
+                OperationKind::kSystemTask,
+                graph.internSymbol("pack_estimate_task_" + suffix));
+            graph.addOperand(task, one);
+            graph.addOperand(task, format);
+            graph.addOperand(task, q);
+            graph.addOperand(task, useAux ? auxClk : clk);
+            graph.setAttr(task, "name", std::string("display"));
+            graph.setAttr(task, "procKind", std::string("always_ff"));
+            graph.setAttr(task, "hasTiming", false);
+            graph.setAttr(task, "hasSideEffects", true);
+            graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+        }
+
+        OperationId clkWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                      graph.internSymbol("pack_estimate_clk_write"));
+        graph.addOperand(clkWrite, one);
+        graph.addOperand(clkWrite, data);
+        graph.addOperand(clkWrite, mask);
+        graph.addOperand(clkWrite, clk);
+        graph.setAttr(clkWrite, "regSymbol", std::string("pack_estimate_clk_reg"));
+        graph.setAttr(clkWrite, "eventEdge", std::vector<std::string>{"posedge"});
+
+        OperationId auxWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                      graph.internSymbol("pack_estimate_aux_write"));
+        graph.addOperand(auxWrite, one);
+        graph.addOperand(auxWrite, data);
+        graph.addOperand(auxWrite, mask);
+        graph.addOperand(auxWrite, auxClk);
+        graph.setAttr(auxWrite, "regSymbol", std::string("pack_estimate_aux_reg"));
+        graph.setAttr(auxWrite, "eventEdge", std::vector<std::string>{"posedge"});
+
         return design;
     }
 
@@ -6452,7 +6610,10 @@ int main()
                                               std::optional<bool> profile = std::nullopt,
                                               std::size_t taskCount = 16u,
                                               std::size_t schedBatchMaxOps = 8u,
-                                              std::size_t schedBatchMaxEstimatedLines = 96u)
+                                              std::size_t schedBatchMaxEstimatedLines = 96u,
+                                              std::optional<std::string_view> packPolicy = std::nullopt,
+                                              std::optional<std::size_t> packMaxMovedSupernodePpm = std::nullopt,
+                                              std::optional<std::size_t> packMaxChangedWordPpm = std::nullopt)
             -> std::optional<std::filesystem::path>
         {
             const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
@@ -6474,7 +6635,10 @@ int main()
                                           bypass,
                                           profile,
                                           schedBatchMaxOps,
-                                          schedBatchMaxEstimatedLines) ||
+                                          schedBatchMaxEstimatedLines,
+                                          packPolicy,
+                                          packMaxMovedSupernodePpm,
+                                          packMaxChangedWordPpm) ||
                 !fixtureResult.success || fixtureDiag.hasError())
             {
                 return std::nullopt;
@@ -6566,16 +6730,153 @@ int main()
                                                                  24u,
                                                                  100000u,
                                                                  100000u);
+        const auto pureEventPackDefaultDir = emitPureEventFixture("pack_default",
+                                                                  PureEventWordFixtureMode::kAlternatingEvents,
+                                                                  true,
+                                                                  false,
+                                                                  false,
+                                                                  false,
+                                                                  16u,
+                                                                  100000u,
+                                                                  100000u);
+        const auto pureEventPackOffDir = emitPureEventFixture("pack_off",
+                                                              PureEventWordFixtureMode::kAlternatingEvents,
+                                                              true,
+                                                              false,
+                                                              false,
+                                                              false,
+                                                              16u,
+                                                              100000u,
+                                                              100000u,
+                                                              "off");
+        const auto pureEventPackProbeDir = emitPureEventFixture("pack_probe",
+                                                                PureEventWordFixtureMode::kAlternatingEvents,
+                                                                true,
+                                                                false,
+                                                                false,
+                                                                false,
+                                                                16u,
+                                                                100000u,
+                                                                100000u,
+                                                                "probe",
+                                                                1000000u,
+                                                                1000000u);
+        const auto pureEventPackTargetedDir = emitPureEventFixture("pack_targeted",
+                                                                   PureEventWordFixtureMode::kAlternatingEvents,
+                                                                   true,
+                                                                   false,
+                                                                   false,
+                                                                   false,
+                                                                   16u,
+                                                                   100000u,
+                                                                   100000u,
+                                                                   "targeted",
+                                                                   1000000u,
+                                                                   1000000u);
+        const auto pureEventPackTargetedRepeatDir = emitPureEventFixture("pack_targeted_repeat",
+                                                                         PureEventWordFixtureMode::kAlternatingEvents,
+                                                                         true,
+                                                                         false,
+                                                                         false,
+                                                                         false,
+                                                                         16u,
+                                                                         100000u,
+                                                                         100000u,
+                                                                         "targeted",
+                                                                         1000000u,
+                                                                         1000000u);
+        const auto pureEventPackRemainderOffDir = emitPureEventFixture("pack_remainder_off",
+                                                                       PureEventWordFixtureMode::kAlternatingEvents,
+                                                                       true,
+                                                                       false,
+                                                                       false,
+                                                                       false,
+                                                                       20u,
+                                                                       100000u,
+                                                                       100000u,
+                                                                       "off");
+        const auto pureEventPackRemainderProbeDir = emitPureEventFixture("pack_remainder_probe",
+                                                                         PureEventWordFixtureMode::kAlternatingEvents,
+                                                                         true,
+                                                                         false,
+                                                                         false,
+                                                                         false,
+                                                                         20u,
+                                                                         100000u,
+                                                                         100000u,
+                                                                         "probe",
+                                                                         1000000u,
+                                                                         1000000u);
+        const auto pureEventPackRemainderTargetedDir = emitPureEventFixture("pack_remainder_targeted",
+                                                                            PureEventWordFixtureMode::kAlternatingEvents,
+                                                                            true,
+                                                                            false,
+                                                                            false,
+                                                                            false,
+                                                                            20u,
+                                                                            100000u,
+                                                                            100000u,
+                                                                            "targeted",
+                                                                            1000000u,
+                                                                            1000000u);
+        ActivityScheduleOptions pureEventPackEstimatedLineSchedule;
+        pureEventPackEstimatedLineSchedule.maxOpInComputeSupernode = 4u;
+        pureEventPackEstimatedLineSchedule.enableCoarsen = false;
+        const auto emitPureEventPackEstimatedLineFixture = [&](std::string_view suffix,
+                                                               std::string_view policy)
+            -> std::optional<std::filesystem::path>
+        {
+            const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
+            std::filesystem::remove_all(dir);
+            Design fixture = buildPureEventWordPackEstimatedLineDriftDesign();
+            EmitDiagnostics fixtureDiag;
+            EmitResult fixtureResult;
+            if (!emitWithActivitySchedule(fixture,
+                                          dir,
+                                          fixtureDiag,
+                                          fixtureResult,
+                                          pureEventPackEstimatedLineSchedule,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          true,
+                                          false,
+                                          100000u,
+                                          100000u,
+                                          policy,
+                                          1000000u,
+                                          1000000u) ||
+                !fixtureResult.success || fixtureDiag.hasError())
+            {
+                return std::nullopt;
+            }
+            return dir;
+        };
+        const auto pureEventPackEstimatedLineOffDir =
+            emitPureEventPackEstimatedLineFixture("pack_estimated_line_off", "off");
+        const auto pureEventPackEstimatedLineProbeDir =
+            emitPureEventPackEstimatedLineFixture("pack_estimated_line_probe", "probe");
+        const auto pureEventPackEstimatedLineTargetedDir =
+            emitPureEventPackEstimatedLineFixture("pack_estimated_line_targeted", "targeted");
         if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
             !pureEventProfileDisabledDir || !pureEventProfileOnlyDir || !pureEventProfileBypassDir ||
             !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir ||
-            !pureEventSparseOneDir || !pureEventSparseTwoDir || !pureEventDenseThreeDir)
+            !pureEventSparseOneDir || !pureEventSparseTwoDir || !pureEventDenseThreeDir ||
+            !pureEventPackDefaultDir || !pureEventPackOffDir || !pureEventPackProbeDir ||
+            !pureEventPackTargetedDir || !pureEventPackTargetedRepeatDir ||
+            !pureEventPackRemainderOffDir || !pureEventPackRemainderProbeDir ||
+            !pureEventPackRemainderTargetedDir || !pureEventPackEstimatedLineOffDir ||
+            !pureEventPackEstimatedLineProbeDir || !pureEventPackEstimatedLineTargetedDir)
         {
             return fail("pure-event compute-word fixture emit failed");
         }
 
         const auto readPureEventGenerated = [](const std::filesystem::path &dir) {
             return readFile(dir / "grhsim_top.hpp") +
+                   readFile(dir / "grhsim_top_runtime.hpp") +
                    readFiles(collectSchedFiles(dir, "grhsim_top_state")) +
                    readFile(dir / "grhsim_top_eval.cpp") +
                    readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
@@ -6593,6 +6894,357 @@ int main()
             pureEventDefaultSource.find(pureEventMarker) != std::string::npos)
         {
             return fail("pure-event compute-word default and explicit zero option sources should be byte-identical");
+        }
+
+        const std::string pureEventPackDefaultSource = readPureEventGenerated(*pureEventPackDefaultDir);
+        const std::string pureEventPackOffSource = readPureEventGenerated(*pureEventPackOffDir);
+        const std::string pureEventPackProbeSource = readPureEventGenerated(*pureEventPackProbeDir);
+        const std::string pureEventPackTargetedSource = readPureEventGenerated(*pureEventPackTargetedDir);
+        const std::string pureEventPackTargetedRepeatSource =
+            readPureEventGenerated(*pureEventPackTargetedRepeatDir);
+        const std::string pureEventPackDefaultStats =
+            readFile(*pureEventPackDefaultDir / "grhsim_emit_stats.json");
+        const std::string pureEventPackOffStats =
+            readFile(*pureEventPackOffDir / "grhsim_emit_stats.json");
+        const std::string pureEventPackProbeStats =
+            readFile(*pureEventPackProbeDir / "grhsim_emit_stats.json");
+        const std::string pureEventPackTargetedStats =
+            readFile(*pureEventPackTargetedDir / "grhsim_emit_stats.json");
+        const std::string pureEventPackTargetedRepeatStats =
+            readFile(*pureEventPackTargetedRepeatDir / "grhsim_emit_stats.json");
+        if (pureEventPackDefaultSource != pureEventPackOffSource ||
+            pureEventPackDefaultStats != pureEventPackOffStats ||
+            pureEventPackOffStats.find("\"pure_event_word_pack\"") != std::string::npos)
+        {
+            return fail("pure-event word-pack default and explicit off artifacts should be byte-identical");
+        }
+        if (pureEventPackProbeSource != pureEventPackOffSource ||
+            pureEventPackProbeStats.find("\"policy\": \"probe\"") == std::string::npos ||
+            pureEventPackProbeStats.find("\"applied\": false") == std::string::npos ||
+            pureEventPackProbeStats.find("\"validation_passed\": true") == std::string::npos)
+        {
+            return fail("pure-event word-pack probe should report a validated candidate without changing source");
+        }
+        const auto packProbeBaselinePureWords =
+            jsonUnsignedField(pureEventPackProbeStats, "baseline_pure_word_count");
+        const auto packProbeCandidatePureWords =
+            jsonUnsignedField(pureEventPackProbeStats, "candidate_pure_word_count");
+        const auto packProbeAddedPureWords =
+            jsonUnsignedField(pureEventPackProbeStats, "added_pure_word_count");
+        const auto packProbeLostPureWords =
+            jsonUnsignedField(pureEventPackProbeStats, "lost_pure_word_count");
+        const auto packProbeMovedSupernodes =
+            jsonUnsignedField(pureEventPackProbeStats, "moved_supernode_count");
+        if (!packProbeBaselinePureWords || !packProbeCandidatePureWords || !packProbeAddedPureWords ||
+            !packProbeLostPureWords || !packProbeMovedSupernodes ||
+            *packProbeCandidatePureWords <= *packProbeBaselinePureWords ||
+            *packProbeAddedPureWords != *packProbeCandidatePureWords - *packProbeBaselinePureWords ||
+            *packProbeLostPureWords != 0u || *packProbeMovedSupernodes == 0u)
+        {
+            return fail("pure-event word-pack probe should discover a lossless packing opportunity");
+        }
+        if (pureEventPackTargetedStats.find("\"policy\": \"targeted\"") == std::string::npos ||
+            pureEventPackTargetedStats.find("\"applied\": true") == std::string::npos ||
+            pureEventPackTargetedStats.find("\"validation_passed\": true") == std::string::npos ||
+            jsonUnsignedField(pureEventPackTargetedStats, "baseline_pure_word_count") !=
+                packProbeBaselinePureWords ||
+            jsonUnsignedField(pureEventPackTargetedStats, "candidate_pure_word_count") !=
+                packProbeCandidatePureWords ||
+            jsonUnsignedField(pureEventPackTargetedStats, "moved_supernode_count") !=
+                packProbeMovedSupernodes ||
+            pureEventPackTargetedSource == pureEventPackOffSource ||
+            countSubstring(pureEventPackTargetedSource, pureEventMarker) <=
+                countSubstring(pureEventPackOffSource, pureEventMarker))
+        {
+            return fail("targeted pure-event word packing should apply and create additional bypass words");
+        }
+        if (pureEventPackTargetedSource != pureEventPackTargetedRepeatSource ||
+            pureEventPackTargetedStats != pureEventPackTargetedRepeatStats)
+        {
+            return fail("targeted pure-event word packing should be deterministic across emits");
+        }
+
+        const std::string pureEventPackRemainderOffSource =
+            readPureEventGenerated(*pureEventPackRemainderOffDir);
+        const std::string pureEventPackRemainderProbeSource =
+            readPureEventGenerated(*pureEventPackRemainderProbeDir);
+        const std::string pureEventPackRemainderTargetedSource =
+            readPureEventGenerated(*pureEventPackRemainderTargetedDir);
+        const std::string pureEventPackRemainderProbeStats =
+            readFile(*pureEventPackRemainderProbeDir / "grhsim_emit_stats.json");
+        const std::string pureEventPackRemainderTargetedStats =
+            readFile(*pureEventPackRemainderTargetedDir / "grhsim_emit_stats.json");
+        const auto packRemainderBaselinePureWords =
+            jsonUnsignedField(pureEventPackRemainderProbeStats, "baseline_pure_word_count");
+        const auto packRemainderCandidatePureWords =
+            jsonUnsignedField(pureEventPackRemainderProbeStats, "candidate_pure_word_count");
+        const auto packRemainderAddedPureWords =
+            jsonUnsignedField(pureEventPackRemainderProbeStats, "added_pure_word_count");
+        if (pureEventPackRemainderProbeSource != pureEventPackRemainderOffSource ||
+            !packRemainderBaselinePureWords || !packRemainderCandidatePureWords ||
+            !packRemainderAddedPureWords ||
+            *packRemainderCandidatePureWords <= *packRemainderBaselinePureWords ||
+            *packRemainderAddedPureWords == 0u ||
+            pureEventPackRemainderTargetedStats.find("\"applied\": true") == std::string::npos ||
+            countSubstring(pureEventPackRemainderTargetedSource, pureEventMarker) <=
+                countSubstring(pureEventPackRemainderOffSource, pureEventMarker))
+        {
+            return fail("pure-event word packing should preserve partial event-key remainders");
+        }
+
+        const std::string pureEventPackEstimatedLineOffSource =
+            readPureEventGenerated(*pureEventPackEstimatedLineOffDir);
+        const std::string pureEventPackEstimatedLineProbeSource =
+            readPureEventGenerated(*pureEventPackEstimatedLineProbeDir);
+        const std::string pureEventPackEstimatedLineTargetedSource =
+            readPureEventGenerated(*pureEventPackEstimatedLineTargetedDir);
+        const std::string pureEventPackEstimatedLineProbeStats =
+            readFile(*pureEventPackEstimatedLineProbeDir / "grhsim_emit_stats.json");
+        const std::string pureEventPackEstimatedLineTargetedStats =
+            readFile(*pureEventPackEstimatedLineTargetedDir / "grhsim_emit_stats.json");
+        const auto estimatedLineBaselinePureWords =
+            jsonUnsignedField(pureEventPackEstimatedLineProbeStats, "baseline_pure_word_count");
+        const auto estimatedLineCandidatePureWords =
+            jsonUnsignedField(pureEventPackEstimatedLineProbeStats, "candidate_pure_word_count");
+        const auto frozenBaselineEstimatedLines =
+            jsonUnsignedField(pureEventPackEstimatedLineTargetedStats,
+                              "frozen_batch_baseline_estimated_lines");
+        const auto frozenRebuiltEstimatedLines =
+            jsonUnsignedField(pureEventPackEstimatedLineTargetedStats,
+                              "frozen_batch_rebuilt_estimated_lines");
+        const auto frozenEstimatedLineChangedBatchCount =
+            jsonUnsignedField(pureEventPackEstimatedLineTargetedStats,
+                              "frozen_batch_estimated_line_changed_batch_count");
+        const auto frozenMaxAbsEstimatedLineDelta =
+            jsonUnsignedField(pureEventPackEstimatedLineTargetedStats,
+                              "frozen_batch_max_abs_estimated_line_delta");
+        bool frozenEstimatedLineDriftMatches = false;
+        if (frozenBaselineEstimatedLines && frozenRebuiltEstimatedLines &&
+            frozenEstimatedLineChangedBatchCount && frozenMaxAbsEstimatedLineDelta)
+        {
+            const std::size_t totalDelta =
+                *frozenBaselineEstimatedLines > *frozenRebuiltEstimatedLines
+                    ? *frozenBaselineEstimatedLines - *frozenRebuiltEstimatedLines
+                    : *frozenRebuiltEstimatedLines - *frozenBaselineEstimatedLines;
+            frozenEstimatedLineDriftMatches =
+                *frozenEstimatedLineChangedBatchCount == 1u && totalDelta != 0u &&
+                *frozenMaxAbsEstimatedLineDelta == totalDelta;
+        }
+        if (pureEventPackEstimatedLineProbeSource != pureEventPackEstimatedLineOffSource ||
+            !estimatedLineBaselinePureWords || !estimatedLineCandidatePureWords ||
+            *estimatedLineBaselinePureWords != 0u ||
+            *estimatedLineCandidatePureWords <= *estimatedLineBaselinePureWords ||
+            pureEventPackEstimatedLineTargetedStats.find("\"applied\": true") == std::string::npos ||
+            !frozenEstimatedLineDriftMatches ||
+            countSubstring(pureEventPackEstimatedLineTargetedSource, pureEventMarker) <=
+                countSubstring(pureEventPackEstimatedLineOffSource, pureEventMarker))
+        {
+            return fail("targeted pure-event word packing should report the expected frozen-batch line drift");
+        }
+
+        const auto commitBatchBlock = [](std::string_view source) -> std::optional<std::string_view> {
+            const std::size_t method = source.find("void GrhSIM_top::eval_commit_batch_1()");
+            const std::size_t open = source.find('{', method);
+            const std::size_t close = findMatchingBrace(source, open);
+            if (method == std::string_view::npos || open == std::string_view::npos ||
+                close == std::string_view::npos)
+            {
+                return std::nullopt;
+            }
+            return source.substr(method, close - method + 1u);
+        };
+        const auto collectCommitStructure = [](std::string_view block,
+                                               std::string_view marker,
+                                               char terminator) {
+            std::vector<std::string> values;
+            std::size_t pos = 0u;
+            while ((pos = block.find(marker, pos)) != std::string_view::npos)
+            {
+                const std::size_t begin = pos + marker.size();
+                const std::size_t end = block.find(terminator, begin);
+                if (end == std::string_view::npos)
+                {
+                    values.clear();
+                    return values;
+                }
+                values.emplace_back(block.substr(begin, end - begin));
+                pos = end + 1u;
+            }
+            return values;
+        };
+        const auto estimatedLineOffCommit = commitBatchBlock(pureEventPackEstimatedLineOffSource);
+        const auto estimatedLineTargetedCommit =
+            commitBatchBlock(pureEventPackEstimatedLineTargetedSource);
+        if (!estimatedLineOffCommit || !estimatedLineTargetedCommit)
+        {
+            return fail("estimated-line fixture should emit one identifiable commit batch");
+        }
+        const auto offCommitMembers =
+            collectCommitStructure(*estimatedLineOffCommit, "// Supernode ", ':');
+        const auto targetedCommitMembers =
+            collectCommitStructure(*estimatedLineTargetedCommit, "// Supernode ", ':');
+        const std::size_t offClkWrite = estimatedLineOffCommit->find("pack_estimate_clk_write");
+        const std::size_t offAuxWrite = estimatedLineOffCommit->find("pack_estimate_aux_write");
+        const std::size_t targetedClkWrite =
+            estimatedLineTargetedCommit->find("pack_estimate_clk_write");
+        const std::size_t targetedAuxWrite =
+            estimatedLineTargetedCommit->find("pack_estimate_aux_write");
+        if (offCommitMembers.size() != 2u || offCommitMembers != targetedCommitMembers ||
+            offClkWrite == std::string_view::npos || offAuxWrite == std::string_view::npos ||
+            targetedClkWrite == std::string_view::npos || targetedAuxWrite == std::string_view::npos ||
+            !(offClkWrite < offAuxWrite) || !(targetedClkWrite < targetedAuxWrite) ||
+            *estimatedLineOffCommit == *estimatedLineTargetedCommit)
+        {
+            return fail("estimated-line drift must preserve nontrivial commit membership and order");
+        }
+
+        const auto expectPackEmitFailure = [&](std::string_view suffix,
+                                               std::string_view policy,
+                                               bool bypass,
+                                               std::optional<std::size_t> maxMovedSupernodePpm,
+                                               std::optional<std::size_t> maxChangedWordPpm,
+                                               bool removeDag,
+                                               std::string_view expectedDiagnostic,
+                                               std::optional<std::string_view> rawMaxMovedSupernodePpm = std::nullopt,
+                                               std::optional<std::string_view> rawMaxChangedWordPpm = std::nullopt) {
+            const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
+            std::filesystem::remove_all(dir);
+            Design fixture = buildPureEventWordBypassDesign(PureEventWordFixtureMode::kAlternatingEvents);
+            EmitDiagnostics fixtureDiag;
+            EmitResult fixtureResult;
+            if (!emitWithActivitySchedule(fixture,
+                                          dir,
+                                          fixtureDiag,
+                                          fixtureResult,
+                                          pureEventSchedule,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          bypass,
+                                          false,
+                                          100000u,
+                                          100000u,
+                                          policy,
+                                          maxMovedSupernodePpm,
+                                          maxChangedWordPpm,
+                                          removeDag,
+                                          rawMaxMovedSupernodePpm,
+                                          rawMaxChangedWordPpm))
+            {
+                return false;
+            }
+            return !fixtureResult.success && fixtureDiag.hasError() &&
+                   diagnosticsContain(fixtureDiag, expectedDiagnostic);
+        };
+        if (!expectPackEmitFailure("pack_invalid_policy",
+                                   "invalid",
+                                   true,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   false,
+                                   "invalid pure_event_word_pack_policy: invalid") ||
+            !expectPackEmitFailure("pack_moved_ppm_overflow",
+                                   "probe",
+                                   true,
+                                   1000001u,
+                                   std::nullopt,
+                                   false,
+                                   "pure_event_word_pack_max_moved_supernode_ppm") ||
+            !expectPackEmitFailure("pack_changed_ppm_overflow",
+                                   "probe",
+                                   true,
+                                   std::nullopt,
+                                   1000001u,
+                                   false,
+                                   "pure_event_word_pack_max_changed_word_ppm") ||
+            !expectPackEmitFailure("pack_moved_ppm_malformed",
+                                   "probe",
+                                   true,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   false,
+                                   "pure_event_word_pack_max_moved_supernode_ppm",
+                                   "not-a-number") ||
+            !expectPackEmitFailure("pack_changed_ppm_malformed",
+                                   "probe",
+                                   true,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   false,
+                                   "pure_event_word_pack_max_changed_word_ppm",
+                                   std::nullopt,
+                                   "12ppm") ||
+            !expectPackEmitFailure("pack_targeted_without_bypass",
+                                   "targeted",
+                                   false,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   false,
+                                   "pure_event_word_pack_policy=targeted requires pure_event_compute_word_bypass=true") ||
+            !expectPackEmitFailure("pack_probe_without_dag",
+                                   "probe",
+                                   true,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   true,
+                                   "missing activity-schedule dag") ||
+            !expectPackEmitFailure("pack_targeted_without_dag",
+                                   "targeted",
+                                   true,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   true,
+                                   "missing activity-schedule dag") ||
+            !expectPackEmitFailure("pack_moved_budget",
+                                   "targeted",
+                                   true,
+                                   0u,
+                                   1000000u,
+                                   false,
+                                   "budget") ||
+            !expectPackEmitFailure("pack_changed_budget",
+                                   "targeted",
+                                   true,
+                                   1000000u,
+                                   0u,
+                                   false,
+                                   "budget"))
+        {
+            return fail("pure-event word-pack option validation or rejection contract failed");
+        }
+
+        {
+            const std::filesystem::path dir = pureEventRoot.string() + "_pack_off_without_dag";
+            std::filesystem::remove_all(dir);
+            Design fixture = buildPureEventWordBypassDesign(PureEventWordFixtureMode::kAlternatingEvents);
+            EmitDiagnostics fixtureDiag;
+            EmitResult fixtureResult;
+            if (!emitWithActivitySchedule(fixture,
+                                          dir,
+                                          fixtureDiag,
+                                          fixtureResult,
+                                          pureEventSchedule,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          true,
+                                          false,
+                                          100000u,
+                                          100000u,
+                                          "off",
+                                          std::nullopt,
+                                          std::nullopt,
+                                          true) ||
+                !fixtureResult.success || fixtureDiag.hasError())
+            {
+                return fail("pure-event word-pack off policy should not require activity-schedule dag");
+            }
         }
         const std::size_t pureEventMarkerCount = countSubstring(pureEventEnabledSched, pureEventMarker);
         if (pureEventMarkerCount == 0)
@@ -6818,6 +7470,33 @@ int main()
             countSubstring(*pureEventEnabledLog, "pure-event=") != 32u)
         {
             return fail("pure-event compute-word hit/miss harness output mismatch");
+        }
+        const auto pureEventPackOffLog = runPureEventHarness(*pureEventPackOffDir);
+        const auto pureEventPackTargetedLog = runPureEventHarness(*pureEventPackTargetedDir);
+        if (!pureEventPackOffLog || !pureEventPackTargetedLog ||
+            *pureEventPackOffLog != *pureEventPackTargetedLog ||
+            pureEventPackTargetedLog->find("pure-event=") == std::string::npos)
+        {
+            return fail("targeted pure-event word packing changed functional harness output");
+        }
+        const auto pureEventPackRemainderOffLog = runPureEventHarness(*pureEventPackRemainderOffDir);
+        const auto pureEventPackRemainderTargetedLog =
+            runPureEventHarness(*pureEventPackRemainderTargetedDir);
+        if (!pureEventPackRemainderOffLog || !pureEventPackRemainderTargetedLog ||
+            *pureEventPackRemainderOffLog != *pureEventPackRemainderTargetedLog ||
+            pureEventPackRemainderTargetedLog->find("pure-event=") == std::string::npos)
+        {
+            return fail("targeted pure-event word packing changed remainder-fixture output");
+        }
+        const auto pureEventPackEstimatedLineOffLog =
+            runPureEventHarness(*pureEventPackEstimatedLineOffDir);
+        const auto pureEventPackEstimatedLineTargetedLog =
+            runPureEventHarness(*pureEventPackEstimatedLineTargetedDir);
+        if (!pureEventPackEstimatedLineOffLog || !pureEventPackEstimatedLineTargetedLog ||
+            *pureEventPackEstimatedLineOffLog != *pureEventPackEstimatedLineTargetedLog ||
+            pureEventPackEstimatedLineTargetedLog->find("pack-estimate=") == std::string::npos)
+        {
+            return fail("targeted pure-event word packing changed estimated-line fixture output");
         }
         const auto pureEventProfileOnlyLog = runPureEventHarness(*pureEventProfileOnlyDir, true);
         const auto pureEventProfileBypassLog = runPureEventHarness(*pureEventProfileBypassDir, true);

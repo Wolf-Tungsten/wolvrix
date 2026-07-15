@@ -152,6 +152,11 @@ namespace wolvrix::app::pybind
         PyObject *inputFullpassSpecializationObj = Py_None;
         PyObject *posedgeFullpassSpecializationObj = Py_None;
         PyObject *fullActiveWordConsumeObj = Py_None;
+        PyObject *pureEventComputeWordBypassObj = Py_None;
+        PyObject *pureEventComputeWordProfileObj = Py_None;
+        const char *pureEventWordPackPolicy = nullptr;
+        PyObject *pureEventWordPackMaxMovedSupernodePpmObj = Py_None;
+        PyObject *pureEventWordPackMaxChangedWordPpmObj = Py_None;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -167,8 +172,16 @@ namespace wolvrix::app::pybind
                                        "input_fullpass_specialization",
                                        "posedge_fullpass_specialization",
                                        "full_active_word_consume",
+                                       "pure_event_compute_word_bypass",
+                                       "pure_event_compute_word_profile",
+                                       "pure_event_word_pack_policy",
+                                       "pure_event_word_pack_max_moved_supernode_ppm",
+                                       "pure_event_word_pack_max_changed_word_ppm",
                                        nullptr};
-                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssOOO", const_cast<char **>(kwlist),
+        if (!PyArg_ParseTupleAndKeywords(args,
+                                         kwargs,
+                                         "Oss|OOOOOOOssOOOOOsOO",
+                                         const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
                                          &output,
@@ -183,7 +196,12 @@ namespace wolvrix::app::pybind
                                          &perfMode,
                                          &inputFullpassSpecializationObj,
                                          &posedgeFullpassSpecializationObj,
-                                         &fullActiveWordConsumeObj))
+                                         &fullActiveWordConsumeObj,
+                                         &pureEventComputeWordBypassObj,
+                                         &pureEventComputeWordProfileObj,
+                                         &pureEventWordPackPolicy,
+                                         &pureEventWordPackMaxMovedSupernodePpmObj,
+                                         &pureEventWordPackMaxChangedWordPpmObj))
         {
             return nullptr;
         }
@@ -321,6 +339,50 @@ namespace wolvrix::app::pybind
                 return nullptr;
             }
             options.attributes["full_active_word_consume"] = enabled != 0 ? "1" : "0";
+        }
+        if (pureEventComputeWordBypassObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(pureEventComputeWordBypassObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["pure_event_compute_word_bypass"] = enabled != 0 ? "1" : "0";
+        }
+        if (pureEventComputeWordProfileObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(pureEventComputeWordProfileObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["pure_event_compute_word_profile"] = enabled != 0 ? "1" : "0";
+        }
+        if (pureEventWordPackPolicy != nullptr)
+        {
+            options.attributes["pure_event_word_pack_policy"] = pureEventWordPackPolicy;
+        }
+        if (pureEventWordPackMaxMovedSupernodePpmObj != Py_None)
+        {
+            const unsigned long long parsed = PyLong_AsUnsignedLongLong(pureEventWordPackMaxMovedSupernodePpmObj);
+            if (PyErr_Occurred() || parsed > 1000000ULL)
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "pure_event_word_pack_max_moved_supernode_ppm must be an integer between 0 and 1000000");
+                return nullptr;
+            }
+            options.attributes["pure_event_word_pack_max_moved_supernode_ppm"] = std::to_string(parsed);
+        }
+        if (pureEventWordPackMaxChangedWordPpmObj != Py_None)
+        {
+            const unsigned long long parsed = PyLong_AsUnsignedLongLong(pureEventWordPackMaxChangedWordPpmObj);
+            if (PyErr_Occurred() || parsed > 1000000ULL)
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "pure_event_word_pack_max_changed_word_ppm must be an integer between 0 and 1000000");
+                return nullptr;
+            }
+            options.attributes["pure_event_word_pack_max_changed_word_ppm"] = std::to_string(parsed);
         }
 
         const auto result = emitter.emit(*design, options);

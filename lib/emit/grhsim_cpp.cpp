@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <streambuf>
 #include <string>
@@ -43,6 +44,7 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::grh::ValueIdHash;
         using wolvrix::lib::grh::ValueType;
         using wolvrix::lib::transform::ActivityScheduleStateReadSupernodes;
+        using wolvrix::lib::transform::ActivityScheduleDag;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKind;
         using wolvrix::lib::transform::ActivityScheduleComputeNodesBySupernode;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKinds;
@@ -1375,6 +1377,105 @@ namespace wolvrix::lib::emit
             return defaultValue;
         }
 
+        enum class PureEventWordPackPolicy
+        {
+            kOff,
+            kProbe,
+            kTargeted,
+        };
+
+        std::string_view pureEventWordPackPolicyName(PureEventWordPackPolicy policy) noexcept
+        {
+            switch (policy)
+            {
+            case PureEventWordPackPolicy::kOff:
+                return "off";
+            case PureEventWordPackPolicy::kProbe:
+                return "probe";
+            case PureEventWordPackPolicy::kTargeted:
+                return "targeted";
+            }
+            return "off";
+        }
+
+        std::optional<PureEventWordPackPolicy> parsePureEventWordPackPolicy(
+            const EmitOptions &options,
+            std::string &invalidValue)
+        {
+            std::string value = "off";
+            if (const auto it = options.attributes.find("pure_event_word_pack_policy");
+                it != options.attributes.end())
+            {
+                value = it->second;
+            }
+            else if (const char *env = std::getenv("WOLVRIX_GRHSIM_PURE_EVENT_WORD_PACK_POLICY"))
+            {
+                value = env;
+            }
+
+            if (value.empty() || value == "off")
+            {
+                return PureEventWordPackPolicy::kOff;
+            }
+            if (value == "probe")
+            {
+                return PureEventWordPackPolicy::kProbe;
+            }
+            if (value == "targeted")
+            {
+                return PureEventWordPackPolicy::kTargeted;
+            }
+            invalidValue = std::move(value);
+            return std::nullopt;
+        }
+
+        std::optional<std::size_t> parseUnsignedEmitOption(const EmitOptions &options,
+                                                           std::string_view attributeName,
+                                                           const char *envName,
+                                                           std::size_t defaultValue,
+                                                           std::string &invalidValue)
+        {
+            std::string value;
+            if (const auto it = options.attributes.find(std::string(attributeName));
+                it != options.attributes.end())
+            {
+                value = it->second;
+            }
+            else if (const char *env = std::getenv(envName))
+            {
+                value = env;
+            }
+            else
+            {
+                return defaultValue;
+            }
+            if (value.empty() ||
+                !std::all_of(value.begin(),
+                             value.end(),
+                             [](unsigned char ch) { return std::isdigit(ch) != 0; }))
+            {
+                invalidValue = std::move(value);
+                return std::nullopt;
+            }
+            try
+            {
+                std::size_t consumed = 0u;
+                const unsigned long long parsed = std::stoull(value, &consumed);
+                if (consumed != value.size() ||
+                    parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max()))
+                {
+                    invalidValue = std::move(value);
+                    return std::nullopt;
+                }
+                return static_cast<std::size_t>(parsed);
+            }
+            catch (const std::exception &)
+            {
+                invalidValue = std::move(value);
+                return std::nullopt;
+            }
+        }
+
         bool emitStorageRefAliasesEnabled()
         {
             if (const char *env = std::getenv("WOLVRIX_GRHSIM_STORAGE_REF_ALIASES"))
@@ -2252,6 +2353,7 @@ namespace wolvrix::lib::emit
             const ActivityScheduleValueFanout &valueFanout;
             const ActivityScheduleTopoOrder &topoOrder;
             const ActivityScheduleStateReadSupernodes &stateReadSupernodes;
+            const ActivityScheduleDag *dag = nullptr;
             const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
             const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
         };
@@ -2594,6 +2696,35 @@ namespace wolvrix::lib::emit
             std::size_t packedArrayLaneEmitSelects = 0;
             std::size_t packedArrayLaneEmitFallbackMixedUser = 0;
             std::size_t packedArrayLaneEmitFallbackInvalidShape = 0;
+        };
+
+        struct PureEventWordPackStats
+        {
+            PureEventWordPackPolicy policy = PureEventWordPackPolicy::kOff;
+            bool applied = false;
+            bool validationPassed = false;
+            std::size_t supernodeCount = 0;
+            std::size_t computeSupernodeCount = 0;
+            std::size_t kahnLevelCount = 0;
+            std::size_t batchCount = 0;
+            std::size_t eligibleFullComputeWordCount = 0;
+            std::size_t baselinePureWordCount = 0;
+            std::size_t candidatePureWordCount = 0;
+            std::size_t addedPureWordCount = 0;
+            std::size_t lostPureWordCount = 0;
+            std::size_t movedSupernodeCount = 0;
+            std::size_t movedEventSupernodeCount = 0;
+            std::size_t movedSupernodePpm = 0;
+            std::size_t changedWordCount = 0;
+            std::size_t changedWordPpm = 0;
+            std::size_t computeActiveWordCount = 0;
+            std::size_t maxActiveIdDisplacement = 0;
+            std::size_t frozenBatchBaselineEstimatedLines = 0;
+            std::size_t frozenBatchRebuiltEstimatedLines = 0;
+            std::size_t frozenBatchEstimatedLineChangedBatchCount = 0;
+            std::size_t frozenBatchMaxAbsEstimatedLineDelta = 0;
+            std::size_t maxMovedSupernodePpm = 5000;
+            std::size_t maxChangedWordPpm = 20000;
         };
 
         struct WaveformSignalDecl
@@ -3092,9 +3223,10 @@ namespace wolvrix::lib::emit
                    std::to_string(value.generation) + "_" + valueDebugName(graph, value) + "_";
         }
 
-        std::optional<std::string> writePackedArrayLaneEmitStatsJson(const std::filesystem::path &path,
-                                                                     const PackedArrayLaneEmitStats &stats,
-                                                                     std::uint64_t maxOutputFileBytes)
+        std::optional<std::string> writeGrhSimEmitStatsJson(const std::filesystem::path &path,
+                                                            const PackedArrayLaneEmitStats &stats,
+                                                            const PureEventWordPackStats *wordPackStats,
+                                                            std::uint64_t maxOutputFileBytes)
         {
             if (auto error = ensureOutputDirectory(path))
             {
@@ -3123,7 +3255,51 @@ namespace wolvrix::lib::emit
                    << stats.svPackedArrayAttrConcatDefops << ",\n";
             stream << "    \"sv_packed_array_attr_defops\": "
                    << stats.svPackedArrayAttrDefops << "\n";
-            stream << "  }\n";
+            stream << "  }";
+            if (wordPackStats != nullptr)
+            {
+                stream << ",\n";
+                stream << "  \"pure_event_word_pack\": {\n";
+                stream << "    \"added_pure_word_count\": " << wordPackStats->addedPureWordCount << ",\n";
+                stream << "    \"applied\": " << (wordPackStats->applied ? "true" : "false") << ",\n";
+                stream << "    \"baseline_pure_word_count\": " << wordPackStats->baselinePureWordCount << ",\n";
+                stream << "    \"batch_count\": " << wordPackStats->batchCount << ",\n";
+                stream << "    \"candidate_pure_word_count\": " << wordPackStats->candidatePureWordCount << ",\n";
+                stream << "    \"changed_word_count\": " << wordPackStats->changedWordCount << ",\n";
+                stream << "    \"changed_word_ppm\": " << wordPackStats->changedWordPpm << ",\n";
+                stream << "    \"compute_active_word_count\": " << wordPackStats->computeActiveWordCount << ",\n";
+                stream << "    \"compute_supernode_count\": " << wordPackStats->computeSupernodeCount << ",\n";
+                stream << "    \"eligible_full_compute_word_count\": "
+                       << wordPackStats->eligibleFullComputeWordCount << ",\n";
+                stream << "    \"frozen_batch_baseline_estimated_lines\": "
+                       << wordPackStats->frozenBatchBaselineEstimatedLines << ",\n";
+                stream << "    \"frozen_batch_estimated_line_changed_batch_count\": "
+                       << wordPackStats->frozenBatchEstimatedLineChangedBatchCount << ",\n";
+                stream << "    \"frozen_batch_max_abs_estimated_line_delta\": "
+                       << wordPackStats->frozenBatchMaxAbsEstimatedLineDelta << ",\n";
+                stream << "    \"frozen_batch_rebuilt_estimated_lines\": "
+                       << wordPackStats->frozenBatchRebuiltEstimatedLines << ",\n";
+                stream << "    \"kahn_level_count\": " << wordPackStats->kahnLevelCount << ",\n";
+                stream << "    \"lost_pure_word_count\": " << wordPackStats->lostPureWordCount << ",\n";
+                stream << "    \"max_active_id_displacement\": "
+                       << wordPackStats->maxActiveIdDisplacement << ",\n";
+                stream << "    \"max_changed_word_ppm\": " << wordPackStats->maxChangedWordPpm << ",\n";
+                stream << "    \"max_moved_supernode_ppm\": "
+                       << wordPackStats->maxMovedSupernodePpm << ",\n";
+                stream << "    \"moved_event_supernode_count\": "
+                       << wordPackStats->movedEventSupernodeCount << ",\n";
+                stream << "    \"moved_supernode_count\": " << wordPackStats->movedSupernodeCount << ",\n";
+                stream << "    \"moved_supernode_ppm\": " << wordPackStats->movedSupernodePpm << ",\n";
+                stream << "    \"policy\": \"" << pureEventWordPackPolicyName(wordPackStats->policy) << "\",\n";
+                stream << "    \"supernode_count\": " << wordPackStats->supernodeCount << ",\n";
+                stream << "    \"validation_passed\": "
+                       << (wordPackStats->validationPassed ? "true" : "false") << "\n";
+                stream << "  }\n";
+            }
+            else
+            {
+                stream << "\n";
+            }
             stream << "}\n";
             return finalizeOutputFile(stream, path);
         }
@@ -13661,6 +13837,882 @@ namespace wolvrix::lib::emit
             return analyzePureEventComputeWord(graph, model, schedule.supernodeToOps, word);
         }
 
+        std::size_t ratioPpm(std::size_t numerator, std::size_t denominator) noexcept
+        {
+            if (denominator == 0u)
+            {
+                return numerator == 0u ? 0u : std::numeric_limits<std::size_t>::max();
+            }
+            return static_cast<std::size_t>(
+                (static_cast<unsigned __int128>(numerator) * 1000000u) / denominator);
+        }
+
+        bool withinPpmBudget(std::size_t numerator,
+                             std::size_t denominator,
+                             std::size_t maxPpm) noexcept
+        {
+            if (denominator == 0u)
+            {
+                return numerator == 0u;
+            }
+            return static_cast<unsigned __int128>(numerator) * 1000000u <=
+                   static_cast<unsigned __int128>(denominator) * maxPpm;
+        }
+
+        bool buildActivityScheduleKahnLevels(const ActivityScheduleDag &dag,
+                                             std::size_t supernodeCount,
+                                             std::vector<std::size_t> &levelBySupernode,
+                                             std::size_t &levelCount,
+                                             std::string &error)
+        {
+            if (dag.size() != supernodeCount)
+            {
+                error = "activity-schedule dag size mismatch: dag=" + std::to_string(dag.size()) +
+                        " supernodes=" + std::to_string(supernodeCount);
+                return false;
+            }
+
+            std::vector<std::size_t> indegree(supernodeCount, 0u);
+            for (std::size_t supernodeId = 0; supernodeId < dag.size(); ++supernodeId)
+            {
+                for (uint32_t succ : dag[supernodeId])
+                {
+                    if (succ >= supernodeCount)
+                    {
+                        error = "activity-schedule dag contains out-of-range edge: " +
+                                std::to_string(supernodeId) + "->" + std::to_string(succ);
+                        return false;
+                    }
+                    ++indegree[succ];
+                }
+            }
+
+            std::vector<uint32_t> frontier;
+            frontier.reserve(supernodeCount);
+            for (std::size_t supernodeId = 0; supernodeId < supernodeCount; ++supernodeId)
+            {
+                if (indegree[supernodeId] == 0u)
+                {
+                    frontier.push_back(static_cast<uint32_t>(supernodeId));
+                }
+            }
+            std::sort(frontier.begin(), frontier.end());
+
+            levelBySupernode.assign(supernodeCount, kInvalidIndex);
+            std::size_t visited = 0u;
+            levelCount = 0u;
+            while (!frontier.empty())
+            {
+                std::vector<uint32_t> next;
+                for (uint32_t supernodeId : frontier)
+                {
+                    levelBySupernode[supernodeId] = levelCount;
+                    ++visited;
+                    for (uint32_t succ : dag[supernodeId])
+                    {
+                        if (--indegree[succ] == 0u)
+                        {
+                            next.push_back(succ);
+                        }
+                    }
+                }
+                std::sort(next.begin(), next.end());
+                frontier = std::move(next);
+                ++levelCount;
+            }
+            if (visited != supernodeCount)
+            {
+                error = "activity-schedule dag contains a cycle: visited=" + std::to_string(visited) +
+                        " supernodes=" + std::to_string(supernodeCount);
+                return false;
+            }
+            return true;
+        }
+
+        bool validateActivityScheduleTopo(const ActivityScheduleDag &dag,
+                                          const ActivityScheduleTopoOrder &topoOrder,
+                                          std::vector<std::size_t> &positionBySupernode,
+                                          std::string &error)
+        {
+            if (topoOrder.size() != dag.size())
+            {
+                error = "activity-schedule topo size mismatch: topo=" + std::to_string(topoOrder.size()) +
+                        " dag=" + std::to_string(dag.size());
+                return false;
+            }
+            positionBySupernode.assign(dag.size(), kInvalidIndex);
+            for (std::size_t position = 0; position < topoOrder.size(); ++position)
+            {
+                const uint32_t supernodeId = topoOrder[position];
+                if (supernodeId >= dag.size() || positionBySupernode[supernodeId] != kInvalidIndex)
+                {
+                    error = "activity-schedule topo is not a strict supernode permutation at position=" +
+                            std::to_string(position) + " supernode=" + std::to_string(supernodeId);
+                    return false;
+                }
+                positionBySupernode[supernodeId] = position;
+            }
+            for (std::size_t supernodeId = 0; supernodeId < dag.size(); ++supernodeId)
+            {
+                for (uint32_t succ : dag[supernodeId])
+                {
+                    if (succ >= dag.size() ||
+                        positionBySupernode[supernodeId] >= positionBySupernode[succ])
+                    {
+                        error = "activity-schedule topo violates dag edge: " +
+                                std::to_string(supernodeId) + "->" + std::to_string(succ);
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool buildTargetedPureEventWordPack(
+            const Graph &graph,
+            const EmitModel &baselineModel,
+            const ScheduleRefs &schedule,
+            const std::vector<ScheduleBatch> &baselineBatches,
+            PureEventWordPackStats &stats,
+            ActivityScheduleTopoOrder &candidateTopoOrder,
+            std::string &error)
+        {
+            if (schedule.dag == nullptr)
+            {
+                error = "missing activity-schedule dag for pure-event word packing";
+                return false;
+            }
+            const ActivityScheduleDag &dag = *schedule.dag;
+            const std::size_t supernodeCount = schedule.supernodeToOps.size();
+            stats.supernodeCount = supernodeCount;
+            stats.computeSupernodeCount = baselineModel.computeSupernodeIds.size();
+            stats.batchCount = baselineBatches.size();
+
+            std::vector<std::size_t> levelBySupernode;
+            if (!buildActivityScheduleKahnLevels(
+                    dag, supernodeCount, levelBySupernode, stats.kahnLevelCount, error))
+            {
+                return false;
+            }
+            std::vector<std::size_t> baselinePosition;
+            if (!validateActivityScheduleTopo(dag, schedule.topoOrder, baselinePosition, error))
+            {
+                return false;
+            }
+
+            std::vector<std::size_t> batchBySupernode(supernodeCount, kInvalidIndex);
+            std::set<std::size_t> computeActiveWords;
+            for (const ScheduleBatch &batch : baselineBatches)
+            {
+                for (uint32_t supernodeId : batch.supernodeIds)
+                {
+                    if (supernodeId >= supernodeCount || batchBySupernode[supernodeId] != kInvalidIndex)
+                    {
+                        error = "baseline schedule batches do not form a strict supernode partition";
+                        return false;
+                    }
+                    batchBySupernode[supernodeId] = batch.index;
+                }
+                if (batch.phase == ScheduleBatch::Phase::kCompute)
+                {
+                    for (const ScheduleBatch::Word &word : batch.words)
+                    {
+                        computeActiveWords.insert(word.activeFlagWordIndex);
+                    }
+                }
+            }
+            for (uint32_t supernodeId : schedule.topoOrder)
+            {
+                if (supernodeId >= supernodeCount || batchBySupernode[supernodeId] == kInvalidIndex)
+                {
+                    error = "baseline schedule batches omit supernode=" + std::to_string(supernodeId);
+                    return false;
+                }
+            }
+            stats.computeActiveWordCount = computeActiveWords.size();
+
+            using Group = std::pair<std::size_t, std::size_t>;
+            std::map<Group, std::vector<std::size_t>> wordsByGroup;
+            std::map<std::size_t, std::string> baselinePureExprByWord;
+            std::map<std::size_t, std::vector<uint32_t>> baselinePureNodesByWord;
+            for (const ScheduleBatch &batch : baselineBatches)
+            {
+                if (batch.phase != ScheduleBatch::Phase::kCompute)
+                {
+                    continue;
+                }
+                for (const ScheduleBatch::Word &word : batch.words)
+                {
+                    if (word.supernodeIds.size() != kActiveFlagBitsPerWord)
+                    {
+                        continue;
+                    }
+                    std::vector<std::size_t> activeIds;
+                    activeIds.reserve(word.supernodeIds.size());
+                    bool allCompute = true;
+                    for (uint32_t supernodeId : word.supernodeIds)
+                    {
+                        allCompute = allCompute && isComputeSupernode(baselineModel, supernodeId) &&
+                                     !isCommitSupernode(baselineModel, supernodeId);
+                        if (supernodeId >= baselineModel.activeIdBySupernode.size())
+                        {
+                            allCompute = false;
+                            break;
+                        }
+                        activeIds.push_back(baselineModel.activeIdBySupernode[supernodeId]);
+                    }
+                    std::sort(activeIds.begin(), activeIds.end());
+                    const std::size_t wordBegin = word.activeFlagWordIndex * kActiveFlagBitsPerWord;
+                    for (std::size_t bit = 0; allCompute && bit < kActiveFlagBitsPerWord; ++bit)
+                    {
+                        allCompute = activeIds[bit] == wordBegin + bit;
+                    }
+                    if (!allCompute)
+                    {
+                        continue;
+                    }
+
+                    if (const auto expr = eligiblePureEventComputeWordExpr(
+                            graph, baselineModel, schedule, batch, word, true))
+                    {
+                        baselinePureExprByWord.emplace(word.activeFlagWordIndex, *expr);
+                        baselinePureNodesByWord.emplace(word.activeFlagWordIndex, word.supernodeIds);
+                    }
+
+                    const std::uint8_t dispatchMask =
+                        scheduleBatchWordDispatchMask(baselineModel, word);
+                    const std::uint8_t clearMask =
+                        scheduleBatchWordClearMask(baselineModel, batch, word);
+                    const bool consumeFullActiveWord =
+                        baselineModel.fullActiveWordConsume && dispatchMask == UINT8_C(0xff);
+                    if (consumeFullActiveWord || dispatchMask == UINT8_C(0) ||
+                        dispatchMask != clearMask)
+                    {
+                        continue;
+                    }
+
+                    const std::size_t firstLevel = levelBySupernode[word.supernodeIds.front()];
+                    const bool sameLevel = std::all_of(
+                        word.supernodeIds.begin(),
+                        word.supernodeIds.end(),
+                        [&](uint32_t supernodeId) { return levelBySupernode[supernodeId] == firstLevel; });
+                    if (!sameLevel)
+                    {
+                        continue;
+                    }
+                    wordsByGroup[{firstLevel, batch.index}].push_back(word.activeFlagWordIndex);
+                    ++stats.eligibleFullComputeWordCount;
+                }
+            }
+            stats.baselinePureWordCount = baselinePureExprByWord.size();
+
+            candidateTopoOrder = schedule.topoOrder;
+            for (auto &[group, words] : wordsByGroup)
+            {
+                (void)group;
+                std::sort(words.begin(), words.end());
+                std::map<std::string, std::vector<uint32_t>> nodesByKey;
+                for (std::size_t wordIndex : words)
+                {
+                    const std::size_t begin = wordIndex * kActiveFlagBitsPerWord;
+                    for (std::size_t bit = 0; bit < kActiveFlagBitsPerWord; ++bit)
+                    {
+                        const uint32_t supernodeId = schedule.topoOrder[begin + bit];
+                        if (const auto expr = analyzePureEventComputeSupernode(
+                                graph, baselineModel, schedule.supernodeToOps, supernodeId))
+                        {
+                            nodesByKey[*expr].push_back(supernodeId);
+                        }
+                    }
+                }
+
+                std::map<std::size_t, std::string> assignedWord;
+                std::map<std::string, std::vector<std::size_t>> assignedWordsByKey;
+                for (std::size_t wordIndex : words)
+                {
+                    const auto pureIt = baselinePureExprByWord.find(wordIndex);
+                    if (pureIt == baselinePureExprByWord.end())
+                    {
+                        continue;
+                    }
+                    assignedWord.emplace(wordIndex, pureIt->second);
+                    assignedWordsByKey[pureIt->second].push_back(wordIndex);
+                }
+
+                std::map<std::string, std::size_t> demandByKey;
+                for (const auto &[key, nodes] : nodesByKey)
+                {
+                    const std::size_t assigned = assignedWordsByKey[key].size();
+                    const std::size_t capacity = nodes.size() / kActiveFlagBitsPerWord;
+                    if (assigned > capacity)
+                    {
+                        error = "pure-event word pack assigned-word demand underflow";
+                        return false;
+                    }
+                    demandByKey.emplace(key, capacity - assigned);
+                }
+
+                std::set<std::size_t> freeWords(words.begin(), words.end());
+                for (const auto &[wordIndex, key] : assignedWord)
+                {
+                    (void)key;
+                    freeWords.erase(wordIndex);
+                }
+                struct WordChoice
+                {
+                    std::size_t matches = 0;
+                    std::size_t wordIndex = 0;
+                    std::string key;
+                };
+                std::vector<WordChoice> choices;
+                choices.reserve(nodesByKey.size() * freeWords.size());
+                for (const auto &[key, nodes] : nodesByKey)
+                {
+                    (void)nodes;
+                    for (std::size_t wordIndex : freeWords)
+                    {
+                        std::size_t matches = 0u;
+                        const std::size_t begin = wordIndex * kActiveFlagBitsPerWord;
+                        for (std::size_t bit = 0; bit < kActiveFlagBitsPerWord; ++bit)
+                        {
+                            const uint32_t supernodeId = schedule.topoOrder[begin + bit];
+                            const auto expr = analyzePureEventComputeSupernode(
+                                graph, baselineModel, schedule.supernodeToOps, supernodeId);
+                            matches += expr && *expr == key ? 1u : 0u;
+                        }
+                        choices.push_back(WordChoice{.matches = matches,
+                                                     .wordIndex = wordIndex,
+                                                     .key = key});
+                    }
+                }
+                std::sort(choices.begin(),
+                          choices.end(),
+                          [](const WordChoice &lhs, const WordChoice &rhs)
+                          {
+                              if (lhs.matches != rhs.matches)
+                              {
+                                  return lhs.matches > rhs.matches;
+                              }
+                              if (lhs.wordIndex != rhs.wordIndex)
+                              {
+                                  return lhs.wordIndex < rhs.wordIndex;
+                              }
+                              return lhs.key < rhs.key;
+                          });
+                for (const WordChoice &choice : choices)
+                {
+                    auto demandIt = demandByKey.find(choice.key);
+                    if (!freeWords.contains(choice.wordIndex) ||
+                        demandIt == demandByKey.end() || demandIt->second == 0u)
+                    {
+                        continue;
+                    }
+                    assignedWord.emplace(choice.wordIndex, choice.key);
+                    assignedWordsByKey[choice.key].push_back(choice.wordIndex);
+                    freeWords.erase(choice.wordIndex);
+                    --demandIt->second;
+                }
+                for (auto &[key, demand] : demandByKey)
+                {
+                    while (demand != 0u)
+                    {
+                        if (freeWords.empty())
+                        {
+                            error = "not enough complete words for targeted pure-event packing";
+                            return false;
+                        }
+                        const std::size_t wordIndex = *freeWords.begin();
+                        assignedWord.emplace(wordIndex, key);
+                        assignedWordsByKey[key].push_back(wordIndex);
+                        freeWords.erase(freeWords.begin());
+                        --demand;
+                    }
+                }
+
+                std::set<uint32_t> usedNodes;
+                std::set<std::size_t> targetPositions;
+                for (auto &[key, assignedWords] : assignedWordsByKey)
+                {
+                    std::sort(assignedWords.begin(), assignedWords.end());
+                    std::vector<std::size_t> keyPositions;
+                    for (std::size_t wordIndex : assignedWords)
+                    {
+                        for (std::size_t bit = 0; bit < kActiveFlagBitsPerWord; ++bit)
+                        {
+                            keyPositions.push_back(wordIndex * kActiveFlagBitsPerWord + bit);
+                        }
+                    }
+                    targetPositions.insert(keyPositions.begin(), keyPositions.end());
+
+                    const std::vector<uint32_t> &available = nodesByKey.at(key);
+                    std::set<uint32_t> availableSet(available.begin(), available.end());
+                    std::vector<std::size_t> emptyPositions;
+                    for (std::size_t position : keyPositions)
+                    {
+                        const uint32_t supernodeId = schedule.topoOrder[position];
+                        if (availableSet.erase(supernodeId) != 0u)
+                        {
+                            candidateTopoOrder[position] = supernodeId;
+                            usedNodes.insert(supernodeId);
+                        }
+                        else
+                        {
+                            emptyPositions.push_back(position);
+                        }
+                    }
+                    std::vector<uint32_t> remaining;
+                    for (uint32_t supernodeId : available)
+                    {
+                        if (availableSet.contains(supernodeId))
+                        {
+                            remaining.push_back(supernodeId);
+                        }
+                    }
+                    if (remaining.size() < emptyPositions.size())
+                    {
+                        error = "targeted pure-event packing key fill mismatch";
+                        return false;
+                    }
+                    for (std::size_t index = 0; index < emptyPositions.size(); ++index)
+                    {
+                        candidateTopoOrder[emptyPositions[index]] = remaining[index];
+                        usedNodes.insert(remaining[index]);
+                    }
+                }
+
+                std::vector<std::size_t> emptyPositions;
+                std::vector<std::size_t> groupPositions;
+                groupPositions.reserve(words.size() * kActiveFlagBitsPerWord);
+                for (std::size_t wordIndex : words)
+                {
+                    for (std::size_t bit = 0; bit < kActiveFlagBitsPerWord; ++bit)
+                    {
+                        const std::size_t position = wordIndex * kActiveFlagBitsPerWord + bit;
+                        groupPositions.push_back(position);
+                        if (targetPositions.contains(position))
+                        {
+                            continue;
+                        }
+                        const uint32_t supernodeId = schedule.topoOrder[position];
+                        if (!usedNodes.contains(supernodeId))
+                        {
+                            candidateTopoOrder[position] = supernodeId;
+                            usedNodes.insert(supernodeId);
+                        }
+                        else
+                        {
+                            emptyPositions.push_back(position);
+                        }
+                    }
+                }
+                std::vector<uint32_t> unusedNodes;
+                for (std::size_t position : groupPositions)
+                {
+                    const uint32_t supernodeId = schedule.topoOrder[position];
+                    if (!usedNodes.contains(supernodeId))
+                    {
+                        unusedNodes.push_back(supernodeId);
+                    }
+                }
+                if (emptyPositions.size() != unusedNodes.size())
+                {
+                    error = "targeted pure-event packing residual mismatch";
+                    return false;
+                }
+                for (std::size_t index = 0; index < emptyPositions.size(); ++index)
+                {
+                    candidateTopoOrder[emptyPositions[index]] = unusedNodes[index];
+                    usedNodes.insert(unusedNodes[index]);
+                }
+                if (usedNodes.size() != groupPositions.size())
+                {
+                    error = "targeted pure-event packing lost supernodes";
+                    return false;
+                }
+            }
+
+            std::vector<std::size_t> candidatePosition;
+            if (!validateActivityScheduleTopo(dag, candidateTopoOrder, candidatePosition, error))
+            {
+                return false;
+            }
+            for (std::size_t position = 0; position < schedule.topoOrder.size(); ++position)
+            {
+                const uint32_t baselineSupernode = schedule.topoOrder[position];
+                const uint32_t candidateSupernode = candidateTopoOrder[position];
+                if (baselineSupernode == candidateSupernode)
+                {
+                    continue;
+                }
+                if (isCommitSupernode(baselineModel, baselineSupernode) ||
+                    isCommitSupernode(baselineModel, candidateSupernode))
+                {
+                    error = "targeted pure-event packing moved a commit supernode";
+                    return false;
+                }
+                if (levelBySupernode[baselineSupernode] != levelBySupernode[candidateSupernode] ||
+                    batchBySupernode[baselineSupernode] != batchBySupernode[candidateSupernode])
+                {
+                    error = "targeted pure-event packing crossed a Kahn level or frozen batch";
+                    return false;
+                }
+                ++stats.movedSupernodeCount;
+                if (analyzePureEventComputeSupernode(
+                        graph, baselineModel, schedule.supernodeToOps, baselineSupernode))
+                {
+                    ++stats.movedEventSupernodeCount;
+                }
+            }
+            for (uint32_t supernodeId : baselineModel.computeSupernodeIds)
+            {
+                stats.maxActiveIdDisplacement = std::max(
+                    stats.maxActiveIdDisplacement,
+                    baselinePosition[supernodeId] > candidatePosition[supernodeId]
+                        ? baselinePosition[supernodeId] - candidatePosition[supernodeId]
+                        : candidatePosition[supernodeId] - baselinePosition[supernodeId]);
+            }
+            stats.movedSupernodePpm = ratioPpm(stats.movedSupernodeCount, stats.computeSupernodeCount);
+
+            for (std::size_t wordIndex : computeActiveWords)
+            {
+                const std::size_t begin = wordIndex * kActiveFlagBitsPerWord;
+                const std::size_t end = std::min(begin + kActiveFlagBitsPerWord, schedule.topoOrder.size());
+                if (!std::equal(schedule.topoOrder.begin() + static_cast<std::ptrdiff_t>(begin),
+                                schedule.topoOrder.begin() + static_cast<std::ptrdiff_t>(end),
+                                candidateTopoOrder.begin() + static_cast<std::ptrdiff_t>(begin)))
+                {
+                    ++stats.changedWordCount;
+                }
+            }
+            stats.changedWordPpm = ratioPpm(stats.changedWordCount, stats.computeActiveWordCount);
+            if (!withinPpmBudget(stats.movedSupernodeCount,
+                                 stats.computeSupernodeCount,
+                                 stats.maxMovedSupernodePpm))
+            {
+                error = "targeted pure-event word pack exceeds moved-supernode budget: moved=" +
+                        std::to_string(stats.movedSupernodeCount) + " compute=" +
+                        std::to_string(stats.computeSupernodeCount) + " max_ppm=" +
+                        std::to_string(stats.maxMovedSupernodePpm);
+                return false;
+            }
+            if (!withinPpmBudget(stats.changedWordCount,
+                                 stats.computeActiveWordCount,
+                                 stats.maxChangedWordPpm))
+            {
+                error = "targeted pure-event word pack exceeds changed-word budget: changed=" +
+                        std::to_string(stats.changedWordCount) + " compute_words=" +
+                        std::to_string(stats.computeActiveWordCount) + " max_ppm=" +
+                        std::to_string(stats.maxChangedWordPpm);
+                return false;
+            }
+
+            std::size_t candidatePureWords = 0u;
+            for (std::size_t wordIndex : computeActiveWords)
+            {
+                const std::size_t begin = wordIndex * kActiveFlagBitsPerWord;
+                if (begin + kActiveFlagBitsPerWord > candidateTopoOrder.size())
+                {
+                    continue;
+                }
+                const std::span<const uint32_t> nodes(candidateTopoOrder.data() + begin,
+                                                      kActiveFlagBitsPerWord);
+                if (!std::all_of(nodes.begin(),
+                                 nodes.end(),
+                                 [&](uint32_t supernodeId)
+                                 {
+                                     return isComputeSupernode(baselineModel, supernodeId) &&
+                                            !isCommitSupernode(baselineModel, supernodeId);
+                                 }))
+                {
+                    continue;
+                }
+                ScheduleBatch candidateBatch;
+                candidateBatch.phase = ScheduleBatch::Phase::kCompute;
+                candidateBatch.index = batchBySupernode[nodes.front()];
+                ScheduleBatch::Word candidateWord;
+                candidateWord.activeFlagWordIndex = wordIndex;
+                candidateWord.supernodeIds.assign(nodes.begin(), nodes.end());
+                const bool sameBatch = std::all_of(
+                    nodes.begin(),
+                    nodes.end(),
+                    [&](uint32_t supernodeId)
+                    {
+                        return batchBySupernode[supernodeId] == candidateBatch.index;
+                    });
+                // A complete all-compute candidate word has dispatchMask == clearMask == 0xff.
+                // Event purity and materialization do not depend on active IDs, so avoid copying
+                // the full model merely to repeat those two mask computations.
+                const auto expr = sameBatch && !baselineModel.fullActiveWordConsume
+                                      ? analyzePureEventComputeWord(
+                                            graph,
+                                            baselineModel,
+                                            schedule.supernodeToOps,
+                                            candidateWord)
+                                      : std::optional<std::string>{};
+                if (expr)
+                {
+                    ++candidatePureWords;
+                }
+                const auto baselinePureIt = baselinePureExprByWord.find(wordIndex);
+                if (baselinePureIt == baselinePureExprByWord.end())
+                {
+                    continue;
+                }
+                std::vector<uint32_t> candidateNodes(nodes.begin(), nodes.end());
+                std::vector<uint32_t> baselineNodes = baselinePureNodesByWord.at(wordIndex);
+                std::sort(candidateNodes.begin(), candidateNodes.end());
+                std::sort(baselineNodes.begin(), baselineNodes.end());
+                if (!expr || *expr != baselinePureIt->second || candidateNodes != baselineNodes)
+                {
+                    error = "targeted pure-event packing changed an existing pure word: word=" +
+                            std::to_string(wordIndex);
+                    return false;
+                }
+            }
+            stats.candidatePureWordCount = candidatePureWords;
+            if (candidatePureWords < stats.baselinePureWordCount)
+            {
+                stats.lostPureWordCount = stats.baselinePureWordCount - candidatePureWords;
+                error = "targeted pure-event packing lost existing pure words";
+                return false;
+            }
+            stats.addedPureWordCount = candidatePureWords - stats.baselinePureWordCount;
+            stats.validationPassed = true;
+            return true;
+        }
+
+        bool rebuildFrozenScheduleBatches(const Graph &graph,
+                                          const EmitModel &model,
+                                          const ScheduleRefs &schedule,
+                                          const std::vector<ScheduleBatch> &baselineBatches,
+                                          PureEventWordPackStats &stats,
+                                          std::vector<ScheduleBatch> &rebuiltBatches,
+                                          std::string &error)
+        {
+            const std::size_t supernodeCount = schedule.supernodeToOps.size();
+            std::vector<std::size_t> batchBySupernode(supernodeCount, kInvalidIndex);
+            for (const ScheduleBatch &batch : baselineBatches)
+            {
+                for (uint32_t supernodeId : batch.supernodeIds)
+                {
+                    if (supernodeId >= supernodeCount || batchBySupernode[supernodeId] != kInvalidIndex)
+                    {
+                        error = "baseline frozen batches are not a strict supernode partition";
+                        return false;
+                    }
+                    batchBySupernode[supernodeId] = batch.index;
+                }
+            }
+
+            rebuiltBatches.clear();
+            rebuiltBatches.reserve(baselineBatches.size());
+            for (const ScheduleBatch &baseline : baselineBatches)
+            {
+                ScheduleBatch rebuilt;
+                rebuilt.index = baseline.index;
+                rebuilt.phase = baseline.phase;
+                auto appendWord = [&](uint32_t supernodeId)
+                {
+                    const std::size_t activeWordIndex = model.activeIdBySupernode[supernodeId] /
+                                                        kActiveFlagBitsPerWord;
+                    if (rebuilt.phase == ScheduleBatch::Phase::kCommit ||
+                        rebuilt.words.empty() ||
+                        rebuilt.words.back().activeFlagWordIndex != activeWordIndex)
+                    {
+                        rebuilt.words.push_back(
+                            ScheduleBatch::Word{.activeFlagWordIndex = activeWordIndex});
+                    }
+                    ScheduleBatch::Word &word = rebuilt.words.back();
+                    const std::size_t opCount = schedule.supernodeToOps[supernodeId].size();
+                    const std::size_t estimatedLines = estimateSupernodeEmitLines(
+                        graph, model, schedule.valueFanout, schedule.supernodeToOps, supernodeId);
+                    word.supernodeIds.push_back(supernodeId);
+                    word.opCount += opCount;
+                    word.estimatedLines += estimatedLines;
+                    rebuilt.supernodeIds.push_back(supernodeId);
+                    rebuilt.opCount += opCount;
+                    rebuilt.estimatedLines += estimatedLines;
+                };
+                for (uint32_t supernodeId : schedule.topoOrder)
+                {
+                    if (supernodeId >= supernodeCount || batchBySupernode[supernodeId] != baseline.index)
+                    {
+                        continue;
+                    }
+                    const bool correctPhase = rebuilt.phase == ScheduleBatch::Phase::kCompute
+                                                  ? isComputeSupernode(model, supernodeId)
+                                                  : isCommitSupernode(model, supernodeId);
+                    if (!correctPhase || model.activeIdBySupernode[supernodeId] == kInvalidIndex)
+                    {
+                        error = "frozen batch rebuild encountered a phase or active-id mismatch";
+                        return false;
+                    }
+                    appendWord(supernodeId);
+                }
+                rebuiltBatches.push_back(std::move(rebuilt));
+            }
+
+            if (rebuiltBatches.size() != baselineBatches.size())
+            {
+                error = "frozen batch rebuild changed batch count";
+                return false;
+            }
+            stats.frozenBatchBaselineEstimatedLines = 0u;
+            stats.frozenBatchRebuiltEstimatedLines = 0u;
+            stats.frozenBatchEstimatedLineChangedBatchCount = 0u;
+            stats.frozenBatchMaxAbsEstimatedLineDelta = 0u;
+            for (std::size_t batchIndex = 0; batchIndex < baselineBatches.size(); ++batchIndex)
+            {
+                const ScheduleBatch &baseline = baselineBatches[batchIndex];
+                const ScheduleBatch &rebuilt = rebuiltBatches[batchIndex];
+                stats.frozenBatchBaselineEstimatedLines += baseline.estimatedLines;
+                stats.frozenBatchRebuiltEstimatedLines += rebuilt.estimatedLines;
+                if (baseline.estimatedLines != rebuilt.estimatedLines)
+                {
+                    ++stats.frozenBatchEstimatedLineChangedBatchCount;
+                    const std::size_t delta = baseline.estimatedLines > rebuilt.estimatedLines
+                                                  ? baseline.estimatedLines - rebuilt.estimatedLines
+                                                  : rebuilt.estimatedLines - baseline.estimatedLines;
+                    stats.frozenBatchMaxAbsEstimatedLineDelta =
+                        std::max(stats.frozenBatchMaxAbsEstimatedLineDelta, delta);
+                }
+                if (baseline.index != rebuilt.index || baseline.phase != rebuilt.phase ||
+                    baseline.opCount != rebuilt.opCount)
+                {
+                    error = "frozen batch rebuild changed batch metadata: batch=" +
+                            std::to_string(batchIndex) + " baseline_index=" +
+                            std::to_string(baseline.index) + " rebuilt_index=" +
+                            std::to_string(rebuilt.index) + " baseline_phase=" +
+                            std::string(scheduleBatchPhaseName(baseline.phase)) + " rebuilt_phase=" +
+                            std::string(scheduleBatchPhaseName(rebuilt.phase)) + " baseline_ops=" +
+                            std::to_string(baseline.opCount) + " rebuilt_ops=" +
+                            std::to_string(rebuilt.opCount) + " baseline_lines=" +
+                            std::to_string(baseline.estimatedLines) + " rebuilt_lines=" +
+                            std::to_string(rebuilt.estimatedLines) + " baseline_words=" +
+                            std::to_string(baseline.words.size()) + " rebuilt_words=" +
+                            std::to_string(rebuilt.words.size()) + " baseline_members=" +
+                            std::to_string(baseline.supernodeIds.size()) + " rebuilt_members=" +
+                            std::to_string(rebuilt.supernodeIds.size());
+                    return false;
+                }
+                std::vector<uint32_t> baselineMembers = baseline.supernodeIds;
+                std::vector<uint32_t> rebuiltMembers = rebuilt.supernodeIds;
+                std::sort(baselineMembers.begin(), baselineMembers.end());
+                std::sort(rebuiltMembers.begin(), rebuiltMembers.end());
+                if (baselineMembers != rebuiltMembers)
+                {
+                    error = "frozen batch rebuild changed batch membership: batch=" +
+                            std::to_string(batchIndex);
+                    return false;
+                }
+                std::vector<std::size_t> baselineWords;
+                std::vector<std::size_t> rebuiltWords;
+                for (const ScheduleBatch::Word &word : baseline.words)
+                {
+                    baselineWords.push_back(word.activeFlagWordIndex);
+                }
+                for (const ScheduleBatch::Word &word : rebuilt.words)
+                {
+                    rebuiltWords.push_back(word.activeFlagWordIndex);
+                }
+                std::sort(baselineWords.begin(), baselineWords.end());
+                std::sort(rebuiltWords.begin(), rebuiltWords.end());
+                if (baselineWords != rebuiltWords)
+                {
+                    error = "frozen batch rebuild changed active-word slots: batch=" +
+                            std::to_string(batchIndex);
+                    return false;
+                }
+                if (baseline.phase == ScheduleBatch::Phase::kCommit &&
+                    baseline.supernodeIds != rebuilt.supernodeIds)
+                {
+                    error = "frozen batch rebuild changed commit order: batch=" +
+                            std::to_string(batchIndex);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool validateRebuiltActiveIdVectors(const EmitModel &model,
+                                            std::size_t supernodeCount,
+                                            std::string &error)
+        {
+            const auto validateIds = [&](const std::vector<uint32_t> &activeIds,
+                                         std::string_view field) -> bool
+            {
+                if (!std::is_sorted(activeIds.begin(), activeIds.end()) ||
+                    std::adjacent_find(activeIds.begin(), activeIds.end()) != activeIds.end() ||
+                    std::any_of(activeIds.begin(),
+                                activeIds.end(),
+                                [&](uint32_t activeId) { return activeId >= supernodeCount; }))
+                {
+                    error = "rebuilt active-id vector is not sorted-unique/in-range: " +
+                            std::string(field);
+                    return false;
+                }
+                return true;
+            };
+            for (const auto &[value, activeIds] : model.boundaryFanoutByValue)
+            {
+                (void)value;
+                if (!validateIds(activeIds, "boundary_fanout"))
+                {
+                    return false;
+                }
+            }
+            for (const auto &[value, activeIds] : model.inputHeadSupernodesByValue)
+            {
+                (void)value;
+                if (!validateIds(activeIds, "input_heads"))
+                {
+                    return false;
+                }
+            }
+            for (const auto &[symbol, activeIds] : model.stateHeadSupernodesBySymbol)
+            {
+                (void)symbol;
+                if (!validateIds(activeIds, "state_heads"))
+                {
+                    return false;
+                }
+            }
+            const std::size_t activeWordCount =
+                (supernodeCount + kActiveFlagBitsPerWord - 1u) / kActiveFlagBitsPerWord;
+            for (const MemoryRowReaderActivationDecl &activation : model.memoryRowReaderActivations)
+            {
+                if (!validateIds(activation.dynamicReaderActiveIds, "memory_dynamic_readers") ||
+                    activation.rowEntryOffsets.empty() || activation.rowEntryOffsets.front() != 0u ||
+                    activation.rowEntryOffsets.back() != activation.rowEntries.size() ||
+                    !std::is_sorted(activation.rowEntryOffsets.begin(), activation.rowEntryOffsets.end()))
+                {
+                    if (error.empty())
+                    {
+                        error = "rebuilt memory-row activation offsets are invalid";
+                    }
+                    return false;
+                }
+                for (std::size_t row = 1; row < activation.rowEntryOffsets.size(); ++row)
+                {
+                    std::size_t previousWord = kInvalidIndex;
+                    for (std::size_t index = activation.rowEntryOffsets[row - 1];
+                         index < activation.rowEntryOffsets[row];
+                         ++index)
+                    {
+                        const ActiveMaskEntry &entry = activation.rowEntries[index];
+                        if (entry.mask == UINT8_C(0) || entry.wordIndex >= activeWordCount ||
+                            (previousWord != kInvalidIndex && entry.wordIndex <= previousWord))
+                        {
+                            error = "rebuilt memory-row activation entries are invalid";
+                            return false;
+                        }
+                        previousWord = entry.wordIndex;
+                    }
+                }
+            }
+            return true;
+        }
+
         bool isCompressibleScalarStateWrite(const EmitModel &model, OperationId opId)
         {
             (void)model;
@@ -16231,6 +17283,8 @@ namespace wolvrix::lib::emit
             getSessionValue<ActivityScheduleValueFanout>(options, sessionPrefix + "value_fanout");
         const auto *topoOrder =
             getSessionValue<ActivityScheduleTopoOrder>(options, sessionPrefix + "topo_order");
+        const auto *dag =
+            getSessionValue<ActivityScheduleDag>(options, sessionPrefix + "dag");
         const auto *stateReadSupernodes =
             getSessionValue<ActivityScheduleStateReadSupernodes>(options, sessionPrefix + "state_read_supernodes");
         const auto *supernodeKinds =
@@ -16244,11 +17298,13 @@ namespace wolvrix::lib::emit
             result.success = false;
             return result;
         }
+        ActivityScheduleTopoOrder emitterTopoOrder = *topoOrder;
         const ScheduleRefs schedule{
             .supernodeToOps = *supernodeToOps,
             .valueFanout = *valueFanout,
-            .topoOrder = *topoOrder,
+            .topoOrder = emitterTopoOrder,
             .stateReadSupernodes = *stateReadSupernodes,
+            .dag = dag,
             .supernodeKinds = supernodeKinds,
             .computeNodesBySupernode = computeNodesBySupernode,
         };
@@ -16308,6 +17364,74 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "pure_event_compute_word_profile",
                                    "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_PROFILE");
+        std::string invalidWordPackPolicy;
+        const auto pureEventWordPackPolicy =
+            parsePureEventWordPackPolicy(options, invalidWordPackPolicy);
+        if (!pureEventWordPackPolicy)
+        {
+            reportError("invalid pure_event_word_pack_policy: " + invalidWordPackPolicy +
+                        " (expected off, probe, or targeted)");
+            result.success = false;
+            return result;
+        }
+        if (*pureEventWordPackPolicy != PureEventWordPackPolicy::kOff && dag == nullptr)
+        {
+            reportError("missing activity-schedule dag for pure-event word packing", sessionPrefix);
+            result.success = false;
+            return result;
+        }
+        if (*pureEventWordPackPolicy == PureEventWordPackPolicy::kTargeted &&
+            !pureEventComputeWordBypass)
+        {
+            reportError("pure_event_word_pack_policy=targeted requires "
+                        "pure_event_compute_word_bypass=true");
+            result.success = false;
+            return result;
+        }
+        std::string invalidWordPackBudget;
+        const auto parsedPureEventWordPackMaxMovedSupernodePpm =
+            parseUnsignedEmitOption(options,
+                                    "pure_event_word_pack_max_moved_supernode_ppm",
+                                    "WOLVRIX_GRHSIM_PURE_EVENT_WORD_PACK_MAX_MOVED_SUPERNODE_PPM",
+                                    5000u,
+                                    invalidWordPackBudget);
+        if (!parsedPureEventWordPackMaxMovedSupernodePpm)
+        {
+            reportError("invalid pure_event_word_pack_max_moved_supernode_ppm: " +
+                        invalidWordPackBudget);
+            result.success = false;
+            return result;
+        }
+        invalidWordPackBudget.clear();
+        const auto parsedPureEventWordPackMaxChangedWordPpm =
+            parseUnsignedEmitOption(options,
+                                    "pure_event_word_pack_max_changed_word_ppm",
+                                    "WOLVRIX_GRHSIM_PURE_EVENT_WORD_PACK_MAX_CHANGED_WORD_PPM",
+                                    20000u,
+                                    invalidWordPackBudget);
+        if (!parsedPureEventWordPackMaxChangedWordPpm)
+        {
+            reportError("invalid pure_event_word_pack_max_changed_word_ppm: " +
+                        invalidWordPackBudget);
+            result.success = false;
+            return result;
+        }
+        const std::size_t pureEventWordPackMaxMovedSupernodePpm =
+            *parsedPureEventWordPackMaxMovedSupernodePpm;
+        const std::size_t pureEventWordPackMaxChangedWordPpm =
+            *parsedPureEventWordPackMaxChangedWordPpm;
+        if (pureEventWordPackMaxMovedSupernodePpm > 1000000u)
+        {
+            reportError("pure_event_word_pack_max_moved_supernode_ppm must be <= 1000000");
+            result.success = false;
+            return result;
+        }
+        if (pureEventWordPackMaxChangedWordPpm > 1000000u)
+        {
+            reportError("pure_event_word_pack_max_changed_word_ppm must be <= 1000000");
+            result.success = false;
+            return result;
+        }
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -16322,6 +17446,20 @@ namespace wolvrix::lib::emit
         }
 #endif
 
+        const auto configureModel = [&](EmitModel &configuredModel)
+        {
+            configuredModel.emitWaveform = waveformMode != WaveformMode::kOff;
+            configuredModel.emitPerf = perfMode != PerfMode::kOff;
+            configuredModel.emitRuntimeProfile = emitRuntimeProfile;
+            configuredModel.inputFullpassSpecialization = inputFullpassSpecialization;
+            configuredModel.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
+            configuredModel.commitStateChangeUnlikely = commitStateChangeUnlikely;
+            configuredModel.fullActiveWordConsume = fullActiveWordConsume;
+            configuredModel.oneBitBitwiseBytes = oneBitBitwiseBytes;
+            configuredModel.pureEventComputeWordBypass = pureEventComputeWordBypass;
+            configuredModel.pureEventComputeWordProfile = pureEventComputeWordProfile;
+        };
+
         EmitModel model;
         model.directSingleWriterStateReads = directSingleWriterStateReads;
         std::string buildError;
@@ -16331,16 +17469,7 @@ namespace wolvrix::lib::emit
             result.success = false;
             return result;
         }
-        model.emitWaveform = waveformMode != WaveformMode::kOff;
-        model.emitPerf = perfMode != PerfMode::kOff;
-        model.emitRuntimeProfile = emitRuntimeProfile;
-        model.inputFullpassSpecialization = inputFullpassSpecialization;
-        model.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
-        model.commitStateChangeUnlikely = commitStateChangeUnlikely;
-        model.fullActiveWordConsume = fullActiveWordConsume;
-        model.oneBitBitwiseBytes = oneBitBitwiseBytes;
-        model.pureEventComputeWordBypass = pureEventComputeWordBypass;
-        model.pureEventComputeWordProfile = pureEventComputeWordProfile;
+        configureModel(model);
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);
@@ -16379,6 +17508,150 @@ namespace wolvrix::lib::emit
         if (scheduleBatches.empty())
         {
             scheduleBatches.push_back(ScheduleBatch{.index = 0});
+        }
+
+        PureEventWordPackStats pureEventWordPackStats;
+        pureEventWordPackStats.policy = *pureEventWordPackPolicy;
+        pureEventWordPackStats.maxMovedSupernodePpm = pureEventWordPackMaxMovedSupernodePpm;
+        pureEventWordPackStats.maxChangedWordPpm = pureEventWordPackMaxChangedWordPpm;
+        if (*pureEventWordPackPolicy != PureEventWordPackPolicy::kOff)
+        {
+            ActivityScheduleTopoOrder candidateTopoOrder;
+            std::string wordPackError;
+            if (!buildTargetedPureEventWordPack(graph,
+                                                model,
+                                                schedule,
+                                                scheduleBatches,
+                                                pureEventWordPackStats,
+                                                candidateTopoOrder,
+                                                wordPackError))
+            {
+                reportError(wordPackError, graph.symbol());
+                result.success = false;
+                return result;
+            }
+
+            if (*pureEventWordPackPolicy == PureEventWordPackPolicy::kTargeted)
+            {
+                const std::vector<uint32_t> baselineCommitSupernodeIds = model.commitSupernodeIds;
+                const std::vector<std::size_t> baselineActiveIdBySupernode = model.activeIdBySupernode;
+                emitterTopoOrder = std::move(candidateTopoOrder);
+                model = EmitModel{};
+
+                EmitModel rebuiltModel;
+                rebuiltModel.directSingleWriterStateReads = directSingleWriterStateReads;
+                std::string rebuildError;
+                if (!buildModel(graph, schedule, {}, waveformValueIds, rebuiltModel, rebuildError))
+                {
+                    reportError(rebuildError, graph.symbol());
+                    result.success = false;
+                    return result;
+                }
+                configureModel(rebuiltModel);
+                if (rebuiltModel.emitRuntimeProfile)
+                {
+                    buildRuntimeProfileWeights(graph, schedule, rebuiltModel);
+                }
+                if (rebuiltModel.activeIdBySupernode.size() != emitterTopoOrder.size())
+                {
+                    reportError("rebuilt active-id map size mismatch", graph.symbol());
+                    result.success = false;
+                    return result;
+                }
+                for (std::size_t activeId = 0; activeId < emitterTopoOrder.size(); ++activeId)
+                {
+                    const uint32_t supernodeId = emitterTopoOrder[activeId];
+                    if (supernodeId >= rebuiltModel.activeIdBySupernode.size() ||
+                        rebuiltModel.activeIdBySupernode[supernodeId] != activeId)
+                    {
+                        reportError("rebuilt active-id map is not the candidate permutation", graph.symbol());
+                        result.success = false;
+                        return result;
+                    }
+                }
+                if (rebuiltModel.commitSupernodeIds != baselineCommitSupernodeIds)
+                {
+                    reportError("pure-event word packing changed commit supernode order", graph.symbol());
+                    result.success = false;
+                    return result;
+                }
+                for (uint32_t supernodeId : baselineCommitSupernodeIds)
+                {
+                    if (rebuiltModel.activeIdBySupernode[supernodeId] !=
+                        baselineActiveIdBySupernode[supernodeId])
+                    {
+                        reportError("pure-event word packing changed a commit active ID", graph.symbol());
+                        result.success = false;
+                        return result;
+                    }
+                }
+                if (!validateRebuiltActiveIdVectors(
+                        rebuiltModel, schedule.supernodeToOps.size(), rebuildError))
+                {
+                    reportError(rebuildError, graph.symbol());
+                    result.success = false;
+                    return result;
+                }
+
+                std::vector<ScheduleBatch> rebuiltBatches;
+                if (!rebuildFrozenScheduleBatches(
+                        graph,
+                        rebuiltModel,
+                        schedule,
+                        scheduleBatches,
+                        pureEventWordPackStats,
+                        rebuiltBatches,
+                        rebuildError))
+                {
+                    reportError(rebuildError, graph.symbol());
+                    result.success = false;
+                    return result;
+                }
+                std::size_t rebuiltPureWordCount = 0u;
+                for (const ScheduleBatch &batch : rebuiltBatches)
+                {
+                    for (const ScheduleBatch::Word &word : batch.words)
+                    {
+                        if (word.supernodeIds.size() == kActiveFlagBitsPerWord &&
+                            eligiblePureEventComputeWordExpr(
+                                graph, rebuiltModel, schedule, batch, word, true))
+                        {
+                            ++rebuiltPureWordCount;
+                        }
+                    }
+                }
+                if (rebuiltPureWordCount != pureEventWordPackStats.candidatePureWordCount)
+                {
+                    reportError("rebuilt pure-event word coverage differs from validated candidate: rebuilt=" +
+                                    std::to_string(rebuiltPureWordCount) + " candidate=" +
+                                    std::to_string(pureEventWordPackStats.candidatePureWordCount),
+                                graph.symbol());
+                    result.success = false;
+                    return result;
+                }
+                model = std::move(rebuiltModel);
+                scheduleBatches = std::move(rebuiltBatches);
+                pureEventWordPackStats.applied = true;
+            }
+
+            std::fprintf(stderr,
+                         "[GRHSIM_PURE_EVENT_WORD_PACK] policy=%.*s applied=%u baseline_pure_words=%zu candidate_pure_words=%zu added=%zu moved=%zu moved_ppm=%zu changed_words=%zu changed_word_ppm=%zu levels=%zu batches=%zu line_changed_batches=%zu line_baseline=%zu line_rebuilt=%zu max_line_delta=%zu\n",
+                         static_cast<int>(pureEventWordPackPolicyName(*pureEventWordPackPolicy).size()),
+                         pureEventWordPackPolicyName(*pureEventWordPackPolicy).data(),
+                         pureEventWordPackStats.applied ? 1u : 0u,
+                         pureEventWordPackStats.baselinePureWordCount,
+                         pureEventWordPackStats.candidatePureWordCount,
+                         pureEventWordPackStats.addedPureWordCount,
+                         pureEventWordPackStats.movedSupernodeCount,
+                         pureEventWordPackStats.movedSupernodePpm,
+                         pureEventWordPackStats.changedWordCount,
+                         pureEventWordPackStats.changedWordPpm,
+                         pureEventWordPackStats.kahnLevelCount,
+                         pureEventWordPackStats.batchCount,
+                         pureEventWordPackStats.frozenBatchEstimatedLineChangedBatchCount,
+                         pureEventWordPackStats.frozenBatchBaselineEstimatedLines,
+                         pureEventWordPackStats.frozenBatchRebuiltEstimatedLines,
+                         pureEventWordPackStats.frozenBatchMaxAbsEstimatedLineDelta);
         }
         markRepeatedPatternScheduleBatches(graph, model, schedule, scheduleBatches);
         std::vector<ValueId> batchReadLocalityValueOrder =
@@ -23758,9 +25031,14 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
         }
 
-        if (auto error = writePackedArrayLaneEmitStatsJson(emitStatsPath,
-                                                           model.packedArrayLaneEmitStats,
-                                                           maxOutputFileBytes))
+        const PureEventWordPackStats *wordPackStatsForJson =
+            *pureEventWordPackPolicy == PureEventWordPackPolicy::kOff
+                ? nullptr
+                : &pureEventWordPackStats;
+        if (auto error = writeGrhSimEmitStatsJson(emitStatsPath,
+                                                  model.packedArrayLaneEmitStats,
+                                                  wordPackStatsForJson,
+                                                  maxOutputFileBytes))
         {
             reportError(*error, emitStatsPath.string());
             result.success = false;

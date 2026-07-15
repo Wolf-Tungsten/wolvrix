@@ -9715,6 +9715,608 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        struct FinalFaninPullbackCandidate
+        {
+            uint32_t computeNode = kInvalidActivitySupernodeId;
+            uint32_t source = kInvalidActivitySupernodeId;
+            uint32_t target = kInvalidActivitySupernodeId;
+            std::size_t opCount = 0;
+            std::size_t maxValueWidth = 0;
+            std::size_t removableInputs = 0;
+            std::size_t gain = 0;
+            std::vector<wolvrix::lib::grh::OperationId> touchedOps;
+            std::vector<wolvrix::lib::grh::ValueId> touchedValues;
+        };
+
+        struct FinalFaninPullbackProbeStats
+        {
+            using CountMap = ActivityScheduleSummaryStats::KindCountMap;
+
+            std::size_t scanned = 0;
+            std::size_t pure = 0;
+            std::size_t commonSource = 0;
+            std::size_t exactEligible = 0;
+            std::size_t selected = 0;
+            std::size_t eligibleProjectedBaeGain = 0;
+            std::size_t projectedBaeGain = 0;
+            std::size_t movedOps = 0;
+            std::size_t movedOpLimit = 0;
+            std::size_t rejectedOwner = 0;
+            std::size_t rejectedNodeSize = 0;
+            std::size_t rejectedRestricted = 0;
+            std::size_t rejectedKind = 0;
+            std::size_t rejectedSideEffect = 0;
+            std::size_t rejectedCloneForbidden = 0;
+            std::size_t rejectedShape = 0;
+            std::size_t rejectedWidth = 0;
+            std::size_t rejectedPortOrDeclared = 0;
+            std::size_t rejectedLiveoutCount = 0;
+            std::size_t rejectedCone = 0;
+            std::size_t rejectedNoDef = 0;
+            std::size_t rejectedTargetPredecessor = 0;
+            std::size_t rejectedThirdSource = 0;
+            std::size_t rejectedSourceKind = 0;
+            std::size_t rejectedExternalConsumer = 0;
+            std::size_t rejectedTargetEmpty = 0;
+            std::size_t rejectedCapacity = 0;
+            std::size_t rejectedNoRemovableInput = 0;
+            std::size_t rejectedMinGain = 0;
+            std::size_t rejectedSelectionMoveLimit = 0;
+            std::size_t rejectedSelectionBudget = 0;
+            std::size_t rejectedSelectionCapacity = 0;
+            std::size_t rejectedSelectionTargetEmpty = 0;
+            std::size_t rejectedSelectionNodeOverlap = 0;
+            std::size_t rejectedSelectionValueOverlap = 0;
+            bool skippedOversize = false;
+            bool skippedFinalTopo = false;
+            CountMap eligibleByGain;
+            CountMap eligibleByNodeOps;
+            CountMap eligibleByMaxWidth;
+            CountMap selectedByGain;
+            CountMap selectedByNodeOps;
+            CountMap selectedByMaxWidth;
+        };
+
+        FinalFaninPullbackProbeStats probeFinalFaninPullback(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ComputeRewriteBuild &rewrite,
+            const ActivityScheduleBuild &build,
+            const ComputeNodeMaterializePerfStats &materializePerf)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+            using wolvrix::lib::grh::ValueIdHash;
+            using wolvrix::lib::grh::ValueType;
+
+            FinalFaninPullbackProbeStats stats;
+            const std::size_t computeSupernodeCap =
+                options.maxOpInComputeSupernode == 0
+                    ? std::numeric_limits<std::size_t>::max()
+                    : options.maxOpInComputeSupernode;
+            const auto ppmLimit =
+                (static_cast<unsigned __int128>(rewrite.stats.computeNodeOpsTotal) *
+                 options.finalFaninPullbackMaxMovedOpPpm) /
+                1000000U;
+            stats.movedOpLimit =
+                ppmLimit > std::numeric_limits<std::size_t>::max()
+                    ? std::numeric_limits<std::size_t>::max()
+                    : static_cast<std::size_t>(ppmLimit);
+
+            if (materializePerf.splitOversizeComputeNodes != 0)
+            {
+                stats.skippedOversize = true;
+                return stats;
+            }
+            if (options.finalTopoPolicy != "level-id")
+            {
+                stats.skippedFinalTopo = true;
+                return stats;
+            }
+
+            const auto ownerOfOp = [&](OperationId opId)
+            {
+                if (!opId.valid() || opId.index - 1 >= build.opToSupernode.size())
+                {
+                    return kInvalidActivitySupernodeId;
+                }
+                return build.opToSupernode[opId.index - 1];
+            };
+            const auto isComputeSupernode = [&](uint32_t supernode)
+            {
+                return supernode < build.supernodeKinds.size() &&
+                       build.supernodeKinds[supernode] == ActivityScheduleSupernodeKind::Compute;
+            };
+
+            std::vector<uint32_t> ownerByComputeNode(rewrite.computeNodes.size(),
+                                                     kInvalidActivitySupernodeId);
+            std::vector<bool> ambiguousComputeNodeOwner(rewrite.computeNodes.size(), false);
+            for (uint32_t supernode = 0; supernode < build.computeNodesBySupernode.size(); ++supernode)
+            {
+                for (const uint32_t computeNode : build.computeNodesBySupernode[supernode])
+                {
+                    if (computeNode >= ownerByComputeNode.size())
+                    {
+                        continue;
+                    }
+                    if (ownerByComputeNode[computeNode] != kInvalidActivitySupernodeId &&
+                        ownerByComputeNode[computeNode] != supernode)
+                    {
+                        ambiguousComputeNodeOwner[computeNode] = true;
+                    }
+                    else
+                    {
+                        ownerByComputeNode[computeNode] = supernode;
+                    }
+                }
+            }
+
+            std::unordered_set<ValueId, ValueIdHash> portValues;
+            for (const auto &port : graph.outputPorts())
+            {
+                portValues.insert(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                portValues.insert(port.in);
+                portValues.insert(port.out);
+                portValues.insert(port.oe);
+            }
+
+            std::unordered_map<ValueId, std::vector<OperationId>, ValueIdHash> implicitIndexUsers;
+            for (const OperationId opId : graph.operations())
+            {
+                const auto op = graph.getOperation(opId);
+                if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                {
+                    implicitIndexUsers[*indexValue].push_back(opId);
+                }
+            }
+
+            std::vector<FinalFaninPullbackCandidate> candidates;
+            candidates.reserve(rewrite.computeNodes.size() / 16 + 1);
+            for (uint32_t computeNodeId = 0; computeNodeId < rewrite.computeNodes.size(); ++computeNodeId)
+            {
+                ++stats.scanned;
+                const auto &node = rewrite.computeNodes[computeNodeId];
+                const uint32_t target = ownerByComputeNode[computeNodeId];
+                if (ambiguousComputeNodeOwner[computeNodeId] ||
+                    target == kInvalidActivitySupernodeId ||
+                    !isComputeSupernode(target) ||
+                    target >= build.supernodeToOps.size())
+                {
+                    ++stats.rejectedOwner;
+                    continue;
+                }
+                if (node.ops.empty() || node.ops.size() > options.finalFaninPullbackMaxNodeOps)
+                {
+                    ++stats.rejectedNodeSize;
+                    continue;
+                }
+                if (node.indivisible || !node.intentGroup.empty())
+                {
+                    ++stats.rejectedRestricted;
+                    continue;
+                }
+
+                std::unordered_set<OperationId, OperationIdHash> nodeOps(node.ops.begin(), node.ops.end());
+                bool invalidOwner = false;
+                bool invalidKind = false;
+                bool sideEffect = false;
+                bool cloneForbidden = false;
+                bool invalidShape = false;
+                bool invalidWidth = false;
+                bool anchoredResult = false;
+                std::size_t maxValueWidth = 0;
+                std::unordered_set<ValueId, ValueIdHash> nodeResults;
+                std::unordered_set<ValueId, ValueIdHash> touchedValues;
+                for (const OperationId opId : node.ops)
+                {
+                    invalidOwner |= ownerOfOp(opId) != target;
+                    const auto op = graph.getOperation(opId);
+                    invalidKind |= !isCloneableLocalSharedComputeOpKind(op.kind());
+                    sideEffect |= opHasSideEffects(op);
+                    cloneForbidden |= hasLocalSharedCloneForbiddenAttr(op);
+                    invalidShape |= op.results().empty();
+                    for (const ValueId value : op.operands())
+                    {
+                        touchedValues.insert(value);
+                        const auto valueInfo = graph.getValue(value);
+                        if (valueInfo.type() != ValueType::Logic || valueInfo.width() <= 0)
+                        {
+                            invalidWidth = true;
+                            continue;
+                        }
+                        const std::size_t width = static_cast<std::size_t>(valueInfo.width());
+                        maxValueWidth = std::max(maxValueWidth, width);
+                        invalidWidth |= width > options.finalFaninPullbackMaxValueWidth;
+                    }
+                    for (const ValueId value : op.results())
+                    {
+                        nodeResults.insert(value);
+                        touchedValues.insert(value);
+                        const auto valueInfo = graph.getValue(value);
+                        if (valueInfo.type() != ValueType::Logic || valueInfo.width() <= 0)
+                        {
+                            invalidWidth = true;
+                        }
+                        else
+                        {
+                            const std::size_t width = static_cast<std::size_t>(valueInfo.width());
+                            maxValueWidth = std::max(maxValueWidth, width);
+                            invalidWidth |= width > options.finalFaninPullbackMaxValueWidth;
+                        }
+                        anchoredResult |= isDeclaredCutValue(graph, rewrite.canonicalValues, value) ||
+                                          valueInfo.isInput() || valueInfo.isOutput() ||
+                                          valueInfo.isInout() || portValues.contains(value);
+                    }
+                }
+                if (invalidOwner)
+                {
+                    ++stats.rejectedOwner;
+                    continue;
+                }
+                if (invalidKind)
+                {
+                    ++stats.rejectedKind;
+                    continue;
+                }
+                if (sideEffect)
+                {
+                    ++stats.rejectedSideEffect;
+                    continue;
+                }
+                if (cloneForbidden)
+                {
+                    ++stats.rejectedCloneForbidden;
+                    continue;
+                }
+                if (invalidShape)
+                {
+                    ++stats.rejectedShape;
+                    continue;
+                }
+                if (invalidWidth)
+                {
+                    ++stats.rejectedWidth;
+                    continue;
+                }
+                ++stats.pure;
+                if (anchoredResult)
+                {
+                    ++stats.rejectedPortOrDeclared;
+                    continue;
+                }
+
+                std::vector<ValueId> liveouts;
+                for (const ValueId value : nodeResults)
+                {
+                    bool external = false;
+                    for (const auto &user : graph.getValue(value).users())
+                    {
+                        if (!user.operation.valid() || !nodeOps.contains(user.operation))
+                        {
+                            external = true;
+                            break;
+                        }
+                    }
+                    if (!external)
+                    {
+                        const auto implicitIt = implicitIndexUsers.find(value);
+                        if (implicitIt != implicitIndexUsers.end())
+                        {
+                            external = std::any_of(
+                                implicitIt->second.begin(),
+                                implicitIt->second.end(),
+                                [&](OperationId user) { return !nodeOps.contains(user); });
+                        }
+                    }
+                    if (external)
+                    {
+                        liveouts.push_back(value);
+                    }
+                }
+                if (liveouts.size() != 1)
+                {
+                    ++stats.rejectedLiveoutCount;
+                    continue;
+                }
+                const ValueId liveout = liveouts.front();
+
+                std::unordered_set<OperationId, OperationIdHash> reverseCovered;
+                std::vector<OperationId> reverseWorklist;
+                const OperationId root = graph.valueDef(liveout);
+                if (root.valid() && nodeOps.contains(root))
+                {
+                    reverseCovered.insert(root);
+                    reverseWorklist.push_back(root);
+                }
+                while (!reverseWorklist.empty())
+                {
+                    const OperationId current = reverseWorklist.back();
+                    reverseWorklist.pop_back();
+                    for (const ValueId operand : graph.opOperands(current))
+                    {
+                        const OperationId def = graph.valueDef(operand);
+                        if (def.valid() && nodeOps.contains(def) && reverseCovered.insert(def).second)
+                        {
+                            reverseWorklist.push_back(def);
+                        }
+                    }
+                }
+                if (reverseCovered.size() != node.ops.size())
+                {
+                    ++stats.rejectedCone;
+                    continue;
+                }
+
+                std::unordered_set<ValueId, ValueIdHash> boundarySet;
+                for (const OperationId opId : node.ops)
+                {
+                    for (const ValueId operand : graph.opOperands(opId))
+                    {
+                        const OperationId def = graph.valueDef(operand);
+                        if (!def.valid() || !nodeOps.contains(def))
+                        {
+                            boundarySet.insert(operand);
+                        }
+                    }
+                }
+                std::vector<ValueId> boundaryInputs(boundarySet.begin(), boundarySet.end());
+                std::sort(boundaryInputs.begin(),
+                          boundaryInputs.end(),
+                          [](ValueId lhs, ValueId rhs) { return lhs.index < rhs.index; });
+                uint32_t source = kInvalidActivitySupernodeId;
+                bool noDef = false;
+                bool targetPredecessor = false;
+                bool thirdSource = false;
+                bool sourceKind = false;
+                for (const ValueId value : boundaryInputs)
+                {
+                    const OperationId def = graph.valueDef(value);
+                    if (!def.valid())
+                    {
+                        noDef = true;
+                        continue;
+                    }
+                    const uint32_t owner = ownerOfOp(def);
+                    if (owner == kInvalidActivitySupernodeId)
+                    {
+                        noDef = true;
+                        continue;
+                    }
+                    if (owner == target)
+                    {
+                        targetPredecessor = true;
+                        continue;
+                    }
+                    if (!isComputeSupernode(owner))
+                    {
+                        sourceKind = true;
+                        continue;
+                    }
+                    if (source == kInvalidActivitySupernodeId)
+                    {
+                        source = owner;
+                    }
+                    else if (source != owner)
+                    {
+                        thirdSource = true;
+                    }
+                }
+                if (noDef)
+                {
+                    ++stats.rejectedNoDef;
+                    continue;
+                }
+                if (targetPredecessor)
+                {
+                    ++stats.rejectedTargetPredecessor;
+                    continue;
+                }
+                if (thirdSource)
+                {
+                    ++stats.rejectedThirdSource;
+                    continue;
+                }
+                if (sourceKind || source == kInvalidActivitySupernodeId || source == target)
+                {
+                    ++stats.rejectedSourceKind;
+                    continue;
+                }
+                ++stats.commonSource;
+
+                bool invalidExternalConsumer = false;
+                bool haveExternalConsumer = false;
+                for (const auto &user : graph.getValue(liveout).users())
+                {
+                    if (user.operation.valid() && nodeOps.contains(user.operation))
+                    {
+                        continue;
+                    }
+                    haveExternalConsumer = true;
+                    if (!user.operation.valid() || ownerOfOp(user.operation) != target)
+                    {
+                        invalidExternalConsumer = true;
+                    }
+                }
+                const auto implicitLiveoutIt = implicitIndexUsers.find(liveout);
+                if (implicitLiveoutIt != implicitIndexUsers.end())
+                {
+                    for (const OperationId user : implicitLiveoutIt->second)
+                    {
+                        if (nodeOps.contains(user))
+                        {
+                            continue;
+                        }
+                        haveExternalConsumer = true;
+                        if (ownerOfOp(user) != target)
+                        {
+                            invalidExternalConsumer = true;
+                        }
+                    }
+                }
+                if (!haveExternalConsumer || invalidExternalConsumer)
+                {
+                    ++stats.rejectedExternalConsumer;
+                    continue;
+                }
+                if (build.supernodeToOps[target].size() <= node.ops.size())
+                {
+                    ++stats.rejectedTargetEmpty;
+                    continue;
+                }
+                if (build.supernodeToOps[source].size() > computeSupernodeCap ||
+                    node.ops.size() >
+                        computeSupernodeCap - build.supernodeToOps[source].size())
+                {
+                    ++stats.rejectedCapacity;
+                    continue;
+                }
+
+                std::size_t removableInputs = 0;
+                for (const ValueId value : boundaryInputs)
+                {
+                    bool remainingTargetUse = false;
+                    for (const auto &user : graph.getValue(value).users())
+                    {
+                        if (user.operation.valid() && !nodeOps.contains(user.operation) &&
+                            ownerOfOp(user.operation) == target)
+                        {
+                            remainingTargetUse = true;
+                            break;
+                        }
+                    }
+                    if (!remainingTargetUse)
+                    {
+                        const auto implicitIt = implicitIndexUsers.find(value);
+                        if (implicitIt != implicitIndexUsers.end())
+                        {
+                            remainingTargetUse = std::any_of(
+                                implicitIt->second.begin(),
+                                implicitIt->second.end(),
+                                [&](OperationId user)
+                                {
+                                    return !nodeOps.contains(user) && ownerOfOp(user) == target;
+                                });
+                        }
+                    }
+                    removableInputs += remainingTargetUse ? 0 : 1;
+                }
+                if (removableInputs == 0)
+                {
+                    ++stats.rejectedNoRemovableInput;
+                    continue;
+                }
+                const std::size_t gain = removableInputs - 1;
+                if (gain < options.finalFaninPullbackMinGain)
+                {
+                    ++stats.rejectedMinGain;
+                    continue;
+                }
+
+                FinalFaninPullbackCandidate candidate;
+                candidate.computeNode = computeNodeId;
+                candidate.source = source;
+                candidate.target = target;
+                candidate.opCount = node.ops.size();
+                candidate.maxValueWidth = maxValueWidth;
+                candidate.removableInputs = removableInputs;
+                candidate.gain = gain;
+                candidate.touchedOps = node.ops;
+                candidate.touchedValues.assign(touchedValues.begin(), touchedValues.end());
+                std::sort(candidate.touchedValues.begin(),
+                          candidate.touchedValues.end(),
+                          [](ValueId lhs, ValueId rhs) { return lhs.index < rhs.index; });
+                candidates.push_back(std::move(candidate));
+                ++stats.exactEligible;
+                stats.eligibleProjectedBaeGain += gain;
+                ++stats.eligibleByGain[std::to_string(gain)];
+                ++stats.eligibleByNodeOps[std::to_string(node.ops.size())];
+                ++stats.eligibleByMaxWidth[std::to_string(maxValueWidth)];
+            }
+
+            std::stable_sort(candidates.begin(),
+                             candidates.end(),
+                             [](const auto &lhs, const auto &rhs)
+                             {
+                                 if (lhs.gain != rhs.gain)
+                                 {
+                                     return lhs.gain > rhs.gain;
+                                 }
+                                 return std::tuple{lhs.opCount,
+                                                   lhs.maxValueWidth,
+                                                   lhs.computeNode} <
+                                        std::tuple{rhs.opCount,
+                                                   rhs.maxValueWidth,
+                                                   rhs.computeNode};
+                             });
+
+            std::vector<std::size_t> projectedOps;
+            projectedOps.reserve(build.supernodeToOps.size());
+            for (const auto &ops : build.supernodeToOps)
+            {
+                projectedOps.push_back(ops.size());
+            }
+            std::unordered_set<OperationId, OperationIdHash> selectedOps;
+            std::unordered_set<ValueId, ValueIdHash> selectedValues;
+            for (const auto &candidate : candidates)
+            {
+                if (stats.selected >= options.finalFaninPullbackMaxMoves)
+                {
+                    ++stats.rejectedSelectionMoveLimit;
+                    continue;
+                }
+                if (candidate.opCount > stats.movedOpLimit -
+                                            std::min(stats.movedOps, stats.movedOpLimit))
+                {
+                    ++stats.rejectedSelectionBudget;
+                    continue;
+                }
+                if (std::any_of(candidate.touchedOps.begin(),
+                                candidate.touchedOps.end(),
+                                [&](OperationId op) { return selectedOps.contains(op); }))
+                {
+                    ++stats.rejectedSelectionNodeOverlap;
+                    continue;
+                }
+                if (std::any_of(candidate.touchedValues.begin(),
+                                candidate.touchedValues.end(),
+                                [&](ValueId value) { return selectedValues.contains(value); }))
+                {
+                    ++stats.rejectedSelectionValueOverlap;
+                    continue;
+                }
+                if (candidate.source >= projectedOps.size() ||
+                    projectedOps[candidate.source] > computeSupernodeCap ||
+                    candidate.opCount >
+                        computeSupernodeCap - projectedOps[candidate.source])
+                {
+                    ++stats.rejectedSelectionCapacity;
+                    continue;
+                }
+                if (candidate.target >= projectedOps.size() ||
+                    projectedOps[candidate.target] <= candidate.opCount)
+                {
+                    ++stats.rejectedSelectionTargetEmpty;
+                    continue;
+                }
+
+                projectedOps[candidate.source] += candidate.opCount;
+                projectedOps[candidate.target] -= candidate.opCount;
+                selectedOps.insert(candidate.touchedOps.begin(), candidate.touchedOps.end());
+                selectedValues.insert(candidate.touchedValues.begin(), candidate.touchedValues.end());
+                ++stats.selected;
+                stats.movedOps += candidate.opCount;
+                stats.projectedBaeGain += candidate.gain;
+                ++stats.selectedByGain[std::to_string(candidate.gain)];
+                ++stats.selectedByNodeOps[std::to_string(candidate.opCount)];
+                ++stats.selectedByMaxWidth[std::to_string(candidate.maxValueWidth)];
+            }
+            return stats;
+        }
+
     } // namespace
 
     ActivitySchedulePass::ActivitySchedulePass()
@@ -9748,6 +10350,13 @@ namespace wolvrix::lib::transform
             options_.finalTopoPolicy != "ready-op")
         {
             error("activity-schedule final_topo_policy must be level-id, level-op, or ready-op");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalFaninPullbackPolicy != "off" &&
+            options_.finalFaninPullbackPolicy != "probe")
+        {
+            error("activity-schedule final_fanin_pullback_policy must be off or probe");
             result.failed = true;
             return result;
         }
@@ -9814,6 +10423,12 @@ namespace wolvrix::lib::transform
         if (options_.dpSegmentPenaltyPpm > 1000000000)
         {
             error("activity-schedule dp_segment_penalty_ppm must be <= 1000000000");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalFaninPullbackMaxMovedOpPpm > 1000000)
+        {
+            error("activity-schedule final_fanin_pullback_max_moved_op_ppm must be <= 1000000");
             result.failed = true;
             return result;
         }
@@ -10287,6 +10902,82 @@ namespace wolvrix::lib::transform
         logInfo("activity-schedule progress: final_materialize done supernodes=" +
                 std::to_string(build.supernodeToOps.size()) +
                 " elapsed_ms=" + std::to_string(materializeMs));
+
+        if (options_.finalFaninPullbackPolicy == "probe")
+        {
+            const auto probeStart = std::chrono::steady_clock::now();
+            const FinalFaninPullbackProbeStats probe =
+                probeFinalFaninPullback(*graph, options_, rewrite, build, materializePerf);
+            const std::uint64_t probeMs = elapsedMs(probeStart);
+            logInfo("activity-schedule final-fanin pullback probe: policy=" +
+                    options_.finalFaninPullbackPolicy +
+                    " max_node_ops=" +
+                    std::to_string(options_.finalFaninPullbackMaxNodeOps) +
+                    " max_value_width=" +
+                    std::to_string(options_.finalFaninPullbackMaxValueWidth) +
+                    " min_gain=" + std::to_string(options_.finalFaninPullbackMinGain) +
+                    " max_moves=" + std::to_string(options_.finalFaninPullbackMaxMoves) +
+                    " max_moved_op_ppm=" +
+                    std::to_string(options_.finalFaninPullbackMaxMovedOpPpm) +
+                    " scanned=" + std::to_string(probe.scanned) +
+                    " pure=" + std::to_string(probe.pure) +
+                    " common_source=" + std::to_string(probe.commonSource) +
+                    " exact_eligible=" + std::to_string(probe.exactEligible) +
+                    " selected=" + std::to_string(probe.selected) +
+                    " eligible_projected_bae_gain=" +
+                    std::to_string(probe.eligibleProjectedBaeGain) +
+                    " projected_bae_gain=" + std::to_string(probe.projectedBaeGain) +
+                    " moved_ops=" + std::to_string(probe.movedOps) +
+                    " moved_op_limit=" + std::to_string(probe.movedOpLimit) +
+                    " skipped_oversize=" +
+                    std::string(probe.skippedOversize ? "true" : "false") +
+                    " skipped_final_topo=" +
+                    std::string(probe.skippedFinalTopo ? "true" : "false") +
+                    " elapsed_ms=" + std::to_string(probeMs));
+            logInfo("activity-schedule final-fanin pullback probe rejects: rejected_owner=" +
+                    std::to_string(probe.rejectedOwner) +
+                    " rejected_node_size=" + std::to_string(probe.rejectedNodeSize) +
+                    " rejected_restricted=" + std::to_string(probe.rejectedRestricted) +
+                    " rejected_kind=" + std::to_string(probe.rejectedKind) +
+                    " rejected_side_effect=" + std::to_string(probe.rejectedSideEffect) +
+                    " rejected_clone_forbidden=" + std::to_string(probe.rejectedCloneForbidden) +
+                    " rejected_shape=" + std::to_string(probe.rejectedShape) +
+                    " rejected_width=" + std::to_string(probe.rejectedWidth) +
+                    " rejected_port_or_declared=" + std::to_string(probe.rejectedPortOrDeclared) +
+                    " rejected_liveout_count=" + std::to_string(probe.rejectedLiveoutCount) +
+                    " rejected_cone=" + std::to_string(probe.rejectedCone) +
+                    " rejected_no_def=" + std::to_string(probe.rejectedNoDef) +
+                    " rejected_target_predecessor=" +
+                    std::to_string(probe.rejectedTargetPredecessor) +
+                    " rejected_third_source=" + std::to_string(probe.rejectedThirdSource) +
+                    " rejected_source_kind=" + std::to_string(probe.rejectedSourceKind) +
+                    " rejected_external_consumer=" +
+                    std::to_string(probe.rejectedExternalConsumer) +
+                    " rejected_target_empty=" + std::to_string(probe.rejectedTargetEmpty) +
+                    " rejected_capacity=" + std::to_string(probe.rejectedCapacity) +
+                    " rejected_no_removable_input=" +
+                    std::to_string(probe.rejectedNoRemovableInput) +
+                    " rejected_min_gain=" + std::to_string(probe.rejectedMinGain) +
+                    " rejected_selection_move_limit=" +
+                    std::to_string(probe.rejectedSelectionMoveLimit) +
+                    " rejected_selection_budget=" +
+                    std::to_string(probe.rejectedSelectionBudget) +
+                    " rejected_selection_capacity=" +
+                    std::to_string(probe.rejectedSelectionCapacity) +
+                    " rejected_selection_target_empty=" +
+                    std::to_string(probe.rejectedSelectionTargetEmpty) +
+                    " rejected_selection_node_overlap=" +
+                    std::to_string(probe.rejectedSelectionNodeOverlap) +
+                    " rejected_selection_value_overlap=" +
+                    std::to_string(probe.rejectedSelectionValueOverlap));
+            logInfo("activity-schedule final-fanin pullback probe distribution: eligible_by_gain=" +
+                    formatTopCounts(probe.eligibleByGain, 32) +
+                    " eligible_by_node_ops=" + formatTopCounts(probe.eligibleByNodeOps, 32) +
+                    " eligible_by_max_width=" + formatTopCounts(probe.eligibleByMaxWidth, 32) +
+                    " selected_by_gain=" + formatTopCounts(probe.selectedByGain, 32) +
+                    " selected_by_node_ops=" + formatTopCounts(probe.selectedByNodeOps, 32) +
+                    " selected_by_max_width=" + formatTopCounts(probe.selectedByMaxWidth, 32));
+        }
 
         const std::string keyPrefix = options_.path + ".activity_schedule.";
         const auto exportStart = std::chrono::steady_clock::now();

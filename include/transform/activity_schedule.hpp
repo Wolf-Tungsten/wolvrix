@@ -42,6 +42,11 @@ namespace wolvrix::lib::transform
         std::size_t localSharedComputeCommonOwnerMaxClonedOpPpm = 5000;
         std::size_t splitOversizeComputeNodeMaxOps = 0;
         std::size_t dpSegmentPenaltyPpm = 1000000;
+        std::size_t finalFaninPullbackMaxNodeOps = 8;
+        std::size_t finalFaninPullbackMaxValueWidth = 64;
+        std::size_t finalFaninPullbackMinGain = 3;
+        std::size_t finalFaninPullbackMaxMoves = 4096;
+        std::size_t finalFaninPullbackMaxMovedOpPpm = 5000;
         std::size_t postDpRefineMaxRounds = 1;
         std::size_t postDpRefineMaxMoves = 4096;
         std::size_t postDpRefineMaxMovedOpPpm = 10000;
@@ -56,6 +61,7 @@ namespace wolvrix::lib::transform
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
         std::string localSharedComputeCommonOwnerPolicy = "off";
+        std::string finalFaninPullbackPolicy = "off";
         std::string postDpRefinePolicy = "off";
         std::string kahnLevelPackPolicy = "off";
         std::string finalTopoPolicy = "level-id";

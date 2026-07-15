@@ -4303,6 +4303,772 @@ int main()
     }
 
     {
+        currentCase = "final fanin pullback probe";
+        struct FaninFixtureOptions
+        {
+            std::size_t sourceCount = 4;
+            bool sharedTargetInput = false;
+            bool duplicateCandidateInput = false;
+            bool extraSourceResult = false;
+            bool secondCandidateLiveout = false;
+            bool anchoredUnusedResult = false;
+            bool bindCandidateOutput = false;
+            bool declareCandidate = false;
+            bool addCommitConsumer = false;
+            bool fillSourceCapacity = false;
+            bool candidateUsesNoDef = false;
+            bool candidateUsesTargetPredecessor = false;
+            bool candidateHasSideEffects = false;
+            bool candidateHasCloneForbiddenAttr = false;
+            bool wideCandidateResult = false;
+        };
+        struct FaninFixtureOps
+        {
+            std::vector<wolvrix::lib::grh::OperationId> sources;
+            wolvrix::lib::grh::OperationId candidate;
+            wolvrix::lib::grh::OperationId tail;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design,
+                                     const std::string &name,
+                                     const FaninFixtureOptions &fixture)
+        {
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            std::vector<wolvrix::lib::grh::ValueId> sourceValues;
+            FaninFixtureOps ops;
+            for (std::size_t i = 0; i < fixture.sourceCount; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto input = makeValue(graph, "source_input_" + suffix, 8);
+                graph.bindInputPort("source_input_" + suffix, input);
+                const auto value = makeValue(graph, "source_value_" + suffix, 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("source_" + suffix));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                sourceValues.push_back(value);
+                if (i == 0 && fixture.extraSourceResult)
+                {
+                    const auto extraValue =
+                        makeValue(graph, "source_extra_value", 8);
+                    graph.addResult(op, extraValue);
+                    sourceValues.push_back(extraValue);
+                }
+                ops.sources.push_back(op);
+            }
+            if (fixture.fillSourceCapacity)
+            {
+                const auto input = makeValue(graph, "source_padding_input", 8);
+                graph.bindInputPort("source_padding_input", input);
+                const auto value = makeValue(graph, "source_padding_value", 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("source_padding"));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                graph.bindOutputPort("source_padding", value);
+            }
+
+            const auto blockerInput = makeValue(graph, "blocker_input", 8);
+            graph.bindInputPort("blocker_input", blockerInput);
+            const auto blockerValue = makeValue(graph, "blocker_value", 8);
+            const auto blocker = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kNot,
+                graph.internSymbol("blocker"));
+            graph.addOperand(blocker, blockerInput);
+            graph.addResult(blocker, blockerValue);
+
+            const auto candidateSymbol = graph.internSymbol("candidate_value");
+            if (fixture.declareCandidate)
+            {
+                graph.addDeclaredSymbol(candidateSymbol);
+            }
+            const auto candidateValue =
+                graph.createValue(candidateSymbol,
+                                  fixture.wideCandidateResult ? 128 : 8,
+                                  false);
+            ops.candidate = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kAnd,
+                graph.internSymbol("candidate"));
+            for (const auto value : sourceValues)
+            {
+                graph.addOperand(ops.candidate, value);
+            }
+            if (fixture.duplicateCandidateInput)
+            {
+                graph.addOperand(ops.candidate, sourceValues.front());
+            }
+            if (fixture.candidateUsesNoDef)
+            {
+                const auto noDef = makeValue(graph, "candidate_no_def", 8);
+                graph.bindInputPort("candidate_no_def", noDef);
+                graph.addOperand(ops.candidate, noDef);
+            }
+            if (fixture.candidateUsesTargetPredecessor)
+            {
+                graph.addOperand(ops.candidate, blockerValue);
+            }
+            graph.addResult(ops.candidate, candidateValue);
+            std::optional<wolvrix::lib::grh::ValueId> secondCandidateValue;
+            if (fixture.secondCandidateLiveout)
+            {
+                secondCandidateValue = makeValue(graph, "candidate_second_value", 8);
+                graph.addResult(ops.candidate, *secondCandidateValue);
+            }
+            if (fixture.anchoredUnusedResult)
+            {
+                const auto anchored = makeValue(graph, "candidate_anchored_unused", 8);
+                graph.addResult(ops.candidate, anchored);
+                graph.bindOutputPort("candidate_anchored_unused", anchored);
+            }
+            if (fixture.candidateHasSideEffects)
+            {
+                graph.setAttr(ops.candidate, "hasSideEffects", true);
+            }
+            if (fixture.candidateHasCloneForbiddenAttr)
+            {
+                graph.setAttr(ops.candidate,
+                              "regToMem.intent.testOnly",
+                              std::string("forbidden"));
+            }
+            if (fixture.bindCandidateOutput)
+            {
+                graph.bindOutputPort("candidate", candidateValue);
+            }
+
+            const auto tailValue = makeValue(graph, "tail_value", 8);
+            ops.tail = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kXor,
+                graph.internSymbol("tail"));
+            graph.addOperand(ops.tail, candidateValue);
+            if (secondCandidateValue)
+            {
+                graph.addOperand(ops.tail, *secondCandidateValue);
+            }
+            graph.addOperand(ops.tail, blockerValue);
+            if (fixture.sharedTargetInput)
+            {
+                graph.addOperand(ops.tail, sourceValues.front());
+            }
+            graph.addResult(ops.tail, tailValue);
+
+            auto output = tailValue;
+            for (std::size_t i = 0; i < fixture.sourceCount - 2; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto value = makeValue(graph, "tail_chain_value_" + suffix, 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("tail_chain_" + suffix));
+                graph.addOperand(op, output);
+                graph.addResult(op, value);
+                output = value;
+            }
+            graph.bindOutputPort("output", output);
+
+            if (fixture.addCommitConsumer)
+            {
+                const auto enable = makeValue(graph, "commit_enable", 1);
+                const auto mask = makeValue(graph, "commit_mask", 8);
+                const auto clock = makeValue(graph, "commit_clock", 1);
+                graph.bindInputPort("commit_enable", enable);
+                graph.bindInputPort("commit_mask", mask);
+                graph.bindInputPort("commit_clock", clock);
+                const auto reg = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegister,
+                    graph.internSymbol("commit_state"));
+                graph.setAttr(reg, "width", static_cast<int64_t>(8));
+                graph.setAttr(reg, "isSigned", false);
+                const auto write = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                    graph.internSymbol("commit_write"));
+                graph.addOperand(write, enable);
+                graph.addOperand(write, candidateValue);
+                graph.addOperand(write, mask);
+                graph.addOperand(write, clock);
+                graph.setAttr(write, "regSymbol", std::string("commit_state"));
+                graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            }
+            return ops;
+        };
+        const auto runFixture = [&](wolvrix::lib::grh::Design &design,
+                                    const std::string &name,
+                                    std::optional<std::string> policy,
+                                    SessionStore &session,
+                                    std::string *log = nullptr,
+                                    std::size_t maxSupernodeOps = 5,
+                                    std::size_t maxMoves = 4096,
+                                    std::size_t movedOpPpm = 1000000)
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = maxSupernodeOps;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            if (policy)
+            {
+                options.finalFaninPullbackPolicy = *policy;
+            }
+            options.finalFaninPullbackMaxNodeOps = 8;
+            options.finalFaninPullbackMaxValueWidth = 64;
+            options.finalFaninPullbackMinGain = 3;
+            options.finalFaninPullbackMaxMoves = maxMoves;
+            options.finalFaninPullbackMaxMovedOpPpm = movedOpPpm;
+            PassManager manager;
+            manager.options().session = &session;
+            if (log != nullptr)
+            {
+                manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+                manager.options().logSink =
+                    [log](wolvrix::lib::LogLevel,
+                          std::string_view,
+                          std::string_view message)
+                    {
+                        log->append(message);
+                        log->push_back('\n');
+                    };
+            }
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return result.success && !result.changed && !diags.hasError();
+        };
+
+        std::string parseError;
+        const std::vector<std::string_view> separatedArgs{
+            "-path", "final_fanin_pullback_probe",
+            "-final-fanin-pullback-policy", "probe",
+            "-final-fanin-pullback-max-node-ops", "8",
+            "-final-fanin-pullback-max-value-width", "64",
+            "-final-fanin-pullback-min-gain", "3",
+            "-final-fanin-pullback-max-moves", "4096",
+            "-final-fanin-pullback-max-moved-op-ppm", "5000"};
+        const std::vector<std::string_view> equalsArgs{
+            "-path=final_fanin_pullback_probe",
+            "-final-fanin-pullback-policy=off",
+            "-final-fanin-pullback-max-node-ops=8",
+            "-final-fanin-pullback-max-value-width=64",
+            "-final-fanin-pullback-min-gain=3",
+            "-final-fanin-pullback-max-moves=4096",
+            "-final-fanin-pullback-max-moved-op-ppm=5000"};
+        const std::vector<std::string_view> malformedArgs{
+            "-path=final_fanin_pullback_probe",
+            "-final-fanin-pullback-max-node-ops=8x"};
+        const std::vector<std::string_view> overflowArgs{
+            "-path=final_fanin_pullback_probe",
+            "-final-fanin-pullback-max-moves=999999999999999999999999999999999999"};
+        if (makePass("activity-schedule", separatedArgs, parseError) == nullptr ||
+            makePass("activity-schedule", equalsArgs, parseError) == nullptr ||
+            makePass("activity-schedule", malformedArgs, parseError) != nullptr ||
+            makePass("activity-schedule", overflowArgs, parseError) != nullptr)
+        {
+            return fail("Expected final-fanin pullback CLI policy and size forms to parse strictly");
+        }
+
+        constexpr std::string_view kName = "final_fanin_pullback_probe";
+        wolvrix::lib::grh::Design defaultDesign;
+        buildFixture(defaultDesign, std::string(kName), {});
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign, std::string(kName), std::nullopt, defaultSession))
+        {
+            return fail("Expected default final-fanin pullback schedule to succeed");
+        }
+        wolvrix::lib::grh::Design offDesign;
+        buildFixture(offDesign, std::string(kName), {});
+        SessionStore offSession;
+        if (!runFixture(offDesign, std::string(kName), "off", offSession))
+        {
+            return fail("Expected explicit-off final-fanin pullback schedule to succeed");
+        }
+        wolvrix::lib::grh::Design probeDesign;
+        const FaninFixtureOps probeOps =
+            buildFixture(probeDesign, std::string(kName), {});
+        SessionStore probeSession;
+        std::string probeLog;
+        if (!runFixture(probeDesign, std::string(kName), "probe", probeSession, &probeLog))
+        {
+            return fail("Expected final-fanin pullback probe schedule to succeed");
+        }
+        const auto defaultSchedule = loadSchedule(defaultSession, std::string(kName));
+        const auto offSchedule = loadSchedule(offSession, std::string(kName));
+        const auto probeSchedule = loadSchedule(probeSession, std::string(kName));
+        const auto *probeGraph = probeDesign.findGraph(std::string(kName));
+        if (probeGraph == nullptr ||
+            validateCommonScheduleShape(*probeGraph, probeSchedule) != 0 ||
+            !schedulesEqual(defaultSchedule, offSchedule) ||
+            !schedulesEqual(offSchedule, probeSchedule) ||
+            defaultSession.size() != offSession.size() ||
+            offSession.size() != probeSession.size())
+        {
+            return fail("Expected default/off/probe final-fanin schedule identity");
+        }
+        if (probeSchedule.opToSupernode == nullptr ||
+            probeSchedule.supernodeToOps == nullptr)
+        {
+            return fail("Expected final-fanin probe owner maps");
+        }
+        const auto owner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*probeSchedule.opToSupernode)[op.index - 1];
+        };
+        const uint32_t sourceOwner = owner(probeOps.sources.front());
+        const uint32_t targetOwner = owner(probeOps.candidate);
+        if (sourceOwner == targetOwner || owner(probeOps.tail) != targetOwner ||
+            !std::all_of(probeOps.sources.begin(), probeOps.sources.end(),
+                         [&](const auto op) { return owner(op) == sourceOwner; }) ||
+            sourceOwner >= probeSchedule.supernodeToOps->size() ||
+            targetOwner >= probeSchedule.supernodeToOps->size() ||
+            (*probeSchedule.supernodeToOps)[sourceOwner].size() != 4 ||
+            (*probeSchedule.supernodeToOps)[targetOwner].size() != 5)
+        {
+            return fail("Expected four-input final-fanin source/target fixture shape");
+        }
+        if (probeLog.find("activity-schedule final-fanin pullback probe:") ==
+                std::string::npos ||
+            parseStatField(probeLog, "exact_eligible") != 1 ||
+            parseStatField(probeLog, "selected") != 1 ||
+            parseStatField(probeLog, "eligible_projected_bae_gain") != 3 ||
+            parseStatField(probeLog, "projected_bae_gain") != 3 ||
+            parseStatField(probeLog, "moved_ops") != 1)
+        {
+            return fail("Expected four-input final-fanin projected gain three: " + probeLog);
+        }
+
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign, std::string(kName), {});
+        SessionStore repeatSession;
+        std::string repeatLog;
+        if (!runFixture(repeatDesign, std::string(kName), "probe", repeatSession, &repeatLog) ||
+            !schedulesEqual(probeSchedule, loadSchedule(repeatSession, std::string(kName))) ||
+            parseStatField(repeatLog, "exact_eligible") !=
+                parseStatField(probeLog, "exact_eligible") ||
+            parseStatField(repeatLog, "selected") != parseStatField(probeLog, "selected") ||
+            parseStatField(repeatLog, "projected_bae_gain") !=
+                parseStatField(probeLog, "projected_bae_gain"))
+        {
+            return fail("Expected deterministic final-fanin probe selection");
+        }
+
+        const auto expectSelectionBudgetReject = [&](const std::string &name,
+                                                     std::size_t maxMoves,
+                                                     std::size_t movedOpPpm,
+                                                     const std::string &counter)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, name, {});
+            SessionStore session;
+            std::string log;
+            return runFixture(design,
+                              name,
+                              "probe",
+                              session,
+                              &log,
+                              5,
+                              maxMoves,
+                              movedOpPpm) &&
+                   parseStatField(log, "exact_eligible") == 1 &&
+                   parseStatField(log, "selected") == 0 &&
+                   parseStatField(log, counter) == 1;
+        };
+        if (!expectSelectionBudgetReject("final_fanin_pullback_zero_moves",
+                                         0,
+                                         1000000,
+                                         "rejected_selection_move_limit") ||
+            !expectSelectionBudgetReject("final_fanin_pullback_zero_ppm",
+                                         4096,
+                                         0,
+                                         "rejected_selection_budget"))
+        {
+            return fail("Expected final-fanin move-count and moved-op budgets to reject selection");
+        }
+
+        FaninFixtureOptions sharedFixture;
+        sharedFixture.sharedTargetInput = true;
+        sharedFixture.duplicateCandidateInput = true;
+        sharedFixture.extraSourceResult = true;
+        wolvrix::lib::grh::Design sharedDesign;
+        buildFixture(sharedDesign, "final_fanin_pullback_shared_input", sharedFixture);
+        SessionStore sharedSession;
+        std::string sharedLog;
+        if (!runFixture(sharedDesign,
+                        "final_fanin_pullback_shared_input",
+                        "probe",
+                        sharedSession,
+                        &sharedLog) ||
+            parseStatField(sharedLog, "exact_eligible") != 1 ||
+            parseStatField(sharedLog, "selected") != 1 ||
+            parseStatField(sharedLog, "eligible_projected_bae_gain") != 3 ||
+            parseStatField(sharedLog, "projected_bae_gain") != 3)
+        {
+            return fail("Expected shared target input to count only four distinct removable inputs: " +
+                        sharedLog);
+        }
+
+        {
+            const std::string name = "final_fanin_pullback_implicit_index";
+            const std::string intentGroup = "final_fanin_hidden_index";
+            wolvrix::lib::grh::Design design;
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            std::vector<wolvrix::lib::grh::ValueId> sourceValues;
+            for (std::size_t i = 0; i < 4; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto input = makeValue(graph, "source_input_" + suffix, 8);
+                graph.bindInputPort("source_input_" + suffix, input);
+                const auto value = makeValue(graph, "source_value_" + suffix, 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("source_" + suffix));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                sourceValues.push_back(value);
+                if (i == 0)
+                {
+                    const auto extra = makeValue(graph, "source_extra_value", 8);
+                    graph.addResult(op, extra);
+                    sourceValues.push_back(extra);
+                }
+            }
+            for (std::size_t i = 0; i < 3; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto input = makeValue(graph, "padding_input_" + suffix, 8);
+                graph.bindInputPort("padding_input_" + suffix, input);
+                const auto value = makeValue(graph, "padding_value_" + suffix, 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("padding_" + suffix));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                graph.bindOutputPort("padding_" + suffix, value);
+            }
+
+            const auto blockerInput = makeValue(graph, "blocker_input", 8);
+            graph.bindInputPort("blocker_input", blockerInput);
+            const auto blockerValue = makeValue(graph, "blocker_value", 8);
+            const auto blocker = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kNot,
+                graph.internSymbol("blocker"));
+            graph.addOperand(blocker, blockerInput);
+            graph.addResult(blocker, blockerValue);
+            const auto candidateValue = makeValue(graph, "candidate_value", 8);
+            const auto candidate = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kAnd,
+                graph.internSymbol("candidate"));
+            for (const auto value : sourceValues)
+            {
+                graph.addOperand(candidate, value);
+            }
+            graph.addResult(candidate, candidateValue);
+            auto output = makeValue(graph, "tail_value", 8);
+            const auto tail = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kXor,
+                graph.internSymbol("tail"));
+            graph.addOperand(tail, candidateValue);
+            graph.addOperand(tail, blockerValue);
+            graph.addResult(tail, output);
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto value = makeValue(graph, "tail_chain_value_" + suffix, 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("tail_chain_" + suffix));
+                graph.addOperand(op, output);
+                graph.addResult(op, value);
+                output = value;
+            }
+            graph.bindOutputPort("output", output);
+
+            const auto reg = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kRegister,
+                graph.internSymbol("intent_reg"));
+            graph.setAttr(reg, "width", int64_t{8});
+            graph.setAttr(reg, "isSigned", false);
+            setIntentShape(graph, reg, intentGroup, "register", 8, 1);
+            graph.setAttr(reg, "regToMem.intent.row", int64_t{0});
+            const auto readValue = makeValue(graph, "intent_read_value", 8);
+            const auto read = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                graph.internSymbol("intent_read"));
+            graph.addResult(read, readValue);
+            graph.setAttr(read, "regSymbol", std::string("intent_reg"));
+            graph.setAttr(read, "regToMem.intent.group", intentGroup);
+            graph.setAttr(read, "regToMem.intent.mode", std::string("array-index"));
+            graph.setAttr(read, "regToMem.intent.role", std::string("read"));
+            graph.setAttr(read, "regToMem.intent.row", int64_t{0});
+            const auto packed = makeValue(graph, "intent_packed", 8);
+            const auto concat = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kConcat,
+                graph.internSymbol("intent_concat"));
+            graph.addOperand(concat, readValue);
+            graph.addResult(concat, packed);
+            setIntentShape(graph, concat, intentGroup, "concat", 8, 1);
+            graph.setAttr(concat,
+                          "regToMem.intent.regSymbols",
+                          std::vector<std::string>{"intent_reg"});
+            graph.setAttr(concat,
+                          "regToMem.intent.operandRows",
+                          std::vector<int64_t>{0});
+            const auto elemWidth =
+                makeConstant(graph, "intent_width_const", "intent_width", 8, "8'd8");
+            const auto start = makeValue(graph, "intent_start", 8);
+            const auto mul = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kMul,
+                graph.internSymbol("intent_start_mul"));
+            graph.addOperand(mul, sourceValues.front());
+            graph.addOperand(mul, elemWidth);
+            graph.addResult(mul, start);
+            const auto selected = makeValue(graph, "intent_selected", 8);
+            const auto slice = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kSliceDynamic,
+                graph.internSymbol("intent_slice"));
+            graph.addOperand(slice, packed);
+            graph.addOperand(slice, start);
+            graph.addResult(slice, selected);
+            graph.setAttr(slice, "sliceWidth", int64_t{8});
+            setIntentShape(graph, slice, intentGroup, "slice", 8, 1);
+            graph.setAttr(slice,
+                          "regToMem.intent.sliceKind",
+                          std::string("slice-dynamic"));
+            graph.bindOutputPort("intent_selected", selected);
+
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 8;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.finalFaninPullbackPolicy = "probe";
+            options.finalFaninPullbackMaxMovedOpPpm = 1000000;
+            SessionStore session;
+            std::string log;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+            manager.options().logSink =
+                [&log](wolvrix::lib::LogLevel,
+                       std::string_view,
+                       std::string_view message)
+                {
+                    log.append(message);
+                    log.push_back('\n');
+                };
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            const auto schedule = loadSchedule(session, name);
+            const auto ownerOf = [&](wolvrix::lib::grh::OperationId op)
+            {
+                return schedule.opToSupernode == nullptr ||
+                               op.index - 1 >= schedule.opToSupernode->size()
+                           ? kInvalidActivitySupernodeId
+                           : (*schedule.opToSupernode)[op.index - 1];
+            };
+            if (!result.success || diags.hasError() ||
+                ownerOf(mul) != kInvalidActivitySupernodeId ||
+                parseStatField(log, "exact_eligible") != 1 ||
+                parseStatField(log, "selected") != 1 ||
+                parseStatField(log, "rejected_restricted") == 0 ||
+                parseStatField(log, "eligible_projected_bae_gain") != 3 ||
+                log.find(" projected_bae_gain=3") == std::string::npos)
+            {
+                return fail("Expected hidden reg-to-mem index to make one input non-removable: " +
+                            log);
+            }
+        }
+
+        {
+            const std::string name = "final_fanin_pullback_cumulative_capacity";
+            wolvrix::lib::grh::Design design;
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            std::vector<wolvrix::lib::grh::ValueId> sourceValues;
+            const auto sourceInput = makeValue(graph, "source_input", 8);
+            graph.bindInputPort("source_input", sourceInput);
+            const auto source = graph.createOperation(
+                wolvrix::lib::grh::OperationKind::kNot,
+                graph.internSymbol("source"));
+            graph.addOperand(source, sourceInput);
+            for (std::size_t i = 0; i < 8; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto value = makeValue(graph, "source_value_" + suffix, 8);
+                graph.addResult(source, value);
+                sourceValues.push_back(value);
+            }
+            auto middle = makeValue(graph, "middle_input", 8);
+            graph.bindInputPort("middle_input", middle);
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                const std::string suffix = std::to_string(i);
+                const auto value = makeValue(graph, "middle_value_" + suffix, 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol("middle_" + suffix));
+                graph.addOperand(op, middle);
+                graph.addResult(op, value);
+                middle = value;
+            }
+            graph.bindOutputPort("middle", middle);
+            for (std::size_t group = 0; group < 2; ++group)
+            {
+                const std::string prefix = "group_" + std::to_string(group) + "_";
+                const auto candidateValue = makeValue(graph, prefix + "candidate_value", 8);
+                const auto candidate = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kAnd,
+                    graph.internSymbol(prefix + "candidate"));
+                for (std::size_t i = group * 4; i < group * 4 + 4; ++i)
+                {
+                    graph.addOperand(candidate, sourceValues[i]);
+                }
+                graph.addResult(candidate, candidateValue);
+                auto output = makeValue(graph, prefix + "tail_value", 8);
+                const auto tail = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol(prefix + "tail"));
+                graph.addOperand(tail, candidateValue);
+                graph.addResult(tail, output);
+                graph.bindOutputPort(prefix + "output", output);
+            }
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 2;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = true;
+            options.enableChainMerge = true;
+            options.finalFaninPullbackPolicy = "probe";
+            options.finalFaninPullbackMaxMovedOpPpm = 1000000;
+            SessionStore session;
+            std::string log;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+            manager.options().logSink =
+                [&log](wolvrix::lib::LogLevel,
+                       std::string_view,
+                       std::string_view message)
+                {
+                    log.append(message);
+                    log.push_back('\n');
+                };
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            if (!result.success || result.changed || diags.hasError() ||
+                parseStatField(log, "exact_eligible") != 2 ||
+                parseStatField(log, "selected") != 1 ||
+                parseStatField(log, "eligible_projected_bae_gain") != 6 ||
+                log.find(" projected_bae_gain=3") == std::string::npos ||
+                parseStatField(log, "rejected_selection_capacity") != 1)
+            {
+                return fail("Expected cumulative source capacity to select one candidate: " + log);
+            }
+        }
+
+        std::string rejectedFixtureFailure;
+        const auto expectRejected = [&](const std::string &name,
+                                        const FaninFixtureOptions &fixture,
+                                        const std::string &counter)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, name, fixture);
+            SessionStore session;
+            std::string log;
+            const bool accepted = runFixture(design, name, "probe", session, &log) &&
+                                  log.find("activity-schedule final-fanin pullback probe:") !=
+                                      std::string::npos &&
+                                  parseStatField(log, "scanned") != 0 &&
+                                  parseStatField(log, "exact_eligible") == 0 &&
+                                  parseStatField(log, "selected") == 0 &&
+                                  parseStatField(log, counter) != 0;
+            if (!accepted)
+            {
+                rejectedFixtureFailure = name + " expected " + counter + ": " + log;
+            }
+            return accepted;
+        };
+        FaninFixtureOptions multiLiveout;
+        multiLiveout.secondCandidateLiveout = true;
+        FaninFixtureOptions outputLiveout;
+        outputLiveout.bindCandidateOutput = true;
+        FaninFixtureOptions declaredLiveout;
+        declaredLiveout.declareCandidate = true;
+        FaninFixtureOptions commitConsumer;
+        commitConsumer.addCommitConsumer = true;
+        FaninFixtureOptions fullSource;
+        fullSource.fillSourceCapacity = true;
+        FaninFixtureOptions anchoredUnused;
+        anchoredUnused.anchoredUnusedResult = true;
+        FaninFixtureOptions noDef;
+        noDef.candidateUsesNoDef = true;
+        FaninFixtureOptions targetPredecessor;
+        targetPredecessor.candidateUsesTargetPredecessor = true;
+        FaninFixtureOptions sideEffect;
+        sideEffect.candidateHasSideEffects = true;
+        FaninFixtureOptions cloneForbidden;
+        cloneForbidden.candidateHasCloneForbiddenAttr = true;
+        FaninFixtureOptions wide;
+        wide.wideCandidateResult = true;
+        if (!expectRejected("final_fanin_pullback_multi_liveout",
+                            multiLiveout,
+                            "rejected_liveout_count") ||
+            !expectRejected("final_fanin_pullback_output_liveout",
+                            outputLiveout,
+                            "rejected_port_or_declared") ||
+            !expectRejected("final_fanin_pullback_declared_liveout",
+                            declaredLiveout,
+                            "rejected_port_or_declared") ||
+            !expectRejected("final_fanin_pullback_anchored_unused",
+                            anchoredUnused,
+                            "rejected_port_or_declared") ||
+            !expectRejected("final_fanin_pullback_commit_consumer",
+                            commitConsumer,
+                            "rejected_external_consumer") ||
+            !expectRejected("final_fanin_pullback_full_source",
+                            fullSource,
+                            "rejected_capacity") ||
+            !expectRejected("final_fanin_pullback_no_def", noDef, "rejected_no_def") ||
+            !expectRejected("final_fanin_pullback_target_predecessor",
+                            targetPredecessor,
+                            "rejected_target_predecessor") ||
+            !expectRejected("final_fanin_pullback_side_effect",
+                            sideEffect,
+                            "rejected_side_effect") ||
+            !expectRejected("final_fanin_pullback_clone_forbidden",
+                            cloneForbidden,
+                            "rejected_clone_forbidden") ||
+            !expectRejected("final_fanin_pullback_wide", wide, "rejected_width"))
+        {
+            return fail("Expected final-fanin rejection: " + rejectedFixtureFailure);
+        }
+
+        const auto runInvalid = [&](const std::string &policy, std::size_t movedOpPpm)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, "final_fanin_pullback_invalid_options", {});
+            ActivityScheduleOptions options;
+            options.path = "final_fanin_pullback_invalid_options";
+            options.finalFaninPullbackPolicy = policy;
+            options.finalFaninPullbackMaxMovedOpPpm = movedOpPpm;
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return !result.success && diags.hasError();
+        };
+        if (!runInvalid("strict", 5000) || !runInvalid("off", 1000001))
+        {
+            return fail("Expected invalid final-fanin policy and moved-op ppm to fail");
+        }
+    }
+
+    {
         currentCase = "final_topo_level_op";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("final_topo_level_op");

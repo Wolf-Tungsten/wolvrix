@@ -633,6 +633,42 @@ namespace wolvrix::lib::transform
                 std::uint64_t elapsedMs = 0;
             };
 
+            struct PostDpSwapProbe
+            {
+                bool evaluated = false;
+                std::size_t capacityBlockedSeeds = 0;
+                std::size_t enumeratedRhs = 0;
+                std::size_t rejectedLocked = 0;
+                std::size_t rejectedEqualLoad = 0;
+                std::size_t rejectedTopo = 0;
+                std::size_t rejectedDagSupport = 0;
+                std::size_t rejectedDagEdgeCount = 0;
+                std::size_t rejectedDagSupportKey = 0;
+                std::size_t rejectedNonpositiveBae = 0;
+                std::size_t rejectedScanLimit = 0;
+                std::size_t rawEligible = 0;
+                std::size_t eligibleBaeGain = 0;
+                std::map<std::size_t, std::size_t> eligibleByClusterOps;
+                std::size_t selected = 0;
+                std::size_t selectedMovedClusters = 0;
+                std::size_t selectedMovedOps = 0;
+                std::size_t rejectedConflict = 0;
+                std::size_t rejectedBudget = 0;
+                std::size_t projectedBaeGain = 0;
+                std::size_t actualBaeGain = 0;
+                std::size_t computeBaeCandidate = 0;
+                std::size_t boundaryValuesBefore = 0;
+                std::size_t boundaryValuesCandidate = 0;
+                std::size_t dagEdgesCandidate = 0;
+                bool segmentCountValid = false;
+                bool segmentOpsValid = false;
+                bool segmentShapeValid = false;
+                bool dagSupportValid = false;
+                bool topoValid = false;
+                bool projectedActualValid = false;
+                bool valid = false;
+            };
+
             std::uint64_t initClustersMs = 0;
             std::uint64_t topoBeforeCoarsenMs = 0;
             std::uint64_t coarsenMs = 0;
@@ -698,6 +734,7 @@ namespace wolvrix::lib::transform
             std::size_t postDpRefineBeforeDagEdges = 0;
             std::size_t postDpRefineAfterDagEdges = 0;
             bool postDpRefineEvaluated = false;
+            PostDpSwapProbe postDpSwapProbe;
             bool coarsenTailStopped = false;
             std::size_t coarsenTailIterations = 0;
             std::vector<CoarsenIteration> coarsenIterationStats;
@@ -4822,6 +4859,35 @@ namespace wolvrix::lib::transform
             return total;
         }
 
+        std::size_t recountPostDpComputeBoundaryValues(
+            const ClusterValueEdges &valueEdges,
+            const std::vector<uint32_t> &ownerByCluster)
+        {
+            std::size_t total = 0;
+            for (const auto &fanout : valueEdges.valueFanouts)
+            {
+                const uint32_t sourceSegment =
+                    fanout.sourceCluster < ownerByCluster.size()
+                        ? ownerByCluster[fanout.sourceCluster]
+                        : kInvalidActivitySupernodeId;
+                if (sourceSegment == kInvalidActivitySupernodeId)
+                {
+                    continue;
+                }
+                const bool boundary = std::any_of(
+                    fanout.targetClusters.begin(),
+                    fanout.targetClusters.end(),
+                    [&](uint32_t targetCluster)
+                    {
+                        return targetCluster < ownerByCluster.size() &&
+                               ownerByCluster[targetCluster] != kInvalidActivitySupernodeId &&
+                               ownerByCluster[targetCluster] != sourceSegment;
+                    });
+                total += boundary ? 1U : 0U;
+            }
+            return total;
+        }
+
         PostDpDagState buildPostDpDagState(const NodeClusterView &view,
                                            const ClusterValueEdges &valueEdges,
                                            const std::vector<uint32_t> &ownerByCluster,
@@ -4896,6 +4962,22 @@ namespace wolvrix::lib::transform
                 }
             }
             return true;
+        }
+
+        bool equalPostDpDagSupport(const PostDpDagState &lhs,
+                                   const PostDpDagState &rhs)
+        {
+            if (lhs.edges != rhs.edges || lhs.refs.size() != rhs.refs.size())
+            {
+                return false;
+            }
+            return std::all_of(
+                lhs.refs.begin(),
+                lhs.refs.end(),
+                [&](const auto &entry)
+                {
+                    return rhs.refs.contains(entry.first);
+                });
         }
 
         PostDpPartitionMetrics recountPostDpPartitionMetrics(
@@ -6183,6 +6265,7 @@ namespace wolvrix::lib::transform
             constexpr std::size_t kTopPeerDestinations = 4;
             constexpr std::size_t kMaxBlockedMoves = 32768;
             constexpr std::size_t kMaxSwapCandidates = 65536;
+            constexpr std::size_t kMaxSwapPairScans = 4 * 1024 * 1024;
             struct TopPeerDestinations
             {
                 uint32_t segments[kTopPeerDestinations]{};
@@ -6216,6 +6299,510 @@ namespace wolvrix::lib::transform
                 top.counts[position] = count;
                 top.size = nextSize;
             };
+
+            if (options.postDpRefinePolicy == "swap-probe")
+            {
+                auto &probe = perf.postDpSwapProbe;
+                probe.evaluated = true;
+                probe.boundaryValuesBefore =
+                    recountPostDpComputeBoundaryValues(valueEdges, ownerByCluster);
+
+                std::vector<TopPeerDestinations> valuePeers(
+                    valueEdges.valueFanouts.size());
+                for (const auto &[packed, count] : valueTargetSegmentRefs)
+                {
+                    const uint32_t valueId = static_cast<uint32_t>(packed >> 32);
+                    const uint32_t segmentId = static_cast<uint32_t>(packed);
+                    if (valueId < valuePeers.size())
+                    {
+                        addTopPeer(valuePeers[valueId], segmentId, count);
+                    }
+                }
+                std::vector<TopPeerDestinations> commitPeers(commitCount);
+                for (const auto &[packed, count] : commitSegmentRefs)
+                {
+                    const uint32_t commitId = static_cast<uint32_t>(packed >> 32);
+                    const uint32_t segmentId = static_cast<uint32_t>(packed);
+                    if (commitId < commitPeers.size())
+                    {
+                        addTopPeer(commitPeers[commitId], segmentId, count);
+                    }
+                }
+
+                const auto affinityDestinations = [&](uint32_t clusterId)
+                {
+                    std::unordered_map<uint32_t, std::size_t> affinity;
+                    if (clusterId >= ownerByCluster.size())
+                    {
+                        return std::vector<std::pair<uint32_t, std::size_t>>{};
+                    }
+                    const uint32_t from = ownerByCluster[clusterId];
+                    const auto addDestination = [&](uint32_t destination,
+                                                    std::size_t amount)
+                    {
+                        if (destination != kInvalidActivitySupernodeId &&
+                            destination < segments.size() && destination != from &&
+                            splitSensitiveSegments[destination] == 0)
+                        {
+                            affinity[destination] += amount;
+                        }
+                    };
+                    const auto addValuePeers = [&](uint32_t valueId)
+                    {
+                        if (valueId >= valuePeers.size())
+                        {
+                            return;
+                        }
+                        const auto &peers = valuePeers[valueId];
+                        for (std::size_t i = 0; i < peers.size; ++i)
+                        {
+                            addDestination(peers.segments[i], peers.counts[i]);
+                        }
+                    };
+                    if (clusterId < valueEdges.sourceValuesByCluster.size())
+                    {
+                        for (const uint32_t valueId :
+                             valueEdges.sourceValuesByCluster[clusterId])
+                        {
+                            addValuePeers(valueId);
+                        }
+                    }
+                    if (clusterId < valueEdges.targetValuesByCluster.size())
+                    {
+                        for (const uint32_t valueId :
+                             valueEdges.targetValuesByCluster[clusterId])
+                        {
+                            if (valueId >= valueEdges.valueFanouts.size())
+                            {
+                                continue;
+                            }
+                            const uint32_t sourceCluster =
+                                valueEdges.valueFanouts[valueId].sourceCluster;
+                            if (sourceCluster < ownerByCluster.size())
+                            {
+                                addDestination(ownerByCluster[sourceCluster], 1);
+                            }
+                            addValuePeers(valueId);
+                        }
+                    }
+                    if (clusterId < valueEdges.commitSuccsByCluster.size())
+                    {
+                        for (const uint32_t rawCommit :
+                             valueEdges.commitSuccsByCluster[clusterId])
+                        {
+                            if (rawCommit < clusterCount)
+                            {
+                                continue;
+                            }
+                            const uint32_t commitId = rawCommit - clusterCount;
+                            if (commitId >= commitPeers.size())
+                            {
+                                continue;
+                            }
+                            const auto &peers = commitPeers[commitId];
+                            for (std::size_t i = 0; i < peers.size; ++i)
+                            {
+                                addDestination(peers.segments[i], peers.counts[i]);
+                            }
+                        }
+                    }
+                    for (const uint32_t pred : view.preds[clusterId])
+                    {
+                        if (pred < ownerByCluster.size())
+                        {
+                            addDestination(ownerByCluster[pred], 1);
+                        }
+                    }
+                    for (const uint32_t succ : view.succs[clusterId])
+                    {
+                        if (succ < ownerByCluster.size())
+                        {
+                            addDestination(ownerByCluster[succ], 1);
+                        }
+                    }
+                    std::vector<std::pair<uint32_t, std::size_t>> destinations(
+                        affinity.begin(), affinity.end());
+                    std::sort(destinations.begin(),
+                              destinations.end(),
+                              [](const auto &lhs, const auto &rhs)
+                              {
+                                  if (lhs.second != rhs.second)
+                                  {
+                                      return lhs.second > rhs.second;
+                                  }
+                                  return lhs.first < rhs.first;
+                              });
+                    if (destinations.size() > kTopDestinations)
+                    {
+                        destinations.resize(kTopDestinations);
+                    }
+                    return destinations;
+                };
+
+                const auto blockedMoveBetter = [](const BlockedMove &lhs,
+                                                  const BlockedMove &rhs)
+                {
+                    if (lhs.affinity != rhs.affinity)
+                    {
+                        return lhs.affinity > rhs.affinity;
+                    }
+                    if (lhs.cluster != rhs.cluster)
+                    {
+                        return lhs.cluster < rhs.cluster;
+                    }
+                    if (lhs.to != rhs.to)
+                    {
+                        return lhs.to < rhs.to;
+                    }
+                    return lhs.from < rhs.from;
+                };
+                std::set<BlockedMove, decltype(blockedMoveBetter)> blockedMoveTop(
+                    blockedMoveBetter);
+                if (options.postDpRefineMaxRounds != 0)
+                {
+                    for (uint32_t lhs = 0; lhs < view.members.size(); ++lhs)
+                    {
+                        if (locked[lhs] != 0)
+                        {
+                            continue;
+                        }
+                        const uint32_t from = ownerByCluster[lhs];
+                        if (from >= segments.size())
+                        {
+                            continue;
+                        }
+                        for (const auto &[to, affinity] : affinityDestinations(lhs))
+                        {
+                            if (segments[from].size() > 1 &&
+                                segmentOps[to] + clusterOps[lhs] <= maxOps)
+                            {
+                                continue;
+                            }
+                            ++probe.capacityBlockedSeeds;
+                            const BlockedMove candidate{lhs, from, to, affinity};
+                            if (blockedMoveTop.size() < kMaxBlockedMoves)
+                            {
+                                blockedMoveTop.insert(candidate);
+                                continue;
+                            }
+                            ++probe.rejectedScanLimit;
+                            const auto worst = std::prev(blockedMoveTop.end());
+                            if (blockedMoveBetter(candidate, *worst))
+                            {
+                                blockedMoveTop.erase(worst);
+                                blockedMoveTop.insert(candidate);
+                            }
+                        }
+                    }
+                }
+                const std::vector<BlockedMove> blockedMoves(blockedMoveTop.begin(),
+                                                            blockedMoveTop.end());
+
+                struct SwapProbeCandidate
+                {
+                    uint32_t lhs = 0;
+                    uint32_t rhs = 0;
+                    uint32_t lhsFrom = 0;
+                    uint32_t lhsTo = 0;
+                    std::size_t clusterOps = 0;
+                    std::size_t affinity = 0;
+                    std::size_t baeGain = 0;
+                };
+                const auto proposalPreservesDagSupport = [&](const ProposalEval &eval)
+                {
+                    if (eval.dagGain == std::numeric_limits<std::int64_t>::min())
+                    {
+                        return false;
+                    }
+                    for (const auto &[pair, delta] : eval.dagRefDeltas)
+                    {
+                        const auto it = dagState.refs.find(pair);
+                        const std::int64_t before =
+                            it == dagState.refs.end() ? 0 : it->second;
+                        const std::int64_t after = before + delta;
+                        if (after < 0 || (before > 0) != (after > 0))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
+                const auto swapCandidateBetter = [](const SwapProbeCandidate &lhs,
+                                                    const SwapProbeCandidate &rhs)
+                {
+                    if (lhs.baeGain != rhs.baeGain)
+                    {
+                        return lhs.baeGain > rhs.baeGain;
+                    }
+                    if (lhs.affinity != rhs.affinity)
+                    {
+                        return lhs.affinity > rhs.affinity;
+                    }
+                    if (lhs.clusterOps != rhs.clusterOps)
+                    {
+                        return lhs.clusterOps < rhs.clusterOps;
+                    }
+                    if (lhs.lhs != rhs.lhs)
+                    {
+                        return lhs.lhs < rhs.lhs;
+                    }
+                    return lhs.rhs < rhs.rhs;
+                };
+                std::set<SwapProbeCandidate, decltype(swapCandidateBetter)> eligibleTop(
+                    swapCandidateBetter);
+                std::unordered_set<uint64_t> seenClusterPairs;
+                seenClusterPairs.reserve(kMaxSwapCandidates * 2);
+                std::size_t totalRhsPairs = 0;
+                for (const auto &blocked : blockedMoves)
+                {
+                    if (blocked.to >= segments.size())
+                    {
+                        continue;
+                    }
+                    const std::size_t rhsCount = segments[blocked.to].size();
+                    if (rhsCount > std::numeric_limits<std::size_t>::max() - totalRhsPairs)
+                    {
+                        totalRhsPairs = std::numeric_limits<std::size_t>::max();
+                        break;
+                    }
+                    totalRhsPairs += rhsCount;
+                }
+                bool pairScanLimitReached = false;
+                for (const auto &blocked : blockedMoves)
+                {
+                    if (blocked.cluster >= ownerByCluster.size() ||
+                        blocked.to >= segments.size())
+                    {
+                        continue;
+                    }
+                    for (const uint32_t rhs : segments[blocked.to])
+                    {
+                        if (probe.enumeratedRhs >= kMaxSwapPairScans)
+                        {
+                            pairScanLimitReached = true;
+                            break;
+                        }
+                        ++probe.enumeratedRhs;
+                        if (rhs >= ownerByCluster.size() || rhs == blocked.cluster ||
+                            locked[rhs] != 0 || splitSensitive[rhs] != 0)
+                        {
+                            ++probe.rejectedLocked;
+                            continue;
+                        }
+                        if (clusterOps[blocked.cluster] != clusterOps[rhs])
+                        {
+                            ++probe.rejectedEqualLoad;
+                            continue;
+                        }
+                        if (!proposalPreservesTopo(blocked.cluster,
+                                                   blocked.to,
+                                                   rhs,
+                                                   blocked.from))
+                        {
+                            ++probe.rejectedTopo;
+                            continue;
+                        }
+                        ProposalEval eval = evaluateProposal(blocked.cluster,
+                                                             blocked.to,
+                                                             rhs,
+                                                             blocked.from,
+                                                             true);
+                        if (!proposalPreservesDagSupport(eval))
+                        {
+                            ++probe.rejectedDagSupport;
+                            if (eval.dagGain == 0)
+                            {
+                                ++probe.rejectedDagSupportKey;
+                            }
+                            else
+                            {
+                                ++probe.rejectedDagEdgeCount;
+                            }
+                            continue;
+                        }
+                        if (eval.baeGain <= 0)
+                        {
+                            ++probe.rejectedNonpositiveBae;
+                            continue;
+                        }
+                        const auto [pairLhs, pairRhs] =
+                            std::minmax(blocked.cluster, rhs);
+                        if (!seenClusterPairs.insert(packClusterPair(pairLhs, pairRhs)).second)
+                        {
+                            continue;
+                        }
+                        const SwapProbeCandidate candidate{
+                            blocked.cluster,
+                            rhs,
+                            blocked.from,
+                            blocked.to,
+                            clusterOps[blocked.cluster],
+                            blocked.affinity,
+                            static_cast<std::size_t>(eval.baeGain),
+                        };
+                        if (eligibleTop.size() < kMaxSwapCandidates)
+                        {
+                            eligibleTop.insert(candidate);
+                            continue;
+                        }
+                        ++probe.rejectedScanLimit;
+                        const auto worst = std::prev(eligibleTop.end());
+                        if (swapCandidateBetter(candidate, *worst))
+                        {
+                            eligibleTop.erase(worst);
+                            eligibleTop.insert(candidate);
+                        }
+                    }
+                    if (pairScanLimitReached)
+                    {
+                        break;
+                    }
+                }
+                if (totalRhsPairs > probe.enumeratedRhs)
+                {
+                    const std::size_t skippedRhs = totalRhsPairs - probe.enumeratedRhs;
+                    if (skippedRhs > std::numeric_limits<std::size_t>::max() -
+                                         probe.rejectedScanLimit)
+                    {
+                        probe.rejectedScanLimit =
+                            std::numeric_limits<std::size_t>::max();
+                    }
+                    else
+                    {
+                        probe.rejectedScanLimit += skippedRhs;
+                    }
+                }
+                const std::vector<SwapProbeCandidate> eligible(eligibleTop.begin(),
+                                                               eligibleTop.end());
+                probe.rawEligible = eligible.size();
+                for (const auto &candidate : eligible)
+                {
+                    probe.eligibleBaeGain += candidate.baeGain;
+                    ++probe.eligibleByClusterOps[candidate.clusterOps];
+                }
+                perf.postDpRefineCandidates = probe.rawEligible;
+
+                std::vector<uint8_t> selectedClusters(view.members.size(), 0U);
+                std::vector<uint8_t> selectedSegments(segments.size(), 0U);
+                std::vector<SwapProbeCandidate> selected;
+                for (const auto &candidate : eligible)
+                {
+                    if (selectedClusters[candidate.lhs] != 0 ||
+                        selectedClusters[candidate.rhs] != 0 ||
+                        selectedSegments[candidate.lhsFrom] != 0 ||
+                        selectedSegments[candidate.lhsTo] != 0)
+                    {
+                        ++probe.rejectedConflict;
+                        continue;
+                    }
+                    const std::size_t movedOps = candidate.clusterOps * 2;
+                    if (probe.selectedMovedClusters + 2 >
+                            options.postDpRefineMaxMoves ||
+                        probe.selectedMovedOps + movedOps > movedOpBudget)
+                    {
+                        ++probe.rejectedBudget;
+                        continue;
+                    }
+                    selected.push_back(candidate);
+                    selectedClusters[candidate.lhs] = 1U;
+                    selectedClusters[candidate.rhs] = 1U;
+                    selectedSegments[candidate.lhsFrom] = 1U;
+                    selectedSegments[candidate.lhsTo] = 1U;
+                    probe.selectedMovedClusters += 2;
+                    probe.selectedMovedOps += movedOps;
+                    probe.projectedBaeGain += candidate.baeGain;
+                }
+                probe.selected = selected.size();
+
+                std::vector<std::vector<uint32_t>> candidateSegments = segments;
+                for (const auto &candidate : selected)
+                {
+                    auto &fromMembers = candidateSegments[candidate.lhsFrom];
+                    auto &toMembers = candidateSegments[candidate.lhsTo];
+                    const auto lhsIt =
+                        std::find(fromMembers.begin(), fromMembers.end(), candidate.lhs);
+                    const auto rhsIt =
+                        std::find(toMembers.begin(), toMembers.end(), candidate.rhs);
+                    if (lhsIt == fromMembers.end() || rhsIt == toMembers.end())
+                    {
+                        continue;
+                    }
+                    *lhsIt = candidate.rhs;
+                    *rhsIt = candidate.lhs;
+                    std::sort(fromMembers.begin(), fromMembers.end());
+                    std::sort(toMembers.begin(), toMembers.end());
+                }
+
+                const std::vector<uint32_t> candidateOwners =
+                    postDpSegmentOwners(view, candidateSegments);
+                probe.computeBaeCandidate = recountPostDpComputeBae(
+                    valueEdges, candidateOwners, candidateSegments.size());
+                probe.boundaryValuesCandidate =
+                    recountPostDpComputeBoundaryValues(valueEdges, candidateOwners);
+                const PostDpDagState candidateDag = buildPostDpDagState(
+                    view, valueEdges, candidateOwners, candidateSegments.size());
+                probe.dagEdgesCandidate = candidateDag.edges;
+                probe.segmentCountValid = candidateSegments.size() == segments.size();
+                std::vector<std::size_t> candidateSegmentOps(candidateSegments.size(), 0);
+                for (uint32_t segmentId = 0; segmentId < candidateSegments.size(); ++segmentId)
+                {
+                    for (const uint32_t clusterId : candidateSegments[segmentId])
+                    {
+                        if (clusterId < clusterOps.size())
+                        {
+                            candidateSegmentOps[segmentId] += clusterOps[clusterId];
+                        }
+                    }
+                }
+                probe.segmentOpsValid = candidateSegmentOps == segmentOps;
+                probe.segmentShapeValid = validateComputeSupernodeSegments(
+                    view, candidateSegments, nodeOpSizes, maxOps);
+                probe.dagSupportValid = equalPostDpDagSupport(dagState, candidateDag);
+                probe.topoValid =
+                    std::find(candidateOwners.begin(),
+                              candidateOwners.end(),
+                              kInvalidActivitySupernodeId) == candidateOwners.end();
+                if (probe.topoValid)
+                {
+                    for (uint32_t fromCluster = 0;
+                         fromCluster < view.succs.size() && probe.topoValid;
+                         ++fromCluster)
+                    {
+                        for (const uint32_t toCluster : view.succs[fromCluster])
+                        {
+                            if (fromCluster >= candidateOwners.size() ||
+                                toCluster >= candidateOwners.size())
+                            {
+                                probe.topoValid = false;
+                                break;
+                            }
+                            const uint32_t from = candidateOwners[fromCluster];
+                            const uint32_t to = candidateOwners[toCluster];
+                            if (from != to && from >= to)
+                            {
+                                probe.topoValid = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (probe.computeBaeCandidate <= baselineBae)
+                {
+                    probe.actualBaeGain = baselineBae - probe.computeBaeCandidate;
+                }
+                probe.projectedActualValid =
+                    probe.actualBaeGain == probe.projectedBaeGain;
+                probe.valid = probe.segmentCountValid && probe.segmentOpsValid &&
+                              probe.segmentShapeValid && probe.dagSupportValid &&
+                              probe.topoValid && probe.projectedActualValid;
+
+                perf.postDpRefineRounds =
+                    options.postDpRefineMaxRounds == 0 ? 0 : 1;
+                perf.postDpRefineAfterComputeBae = baselineBae;
+                perf.postDpRefineAfterDagEdges = baselineDag;
+                return true;
+            }
 
             for (std::size_t round = 0;
                  round < options.postDpRefineMaxRounds &&
@@ -10938,9 +11525,10 @@ namespace wolvrix::lib::transform
         if (options_.postDpRefinePolicy != "off" &&
             options_.postDpRefinePolicy != "strict" &&
             options_.postDpRefinePolicy != "bae-budget" &&
-            options_.postDpRefinePolicy != "balanced")
+            options_.postDpRefinePolicy != "balanced" &&
+            options_.postDpRefinePolicy != "swap-probe")
         {
-            error("activity-schedule post_dp_refine_policy must be off, strict, bae-budget, or balanced");
+            error("activity-schedule post_dp_refine_policy must be off, strict, bae-budget, balanced, or swap-probe");
             result.failed = true;
             return result;
         }
@@ -11825,6 +12413,76 @@ namespace wolvrix::lib::transform
                     std::to_string(materializePerf.postDpRefineBeforeDagEdges) +
                     " dag_edges_after=" +
                     std::to_string(materializePerf.postDpRefineAfterDagEdges));
+        }
+        if (options_.postDpRefinePolicy == "swap-probe")
+        {
+            const auto &probe = materializePerf.postDpSwapProbe;
+            std::ostringstream opDistribution;
+            bool firstBucket = true;
+            for (const auto &[ops, count] : probe.eligibleByClusterOps)
+            {
+                if (!firstBucket)
+                {
+                    opDistribution << ',';
+                }
+                firstBucket = false;
+                opDistribution << ops << ':' << count;
+            }
+            logInfo(
+                "activity-schedule post-DP swap probe: capacity_blocked_seeds=" +
+                std::to_string(probe.capacityBlockedSeeds) +
+                " enumerated_rhs=" + std::to_string(probe.enumeratedRhs) +
+                " rejected_locked=" + std::to_string(probe.rejectedLocked) +
+                " rejected_equal_load=" +
+                std::to_string(probe.rejectedEqualLoad) +
+                " swap_rejected_topo=" + std::to_string(probe.rejectedTopo) +
+                " rejected_dag_support=" +
+                std::to_string(probe.rejectedDagSupport) +
+                " rejected_dag_edge_count=" +
+                std::to_string(probe.rejectedDagEdgeCount) +
+                " rejected_dag_support_key=" +
+                std::to_string(probe.rejectedDagSupportKey) +
+                " rejected_nonpositive_bae=" +
+                std::to_string(probe.rejectedNonpositiveBae) +
+                " rejected_scan_limit=" +
+                std::to_string(probe.rejectedScanLimit) +
+                " raw_eligible_swaps=" + std::to_string(probe.rawEligible) +
+                " eligible_bae_gain=" + std::to_string(probe.eligibleBaeGain) +
+                " eligible_cluster_ops=" + opDistribution.str() +
+                " selected_swaps=" + std::to_string(probe.selected) +
+                " selected_moved_clusters=" +
+                std::to_string(probe.selectedMovedClusters) +
+                " selected_moved_ops=" + std::to_string(probe.selectedMovedOps) +
+                " rejected_conflict=" + std::to_string(probe.rejectedConflict) +
+                " rejected_budget=" + std::to_string(probe.rejectedBudget) +
+                " projected_bae_gain=" +
+                std::to_string(probe.projectedBaeGain) +
+                " actual_bae_gain=" + std::to_string(probe.actualBaeGain) +
+                " swap_compute_bae_before=" +
+                std::to_string(materializePerf.postDpRefineBeforeComputeBae) +
+                " swap_compute_bae_candidate=" +
+                std::to_string(probe.computeBaeCandidate) +
+                " compute_boundary_values_before=" +
+                std::to_string(probe.boundaryValuesBefore) +
+                " compute_boundary_values_candidate=" +
+                std::to_string(probe.boundaryValuesCandidate) +
+                " swap_dag_edges_before=" +
+                std::to_string(materializePerf.postDpRefineBeforeDagEdges) +
+                " swap_dag_edges_candidate=" +
+                std::to_string(probe.dagEdgesCandidate) +
+                " segment_count_valid=" +
+                std::string(probe.segmentCountValid ? "true" : "false") +
+                " segment_ops_valid=" +
+                std::string(probe.segmentOpsValid ? "true" : "false") +
+                " segment_shape_valid=" +
+                std::string(probe.segmentShapeValid ? "true" : "false") +
+                " dag_support_valid=" +
+                std::string(probe.dagSupportValid ? "true" : "false") +
+                " topo_valid=" +
+                std::string(probe.topoValid ? "true" : "false") +
+                " projected_actual_valid=" +
+                std::string(probe.projectedActualValid ? "true" : "false") +
+                " valid=" + std::string(probe.valid ? "true" : "false"));
         }
         logInfo("activity-schedule compute-node coarsen detail: enabled=" +
                 std::string(options_.enableCoarsen ? "true" : "false") +

@@ -59,7 +59,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-split-oversize-compute-nodes` | `false` | materialize 阶段拆分超过上限的单个 compute node |
 | `-declared-value-compute-node-boundary` | `false` | 把带 declared symbol 的 value 作为 compute-node 截断边界 |
 | `-kahn-level-pack-policy` | `off` | same-Kahn-level packing policy：`off/strict/bae-budget/balanced` |
-| `-post-dp-refine-policy` | `off` | post-DP exact refinement policy：`off/strict/bae-budget/balanced` |
+| `-post-dp-refine-policy` | `off` | post-DP exact refinement policy：`off/strict/bae-budget/balanced/swap-probe` |
 | `-export-compute-dag` | 无 | 导出 `wolvrix.compute-op-dag.v1` compute op DAG JSON |
 
 ## Plain 调度路径
@@ -137,6 +137,11 @@ incoming_boundary_activation_edges + 1
 ```
 
 同成本时偏向更长 segment。
+
+`post-dp-refine-policy=swap-probe` 只读枚举因目标 segment 满载而受阻的 equal-load
+cluster swap。候选必须保持 pair topology 和 exact quotient DAG support key，且降低 exact
+compute BAE；预算内的无冲突候选只应用到内部副本以复算指标和验证约束，不修改导出的
+activity schedule。
 
 ## Session 输出
 

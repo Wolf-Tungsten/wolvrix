@@ -2587,6 +2587,527 @@ int main()
     }
 
     {
+        currentCase = "post-DP equal-load swap probe";
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId p;
+            wolvrix::lib::grh::OperationId q;
+            wolvrix::lib::grh::OperationId x;
+            wolvrix::lib::grh::OperationId t;
+            wolvrix::lib::grh::OperationId z;
+            wolvrix::lib::grh::OperationId filler;
+        };
+        const auto buildPositive = [](wolvrix::lib::grh::Design &design,
+                                      const std::string &name)
+        {
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            const auto c = makeValue(graph, "c", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            graph.bindInputPort("c", c);
+            const auto makeNot = [&](const std::string &opName,
+                                     wolvrix::lib::grh::ValueId operand)
+            {
+                const auto value = makeValue(graph, opName + "_value", 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol(opName));
+                graph.addOperand(op, operand);
+                graph.addResult(op, value);
+                graph.bindOutputPort(opName, value);
+                return std::pair{op, value};
+            };
+            const auto [p, pValue] = makeNot("p", a);
+            const auto [q, qValue] = makeNot("q", b);
+            const auto [x, xValue] = makeNot("x", qValue);
+            const auto [t, tValue] = makeNot("t", pValue);
+            const auto [z, zValue] = makeNot("z", qValue);
+            const auto [filler, fillerValue] = makeNot("filler", c);
+            return FixtureOps{p, q, x, t, z, filler};
+        };
+        const auto buildSupportChange = [](wolvrix::lib::grh::Design &design,
+                                           const std::string &name)
+        {
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            const auto c = makeValue(graph, "c", 8);
+            const auto d = makeValue(graph, "d", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            graph.bindInputPort("c", c);
+            graph.bindInputPort("d", d);
+            const auto makeNot = [&](const std::string &opName,
+                                     wolvrix::lib::grh::ValueId operand)
+            {
+                const auto value = makeValue(graph, opName + "_value", 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol(opName));
+                graph.addOperand(op, operand);
+                graph.addResult(op, value);
+                graph.bindOutputPort(opName, value);
+                return std::pair{op, value};
+            };
+            const auto [p, pValue] = makeNot("p", a);
+            const auto [q, qValue] = makeNot("q", b);
+            const auto [r, rValue] = makeNot("r", c);
+            makeNot("filler", d);
+            makeNot("t", pValue);
+            makeNot("u", rValue);
+        };
+        struct SupportKeyOps
+        {
+            wolvrix::lib::grh::OperationId lhs;
+            wolvrix::lib::grh::OperationId rootA;
+            wolvrix::lib::grh::OperationId fillerA;
+            wolvrix::lib::grh::OperationId rhs;
+            wolvrix::lib::grh::OperationId targetB;
+            wolvrix::lib::grh::OperationId fillerB;
+            wolvrix::lib::grh::OperationId targetC;
+            wolvrix::lib::grh::OperationId fillerC1;
+            wolvrix::lib::grh::OperationId fillerC2;
+        };
+        const auto buildSupportKeyChange = [](wolvrix::lib::grh::Design &design,
+                                              const std::string &name)
+        {
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+            const auto a = makeValue(graph, "a", 8);
+            const auto b = makeValue(graph, "b", 8);
+            const auto c = makeValue(graph, "c", 8);
+            const auto d = makeValue(graph, "d", 8);
+            const auto e = makeValue(graph, "e", 8);
+            const auto f = makeValue(graph, "f", 8);
+            const auto g = makeValue(graph, "g", 8);
+            graph.bindInputPort("a", a);
+            graph.bindInputPort("b", b);
+            graph.bindInputPort("c", c);
+            graph.bindInputPort("d", d);
+            graph.bindInputPort("e", e);
+            graph.bindInputPort("f", f);
+            graph.bindInputPort("g", g);
+            const auto makeNot = [&](const std::string &opName,
+                                     wolvrix::lib::grh::ValueId operand)
+            {
+                const auto value = makeValue(graph, opName + "_value", 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kNot,
+                    graph.internSymbol(opName));
+                graph.addOperand(op, operand);
+                graph.addResult(op, value);
+                graph.bindOutputPort(opName, value);
+                return std::pair{op, value};
+            };
+            const auto makeXor = [&](const std::string &opName,
+                                     wolvrix::lib::grh::ValueId lhs,
+                                     wolvrix::lib::grh::ValueId rhs)
+            {
+                const auto value = makeValue(graph, opName + "_value", 8);
+                const auto op = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kXor,
+                    graph.internSymbol(opName));
+                graph.addOperand(op, lhs);
+                graph.addOperand(op, rhs);
+                graph.addResult(op, value);
+                graph.bindOutputPort(opName, value);
+                return std::pair{op, value};
+            };
+            const auto [lhs, lhsValue] = makeNot("lhs", a);
+            const auto [rootA, rootAValue] = makeNot("root_a", b);
+            const auto [fillerA, fillerAValue] = makeNot("filler_a", c);
+            const auto [rhs, rhsValue] = makeNot("rhs", d);
+            const auto [targetB, targetBValue] =
+                makeXor("target_b", lhsValue, rhsValue);
+            const auto [fillerB, fillerBValue] = makeNot("filler_b", e);
+            const auto [targetC, targetCValue] =
+                makeXor("target_c", rhsValue, fillerAValue);
+            const auto [fillerC1, fillerC1Value] = makeNot("filler_c1", f);
+            const auto [fillerC2, fillerC2Value] = makeNot("filler_c2", g);
+            return SupportKeyOps{lhs,
+                                 rootA,
+                                 fillerA,
+                                 rhs,
+                                 targetB,
+                                 fillerB,
+                                 targetC,
+                                 fillerC1,
+                                 fillerC2};
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   SessionStore &session,
+                                   const std::string &name,
+                                   const std::string &policy,
+                                   std::size_t maxMoves,
+                                   std::size_t movedOpPpm,
+                                   std::string *log,
+                                   std::size_t maxNodeOps,
+                                   bool enableCoarsen,
+                                   std::size_t maxRounds)
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 3;
+            options.maxOpInComputeNode = maxNodeOps;
+            options.postDpRefinePolicy = policy;
+            options.postDpRefineMaxRounds = maxRounds;
+            options.postDpRefineMaxMoves = maxMoves;
+            options.postDpRefineMaxMovedOpPpm = movedOpPpm;
+            options.enableCoarsen = enableCoarsen;
+            options.enableChainMerge = !enableCoarsen;
+            PassManager manager;
+            manager.options().session = &session;
+            if (log != nullptr)
+            {
+                manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+                manager.options().logSink =
+                    [log](wolvrix::lib::LogLevel,
+                          std::string_view,
+                          std::string_view message)
+                    {
+                        log->append(message);
+                        log->push_back('\n');
+                    };
+            }
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return std::pair{result, diags.hasError()};
+        };
+
+        constexpr std::string_view kPositiveName = "post_dp_equal_load_swap_probe";
+        wolvrix::lib::grh::Design offDesign;
+        const FixtureOps offOps = buildPositive(offDesign, std::string(kPositiveName));
+        SessionStore offSession;
+        const auto [offResult, offError] = runFixture(offDesign,
+                                                      offSession,
+                                                      std::string(kPositiveName),
+                                                      "off",
+                                                      16,
+                                                      1000000,
+                                                      nullptr,
+                                                      1,
+                                                      false,
+                                                      1);
+        if (!offResult.success || offError)
+        {
+            return fail("Expected equal-load swap explicit-off fixture to succeed");
+        }
+        const auto offSchedule = loadSchedule(offSession, std::string(kPositiveName));
+        const auto offOwner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*offSchedule.opToSupernode)[op.index - 1];
+        };
+        if (offOwner(offOps.p) != offOwner(offOps.q) ||
+            offOwner(offOps.p) != offOwner(offOps.filler) ||
+            offOwner(offOps.p) == offOwner(offOps.t) ||
+            offOwner(offOps.t) != offOwner(offOps.x) ||
+            offOwner(offOps.t) != offOwner(offOps.z))
+        {
+            return fail("Expected equal-load swap baseline partition {p,q,filler}/{x,t,z}: p=" +
+                        std::to_string(offOwner(offOps.p)) +
+                        " q=" + std::to_string(offOwner(offOps.q)) +
+                        " x=" + std::to_string(offOwner(offOps.x)) +
+                        " t=" + std::to_string(offOwner(offOps.t)) +
+                        " z=" + std::to_string(offOwner(offOps.z)) +
+                        " filler=" + std::to_string(offOwner(offOps.filler)));
+        }
+
+        wolvrix::lib::grh::Design probeDesign;
+        buildPositive(probeDesign, std::string(kPositiveName));
+        SessionStore probeSession;
+        std::string probeLog;
+        const auto [probeResult, probeError] = runFixture(probeDesign,
+                                                          probeSession,
+                                                          std::string(kPositiveName),
+                                                          "swap-probe",
+                                                          16,
+                                                          1000000,
+                                                          &probeLog,
+                                                          1,
+                                                          false,
+                                                          1);
+        wolvrix::lib::grh::Design repeatDesign;
+        buildPositive(repeatDesign, std::string(kPositiveName));
+        SessionStore repeatSession;
+        std::string repeatLog;
+        const auto [repeatResult, repeatError] = runFixture(repeatDesign,
+                                                            repeatSession,
+                                                            std::string(kPositiveName),
+                                                            "swap-probe",
+                                                            16,
+                                                            1000000,
+                                                            &repeatLog,
+                                                            1,
+                                                            false,
+                                                            1);
+        const auto probeSchedule = loadSchedule(probeSession, std::string(kPositiveName));
+        if (!probeResult.success || probeError || !repeatResult.success || repeatError ||
+            !schedulesEqual(offSchedule, probeSchedule) ||
+            !schedulesEqual(probeSchedule,
+                            loadSchedule(repeatSession, std::string(kPositiveName))) ||
+            parseStatField(probeLog, "capacity_blocked_seeds") == 0 ||
+            parseStatField(probeLog, "raw_eligible_swaps") == 0 ||
+            parseStatField(repeatLog, "raw_eligible_swaps") !=
+                parseStatField(probeLog, "raw_eligible_swaps") ||
+            parseStatField(probeLog, "selected_swaps") != 1 ||
+            parseStatField(repeatLog, "selected_swaps") !=
+                parseStatField(probeLog, "selected_swaps") ||
+            parseStatField(probeLog, "selected_moved_clusters") != 2 ||
+            parseStatField(probeLog, "swap_rejected_topo") == 0 ||
+            parseStatField(probeLog, "rejected_conflict") == 0 ||
+            parseStatField(probeLog, "projected_bae_gain") == 0 ||
+            parseStatField(probeLog, "actual_bae_gain") !=
+                parseStatField(probeLog, "projected_bae_gain") ||
+            parseStatField(repeatLog, "projected_bae_gain") !=
+                parseStatField(probeLog, "projected_bae_gain") ||
+            probeLog.find(" segment_count_valid=true") == std::string::npos ||
+            probeLog.find(" segment_ops_valid=true") == std::string::npos ||
+            probeLog.find(" dag_support_valid=true") == std::string::npos ||
+            probeLog.find(" projected_actual_valid=true") == std::string::npos ||
+            probeLog.find(" valid=true") == std::string::npos)
+        {
+            return fail("Expected deterministic no-mutation equal-load swap probe: " + probeLog);
+        }
+
+        wolvrix::lib::grh::Design budgetDesign;
+        buildPositive(budgetDesign, std::string(kPositiveName));
+        SessionStore budgetSession;
+        std::string budgetLog;
+        const auto [budgetResult, budgetError] = runFixture(budgetDesign,
+                                                            budgetSession,
+                                                            std::string(kPositiveName),
+                                                            "swap-probe",
+                                                            1,
+                                                            1000000,
+                                                            &budgetLog,
+                                                            1,
+                                                            false,
+                                                            1);
+        if (!budgetResult.success || budgetError ||
+            !schedulesEqual(offSchedule,
+                            loadSchedule(budgetSession, std::string(kPositiveName))) ||
+            parseStatField(budgetLog, "raw_eligible_swaps") == 0 ||
+            parseStatField(budgetLog, "selected_swaps") != 0 ||
+            parseStatField(budgetLog, "rejected_budget") == 0)
+        {
+            return fail("Expected equal-load swap moved-cluster budget rejection: " + budgetLog);
+        }
+
+        wolvrix::lib::grh::Design ppmBudgetDesign;
+        buildPositive(ppmBudgetDesign, std::string(kPositiveName));
+        SessionStore ppmBudgetSession;
+        std::string ppmBudgetLog;
+        const auto [ppmBudgetResult, ppmBudgetError] = runFixture(
+            ppmBudgetDesign,
+            ppmBudgetSession,
+            std::string(kPositiveName),
+            "swap-probe",
+            16,
+            0,
+            &ppmBudgetLog,
+            1,
+            false,
+            1);
+        if (!ppmBudgetResult.success || ppmBudgetError ||
+            !schedulesEqual(offSchedule,
+                            loadSchedule(ppmBudgetSession, std::string(kPositiveName))) ||
+            parseStatField(ppmBudgetLog, "raw_eligible_swaps") == 0 ||
+            parseStatField(ppmBudgetLog, "selected_swaps") != 0 ||
+            parseStatField(ppmBudgetLog, "selected_moved_ops") != 0 ||
+            parseStatField(ppmBudgetLog, "rejected_budget") == 0)
+        {
+            return fail("Expected equal-load swap moved-op PPM budget rejection: " +
+                        ppmBudgetLog);
+        }
+
+        wolvrix::lib::grh::Design noRoundsDesign;
+        buildPositive(noRoundsDesign, std::string(kPositiveName));
+        SessionStore noRoundsSession;
+        std::string noRoundsLog;
+        const auto [noRoundsResult, noRoundsError] = runFixture(
+            noRoundsDesign,
+            noRoundsSession,
+            std::string(kPositiveName),
+            "swap-probe",
+            16,
+            1000000,
+            &noRoundsLog,
+            1,
+            false,
+            0);
+        if (!noRoundsResult.success || noRoundsError ||
+            !schedulesEqual(offSchedule,
+                            loadSchedule(noRoundsSession, std::string(kPositiveName))) ||
+            parseStatField(noRoundsLog, "rounds") != 0 ||
+            parseStatField(noRoundsLog, "capacity_blocked_seeds") != 0 ||
+            parseStatField(noRoundsLog, "enumerated_rhs") != 0 ||
+            parseStatField(noRoundsLog, "raw_eligible_swaps") != 0 ||
+            parseStatField(noRoundsLog, "selected_swaps") != 0)
+        {
+            return fail("Expected zero-round swap probe to skip candidate scanning: " +
+                        noRoundsLog);
+        }
+
+        constexpr std::string_view kSupportName = "post_dp_swap_probe_support_change";
+        wolvrix::lib::grh::Design supportDesign;
+        buildSupportChange(supportDesign, std::string(kSupportName));
+        SessionStore supportSession;
+        std::string supportLog;
+        const auto [supportResult, supportError] = runFixture(supportDesign,
+                                                              supportSession,
+                                                              std::string(kSupportName),
+                                                              "swap-probe",
+                                                              16,
+                                                              1000000,
+                                                              &supportLog,
+                                                              1,
+                                                              false,
+                                                              1);
+        if (!supportResult.success || supportError ||
+            parseStatField(supportLog, "rejected_dag_support") == 0 ||
+            parseStatField(supportLog, "rejected_dag_edge_count") == 0 ||
+            parseStatField(supportLog, "rejected_dag_support_key") != 0 ||
+            parseStatField(supportLog, "selected_swaps") != 0)
+        {
+            return fail("Expected equal-load swap DAG-edge-count rejection: " + supportLog);
+        }
+
+        constexpr std::string_view kSupportKeyName =
+            "post_dp_swap_probe_support_key_change";
+        wolvrix::lib::grh::Design supportKeyOffDesign;
+        const SupportKeyOps supportKeyOps =
+            buildSupportKeyChange(supportKeyOffDesign, std::string(kSupportKeyName));
+        SessionStore supportKeyOffSession;
+        const auto [supportKeyOffResult, supportKeyOffError] = runFixture(
+            supportKeyOffDesign,
+            supportKeyOffSession,
+            std::string(kSupportKeyName),
+            "off",
+            0,
+            1000000,
+            nullptr,
+            1,
+            false,
+            1);
+        if (!supportKeyOffResult.success || supportKeyOffError)
+        {
+            return fail("Expected DAG-support-key explicit-off fixture to succeed");
+        }
+        const auto supportKeyOffSchedule =
+            loadSchedule(supportKeyOffSession, std::string(kSupportKeyName));
+        const auto supportKeyOwner = [&](wolvrix::lib::grh::OperationId op)
+        {
+            return (*supportKeyOffSchedule.opToSupernode)[op.index - 1];
+        };
+        if (supportKeyOwner(supportKeyOps.fillerA) !=
+                supportKeyOwner(supportKeyOps.fillerB) ||
+            supportKeyOwner(supportKeyOps.fillerA) !=
+                supportKeyOwner(supportKeyOps.fillerC1) ||
+            supportKeyOwner(supportKeyOps.fillerA) == supportKeyOwner(supportKeyOps.lhs) ||
+            supportKeyOwner(supportKeyOps.lhs) != supportKeyOwner(supportKeyOps.rhs) ||
+            supportKeyOwner(supportKeyOps.lhs) !=
+                supportKeyOwner(supportKeyOps.fillerC2) ||
+            supportKeyOwner(supportKeyOps.lhs) == supportKeyOwner(supportKeyOps.rootA) ||
+            supportKeyOwner(supportKeyOps.rootA) !=
+                supportKeyOwner(supportKeyOps.targetB) ||
+            supportKeyOwner(supportKeyOps.rootA) !=
+                supportKeyOwner(supportKeyOps.targetC))
+        {
+            return fail("Expected DAG-support-key baseline partition A/B/C: lhs=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.lhs)) +
+                        " root_a=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.rootA)) +
+                        " filler_a=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.fillerA)) +
+                        " rhs=" + std::to_string(supportKeyOwner(supportKeyOps.rhs)) +
+                        " target_b=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.targetB)) +
+                        " filler_b=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.fillerB)) +
+                        " target_c=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.targetC)) +
+                        " filler_c1=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.fillerC1)) +
+                        " filler_c2=" +
+                        std::to_string(supportKeyOwner(supportKeyOps.fillerC2)));
+        }
+
+        wolvrix::lib::grh::Design supportKeyDesign;
+        buildSupportKeyChange(supportKeyDesign, std::string(kSupportKeyName));
+        SessionStore supportKeySession;
+        std::string supportKeyLog;
+        const auto [supportKeyResult, supportKeyError] = runFixture(
+            supportKeyDesign,
+            supportKeySession,
+            std::string(kSupportKeyName),
+            "swap-probe",
+            0,
+            1000000,
+            &supportKeyLog,
+            1,
+            false,
+            1);
+        if (!supportKeyResult.success || supportKeyError ||
+            !schedulesEqual(supportKeyOffSchedule,
+                            loadSchedule(supportKeySession,
+                                         std::string(kSupportKeyName))) ||
+            parseStatField(supportKeyLog, "rejected_dag_support_key") == 0 ||
+            parseStatField(supportKeyLog, "swap_dag_edges_before") != 2 ||
+            parseStatField(supportKeyLog, "swap_dag_edges_candidate") != 2 ||
+            parseStatField(supportKeyLog, "selected_swaps") != 0)
+        {
+            return fail("Expected same-edge-count DAG-support-key rejection: " +
+                        supportKeyLog);
+        }
+
+        constexpr std::string_view kUnequalName = "post_dp_swap_probe_unequal_load";
+        wolvrix::lib::grh::Design unequalDesign;
+        buildPositive(unequalDesign, std::string(kUnequalName));
+        SessionStore unequalSession;
+        std::string unequalLog;
+        const auto [unequalResult, unequalError] = runFixture(
+            unequalDesign,
+            unequalSession,
+            std::string(kUnequalName),
+            "swap-probe",
+            16,
+            1000000,
+            &unequalLog,
+            2,
+            true,
+            1);
+        if (!unequalResult.success || unequalError ||
+            parseStatField(unequalLog, "rejected_equal_load") == 0)
+        {
+            return fail("Expected unequal-load swap rejection: " + unequalLog);
+        }
+
+        wolvrix::lib::grh::Design invalidDesign;
+        buildPositive(invalidDesign, "post_dp_swap_probe_invalid_policy");
+        SessionStore invalidSession;
+        const auto [invalidResult, invalidError] = runFixture(
+            invalidDesign,
+            invalidSession,
+            "post_dp_swap_probe_invalid_policy",
+            "swap-probe-invalid",
+            16,
+            1000000,
+            nullptr,
+            1,
+            false,
+            1);
+        if (invalidResult.success || !invalidError)
+        {
+            return fail("Expected invalid post-DP swap policy to fail explicitly");
+        }
+    }
+
+    {
         currentCase = "local shared compute clone";
         struct FixtureOps
         {

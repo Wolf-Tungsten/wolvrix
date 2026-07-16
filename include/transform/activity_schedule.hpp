@@ -78,6 +78,8 @@ namespace wolvrix::lib::transform
 
     using ActivityScheduleSupernodeToOps = std::vector<std::vector<wolvrix::lib::grh::OperationId>>;
     using ActivityScheduleOpToSupernode = std::vector<uint32_t>;
+    using ActivityScheduleCommitLocalityGroupByOp = std::vector<uint32_t>;
+    using ActivityScheduleCommitLocalityGroupOrder = std::vector<uint32_t>;
     using ActivityScheduleDag = std::vector<std::vector<uint32_t>>;
     using ActivityScheduleValueFanout = std::vector<std::vector<uint32_t>>;
     using ActivityScheduleTopoOrder = std::vector<uint32_t>;

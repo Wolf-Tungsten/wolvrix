@@ -352,6 +352,8 @@ DP 输出的 segment 会 flatten 成 compute node 列表，再展开成 compute 
 | --- | --- |
 | `supernode_to_ops` | 每个 supernode 包含的 op。 |
 | `op_to_supernode` | 每个 op 所在 supernode。 |
+| `commit_locality_group_by_op` | 每个 commit op 的 canonical pre-merge locality group；非 commit op 为 invalid。 |
+| `commit_locality_group_order` | `level-id` 下 canonical commit locality group 的伪 baseline topo 顺序。 |
 | `dag` | supernode DAG。 |
 | `supernode_kind` | compute 或 commit。 |
 | `compute_nodes_by_supernode` | compute supernode 由哪些 compute node 展开得到；commit 对应空列表。 |
@@ -379,6 +381,32 @@ Emitter 读取静态 schedule 后，会构造运行时模型。下面名字来�
 | `inputHeadSupernodesByValue` | compute supernode 的 input operand scan | 外部输入变化后，要初始激活哪些 compute active bit。 |
 | `stateHeadSupernodesBySymbol` | `state_read_supernodes` | visible state 变化后，要激活哪些 reader compute active bit。 |
 | `commitInputValues` | commit supernode 的 input operand scan | 外部输入只喂给 commit 时，也要启动一轮 commit scan。 |
+
+### Materialized value slot locality
+
+Emitter 保持 state storage 的稳定布局，并按关联 state anchor、首次读取顺序、读取次数
+和 graph order 排列 materialized value 的 typed slots。Compute supernode 继续以节点内
+register/latch read/write state 的最大 slot offset 作为 anchor。
+
+Commit operand 的 canonical 路径要求同时存在完整有效的
+`commit_locality_group_by_op` 和 `commit_locality_group_order`。Emitter 先只按实际
+schedule 扫描 compute reads，再按 canonical group topo order 扫描一次 commit ops；
+组内保持实际 schedule 的稳定 op 顺序。每个 group 同时聚合其 register/latch write
+target 的最大 state offset，并把该 anchor 应用于组内 operand。这样
+`firstReadSequence`、`totalReads` 和 state anchor 都不再依赖 high-cap merged commit
+supernode 在实际 topo 中的位置。
+
+默认 4096 cap 下 canonical group 和 order 对应实际 commit supernode，因此生成布局
+与旧 supernode-anchor 路径相同；guard-event high cap 合并多个完整 baseline cluster
+时，各子组仍使用自己的 baseline anchor 与 baseline topo 顺序，execution partition
+不会引起全局 value-slot 改号。
+
+这两个 session key 是成对的可选兼容输入。任一 key 缺失，map 未覆盖全部 graph op、
+commit group 不稠密，order 不是 group 的完整排列，或 commit op 未在实际 schedule 中
+恰好出现一次时，emitter 对整张 value-slot 排列表回退到原有 schedule scan 和 commit
+supernode-level anchor，不混用部分 metadata。当前 transform 仅在
+`final_topo_policy=level-id` 时导出非空 canonical order；其他 topo policy 因此使用
+legacy 路径。
 
 `value_fanout` 中指向 commit supernode 的 target 不进入 `boundaryFanoutByValue`。
 Commit supernode 每轮由 commit phase 扫描，不通过 boundary value activation 决定是否扫描。

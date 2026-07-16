@@ -616,6 +616,7 @@ namespace wolvrix::lib::transform
         struct SinkPartition
         {
             std::vector<std::vector<uint32_t>> clusters;
+            ActivityScheduleCommitLocalityGroupByOp localityGroupByOp;
         };
 
         struct ComputeNodeMaterializePerfStats
@@ -1248,10 +1249,31 @@ namespace wolvrix::lib::transform
                                                        bool groupByGuard)
         {
             SinkPartition partition;
+            partition.localityGroupByOp.assign(opData.maxOpIndex,
+                                               kInvalidActivitySupernodeId);
             if (topoPositions.empty())
             {
                 return partition;
             }
+
+            uint32_t nextLocalityGroup = 0;
+            const auto assignLocalityGroup = [&](const std::vector<uint32_t> &cluster)
+            {
+                const uint32_t group = nextLocalityGroup++;
+                for (const uint32_t topoPos : cluster)
+                {
+                    if (topoPos >= opData.topoOps.size())
+                    {
+                        continue;
+                    }
+                    const auto opId = opData.topoOps[topoPos];
+                    if (opId.index == 0 || opId.index > partition.localityGroupByOp.size())
+                    {
+                        continue;
+                    }
+                    partition.localityGroupByOp[opId.index - 1] = group;
+                }
+            };
 
             const std::size_t chunkSize = maxSize == 0 ? topoPositions.size() : maxSize;
 
@@ -1342,6 +1364,11 @@ namespace wolvrix::lib::transform
                     }
                     flushPositions();
 
+                    for (const auto &cluster : baselineClusters)
+                    {
+                        assignLocalityGroup(cluster);
+                    }
+
                     if (maxSize == 0 || maxSize <= kMaxGuardEventMergeOps)
                     {
                         for (auto &cluster : baselineClusters)
@@ -1416,6 +1443,7 @@ namespace wolvrix::lib::transform
                     {
                         return;
                     }
+                    assignLocalityGroup(cluster);
                     partition.clusters.push_back(std::move(cluster));
                     cluster = {};
                 };
@@ -1424,6 +1452,7 @@ namespace wolvrix::lib::transform
                     if (unit.size() > chunkSize)
                     {
                         flushCluster();
+                        assignLocalityGroup(unit);
                         partition.clusters.push_back(std::move(unit));
                         continue;
                     }
@@ -1500,6 +1529,7 @@ namespace wolvrix::lib::transform
         {
             std::vector<ComputeNode> computeNodes;
             std::vector<CommitNode> commitNodes;
+            ActivityScheduleCommitLocalityGroupByOp commitLocalityGroupByOp;
             std::vector<std::vector<uint32_t>> computeDag;
             std::vector<uint32_t> computeTopoOrder;
             std::vector<uint32_t> computeNodeOfOp;
@@ -3237,6 +3267,162 @@ namespace wolvrix::lib::transform
                 out.insert(out.end(), ordered.begin(), ordered.end());
             }
             return out;
+        }
+
+        bool buildCommitLocalityGroupOrder(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleBuild &build,
+            const ActivityScheduleCommitLocalityGroupByOp &groupByOp,
+            std::string_view finalTopoPolicy,
+            ActivityScheduleCommitLocalityGroupOrder &groupOrder,
+            std::string &error)
+        {
+            groupOrder.clear();
+            if (finalTopoPolicy != "level-id")
+            {
+                return true;
+            }
+            std::size_t computeSupernodes = 0;
+            while (computeSupernodes < build.supernodeKinds.size() &&
+                   build.supernodeKinds[computeSupernodes] ==
+                       ActivityScheduleSupernodeKind::Compute)
+            {
+                ++computeSupernodes;
+            }
+            for (std::size_t supernode = computeSupernodes;
+                 supernode < build.supernodeKinds.size();
+                 ++supernode)
+            {
+                if (build.supernodeKinds[supernode] !=
+                    ActivityScheduleSupernodeKind::Commit)
+                {
+                    error = "activity-schedule commit locality order requires compute-before-commit storage order";
+                    return false;
+                }
+            }
+
+            std::size_t commitOps = 0;
+            uint32_t maxGroup = 0;
+            bool haveGroup = false;
+            for (std::size_t supernode = computeSupernodes;
+                 supernode < build.supernodeToOps.size();
+                 ++supernode)
+            {
+                for (const auto opId : build.supernodeToOps[supernode])
+                {
+                    ++commitOps;
+                    if (opId.index == 0 || opId.index > groupByOp.size())
+                    {
+                        error = "activity-schedule commit locality order map does not cover commit op=" +
+                                std::to_string(opId.index);
+                        return false;
+                    }
+                    const uint32_t group = groupByOp[opId.index - 1];
+                    if (group == kInvalidActivitySupernodeId)
+                    {
+                        error = "activity-schedule commit locality order found an ungrouped commit op=" +
+                                std::to_string(opId.index);
+                        return false;
+                    }
+                    maxGroup = haveGroup ? std::max(maxGroup, group) : group;
+                    haveGroup = true;
+                }
+            }
+            const std::size_t groupCount = haveGroup ? static_cast<std::size_t>(maxGroup) + 1 : 0;
+            if (groupCount > commitOps)
+            {
+                error = "activity-schedule commit locality order group id is out of range";
+                return false;
+            }
+            std::vector<uint8_t> seenGroups(groupCount, 0U);
+            for (std::size_t supernode = computeSupernodes;
+                 supernode < build.supernodeToOps.size();
+                 ++supernode)
+            {
+                for (const auto opId : build.supernodeToOps[supernode])
+                {
+                    const uint32_t group = groupByOp[opId.index - 1];
+                    if (group >= seenGroups.size())
+                    {
+                        error = "activity-schedule commit locality order group id is out of range";
+                        return false;
+                    }
+                    seenGroups[group] = 1U;
+                }
+            }
+            if (std::find(seenGroups.begin(), seenGroups.end(), uint8_t{0}) !=
+                seenGroups.end())
+            {
+                error = "activity-schedule commit locality order group ids are not dense";
+                return false;
+            }
+
+            std::vector<std::vector<uint32_t>> baselineDag(computeSupernodes + groupCount);
+            for (uint32_t from = 0; from < computeSupernodes; ++from)
+            {
+                for (const uint32_t to : build.dag[from])
+                {
+                    if (to < computeSupernodes)
+                    {
+                        baselineDag[from].push_back(to);
+                    }
+                }
+            }
+            for (std::size_t supernode = computeSupernodes;
+                 supernode < build.supernodeToOps.size();
+                 ++supernode)
+            {
+                for (const auto opId : build.supernodeToOps[supernode])
+                {
+                    const uint32_t group = groupByOp[opId.index - 1];
+                    const uint32_t groupNode =
+                        static_cast<uint32_t>(computeSupernodes + group);
+                    for (const auto operand : graph.opOperands(opId))
+                    {
+                        const auto defOp = graph.valueDef(operand);
+                        if (!defOp.valid() || defOp.index == 0 ||
+                            defOp.index > build.opToSupernode.size())
+                        {
+                            continue;
+                        }
+                        const uint32_t from = build.opToSupernode[defOp.index - 1];
+                        if (from < computeSupernodes)
+                        {
+                            baselineDag[from].push_back(groupNode);
+                        }
+                    }
+                }
+            }
+            for (auto &succs : baselineDag)
+            {
+                std::sort(succs.begin(), succs.end());
+                succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+            }
+
+            try
+            {
+                const auto baselineTopo = topoOrderForDag(baselineDag);
+                for (const uint32_t node : baselineTopo)
+                {
+                    if (node >= computeSupernodes)
+                    {
+                        groupOrder.push_back(
+                            static_cast<uint32_t>(node - computeSupernodes));
+                    }
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                error = std::string("activity-schedule commit locality order topo failed: ") +
+                        ex.what();
+                return false;
+            }
+            if (groupOrder.size() != groupCount)
+            {
+                error = "activity-schedule commit locality order topo lost groups";
+                return false;
+            }
+            return true;
         }
 
         std::vector<std::size_t> minOpIndexBySupernode(const ActivityScheduleBuild &build)
@@ -7511,6 +7697,7 @@ namespace wolvrix::lib::transform
                                                  maxCommitOps,
                                                  &canonicalValues,
                                                  options.commitGuardEventBuckets);
+            out.commitLocalityGroupByOp = std::move(sinkPartition.localityGroupByOp);
             if (fixedCommitPartition != nullptr)
             {
                 using wolvrix::lib::grh::OperationId;
@@ -12303,6 +12490,20 @@ namespace wolvrix::lib::transform
                     formatTopCounts(evaluation.selectedByMaxWidth, 32));
         }
 
+        ActivityScheduleCommitLocalityGroupOrder commitLocalityGroupOrder;
+        std::string commitLocalityOrderError;
+        if (!buildCommitLocalityGroupOrder(*graph,
+                                           build,
+                                           rewrite.commitLocalityGroupByOp,
+                                           options_.finalTopoPolicy,
+                                           commitLocalityGroupOrder,
+                                           commitLocalityOrderError))
+        {
+            error(*graph, commitLocalityOrderError);
+            result.failed = true;
+            return result;
+        }
+
         const std::string keyPrefix = options_.path + ".activity_schedule.";
         const auto exportStart = std::chrono::steady_clock::now();
         logInfo("activity-schedule progress: export_session start");
@@ -12312,6 +12513,12 @@ namespace wolvrix::lib::transform
         setSessionValue(keyPrefix + "op_to_supernode",
                         build.opToSupernode,
                         "activity-schedule.op-to-supernode");
+        setSessionValue(keyPrefix + "commit_locality_group_by_op",
+                        rewrite.commitLocalityGroupByOp,
+                        "activity-schedule.commit-locality-group-by-op");
+        setSessionValue(keyPrefix + "commit_locality_group_order",
+                        commitLocalityGroupOrder,
+                        "activity-schedule.commit-locality-group-order");
         setSessionValue(keyPrefix + "dag", build.dag, "activity-schedule.dag");
         setSessionValue(keyPrefix + "supernode_kind",
                         build.supernodeKinds,

@@ -78,6 +78,8 @@ namespace
     {
         const ActivityScheduleSupernodeToOps *supernodeToOps = nullptr;
         const ActivityScheduleOpToSupernode *opToSupernode = nullptr;
+        const ActivityScheduleCommitLocalityGroupByOp *commitLocalityGroupByOp = nullptr;
+        const ActivityScheduleCommitLocalityGroupOrder *commitLocalityGroupOrder = nullptr;
         const ActivityScheduleDag *dag = nullptr;
         const ActivityScheduleValueFanout *valueFanout = nullptr;
         const ActivityScheduleTopoOrder *topoOrder = nullptr;
@@ -93,6 +95,12 @@ namespace
         return ScheduleView{
             getSessionValue<ActivityScheduleSupernodeToOps>(session, prefix + "supernode_to_ops"),
             getSessionValue<ActivityScheduleOpToSupernode>(session, prefix + "op_to_supernode"),
+            getSessionValue<ActivityScheduleCommitLocalityGroupByOp>(
+                session,
+                prefix + "commit_locality_group_by_op"),
+            getSessionValue<ActivityScheduleCommitLocalityGroupOrder>(
+                session,
+                prefix + "commit_locality_group_order"),
             getSessionValue<ActivityScheduleDag>(session, prefix + "dag"),
             getSessionValue<ActivityScheduleValueFanout>(session, prefix + "value_fanout"),
             getSessionValue<ActivityScheduleTopoOrder>(session, prefix + "topo_order"),
@@ -107,6 +115,8 @@ namespace
     {
         if (lhs.supernodeToOps == nullptr || rhs.supernodeToOps == nullptr ||
             lhs.opToSupernode == nullptr || rhs.opToSupernode == nullptr ||
+            lhs.commitLocalityGroupByOp == nullptr || rhs.commitLocalityGroupByOp == nullptr ||
+            lhs.commitLocalityGroupOrder == nullptr || rhs.commitLocalityGroupOrder == nullptr ||
             lhs.dag == nullptr || rhs.dag == nullptr ||
             lhs.valueFanout == nullptr || rhs.valueFanout == nullptr ||
             lhs.topoOrder == nullptr || rhs.topoOrder == nullptr ||
@@ -119,6 +129,8 @@ namespace
         }
         return *lhs.supernodeToOps == *rhs.supernodeToOps &&
                *lhs.opToSupernode == *rhs.opToSupernode &&
+               *lhs.commitLocalityGroupByOp == *rhs.commitLocalityGroupByOp &&
+               *lhs.commitLocalityGroupOrder == *rhs.commitLocalityGroupOrder &&
                *lhs.dag == *rhs.dag &&
                *lhs.valueFanout == *rhs.valueFanout &&
                *lhs.topoOrder == *rhs.topoOrder &&
@@ -218,6 +230,8 @@ namespace
                                     const ScheduleView &schedule)
     {
         if (schedule.supernodeToOps == nullptr || schedule.opToSupernode == nullptr ||
+            schedule.commitLocalityGroupByOp == nullptr ||
+            schedule.commitLocalityGroupOrder == nullptr ||
             schedule.dag == nullptr || schedule.valueFanout == nullptr ||
             schedule.topoOrder == nullptr || schedule.stateReadSupernodes == nullptr ||
             schedule.supernodeKinds == nullptr || schedule.computeNodesBySupernode == nullptr ||
@@ -226,7 +240,8 @@ namespace
             return fail("Expected all activity-schedule session outputs to exist");
         }
         if (schedule.supernodeToOps->size() != schedule.supernodeKinds->size() ||
-            schedule.supernodeToOps->size() != schedule.topoOrder->size())
+            schedule.supernodeToOps->size() != schedule.topoOrder->size() ||
+            schedule.commitLocalityGroupByOp->size() != schedule.opToSupernode->size())
         {
             return fail("Expected supernode outputs to have matching sizes");
         }
@@ -241,6 +256,56 @@ namespace
                 {
                     return fail("Expected explicit supernode_kind to match contained ops");
                 }
+            }
+        }
+        std::vector<uint8_t> localityGroups(schedule.commitLocalityGroupByOp->size(), 0U);
+        std::size_t localityGroupCount = 0;
+        for (const auto opId : graph.operations())
+        {
+            if (opId.index == 0 || opId.index > schedule.commitLocalityGroupByOp->size())
+            {
+                return fail("Expected commit locality map to cover every graph operation index");
+            }
+            const uint32_t group = (*schedule.commitLocalityGroupByOp)[opId.index - 1];
+            if (!isCommitPhaseOp(graph.getOperation(opId)))
+            {
+                if (group != kInvalidActivitySupernodeId)
+                {
+                    return fail("Expected non-commit operations to have invalid locality groups");
+                }
+                continue;
+            }
+            if (group == kInvalidActivitySupernodeId || group >= localityGroups.size())
+            {
+                return fail("Expected every commit operation to have an in-range locality group");
+            }
+            if (localityGroups[group] == 0U)
+            {
+                localityGroups[group] = 1U;
+                ++localityGroupCount;
+            }
+        }
+        for (std::size_t group = 0; group < localityGroupCount; ++group)
+        {
+            if (localityGroups[group] == 0U)
+            {
+                return fail("Expected commit locality group ids to be dense and graph-global");
+            }
+        }
+        if (!schedule.commitLocalityGroupOrder->empty())
+        {
+            if (schedule.commitLocalityGroupOrder->size() != localityGroupCount)
+            {
+                return fail("Expected canonical commit locality order to cover every group");
+            }
+            std::vector<uint8_t> orderedGroups(localityGroupCount, 0U);
+            for (const uint32_t group : *schedule.commitLocalityGroupOrder)
+            {
+                if (group >= orderedGroups.size() || orderedGroups[group] != 0U)
+                {
+                    return fail("Expected canonical commit locality order to be a permutation");
+                }
+                orderedGroups[group] = 1U;
             }
         }
         return 0;
@@ -2331,6 +2396,81 @@ int main()
         {
             return fail("High commit cap changed sink membership or execution order");
         }
+        const auto localityGroupsForWrites = [](const ScheduleView &schedule,
+                                                const Fixture &fixture)
+        {
+            std::vector<uint32_t> out;
+            out.reserve(fixture.writes.size());
+            for (const auto write : fixture.writes)
+            {
+                if (write.index == 0 ||
+                    write.index > schedule.commitLocalityGroupByOp->size())
+                {
+                    return std::vector<uint32_t>{};
+                }
+                out.push_back((*schedule.commitLocalityGroupByOp)[write.index - 1]);
+            }
+            return out;
+        };
+        const auto baselineLocalityGroups =
+            localityGroupsForWrites(explicit4096Schedule, explicit4096Fixture);
+        const auto highCapLocalityGroups =
+            localityGroupsForWrites(highCapSchedule, highCapFixture);
+        if (baselineLocalityGroups.size() != kTotalWrites ||
+            baselineLocalityGroups != highCapLocalityGroups)
+        {
+            return fail("High commit cap changed canonical 4096 locality groups");
+        }
+        if (explicit4096Schedule.commitLocalityGroupOrder->empty() ||
+            *explicit4096Schedule.commitLocalityGroupOrder !=
+                *highCapSchedule.commitLocalityGroupOrder)
+        {
+            return fail("High commit cap changed canonical 4096 locality group order");
+        }
+        for (uint32_t cluster = 0; cluster < baselineOrdinalClusters.size(); ++cluster)
+        {
+            for (const uint32_t ordinal : baselineOrdinalClusters[cluster])
+            {
+                if (ordinal >= baselineLocalityGroups.size() ||
+                    baselineLocalityGroups[ordinal] != cluster)
+                {
+                    return fail("Explicit 4096 locality groups do not match commit nodes");
+                }
+            }
+        }
+        const auto commitGroupTopoOrder = [](const ScheduleView &schedule)
+        {
+            std::vector<uint32_t> out;
+            for (const uint32_t supernode : *schedule.topoOrder)
+            {
+                if ((*schedule.supernodeKinds)[supernode] !=
+                    ActivityScheduleSupernodeKind::Commit)
+                {
+                    continue;
+                }
+                const auto &ops = (*schedule.supernodeToOps)[supernode];
+                if (ops.empty())
+                {
+                    return std::vector<uint32_t>{};
+                }
+                const uint32_t group =
+                    (*schedule.commitLocalityGroupByOp)[ops.front().index - 1];
+                for (const auto opId : ops)
+                {
+                    if ((*schedule.commitLocalityGroupByOp)[opId.index - 1] != group)
+                    {
+                        return std::vector<uint32_t>{};
+                    }
+                }
+                out.push_back(group);
+            }
+            return out;
+        };
+        if (commitGroupTopoOrder(explicit4096Schedule) !=
+            *explicit4096Schedule.commitLocalityGroupOrder)
+        {
+            return fail("Explicit 4096 canonical group order did not match commit topo order");
+        }
 
         const auto packWholeClusters = [&](const std::vector<std::vector<uint32_t>> &input)
         {
@@ -2399,6 +2539,43 @@ int main()
             directHighCapClusters == expectedHighCapClusters)
         {
             return fail("High commit cap did not preserve complete 4096-baseline node boundaries");
+        }
+        for (const auto &cluster : highCapOrdinalClusters)
+        {
+            std::vector<uint32_t> groups;
+            for (const uint32_t ordinal : cluster)
+            {
+                const uint32_t group = highCapLocalityGroups[ordinal];
+                if (groups.empty() || groups.back() != group)
+                {
+                    groups.push_back(group);
+                }
+            }
+            for (std::size_t index = 1; index < groups.size(); ++index)
+            {
+                if (groups[index] != groups[index - 1] + 1)
+                {
+                    return fail("Merged commit node crossed non-contiguous locality groups");
+                }
+            }
+            for (const uint32_t group : groups)
+            {
+                const std::size_t expected =
+                    std::count(baselineLocalityGroups.begin(),
+                               baselineLocalityGroups.end(),
+                               group);
+                const std::size_t actual =
+                    std::count_if(cluster.begin(),
+                                  cluster.end(),
+                                  [&](uint32_t ordinal)
+                                  {
+                                      return highCapLocalityGroups[ordinal] == group;
+                                  });
+                if (actual != expected)
+                {
+                    return fail("Merged commit node contains a partial locality group");
+                }
+            }
         }
 
         const auto commitTargets = [](const ScheduleView &schedule,

@@ -72,6 +72,9 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 3. 如果发生 clone，pass 重新 `freeze()` 并重建 `ActivityOpData` / `opClasses`。
 4. `buildComputeNodeRewrite(...)` 先按 sink event key / guard key 构造 `commitNodes`，
    再从 commit input、output/inout 根和无 result compute op 出发构造 `computeNodes`。
+   guard-event 模式同时按实际 cap 不超过 4096 的 baseline cluster 给每个 sink op
+   分配 graph-global commit locality group；更高 cap 只合并 execution cluster，不合并
+   该 locality group。关闭 guard-event 模式时 locality group 等于直接 event chunk。
 5. 若开启 local shared compute clone，先用该 rewrite 发现 bounded 候选；true-clone
    op/value 并替换远端 consumer uses 后，重新 `freeze()`，从头重建
    `ActivityOpData` / `opClasses` / compute rewrite。baseline rewrite 的 node/ID 不复用。
@@ -149,6 +152,8 @@ activity schedule。
 
 - `<target>.activity_schedule.supernode_to_ops`
 - `<target>.activity_schedule.op_to_supernode`
+- `<target>.activity_schedule.commit_locality_group_by_op`
+- `<target>.activity_schedule.commit_locality_group_order`
 - `<target>.activity_schedule.dag`
 - `<target>.activity_schedule.supernode_kind`
 - `<target>.activity_schedule.compute_nodes_by_supernode`
@@ -158,6 +163,23 @@ activity schedule。
 - `<target>.activity_schedule.summary_stats`
 
 `summary_stats` 是 plain schedule 的结构统计 JSON，只包含当前调度结构统计字段。
+
+`commit_locality_group_by_op` 是按 `op.index - 1` 索引的 `uint32_t` vector。
+非 commit op 使用 invalid ID。默认 4096 cap 下每个 group 与实际 commit supernode
+一一对应；guard-event high-cap schedule 合并完整 baseline commit node 时，组 ID 仍保持
+pre-merge 4096 边界，供 emitter 稳定 value-slot locality。fixed partition 或 graph clone
+rebuild 始终从当前 graph 的 sink partition 重建该映射，不复用旧 OperationId。
+
+`commit_locality_group_order` 是 canonical locality group ID 的排列。`level-id`
+策略在最终 materialize 后构造 `compute supernode + canonical commit group` 伪
+baseline DAG：compute-to-compute 边沿用最终 DAG，每个 group 的 incoming 边则从
+组内 sink operand 的 defining compute supernode 重新建立，再复用 level-id topo。
+因此 high-cap execution merge 不会改变该 group 顺序。group ID 对应 pre-merge
+baseline commit node ID 顺序。
+
+当前 canonical order 只定义于 `final_topo_policy=level-id`。`level-op` 和
+`ready-op` 仍导出该 key，但值为空；emitter 会把空 order 视为不完整 metadata，
+对整张 value-slot 排列表使用 legacy 路径。
 
 ## Compute DAG 导出
 

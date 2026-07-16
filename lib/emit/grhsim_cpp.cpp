@@ -45,6 +45,8 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::grh::ValueType;
         using wolvrix::lib::transform::ActivityScheduleStateReadSupernodes;
         using wolvrix::lib::transform::ActivityScheduleDag;
+        using wolvrix::lib::transform::ActivityScheduleCommitLocalityGroupByOp;
+        using wolvrix::lib::transform::ActivityScheduleCommitLocalityGroupOrder;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKind;
         using wolvrix::lib::transform::ActivityScheduleComputeNodesBySupernode;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKinds;
@@ -2353,6 +2355,8 @@ namespace wolvrix::lib::emit
             const ActivityScheduleValueFanout &valueFanout;
             const ActivityScheduleTopoOrder &topoOrder;
             const ActivityScheduleStateReadSupernodes &stateReadSupernodes;
+            const ActivityScheduleCommitLocalityGroupByOp *commitLocalityGroupByOp = nullptr;
+            const ActivityScheduleCommitLocalityGroupOrder *commitLocalityGroupOrder = nullptr;
             const ActivityScheduleDag *dag = nullptr;
             const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
             const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
@@ -4170,7 +4174,11 @@ namespace wolvrix::lib::emit
         std::vector<ValueId> buildStateAnchoredValueOrder(const Graph &graph,
                                                           const EmitModel &model,
                                                           std::span<const ScheduleBatch> scheduleBatches,
-                                                          const ActivityScheduleSupernodeToOps &supernodeToOps)
+                                                          const ActivityScheduleSupernodeToOps &supernodeToOps,
+                                                          const ActivityScheduleCommitLocalityGroupByOp *
+                                                              commitLocalityGroupByOp,
+                                                          const ActivityScheduleCommitLocalityGroupOrder *
+                                                              commitLocalityGroupOrder)
         {
             struct ValueReadOrder
             {
@@ -4245,41 +4253,228 @@ namespace wolvrix::lib::emit
                 stateAnchorBySupernode[supernodeId] = stateAnchor;
             }
 
-            std::size_t readSequence = 0;
-            for (std::size_t batchIndex = 0; batchIndex < scheduleBatches.size(); ++batchIndex)
+            bool useCommitLocalityGroups =
+                commitLocalityGroupByOp != nullptr && commitLocalityGroupOrder != nullptr;
+            std::size_t commitOpCount = 0;
+            uint32_t maxCommitLocalityGroup = 0;
+            bool haveCommitLocalityGroup = false;
+            if (useCommitLocalityGroups)
             {
-                const ScheduleBatch &batch = scheduleBatches[batchIndex];
-                for (uint32_t supernodeId : batch.supernodeIds)
+                for (const OperationId opId : graph.operations())
                 {
-                    if (supernodeId >= supernodeToOps.size())
+                    if (opId.index == 0 || opId.index > commitLocalityGroupByOp->size())
+                    {
+                        useCommitLocalityGroups = false;
+                        break;
+                    }
+                    const uint32_t group = (*commitLocalityGroupByOp)[opId.index - 1];
+                    if (!isCommitPhaseOp(graph.getOperation(opId)))
+                    {
+                        if (group != wolvrix::lib::transform::kInvalidActivitySupernodeId)
+                        {
+                            useCommitLocalityGroups = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (group == wolvrix::lib::transform::kInvalidActivitySupernodeId)
+                    {
+                        useCommitLocalityGroups = false;
+                        break;
+                    }
+                    ++commitOpCount;
+                    maxCommitLocalityGroup = haveCommitLocalityGroup
+                                                 ? std::max(maxCommitLocalityGroup, group)
+                                                 : group;
+                    haveCommitLocalityGroup = true;
+                }
+            }
+
+            std::size_t commitLocalityGroupCount = 0;
+            if (useCommitLocalityGroups && haveCommitLocalityGroup)
+            {
+                const uint64_t candidateGroupCount =
+                    static_cast<uint64_t>(maxCommitLocalityGroup) + UINT64_C(1);
+                if (candidateGroupCount > static_cast<uint64_t>(commitOpCount) ||
+                    candidateGroupCount >
+                        static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
+                {
+                    useCommitLocalityGroups = false;
+                }
+                else
+                {
+                    commitLocalityGroupCount =
+                        static_cast<std::size_t>(candidateGroupCount);
+                }
+            }
+            std::vector<uint8_t> seenCommitLocalityGroups(commitLocalityGroupCount, 0U);
+            if (useCommitLocalityGroups)
+            {
+                if (commitLocalityGroupOrder->size() != commitLocalityGroupCount)
+                {
+                    useCommitLocalityGroups = false;
+                }
+                for (const OperationId opId : graph.operations())
+                {
+                    if (!useCommitLocalityGroups ||
+                        !isCommitPhaseOp(graph.getOperation(opId)))
                     {
                         continue;
                     }
-                    const std::size_t stateAnchor = stateAnchorBySupernode[supernodeId];
-                    for (const OperationId opId : supernodeToOps[supernodeId])
+                    const uint32_t group = (*commitLocalityGroupByOp)[opId.index - 1];
+                    if (group >= seenCommitLocalityGroups.size())
                     {
-                        const Operation op = graph.getOperation(opId);
-                        auto noteRead = [&](ValueId valueId) {
-                            auto it = orderByValue.find(valueId);
-                            if (it == orderByValue.end())
-                            {
-                                return;
-                            }
-                            if (it->second.firstReadSequence == kInvalidIndex)
-                            {
-                                it->second.firstReadSequence = readSequence++;
-                            }
-                            if (stateAnchor != kInvalidIndex)
-                            {
-                                it->second.stateAnchor = it->second.stateAnchor == kInvalidIndex
-                                                            ? stateAnchor
-                                                            : std::max(it->second.stateAnchor, stateAnchor);
-                            }
-                            ++it->second.totalReads;
-                        };
-                        for (ValueId operand : op.operands())
+                        useCommitLocalityGroups = false;
+                        break;
+                    }
+                    seenCommitLocalityGroups[group] = 1U;
+                }
+                if (useCommitLocalityGroups &&
+                    std::find(seenCommitLocalityGroups.begin(),
+                              seenCommitLocalityGroups.end(),
+                              uint8_t{0}) != seenCommitLocalityGroups.end())
+                {
+                    useCommitLocalityGroups = false;
+                }
+                std::fill(seenCommitLocalityGroups.begin(),
+                          seenCommitLocalityGroups.end(),
+                          uint8_t{0});
+                for (const uint32_t group : *commitLocalityGroupOrder)
+                {
+                    if (!useCommitLocalityGroups ||
+                        group >= seenCommitLocalityGroups.size() ||
+                        seenCommitLocalityGroups[group] != 0U)
+                    {
+                        useCommitLocalityGroups = false;
+                        break;
+                    }
+                    seenCommitLocalityGroups[group] = 1U;
+                }
+            }
+
+            std::vector<std::size_t> stateAnchorByCommitLocalityGroup(
+                commitLocalityGroupCount,
+                kInvalidIndex);
+            std::vector<std::vector<OperationId>> commitOpsByLocalityGroup(
+                commitLocalityGroupCount);
+            std::unordered_set<OperationId, OperationIdHash> seenCommitOps;
+            if (useCommitLocalityGroups)
+            {
+                seenCommitOps.reserve(commitOpCount);
+                for (const ScheduleBatch &batch : scheduleBatches)
+                {
+                    for (const uint32_t supernodeId : batch.supernodeIds)
+                    {
+                        if (supernodeId >= supernodeToOps.size() ||
+                            !isCommitSupernode(model, supernodeId))
                         {
-                            noteRead(operand);
+                            continue;
+                        }
+                        for (const OperationId opId : supernodeToOps[supernodeId])
+                        {
+                            if (!isCommitPhaseOp(graph.getOperation(opId)) ||
+                                !seenCommitOps.insert(opId).second)
+                            {
+                                useCommitLocalityGroups = false;
+                                break;
+                            }
+                            const uint32_t group = (*commitLocalityGroupByOp)[opId.index - 1];
+                            if (group >= commitOpsByLocalityGroup.size())
+                            {
+                                useCommitLocalityGroups = false;
+                                break;
+                            }
+                            commitOpsByLocalityGroup[group].push_back(opId);
+                            const auto writeIt = model.writeByOp.find(opId);
+                            if (writeIt != model.writeByOp.end())
+                            {
+                                const auto stateIt = model.stateBySymbol.find(writeIt->second.symbol);
+                                if (stateIt != model.stateBySymbol.end())
+                                {
+                                    noteStateAnchor(stateAnchorByCommitLocalityGroup[group],
+                                                    stateIt->second);
+                                }
+                            }
+                        }
+                        if (!useCommitLocalityGroups)
+                        {
+                            break;
+                        }
+                    }
+                    if (!useCommitLocalityGroups)
+                    {
+                        break;
+                    }
+                }
+                if (seenCommitOps.size() != commitOpCount)
+                {
+                    useCommitLocalityGroups = false;
+                }
+            }
+
+            std::size_t readSequence = 0;
+            const auto noteOperationReads = [&](OperationId opId, std::size_t stateAnchor)
+            {
+                const Operation op = graph.getOperation(opId);
+                for (ValueId operand : op.operands())
+                {
+                    auto it = orderByValue.find(operand);
+                    if (it == orderByValue.end())
+                    {
+                        continue;
+                    }
+                    if (it->second.firstReadSequence == kInvalidIndex)
+                    {
+                        it->second.firstReadSequence = readSequence++;
+                    }
+                    if (stateAnchor != kInvalidIndex)
+                    {
+                        it->second.stateAnchor = it->second.stateAnchor == kInvalidIndex
+                                                    ? stateAnchor
+                                                    : std::max(it->second.stateAnchor, stateAnchor);
+                    }
+                    ++it->second.totalReads;
+                }
+            };
+            if (useCommitLocalityGroups)
+            {
+                for (const ScheduleBatch &batch : scheduleBatches)
+                {
+                    for (const uint32_t supernodeId : batch.supernodeIds)
+                    {
+                        if (supernodeId >= supernodeToOps.size() ||
+                            isCommitSupernode(model, supernodeId))
+                        {
+                            continue;
+                        }
+                        for (const OperationId opId : supernodeToOps[supernodeId])
+                        {
+                            noteOperationReads(opId, stateAnchorBySupernode[supernodeId]);
+                        }
+                    }
+                }
+                for (const uint32_t group : *commitLocalityGroupOrder)
+                {
+                    for (const OperationId opId : commitOpsByLocalityGroup[group])
+                    {
+                        noteOperationReads(opId,
+                                           stateAnchorByCommitLocalityGroup[group]);
+                    }
+                }
+            }
+            else
+            {
+                for (const ScheduleBatch &batch : scheduleBatches)
+                {
+                    for (const uint32_t supernodeId : batch.supernodeIds)
+                    {
+                        if (supernodeId >= supernodeToOps.size())
+                        {
+                            continue;
+                        }
+                        for (const OperationId opId : supernodeToOps[supernodeId])
+                        {
+                            noteOperationReads(opId, stateAnchorBySupernode[supernodeId]);
                         }
                     }
                 }
@@ -17287,6 +17482,14 @@ namespace wolvrix::lib::emit
             getSessionValue<ActivityScheduleDag>(options, sessionPrefix + "dag");
         const auto *stateReadSupernodes =
             getSessionValue<ActivityScheduleStateReadSupernodes>(options, sessionPrefix + "state_read_supernodes");
+        const auto *commitLocalityGroupByOp =
+            getSessionValue<ActivityScheduleCommitLocalityGroupByOp>(
+                options,
+                sessionPrefix + "commit_locality_group_by_op");
+        const auto *commitLocalityGroupOrder =
+            getSessionValue<ActivityScheduleCommitLocalityGroupOrder>(
+                options,
+                sessionPrefix + "commit_locality_group_order");
         const auto *supernodeKinds =
             getSessionValue<ActivityScheduleSupernodeKinds>(options, sessionPrefix + "supernode_kind");
         const auto *computeNodesBySupernode =
@@ -17304,6 +17507,8 @@ namespace wolvrix::lib::emit
             .valueFanout = *valueFanout,
             .topoOrder = emitterTopoOrder,
             .stateReadSupernodes = *stateReadSupernodes,
+            .commitLocalityGroupByOp = commitLocalityGroupByOp,
+            .commitLocalityGroupOrder = commitLocalityGroupOrder,
             .dag = dag,
             .supernodeKinds = supernodeKinds,
             .computeNodesBySupernode = computeNodesBySupernode,
@@ -17655,7 +17860,12 @@ namespace wolvrix::lib::emit
         }
         markRepeatedPatternScheduleBatches(graph, model, schedule, scheduleBatches);
         std::vector<ValueId> batchReadLocalityValueOrder =
-            buildStateAnchoredValueOrder(graph, model, scheduleBatches, schedule.supernodeToOps);
+            buildStateAnchoredValueOrder(graph,
+                                         model,
+                                         scheduleBatches,
+                                         schedule.supernodeToOps,
+                                         schedule.commitLocalityGroupByOp,
+                                         schedule.commitLocalityGroupOrder);
         rebuildMaterializedValueStorage(graph, batchReadLocalityValueOrder, model);
         const bool runtimeProfileCompiled =
             model.emitRuntimeProfile || model.pureEventComputeWordProfile;

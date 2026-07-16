@@ -52,6 +52,85 @@ namespace
         return out;
     }
 
+    template <typename T>
+    const T *sessionValue(const SessionStore &session, std::string_view key)
+    {
+        const auto it = session.find(std::string(key));
+        if (it == session.end())
+        {
+            return nullptr;
+        }
+        const auto *typed = dynamic_cast<const SessionSlotValue<T> *>(it->second.get());
+        return typed == nullptr ? nullptr : &typed->value;
+    }
+
+    std::map<std::string, std::string> extractValueSlotMapping(std::string_view text)
+    {
+        std::map<std::string, std::string> mapping;
+        std::istringstream lines{std::string(text)};
+        std::string line;
+        while (std::getline(lines, line))
+        {
+            const std::size_t valueIdMarker = line.find(" [value_id=");
+            if (valueIdMarker == std::string::npos)
+            {
+                continue;
+            }
+            const std::size_t arrow = line.rfind(" -> ", valueIdMarker);
+            const std::size_t valueIdBegin = valueIdMarker + std::string_view(" [value_id=").size();
+            const std::size_t valueIdEnd = line.find(']', valueIdBegin);
+            if (arrow == std::string::npos || valueIdEnd == std::string::npos)
+            {
+                continue;
+            }
+            const std::string slot = line.substr(arrow + 4, valueIdMarker - arrow - 4);
+            if (!slot.starts_with("value_") || slot.find("_slots_[") == std::string::npos)
+            {
+                continue;
+            }
+            mapping.insert_or_assign(line.substr(valueIdBegin, valueIdEnd - valueIdBegin), slot);
+        }
+        return mapping;
+    }
+
+    std::vector<std::string> extractValueSlotDeclarations(std::string_view header)
+    {
+        std::vector<std::string> declarations;
+        std::istringstream lines{std::string(header)};
+        std::string line;
+        while (std::getline(lines, line))
+        {
+            if (line.find(" value_") != std::string::npos &&
+                line.find("_slots_{};") != std::string::npos)
+            {
+                declarations.push_back(line);
+            }
+        }
+        return declarations;
+    }
+
+    std::map<std::string, std::string> collectGeneratedSourceFiles(
+        const std::filesystem::path &dir,
+        std::string_view prefix)
+    {
+        std::map<std::string, std::string> files;
+        for (const auto &entry : std::filesystem::directory_iterator(dir))
+        {
+            if (!entry.is_regular_file())
+            {
+                continue;
+            }
+            const std::string name = entry.path().filename().string();
+            if (!name.starts_with(prefix) ||
+                (entry.path().extension() != ".cpp" && entry.path().extension() != ".hpp"))
+            {
+                continue;
+            }
+            files.emplace(name, readFile(entry.path()));
+        }
+        return files;
+    }
+
     std::size_t countSubstring(std::string_view text, std::string_view needle)
     {
         if (needle.empty())
@@ -1083,7 +1162,6 @@ namespace
         {
             session.erase("top.activity_schedule.dag");
         }
-
         std::filesystem::create_directories(outDir);
         EmitOptions options;
         options.outputDir = outDir.string();
@@ -1149,6 +1227,56 @@ namespace
                 std::string(*pureEventWordPackMaxChangedWordPpmRaw);
         }
 
+        EmitGrhSimCpp emitter(&diag);
+        result = emitter.emit(design, options);
+        return true;
+    }
+
+    bool emitCommitLocalityCase(
+        Design &design,
+        const std::filesystem::path &outDir,
+        ActivityScheduleOptions scheduleOptions,
+        bool removeMetadata,
+        const ActivityScheduleCommitLocalityGroupByOp *metadataOverride,
+        const ActivityScheduleCommitLocalityGroupOrder *orderOverride,
+        EmitDiagnostics &diag,
+        EmitResult &result)
+    {
+        SessionStore session;
+        if (!runActivitySchedule(design, session, std::move(scheduleOptions)))
+        {
+            return false;
+        }
+        if (metadataOverride != nullptr)
+        {
+            session.insert_or_assign(
+                "top.activity_schedule.commit_locality_group_by_op",
+                std::make_unique<SessionSlotValue<ActivityScheduleCommitLocalityGroupByOp>>(
+                    *metadataOverride,
+                    "activity-schedule.commit-locality-group-by-op"));
+        }
+        if (orderOverride != nullptr)
+        {
+            session.insert_or_assign(
+                "top.activity_schedule.commit_locality_group_order",
+                std::make_unique<SessionSlotValue<ActivityScheduleCommitLocalityGroupOrder>>(
+                    *orderOverride,
+                    "activity-schedule.commit-locality-group-order"));
+        }
+        if (removeMetadata)
+        {
+            session.erase("top.activity_schedule.commit_locality_group_by_op");
+            session.erase("top.activity_schedule.commit_locality_group_order");
+        }
+
+        std::filesystem::create_directories(outDir);
+        EmitOptions options;
+        options.outputDir = outDir.string();
+        options.session = &session;
+        options.sessionPathPrefix = std::string("top");
+        options.attributes["sched_batch_max_ops"] = "8";
+        options.attributes["sched_batch_max_estimated_lines"] = "96";
+        options.attributes["emit_parallelism"] = "2";
         EmitGrhSimCpp emitter(&diag);
         result = emitter.emit(design, options);
         return true;
@@ -1618,6 +1746,77 @@ namespace
         graph.addResult(addY, y);
         graph.bindOutputPort("y", y);
 
+        return design;
+    }
+
+    Design buildCommitLocalityPartitionDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId clk = makeLogicValue(graph, "locality_clk", 1);
+        const ValueId guardLow = makeLogicValue(graph, "locality_guard_low", 1);
+        const ValueId guardHigh = makeLogicValue(graph, "locality_guard_high", 1);
+        const ValueId a = makeLogicValue(graph, "locality_a", 8);
+        const ValueId b = makeLogicValue(graph, "locality_b", 8);
+        const ValueId c = makeLogicValue(graph, "locality_c", 8);
+        const ValueId d = makeLogicValue(graph, "locality_d", 8);
+        graph.bindInputPort("locality_clk", clk);
+        graph.bindInputPort("locality_guard_low", guardLow);
+        graph.bindInputPort("locality_guard_high", guardHigh);
+        graph.bindInputPort("locality_a", a);
+        graph.bindInputPort("locality_b", b);
+        graph.bindInputPort("locality_c", c);
+        graph.bindInputPort("locality_d", d);
+
+        const ValueId mask =
+            addConstant(graph, "locality_mask_op", "locality_mask", 8, "8'hff");
+        const ValueId dataLow = makeLogicValue(graph, "locality_data_low", 8);
+        const OperationId dataLowOp =
+            graph.createOperation(OperationKind::kXor, graph.internSymbol("locality_data_low_op"));
+        graph.addOperand(dataLowOp, a);
+        graph.addOperand(dataLowOp, b);
+        graph.addResult(dataLowOp, dataLow);
+        graph.bindOutputPort("locality_data_low", dataLow);
+
+        const ValueId dataHigh = makeLogicValue(graph, "locality_data_high", 8);
+        const OperationId dataHighOp =
+            graph.createOperation(OperationKind::kAdd, graph.internSymbol("locality_data_high_op"));
+        graph.addOperand(dataHighOp, c);
+        graph.addOperand(dataHighOp, d);
+        graph.addResult(dataHighOp, dataHigh);
+        graph.bindOutputPort("locality_data_high", dataHigh);
+
+        const auto addRegister = [&](std::string_view name)
+        {
+            const OperationId reg =
+                graph.createOperation(OperationKind::kRegister,
+                                      graph.internSymbol(std::string(name)));
+            graph.setAttr(reg, "width", static_cast<int64_t>(8));
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("8'h00"));
+        };
+        addRegister("locality_reg_low");
+        addRegister("locality_reg_high");
+
+        const auto addWrite = [&](std::string_view name,
+                                  std::string_view reg,
+                                  ValueId guard,
+                                  ValueId data)
+        {
+            const OperationId write =
+                graph.createOperation(OperationKind::kRegisterWritePort,
+                                      graph.internSymbol(std::string(name)));
+            graph.addOperand(write, guard);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", std::string(reg));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+        addWrite("locality_write_low", "locality_reg_low", guardLow, dataLow);
+        addWrite("locality_write_high", "locality_reg_high", guardHigh, dataHigh);
         return design;
     }
 
@@ -5626,6 +5825,195 @@ int main()
         if (std::system(commitBatchHarnessExe.string().c_str()) != 0)
         {
             return fail("commit-cond-batch harness failed to run");
+        }
+
+        const auto commitLocalityScheduleOptions = [](std::size_t commitCap)
+        {
+            ActivityScheduleOptions options;
+            options.path = "top";
+            options.maxOpInComputeSupernode = 1;
+            options.maxOpInCommitSupernode = commitCap;
+            options.enableCoarsen = false;
+            return options;
+        };
+        Design commitLocalitySeedDesign = buildCommitLocalityPartitionDesign();
+        SessionStore commitLocalitySeedSession;
+        if (!runActivitySchedule(commitLocalitySeedDesign,
+                                 commitLocalitySeedSession,
+                                 commitLocalityScheduleOptions(1)))
+        {
+            return fail("commit-locality split seed schedule failed");
+        }
+        const auto *commitLocalitySeed =
+            sessionValue<ActivityScheduleCommitLocalityGroupByOp>(
+                commitLocalitySeedSession,
+                "top.activity_schedule.commit_locality_group_by_op");
+        const auto *commitLocalityOrderSeed =
+            sessionValue<ActivityScheduleCommitLocalityGroupOrder>(
+                commitLocalitySeedSession,
+                "top.activity_schedule.commit_locality_group_order");
+        if (commitLocalitySeed == nullptr || commitLocalityOrderSeed == nullptr)
+        {
+            return fail("commit-locality split seed metadata is missing");
+        }
+        std::vector<uint32_t> seedGroups;
+        for (const uint32_t group : *commitLocalitySeed)
+        {
+            if (group != kInvalidActivitySupernodeId)
+            {
+                seedGroups.push_back(group);
+            }
+        }
+        std::sort(seedGroups.begin(), seedGroups.end());
+        seedGroups.erase(std::unique(seedGroups.begin(), seedGroups.end()), seedGroups.end());
+        if (seedGroups != std::vector<uint32_t>{0, 1})
+        {
+            return fail("commit-locality split seed should contain two canonical groups");
+        }
+        if (commitLocalityOrderSeed->size() != seedGroups.size())
+        {
+            return fail("commit-locality split seed order should cover both canonical groups");
+        }
+
+        ActivityScheduleCommitLocalityGroupByOp malformedCommitLocality = *commitLocalitySeed;
+        const auto malformedEntry =
+            std::find_if(malformedCommitLocality.begin(),
+                         malformedCommitLocality.end(),
+                         [](uint32_t group)
+                         {
+                             return group != kInvalidActivitySupernodeId;
+                         });
+        if (malformedEntry == malformedCommitLocality.end())
+        {
+            return fail("commit-locality malformed fixture has no commit entry");
+        }
+        *malformedEntry = kInvalidActivitySupernodeId;
+        ActivityScheduleCommitLocalityGroupByOp highCommitLocality =
+            *commitLocalitySeed;
+        const auto highEntry =
+            std::find_if(highCommitLocality.begin(),
+                         highCommitLocality.end(),
+                         [](uint32_t group)
+                         {
+                             return group != kInvalidActivitySupernodeId;
+                         });
+        if (highEntry == highCommitLocality.end())
+        {
+            return fail("commit-locality high-group fixture has no commit entry");
+        }
+        *highEntry = std::numeric_limits<uint32_t>::max() - 1U;
+        ActivityScheduleCommitLocalityGroupOrder malformedCommitLocalityOrder =
+            *commitLocalityOrderSeed;
+        if (malformedCommitLocalityOrder.size() < 2)
+        {
+            return fail("commit-locality malformed order fixture needs two groups");
+        }
+        malformedCommitLocalityOrder[1] = malformedCommitLocalityOrder[0];
+
+        struct CommitLocalityEmitCase
+        {
+            std::string_view name;
+            std::size_t commitCap = 1;
+            bool removeMetadata = false;
+            const ActivityScheduleCommitLocalityGroupByOp *metadataOverride = nullptr;
+            const ActivityScheduleCommitLocalityGroupOrder *orderOverride = nullptr;
+        };
+        const std::array<CommitLocalityEmitCase, 8> commitLocalityCases = {{
+            {"split", 1, false, nullptr, nullptr},
+            {"split_fallback", 1, true, nullptr, nullptr},
+            {"merged_stable", 2, false, commitLocalitySeed, commitLocalityOrderSeed},
+            {"merged_native", 2, false, nullptr, nullptr},
+            {"merged_fallback", 2, true, nullptr, nullptr},
+            {"merged_malformed_map", 2, false, &malformedCommitLocality, nullptr},
+            {"merged_high_group", 2, false, &highCommitLocality, nullptr},
+            {"merged_malformed_order", 2, false, commitLocalitySeed,
+             &malformedCommitLocalityOrder},
+        }};
+        const std::filesystem::path commitLocalityBaseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            "grhsim_cpp_commit_locality_partition";
+        std::filesystem::remove_all(commitLocalityBaseDir);
+        std::map<std::string, std::filesystem::path> commitLocalityDirs;
+        for (const auto &testCase : commitLocalityCases)
+        {
+            const std::filesystem::path outDir =
+                commitLocalityBaseDir / std::string(testCase.name);
+            Design caseDesign = buildCommitLocalityPartitionDesign();
+            EmitDiagnostics caseDiag;
+            EmitResult caseResult;
+            if (!emitCommitLocalityCase(caseDesign,
+                                        outDir,
+                                        commitLocalityScheduleOptions(testCase.commitCap),
+                                        testCase.removeMetadata,
+                                        testCase.metadataOverride,
+                                        testCase.orderOverride,
+                                        caseDiag,
+                                        caseResult) ||
+                !caseResult.success || caseDiag.hasError())
+            {
+                return fail("commit-locality emit failed for " + std::string(testCase.name));
+            }
+            commitLocalityDirs.emplace(testCase.name, outDir);
+        }
+
+        const auto slotMapping = [&](std::string_view name)
+        {
+            const auto &dir = commitLocalityDirs.at(std::string(name));
+            return extractValueSlotMapping(
+                readFiles(collectSchedFiles(dir, "grhsim_top_sched_")));
+        };
+        const auto slotDeclarations = [&](std::string_view name)
+        {
+            const auto &dir = commitLocalityDirs.at(std::string(name));
+            return extractValueSlotDeclarations(readFile(dir / "grhsim_top.hpp"));
+        };
+        const auto splitSlotMapping = slotMapping("split");
+        const auto stableSlotMapping = slotMapping("merged_stable");
+        const auto nativeSlotMapping = slotMapping("merged_native");
+        const auto fallbackSlotMapping = slotMapping("merged_fallback");
+        const auto malformedMapSlotMapping = slotMapping("merged_malformed_map");
+        const auto highGroupSlotMapping = slotMapping("merged_high_group");
+        const auto malformedOrderSlotMapping = slotMapping("merged_malformed_order");
+        if (splitSlotMapping.empty() || splitSlotMapping != stableSlotMapping ||
+            slotDeclarations("split") != slotDeclarations("merged_stable"))
+        {
+            return fail("canonical commit locality groups should stabilize typed value slots across partitioning");
+        }
+        if (nativeSlotMapping != fallbackSlotMapping ||
+            fallbackSlotMapping != malformedMapSlotMapping ||
+            fallbackSlotMapping != highGroupSlotMapping ||
+            fallbackSlotMapping != malformedOrderSlotMapping)
+        {
+            return fail("missing or malformed commit locality metadata should use the legacy value order");
+        }
+        if (splitSlotMapping == fallbackSlotMapping)
+        {
+            return fail("commit-locality fixture did not distinguish split and merged legacy anchors");
+        }
+        const auto nativeSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("merged_native"), "grhsim_top");
+        const auto fallbackSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("merged_fallback"), "grhsim_top");
+        const auto malformedMapSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("merged_malformed_map"), "grhsim_top");
+        const auto highGroupSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("merged_high_group"), "grhsim_top");
+        const auto malformedOrderSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("merged_malformed_order"), "grhsim_top");
+        if (nativeSources.empty() || nativeSources != fallbackSources ||
+            fallbackSources != malformedMapSources ||
+            fallbackSources != highGroupSources ||
+            fallbackSources != malformedOrderSources)
+        {
+            return fail("native commit locality metadata must preserve default generated source identity");
+        }
+        const auto splitSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("split"), "grhsim_top");
+        const auto splitFallbackSources =
+            collectGeneratedSourceFiles(commitLocalityDirs.at("split_fallback"), "grhsim_top");
+        if (splitSources.empty() || splitSources != splitFallbackSources)
+        {
+            return fail("split canonical metadata must preserve legacy generated source identity");
         }
 
         const std::filesystem::path oneBitBaseDir =

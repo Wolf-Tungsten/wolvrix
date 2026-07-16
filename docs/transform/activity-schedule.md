@@ -58,6 +58,10 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-disable-commit-guard-event-buckets` | `false` | 关闭 commit guard/event bucket 分组 |
 | `-split-oversize-compute-nodes` | `false` | materialize 阶段拆分超过上限的单个 compute node |
 | `-declared-value-compute-node-boundary` | `false` | 把带 declared symbol 的 value 作为 compute-node 截断边界 |
+| `-final-sibling-fusion-policy` | `off` | final compute sibling fusion 只读策略：`off/probe` |
+| `-final-sibling-fusion-min-gain` | `4` | probe pair 的最小 exact compute BAE gain |
+| `-final-sibling-fusion-max-pairs` | `256` | probe conflict-free projected pair 上限 |
+| `-final-sibling-fusion-max-fused-op-ppm` | `5000` | selected pair 涉及的 raw compute op 占最终 compute op 的 PPM 上限 |
 | `-kahn-level-pack-policy` | `off` | same-Kahn-level packing policy：`off/strict/bae-budget/balanced` |
 | `-post-dp-refine-policy` | `off` | post-DP exact refinement policy：`off/strict/bae-budget/balanced/swap-probe` |
 | `-export-compute-dag` | 无 | 导出 `wolvrix.compute-op-dag.v1` compute op DAG JSON |
@@ -145,6 +149,44 @@ incoming_boundary_activation_edges + 1
 cluster swap。候选必须保持 pair topology 和 exact quotient DAG support key，且降低 exact
 compute BAE；预算内的无冲突候选只应用到内部副本以复算指标和验证约束，不修改导出的
 activity schedule。
+
+`final-sibling-fusion-policy=probe` 在 final schedule 上构造每个 compute supernode 的
+完整 value/input activation signature：一部分是 `value_fanout` 反向得到的 schedule
+incoming `ValueId` 有序集合，另一部分是直接 operand 中的 graph input/inout `ValueId`
+有序集合。只有处于同一 `level-id` Kahn level、两部分 signature 都完全相同、且两个
+supernode 的 raw op 总数不超过 `max-op-in-compute-supernode` 的节点才可能进入 exact
+pair 空间。graph input signature 只用于证明激活等价；projected compute BAE gain 仍只
+等于共同 schedule incoming `ValueId` 的数量，空 schedule incoming signature 不进入候选。
+
+首版 probe 保守拒绝任何包含 state-read/reg-to-mem-intent、event-sensitive side effect
+或未分类无 def operand 的 compute supernode。只比较相同 state symbol 不足以证明当前
+emitter 下同时执行：native direct-state 优化会把激活从 read source 重写到 consumer，
+memory reader 还可能按 constant row 细化；同理 pure-event bypass 会区分 posedge/negedge
+predicate。probe 分别报告 `state_activation_nodes`、`event_activation_nodes` 和
+`unclassified_activation_nodes`，不把这些节点作为 activation-equivalent 候选。
+
+同一 signature 桶内的可行 pair 按
+`(topoDistance, storageDistance, min(supernodeId), max(supernodeId))` 升序贪心选择，
+已配对节点不再参与后续 pair。实现只保留每个节点当前最近的可行 topo 后继，并通过
+lazy priority queue 和 active-op minimum tree 更新冲突项，避免物化桶内的二次方 pair
+集合。形成的无冲突 pair 再按 gain 降序、canonical signature 桶顺序和桶内 pair 顺序
+应用 pair 数与 fused-op PPM 预算。日志区分所有组合的 `raw_exact_pairs`、capacity 组合
+上界 `cap_eligible_pairs`、因 pair overlap 未入选的 `rejected_overlap_pairs`、桶内最近
+距离配对后的 `exact_eligible` 以及最终 `selected`，并给出 gain/op/distance 分布。
+每个 selected pair 另行输出 `lhs/rhs` supernode、对应 baseline active ID、gain、op 数和
+topo/storage distance，供 runtime fire profile 与 active-mask packing 离线复核；这些
+逐 pair 日志不写入 session。
+
+pair 的 combined raw-op cap 直接使用 `max-op-in-compute-supernode`，与当前 schedule 的
+合法 supernode 上限保持一致；它不是独立的固定常量。
+
+probe 还单独扫描 storage 相邻且 topo 相邻的 exact pair，报告
+`adjacent_cap_eligible` 和逐层拒绝原因。plain DP 对正 segment penalty 的最优分段通常
+使该集合为空；该计数独立于实验 `min-gain`，只用于验证结构性质，不裁剪主集合。
+当前没有 `strict` 策略，probe 不修改 graph、schedule/session key 或 summary stats。
+后续若实现非相邻融合，需要先
+解决 active-ID、batch/code layout 与 value-slot locality 稳定性，不能直接把 projected
+pair 应用到导出 schedule。
 
 ## Session 输出
 

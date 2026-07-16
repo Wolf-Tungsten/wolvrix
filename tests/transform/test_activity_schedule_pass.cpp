@@ -6542,6 +6542,576 @@ int main()
     }
 
     {
+        currentCase = "final_sibling_fusion_probe";
+
+        struct FixtureOptions
+        {
+            std::size_t leaves = 2;
+            bool separators = true;
+            bool valueMismatch = false;
+            bool stateMismatch = false;
+            bool inputMismatch = false;
+            bool eventSensitive = false;
+            bool unclassifiedActivation = false;
+        };
+
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design,
+                                     const std::string &name,
+                                     const FixtureOptions &fixture)
+        {
+            using K = wolvrix::lib::grh::OperationKind;
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+
+            const auto input = makeValue(graph, "input", 1);
+            graph.bindInputPort("input", input);
+            auto producerInput = input;
+            for (std::size_t i = 0; i < 3; ++i)
+            {
+                const auto value = makeValue(
+                    graph,
+                    "producer_prefix_value_" + std::to_string(i),
+                    1);
+                const auto op = graph.createOperation(
+                    K::kNot,
+                    graph.internSymbol("producer_prefix_" + std::to_string(i)));
+                graph.addOperand(op, producerInput);
+                graph.addResult(op, value);
+                producerInput = value;
+            }
+            const auto producer = graph.createOperation(
+                K::kAnd,
+                graph.internSymbol("shared_producer"));
+            graph.addOperand(producer, producerInput);
+            std::vector<wolvrix::lib::grh::ValueId> producerValues;
+            for (std::size_t i = 0; i < 4; ++i)
+            {
+                const auto symbol =
+                    graph.internSymbol("producer_value_" + std::to_string(i));
+                graph.addDeclaredSymbol(symbol);
+                const auto value = graph.createValue(symbol, 1, false);
+                graph.addResult(producer, value);
+                producerValues.push_back(value);
+            }
+            const auto commit = graph.createOperation(
+                K::kRegisterWritePort,
+                graph.internSymbol("producer_commit_root"));
+            for (const auto value : producerValues)
+            {
+                graph.addOperand(commit, value);
+            }
+            graph.setAttr(commit, "regSymbol", std::string("producer_commit_state"));
+
+            for (std::size_t leafIndex = 0; leafIndex < fixture.leaves; ++leafIndex)
+            {
+                std::vector<wolvrix::lib::grh::ValueId> operands = producerValues;
+                if (fixture.valueMismatch && leafIndex == 1)
+                {
+                    operands.back() = operands[operands.size() - 2];
+                }
+                if (fixture.stateMismatch && leafIndex == 1)
+                {
+                    const auto readValue = makeValue(graph, "state_read_value", 1);
+                    const auto read = graph.createOperation(
+                        K::kRegisterReadPort,
+                        graph.internSymbol("state_read"));
+                    graph.setAttr(read, "regSymbol", std::string("state_only_on_rhs"));
+                    graph.addResult(read, readValue);
+                    operands.push_back(readValue);
+                }
+                if (fixture.inputMismatch && leafIndex == 1)
+                {
+                    operands.push_back(input);
+                }
+                if (fixture.unclassifiedActivation && leafIndex == 1)
+                {
+                    operands.push_back(
+                        makeValue(graph, "unclassified_activation_value", 1));
+                }
+                const auto leafValue =
+                    makeValue(graph, "leaf_value_" + std::to_string(leafIndex), 1);
+                const auto leaf = graph.createOperation(
+                    K::kAnd,
+                    graph.internSymbol("leaf_" + std::to_string(leafIndex)));
+                if (fixture.eventSensitive && leafIndex == 1)
+                {
+                    graph.setAttr(leaf, "hasSideEffects", true);
+                }
+                for (const auto operand : operands)
+                {
+                    graph.addOperand(leaf, operand);
+                }
+                graph.addResult(leaf, leafValue);
+                graph.bindOutputPort("leaf_" + std::to_string(leafIndex), leafValue);
+
+                if (!fixture.separators || leafIndex + 1 == fixture.leaves)
+                {
+                    continue;
+                }
+                auto separatorValue = producerValues.front();
+                for (std::size_t opIndex = 0; opIndex < 4; ++opIndex)
+                {
+                    const auto next = makeValue(
+                        graph,
+                        "separator_" + std::to_string(leafIndex) + "_value_" +
+                            std::to_string(opIndex),
+                        1);
+                    const auto op = graph.createOperation(
+                        K::kNot,
+                        graph.internSymbol(
+                            "separator_" + std::to_string(leafIndex) + "_op_" +
+                            std::to_string(opIndex)));
+                    graph.addOperand(op, separatorValue);
+                    graph.addResult(op, next);
+                    separatorValue = next;
+                }
+                graph.bindOutputPort(
+                    "leaf_" + std::to_string(leafIndex) + "_separator",
+                    separatorValue);
+            }
+        };
+
+        const auto runFixture = [&](wolvrix::lib::grh::Design &design,
+                                    const std::string &name,
+                                    std::string policy,
+                                    std::size_t minGain,
+                                    std::size_t maxPairs,
+                                    std::size_t maxFusedOpPpm,
+                                    std::size_t computeCap,
+                                    std::string finalTopoPolicy,
+                                    bool splitOversize,
+                                    SessionStore &session,
+                                    std::string *log = nullptr)
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = computeCap;
+            options.declaredValueComputeNodeBoundary = true;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.finalTopoPolicy = std::move(finalTopoPolicy);
+            if (!policy.empty())
+            {
+                options.finalSiblingFusionPolicy = std::move(policy);
+            }
+            options.finalSiblingFusionMinGain = minGain;
+            options.finalSiblingFusionMaxPairs = maxPairs;
+            options.finalSiblingFusionMaxFusedOpPpm = maxFusedOpPpm;
+            options.splitOversizeComputeNodes = splitOversize;
+            options.splitOversizeComputeNodeMaxOps = splitOversize ? 1 : 0;
+            PassManager manager;
+            manager.options().session = &session;
+            if (log != nullptr)
+            {
+                manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+                manager.options().logSink =
+                    [log](wolvrix::lib::LogLevel,
+                          std::string_view,
+                          std::string_view message)
+                    {
+                        log->append(message);
+                        log->push_back('\n');
+                    };
+            }
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return result.success && !diags.hasError();
+        };
+
+        const auto describeSchedule = [](const wolvrix::lib::grh::Design &design,
+                                         const std::string &name,
+                                         const SessionStore &session)
+        {
+            const auto schedule = loadSchedule(session, name);
+            const auto *graph = design.findGraph(name);
+            std::ostringstream out;
+            if (graph == nullptr || schedule.supernodeToOps == nullptr ||
+                schedule.supernodeKinds == nullptr || schedule.topoOrder == nullptr ||
+                schedule.valueFanout == nullptr || schedule.dag == nullptr)
+            {
+                return std::string(" schedule=<missing>");
+            }
+            std::vector<std::size_t> topoPosition(schedule.topoOrder->size(), 0);
+            for (std::size_t i = 0; i < schedule.topoOrder->size(); ++i)
+            {
+                topoPosition[(*schedule.topoOrder)[i]] = i;
+            }
+            std::vector<std::vector<std::size_t>> incoming(schedule.supernodeToOps->size());
+            for (std::size_t value = 0; value < schedule.valueFanout->size(); ++value)
+            {
+                for (const uint32_t target : (*schedule.valueFanout)[value])
+                {
+                    if (target < incoming.size())
+                    {
+                        incoming[target].push_back(value + 1);
+                    }
+                }
+            }
+            out << " schedule=";
+            for (std::size_t node = 0; node < schedule.supernodeToOps->size(); ++node)
+            {
+                out << " [sn=" << node
+                    << " kind="
+                    << ((*schedule.supernodeKinds)[node] ==
+                                ActivityScheduleSupernodeKind::Compute
+                            ? 'C'
+                            : 'M')
+                    << " topo=" << topoPosition[node] << " ops=";
+                for (const auto opId : (*schedule.supernodeToOps)[node])
+                {
+                    out << graph->getOperation(opId).symbolText() << ',';
+                }
+                out << " in=";
+                for (const std::size_t value : incoming[node])
+                {
+                    out << value << ',';
+                }
+                out << " dag=";
+                for (const uint32_t successor : (*schedule.dag)[node])
+                {
+                    out << successor << ',';
+                }
+                out << ']';
+            }
+            return out.str();
+        };
+
+        std::string parseError;
+        const std::vector<std::string_view> separatedArgs{
+            "-path", "final_sibling_fusion_probe",
+            "-final-sibling-fusion-policy", "probe",
+            "-final-sibling-fusion-min-gain", "4",
+            "-final-sibling-fusion-max-pairs", "256",
+            "-final-sibling-fusion-max-fused-op-ppm", "5000"};
+        const std::vector<std::string_view> equalsArgs{
+            "-path=final_sibling_fusion_probe",
+            "-final-sibling-fusion-policy=off",
+            "-final-sibling-fusion-min-gain=4",
+            "-final-sibling-fusion-max-pairs=256",
+            "-final-sibling-fusion-max-fused-op-ppm=5000"};
+        const std::vector<std::string_view> malformedArgs{
+            "-path=final_sibling_fusion_probe",
+            "-final-sibling-fusion-min-gain=4x"};
+        const std::vector<std::string_view> overflowArgs{
+            "-path=final_sibling_fusion_probe",
+            "-final-sibling-fusion-max-pairs=999999999999999999999999999999999999"};
+        if (makePass("activity-schedule", separatedArgs, parseError) == nullptr ||
+            makePass("activity-schedule", equalsArgs, parseError) == nullptr ||
+            makePass("activity-schedule", malformedArgs, parseError) != nullptr ||
+            makePass("activity-schedule", overflowArgs, parseError) != nullptr)
+        {
+            return fail("Expected final sibling fusion CLI forms to parse strictly");
+        }
+
+        constexpr std::string_view kName = "final_sibling_fusion_probe";
+        wolvrix::lib::grh::Design defaultDesign;
+        buildFixture(defaultDesign, std::string(kName), {});
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign,
+                        std::string(kName),
+                        "",
+                        4,
+                        256,
+                        1000000,
+                        4,
+                        "level-id",
+                        false,
+                        defaultSession))
+        {
+            return fail("Expected default final sibling fusion schedule to succeed");
+        }
+        wolvrix::lib::grh::Design offDesign;
+        buildFixture(offDesign, std::string(kName), {});
+        SessionStore offSession;
+        if (!runFixture(offDesign,
+                        std::string(kName),
+                        "off",
+                        4,
+                        256,
+                        1000000,
+                        4,
+                        "level-id",
+                        false,
+                        offSession))
+        {
+            return fail("Expected explicit-off final sibling fusion schedule to succeed");
+        }
+        wolvrix::lib::grh::Design probeDesign;
+        buildFixture(probeDesign, std::string(kName), {});
+        SessionStore probeSession;
+        std::string probeLog;
+        if (!runFixture(probeDesign,
+                        std::string(kName),
+                        "probe",
+                        4,
+                        256,
+                        1000000,
+                        4,
+                        "level-id",
+                        false,
+                        probeSession,
+                        &probeLog))
+        {
+            return fail("Expected final sibling fusion probe schedule to succeed");
+        }
+        if (!schedulesEqual(loadSchedule(defaultSession, std::string(kName)),
+                            loadSchedule(offSession, std::string(kName))) ||
+            !schedulesEqual(loadSchedule(offSession, std::string(kName)),
+                            loadSchedule(probeSession, std::string(kName))) ||
+            defaultSession.size() != offSession.size() ||
+            offSession.size() != probeSession.size())
+        {
+            return fail("Expected off/probe final sibling fusion session identity");
+        }
+        if (probeLog.find("activity-schedule final sibling fusion probe:") ==
+                std::string::npos ||
+            parseStatField(probeLog, "exact_eligible") != 1 ||
+            parseStatField(probeLog, "selected") != 1 ||
+            parseStatField(probeLog, "eligible_projected_bae_gain") != 4 ||
+            parseStatField(probeLog, "projected_bae_gain") != 4 ||
+            parseStatField(probeLog, "adjacent_cap_eligible") != 0 ||
+            probeLog.find("eligible_by_storage_distance=2-4:1") ==
+                std::string::npos ||
+            probeLog.find("eligible_by_topo_distance=2-4:1") ==
+                std::string::npos)
+        {
+            return fail("Expected one non-adjacent exact sibling pair with gain four: " +
+                        probeLog + describeSchedule(probeDesign,
+                                                    std::string(kName),
+                                                    probeSession));
+        }
+
+        const auto expectNoEligible = [&](const std::string &name,
+                                          const FixtureOptions &fixture,
+                                          std::size_t minGain,
+                                          std::size_t cap,
+                                          const std::string &counter)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, name, fixture);
+            SessionStore session;
+            std::string log;
+            const bool success = runFixture(design,
+                                            name,
+                                            "probe",
+                                            minGain,
+                                            256,
+                                            1000000,
+                                            cap,
+                                            "level-id",
+                                            false,
+                                            session,
+                                            &log);
+            return success && parseStatField(log, "exact_eligible") == 0 &&
+                   parseStatField(log, "selected") == 0 &&
+                   parseStatField(log, counter) != 0;
+        };
+        FixtureOptions valueMismatch;
+        valueMismatch.valueMismatch = true;
+        FixtureOptions stateMismatch;
+        stateMismatch.separators = false;
+        stateMismatch.stateMismatch = true;
+        FixtureOptions inputMismatch;
+        inputMismatch.inputMismatch = true;
+        FixtureOptions eventSensitive;
+        eventSensitive.eventSensitive = true;
+        FixtureOptions unclassifiedActivation;
+        unclassifiedActivation.unclassifiedActivation = true;
+        FixtureOptions capacity;
+        capacity.separators = false;
+        if (!expectNoEligible("final_sibling_fusion_value_mismatch",
+                              valueMismatch,
+                              4,
+                              4,
+                              "singleton_signature_nodes") ||
+            !expectNoEligible("final_sibling_fusion_state_mismatch",
+                              stateMismatch,
+                              4,
+                              2,
+                              "state_activation_nodes") ||
+            !expectNoEligible("final_sibling_fusion_input_mismatch",
+                              inputMismatch,
+                              4,
+                              4,
+                              "input_activation_nodes") ||
+            !expectNoEligible("final_sibling_fusion_event_sensitive",
+                              eventSensitive,
+                              4,
+                              4,
+                              "event_activation_nodes") ||
+            !expectNoEligible("final_sibling_fusion_unclassified_activation",
+                              unclassifiedActivation,
+                              4,
+                              4,
+                              "unclassified_activation_nodes") ||
+            !expectNoEligible("final_sibling_fusion_capacity",
+                              capacity,
+                              4,
+                              1,
+                              "rejected_capacity_pairs") ||
+            !expectNoEligible("final_sibling_fusion_min_gain",
+                              FixtureOptions{},
+                              5,
+                              4,
+                              "rejected_min_gain_pairs"))
+        {
+            return fail("Expected final sibling fusion signature/cap/gain rejects");
+        }
+
+        FixtureOptions fourPairs;
+        fourPairs.leaves = 4;
+        wolvrix::lib::grh::Design pairBudgetDesign;
+        buildFixture(pairBudgetDesign, "final_sibling_fusion_pair_budget", fourPairs);
+        SessionStore pairBudgetSession;
+        std::string pairBudgetLog;
+        if (!runFixture(pairBudgetDesign,
+                        "final_sibling_fusion_pair_budget",
+                        "probe",
+                        4,
+                        1,
+                        1000000,
+                        4,
+                        "level-id",
+                        false,
+                        pairBudgetSession,
+                        &pairBudgetLog) ||
+            parseStatField(pairBudgetLog, "exact_eligible") != 2 ||
+            parseStatField(pairBudgetLog, "selected") != 1 ||
+            parseStatField(pairBudgetLog, "rejected_overlap_pairs") != 4 ||
+            parseStatField(pairBudgetLog, "rejected_selection_pair_limit") != 1 ||
+            pairBudgetLog.find("eligible_by_topo_distance=2-4:2") ==
+                std::string::npos)
+        {
+            return fail("Expected deterministic final sibling pair limit: " + pairBudgetLog);
+        }
+        wolvrix::lib::grh::Design zeroBudgetDesign;
+        buildFixture(zeroBudgetDesign, "final_sibling_fusion_zero_budget", fourPairs);
+        SessionStore zeroBudgetSession;
+        std::string zeroBudgetLog;
+        if (!runFixture(zeroBudgetDesign,
+                        "final_sibling_fusion_zero_budget",
+                        "probe",
+                        4,
+                        256,
+                        0,
+                        4,
+                        "level-id",
+                        false,
+                        zeroBudgetSession,
+                        &zeroBudgetLog) ||
+            parseStatField(zeroBudgetLog, "exact_eligible") != 2 ||
+            parseStatField(zeroBudgetLog, "selected") != 0 ||
+            parseStatField(zeroBudgetLog, "rejected_selection_budget") != 2)
+        {
+            return fail("Expected final sibling fused-op budget rejection: " + zeroBudgetLog);
+        }
+        wolvrix::lib::grh::Design repeatDesign;
+        buildFixture(repeatDesign, "final_sibling_fusion_repeat", fourPairs);
+        SessionStore repeatSession;
+        std::string repeatLog;
+        const auto selectedPairLines = [](const std::string &log)
+        {
+            constexpr std::string_view prefix =
+                "activity-schedule final sibling fusion probe pair:";
+            std::string selected;
+            std::istringstream lines(log);
+            for (std::string line; std::getline(lines, line);)
+            {
+                if (line.starts_with(prefix))
+                {
+                    selected.append(line);
+                    selected.push_back('\n');
+                }
+            }
+            return selected;
+        };
+        if (!runFixture(repeatDesign,
+                        "final_sibling_fusion_repeat",
+                        "probe",
+                        4,
+                        1,
+                        1000000,
+                        4,
+                        "level-id",
+                        false,
+                        repeatSession,
+                        &repeatLog) ||
+            parseStatField(repeatLog, "exact_eligible") !=
+                parseStatField(pairBudgetLog, "exact_eligible") ||
+            parseStatField(repeatLog, "selected") !=
+                parseStatField(pairBudgetLog, "selected") ||
+            parseStatField(repeatLog, "projected_bae_gain") !=
+                parseStatField(pairBudgetLog, "projected_bae_gain") ||
+            selectedPairLines(repeatLog) != selectedPairLines(pairBudgetLog))
+        {
+            return fail("Expected deterministic final sibling probe selection");
+        }
+
+        wolvrix::lib::grh::Design nonLevelDesign;
+        buildFixture(nonLevelDesign, "final_sibling_fusion_non_level", {});
+        SessionStore nonLevelSession;
+        std::string nonLevelLog;
+        if (!runFixture(nonLevelDesign,
+                        "final_sibling_fusion_non_level",
+                        "probe",
+                        4,
+                        256,
+                        1000000,
+                        4,
+                        "level-op",
+                        false,
+                        nonLevelSession,
+                        &nonLevelLog) ||
+            nonLevelLog.find("skipped_final_topo=true") == std::string::npos)
+        {
+            return fail("Expected non-level-id final sibling probe to skip safely");
+        }
+
+        wolvrix::lib::grh::Design oversizeDesign;
+        buildFixture(oversizeDesign, "final_sibling_fusion_oversize", {});
+        SessionStore oversizeSession;
+        std::string oversizeLog;
+        if (!runFixture(oversizeDesign,
+                        "final_sibling_fusion_oversize",
+                        "probe",
+                        4,
+                        256,
+                        1000000,
+                        4,
+                        "level-id",
+                        true,
+                        oversizeSession,
+                        &oversizeLog) ||
+            oversizeLog.find("skipped_oversize=true") == std::string::npos)
+        {
+            return fail("Expected split-oversize final sibling probe to skip safely");
+        }
+
+        const auto invalidOptionsFail = [&](std::string policy, std::size_t ppm)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, "final_sibling_fusion_invalid", {});
+            ActivityScheduleOptions options;
+            options.path = "final_sibling_fusion_invalid";
+            options.finalSiblingFusionPolicy = std::move(policy);
+            options.finalSiblingFusionMaxFusedOpPpm = ppm;
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return !result.success && diags.hasError();
+        };
+        if (!invalidOptionsFail("strict", 5000) ||
+            !invalidOptionsFail("off", 1000001))
+        {
+            return fail("Expected invalid final sibling policy/PPM to fail");
+        }
+    }
+
+    {
         currentCase = "final_topo_level_op";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("final_topo_level_op");

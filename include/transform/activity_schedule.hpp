@@ -47,6 +47,9 @@ namespace wolvrix::lib::transform
         std::size_t finalFaninPullbackMinGain = 3;
         std::size_t finalFaninPullbackMaxMoves = 4096;
         std::size_t finalFaninPullbackMaxMovedOpPpm = 5000;
+        std::size_t finalSiblingFusionMinGain = 4;
+        std::size_t finalSiblingFusionMaxPairs = 256;
+        std::size_t finalSiblingFusionMaxFusedOpPpm = 5000;
         std::size_t postDpRefineMaxRounds = 1;
         std::size_t postDpRefineMaxMoves = 4096;
         std::size_t postDpRefineMaxMovedOpPpm = 10000;
@@ -62,6 +65,7 @@ namespace wolvrix::lib::transform
         bool declaredValueComputeNodeBoundary = false;
         std::string localSharedComputeCommonOwnerPolicy = "off";
         std::string finalFaninPullbackPolicy = "off";
+        std::string finalSiblingFusionPolicy = "off";
         std::string postDpRefinePolicy = "off";
         std::string kahnLevelPackPolicy = "off";
         std::string finalTopoPolicy = "level-id";

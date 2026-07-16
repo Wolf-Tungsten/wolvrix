@@ -1329,6 +1329,19 @@ namespace wolvrix::lib::transform
                     options.finalFaninPullbackPolicy = std::string(
                         arg.substr(std::string_view("-final-fanin-pullback-policy=").size()));
                 }
+                else if (arg == "-final-sibling-fusion-policy")
+                {
+                    if (!parseStringArg("-final-sibling-fusion-policy",
+                                        options.finalSiblingFusionPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-sibling-fusion-policy="))
+                {
+                    options.finalSiblingFusionPolicy = std::string(
+                        arg.substr(std::string_view("-final-sibling-fusion-policy=").size()));
+                }
                 else if (arg == "-dp-segment-penalty-ppm")
                 {
                     if (i + 1 >= args.size())
@@ -1459,6 +1472,60 @@ namespace wolvrix::lib::transform
                             "-final-fanin-pullback-max-moved-op-ppm",
                             arg.substr(std::string_view("-final-fanin-pullback-max-moved-op-ppm=").size()),
                             options.finalFaninPullbackMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-sibling-fusion-min-gain")
+                {
+                    if (!parseExactSizeArg("-final-sibling-fusion-min-gain",
+                                           options.finalSiblingFusionMinGain))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-sibling-fusion-min-gain="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-sibling-fusion-min-gain",
+                            arg.substr(std::string_view("-final-sibling-fusion-min-gain=").size()),
+                            options.finalSiblingFusionMinGain))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-sibling-fusion-max-pairs")
+                {
+                    if (!parseExactSizeArg("-final-sibling-fusion-max-pairs",
+                                           options.finalSiblingFusionMaxPairs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-sibling-fusion-max-pairs="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-sibling-fusion-max-pairs",
+                            arg.substr(std::string_view("-final-sibling-fusion-max-pairs=").size()),
+                            options.finalSiblingFusionMaxPairs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-sibling-fusion-max-fused-op-ppm")
+                {
+                    if (!parseExactSizeArg("-final-sibling-fusion-max-fused-op-ppm",
+                                           options.finalSiblingFusionMaxFusedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-sibling-fusion-max-fused-op-ppm="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-sibling-fusion-max-fused-op-ppm",
+                            arg.substr(std::string_view("-final-sibling-fusion-max-fused-op-ppm=").size()),
+                            options.finalSiblingFusionMaxFusedOpPpm))
                     {
                         return nullptr;
                     }

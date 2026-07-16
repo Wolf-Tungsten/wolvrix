@@ -13,6 +13,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -10527,6 +10528,722 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        struct FinalSiblingFusionSignature
+        {
+            std::size_t level = 0;
+            std::vector<uint32_t> incomingValues;
+            std::vector<uint32_t> inputValues;
+            std::vector<uint32_t> stateReads;
+
+            bool operator<(const FinalSiblingFusionSignature &other) const noexcept
+            {
+                return std::tie(level, incomingValues, inputValues, stateReads) <
+                       std::tie(other.level,
+                                other.incomingValues,
+                                other.inputValues,
+                                other.stateReads);
+            }
+        };
+
+        struct FinalSiblingFusionCandidate
+        {
+            uint32_t lhs = kInvalidActivitySupernodeId;
+            uint32_t rhs = kInvalidActivitySupernodeId;
+            uint32_t lhsActiveId = kInvalidActivitySupernodeId;
+            uint32_t rhsActiveId = kInvalidActivitySupernodeId;
+            std::size_t gain = 0;
+            std::size_t fusedOps = 0;
+            std::size_t storageDistance = 0;
+            std::size_t topoDistance = 0;
+            std::size_t bucketOrder = 0;
+            std::size_t pairOrder = 0;
+        };
+
+        struct FinalSiblingFusionPairEdge
+        {
+            std::size_t lhsPosition = 0;
+            std::size_t rhsPosition = 0;
+            std::size_t topoDistance = 0;
+            std::size_t storageDistance = 0;
+            uint32_t minNode = kInvalidActivitySupernodeId;
+            uint32_t maxNode = kInvalidActivitySupernodeId;
+
+            auto key() const noexcept
+            {
+                return std::tuple{
+                    topoDistance, storageDistance, minNode, maxNode};
+            }
+        };
+
+        struct FinalSiblingFusionPairEdgeGreater
+        {
+            bool operator()(const FinalSiblingFusionPairEdge &lhs,
+                            const FinalSiblingFusionPairEdge &rhs) const noexcept
+            {
+                return lhs.key() > rhs.key();
+            }
+        };
+
+        class FinalSiblingFusionMinOpTree
+        {
+        public:
+            explicit FinalSiblingFusionMinOpTree(const std::vector<std::size_t> &opCounts)
+            {
+                while (leafCount_ < opCounts.size())
+                {
+                    leafCount_ *= 2;
+                }
+                minimum_.assign(leafCount_ * 2, kRemoved);
+                for (std::size_t i = 0; i < opCounts.size(); ++i)
+                {
+                    minimum_[leafCount_ + i] = opCounts[i];
+                }
+                for (std::size_t i = leafCount_; i-- > 1;)
+                {
+                    minimum_[i] = std::min(minimum_[i * 2], minimum_[i * 2 + 1]);
+                }
+            }
+
+            void erase(std::size_t position)
+            {
+                std::size_t node = leafCount_ + position;
+                minimum_[node] = kRemoved;
+                while (node > 1)
+                {
+                    node /= 2;
+                    minimum_[node] = std::min(minimum_[node * 2],
+                                              minimum_[node * 2 + 1]);
+                }
+            }
+
+            std::size_t findFirst(std::size_t begin, std::size_t maxOps) const
+            {
+                return findFirst(1, 0, leafCount_, begin, maxOps);
+            }
+
+            static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+
+        private:
+            static constexpr std::size_t kRemoved = std::numeric_limits<std::size_t>::max();
+
+            std::size_t findFirst(std::size_t node,
+                                  std::size_t left,
+                                  std::size_t right,
+                                  std::size_t begin,
+                                  std::size_t maxOps) const
+            {
+                if (right <= begin || minimum_[node] > maxOps)
+                {
+                    return npos;
+                }
+                if (right - left == 1)
+                {
+                    return left;
+                }
+                const std::size_t middle = left + (right - left) / 2;
+                const std::size_t leftResult =
+                    findFirst(node * 2, left, middle, begin, maxOps);
+                return leftResult != npos
+                           ? leftResult
+                           : findFirst(node * 2 + 1, middle, right, begin, maxOps);
+            }
+
+            std::size_t leafCount_ = 1;
+            std::vector<std::size_t> minimum_;
+        };
+
+        struct FinalSiblingFusionProbeStats
+        {
+            using CountMap = ActivityScheduleSummaryStats::KindCountMap;
+
+            std::size_t computeSupernodes = 0;
+            std::size_t signatureGroups = 0;
+            std::size_t signatureGroupNodes = 0;
+            std::size_t maxSignatureGroupNodes = 0;
+            std::size_t emptyIncomingNodes = 0;
+            std::size_t inputActivationNodes = 0;
+            std::size_t stateActivationNodes = 0;
+            std::size_t eventActivationNodes = 0;
+            std::size_t unclassifiedActivationNodes = 0;
+            std::size_t singletonSignatureNodes = 0;
+            std::size_t rawExactPairs = 0;
+            std::size_t capEligiblePairs = 0;
+            std::size_t exactEligible = 0;
+            std::size_t selected = 0;
+            std::size_t eligibleProjectedBaeGain = 0;
+            std::size_t projectedBaeGain = 0;
+            std::size_t fusedOps = 0;
+            std::size_t fusedOpLimit = 0;
+            std::size_t rejectedCapacityPairs = 0;
+            std::size_t rejectedMinGainPairs = 0;
+            std::size_t rejectedOverlapPairs = 0;
+            std::size_t stalePairRefreshes = 0;
+            std::size_t rejectedSelectionPairLimit = 0;
+            std::size_t rejectedSelectionBudget = 0;
+            std::size_t adjacentPairsScanned = 0;
+            std::size_t adjacentCapEligible = 0;
+            std::size_t rejectedAdjacentTopo = 0;
+            std::size_t rejectedAdjacentLevel = 0;
+            std::size_t rejectedAdjacentValueSignature = 0;
+            std::size_t rejectedAdjacentInputSignature = 0;
+            std::size_t rejectedAdjacentStateSignature = 0;
+            std::size_t rejectedAdjacentStateActivation = 0;
+            std::size_t rejectedAdjacentEventActivation = 0;
+            std::size_t rejectedAdjacentUnclassifiedActivation = 0;
+            std::size_t rejectedAdjacentCapacity = 0;
+            std::size_t rejectedAdjacentMinGain = 0;
+            bool skippedOversize = false;
+            bool skippedFinalTopo = false;
+            CountMap eligibleByGain;
+            CountMap eligibleByFusedOps;
+            CountMap eligibleByStorageDistance;
+            CountMap eligibleByTopoDistance;
+            CountMap selectedByGain;
+            CountMap selectedByFusedOps;
+            CountMap selectedByStorageDistance;
+            CountMap selectedByTopoDistance;
+        };
+
+        std::string finalSiblingFusionDistanceBucket(std::size_t distance)
+        {
+            if (distance <= 1)
+            {
+                return "1";
+            }
+            if (distance <= 4)
+            {
+                return "2-4";
+            }
+            if (distance <= 16)
+            {
+                return "5-16";
+            }
+            if (distance <= 64)
+            {
+                return "17-64";
+            }
+            if (distance <= 256)
+            {
+                return "65-256";
+            }
+            return ">256";
+        }
+
+        std::size_t saturatedAdd(std::size_t lhs, unsigned __int128 rhs) noexcept
+        {
+            const auto max = static_cast<unsigned __int128>(
+                std::numeric_limits<std::size_t>::max());
+            const auto sum = static_cast<unsigned __int128>(lhs) + rhs;
+            return sum > max ? std::numeric_limits<std::size_t>::max()
+                             : static_cast<std::size_t>(sum);
+        }
+
+        FinalSiblingFusionProbeStats evaluateFinalSiblingFusion(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityScheduleBuild &build,
+            const ComputeNodeMaterializePerfStats &materializePerf,
+            std::vector<FinalSiblingFusionCandidate> *selectedCandidates = nullptr)
+        {
+            FinalSiblingFusionProbeStats stats;
+            if (selectedCandidates != nullptr)
+            {
+                selectedCandidates->clear();
+            }
+            if (materializePerf.splitOversizeComputeNodes != 0)
+            {
+                stats.skippedOversize = true;
+                return stats;
+            }
+            if (options.finalTopoPolicy != "level-id")
+            {
+                stats.skippedFinalTopo = true;
+                return stats;
+            }
+
+            const std::size_t supernodeCount = build.supernodeToOps.size();
+            std::vector<uint32_t> topoPosition(supernodeCount,
+                                               kInvalidActivitySupernodeId);
+            std::vector<std::size_t> level(supernodeCount, 0);
+            for (uint32_t position = 0; position < build.topoOrder.size(); ++position)
+            {
+                const uint32_t node = build.topoOrder[position];
+                if (node >= supernodeCount)
+                {
+                    continue;
+                }
+                topoPosition[node] = position;
+                for (const uint32_t succ : build.dag[node])
+                {
+                    if (succ < level.size())
+                    {
+                        level[succ] = std::max(level[succ], level[node] + 1);
+                    }
+                }
+            }
+
+            std::vector<std::vector<uint32_t>> incomingValues(supernodeCount);
+            for (std::size_t valueIndex = 0; valueIndex < build.valueFanout.size(); ++valueIndex)
+            {
+                for (const uint32_t target : build.valueFanout[valueIndex])
+                {
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        incomingValues[target].push_back(
+                            static_cast<uint32_t>(valueIndex + 1));
+                    }
+                }
+            }
+
+            const std::size_t maxValueIndex =
+                graph.values().empty() ? 0 : graph.values().back().index;
+            std::vector<uint8_t> isInputValue(maxValueIndex + 1, 0);
+            const auto noteInputValue = [&](wolvrix::lib::grh::ValueId value)
+            {
+                if (value.valid() && value.index < isInputValue.size())
+                {
+                    isInputValue[value.index] = 1;
+                }
+            };
+            for (const auto &port : graph.inputPorts())
+            {
+                noteInputValue(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                noteInputValue(port.in);
+            }
+
+            std::vector<std::vector<uint32_t>> inputValues(supernodeCount);
+            std::vector<uint8_t> stateActivation(supernodeCount, 0);
+            std::vector<uint8_t> eventActivation(supernodeCount, 0);
+            std::vector<uint8_t> unclassifiedActivation(supernodeCount, 0);
+            for (uint32_t supernode = 0; supernode < supernodeCount; ++supernode)
+            {
+                if (supernode >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernode] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                for (const auto opId : build.supernodeToOps[supernode])
+                {
+                    const auto op = graph.getOperation(opId);
+                    switch (op.kind())
+                    {
+                    case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+                    case wolvrix::lib::grh::OperationKind::kLatchReadPort:
+                    case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+                        stateActivation[supernode] = 1;
+                        break;
+                    default:
+                        break;
+                    }
+                    if (op.kind() == wolvrix::lib::grh::OperationKind::kSystemTask ||
+                        op.kind() == wolvrix::lib::grh::OperationKind::kDpicCall ||
+                        opHasSideEffects(op))
+                    {
+                        eventActivation[supernode] = 1;
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        stateActivation[supernode] = 1;
+                    }
+                    for (const auto operand : op.operands())
+                    {
+                        if (operand.valid() && operand.index < isInputValue.size() &&
+                            isInputValue[operand.index] != 0)
+                        {
+                            inputValues[supernode].push_back(operand.index);
+                        }
+                        else if (operand.valid() && !graph.valueDef(operand).valid())
+                        {
+                            unclassifiedActivation[supernode] = 1;
+                        }
+                    }
+                }
+            }
+
+            std::vector<std::string> stateSymbols;
+            stateSymbols.reserve(build.stateReadSupernodes.size());
+            for (const auto &[symbol, _] : build.stateReadSupernodes)
+            {
+                stateSymbols.push_back(symbol);
+            }
+            std::sort(stateSymbols.begin(), stateSymbols.end());
+            std::vector<std::vector<uint32_t>> stateReads(supernodeCount);
+            for (uint32_t symbolId = 0; symbolId < stateSymbols.size(); ++symbolId)
+            {
+                const auto it = build.stateReadSupernodes.find(stateSymbols[symbolId]);
+                if (it == build.stateReadSupernodes.end())
+                {
+                    continue;
+                }
+                for (const uint32_t target : it->second)
+                {
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        stateReads[target].push_back(symbolId);
+                    }
+                }
+            }
+
+            std::map<FinalSiblingFusionSignature, std::vector<uint32_t>> groups;
+            std::size_t computeOps = 0;
+            for (uint32_t supernode = 0; supernode < supernodeCount; ++supernode)
+            {
+                if (supernode >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernode] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                ++stats.computeSupernodes;
+                computeOps += build.supernodeToOps[supernode].size();
+                std::sort(incomingValues[supernode].begin(), incomingValues[supernode].end());
+                incomingValues[supernode].erase(
+                    std::unique(incomingValues[supernode].begin(),
+                                incomingValues[supernode].end()),
+                    incomingValues[supernode].end());
+                std::sort(stateReads[supernode].begin(), stateReads[supernode].end());
+                stateReads[supernode].erase(
+                    std::unique(stateReads[supernode].begin(),
+                                stateReads[supernode].end()),
+                    stateReads[supernode].end());
+                std::sort(inputValues[supernode].begin(), inputValues[supernode].end());
+                inputValues[supernode].erase(
+                    std::unique(inputValues[supernode].begin(),
+                                inputValues[supernode].end()),
+                    inputValues[supernode].end());
+                if (!inputValues[supernode].empty())
+                {
+                    ++stats.inputActivationNodes;
+                }
+                if (stateActivation[supernode] != 0 || !stateReads[supernode].empty())
+                {
+                    ++stats.stateActivationNodes;
+                    continue;
+                }
+                if (eventActivation[supernode] != 0)
+                {
+                    ++stats.eventActivationNodes;
+                    continue;
+                }
+                if (unclassifiedActivation[supernode] != 0)
+                {
+                    ++stats.unclassifiedActivationNodes;
+                    continue;
+                }
+                if (incomingValues[supernode].empty())
+                {
+                    ++stats.emptyIncomingNodes;
+                    continue;
+                }
+                groups[FinalSiblingFusionSignature{
+                           .level = level[supernode],
+                           .incomingValues = incomingValues[supernode],
+                           .inputValues = inputValues[supernode],
+                           .stateReads = stateReads[supernode],
+                       }]
+                    .push_back(supernode);
+            }
+
+            const auto ppmLimit =
+                (static_cast<unsigned __int128>(computeOps) *
+                 options.finalSiblingFusionMaxFusedOpPpm) /
+                1000000U;
+            stats.fusedOpLimit =
+                ppmLimit > std::numeric_limits<std::size_t>::max()
+                    ? std::numeric_limits<std::size_t>::max()
+                    : static_cast<std::size_t>(ppmLimit);
+
+            const std::size_t computeCap = options.maxOpInComputeSupernode;
+            std::vector<FinalSiblingFusionCandidate> candidates;
+            std::size_t bucketOrder = 0;
+            for (auto &[signature, nodes] : groups)
+            {
+                const std::size_t currentBucketOrder = bucketOrder++;
+                std::stable_sort(nodes.begin(),
+                                 nodes.end(),
+                                 [&topoPosition](uint32_t lhs, uint32_t rhs)
+                                 {
+                                     return std::tuple{topoPosition[lhs], lhs} <
+                                            std::tuple{topoPosition[rhs], rhs};
+                                 });
+                if (nodes.size() < 2)
+                {
+                    ++stats.singletonSignatureNodes;
+                    continue;
+                }
+                ++stats.signatureGroups;
+                stats.signatureGroupNodes += nodes.size();
+                stats.maxSignatureGroupNodes =
+                    std::max(stats.maxSignatureGroupNodes, nodes.size());
+                const unsigned __int128 rawPairs =
+                    static_cast<unsigned __int128>(nodes.size()) *
+                    static_cast<unsigned __int128>(nodes.size() - 1) / 2;
+                stats.rawExactPairs = saturatedAdd(stats.rawExactPairs, rawPairs);
+
+                std::vector<std::size_t> sortedSizes;
+                sortedSizes.reserve(nodes.size());
+                for (const uint32_t node : nodes)
+                {
+                    sortedSizes.push_back(build.supernodeToOps[node].size());
+                }
+                std::sort(sortedSizes.begin(), sortedSizes.end());
+                std::size_t capPairCount = 0;
+                if (!sortedSizes.empty())
+                {
+                    std::size_t right = sortedSizes.size() - 1;
+                    for (std::size_t left = 0; left < sortedSizes.size(); ++left)
+                    {
+                        if (left >= right)
+                        {
+                            break;
+                        }
+                        while (left < right &&
+                               (sortedSizes[left] > computeCap ||
+                                sortedSizes[right] > computeCap - sortedSizes[left]))
+                        {
+                            --right;
+                        }
+                        if (left >= right)
+                        {
+                            break;
+                        }
+                        capPairCount += right - left;
+                    }
+                }
+                stats.capEligiblePairs = saturatedAdd(stats.capEligiblePairs, capPairCount);
+                stats.rejectedCapacityPairs = saturatedAdd(
+                    stats.rejectedCapacityPairs,
+                    rawPairs - static_cast<unsigned __int128>(capPairCount));
+                if (signature.incomingValues.size() < options.finalSiblingFusionMinGain)
+                {
+                    stats.rejectedMinGainPairs = saturatedAdd(
+                        stats.rejectedMinGainPairs,
+                        capPairCount);
+                    continue;
+                }
+
+                std::vector<std::size_t> opCounts;
+                opCounts.reserve(nodes.size());
+                for (const uint32_t node : nodes)
+                {
+                    opCounts.push_back(build.supernodeToOps[node].size());
+                }
+                FinalSiblingFusionMinOpTree activeOps(opCounts);
+                std::vector<uint8_t> active(nodes.size(), 1);
+                std::priority_queue<FinalSiblingFusionPairEdge,
+                                    std::vector<FinalSiblingFusionPairEdge>,
+                                    FinalSiblingFusionPairEdgeGreater>
+                    pairQueue;
+                const auto makePairEdge = [&](std::size_t lhsPosition)
+                    -> std::optional<FinalSiblingFusionPairEdge>
+                {
+                    if (lhsPosition >= nodes.size() || !active[lhsPosition])
+                    {
+                        return std::nullopt;
+                    }
+                    const std::size_t lhsOps = opCounts[lhsPosition];
+                    if (lhsOps > computeCap)
+                    {
+                        return std::nullopt;
+                    }
+                    const std::size_t rhsPosition =
+                        activeOps.findFirst(lhsPosition + 1, computeCap - lhsOps);
+                    if (rhsPosition == FinalSiblingFusionMinOpTree::npos)
+                    {
+                        return std::nullopt;
+                    }
+                    const uint32_t lhs = nodes[lhsPosition];
+                    const uint32_t rhs = nodes[rhsPosition];
+                    return FinalSiblingFusionPairEdge{
+                        .lhsPosition = lhsPosition,
+                        .rhsPosition = rhsPosition,
+                        .topoDistance = topoPosition[rhs] - topoPosition[lhs],
+                        .storageDistance = lhs > rhs ? lhs - rhs : rhs - lhs,
+                        .minNode = std::min(lhs, rhs),
+                        .maxNode = std::max(lhs, rhs),
+                    };
+                };
+                for (std::size_t lhsPosition = 0; lhsPosition < nodes.size(); ++lhsPosition)
+                {
+                    if (const auto edge = makePairEdge(lhsPosition))
+                    {
+                        pairQueue.push(*edge);
+                    }
+                }
+
+                std::size_t pairOrder = 0;
+                while (!pairQueue.empty())
+                {
+                    const FinalSiblingFusionPairEdge edge = pairQueue.top();
+                    pairQueue.pop();
+                    if (!active[edge.lhsPosition])
+                    {
+                        continue;
+                    }
+                    const auto currentEdge = makePairEdge(edge.lhsPosition);
+                    if (!currentEdge)
+                    {
+                        continue;
+                    }
+                    if (currentEdge->rhsPosition != edge.rhsPosition)
+                    {
+                        ++stats.stalePairRefreshes;
+                        pairQueue.push(*currentEdge);
+                        continue;
+                    }
+
+                    active[edge.lhsPosition] = 0;
+                    active[edge.rhsPosition] = 0;
+                    activeOps.erase(edge.lhsPosition);
+                    activeOps.erase(edge.rhsPosition);
+                    const std::size_t fusedOps =
+                        opCounts[edge.lhsPosition] + opCounts[edge.rhsPosition];
+                    candidates.push_back(FinalSiblingFusionCandidate{
+                        .lhs = edge.minNode,
+                        .rhs = edge.maxNode,
+                        .lhsActiveId = topoPosition[edge.minNode],
+                        .rhsActiveId = topoPosition[edge.maxNode],
+                        .gain = signature.incomingValues.size(),
+                        .fusedOps = fusedOps,
+                        .storageDistance = edge.storageDistance,
+                        .topoDistance = edge.topoDistance,
+                        .bucketOrder = currentBucketOrder,
+                        .pairOrder = pairOrder++,
+                    });
+                    ++stats.exactEligible;
+                    stats.eligibleProjectedBaeGain += signature.incomingValues.size();
+                    ++stats.eligibleByGain[std::to_string(signature.incomingValues.size())];
+                    ++stats.eligibleByFusedOps[std::to_string(fusedOps)];
+                    ++stats.eligibleByStorageDistance[
+                        finalSiblingFusionDistanceBucket(edge.storageDistance)];
+                    ++stats.eligibleByTopoDistance[
+                        finalSiblingFusionDistanceBucket(edge.topoDistance)];
+                }
+                stats.rejectedOverlapPairs = saturatedAdd(
+                    stats.rejectedOverlapPairs,
+                    static_cast<unsigned __int128>(capPairCount) - pairOrder);
+            }
+
+            for (uint32_t lhs = 0; lhs + 1 < supernodeCount; ++lhs)
+            {
+                const uint32_t rhs = lhs + 1;
+                if (rhs >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[lhs] != ActivityScheduleSupernodeKind::Compute ||
+                    build.supernodeKinds[rhs] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                ++stats.adjacentPairsScanned;
+                if (level[lhs] != level[rhs])
+                {
+                    ++stats.rejectedAdjacentLevel;
+                    continue;
+                }
+                if (topoPosition[lhs] == kInvalidActivitySupernodeId ||
+                    topoPosition[rhs] != topoPosition[lhs] + 1)
+                {
+                    ++stats.rejectedAdjacentTopo;
+                    continue;
+                }
+                if (incomingValues[lhs] != incomingValues[rhs])
+                {
+                    ++stats.rejectedAdjacentValueSignature;
+                    continue;
+                }
+                if (inputValues[lhs] != inputValues[rhs])
+                {
+                    ++stats.rejectedAdjacentInputSignature;
+                    continue;
+                }
+                if (stateActivation[lhs] != 0 || stateActivation[rhs] != 0)
+                {
+                    ++stats.rejectedAdjacentStateActivation;
+                    continue;
+                }
+                if (stateReads[lhs] != stateReads[rhs])
+                {
+                    ++stats.rejectedAdjacentStateSignature;
+                    continue;
+                }
+                if (eventActivation[lhs] != 0 || eventActivation[rhs] != 0)
+                {
+                    ++stats.rejectedAdjacentEventActivation;
+                    continue;
+                }
+                if (unclassifiedActivation[lhs] != 0 ||
+                    unclassifiedActivation[rhs] != 0)
+                {
+                    ++stats.rejectedAdjacentUnclassifiedActivation;
+                    continue;
+                }
+                const std::size_t lhsOps = build.supernodeToOps[lhs].size();
+                const std::size_t rhsOps = build.supernodeToOps[rhs].size();
+                if (lhsOps > computeCap || rhsOps > computeCap - lhsOps)
+                {
+                    ++stats.rejectedAdjacentCapacity;
+                    continue;
+                }
+                ++stats.adjacentCapEligible;
+                if (incomingValues[lhs].size() < options.finalSiblingFusionMinGain)
+                {
+                    ++stats.rejectedAdjacentMinGain;
+                    continue;
+                }
+            }
+
+            std::stable_sort(candidates.begin(),
+                             candidates.end(),
+                             [](const auto &lhs, const auto &rhs)
+                             {
+                                 if (lhs.gain != rhs.gain)
+                                 {
+                                     return lhs.gain > rhs.gain;
+                                 }
+                                 return std::tuple{lhs.bucketOrder,
+                                                   lhs.pairOrder,
+                                                   lhs.fusedOps,
+                                                   lhs.lhs,
+                                                   lhs.rhs} <
+                                        std::tuple{rhs.bucketOrder,
+                                                   rhs.pairOrder,
+                                                   rhs.fusedOps,
+                                                   rhs.lhs,
+                                                   rhs.rhs};
+                             });
+            for (const auto &candidate : candidates)
+            {
+                if (stats.selected >= options.finalSiblingFusionMaxPairs)
+                {
+                    ++stats.rejectedSelectionPairLimit;
+                    continue;
+                }
+                if (candidate.fusedOps >
+                    stats.fusedOpLimit - std::min(stats.fusedOps, stats.fusedOpLimit))
+                {
+                    ++stats.rejectedSelectionBudget;
+                    continue;
+                }
+                ++stats.selected;
+                stats.fusedOps += candidate.fusedOps;
+                stats.projectedBaeGain += candidate.gain;
+                if (selectedCandidates != nullptr)
+                {
+                    selectedCandidates->push_back(candidate);
+                }
+                ++stats.selectedByGain[std::to_string(candidate.gain)];
+                ++stats.selectedByFusedOps[std::to_string(candidate.fusedOps)];
+                ++stats.selectedByStorageDistance[
+                    finalSiblingFusionDistanceBucket(candidate.storageDistance)];
+                ++stats.selectedByTopoDistance[
+                    finalSiblingFusionDistanceBucket(candidate.topoDistance)];
+            }
+            return stats;
+        }
+
         struct FinalFaninPullbackCandidate
         {
             uint32_t computeNode = kInvalidActivitySupernodeId;
@@ -11747,6 +12464,13 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.finalSiblingFusionPolicy != "off" &&
+            options_.finalSiblingFusionPolicy != "probe")
+        {
+            error("activity-schedule final_sibling_fusion_policy must be off or probe");
+            result.failed = true;
+            return result;
+        }
         if (options_.postDpRefinePolicy != "off" &&
             options_.postDpRefinePolicy != "strict" &&
             options_.postDpRefinePolicy != "bae-budget" &&
@@ -11817,6 +12541,12 @@ namespace wolvrix::lib::transform
         if (options_.finalFaninPullbackMaxMovedOpPpm > 1000000)
         {
             error("activity-schedule final_fanin_pullback_max_moved_op_ppm must be <= 1000000");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalSiblingFusionMaxFusedOpPpm > 1000000)
+        {
+            error("activity-schedule final_sibling_fusion_max_fused_op_ppm must be <= 1000000");
             result.failed = true;
             return result;
         }
@@ -12488,6 +13218,124 @@ namespace wolvrix::lib::transform
                     formatTopCounts(evaluation.selectedByNodeOps, 32) +
                     " selected_by_max_width=" +
                     formatTopCounts(evaluation.selectedByMaxWidth, 32));
+        }
+
+        if (options_.finalSiblingFusionPolicy == "probe")
+        {
+            const auto probeStart = std::chrono::steady_clock::now();
+            std::vector<FinalSiblingFusionCandidate> selectedCandidates;
+            const FinalSiblingFusionProbeStats probe =
+                evaluateFinalSiblingFusion(
+                    *graph, options_, build, materializePerf, &selectedCandidates);
+            const std::uint64_t probeMs = elapsedMs(probeStart);
+            logInfo("activity-schedule final sibling fusion probe: policy=" +
+                    options_.finalSiblingFusionPolicy +
+                    " min_gain=" + std::to_string(options_.finalSiblingFusionMinGain) +
+                    " max_pairs=" + std::to_string(options_.finalSiblingFusionMaxPairs) +
+                    " max_fused_op_ppm=" +
+                    std::to_string(options_.finalSiblingFusionMaxFusedOpPpm) +
+                    " compute_supernodes=" + std::to_string(probe.computeSupernodes) +
+                    " signature_groups=" + std::to_string(probe.signatureGroups) +
+                    " signature_group_nodes=" +
+                    std::to_string(probe.signatureGroupNodes) +
+                    " max_signature_group_nodes=" +
+                    std::to_string(probe.maxSignatureGroupNodes) +
+                    " empty_incoming_nodes=" +
+                    std::to_string(probe.emptyIncomingNodes) +
+                    " input_activation_nodes=" +
+                    std::to_string(probe.inputActivationNodes) +
+                    " state_activation_nodes=" +
+                    std::to_string(probe.stateActivationNodes) +
+                    " event_activation_nodes=" +
+                    std::to_string(probe.eventActivationNodes) +
+                    " unclassified_activation_nodes=" +
+                    std::to_string(probe.unclassifiedActivationNodes) +
+                    " singleton_signature_nodes=" +
+                    std::to_string(probe.singletonSignatureNodes) +
+                    " raw_exact_pairs=" + std::to_string(probe.rawExactPairs) +
+                    " cap_eligible_pairs=" + std::to_string(probe.capEligiblePairs) +
+                    " exact_eligible=" + std::to_string(probe.exactEligible) +
+                    " selected=" + std::to_string(probe.selected) +
+                    " eligible_projected_bae_gain=" +
+                    std::to_string(probe.eligibleProjectedBaeGain) +
+                    " projected_bae_gain=" +
+                    std::to_string(probe.projectedBaeGain) +
+                    " fused_ops=" + std::to_string(probe.fusedOps) +
+                    " fused_op_limit=" + std::to_string(probe.fusedOpLimit) +
+                    " adjacent_pairs_scanned=" +
+                    std::to_string(probe.adjacentPairsScanned) +
+                    " adjacent_cap_eligible=" +
+                    std::to_string(probe.adjacentCapEligible) +
+                    " skipped_oversize=" +
+                    std::string(probe.skippedOversize ? "true" : "false") +
+                    " skipped_final_topo=" +
+                    std::string(probe.skippedFinalTopo ? "true" : "false") +
+                    " elapsed_ms=" + std::to_string(probeMs));
+            logInfo("activity-schedule final sibling fusion probe rejects: rejected_capacity_pairs=" +
+                    std::to_string(probe.rejectedCapacityPairs) +
+                    " rejected_min_gain_pairs=" +
+                    std::to_string(probe.rejectedMinGainPairs) +
+                    " rejected_overlap_pairs=" +
+                    std::to_string(probe.rejectedOverlapPairs) +
+                    " stale_pair_refreshes=" +
+                    std::to_string(probe.stalePairRefreshes) +
+                    " rejected_selection_pair_limit=" +
+                    std::to_string(probe.rejectedSelectionPairLimit) +
+                    " rejected_selection_budget=" +
+                    std::to_string(probe.rejectedSelectionBudget) +
+                    " rejected_adjacent_topo=" +
+                    std::to_string(probe.rejectedAdjacentTopo) +
+                    " rejected_adjacent_level=" +
+                    std::to_string(probe.rejectedAdjacentLevel) +
+                    " rejected_adjacent_value_signature=" +
+                    std::to_string(probe.rejectedAdjacentValueSignature) +
+                    " rejected_adjacent_input_signature=" +
+                    std::to_string(probe.rejectedAdjacentInputSignature) +
+                    " rejected_adjacent_state_signature=" +
+                    std::to_string(probe.rejectedAdjacentStateSignature) +
+                    " rejected_adjacent_state_activation=" +
+                    std::to_string(probe.rejectedAdjacentStateActivation) +
+                    " rejected_adjacent_event_activation=" +
+                    std::to_string(probe.rejectedAdjacentEventActivation) +
+                    " rejected_adjacent_unclassified_activation=" +
+                    std::to_string(probe.rejectedAdjacentUnclassifiedActivation) +
+                    " rejected_adjacent_capacity=" +
+                    std::to_string(probe.rejectedAdjacentCapacity) +
+                    " rejected_adjacent_min_gain=" +
+                    std::to_string(probe.rejectedAdjacentMinGain));
+            logInfo("activity-schedule final sibling fusion probe distribution: eligible_by_gain=" +
+                    formatTopCounts(probe.eligibleByGain, 32) +
+                    " eligible_by_fused_ops=" +
+                    formatTopCounts(probe.eligibleByFusedOps, 32) +
+                    " eligible_by_storage_distance=" +
+                    formatTopCounts(probe.eligibleByStorageDistance, 32) +
+                    " eligible_by_topo_distance=" +
+                    formatTopCounts(probe.eligibleByTopoDistance, 32) +
+                    " selected_by_gain=" +
+                    formatTopCounts(probe.selectedByGain, 32) +
+                    " selected_by_fused_ops=" +
+                    formatTopCounts(probe.selectedByFusedOps, 32) +
+                    " selected_by_storage_distance=" +
+                    formatTopCounts(probe.selectedByStorageDistance, 32) +
+                    " selected_by_topo_distance=" +
+                    formatTopCounts(probe.selectedByTopoDistance, 32));
+            for (std::size_t rank = 0; rank < selectedCandidates.size(); ++rank)
+            {
+                const auto &candidate = selectedCandidates[rank];
+                logInfo("activity-schedule final sibling fusion probe pair: rank=" +
+                        std::to_string(rank) +
+                        " lhs=" + std::to_string(candidate.lhs) +
+                        " rhs=" + std::to_string(candidate.rhs) +
+                        " lhs_active_id=" +
+                        std::to_string(candidate.lhsActiveId) +
+                        " rhs_active_id=" +
+                        std::to_string(candidate.rhsActiveId) +
+                        " gain=" + std::to_string(candidate.gain) +
+                        " fused_ops=" + std::to_string(candidate.fusedOps) +
+                        " topo_distance=" + std::to_string(candidate.topoDistance) +
+                        " storage_distance=" +
+                        std::to_string(candidate.storageDistance));
+            }
         }
 
         ActivityScheduleCommitLocalityGroupOrder commitLocalityGroupOrder;

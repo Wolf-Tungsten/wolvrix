@@ -583,3 +583,10 @@ result 变化产生。
 | `splitOversizeComputeNodes` | 是否在最终 materialize 时切开超大 compute node。 |
 | `splitOversizeComputeNodeMaxOps` | 超大 compute node split 的 chunk 上限；为 0 时使用 `maxOpInComputeSupernode`。 |
 | `exportComputeDagPath` | 导出 compute op DAG JSON。 |
+
+Emitter 的 `direct_single_writer_state_reads` 和
+`pure_event_compute_word_bypass` 默认开启。两者都按 attribute、环境变量、C++ 默认值的
+顺序解析；attribute 名分别对应环境变量
+`WOLVRIX_GRHSIM_DIRECT_SINGLE_WRITER_STATE_READS` 和
+`WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_BYPASS`。将 attribute 或环境变量显式设为
+`0` 可回滚到旧生成路径。

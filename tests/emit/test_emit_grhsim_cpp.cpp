@@ -1135,10 +1135,10 @@ namespace
                                   bool posedgeFullpassSpecialization = false,
                                   bool perf = false,
                                   bool stateReadLocalityStats = false,
-                                  bool directSingleWriterStateReads = false,
+                                  std::optional<bool> directSingleWriterStateReads = false,
                                   bool materializedScalarReadLocalityStats = false,
                                   bool fullActiveWordConsume = false,
-                                  std::optional<bool> pureEventComputeWordBypass = std::nullopt,
+                                  std::optional<bool> pureEventComputeWordBypass = false,
                                   std::optional<bool> pureEventComputeWordProfile = std::nullopt,
                                   std::size_t schedBatchMaxOps = 8u,
                                   std::size_t schedBatchMaxEstimatedLines = 96u,
@@ -1182,9 +1182,10 @@ namespace
         {
             options.attributes["state_read_locality_stats"] = "1";
         }
-        if (directSingleWriterStateReads)
+        if (directSingleWriterStateReads.has_value())
         {
-            options.attributes["direct_single_writer_state_reads"] = "1";
+            options.attributes["direct_single_writer_state_reads"] =
+                *directSingleWriterStateReads ? "1" : "0";
         }
         if (materializedScalarReadLocalityStats)
         {
@@ -6839,6 +6840,12 @@ int main()
 
         const std::filesystem::path directReadDir =
             std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_direct_state_read";
+        constexpr const char *directReadEnv =
+            "WOLVRIX_GRHSIM_DIRECT_SINGLE_WRITER_STATE_READS";
+        if (unsetenv(directReadEnv) != 0)
+        {
+            return fail("failed to clear direct state-read environment option");
+        }
         std::filesystem::remove_all(directReadDir);
         Design directReadDesign = buildDirectStateReadForwardDesign();
         ActivityScheduleOptions directReadScheduleOptions;
@@ -6855,7 +6862,10 @@ int main()
                                       false,
                                       false,
                                       false,
-                                      true))
+                                      std::nullopt,
+                                      false,
+                                      false,
+                                      false))
         {
             return fail("direct state-read activity-schedule pass failed");
         }
@@ -6908,6 +6918,85 @@ int main()
             multiReadSource.find("direct single-writer state read") != std::string_view::npos)
         {
             return fail("protected and multi-writer register reads must retain the materialized path");
+        }
+
+        const auto emitDirectReadOptionFixture = [&](std::string_view suffix,
+                                                     std::optional<bool> directReadOption)
+            -> std::optional<std::filesystem::path>
+        {
+            const std::filesystem::path dir = directReadDir.string() + "_" + std::string(suffix);
+            std::filesystem::remove_all(dir);
+            Design fixture = buildDirectStateReadForwardDesign();
+            EmitDiagnostics fixtureDiag;
+            EmitResult fixtureResult;
+            if (!emitWithActivitySchedule(fixture,
+                                          dir,
+                                          fixtureDiag,
+                                          fixtureResult,
+                                          directReadScheduleOptions,
+                                          false,
+                                          false,
+                                          false,
+                                          directReadOption,
+                                          false,
+                                          false,
+                                          false) ||
+                !fixtureResult.success || fixtureDiag.hasError())
+            {
+                return std::nullopt;
+            }
+            return dir;
+        };
+        const auto directReadExplicitOffDir =
+            emitDirectReadOptionFixture("explicit_off", false);
+        if (setenv(directReadEnv, "0", 1) != 0)
+        {
+            return fail("failed to set direct state-read environment option");
+        }
+        const auto directReadEnvOffDir =
+            emitDirectReadOptionFixture("env_off", std::nullopt);
+        const auto directReadAttributeOnEnvOffDir =
+            emitDirectReadOptionFixture("attribute_on_env_off", true);
+        if (setenv(directReadEnv, "1", 1) != 0)
+        {
+            return fail("failed to set direct state-read environment option");
+        }
+        const auto directReadAttributeOffEnvOnDir =
+            emitDirectReadOptionFixture("attribute_off_env_on", false);
+        if (unsetenv(directReadEnv) != 0)
+        {
+            return fail("failed to clear direct state-read environment option");
+        }
+        if (!directReadExplicitOffDir || !directReadEnvOffDir ||
+            !directReadAttributeOnEnvOffDir || !directReadAttributeOffEnvOnDir)
+        {
+            return fail("direct state-read option fixture emit failed");
+        }
+        const auto directReadDefaultFiles =
+            collectGeneratedSourceFiles(directReadDir, "grhsim_top");
+        const auto directReadExplicitOffFiles =
+            collectGeneratedSourceFiles(*directReadExplicitOffDir, "grhsim_top");
+        const auto directReadEnvOffFiles =
+            collectGeneratedSourceFiles(*directReadEnvOffDir, "grhsim_top");
+        const auto directReadAttributeOnEnvOffFiles =
+            collectGeneratedSourceFiles(*directReadAttributeOnEnvOffDir, "grhsim_top");
+        const auto directReadAttributeOffEnvOnFiles =
+            collectGeneratedSourceFiles(*directReadAttributeOffEnvOnDir, "grhsim_top");
+        const std::string directReadExplicitOffSched =
+            readFiles(collectSchedFiles(*directReadExplicitOffDir, "grhsim_top_sched_"));
+        constexpr std::string_view directReadMarker =
+            "direct single-writer state read: consumer reads visible state";
+        if (directReadDefaultFiles != directReadAttributeOnEnvOffFiles ||
+            directReadDefaultFiles == directReadExplicitOffFiles ||
+            directReadSched.find(directReadMarker) == std::string::npos)
+        {
+            return fail("direct state-read native default should match explicit enable");
+        }
+        if (directReadExplicitOffFiles != directReadEnvOffFiles ||
+            directReadExplicitOffFiles != directReadAttributeOffEnvOnFiles ||
+            directReadExplicitOffSched.find(directReadMarker) != std::string::npos)
+        {
+            return fail("direct state-read explicit disable or option precedence changed legacy output");
         }
 
         const std::filesystem::path directReadHarnessPath = directReadDir / "grhsim_top_harness.cpp";
@@ -6985,6 +7074,12 @@ int main()
 
         const std::filesystem::path pureEventRoot =
             std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_pure_event_word";
+        constexpr const char *pureEventBypassEnv =
+            "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_BYPASS";
+        if (unsetenv(pureEventBypassEnv) != 0)
+        {
+            return fail("failed to clear pure-event compute-word environment option");
+        }
         ActivityScheduleOptions pureEventSchedule;
         pureEventSchedule.maxOpInComputeSupernode = 1;
         pureEventSchedule.enableCoarsen = false;
@@ -7249,6 +7344,35 @@ int main()
             emitPureEventPackEstimatedLineFixture("pack_estimated_line_probe", "probe");
         const auto pureEventPackEstimatedLineTargetedDir =
             emitPureEventPackEstimatedLineFixture("pack_estimated_line_targeted", "targeted");
+        if (setenv(pureEventBypassEnv, "0", 1) != 0)
+        {
+            return fail("failed to set pure-event compute-word environment option");
+        }
+        const auto pureEventEnvDisabledDir = emitPureEventFixture("env_disabled",
+                                                                  PureEventWordFixtureMode::kHomogeneous,
+                                                                  std::nullopt,
+                                                                  false,
+                                                                  false);
+        const auto pureEventAttributeEnabledEnvDisabledDir =
+            emitPureEventFixture("attribute_enabled_env_disabled",
+                                 PureEventWordFixtureMode::kHomogeneous,
+                                 true,
+                                 false,
+                                 false);
+        if (setenv(pureEventBypassEnv, "1", 1) != 0)
+        {
+            return fail("failed to set pure-event compute-word environment option");
+        }
+        const auto pureEventAttributeDisabledEnvEnabledDir =
+            emitPureEventFixture("attribute_disabled_env_enabled",
+                                 PureEventWordFixtureMode::kHomogeneous,
+                                 false,
+                                 false,
+                                 false);
+        if (unsetenv(pureEventBypassEnv) != 0)
+        {
+            return fail("failed to clear pure-event compute-word environment option");
+        }
         if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
             !pureEventProfileDisabledDir || !pureEventProfileOnlyDir || !pureEventProfileBypassDir ||
             !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir ||
@@ -7257,7 +7381,9 @@ int main()
             !pureEventPackTargetedDir || !pureEventPackTargetedRepeatDir ||
             !pureEventPackRemainderOffDir || !pureEventPackRemainderProbeDir ||
             !pureEventPackRemainderTargetedDir || !pureEventPackEstimatedLineOffDir ||
-            !pureEventPackEstimatedLineProbeDir || !pureEventPackEstimatedLineTargetedDir)
+            !pureEventPackEstimatedLineProbeDir || !pureEventPackEstimatedLineTargetedDir ||
+            !pureEventEnvDisabledDir || !pureEventAttributeEnabledEnvDisabledDir ||
+            !pureEventAttributeDisabledEnvEnabledDir)
         {
             return fail("pure-event compute-word fixture emit failed");
         }
@@ -7271,17 +7397,32 @@ int main()
         };
         const std::string pureEventDefaultSource = readPureEventGenerated(*pureEventDefaultDir);
         const std::string pureEventDisabledSource = readPureEventGenerated(*pureEventDisabledDir);
+        const std::string pureEventEnabledSource = readPureEventGenerated(*pureEventEnabledDir);
         const std::string pureEventProfileDisabledSource =
             readPureEventGenerated(*pureEventProfileDisabledDir);
+        const std::string pureEventEnvDisabledSource =
+            readPureEventGenerated(*pureEventEnvDisabledDir);
+        const std::string pureEventAttributeEnabledEnvDisabledSource =
+            readPureEventGenerated(*pureEventAttributeEnabledEnvDisabledDir);
+        const std::string pureEventAttributeDisabledEnvEnabledSource =
+            readPureEventGenerated(*pureEventAttributeDisabledEnvEnabledDir);
         const std::string pureEventEnabledSched =
             readFiles(collectSchedFiles(*pureEventEnabledDir, "grhsim_top_sched_"));
         constexpr std::string_view pureEventMarker =
             "// Pure-event compute word: an event miss consumes the cleared word.";
-        if (pureEventDefaultSource != pureEventDisabledSource ||
+        if (pureEventDefaultSource != pureEventEnabledSource ||
             pureEventDefaultSource != pureEventProfileDisabledSource ||
-            pureEventDefaultSource.find(pureEventMarker) != std::string::npos)
+            pureEventDefaultSource != pureEventAttributeEnabledEnvDisabledSource ||
+            pureEventDefaultSource.find(pureEventMarker) == std::string::npos)
         {
-            return fail("pure-event compute-word default and explicit zero option sources should be byte-identical");
+            return fail("pure-event compute-word native default should match explicit enable");
+        }
+        if (pureEventDisabledSource != pureEventEnvDisabledSource ||
+            pureEventDisabledSource != pureEventAttributeDisabledEnvEnabledSource ||
+            pureEventDisabledSource == pureEventDefaultSource ||
+            pureEventDisabledSource.find(pureEventMarker) != std::string::npos)
+        {
+            return fail("pure-event compute-word explicit disable or option precedence changed legacy output");
         }
 
         const std::string pureEventPackDefaultSource = readPureEventGenerated(*pureEventPackDefaultDir);

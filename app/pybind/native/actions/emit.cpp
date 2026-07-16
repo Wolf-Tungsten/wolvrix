@@ -152,6 +152,7 @@ namespace wolvrix::app::pybind
         PyObject *inputFullpassSpecializationObj = Py_None;
         PyObject *posedgeFullpassSpecializationObj = Py_None;
         PyObject *fullActiveWordConsumeObj = Py_None;
+        PyObject *directSingleWriterStateReadsObj = Py_None;
         PyObject *pureEventComputeWordBypassObj = Py_None;
         PyObject *pureEventComputeWordProfileObj = Py_None;
         const char *pureEventWordPackPolicy = nullptr;
@@ -177,10 +178,11 @@ namespace wolvrix::app::pybind
                                        "pure_event_word_pack_policy",
                                        "pure_event_word_pack_max_moved_supernode_ppm",
                                        "pure_event_word_pack_max_changed_word_ppm",
+                                       "direct_single_writer_state_reads",
                                        nullptr};
         if (!PyArg_ParseTupleAndKeywords(args,
                                          kwargs,
-                                         "Oss|OOOOOOOssOOOOOsOO",
+                                         "Oss|OOOOOOOssOOOOOsOOO",
                                          const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
@@ -201,7 +203,8 @@ namespace wolvrix::app::pybind
                                          &pureEventComputeWordProfileObj,
                                          &pureEventWordPackPolicy,
                                          &pureEventWordPackMaxMovedSupernodePpmObj,
-                                         &pureEventWordPackMaxChangedWordPpmObj))
+                                         &pureEventWordPackMaxChangedWordPpmObj,
+                                         &directSingleWriterStateReadsObj))
         {
             return nullptr;
         }
@@ -339,6 +342,15 @@ namespace wolvrix::app::pybind
                 return nullptr;
             }
             options.attributes["full_active_word_consume"] = enabled != 0 ? "1" : "0";
+        }
+        if (directSingleWriterStateReadsObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(directSingleWriterStateReadsObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["direct_single_writer_state_reads"] = enabled != 0 ? "1" : "0";
         }
         if (pureEventComputeWordBypassObj != Py_None)
         {

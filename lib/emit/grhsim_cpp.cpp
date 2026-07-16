@@ -17552,7 +17552,8 @@ namespace wolvrix::lib::emit
         const bool directSingleWriterStateReads =
             parseBooleanEmitOption(options,
                                    "direct_single_writer_state_reads",
-                                   "WOLVRIX_GRHSIM_DIRECT_SINGLE_WRITER_STATE_READS");
+                                   "WOLVRIX_GRHSIM_DIRECT_SINGLE_WRITER_STATE_READS",
+                                   true);
         const bool fullActiveWordConsume =
             parseBooleanEmitOption(options,
                                    "full_active_word_consume",
@@ -17564,7 +17565,8 @@ namespace wolvrix::lib::emit
         const bool pureEventComputeWordBypass =
             parseBooleanEmitOption(options,
                                    "pure_event_compute_word_bypass",
-                                   "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_BYPASS");
+                                   "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_BYPASS",
+                                   true);
         const bool pureEventComputeWordProfile =
             parseBooleanEmitOption(options,
                                    "pure_event_compute_word_profile",

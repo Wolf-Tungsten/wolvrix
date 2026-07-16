@@ -300,6 +300,7 @@ class Session:
         input_fullpass_specialization: bool | None = None,
         posedge_fullpass_specialization: bool | None = None,
         full_active_word_consume: bool | None = None,
+        direct_single_writer_state_reads: bool | None = None,
         pure_event_compute_word_bypass: bool | None = None,
         pure_event_compute_word_profile: bool | None = None,
         pure_event_word_pack_policy: str | None = None,
@@ -312,7 +313,8 @@ class Session:
                 sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
                 sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
                 input_fullpass_specialization is not None or posedge_fullpass_specialization is not None or
-                full_active_word_consume is not None or pure_event_compute_word_bypass is not None or
+                full_active_word_consume is not None or direct_single_writer_state_reads is not None or
+                pure_event_compute_word_bypass is not None or
                 pure_event_compute_word_profile is not None or pure_event_word_pack_policy is not None or
                 pure_event_word_pack_max_moved_supernode_ppm is not None or
                 pure_event_word_pack_max_changed_word_ppm is not None):
@@ -337,6 +339,8 @@ class Session:
             named_args["posedge_fullpass_specialization"] = posedge_fullpass_specialization
         if full_active_word_consume is not None:
             named_args["full_active_word_consume"] = full_active_word_consume
+        if direct_single_writer_state_reads is not None:
+            named_args["direct_single_writer_state_reads"] = direct_single_writer_state_reads
         if pure_event_compute_word_bypass is not None:
             named_args["pure_event_compute_word_bypass"] = pure_event_compute_word_bypass
         if pure_event_compute_word_profile is not None:
@@ -762,6 +766,10 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
     if full_active_word_consume is not None:
         if not isinstance(full_active_word_consume, bool):
             raise ValueError("emit_grhsim_cpp full_active_word_consume must be a bool")
+    direct_single_writer_state_reads = local.pop("direct_single_writer_state_reads", None)
+    if direct_single_writer_state_reads is not None:
+        if not isinstance(direct_single_writer_state_reads, bool):
+            raise ValueError("emit_grhsim_cpp direct_single_writer_state_reads must be a bool")
     pure_event_compute_word_bypass = local.pop("pure_event_compute_word_bypass", None)
     if pure_event_compute_word_bypass is not None:
         if not isinstance(pure_event_compute_word_bypass, bool):

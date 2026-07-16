@@ -1258,7 +1258,7 @@ namespace wolvrix::lib::transform
             if (groupByGuard)
             {
                 constexpr std::size_t kMaxGuardEventMergeOps = 4096;
-                const std::size_t mergeLimit =
+                const std::size_t baselineMergeLimit =
                     maxSize == 0 ? kMaxGuardEventMergeOps : std::min(maxSize, kMaxGuardEventMergeOps);
 
                 struct EventGuardBuckets
@@ -1303,6 +1303,7 @@ namespace wolvrix::lib::transform
                         continue;
                     }
                     const auto &eventBuckets = eventIt->second;
+                    std::vector<std::vector<uint32_t>> baselineClusters;
                     std::vector<uint32_t> positions;
                     auto flushPositions = [&]()
                     {
@@ -1310,7 +1311,7 @@ namespace wolvrix::lib::transform
                         {
                             return;
                         }
-                        partition.clusters.push_back(std::move(positions));
+                        baselineClusters.push_back(std::move(positions));
                         positions = {};
                     };
                     for (const auto &guardKey : eventBuckets.guardOrder)
@@ -1326,19 +1327,56 @@ namespace wolvrix::lib::transform
                             continue;
                         }
                         orderMemoryWritePriorityGroups(graph, opData, guardPositions);
-                        if (guardPositions.size() > mergeLimit)
+                        if (guardPositions.size() > baselineMergeLimit)
                         {
                             flushPositions();
-                            partition.clusters.emplace_back(guardPositions.begin(), guardPositions.end());
+                            baselineClusters.emplace_back(guardPositions.begin(), guardPositions.end());
                             continue;
                         }
-                        if (!positions.empty() && positions.size() + guardPositions.size() > mergeLimit)
+                        if (!positions.empty() &&
+                            positions.size() + guardPositions.size() > baselineMergeLimit)
                         {
                             flushPositions();
                         }
                         positions.insert(positions.end(), guardPositions.begin(), guardPositions.end());
                     }
                     flushPositions();
+
+                    if (maxSize == 0 || maxSize <= kMaxGuardEventMergeOps)
+                    {
+                        for (auto &cluster : baselineClusters)
+                        {
+                            partition.clusters.push_back(std::move(cluster));
+                        }
+                        continue;
+                    }
+
+                    std::vector<uint32_t> mergedPositions;
+                    auto flushMergedPositions = [&]()
+                    {
+                        if (mergedPositions.empty())
+                        {
+                            return;
+                        }
+                        partition.clusters.push_back(std::move(mergedPositions));
+                        mergedPositions = {};
+                    };
+                    for (auto &cluster : baselineClusters)
+                    {
+                        if (cluster.size() > maxSize)
+                        {
+                            flushMergedPositions();
+                            partition.clusters.push_back(std::move(cluster));
+                            continue;
+                        }
+                        if (!mergedPositions.empty() &&
+                            mergedPositions.size() + cluster.size() > maxSize)
+                        {
+                            flushMergedPositions();
+                        }
+                        mergedPositions.insert(mergedPositions.end(), cluster.begin(), cluster.end());
+                    }
+                    flushMergedPositions();
                 }
 
                 return partition;

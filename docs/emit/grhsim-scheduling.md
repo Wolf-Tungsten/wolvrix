@@ -245,8 +245,13 @@ Commit node 由 sink-class op 形成。
 1. 收集所有 `ActivityOpClass::Sink` op。
 2. 为每个 sink-class op 计算 normalized event key。
 3. 如果开启 `commitGuardEventBuckets`，把 update guard 也纳入分桶 key。
-4. 每个 event/guard bucket 按 `maxOpInCommitSupernode` 切 chunk。
-5. 每个 chunk 形成一个 commit node。
+4. 在 `commitGuardEventBuckets` 模式下，event 内按 guard first-seen order 先以
+   `min(maxOpInCommitSupernode, 4096)` 打包；单个 guard bucket 或 ordered write group
+   保持原子，允许自身超过该上限。
+5. 该模式显式设置 `maxOpInCommitSupernode > 4096` 时，只把相邻的完整
+   4096-baseline cluster 按原顺序继续合并到请求上限，不重新切分 baseline cluster；
+   关闭该模式时直接按请求值切分 event bucket。
+6. 每个最终 cluster 形成一个 commit node。
 
 Commit node 的 `inputValues` 包括 sink-class op 写入需要的 value，例如条件、
 data、mask、地址、event 相关 value。后续 compute node 构造会从这些 input value
@@ -543,7 +548,7 @@ result 变化产生。
 | --- | --- |
 | `maxOpInComputeSupernode` | compute-node coarsen 和 DP 分段的 op 数上限；不是 emit 文件大小上限。 |
 | `maxOpInComputeNode` | 单个 compute node 吸收 op 的上限。 |
-| `maxOpInCommitSupernode` | 单个 commit node / commit supernode chunk 的 sink-class op 上限。 |
+| `maxOpInCommitSupernode` | commit cluster 的 sink-class op 打包上限；`commitGuardEventBuckets` 模式下单个 atomic guard/ordered bucket 可超限，显式大于 4096 时只做 4096-baseline cluster 的顺序合并；关闭该模式时直接按请求值切分。 |
 | `enableCoarsen` | 是否执行 compute-node cluster coarsen。 |
 | `enableChainMerge` | 是否执行 `out1` / `in1`；`siblings` 仍属于 coarsen pipeline。 |
 | `commitGuardEventBuckets` | commit 分桶是否把 update guard 纳入 key。 |

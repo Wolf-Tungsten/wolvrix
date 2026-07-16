@@ -43,7 +43,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
 | `-max-op-in-compute-supernode` | `128` | compute-node cluster coarsen 和连续分段的 op 数上限 |
 | `-max-op-in-compute-node` | `8192` | 单个 compute node 吸收 op 的上限 |
-| `-max-op-in-commit-supernode` | `4096` | 单个 commit supernode 最多包含的 sink op 数 |
+| `-max-op-in-commit-supernode` | `4096` | commit cluster 打包上限；guard-event 模式下 atomic guard/ordered bucket 可超限，显式大于 4096 时顺序合并完整 4096-baseline cluster；关闭该模式时直接按请求值切分 |
 | `-local-shared-compute-max-fanout` | `2` | local shared compute clone 的 distinct compute user op 上限 |
 | `-local-shared-compute-max-width` | `64` | local shared compute clone 的 result value 宽度上限 |
 | `-local-shared-compute-max-clones` | `4096` | local shared compute graph clone 硬上限 |

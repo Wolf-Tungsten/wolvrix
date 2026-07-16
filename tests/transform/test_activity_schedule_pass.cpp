@@ -2099,6 +2099,405 @@ int main()
     }
 
     {
+        currentCase = "commit_guard_event_order_preserving_high_cap";
+        constexpr std::string_view kGraphName = "commit_guard_event_order_preserving_high_cap";
+        constexpr std::size_t kFirstGuardWrites = 1100;
+        constexpr std::size_t kSecondGuardWrites = 2900;
+        constexpr std::size_t kThirdGuardWrites = 2000;
+        constexpr std::size_t kFourthGuardWrites = 3000;
+        constexpr std::size_t kTotalWrites =
+            kFirstGuardWrites + kSecondGuardWrites + kThirdGuardWrites + kFourthGuardWrites;
+        constexpr std::size_t kHighCommitCap = 6144;
+
+        struct Fixture
+        {
+            wolvrix::lib::grh::ValueId sharedCommitInput;
+            wolvrix::lib::grh::ValueId tailCommitInput;
+            std::vector<wolvrix::lib::grh::OperationId> writes;
+        };
+
+        const auto buildFixture = [&](wolvrix::lib::grh::Design &design)
+        {
+            auto &graph = design.createGraph(std::string(kGraphName));
+            design.markAsTop(std::string(kGraphName));
+
+            const auto clk = makeValue(graph, "clk", 1);
+            const auto guard0 = makeValue(graph, "guard0", 1);
+            const auto guard1 = makeValue(graph, "guard1", 1);
+            const auto guard2 = makeValue(graph, "guard2", 1);
+            const auto guard3 = makeValue(graph, "guard3", 1);
+            const auto mask = makeValue(graph, "mask", 8);
+            const auto lhs = makeValue(graph, "lhs", 8);
+            const auto rhs = makeValue(graph, "rhs", 8);
+            const auto tailData = makeValue(graph, "tail_data", 8);
+            const auto sharedCommitInput = makeValue(graph, "shared_commit_input", 8);
+            graph.bindInputPort("clk", clk);
+            graph.bindInputPort("guard0", guard0);
+            graph.bindInputPort("guard1", guard1);
+            graph.bindInputPort("guard2", guard2);
+            graph.bindInputPort("guard3", guard3);
+            graph.bindInputPort("mask", mask);
+            graph.bindInputPort("lhs", lhs);
+            graph.bindInputPort("rhs", rhs);
+
+            const auto xored = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                     graph.internSymbol("tail_xor"));
+            graph.addOperand(xored, lhs);
+            graph.addOperand(xored, rhs);
+            graph.addResult(xored, tailData);
+            const auto add = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd,
+                                                   graph.internSymbol("shared_add"));
+            graph.addOperand(add, lhs);
+            graph.addOperand(add, rhs);
+            graph.addResult(add, sharedCommitInput);
+
+            Fixture fixture{
+                .sharedCommitInput = sharedCommitInput,
+                .tailCommitInput = tailData,
+            };
+            fixture.writes.reserve(kTotalWrites);
+            for (std::size_t index = 0; index < kTotalWrites; ++index)
+            {
+                const std::string suffix = std::to_string(index);
+                const std::string regName = "q" + suffix;
+                const auto reg = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                       graph.internSymbol(regName));
+                graph.setAttr(reg, "width", static_cast<int64_t>(8));
+                graph.setAttr(reg, "isSigned", false);
+
+                const auto write = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                    graph.internSymbol("w" + suffix));
+                wolvrix::lib::grh::ValueId guard = guard0;
+                if (index >= kFirstGuardWrites + kSecondGuardWrites + kThirdGuardWrites)
+                {
+                    guard = guard3;
+                }
+                else if (index >= kFirstGuardWrites + kSecondGuardWrites)
+                {
+                    guard = guard2;
+                }
+                else if (index >= kFirstGuardWrites)
+                {
+                    guard = guard1;
+                }
+                graph.addOperand(write, guard);
+                graph.addOperand(write,
+                                 index < kFirstGuardWrites + kSecondGuardWrites
+                                     ? sharedCommitInput
+                                     : tailData);
+                graph.addOperand(write, mask);
+                graph.addOperand(write, clk);
+                graph.setAttr(write, "regSymbol", regName);
+                graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+                fixture.writes.push_back(write);
+            }
+            return fixture;
+        };
+
+        const auto runFixture = [&](wolvrix::lib::grh::Design &design,
+                                    SessionStore &session,
+                                    std::optional<std::size_t> commitCap)
+        {
+            PassManager manager;
+            manager.options().session = &session;
+            ActivityScheduleOptions options{
+                .path = std::string(kGraphName),
+                .maxOpInComputeSupernode = 8,
+                .enableCoarsen = false,
+            };
+            if (commitCap)
+            {
+                options.maxOpInCommitSupernode = *commitCap;
+            }
+            manager.addPass(std::make_unique<ActivitySchedulePass>(std::move(options)));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        wolvrix::lib::grh::Design defaultDesign;
+        wolvrix::lib::grh::Design explicit4096Design;
+        wolvrix::lib::grh::Design highCapDesign;
+        const Fixture defaultFixture = buildFixture(defaultDesign);
+        const Fixture explicit4096Fixture = buildFixture(explicit4096Design);
+        const Fixture highCapFixture = buildFixture(highCapDesign);
+        SessionStore defaultSession;
+        SessionStore explicit4096Session;
+        SessionStore highCapSession;
+        if (!runFixture(defaultDesign, defaultSession, std::nullopt) ||
+            !runFixture(explicit4096Design, explicit4096Session, 4096) ||
+            !runFixture(highCapDesign, highCapSession, kHighCommitCap))
+        {
+            return fail("Expected order-preserving high commit cap fixtures to schedule");
+        }
+
+        const auto defaultSchedule = loadSchedule(defaultSession, std::string(kGraphName));
+        const auto explicit4096Schedule = loadSchedule(explicit4096Session, std::string(kGraphName));
+        const auto highCapSchedule = loadSchedule(highCapSession, std::string(kGraphName));
+        const auto *defaultGraph = defaultDesign.findGraph(std::string(kGraphName));
+        const auto *explicit4096Graph = explicit4096Design.findGraph(std::string(kGraphName));
+        const auto *highCapGraph = highCapDesign.findGraph(std::string(kGraphName));
+        if (defaultGraph == nullptr || explicit4096Graph == nullptr || highCapGraph == nullptr ||
+            validateCommonScheduleShape(*defaultGraph, defaultSchedule) != 0 ||
+            validateCommonScheduleShape(*explicit4096Graph, explicit4096Schedule) != 0 ||
+            validateCommonScheduleShape(*highCapGraph, highCapSchedule) != 0)
+        {
+            return 1;
+        }
+        if (!schedulesEqual(defaultSchedule, explicit4096Schedule))
+        {
+            return fail("Expected default and explicit 4096 commit caps to be byte-identical");
+        }
+
+        const auto commitSupernodes = [](const ScheduleView &schedule)
+        {
+            std::vector<uint32_t> out;
+            for (uint32_t supernode = 0; supernode < schedule.supernodeKinds->size(); ++supernode)
+            {
+                if ((*schedule.supernodeKinds)[supernode] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    out.push_back(supernode);
+                }
+            }
+            return out;
+        };
+        const auto explicit4096Commit = commitSupernodes(explicit4096Schedule);
+        const auto highCapCommit = commitSupernodes(highCapSchedule);
+        if (explicit4096Commit.size() != 3 || highCapCommit.size() != 2)
+        {
+            return fail("Expected 6144 cap to coarsen only two complete 4096-baseline commit nodes");
+        }
+
+        const auto writeOrdinals = [](const std::vector<wolvrix::lib::grh::OperationId> &ops,
+                                      const std::vector<wolvrix::lib::grh::OperationId> &writes)
+        {
+            std::size_t maxOpIndex = 0;
+            for (const auto write : writes)
+            {
+                maxOpIndex = std::max<std::size_t>(maxOpIndex, write.index);
+            }
+            std::vector<uint32_t> ordinalByOpIndex(maxOpIndex + 1,
+                                                   kInvalidActivitySupernodeId);
+            for (uint32_t ordinal = 0; ordinal < writes.size(); ++ordinal)
+            {
+                ordinalByOpIndex[writes[ordinal].index] = ordinal;
+            }
+            std::vector<uint32_t> out;
+            out.reserve(ops.size());
+            for (const auto opId : ops)
+            {
+                if (opId.index >= ordinalByOpIndex.size() ||
+                    ordinalByOpIndex[opId.index] == kInvalidActivitySupernodeId)
+                {
+                    return std::vector<uint32_t>{};
+                }
+                out.push_back(ordinalByOpIndex[opId.index]);
+            }
+            return out;
+        };
+        const auto ordinalClusters = [&](const ScheduleView &schedule,
+                                         const std::vector<uint32_t> &commitNodes,
+                                         const Fixture &fixture)
+        {
+            std::vector<std::vector<uint32_t>> out;
+            out.reserve(commitNodes.size());
+            for (const uint32_t supernode : commitNodes)
+            {
+                out.push_back(writeOrdinals((*schedule.supernodeToOps)[supernode],
+                                            fixture.writes));
+            }
+            return out;
+        };
+        const auto flattenOrdinals = [](const std::vector<std::vector<uint32_t>> &clusters)
+        {
+            std::vector<uint32_t> out;
+            for (const auto &cluster : clusters)
+            {
+                out.insert(out.end(), cluster.begin(), cluster.end());
+            }
+            return out;
+        };
+        const auto baselineOrdinalClusters = ordinalClusters(explicit4096Schedule,
+                                                              explicit4096Commit,
+                                                              explicit4096Fixture);
+        const auto highCapOrdinalClusters = ordinalClusters(highCapSchedule,
+                                                             highCapCommit,
+                                                             highCapFixture);
+        const auto baselineWriteOrdinals = flattenOrdinals(baselineOrdinalClusters);
+        const auto highCapWriteOrdinals = flattenOrdinals(highCapOrdinalClusters);
+        if (baselineWriteOrdinals.size() != kTotalWrites ||
+            baselineWriteOrdinals != highCapWriteOrdinals)
+        {
+            return fail("High commit cap changed sink membership or execution order");
+        }
+
+        const auto packWholeClusters = [&](const std::vector<std::vector<uint32_t>> &input)
+        {
+            std::vector<std::vector<uint32_t>> out;
+            std::vector<uint32_t> mergedCluster;
+            const auto flushMergedCluster = [&]()
+            {
+                if (!mergedCluster.empty())
+                {
+                    out.push_back(std::move(mergedCluster));
+                    mergedCluster = {};
+                }
+            };
+            for (const auto &cluster : input)
+            {
+                if (cluster.size() > kHighCommitCap)
+                {
+                    flushMergedCluster();
+                    out.push_back(cluster);
+                    continue;
+                }
+                if (!mergedCluster.empty() &&
+                    mergedCluster.size() + cluster.size() > kHighCommitCap)
+                {
+                    flushMergedCluster();
+                }
+                mergedCluster.insert(mergedCluster.end(), cluster.begin(), cluster.end());
+            }
+            flushMergedCluster();
+            return out;
+        };
+        const auto expectedHighCapClusters = packWholeClusters(baselineOrdinalClusters);
+
+        const auto guardGroup = [&](uint32_t ordinal)
+        {
+            if (ordinal < kFirstGuardWrites)
+            {
+                return uint32_t{0};
+            }
+            if (ordinal < kFirstGuardWrites + kSecondGuardWrites)
+            {
+                return uint32_t{1};
+            }
+            if (ordinal < kFirstGuardWrites + kSecondGuardWrites + kThirdGuardWrites)
+            {
+                return uint32_t{2};
+            }
+            return uint32_t{3};
+        };
+        std::vector<std::vector<uint32_t>> atomicGuardClusters;
+        uint32_t previousGuard = std::numeric_limits<uint32_t>::max();
+        for (const uint32_t ordinal : baselineWriteOrdinals)
+        {
+            const uint32_t currentGuard = guardGroup(ordinal);
+            if (atomicGuardClusters.empty() || currentGuard != previousGuard)
+            {
+                atomicGuardClusters.emplace_back();
+                previousGuard = currentGuard;
+            }
+            atomicGuardClusters.back().push_back(ordinal);
+        }
+        const auto directHighCapClusters = packWholeClusters(atomicGuardClusters);
+        if (expectedHighCapClusters.size() >= baselineOrdinalClusters.size() ||
+            highCapOrdinalClusters != expectedHighCapClusters ||
+            atomicGuardClusters.size() != 4 ||
+            directHighCapClusters == expectedHighCapClusters)
+        {
+            return fail("High commit cap did not preserve complete 4096-baseline node boundaries");
+        }
+
+        const auto commitTargets = [](const ScheduleView &schedule,
+                                      wolvrix::lib::grh::ValueId value)
+        {
+            std::vector<uint32_t> out;
+            if (value.index == 0 || value.index > schedule.valueFanout->size())
+            {
+                return out;
+            }
+            for (const uint32_t target : (*schedule.valueFanout)[value.index - 1])
+            {
+                if (target < schedule.supernodeKinds->size() &&
+                    (*schedule.supernodeKinds)[target] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    out.push_back(target);
+                }
+            }
+            return out;
+        };
+        const auto baselineSharedTargets =
+            commitTargets(explicit4096Schedule, explicit4096Fixture.sharedCommitInput);
+        const auto baselineTailTargets =
+            commitTargets(explicit4096Schedule, explicit4096Fixture.tailCommitInput);
+        const auto highCapSharedTargets =
+            commitTargets(highCapSchedule, highCapFixture.sharedCommitInput);
+        const auto highCapTailTargets =
+            commitTargets(highCapSchedule, highCapFixture.tailCommitInput);
+        if (baselineSharedTargets.size() != 1 || baselineTailTargets.size() != 2 ||
+            highCapSharedTargets.size() != 1 || highCapTailTargets.size() != 1)
+        {
+            return fail("Expected repeated compute input commit targets to coarsen from three to two");
+        }
+
+        std::vector<uint32_t> expectedInputValues;
+        for (const auto write : highCapFixture.writes)
+        {
+            for (const auto input : highCapGraph->opOperands(write))
+            {
+                if (std::find(expectedInputValues.begin(), expectedInputValues.end(), input.index) ==
+                    expectedInputValues.end())
+                {
+                    expectedInputValues.push_back(input.index);
+                }
+            }
+        }
+        std::sort(expectedInputValues.begin(), expectedInputValues.end());
+        std::vector<uint32_t> definedInputValues;
+        for (std::size_t valueIndex = 0; valueIndex < highCapSchedule.valueFanout->size(); ++valueIndex)
+        {
+            const auto &targets = (*highCapSchedule.valueFanout)[valueIndex];
+            const bool reachesCommit = std::any_of(
+                targets.begin(),
+                targets.end(),
+                [&](uint32_t target)
+                {
+                    return std::find(highCapCommit.begin(), highCapCommit.end(), target) !=
+                           highCapCommit.end();
+                });
+            if (reachesCommit)
+            {
+                definedInputValues.push_back(static_cast<uint32_t>(valueIndex + 1));
+            }
+        }
+        std::vector<uint32_t> expectedDefinedInputValues{
+            highCapFixture.sharedCommitInput.index,
+            highCapFixture.tailCommitInput.index,
+        };
+        std::sort(expectedDefinedInputValues.begin(), expectedDefinedInputValues.end());
+        if (expectedInputValues.size() != 8 ||
+            definedInputValues != expectedDefinedInputValues)
+        {
+            return fail("High commit cap did not preserve the exact commit input union");
+        }
+
+        const double baselineComputeCommitPairs = parseJsonDoubleField(
+            *explicit4096Schedule.summaryStats,
+            "compute_commit_value_pairs");
+        const double highCapComputeCommitPairs = parseJsonDoubleField(
+            *highCapSchedule.summaryStats,
+            "compute_commit_value_pairs");
+        if (baselineComputeCommitPairs != 3.0 || highCapComputeCommitPairs != 2.0 ||
+            parseJsonDoubleField(*explicit4096Schedule.summaryStats, "commit_input_root_values") != 13.0 ||
+            parseJsonDoubleField(*highCapSchedule.summaryStats, "commit_input_root_values") != 10.0)
+        {
+            return fail("Expected high commit cap to union repeated commit input pairs exactly");
+        }
+        if (parseJsonDoubleField(*explicit4096Schedule.summaryStats, "commit_event_key_runs") != 3.0 ||
+            parseJsonDoubleField(*highCapSchedule.summaryStats, "commit_event_key_runs") != 2.0 ||
+            parseJsonDoubleField(*highCapSchedule.summaryStats, "commit_event_keys") != 1.0 ||
+            parseJsonDoubleField(*highCapSchedule.summaryStats, "commit_sink_ops") !=
+                static_cast<double>(kTotalWrites))
+        {
+            return fail("Expected high commit cap summary to report two order-preserving event runs");
+        }
+        (void)defaultFixture;
+    }
+
+    {
         currentCase = "ordered_memory_write_atomic_chunk";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("ordered_memory_write_atomic_chunk");

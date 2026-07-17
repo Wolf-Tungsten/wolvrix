@@ -44,7 +44,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
 | `-max-op-in-compute-supernode` | `128` | compute-node cluster coarsen 和连续分段的 op 数上限 |
 | `-max-op-in-compute-node` | `8192` | 单个 compute node 吸收 op 的上限 |
-| `-max-op-in-commit-supernode` | `4096` | commit cluster 打包上限；guard-event 模式下 atomic guard/ordered bucket 可超限，显式大于 4096 时顺序合并完整 4096-baseline cluster；关闭该模式时直接按请求值切分 |
+| `-max-op-in-commit-supernode` | `8192` | commit cluster 打包上限；guard-event 模式下 atomic guard/ordered bucket 可超限，请求 cap 大于 4096 时顺序合并完整 4096-baseline cluster；关闭该模式时直接按请求值切分 |
 | `-local-shared-compute-max-fanout` | `2` | local shared compute clone 的 distinct compute user op 上限 |
 | `-local-shared-compute-max-width` | `64` | local shared compute clone 的 result value 宽度上限 |
 | `-local-shared-compute-max-clones` | `4096` | local shared compute graph clone 硬上限 |
@@ -86,8 +86,8 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 3. 如果发生 clone，pass 重新 `freeze()` 并重建 `ActivityOpData` / `opClasses`。
 4. `buildComputeNodeRewrite(...)` 先按 sink event key / guard key 构造 `commitNodes`，
    再从 commit input、output/inout 根和无 result compute op 出发构造 `computeNodes`。
-   guard-event 模式同时按实际 cap 不超过 4096 的 baseline cluster 给每个 sink op
-   分配 graph-global commit locality group；更高 cap 只合并 execution cluster，不合并
+   guard-event 模式同时按 `min(requested cap, 4096)` 的 baseline cluster 给每个 sink op
+   分配 graph-global commit locality group；默认 8192 cap 只合并 execution cluster，不合并
    该 locality group。关闭 guard-event 模式时 locality group 等于直接 event chunk。
 5. 若开启 local shared compute clone，先用该 rewrite 发现 bounded 候选；true-clone
    op/value 并替换远端 consumer uses 后，重新 `freeze()`，从头重建
@@ -254,10 +254,11 @@ pair 应用到导出 schedule。
 `summary_stats` 是 plain schedule 的结构统计 JSON，只包含当前调度结构统计字段。
 
 `commit_locality_group_by_op` 是按 `op.index - 1` 索引的 `uint32_t` vector。
-非 commit op 使用 invalid ID。默认 4096 cap 下每个 group 与实际 commit supernode
-一一对应；guard-event high-cap schedule 合并完整 baseline commit node 时，组 ID 仍保持
-pre-merge 4096 边界，供 emitter 稳定 value-slot locality。fixed partition 或 graph clone
-rebuild 始终从当前 graph 的 sink partition 重建该映射，不复用旧 OperationId。
+非 commit op 使用 invalid ID。canonical/显式 4096 baseline 下每个 group 与实际 commit
+supernode 一一对应；默认 8192 execution schedule 可在一个 commit supernode 中包含多个
+完整、连续的 group，但组 ID 仍保持 pre-merge 4096 边界，供 emitter 稳定 value-slot
+locality。fixed partition 或 graph clone rebuild 始终从当前 graph 的 sink partition 重建
+该映射，不复用旧 OperationId。
 
 `commit_locality_group_order` 是 canonical locality group ID 的排列。`level-id`
 策略在最终 materialize 后构造 `compute supernode + canonical commit group` 伪

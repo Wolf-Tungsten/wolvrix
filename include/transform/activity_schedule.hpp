@@ -33,7 +33,7 @@ namespace wolvrix::lib::transform
         std::string path;
         std::size_t maxOpInComputeSupernode = 128;
         std::size_t maxOpInComputeNode = 8192;
-        std::size_t maxOpInCommitSupernode = 4096;
+        std::size_t maxOpInCommitSupernode = 8192;
         std::size_t localSharedComputeMaxFanout = 2;
         std::size_t localSharedComputeMaxWidth = 64;
         std::size_t localSharedComputeMaxClones = 4096;

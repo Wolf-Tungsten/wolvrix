@@ -248,7 +248,7 @@ Commit node 由 sink-class op 形成。
 4. 在 `commitGuardEventBuckets` 模式下，event 内按 guard first-seen order 先以
    `min(maxOpInCommitSupernode, 4096)` 打包；单个 guard bucket 或 ordered write group
    保持原子，允许自身超过该上限。
-5. 该模式显式设置 `maxOpInCommitSupernode > 4096` 时，只把相邻的完整
+5. 该模式请求 `maxOpInCommitSupernode > 4096` 时，只把相邻的完整
    4096-baseline cluster 按原顺序继续合并到请求上限，不重新切分 baseline cluster；
    关闭该模式时直接按请求值切分 event bucket。
 6. 每个最终 cluster 形成一个 commit node。
@@ -396,10 +396,9 @@ target 的最大 state offset，并把该 anchor 应用于组内 operand。这�
 `firstReadSequence`、`totalReads` 和 state anchor 都不再依赖 high-cap merged commit
 supernode 在实际 topo 中的位置。
 
-默认 4096 cap 下 canonical group 和 order 对应实际 commit supernode，因此生成布局
-与旧 supernode-anchor 路径相同；guard-event high cap 合并多个完整 baseline cluster
-时，各子组仍使用自己的 baseline anchor 与 baseline topo 顺序，execution partition
-不会引起全局 value-slot 改号。
+canonical/显式 4096 baseline 下 group 和 order 对应实际 commit supernode；默认 8192
+execution schedule 会合并相邻的完整 baseline cluster，但各子组仍使用自己的 baseline
+anchor 与 baseline topo 顺序，因此 execution partition 不会引起全局 value-slot 改号。
 
 这两个 session key 是成对的可选兼容输入。任一 key 缺失，map 未覆盖全部 graph op、
 commit group 不稠密，order 不是 group 的完整排列，或 commit op 未在实际 schedule 中
@@ -576,7 +575,7 @@ result 变化产生。
 | --- | --- |
 | `maxOpInComputeSupernode` | compute-node coarsen 和 DP 分段的 op 数上限；不是 emit 文件大小上限。 |
 | `maxOpInComputeNode` | 单个 compute node 吸收 op 的上限。 |
-| `maxOpInCommitSupernode` | commit cluster 的 sink-class op 打包上限；`commitGuardEventBuckets` 模式下单个 atomic guard/ordered bucket 可超限，显式大于 4096 时只做 4096-baseline cluster 的顺序合并；关闭该模式时直接按请求值切分。 |
+| `maxOpInCommitSupernode` | commit cluster 的 sink-class op 打包上限，native default 为 8192；`commitGuardEventBuckets` 模式下单个 atomic guard/ordered bucket 可超限，请求 cap 大于 4096 时只做 4096-baseline cluster 的顺序合并；关闭该模式时直接按请求值切分。 |
 | `enableCoarsen` | 是否执行 compute-node cluster coarsen。 |
 | `enableChainMerge` | 是否执行 `out1` / `in1`；`siblings` 仍属于 coarsen pipeline。 |
 | `commitGuardEventBuckets` | commit 分桶是否把 update guard 纳入 key。 |

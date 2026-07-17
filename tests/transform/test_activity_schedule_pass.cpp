@@ -2283,15 +2283,19 @@ int main()
 
         wolvrix::lib::grh::Design defaultDesign;
         wolvrix::lib::grh::Design explicit4096Design;
+        wolvrix::lib::grh::Design explicit8192Design;
         wolvrix::lib::grh::Design highCapDesign;
         const Fixture defaultFixture = buildFixture(defaultDesign);
         const Fixture explicit4096Fixture = buildFixture(explicit4096Design);
+        buildFixture(explicit8192Design);
         const Fixture highCapFixture = buildFixture(highCapDesign);
         SessionStore defaultSession;
         SessionStore explicit4096Session;
+        SessionStore explicit8192Session;
         SessionStore highCapSession;
         if (!runFixture(defaultDesign, defaultSession, std::nullopt) ||
             !runFixture(explicit4096Design, explicit4096Session, 4096) ||
+            !runFixture(explicit8192Design, explicit8192Session, 8192) ||
             !runFixture(highCapDesign, highCapSession, kHighCommitCap))
         {
             return fail("Expected order-preserving high commit cap fixtures to schedule");
@@ -2299,20 +2303,24 @@ int main()
 
         const auto defaultSchedule = loadSchedule(defaultSession, std::string(kGraphName));
         const auto explicit4096Schedule = loadSchedule(explicit4096Session, std::string(kGraphName));
+        const auto explicit8192Schedule = loadSchedule(explicit8192Session, std::string(kGraphName));
         const auto highCapSchedule = loadSchedule(highCapSession, std::string(kGraphName));
         const auto *defaultGraph = defaultDesign.findGraph(std::string(kGraphName));
         const auto *explicit4096Graph = explicit4096Design.findGraph(std::string(kGraphName));
+        const auto *explicit8192Graph = explicit8192Design.findGraph(std::string(kGraphName));
         const auto *highCapGraph = highCapDesign.findGraph(std::string(kGraphName));
-        if (defaultGraph == nullptr || explicit4096Graph == nullptr || highCapGraph == nullptr ||
+        if (defaultGraph == nullptr || explicit4096Graph == nullptr ||
+            explicit8192Graph == nullptr || highCapGraph == nullptr ||
             validateCommonScheduleShape(*defaultGraph, defaultSchedule) != 0 ||
             validateCommonScheduleShape(*explicit4096Graph, explicit4096Schedule) != 0 ||
+            validateCommonScheduleShape(*explicit8192Graph, explicit8192Schedule) != 0 ||
             validateCommonScheduleShape(*highCapGraph, highCapSchedule) != 0)
         {
             return 1;
         }
-        if (!schedulesEqual(defaultSchedule, explicit4096Schedule))
+        if (!schedulesEqual(defaultSchedule, explicit8192Schedule))
         {
-            return fail("Expected default and explicit 4096 commit caps to be byte-identical");
+            return fail("Expected default and explicit 8192 commit caps to be byte-identical");
         }
 
         const auto commitSupernodes = [](const ScheduleView &schedule)
@@ -2328,10 +2336,12 @@ int main()
             return out;
         };
         const auto explicit4096Commit = commitSupernodes(explicit4096Schedule);
+        const auto explicit8192Commit = commitSupernodes(explicit8192Schedule);
         const auto highCapCommit = commitSupernodes(highCapSchedule);
-        if (explicit4096Commit.size() != 3 || highCapCommit.size() != 2)
+        if (explicit4096Commit.size() != 3 || explicit8192Commit.size() != 2 ||
+            highCapCommit.size() != 2)
         {
-            return fail("Expected 6144 cap to coarsen only two complete 4096-baseline commit nodes");
+            return fail("Expected 6144 and 8192 caps to coarsen to two commit nodes");
         }
 
         const auto writeOrdinals = [](const std::vector<wolvrix::lib::grh::OperationId> &ops,

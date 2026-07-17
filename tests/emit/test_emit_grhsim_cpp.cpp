@@ -3722,6 +3722,61 @@ namespace
         return log;
     }
 
+    std::string stripActiveMaskWriteStatements(std::string_view source)
+    {
+        std::string stripped;
+        std::size_t lineBegin = 0u;
+        while (lineBegin < source.size())
+        {
+            const std::size_t lineEnd = source.find('\n', lineBegin);
+            const std::string_view line = source.substr(
+                lineBegin,
+                lineEnd == std::string_view::npos ? source.size() - lineBegin
+                                                  : lineEnd - lineBegin + 1u);
+            const bool helperWrite =
+                line.find("grhsim_or_active_u64(") != std::string_view::npos ||
+                line.find("grhsim_or_active_u32(") != std::string_view::npos ||
+                line.find("grhsim_or_active_u16(") != std::string_view::npos;
+            const bool byteWrite =
+                line.find("supernode_active_curr_[") != std::string_view::npos &&
+                line.find(" |= ") != std::string_view::npos;
+            if (!helperWrite && !byteWrite)
+            {
+                stripped.append(line);
+            }
+            if (lineEnd == std::string_view::npos)
+            {
+                break;
+            }
+            lineBegin = lineEnd + 1u;
+        }
+        return stripped;
+    }
+
+    std::string conditionalWrapperLines(std::string_view source)
+    {
+        std::string wrappers;
+        std::size_t lineBegin = 0u;
+        while (lineBegin < source.size())
+        {
+            const std::size_t lineEnd = source.find('\n', lineBegin);
+            const std::string_view line = source.substr(
+                lineBegin,
+                lineEnd == std::string_view::npos ? source.size() - lineBegin
+                                                  : lineEnd - lineBegin + 1u);
+            if (line.find("if (grhsim_changed_") != std::string_view::npos)
+            {
+                wrappers.append(line);
+            }
+            if (lineEnd == std::string_view::npos)
+            {
+                break;
+            }
+            lineBegin = lineEnd + 1u;
+        }
+        return wrappers;
+    }
+
     int runActiveMaskGapPackFocusedTests()
     {
         ActiveMaskGapPackFixture fixture = buildActiveMaskGapPackFixture();
@@ -3732,7 +3787,7 @@ namespace
         ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
         const ActiveMaskGapPackEmitRun defaultRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "default", std::nullopt, 2u);
-        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "targeted", 1);
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "targeted-direct", 1);
         const ActiveMaskGapPackEmitRun offRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "off", "off", 2u);
         ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
@@ -3744,14 +3799,25 @@ namespace
         const ActiveMaskGapPackEmitRun probeEnvironmentRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "probe_environment", std::nullopt, 2u);
         ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+        const ActiveMaskGapPackEmitRun targetedSerialRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "targeted_serial", "targeted-direct", 1u);
+        const ActiveMaskGapPackEmitRun targetedParallelRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "targeted_parallel", "targeted-direct", 4u);
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "targeted-direct", 1);
+        const ActiveMaskGapPackEmitRun targetedEnvironmentRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "targeted_environment", std::nullopt, 2u);
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
 
         if (!defaultRun.success || defaultRun.diagnosticError ||
             !offRun.success || offRun.diagnosticError ||
             !probeSerialRun.success || probeSerialRun.diagnosticError ||
             !probeParallelRun.success || probeParallelRun.diagnosticError ||
-            !probeEnvironmentRun.success || probeEnvironmentRun.diagnosticError)
+            !probeEnvironmentRun.success || probeEnvironmentRun.diagnosticError ||
+            !targetedSerialRun.success || targetedSerialRun.diagnosticError ||
+            !targetedParallelRun.success || targetedParallelRun.diagnosticError ||
+            !targetedEnvironmentRun.success || targetedEnvironmentRun.diagnosticError)
         {
-            return fail("active-mask gap-pack off/probe fixture emission failed");
+            return fail("active-mask gap-pack off/probe/targeted-direct fixture emission failed");
         }
         if (defaultRun.artifacts != offRun.artifacts ||
             defaultRun.artifacts != probeSerialRun.artifacts ||
@@ -3779,6 +3845,15 @@ namespace
                 normalizeActiveMaskGapPackLog(probeEnvironmentRun.stderrText))
         {
             return fail("active-mask gap-pack probe aggregation must be parallel deterministic");
+        }
+        if (targetedSerialRun.artifacts != targetedParallelRun.artifacts ||
+            targetedSerialRun.artifacts != targetedEnvironmentRun.artifacts ||
+            normalizeActiveMaskGapPackLog(targetedSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(targetedParallelRun.stderrText) ||
+            normalizeActiveMaskGapPackLog(targetedSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(targetedEnvironmentRun.stderrText))
+        {
+            return fail("active-mask gap-pack targeted-direct emission must be parallel deterministic");
         }
         if (sessionKeys(fixture.session) != keysBefore)
         {
@@ -3849,6 +3924,32 @@ namespace
                         std::string(nonTableLine));
         }
 
+        const std::string_view targetedSummary = probeLogLine(
+            targetedSerialRun.stderrText,
+            "[GRHSIM_ACTIVE_MASK_GAP_PACK] policy=targeted-direct ");
+        const std::string_view targetedNonTableLine =
+            probeStatsLine(targetedSerialRun.stderrText, "non-table");
+        const auto selectedGroups = probeStatsUnsigned(targetedSummary, "selected_groups");
+        const auto selectedBaselineWrites =
+            probeStatsUnsigned(targetedSummary, "selected_baseline_writes");
+        const auto selectedCandidateWrites =
+            probeStatsUnsigned(targetedSummary, "selected_candidate_writes");
+        const auto selectedSavings = probeStatsUnsigned(targetedSummary, "selected_savings");
+        const auto targetedBaselineWrites =
+            probeStatsUnsigned(targetedNonTableLine, "baseline_writes");
+        const auto targetedCandidateWrites =
+            probeStatsUnsigned(targetedNonTableLine, "candidate_writes");
+        if (!selectedGroups || !selectedBaselineWrites || !selectedCandidateWrites ||
+            !selectedSavings || !targetedBaselineWrites || !targetedCandidateWrites ||
+            *selectedGroups != 3u || *selectedBaselineWrites != 12u ||
+            *selectedCandidateWrites != 6u || *selectedSavings != 6u ||
+            *targetedBaselineWrites != 16u || *targetedCandidateWrites != 10u)
+        {
+            return fail("active-mask gap-pack targeted-direct selection statistics are wrong: " +
+                        std::string(targetedSummary) + " / " +
+                        std::string(targetedNonTableLine));
+        }
+
         const auto tableGroups = probeStatsUnsigned(tableLine, "groups");
         const auto tableEntries = probeStatsUnsigned(tableLine, "entries");
         const auto tableBaseline = probeStatsUnsigned(tableLine, "baseline_writes");
@@ -3884,12 +3985,48 @@ namespace
                         std::string(excludedLine));
         }
 
+        bool targetedSchedChanged = false;
+        for (const auto &[name, content] : targetedSerialRun.artifacts)
+        {
+            const auto baselineIt = offRun.artifacts.find(name);
+            if (baselineIt == offRun.artifacts.end())
+            {
+                return fail("active-mask gap-pack targeted-direct added an unexpected artifact: " + name);
+            }
+            const bool schedSource = name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp");
+            if (!schedSource)
+            {
+                if (content != baselineIt->second)
+                {
+                    return fail("active-mask gap-pack targeted-direct changed a non-schedule artifact: " + name);
+                }
+                continue;
+            }
+            targetedSchedChanged = targetedSchedChanged || content != baselineIt->second;
+            if (stripActiveMaskWriteStatements(content) !=
+                stripActiveMaskWriteStatements(baselineIt->second))
+            {
+                return fail("active-mask gap-pack targeted-direct changed schedule code outside active-mask writes: " +
+                            name);
+            }
+            if (conditionalWrapperLines(content) != conditionalWrapperLines(baselineIt->second))
+            {
+                return fail("active-mask gap-pack targeted-direct changed a frozen conditional wrapper: " + name);
+            }
+        }
+        if (targetedSerialRun.artifacts.size() != offRun.artifacts.size() || !targetedSchedChanged)
+        {
+            return fail("active-mask gap-pack targeted-direct artifact set or expected schedule diff is wrong");
+        }
+
         std::string schedSources;
+        std::string targetedSchedSources;
         for (const auto &[name, content] : offRun.artifacts)
         {
             if (name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp"))
             {
                 schedSources += content;
+                targetedSchedSources += targetedSerialRun.artifacts.at(name);
             }
         }
         const std::size_t condition = schedSources.find("if (grhsim_changed_2) {");
@@ -3909,20 +4046,75 @@ namespace
                 return fail("active-mask gap-pack probe changed the frozen conditional lowering");
             }
         }
+        const std::size_t targetedCondition = targetedSchedSources.find("if (grhsim_changed_2) {");
+        const std::size_t targetedOpenBrace = targetedSchedSources.find('{', targetedCondition);
+        const std::size_t targetedCloseBrace =
+            findMatchingBrace(targetedSchedSources, targetedOpenBrace);
+        if (targetedCondition == std::string::npos || targetedCloseBrace == std::string::npos)
+        {
+            return fail("active-mask gap-pack targeted-direct changed the frozen conditional branch");
+        }
+        const std::string_view targetedConditionalBlock(
+            targetedSchedSources.data() + targetedOpenBrace,
+            targetedCloseBrace - targetedOpenBrace + 1u);
+        if (targetedConditionalBlock.find(
+                "grhsim_or_active_u64(supernode_active_curr_.data(), 8u, "
+                "UINT64_C(281479271743489));") ==
+            std::string_view::npos)
+        {
+            return fail("active-mask gap-pack targeted-direct did not apply the selected hole chunk");
+        }
+        for (std::string_view statement : {
+                 "grhsim_or_active_u64(supernode_active_curr_.data(), 80u,",
+                 "grhsim_or_active_u64(supernode_active_curr_.data(), 88u,",
+                 "grhsim_or_active_u64(supernode_active_curr_.data(), 96u,"})
+        {
+            if (targetedSchedSources.find(statement) == std::string::npos)
+            {
+                return fail("active-mask gap-pack targeted-direct did not preserve the 31-entry direct threshold");
+            }
+        }
+        if (targetedSchedSources.find(
+                "grhsim_or_active_u64(supernode_active_curr_.data(), 104u, "
+                "UINT64_C(282578800148737));") == std::string::npos ||
+            targetedSchedSources.find(
+                "grhsim_or_active_u32(supernode_active_curr_.data(), 20u, "
+                "static_cast<std::uint32_t>(static_cast<std::uint32_t>(-static_cast<std::uint32_t>("
+                "grhsim_changed_7)) & UINT32_C(65539)));") == std::string::npos)
+        {
+            return fail("active-mask gap-pack targeted-direct selected mask contents are wrong");
+        }
+        if (schedSources.find(
+                "grhsim_or_active_u32(supernode_active_curr_.data(), 104u,") == std::string::npos ||
+            schedSources.find(
+                "grhsim_or_active_u16(supernode_active_curr_.data(), 108u,") == std::string::npos ||
+            schedSources.find("supernode_active_curr_[110u] |= UINT8_C(") == std::string::npos)
+        {
+            return fail("active-mask gap-pack 31-entry baseline fixture is missing its tail chunks");
+        }
+        if (targetedSchedSources.find("{120u, UINT8_C(") == std::string::npos ||
+            targetedSchedSources.find("{151u, UINT8_C(") == std::string::npos ||
+            targetedSchedSources.find(
+                "supernode_active_curr_[entry.word_index] |= entry.mask;") == std::string::npos ||
+            targetedSchedSources.find(
+                "grhsim_or_active_u64(supernode_active_curr_.data(), 120u,") != std::string::npos)
+        {
+            return fail("active-mask gap-pack targeted-direct changed the 32-entry table lowering");
+        }
 
         const ActiveMaskGapPackEmitRun invalidAttributeRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "invalid_attribute", "targeted", 1u);
         if (invalidAttributeRun.success || !invalidAttributeRun.diagnosticError ||
-            invalidAttributeRun.diagnostics.find("expected off or probe") == std::string::npos)
+            invalidAttributeRun.diagnostics.find("expected off, probe, or targeted-direct") == std::string::npos)
         {
-            return fail("active-mask gap-pack targeted policy must be rejected in the probe-only stage");
+            return fail("active-mask gap-pack unknown attribute policy must be rejected");
         }
         ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "invalid", 1);
         const ActiveMaskGapPackEmitRun invalidEnvironmentRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "invalid_environment", std::nullopt, 1u);
         ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
         if (invalidEnvironmentRun.success || !invalidEnvironmentRun.diagnosticError ||
-            invalidEnvironmentRun.diagnostics.find("expected off or probe") == std::string::npos)
+            invalidEnvironmentRun.diagnostics.find("expected off, probe, or targeted-direct") == std::string::npos)
         {
             return fail("active-mask gap-pack environment policy validation is missing");
         }

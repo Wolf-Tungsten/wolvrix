@@ -47,11 +47,11 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 output="unused",
                 direct_single_writer_state_reads=False,
                 pure_event_compute_word_bypass=False,
-                active_mask_gap_pack_policy="probe",
+                active_mask_gap_pack_policy="targeted-direct",
             )
             self.assertIs(calls[-1][1]["direct_single_writer_state_reads"], False)
             self.assertIs(calls[-1][1]["pure_event_compute_word_bypass"], False)
-            self.assertEqual(calls[-1][1]["active_mask_gap_pack_policy"], "probe")
+            self.assertEqual(calls[-1][1]["active_mask_gap_pack_policy"], "targeted-direct")
         finally:
             wolvrix._native = original_native
 
@@ -64,7 +64,8 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
     def test_python_active_mask_gap_pack_policy_validation(self) -> None:
         _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "off"})
         _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "probe"})
-        for value in ("", "targeted", " probe ", False, 1):
+        _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "targeted-direct"})
+        for value in ("", "targeted", "table", "targeted-table", " probe ", False, 1):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": value})
@@ -78,18 +79,20 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     output="unused",
                     top=[],
                     direct_single_writer_state_reads=False,
-                    active_mask_gap_pack_policy="probe",
+                    active_mask_gap_pack_policy="targeted-direct",
                 )
 
     def test_native_active_mask_gap_pack_policy_rejects_invalid_value(self) -> None:
         with wolvrix.Session() as session:
-            with self.assertRaisesRegex(ValueError, "active_mask_gap_pack_policy"):
-                native.session_emit_grhsim_cpp(
-                    session._capsule,
-                    design="missing.design",
-                    output="unused",
-                    active_mask_gap_pack_policy="targeted",
-                )
+            for value in ("targeted", "table", "targeted-table"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, "active_mask_gap_pack_policy"):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            active_mask_gap_pack_policy=value,
+                        )
 
     def test_native_active_mask_gap_pack_policy_accepts_explicit_none(self) -> None:
         with wolvrix.Session() as session:
@@ -129,7 +132,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
             with self.assertRaisesRegex(KeyError, "design key not found"):
                 native.session_emit_grhsim_cpp(*legacy_args)
             with self.assertRaisesRegex(KeyError, "design key not found"):
-                native.session_emit_grhsim_cpp(*legacy_args, "probe")
+                native.session_emit_grhsim_cpp(*legacy_args, "targeted-direct")
 
         self.assertIn(
             "direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None",

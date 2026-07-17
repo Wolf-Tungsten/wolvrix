@@ -214,10 +214,11 @@ namespace wolvrix::app::pybind
         if (activeMaskGapPackPolicy != nullptr)
         {
             const std::string policy(activeMaskGapPackPolicy);
-            if (policy != "off" && policy != "probe")
+            if (policy != "off" && policy != "probe" && policy != "targeted-direct")
             {
                 PyErr_SetString(PyExc_ValueError,
-                                "active_mask_gap_pack_policy must be one of: off, probe");
+                                "active_mask_gap_pack_policy must be one of: "
+                                "off, probe, targeted-direct");
                 return nullptr;
             }
         }

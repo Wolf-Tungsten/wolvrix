@@ -158,6 +158,7 @@ namespace wolvrix::app::pybind
         const char *pureEventWordPackPolicy = nullptr;
         PyObject *pureEventWordPackMaxMovedSupernodePpmObj = Py_None;
         PyObject *pureEventWordPackMaxChangedWordPpmObj = Py_None;
+        const char *activeMaskGapPackPolicy = nullptr;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -179,10 +180,11 @@ namespace wolvrix::app::pybind
                                        "pure_event_word_pack_max_moved_supernode_ppm",
                                        "pure_event_word_pack_max_changed_word_ppm",
                                        "direct_single_writer_state_reads",
+                                       "active_mask_gap_pack_policy",
                                        nullptr};
         if (!PyArg_ParseTupleAndKeywords(args,
                                          kwargs,
-                                         "Oss|OOOOOOOssOOOOOsOOO",
+                                         "Oss|OOOOOOOssOOOOOsOOOz",
                                          const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
@@ -204,9 +206,20 @@ namespace wolvrix::app::pybind
                                          &pureEventWordPackPolicy,
                                          &pureEventWordPackMaxMovedSupernodePpmObj,
                                          &pureEventWordPackMaxChangedWordPpmObj,
-                                         &directSingleWriterStateReadsObj))
+                                         &directSingleWriterStateReadsObj,
+                                         &activeMaskGapPackPolicy))
         {
             return nullptr;
+        }
+        if (activeMaskGapPackPolicy != nullptr)
+        {
+            const std::string policy(activeMaskGapPackPolicy);
+            if (policy != "off" && policy != "probe")
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "active_mask_gap_pack_policy must be one of: off, probe");
+                return nullptr;
+            }
         }
         SessionHandle *session = getSessionHandle(sessionObj);
         if (!session)
@@ -395,6 +408,10 @@ namespace wolvrix::app::pybind
                 return nullptr;
             }
             options.attributes["pure_event_word_pack_max_changed_word_ppm"] = std::to_string(parsed);
+        }
+        if (activeMaskGapPackPolicy != nullptr)
+        {
+            options.attributes["active_mask_gap_pack_policy"] = activeMaskGapPackPolicy;
         }
 
         const auto result = emitter.emit(*design, options);

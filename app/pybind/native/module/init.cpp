@@ -42,7 +42,7 @@ static PyMethodDef WolvrixMethods[] = {
     {"session_emit_grhsim_cpp",
      reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_grhsim_cpp),
      METH_VARARGS | METH_KEYWORDS,
-     "session_emit_grhsim_cpp(session, design, output, top=None, max_cpp_file_bytes=None, sched_batch_max_ops=None, sched_batch_max_estimated_lines=None, sched_batch_target_count=None, sched_batches_per_cpp=None, emit_parallelism=None, waveform=None, perf=None, input_fullpass_specialization=None, posedge_fullpass_specialization=None, full_active_word_consume=None, pure_event_compute_word_bypass=None, pure_event_compute_word_profile=None, pure_event_word_pack_policy=None, pure_event_word_pack_max_moved_supernode_ppm=None, pure_event_word_pack_max_changed_word_ppm=None, direct_single_writer_state_reads=None) -> (success, diagnostics)"},
+     "session_emit_grhsim_cpp(session, design, output, top=None, max_cpp_file_bytes=None, sched_batch_max_ops=None, sched_batch_max_estimated_lines=None, sched_batch_target_count=None, sched_batches_per_cpp=None, emit_parallelism=None, waveform=None, perf=None, input_fullpass_specialization=None, posedge_fullpass_specialization=None, full_active_word_consume=None, pure_event_compute_word_bypass=None, pure_event_compute_word_profile=None, pure_event_word_pack_policy=None, pure_event_word_pack_max_moved_supernode_ppm=None, pure_event_word_pack_max_changed_word_ppm=None, direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None) -> (success, diagnostics)"},
     {"session_emit_verilator_repcut_package",
      reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_verilator_repcut_package),
      METH_VARARGS | METH_KEYWORDS,

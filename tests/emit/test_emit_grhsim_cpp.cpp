@@ -6,6 +6,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace wolvrix::lib::emit;
 using namespace wolvrix::lib::grh;
@@ -3379,6 +3382,553 @@ namespace
         return result.success && !diags.hasError();
     }
 
+    struct ActiveMaskGapPackFixture
+    {
+        Design design;
+        SessionStore session;
+    };
+
+    template <typename T>
+    void setActivityScheduleFixtureSlot(SessionStore &session,
+                                        std::string_view name,
+                                        T value)
+    {
+        session.insert_or_assign(
+            "top.activity_schedule." + std::string(name),
+            std::make_unique<SessionSlotValue<T>>(std::move(value), "active-mask-gap-pack-test"));
+    }
+
+    ActiveMaskGapPackFixture buildActiveMaskGapPackFixture()
+    {
+        constexpr std::size_t kActiveFlagByteCount = 180u;
+        constexpr std::size_t kSupernodeCount = kActiveFlagByteCount * 8u;
+        const auto byteActiveIds = [](std::initializer_list<std::size_t> bytes)
+        {
+            std::vector<std::size_t> activeIds;
+            for (std::size_t byte : bytes)
+            {
+                activeIds.push_back(byte * 8u);
+            }
+            return activeIds;
+        };
+        const std::vector<std::vector<std::size_t>> groupActiveIds = {
+            byteActiveIds({8u, 10u, 12u, 14u}),
+            byteActiveIds({62u, 64u}),
+            byteActiveIds({177u, 179u}),
+            []
+            {
+                std::vector<std::size_t> indices;
+                for (std::size_t index = 80u; index <= 110u; ++index)
+                {
+                    indices.push_back(index * 8u);
+                }
+                return indices;
+            }(),
+            []
+            {
+                std::vector<std::size_t> indices;
+                for (std::size_t index = 120u; index <= 151u; ++index)
+                {
+                    indices.push_back(index * 8u);
+                }
+                return indices;
+            }(),
+            {42u, 43u, 160u, 161u, 176u},
+        };
+        const std::vector<std::size_t> sourceActiveIds = {7u, 15u, 23u, 31u, 39u, 41u};
+
+        ActivityScheduleTopoOrder topoOrder(kSupernodeCount);
+        for (std::size_t index = 0; index < topoOrder.size(); ++index)
+        {
+            topoOrder[index] = static_cast<uint32_t>(index);
+        }
+        for (std::size_t group = 0; group < groupActiveIds.size(); ++group)
+        {
+            const auto sourceIt = std::find(topoOrder.begin(),
+                                            topoOrder.end(),
+                                            static_cast<uint32_t>(group));
+            std::swap(topoOrder[sourceActiveIds[group]], *sourceIt);
+        }
+
+        std::vector<int> targetGroupBySupernode(kSupernodeCount, -1);
+        for (std::size_t group = 0; group < groupActiveIds.size(); ++group)
+        {
+            for (std::size_t activeId : groupActiveIds[group])
+            {
+                targetGroupBySupernode[topoOrder[activeId]] = static_cast<int>(group);
+            }
+        }
+
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        const ValueId trigger = makeLogicValue(graph, "gap_pack_trigger", 1);
+        graph.bindInputPort("trigger", trigger);
+
+        std::vector<ValueId> sourceValues;
+        std::vector<OperationId> operations(kSupernodeCount);
+        sourceValues.reserve(groupActiveIds.size());
+        for (std::size_t group = 0; group < groupActiveIds.size(); ++group)
+        {
+            const std::string suffix = std::to_string(group);
+            const ValueId value = makeLogicValue(graph, "gap_pack_source_value_" + suffix, 1);
+            const OperationId op = graph.createOperation(
+                OperationKind::kAssign,
+                graph.internSymbol("gap_pack_source_op_" + suffix));
+            graph.addOperand(op, trigger);
+            graph.addResult(op, value);
+            sourceValues.push_back(value);
+            operations[group] = op;
+        }
+        for (std::size_t supernode = groupActiveIds.size(); supernode < kSupernodeCount; ++supernode)
+        {
+            const std::string suffix = std::to_string(supernode);
+            const int targetGroup = targetGroupBySupernode[supernode];
+            const ValueId operand = targetGroup < 0
+                                        ? trigger
+                                        : sourceValues[static_cast<std::size_t>(targetGroup)];
+            const ValueId value = makeLogicValue(graph, "gap_pack_value_" + suffix, 1);
+            const OperationId op = graph.createOperation(
+                OperationKind::kAssign,
+                graph.internSymbol("gap_pack_op_" + suffix));
+            graph.addOperand(op, operand);
+            graph.addResult(op, value);
+            operations[supernode] = op;
+        }
+
+        ActivityScheduleSupernodeToOps supernodeToOps(kSupernodeCount);
+        for (std::size_t supernode = 0; supernode < kSupernodeCount; ++supernode)
+        {
+            supernodeToOps[supernode].push_back(operations[supernode]);
+        }
+        ActivityScheduleValueFanout valueFanout(graph.values().size());
+        for (std::size_t group = 0; group < groupActiveIds.size(); ++group)
+        {
+            auto &fanout = valueFanout[sourceValues[group].index - 1u];
+            for (std::size_t activeId : groupActiveIds[group])
+            {
+                fanout.push_back(topoOrder[activeId]);
+            }
+        }
+        setActivityScheduleFixtureSlot(fixture.session,
+                                       "supernode_to_ops",
+                                       std::move(supernodeToOps));
+        setActivityScheduleFixtureSlot(fixture.session,
+                                       "value_fanout",
+                                       std::move(valueFanout));
+        setActivityScheduleFixtureSlot(fixture.session,
+                                       "topo_order",
+                                       std::move(topoOrder));
+        setActivityScheduleFixtureSlot(fixture.session,
+                                       "state_read_supernodes",
+                                       ActivityScheduleStateReadSupernodes{});
+        return fixture;
+    }
+
+    class StderrCapture
+    {
+    public:
+        StderrCapture()
+        {
+            std::fflush(stderr);
+            file_ = std::tmpfile();
+            savedFd_ = ::dup(STDERR_FILENO);
+            if (file_ != nullptr && savedFd_ >= 0 &&
+                ::dup2(::fileno(file_), STDERR_FILENO) >= 0)
+            {
+                active_ = true;
+            }
+            else if (savedFd_ >= 0)
+            {
+                ::close(savedFd_);
+                savedFd_ = -1;
+            }
+        }
+
+        ~StderrCapture()
+        {
+            restore();
+            if (file_ != nullptr)
+            {
+                std::fclose(file_);
+            }
+        }
+
+        bool valid() const noexcept { return active_; }
+
+        std::string finish()
+        {
+            if (!active_)
+            {
+                return {};
+            }
+            std::fflush(stderr);
+            ::dup2(savedFd_, STDERR_FILENO);
+            ::close(savedFd_);
+            savedFd_ = -1;
+            active_ = false;
+            std::rewind(file_);
+            std::string output;
+            std::array<char, 4096> buffer{};
+            while (const std::size_t count = std::fread(buffer.data(), 1u, buffer.size(), file_))
+            {
+                output.append(buffer.data(), count);
+            }
+            return output;
+        }
+
+    private:
+        void restore()
+        {
+            if (!active_)
+            {
+                return;
+            }
+            std::fflush(stderr);
+            ::dup2(savedFd_, STDERR_FILENO);
+            ::close(savedFd_);
+            savedFd_ = -1;
+            active_ = false;
+        }
+
+        FILE *file_ = nullptr;
+        int savedFd_ = -1;
+        bool active_ = false;
+    };
+
+    struct ActiveMaskGapPackEmitRun
+    {
+        bool success = false;
+        bool diagnosticError = false;
+        std::string diagnostics;
+        std::string stderrText;
+        std::map<std::string, std::string> artifacts;
+    };
+
+    ActiveMaskGapPackEmitRun runActiveMaskGapPackEmit(
+        const Design &design,
+        SessionStore &session,
+        const std::filesystem::path &outDir,
+        std::optional<std::string_view> policy,
+        std::size_t parallelism)
+    {
+        std::filesystem::remove_all(outDir);
+        std::filesystem::create_directories(outDir);
+        EmitOptions options;
+        options.outputDir = outDir.string();
+        options.session = &session;
+        options.sessionPathPrefix = std::string("top");
+        options.attributes["sched_batch_max_ops"] = "8";
+        options.attributes["sched_batch_max_estimated_lines"] = "96";
+        options.attributes["sched_batches_per_cpp"] = "4";
+        options.attributes["emit_parallelism"] = std::to_string(parallelism);
+        if (policy)
+        {
+            options.attributes["active_mask_gap_pack_policy"] = std::string(*policy);
+        }
+
+        EmitDiagnostics diagnostics;
+        EmitGrhSimCpp emitter(&diagnostics);
+        StderrCapture capture;
+        ActiveMaskGapPackEmitRun run;
+        if (!capture.valid())
+        {
+            run.diagnostics = "failed to capture stderr";
+            return run;
+        }
+        const EmitResult result = emitter.emit(design, options);
+        run.stderrText = capture.finish();
+        run.success = result.success;
+        run.diagnosticError = diagnostics.hasError();
+        for (const auto &message : diagnostics.messages())
+        {
+            if (!run.diagnostics.empty())
+            {
+                run.diagnostics.push_back('\n');
+            }
+            run.diagnostics += message.message;
+        }
+        for (const std::string &artifact : result.artifacts)
+        {
+            const std::filesystem::path path(artifact);
+            run.artifacts.insert_or_assign(path.filename().string(), readFile(path));
+        }
+        return run;
+    }
+
+    std::vector<std::string> sessionKeys(const SessionStore &session)
+    {
+        std::vector<std::string> keys;
+        keys.reserve(session.size());
+        for (const auto &[key, _] : session)
+        {
+            keys.push_back(key);
+        }
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+
+    std::string_view probeLogLine(std::string_view log, std::string_view prefix)
+    {
+        const std::size_t begin = log.find(prefix);
+        if (begin == std::string_view::npos)
+        {
+            return {};
+        }
+        const std::size_t end = log.find('\n', begin);
+        return log.substr(begin, end == std::string_view::npos ? log.size() - begin : end - begin);
+    }
+
+    std::string_view probeStatsLine(std::string_view log, std::string_view kind)
+    {
+        return probeLogLine(
+            log,
+            "[GRHSIM_ACTIVE_MASK_GAP_PACK] kind=" + std::string(kind) + " ");
+    }
+
+    std::optional<std::size_t> probeStatsUnsigned(std::string_view line,
+                                                  std::string_view field)
+    {
+        const std::string prefix = std::string(field) + "=";
+        const std::size_t begin = line.find(prefix);
+        if (begin == std::string_view::npos)
+        {
+            return std::nullopt;
+        }
+        const std::size_t valueBegin = begin + prefix.size();
+        const std::size_t valueEnd = line.find(' ', valueBegin);
+        try
+        {
+            return static_cast<std::size_t>(std::stoull(
+                std::string(line.substr(valueBegin, valueEnd - valueBegin))));
+        }
+        catch (const std::exception &)
+        {
+            return std::nullopt;
+        }
+    }
+
+    std::string normalizeActiveMaskGapPackLog(std::string log)
+    {
+        constexpr std::string_view marker = "elapsed_us=";
+        std::size_t position = 0;
+        while ((position = log.find(marker, position)) != std::string::npos)
+        {
+            const std::size_t valueBegin = position + marker.size();
+            const std::size_t valueEnd = log.find_first_not_of("0123456789", valueBegin);
+            log.replace(valueBegin, valueEnd - valueBegin, "<elapsed>");
+            position = valueBegin + std::string_view("<elapsed>").size();
+        }
+        return log;
+    }
+
+    int runActiveMaskGapPackFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture = buildActiveMaskGapPackFixture();
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_active_mask_gap_pack";
+        const std::vector<std::string> keysBefore = sessionKeys(fixture.session);
+
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+        const ActiveMaskGapPackEmitRun defaultRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "default", std::nullopt, 2u);
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "targeted", 1);
+        const ActiveMaskGapPackEmitRun offRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "off", "off", 2u);
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+        const ActiveMaskGapPackEmitRun probeSerialRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "probe_serial", "probe", 1u);
+        const ActiveMaskGapPackEmitRun probeParallelRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "probe_parallel", "probe", 4u);
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "probe", 1);
+        const ActiveMaskGapPackEmitRun probeEnvironmentRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "probe_environment", std::nullopt, 2u);
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+
+        if (!defaultRun.success || defaultRun.diagnosticError ||
+            !offRun.success || offRun.diagnosticError ||
+            !probeSerialRun.success || probeSerialRun.diagnosticError ||
+            !probeParallelRun.success || probeParallelRun.diagnosticError ||
+            !probeEnvironmentRun.success || probeEnvironmentRun.diagnosticError)
+        {
+            return fail("active-mask gap-pack off/probe fixture emission failed");
+        }
+        if (defaultRun.artifacts != offRun.artifacts ||
+            defaultRun.artifacts != probeSerialRun.artifacts ||
+            probeSerialRun.artifacts != probeParallelRun.artifacts ||
+            probeSerialRun.artifacts != probeEnvironmentRun.artifacts)
+        {
+            return fail("active-mask gap-pack off/probe must preserve every generated artifact byte");
+        }
+        constexpr std::string_view kProbePrefix = "[GRHSIM_ACTIVE_MASK_GAP_PACK]";
+        if (defaultRun.stderrText.find(kProbePrefix) != std::string::npos ||
+            offRun.stderrText.find(kProbePrefix) != std::string::npos)
+        {
+            return fail("active-mask gap-pack off must not construct or report probe statistics");
+        }
+        if (probeSerialRun.stderrText.find("validation=pass") == std::string::npos ||
+            probeSerialRun.stderrText.find("coverage=classified_global_activation_path") == std::string::npos ||
+            probeSerialRun.stderrText.find("commit_range_groups=") == std::string::npos ||
+            probeSerialRun.stderrText.find("unclassified_groups=") == std::string::npos)
+        {
+            return fail("active-mask gap-pack probe summary is missing validation or coverage limits");
+        }
+        if (normalizeActiveMaskGapPackLog(probeSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(probeParallelRun.stderrText) ||
+            normalizeActiveMaskGapPackLog(probeSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(probeEnvironmentRun.stderrText))
+        {
+            return fail("active-mask gap-pack probe aggregation must be parallel deterministic");
+        }
+        if (sessionKeys(fixture.session) != keysBefore)
+        {
+            return fail("active-mask gap-pack probe must not write session state");
+        }
+        for (const auto &[_, content] : probeSerialRun.artifacts)
+        {
+            if (content.find(kProbePrefix) != std::string::npos)
+            {
+                return fail("active-mask gap-pack probe log must not enter generated artifacts");
+            }
+        }
+
+        const std::string_view nonTableLine =
+            probeStatsLine(probeSerialRun.stderrText, "non-table");
+        const std::string_view tableLine =
+            probeStatsLine(probeSerialRun.stderrText, "table");
+        const std::string_view excludedLine = probeLogLine(
+            probeSerialRun.stderrText,
+            "[GRHSIM_ACTIVE_MASK_GAP_PACK] owner=excluded ");
+        const auto nonTableGroups = probeStatsUnsigned(nonTableLine, "groups");
+        const auto nonTableEntries = probeStatsUnsigned(nonTableLine, "entries");
+        const auto nonTableLocalTargets = probeStatsUnsigned(nonTableLine, "local_targets");
+        const auto nonTableGlobalActiveIds = probeStatsUnsigned(nonTableLine, "global_active_ids");
+        const auto nonTableConditionalGroups = probeStatsUnsigned(nonTableLine, "conditional_groups");
+        const auto nonTableRealBytes = probeStatsUnsigned(nonTableLine, "real_covered_bytes");
+        const auto nonTableCoveredBytes = probeStatsUnsigned(nonTableLine, "candidate_covered_bytes");
+        const auto nonTableHolePpm = probeStatsUnsigned(nonTableLine, "hole_ppm");
+        const auto nonTableBaseline = probeStatsUnsigned(nonTableLine, "baseline_writes");
+        const auto nonTableContiguous = probeStatsUnsigned(nonTableLine, "contiguous_writes");
+        const auto nonTableCandidate = probeStatsUnsigned(nonTableLine, "candidate_writes");
+        const auto nonTableGapSaved = probeStatsUnsigned(nonTableLine, "gap_saved");
+        const auto nonTableHoles = probeStatsUnsigned(nonTableLine, "hole_bytes");
+        const auto nonTableGapImproved = probeStatsUnsigned(nonTableLine, "gap_improved");
+        const auto nonTableInvalid = probeStatsUnsigned(nonTableLine, "invalid_groups");
+        const auto nonTableBoundsRejects = probeStatsUnsigned(nonTableLine, "rejected_bounds_transitions");
+        const auto nonTableLaneRejects = probeStatsUnsigned(nonTableLine, "rejected_lane_transitions");
+        if (!nonTableGroups || !nonTableEntries || !nonTableLocalTargets ||
+            !nonTableGlobalActiveIds || !nonTableConditionalGroups ||
+            !nonTableRealBytes || !nonTableCoveredBytes || !nonTableHolePpm ||
+            !nonTableBaseline ||
+            !nonTableContiguous || !nonTableCandidate || !nonTableGapSaved ||
+            !nonTableHoles || !nonTableGapImproved || !nonTableInvalid ||
+            !nonTableBoundsRejects || !nonTableLaneRejects)
+        {
+            return fail("active-mask gap-pack non-table statistics are incomplete: " +
+                        std::string(nonTableLine));
+        }
+        if (*nonTableGroups != 5u ||
+            *nonTableEntries != 41u ||
+            *nonTableLocalTargets != 2u ||
+            *nonTableGlobalActiveIds != 42u ||
+            *nonTableConditionalGroups != 5u ||
+            *nonTableRealBytes != 41u ||
+            *nonTableCoveredBytes != 48u ||
+            *nonTableHolePpm != 145833u ||
+            *nonTableBaseline != 16u ||
+            *nonTableContiguous != *nonTableBaseline ||
+            *nonTableCandidate != 10u ||
+            *nonTableGapSaved != 6u ||
+            *nonTableHoles != 7u ||
+            *nonTableGapImproved != 3u ||
+            *nonTableInvalid != 0u ||
+            *nonTableBoundsRejects != 5u ||
+            *nonTableLaneRejects != 2u)
+        {
+            return fail("active-mask gap-pack hole/tail/lane/non-table plan statistics are wrong: " +
+                        std::string(nonTableLine));
+        }
+
+        const auto tableGroups = probeStatsUnsigned(tableLine, "groups");
+        const auto tableEntries = probeStatsUnsigned(tableLine, "entries");
+        const auto tableBaseline = probeStatsUnsigned(tableLine, "baseline_writes");
+        const auto tableContiguous = probeStatsUnsigned(tableLine, "contiguous_writes");
+        const auto tableCandidate = probeStatsUnsigned(tableLine, "candidate_writes");
+        const auto tableGapSaved = probeStatsUnsigned(tableLine, "gap_saved");
+        const auto tableInvalid = probeStatsUnsigned(tableLine, "invalid_groups");
+        if (!tableGroups || !tableEntries || !tableBaseline || !tableContiguous ||
+            !tableCandidate || !tableGapSaved || !tableInvalid || *tableGroups == 0u ||
+            *tableEntries != *tableGroups * 32u ||
+            *tableBaseline != *tableGroups * 32u ||
+            *tableContiguous != *tableGroups * 4u ||
+            *tableCandidate != *tableContiguous ||
+            *tableGapSaved != 0u || *tableInvalid != 0u)
+        {
+            return fail("active-mask gap-pack 31/32 table threshold statistics are wrong: " +
+                        std::string(tableLine));
+        }
+
+        const auto seedGroups = probeStatsUnsigned(excludedLine, "seed_groups");
+        const auto seedEntries = probeStatsUnsigned(excludedLine, "seed_entries");
+        const auto commitRangeGroups = probeStatsUnsigned(excludedLine, "commit_range_groups");
+        const auto commitRangeEntries = probeStatsUnsigned(excludedLine, "commit_range_entries");
+        const auto unclassifiedGroups = probeStatsUnsigned(excludedLine, "unclassified_groups");
+        const auto unclassifiedEntries = probeStatsUnsigned(excludedLine, "unclassified_entries");
+        if (!seedGroups || !seedEntries || !commitRangeGroups || !commitRangeEntries ||
+            !unclassifiedGroups || !unclassifiedEntries ||
+            *seedGroups == 0u || *seedEntries == 0u ||
+            *commitRangeGroups != 0u || *commitRangeEntries != 0u ||
+            *unclassifiedGroups != 0u || *unclassifiedEntries != 0u)
+        {
+            return fail("active-mask gap-pack excluded-path classification is wrong: " +
+                        std::string(excludedLine));
+        }
+
+        std::string schedSources;
+        for (const auto &[name, content] : offRun.artifacts)
+        {
+            if (name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp"))
+            {
+                schedSources += content;
+            }
+        }
+        const std::size_t condition = schedSources.find("if (grhsim_changed_2) {");
+        const std::size_t openBrace = schedSources.find('{', condition);
+        const std::size_t closeBrace = findMatchingBrace(schedSources, openBrace);
+        if (condition == std::string::npos || closeBrace == std::string::npos)
+        {
+            return fail("active-mask gap-pack conditional baseline branch is missing");
+        }
+        const std::string_view conditionalBlock(schedSources.data() + openBrace,
+                                                closeBrace - openBrace + 1u);
+        for (std::size_t byteIndex : {8u, 10u, 12u, 14u})
+        {
+            if (conditionalBlock.find("supernode_active_curr_[" +
+                                      std::to_string(byteIndex) + "u]") == std::string_view::npos)
+            {
+                return fail("active-mask gap-pack probe changed the frozen conditional lowering");
+            }
+        }
+
+        const ActiveMaskGapPackEmitRun invalidAttributeRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "invalid_attribute", "targeted", 1u);
+        if (invalidAttributeRun.success || !invalidAttributeRun.diagnosticError ||
+            invalidAttributeRun.diagnostics.find("expected off or probe") == std::string::npos)
+        {
+            return fail("active-mask gap-pack targeted policy must be rejected in the probe-only stage");
+        }
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "invalid", 1);
+        const ActiveMaskGapPackEmitRun invalidEnvironmentRun = runActiveMaskGapPackEmit(
+            fixture.design, fixture.session, baseDir / "invalid_environment", std::nullopt, 1u);
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+        if (invalidEnvironmentRun.success || !invalidEnvironmentRun.diagnosticError ||
+            invalidEnvironmentRun.diagnostics.find("expected off or probe") == std::string::npos)
+        {
+            return fail("active-mask gap-pack environment policy validation is missing");
+        }
+        return 0;
+    }
+
 } // namespace
 
 #ifndef WOLF_SV_EMIT_ARTIFACT_DIR
@@ -3387,6 +3937,10 @@ namespace
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_ACTIVE_MASK_GAP_PACK") != nullptr)
+    {
+        return runActiveMaskGapPackFocusedTests();
+    }
     try
     {
         EmitOptions options;

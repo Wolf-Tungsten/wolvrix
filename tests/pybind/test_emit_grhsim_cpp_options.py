@@ -35,9 +35,11 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 output="unused",
                 direct_single_writer_state_reads=None,
                 pure_event_compute_word_bypass=None,
+                active_mask_gap_pack_policy=None,
             )
             self.assertNotIn("direct_single_writer_state_reads", calls[-1][1])
             self.assertNotIn("pure_event_compute_word_bypass", calls[-1][1])
+            self.assertNotIn("active_mask_gap_pack_policy", calls[-1][1])
 
             wolvrix.Session.emit_grhsim_cpp(
                 DummySession(),
@@ -45,9 +47,11 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 output="unused",
                 direct_single_writer_state_reads=False,
                 pure_event_compute_word_bypass=False,
+                active_mask_gap_pack_policy="probe",
             )
             self.assertIs(calls[-1][1]["direct_single_writer_state_reads"], False)
             self.assertIs(calls[-1][1]["pure_event_compute_word_bypass"], False)
+            self.assertEqual(calls[-1][1]["active_mask_gap_pack_policy"], "probe")
         finally:
             wolvrix._native = original_native
 
@@ -56,6 +60,14 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
         _compile_emit_grhsim_cpp_kwargs({"direct_single_writer_state_reads": False})
         with self.assertRaises(ValueError):
             _compile_emit_grhsim_cpp_kwargs({"direct_single_writer_state_reads": 1})
+
+    def test_python_active_mask_gap_pack_policy_validation(self) -> None:
+        _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "off"})
+        _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "probe"})
+        for value in ("", "targeted", " probe ", False, 1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": value})
 
     def test_native_keyword_is_accepted(self) -> None:
         with wolvrix.Session() as session:
@@ -66,7 +78,63 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     output="unused",
                     top=[],
                     direct_single_writer_state_reads=False,
+                    active_mask_gap_pack_policy="probe",
                 )
+
+    def test_native_active_mask_gap_pack_policy_rejects_invalid_value(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaisesRegex(ValueError, "active_mask_gap_pack_policy"):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    active_mask_gap_pack_policy="targeted",
+                )
+
+    def test_native_active_mask_gap_pack_policy_accepts_explicit_none(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    active_mask_gap_pack_policy=None,
+                )
+
+    def test_native_new_positional_argument_is_appended(self) -> None:
+        with wolvrix.Session() as session:
+            legacy_args = (
+                session._capsule,
+                "missing.design",
+                "unused",
+                [],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "off",
+                "off",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "off",
+                None,
+                None,
+                False,
+            )
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(*legacy_args)
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(*legacy_args, "probe")
+
+        self.assertIn(
+            "direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None",
+            native.session_emit_grhsim_cpp.__doc__,
+        )
 
 
 if __name__ == "__main__":

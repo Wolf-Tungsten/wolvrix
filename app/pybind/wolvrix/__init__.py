@@ -306,6 +306,7 @@ class Session:
         pure_event_word_pack_policy: str | None = None,
         pure_event_word_pack_max_moved_supernode_ppm: int | None = None,
         pure_event_word_pack_max_changed_word_ppm: int | None = None,
+        active_mask_gap_pack_policy: str | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
@@ -317,7 +318,8 @@ class Session:
                 pure_event_compute_word_bypass is not None or
                 pure_event_compute_word_profile is not None or pure_event_word_pack_policy is not None or
                 pure_event_word_pack_max_moved_supernode_ppm is not None or
-                pure_event_word_pack_max_changed_word_ppm is not None):
+                pure_event_word_pack_max_changed_word_ppm is not None or
+                active_mask_gap_pack_policy is not None):
             named_args = dict(named_args)
         if max_cpp_file_bytes is not None:
             named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
@@ -351,6 +353,8 @@ class Session:
             named_args["pure_event_word_pack_max_moved_supernode_ppm"] = pure_event_word_pack_max_moved_supernode_ppm
         if pure_event_word_pack_max_changed_word_ppm is not None:
             named_args["pure_event_word_pack_max_changed_word_ppm"] = pure_event_word_pack_max_changed_word_ppm
+        if active_mask_gap_pack_policy is not None:
+            named_args["active_mask_gap_pack_policy"] = active_mask_gap_pack_policy
         _compile_emit_grhsim_cpp_kwargs(named_args)
         success, diagnostics = _native.session_emit_grhsim_cpp(
             self._capsule,
@@ -798,6 +802,14 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
         if value is not None:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 1_000_000:
                 raise ValueError(f"emit_grhsim_cpp {key} must be an integer between 0 and 1000000")
+    active_mask_gap_pack_policy = local.pop("active_mask_gap_pack_policy", None)
+    if active_mask_gap_pack_policy is not None:
+        if not isinstance(active_mask_gap_pack_policy, str):
+            raise ValueError("emit_grhsim_cpp active_mask_gap_pack_policy must be a string")
+        if active_mask_gap_pack_policy not in {"off", "probe"}:
+            raise ValueError(
+                "emit_grhsim_cpp active_mask_gap_pack_policy must be one of: off, probe"
+            )
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 
 

@@ -18,6 +18,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 - 可选地把严格受限的双消费者纯组合 op true-clone 到远端 consumer node，并完整重建中间模型
 - 在 compute-node cluster DAG 上执行 plain coarsen 和连续分段
 - 展开最终 `computeSupernode` / `commitSupernode` 调度模型
+- 可选地只读探测把小型 terminal compute node 推入唯一 common-target supernode 的机会
 - 将 schedule 写入 session，供 `grhsim-cpp` emit 使用
 
 完整运行时术语和静态到运行时映射见
@@ -58,6 +59,15 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-disable-commit-guard-event-buckets` | `false` | 关闭 commit guard/event bucket 分组 |
 | `-split-oversize-compute-nodes` | `false` | materialize 阶段拆分超过上限的单个 compute node |
 | `-declared-value-compute-node-boundary` | `false` | 把带 declared symbol 的 value 作为 compute-node 截断边界 |
+| `-final-terminal-pushforward-policy` | `off` | terminal common-target pushforward 只读策略：`off/probe` |
+| `-final-terminal-pushforward-max-node-ops` | `8` | 候选 terminal compute node 的最大 raw compute op 数 |
+| `-final-terminal-pushforward-max-inputs` | `16` | 候选 cone 的最大 external input value 数 |
+| `-final-terminal-pushforward-max-outputs` | `16` | 候选 cone 的最大 external output value 数 |
+| `-final-terminal-pushforward-max-value-width` | `64` | 候选 external input/output logic value 的最大位宽 |
+| `-final-terminal-pushforward-min-bae-gain` | `1` | 候选的最小 exact boundary activation edge 净收益 |
+| `-final-terminal-pushforward-min-boundary-value-gain` | `1` | 候选的最小 exact boundary value 净收益 |
+| `-final-terminal-pushforward-max-moves` | `128` | conflict-free projected move 数上限 |
+| `-final-terminal-pushforward-max-moved-op-ppm` | `200` | selected move 涉及的 raw compute op 占最终 compute op 的 PPM 上限 |
 | `-final-sibling-fusion-policy` | `off` | final compute sibling fusion 只读策略：`off/probe` |
 | `-final-sibling-fusion-min-gain` | `4` | probe pair 的最小 exact compute BAE gain |
 | `-final-sibling-fusion-max-pairs` | `256` | probe conflict-free projected pair 上限 |
@@ -144,6 +154,31 @@ incoming_boundary_activation_edges + 1
 ```
 
 同成本时偏向更长 segment。
+
+## Final terminal common-target pushforward probe
+
+`final-terminal-pushforward-policy=probe` 在 final schedule 上只读寻找完整的小型
+terminal compute node/cone `C`：`C` 当前位于 source compute supernode `S`，它的所有
+external output value 都只被同一个 target compute supernode `T` 使用。候选的所有
+external input value 必须由 `S` 中不属于 `C` 的 remaining op 定义；move 后 `S`、`T`
+都必须非空，且 `T + C` 不能超过最终 compute supernode op cap。state/memory/event/intent、
+side-effect、declared/port 和其它不满足纯组合 allowlist 的路径不会进入候选。
+
+probe 对每个候选按最终 schedule 的 value fanout 机械重算两项净收益：
+
+```text
+net BAE = removed output activation edges - newly introduced input activation edges
+net boundary values = outputs losing all external fanout - inputs becoming external
+```
+
+两项净收益分别受 `min-bae-gain` 和 `min-boundary-value-gain` gate；node op、input/output
+数量与 logic width 也受各自显式上限约束。通过结构 gate 的候选按稳定顺序选择，并受
+move 数、moved-op PPM 和 touched-supernode conflict 预算约束。
+
+当前只实现 `off/probe`，没有 strict mutation。probe 不修改 graph、schedule、active ID、
+session payload 或 emitter layout；它只输出候选/reject funnel、projected gain 和预算统计。
+结构正收益仍不代表端到端收益：pushforward 可能使 input 变化但 output 不变时也执行 `C`
+和 `T`，因此后续 strict 实现必须先通过单独的动态额外执行 gate。
 
 `post-dp-refine-policy=swap-probe` 只读枚举因目标 segment 满载而受阻的 equal-load
 cluster swap。候选必须保持 pair topology 和 exact quotient DAG support key，且降低 exact

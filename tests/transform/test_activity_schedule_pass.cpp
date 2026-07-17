@@ -6542,6 +6542,239 @@ int main()
     }
 
     {
+        currentCase = "final_terminal_pushforward_probe";
+
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId producer;
+            wolvrix::lib::grh::OperationId candidate;
+            wolvrix::lib::grh::OperationId delay;
+            wolvrix::lib::grh::OperationId barrier;
+            wolvrix::lib::grh::OperationId tail;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design,
+                                     const std::string &name)
+        {
+            using K = wolvrix::lib::grh::OperationKind;
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+
+            const auto input = makeValue(graph, "input", 8);
+            graph.bindInputPort("input", input);
+            const auto producer0 = makeValue(graph, "producer_0", 8);
+            const auto producer1 = makeValue(graph, "producer_1", 8);
+            const auto producer2 = makeValue(graph, "producer_2", 8);
+            const auto producer3 = makeValue(graph, "producer_3", 8);
+            FixtureOps ops;
+            ops.producer = graph.createOperation(
+                K::kNot, graph.internSymbol("producer"));
+            graph.addOperand(ops.producer, input);
+            graph.addResult(ops.producer, producer0);
+            graph.addResult(ops.producer, producer1);
+            graph.addResult(ops.producer, producer2);
+            graph.addResult(ops.producer, producer3);
+
+            const auto candidateValue = makeValue(graph, "candidate_value", 8);
+            ops.candidate = graph.createOperation(
+                K::kNot, graph.internSymbol("candidate"));
+            graph.addOperand(ops.candidate, producer0);
+            graph.addResult(ops.candidate, candidateValue);
+
+            const auto delayValue = makeValue(graph, "delay_value", 8);
+            ops.delay = graph.createOperation(K::kNot, graph.internSymbol("delay"));
+            graph.addOperand(ops.delay, producer1);
+            graph.addResult(ops.delay, delayValue);
+
+            const auto barrierValue = makeValue(graph, "barrier_value", 8);
+            ops.barrier = graph.createOperation(K::kAnd, graph.internSymbol("barrier"));
+            graph.addOperand(ops.barrier, delayValue);
+            graph.addOperand(ops.barrier, producer2);
+            graph.addOperand(ops.barrier, producer3);
+            graph.addResult(ops.barrier, barrierValue);
+
+            const auto output = makeValue(graph, "output", 8);
+            ops.tail = graph.createOperation(K::kXor, graph.internSymbol("tail"));
+            graph.addOperand(ops.tail, candidateValue);
+            graph.addOperand(ops.tail, producer0);
+            graph.addOperand(ops.tail, barrierValue);
+            graph.addResult(ops.tail, output);
+            graph.bindOutputPort("output", output);
+            return ops;
+        };
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   const std::string &name,
+                                   std::optional<std::string> policy,
+                                   SessionStore &session,
+                                   std::string *log = nullptr)
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 4;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            if (policy)
+            {
+                options.finalTerminalPushforwardPolicy = *policy;
+            }
+            options.finalTerminalPushforwardMaxMoves = 1;
+            options.finalTerminalPushforwardMaxMovedOpPpm = 1000000;
+            PassManager manager;
+            manager.options().session = &session;
+            if (log != nullptr)
+            {
+                manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+                manager.options().logSink =
+                    [log](wolvrix::lib::LogLevel,
+                          std::string_view,
+                          std::string_view message)
+                    {
+                        log->append(message);
+                        log->push_back('\n');
+                    };
+            }
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return result.success && !result.changed && !diags.hasError();
+        };
+
+        std::string parseError;
+        const std::vector<std::string_view> separatedArgs{
+            "-path", "final_terminal_pushforward_probe",
+            "-final-terminal-pushforward-policy", "probe",
+            "-final-terminal-pushforward-max-node-ops", "8",
+            "-final-terminal-pushforward-max-inputs", "16",
+            "-final-terminal-pushforward-max-outputs", "16",
+            "-final-terminal-pushforward-max-value-width", "64",
+            "-final-terminal-pushforward-min-bae-gain", "1",
+            "-final-terminal-pushforward-min-boundary-value-gain", "1",
+            "-final-terminal-pushforward-max-moves", "128",
+            "-final-terminal-pushforward-max-moved-op-ppm", "200"};
+        const std::vector<std::string_view> equalsArgs{
+            "-path=final_terminal_pushforward_probe",
+            "-final-terminal-pushforward-policy=probe",
+            "-final-terminal-pushforward-max-node-ops=8",
+            "-final-terminal-pushforward-max-inputs=16",
+            "-final-terminal-pushforward-max-outputs=16",
+            "-final-terminal-pushforward-max-value-width=64",
+            "-final-terminal-pushforward-min-bae-gain=1",
+            "-final-terminal-pushforward-min-boundary-value-gain=1",
+            "-final-terminal-pushforward-max-moves=128",
+            "-final-terminal-pushforward-max-moved-op-ppm=200"};
+        const std::vector<std::string_view> malformedArgs{
+            "-final-terminal-pushforward-max-node-ops=-1"};
+        if (makePass("activity-schedule", separatedArgs, parseError) == nullptr ||
+            makePass("activity-schedule", equalsArgs, parseError) == nullptr ||
+            makePass("activity-schedule", malformedArgs, parseError) != nullptr)
+        {
+            return fail("Expected terminal pushforward CLI forms to parse strictly");
+        }
+
+        constexpr std::string_view kName = "final_terminal_pushforward_probe";
+        wolvrix::lib::grh::Design defaultDesign;
+        buildFixture(defaultDesign, std::string(kName));
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign, std::string(kName), std::nullopt, defaultSession))
+        {
+            return fail("Expected default terminal pushforward schedule to succeed");
+        }
+        wolvrix::lib::grh::Design offDesign;
+        buildFixture(offDesign, std::string(kName));
+        SessionStore offSession;
+        if (!runFixture(offDesign, std::string(kName), "off", offSession))
+        {
+            return fail("Expected explicit-off terminal pushforward schedule to succeed");
+        }
+        wolvrix::lib::grh::Design probeDesign;
+        const FixtureOps probeOps = buildFixture(probeDesign, std::string(kName));
+        SessionStore probeSession;
+        std::string probeLog;
+        if (!runFixture(probeDesign, std::string(kName), "probe", probeSession, &probeLog))
+        {
+            return fail("Expected terminal pushforward probe schedule to succeed: " +
+                        probeLog);
+        }
+        const auto defaultSchedule = loadSchedule(defaultSession, std::string(kName));
+        const auto offSchedule = loadSchedule(offSession, std::string(kName));
+        const auto probeSchedule = loadSchedule(probeSession, std::string(kName));
+        if (!schedulesEqual(defaultSchedule, offSchedule) ||
+            !schedulesEqual(offSchedule, probeSchedule) ||
+            defaultSession.size() != offSession.size() ||
+            offSession.size() != probeSession.size())
+        {
+            return fail("Expected off/probe terminal pushforward session identity");
+        }
+        if (probeSchedule.opToSupernode == nullptr ||
+            probeSchedule.supernodeToOps == nullptr)
+        {
+            return fail("Expected terminal pushforward schedule ownership outputs");
+        }
+        const uint32_t source =
+            (*probeSchedule.opToSupernode)[probeOps.candidate.index - 1];
+        const uint32_t target =
+            (*probeSchedule.opToSupernode)[probeOps.tail.index - 1];
+        if (source == target ||
+            (*probeSchedule.opToSupernode)[probeOps.producer.index - 1] != source ||
+            (*probeSchedule.opToSupernode)[probeOps.delay.index - 1] != source ||
+            (*probeSchedule.opToSupernode)[probeOps.barrier.index - 1] != source ||
+            source >= probeSchedule.supernodeToOps->size() ||
+            target >= probeSchedule.supernodeToOps->size() ||
+            (*probeSchedule.supernodeToOps)[source].size() != 4 ||
+            (*probeSchedule.supernodeToOps)[target].size() != 1)
+        {
+            return fail("Expected terminal pushforward 4/1 source/target fixture shape");
+        }
+        const std::string expectedCandidate =
+            "source_ops=4 target_ops=1 node_ops=1 inputs=1 outputs=1 "
+            "max_value_width=8 output_kind=kNot pair_multiplicity=3 "
+            "removed_bae=1 added_bae=0 bae_gain=1 "
+            "removed_boundary_values=1 added_boundary_values=0 "
+            "boundary_value_gain=1 removed_bytes=1 added_bytes=0 byte_gain=1";
+        if (probeLog.find("activity-schedule final terminal pushforward probe:") ==
+                std::string::npos ||
+            parseStatField(probeLog, "scanned") != 5 ||
+            parseStatField(probeLog, "exact_eligible") != 1 ||
+            parseStatField(probeLog, "selected") != 1 ||
+            parseStatField(probeLog, "eligible_bae_gain") != 1 ||
+            parseStatField(probeLog, "selected_bae_gain") != 1 ||
+            parseStatField(probeLog, "eligible_boundary_value_gain") != 1 ||
+            parseStatField(probeLog, "selected_boundary_value_gain") != 1 ||
+            parseStatField(probeLog, "eligible_byte_gain") != 1 ||
+            parseStatField(probeLog, "selected_byte_gain") != 1 ||
+            parseStatField(probeLog, "moved_ops") != 1 ||
+            parseStatField(probeLog, "moved_op_limit") != 5 ||
+            probeLog.find("skipped_oversize=false") == std::string::npos ||
+            probeLog.find(expectedCandidate) == std::string::npos)
+        {
+            return fail("Expected exact terminal pushforward probe accounting: " +
+                        probeLog);
+        }
+
+        const auto invalidOptionsFail = [&](std::string policy, std::size_t ppm)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, "final_terminal_pushforward_invalid");
+            ActivityScheduleOptions options;
+            options.path = "final_terminal_pushforward_invalid";
+            options.finalTerminalPushforwardPolicy = std::move(policy);
+            options.finalTerminalPushforwardMaxMovedOpPpm = ppm;
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return !result.success && diags.hasError();
+        };
+        if (!invalidOptionsFail("strict", 200) ||
+            !invalidOptionsFail("off", 1000001))
+        {
+            return fail("Expected invalid terminal pushforward policy/PPM to fail");
+        }
+    }
+
+    {
         currentCase = "final_sibling_fusion_probe";
 
         struct FixtureOptions

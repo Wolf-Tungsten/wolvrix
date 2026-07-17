@@ -1329,6 +1329,19 @@ namespace wolvrix::lib::transform
                     options.finalFaninPullbackPolicy = std::string(
                         arg.substr(std::string_view("-final-fanin-pullback-policy=").size()));
                 }
+                else if (arg == "-final-terminal-pushforward-policy")
+                {
+                    if (!parseStringArg("-final-terminal-pushforward-policy",
+                                        options.finalTerminalPushforwardPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-policy="))
+                {
+                    options.finalTerminalPushforwardPolicy = std::string(
+                        arg.substr(std::string_view("-final-terminal-pushforward-policy=").size()));
+                }
                 else if (arg == "-final-sibling-fusion-policy")
                 {
                     if (!parseStringArg("-final-sibling-fusion-policy",
@@ -1472,6 +1485,150 @@ namespace wolvrix::lib::transform
                             "-final-fanin-pullback-max-moved-op-ppm",
                             arg.substr(std::string_view("-final-fanin-pullback-max-moved-op-ppm=").size()),
                             options.finalFaninPullbackMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-max-node-ops")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-max-node-ops",
+                                           options.finalTerminalPushforwardMaxNodeOps))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-max-node-ops="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-max-node-ops",
+                            arg.substr(std::string_view("-final-terminal-pushforward-max-node-ops=").size()),
+                            options.finalTerminalPushforwardMaxNodeOps))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-max-inputs")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-max-inputs",
+                                           options.finalTerminalPushforwardMaxInputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-max-inputs="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-max-inputs",
+                            arg.substr(std::string_view("-final-terminal-pushforward-max-inputs=").size()),
+                            options.finalTerminalPushforwardMaxInputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-max-outputs")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-max-outputs",
+                                           options.finalTerminalPushforwardMaxOutputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-max-outputs="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-max-outputs",
+                            arg.substr(std::string_view("-final-terminal-pushforward-max-outputs=").size()),
+                            options.finalTerminalPushforwardMaxOutputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-max-value-width")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-max-value-width",
+                                           options.finalTerminalPushforwardMaxValueWidth))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-max-value-width="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-max-value-width",
+                            arg.substr(std::string_view("-final-terminal-pushforward-max-value-width=").size()),
+                            options.finalTerminalPushforwardMaxValueWidth))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-min-bae-gain")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-min-bae-gain",
+                                           options.finalTerminalPushforwardMinBaeGain))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-min-bae-gain="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-min-bae-gain",
+                            arg.substr(std::string_view("-final-terminal-pushforward-min-bae-gain=").size()),
+                            options.finalTerminalPushforwardMinBaeGain))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-min-boundary-value-gain")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-min-boundary-value-gain",
+                                           options.finalTerminalPushforwardMinBoundaryValueGain))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-min-boundary-value-gain="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-min-boundary-value-gain",
+                            arg.substr(std::string_view("-final-terminal-pushforward-min-boundary-value-gain=").size()),
+                            options.finalTerminalPushforwardMinBoundaryValueGain))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-max-moves")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-max-moves",
+                                           options.finalTerminalPushforwardMaxMoves))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-max-moves="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-max-moves",
+                            arg.substr(std::string_view("-final-terminal-pushforward-max-moves=").size()),
+                            options.finalTerminalPushforwardMaxMoves))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-max-moved-op-ppm")
+                {
+                    if (!parseExactSizeArg("-final-terminal-pushforward-max-moved-op-ppm",
+                                           options.finalTerminalPushforwardMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-max-moved-op-ppm="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-max-moved-op-ppm",
+                            arg.substr(std::string_view("-final-terminal-pushforward-max-moved-op-ppm=").size()),
+                            options.finalTerminalPushforwardMaxMovedOpPpm))
                     {
                         return nullptr;
                     }

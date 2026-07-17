@@ -819,9 +819,11 @@ namespace wolvrix::lib::emit
         {
         public:
             ActiveMaskGapPackProbe(std::size_t activeFlagByteCount,
-                                   ActiveMaskGapPackPolicy policy)
+                                   ActiveMaskGapPackPolicy policy,
+                                   bool tableRuntimeProfileEnabled = false)
                 : activeFlagByteCount_(activeFlagByteCount),
                   policy_(policy),
+                  tableRuntimeProfileEnabled_(tableRuntimeProfileEnabled),
                   validatorSelfTestPassed_(runActiveMaskGapPackValidatorSelfTest()),
                   validationPassed_(validatorSelfTestPassed_)
             {
@@ -830,7 +832,8 @@ namespace wolvrix::lib::emit
             bool observe(const std::vector<ActiveMaskEntry> &entries,
                          const std::vector<ActiveMaskChunk> &baselineChunks,
                          ActiveMaskGapPackObservation observation,
-                         std::vector<ActiveMaskChunk> *selectedChunks)
+                         std::vector<ActiveMaskChunk> *selectedChunks,
+                         std::size_t *validatedCandidateWrites = nullptr)
             {
                 const auto begin = std::chrono::steady_clock::now();
                 ActiveMaskGapPackPlanDiagnostics planDiagnostics;
@@ -900,7 +903,16 @@ namespace wolvrix::lib::emit
                 {
                     *selectedChunks = plan.chunks;
                 }
+                if (validationPassed && validatedCandidateWrites != nullptr)
+                {
+                    *validatedCandidateWrites = plan.writes;
+                }
                 return selected;
+            }
+
+            bool tableRuntimeProfileEnabled() const noexcept
+            {
+                return tableRuntimeProfileEnabled_;
             }
 
             void observeLocalOnly(std::size_t localTargets, bool conditional)
@@ -1139,6 +1151,7 @@ namespace wolvrix::lib::emit
 
             std::size_t activeFlagByteCount_ = 0;
             ActiveMaskGapPackPolicy policy_ = ActiveMaskGapPackPolicy::kOff;
+            bool tableRuntimeProfileEnabled_ = false;
             mutable std::mutex mutex_;
             std::array<KindStats, 2> kindStats_{};
             std::array<ExcludedStats, static_cast<std::size_t>(ActiveMaskGapPackSite::kCount)> excludedStats_{};
@@ -1340,7 +1353,8 @@ namespace wolvrix::lib::emit
                                       const std::vector<ActiveMaskEntry> &entries,
                                       const std::vector<ActiveMaskChunk> &baselineChunks,
                                       ActiveMaskGapPackObservation observation,
-                                      std::vector<ActiveMaskChunk> *selectedChunks = nullptr)
+                                      std::vector<ActiveMaskChunk> *selectedChunks = nullptr,
+                                      std::size_t *validatedCandidateWrites = nullptr)
         {
             if (probe == nullptr || site == ActiveMaskGapPackSite::kAlreadyExcluded)
             {
@@ -1359,7 +1373,11 @@ namespace wolvrix::lib::emit
                 probe->exclude(site, 1u, entries.size());
                 return false;
             }
-            return probe->observe(entries, baselineChunks, observation, selectedChunks);
+            return probe->observe(entries,
+                                  baselineChunks,
+                                  observation,
+                                  selectedChunks,
+                                  validatedCandidateWrites);
         }
 
         struct DeferredActivationGroup
@@ -1513,6 +1531,7 @@ namespace wolvrix::lib::emit
                 chunks = buildActiveMaskChunks(entries);
             }
             std::vector<ActiveMaskChunk> selectedChunks;
+            std::size_t validatedCandidateWrites = chunks.size();
             if (observeActiveMaskGapPack(probe,
                                          probeSite,
                                          entries,
@@ -1522,7 +1541,8 @@ namespace wolvrix::lib::emit
                                              .globalActiveIds = globalIndices.size(),
                                              .conditional = probeConditional,
                                          },
-                                         &selectedChunks))
+                                         &selectedChunks,
+                                         &validatedCandidateWrites))
             {
                 chunks = std::move(selectedChunks);
             }
@@ -1533,6 +1553,19 @@ namespace wolvrix::lib::emit
             if (entries.size() >= kActivationTableThreshold)
             {
                 stream << indent << "{\n";
+                if (probe != nullptr && probeSite == ActiveMaskGapPackSite::kGeneric &&
+                    probe->tableRuntimeProfileEnabled())
+                {
+                    stream << indent << "    if (runtime_profile_enabled_) {\n";
+                    stream << indent << "        ++runtime_profile_active_mask_table_evaluations_;\n";
+                    stream << indent << "        runtime_profile_active_mask_table_current_writes_ += UINT64_C("
+                           << entries.size() << ");\n";
+                    stream << indent << "        runtime_profile_active_mask_table_contiguous_writes_ += UINT64_C("
+                           << chunks.size() << ");\n";
+                    stream << indent << "        runtime_profile_active_mask_table_zero_hole_writes_ += UINT64_C("
+                           << validatedCandidateWrites << ");\n";
+                    stream << indent << "    }\n";
+                }
                 stream << indent << "    static constexpr grhsim_active_mask_entry kActivationMasks[] = {";
                 for (std::size_t i = 0; i < entries.size(); ++i)
                 {
@@ -18907,6 +18940,8 @@ namespace wolvrix::lib::emit
                          pureEventWordPackStats.frozenBatchMaxAbsEstimatedLineDelta);
         }
         std::unique_ptr<ActiveMaskGapPackProbe> activeMaskGapPackProbe;
+        const bool activeMaskTableRuntimeProfileCompiled =
+            model.emitRuntimeProfile && *activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kProbe;
         if (*activeMaskGapPackPolicy != ActiveMaskGapPackPolicy::kOff)
         {
             const std::size_t activeFlagByteCount =
@@ -18914,7 +18949,8 @@ namespace wolvrix::lib::emit
                 kActiveFlagBitsPerWord;
             activeMaskGapPackProbe =
                 std::make_unique<ActiveMaskGapPackProbe>(activeFlagByteCount,
-                                                         *activeMaskGapPackPolicy);
+                                                         *activeMaskGapPackPolicy,
+                                                         activeMaskTableRuntimeProfileCompiled);
             model.activeMaskGapPackProbe = activeMaskGapPackProbe.get();
         }
         markRepeatedPatternScheduleBatches(graph, model, schedule, scheduleBatches);
@@ -22909,6 +22945,13 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_compute_{};\n";
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_commit_{};\n";
             }
+            if (activeMaskTableRuntimeProfileCompiled)
+            {
+                *stream << "    std::uint64_t runtime_profile_active_mask_table_evaluations_ = UINT64_C(0);\n";
+                *stream << "    std::uint64_t runtime_profile_active_mask_table_current_writes_ = UINT64_C(0);\n";
+                *stream << "    std::uint64_t runtime_profile_active_mask_table_contiguous_writes_ = UINT64_C(0);\n";
+                *stream << "    std::uint64_t runtime_profile_active_mask_table_zero_hole_writes_ = UINT64_C(0);\n";
+            }
             if (model.pureEventComputeWordProfile)
             {
                 *stream << "    std::array<std::uint64_t, kBatchCount> pure_event_word_active_hit_by_batch_{};\n";
@@ -23665,6 +23708,14 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] supernode_fire_tsv=%s rows=%zu\\n\",\n";
                 *stream << "                path,\n";
                 *stream << "                kRows.size());\n";
+            }
+            if (activeMaskTableRuntimeProfileCompiled)
+            {
+                *stream << "    std::printf(\"[GRHSIM_ACTIVE_MASK_TABLE_PROFILE] evaluations=%llu current_entry_writes=%llu contiguous_chunk_writes=%llu zero_hole_chunk_writes=%llu\\n\",\n";
+                *stream << "                static_cast<unsigned long long>(runtime_profile_active_mask_table_evaluations_),\n";
+                *stream << "                static_cast<unsigned long long>(runtime_profile_active_mask_table_current_writes_),\n";
+                *stream << "                static_cast<unsigned long long>(runtime_profile_active_mask_table_contiguous_writes_),\n";
+                *stream << "                static_cast<unsigned long long>(runtime_profile_active_mask_table_zero_hole_writes_));\n";
             }
             if (model.pureEventComputeWordProfile)
             {
@@ -25331,6 +25382,13 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 {
                     *stream << "    runtime_profile_fire_compute_.fill(UINT64_C(0));\n";
                     *stream << "    runtime_profile_fire_commit_.fill(UINT64_C(0));\n";
+                }
+                if (activeMaskTableRuntimeProfileCompiled)
+                {
+                    *stream << "    runtime_profile_active_mask_table_evaluations_ = UINT64_C(0);\n";
+                    *stream << "    runtime_profile_active_mask_table_current_writes_ = UINT64_C(0);\n";
+                    *stream << "    runtime_profile_active_mask_table_contiguous_writes_ = UINT64_C(0);\n";
+                    *stream << "    runtime_profile_active_mask_table_zero_hole_writes_ = UINT64_C(0);\n";
                 }
                 if (model.pureEventComputeWordProfile)
                 {

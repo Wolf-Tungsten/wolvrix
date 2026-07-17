@@ -3610,7 +3610,8 @@ namespace
         SessionStore &session,
         const std::filesystem::path &outDir,
         std::optional<std::string_view> policy,
-        std::size_t parallelism)
+        std::size_t parallelism,
+        bool emitRuntimeProfile = false)
     {
         std::filesystem::remove_all(outDir);
         std::filesystem::create_directories(outDir);
@@ -3622,6 +3623,10 @@ namespace
         options.attributes["sched_batch_max_estimated_lines"] = "96";
         options.attributes["sched_batches_per_cpp"] = "4";
         options.attributes["emit_parallelism"] = std::to_string(parallelism);
+        if (emitRuntimeProfile)
+        {
+            options.attributes["emit_runtime_profile"] = "1";
+        }
         if (policy)
         {
             options.attributes["active_mask_gap_pack_policy"] = std::string(*policy);
@@ -3795,6 +3800,13 @@ namespace
             fixture.design, fixture.session, baseDir / "probe_serial", "probe", 1u);
         const ActiveMaskGapPackEmitRun probeParallelRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "probe_parallel", "probe", 4u);
+        const ActiveMaskGapPackEmitRun probeRuntimeProfileRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "probe_runtime_profile",
+            "probe",
+            1u,
+            true);
         ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "probe", 1);
         const ActiveMaskGapPackEmitRun probeEnvironmentRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "probe_environment", std::nullopt, 2u);
@@ -3812,6 +3824,7 @@ namespace
             !offRun.success || offRun.diagnosticError ||
             !probeSerialRun.success || probeSerialRun.diagnosticError ||
             !probeParallelRun.success || probeParallelRun.diagnosticError ||
+            !probeRuntimeProfileRun.success || probeRuntimeProfileRun.diagnosticError ||
             !probeEnvironmentRun.success || probeEnvironmentRun.diagnosticError ||
             !targetedSerialRun.success || targetedSerialRun.diagnosticError ||
             !targetedParallelRun.success || targetedParallelRun.diagnosticError ||
@@ -3967,6 +3980,49 @@ namespace
         {
             return fail("active-mask gap-pack 31/32 table threshold statistics are wrong: " +
                         std::string(tableLine));
+        }
+
+        const auto profileHeaderIt = probeRuntimeProfileRun.artifacts.find("grhsim_top.hpp");
+        const auto profileStateIt = probeRuntimeProfileRun.artifacts.find("grhsim_top_state.cpp");
+        if (profileHeaderIt == probeRuntimeProfileRun.artifacts.end() ||
+            profileStateIt == probeRuntimeProfileRun.artifacts.end())
+        {
+            return fail("active-mask table runtime-profile fixture is missing header/state artifacts");
+        }
+        std::string profileSchedSources;
+        std::string profileStateSources;
+        for (const auto &[name, content] : probeRuntimeProfileRun.artifacts)
+        {
+            if (name.find("grhsim_top_sched_") == 0u)
+            {
+                profileSchedSources += content;
+            }
+            if (name.find("grhsim_top_state") == 0u)
+            {
+                profileStateSources += content;
+            }
+        }
+        const std::string &profileHeader = profileHeaderIt->second;
+        const std::string &profileState = profileStateIt->second;
+        if (profileHeader.find("runtime_profile_active_mask_table_evaluations_") == std::string::npos ||
+            profileHeader.find("runtime_profile_active_mask_table_current_writes_") == std::string::npos ||
+            profileHeader.find("runtime_profile_active_mask_table_contiguous_writes_") == std::string::npos ||
+            profileHeader.find("runtime_profile_active_mask_table_zero_hole_writes_") == std::string::npos ||
+            profileState.find("[GRHSIM_ACTIVE_MASK_TABLE_PROFILE]") == std::string::npos ||
+            profileStateSources.find("runtime_profile_active_mask_table_evaluations_ = UINT64_C(0);") == std::string::npos ||
+            profileSchedSources.find("++runtime_profile_active_mask_table_evaluations_;") == std::string::npos ||
+            profileSchedSources.find("runtime_profile_active_mask_table_current_writes_ += UINT64_C(32);") == std::string::npos ||
+            profileSchedSources.find("runtime_profile_active_mask_table_contiguous_writes_ += UINT64_C(4);") == std::string::npos ||
+            profileSchedSources.find("runtime_profile_active_mask_table_zero_hole_writes_ += UINT64_C(4);") == std::string::npos)
+        {
+            return fail("active-mask table runtime-profile counters are missing or have wrong static costs");
+        }
+        for (const auto &[name, content] : probeSerialRun.artifacts)
+        {
+            if (content.find("runtime_profile_active_mask_table_") != std::string::npos)
+            {
+                return fail("active-mask table runtime-profile counters must remain opt-in");
+            }
         }
 
         const auto seedGroups = probeStatsUnsigned(excludedLine, "seed_groups");

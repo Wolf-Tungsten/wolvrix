@@ -806,10 +806,16 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
     if active_mask_gap_pack_policy is not None:
         if not isinstance(active_mask_gap_pack_policy, str):
             raise ValueError("emit_grhsim_cpp active_mask_gap_pack_policy must be a string")
-        if active_mask_gap_pack_policy not in {"off", "probe", "targeted-direct"}:
+        if active_mask_gap_pack_policy not in {
+            "off",
+            "probe",
+            "targeted-direct",
+            "targeted-table-contiguous",
+            "targeted-table-gap",
+        }:
             raise ValueError(
                 "emit_grhsim_cpp active_mask_gap_pack_policy must be one of: "
-                "off, probe, targeted-direct"
+                "off, probe, targeted-direct, targeted-table-contiguous, targeted-table-gap"
             )
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 

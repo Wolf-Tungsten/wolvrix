@@ -308,6 +308,8 @@ namespace wolvrix::lib::emit
             kOff,
             kProbe,
             kTargetedDirect,
+            kTargetedTableContiguous,
+            kTargetedTableGap,
         };
 
         std::string_view activeMaskGapPackPolicyName(ActiveMaskGapPackPolicy policy) noexcept
@@ -320,6 +322,10 @@ namespace wolvrix::lib::emit
                 return "probe";
             case ActiveMaskGapPackPolicy::kTargetedDirect:
                 return "targeted-direct";
+            case ActiveMaskGapPackPolicy::kTargetedTableContiguous:
+                return "targeted-table-contiguous";
+            case ActiveMaskGapPackPolicy::kTargetedTableGap:
+                return "targeted-table-gap";
             }
             return "unknown";
         }
@@ -836,6 +842,7 @@ namespace wolvrix::lib::emit
                          std::size_t *validatedCandidateWrites = nullptr)
             {
                 const auto begin = std::chrono::steady_clock::now();
+                const bool table = entries.size() >= kActivationTableThreshold;
                 ActiveMaskGapPackPlanDiagnostics planDiagnostics;
                 const ActiveMaskGapPackPlan plan =
                     buildActiveMaskGapPackPlan(entries, activeFlagByteCount_, &planDiagnostics);
@@ -845,15 +852,35 @@ namespace wolvrix::lib::emit
                 {
                     validation.failure = ActiveMaskGapPackValidationFailure::kCandidateWorse;
                 }
+                const ActiveMaskGapPackPlan contiguousPlan =
+                    makeActiveMaskGapPackValidationPlan(baselineChunks, 0u);
+                const ActiveMaskGapPackValidationResult contiguousValidation =
+                    validateActiveMaskGapPackPlan(entries,
+                                                  contiguousPlan,
+                                                  activeFlagByteCount_);
+                if (table &&
+                    policy_ == ActiveMaskGapPackPolicy::kTargetedTableContiguous &&
+                    validation.passed() && !contiguousValidation.passed())
+                {
+                    validation = contiguousValidation;
+                }
                 const bool validationPassed = validation.passed();
                 const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - begin);
-                const bool table = entries.size() >= kActivationTableThreshold;
                 const std::size_t baselineWrites = table ? entries.size() : baselineChunks.size();
                 const std::size_t candidateWrites = validationPassed ? plan.writes : baselineWrites;
-                const bool selected =
+                const bool directSelected =
                     policy_ == ActiveMaskGapPackPolicy::kTargetedDirect &&
                     !table && validationPassed && plan.writes < baselineChunks.size();
+                const bool tableContiguousSelected =
+                    policy_ == ActiveMaskGapPackPolicy::kTargetedTableContiguous &&
+                    table && validationPassed;
+                const bool tableGapSelected =
+                    policy_ == ActiveMaskGapPackPolicy::kTargetedTableGap &&
+                    table && validationPassed;
+                const bool selected = directSelected || tableContiguousSelected || tableGapSelected;
+                const std::size_t selectedWrites =
+                    tableContiguousSelected ? baselineChunks.size() : plan.writes;
 
                 {
                     std::lock_guard lock(mutex_);
@@ -884,9 +911,9 @@ namespace wolvrix::lib::emit
                         if (selected)
                         {
                             ++selectedGroups_;
-                            selectedBaselineWrites_ += baselineChunks.size();
-                            selectedCandidateWrites_ += plan.writes;
-                            selectedSavings_ += baselineChunks.size() - plan.writes;
+                            selectedBaselineWrites_ += baselineWrites;
+                            selectedCandidateWrites_ += selectedWrites;
+                            selectedSavings_ += baselineWrites - selectedWrites;
                         }
                     }
                     else
@@ -901,7 +928,7 @@ namespace wolvrix::lib::emit
                 }
                 if (selected && selectedChunks != nullptr)
                 {
-                    *selectedChunks = plan.chunks;
+                    *selectedChunks = tableContiguousSelected ? baselineChunks : plan.chunks;
                 }
                 if (validationPassed && validatedCandidateWrites != nullptr)
                 {
@@ -1532,17 +1559,19 @@ namespace wolvrix::lib::emit
             }
             std::vector<ActiveMaskChunk> selectedChunks;
             std::size_t validatedCandidateWrites = chunks.size();
-            if (observeActiveMaskGapPack(probe,
-                                         probeSite,
-                                         entries,
-                                         chunks,
-                                         ActiveMaskGapPackObservation{
-                                             .localTargets = localIndices.size(),
-                                             .globalActiveIds = globalIndices.size(),
-                                             .conditional = probeConditional,
-                                         },
-                                         &selectedChunks,
-                                         &validatedCandidateWrites))
+            const bool selected = observeActiveMaskGapPack(
+                probe,
+                probeSite,
+                entries,
+                chunks,
+                ActiveMaskGapPackObservation{
+                    .localTargets = localIndices.size(),
+                    .globalActiveIds = globalIndices.size(),
+                    .conditional = probeConditional,
+                },
+                &selectedChunks,
+                &validatedCandidateWrites);
+            if (selected)
             {
                 chunks = std::move(selectedChunks);
             }
@@ -1552,6 +1581,14 @@ namespace wolvrix::lib::emit
             }
             if (entries.size() >= kActivationTableThreshold)
             {
+                if (selected)
+                {
+                    for (const auto &chunk : chunks)
+                    {
+                        emitActiveMaskChunkStatement(stream, activeExpr, chunk, indent);
+                    }
+                    return;
+                }
                 stream << indent << "{\n";
                 if (probe != nullptr && probeSite == ActiveMaskGapPackSite::kGeneric &&
                     probe->tableRuntimeProfileEnabled())
@@ -2425,6 +2462,14 @@ namespace wolvrix::lib::emit
             if (*configuredValue == "targeted-direct")
             {
                 return ActiveMaskGapPackPolicy::kTargetedDirect;
+            }
+            if (*configuredValue == "targeted-table-contiguous")
+            {
+                return ActiveMaskGapPackPolicy::kTargetedTableContiguous;
+            }
+            if (*configuredValue == "targeted-table-gap")
+            {
+                return ActiveMaskGapPackPolicy::kTargetedTableGap;
             }
             invalidValue = std::move(*configuredValue);
             return std::nullopt;
@@ -18646,7 +18691,8 @@ namespace wolvrix::lib::emit
         {
             reportError("invalid active_mask_gap_pack_policy: " +
                         invalidActiveMaskGapPackPolicy +
-                        " (expected off, probe, or targeted-direct)");
+                        " (expected off, probe, targeted-direct, "
+                        "targeted-table-contiguous, or targeted-table-gap)");
             result.success = false;
             return result;
         }
@@ -26427,11 +26473,16 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
         if (activeMaskGapPackProbe != nullptr)
         {
             activeMaskGapPackProbe->report();
-            if (*activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kTargetedDirect &&
+            if ((*activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kTargetedDirect ||
+                 *activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kTargetedTableContiguous ||
+                 *activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kTargetedTableGap) &&
                 !activeMaskGapPackProbe->validationPassed())
             {
-                reportError("active-mask gap-pack targeted-direct validation failed",
-                            graph.symbol());
+                const std::string validationError =
+                    "active-mask gap-pack " +
+                    std::string(activeMaskGapPackPolicyName(*activeMaskGapPackPolicy)) +
+                    " validation failed";
+                reportError(validationError, graph.symbol());
                 result.success = false;
             }
         }

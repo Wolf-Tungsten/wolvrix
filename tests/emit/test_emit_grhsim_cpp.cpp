@@ -3427,7 +3427,11 @@ namespace
             []
             {
                 std::vector<std::size_t> indices;
-                for (std::size_t index = 120u; index <= 151u; ++index)
+                for (std::size_t index = 112u; index <= 126u; index += 2u)
+                {
+                    indices.push_back(index * 8u);
+                }
+                for (std::size_t index = 130u; index <= 176u; index += 2u)
                 {
                     indices.push_back(index * 8u);
                 }
@@ -3819,6 +3823,48 @@ namespace
         const ActiveMaskGapPackEmitRun targetedEnvironmentRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "targeted_environment", std::nullopt, 2u);
         ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+        const ActiveMaskGapPackEmitRun tableContiguousSerialRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "table_contiguous_serial",
+            "targeted-table-contiguous",
+            1u);
+        const ActiveMaskGapPackEmitRun tableContiguousParallelRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "table_contiguous_parallel",
+            "targeted-table-contiguous",
+            4u);
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY",
+                 "targeted-table-contiguous",
+                 1);
+        const ActiveMaskGapPackEmitRun tableContiguousEnvironmentRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "table_contiguous_environment",
+            std::nullopt,
+            2u);
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
+        const ActiveMaskGapPackEmitRun tableGapSerialRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "table_gap_serial",
+            "targeted-table-gap",
+            1u);
+        const ActiveMaskGapPackEmitRun tableGapParallelRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "table_gap_parallel",
+            "targeted-table-gap",
+            4u);
+        ::setenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY", "targeted-table-gap", 1);
+        const ActiveMaskGapPackEmitRun tableGapEnvironmentRun = runActiveMaskGapPackEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "table_gap_environment",
+            std::nullopt,
+            2u);
+        ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
 
         if (!defaultRun.success || defaultRun.diagnosticError ||
             !offRun.success || offRun.diagnosticError ||
@@ -3828,9 +3874,15 @@ namespace
             !probeEnvironmentRun.success || probeEnvironmentRun.diagnosticError ||
             !targetedSerialRun.success || targetedSerialRun.diagnosticError ||
             !targetedParallelRun.success || targetedParallelRun.diagnosticError ||
-            !targetedEnvironmentRun.success || targetedEnvironmentRun.diagnosticError)
+            !targetedEnvironmentRun.success || targetedEnvironmentRun.diagnosticError ||
+            !tableContiguousSerialRun.success || tableContiguousSerialRun.diagnosticError ||
+            !tableContiguousParallelRun.success || tableContiguousParallelRun.diagnosticError ||
+            !tableContiguousEnvironmentRun.success || tableContiguousEnvironmentRun.diagnosticError ||
+            !tableGapSerialRun.success || tableGapSerialRun.diagnosticError ||
+            !tableGapParallelRun.success || tableGapParallelRun.diagnosticError ||
+            !tableGapEnvironmentRun.success || tableGapEnvironmentRun.diagnosticError)
         {
-            return fail("active-mask gap-pack off/probe/targeted-direct fixture emission failed");
+            return fail("active-mask gap-pack policy fixture emission failed");
         }
         if (defaultRun.artifacts != offRun.artifacts ||
             defaultRun.artifacts != probeSerialRun.artifacts ||
@@ -3867,6 +3919,24 @@ namespace
                 normalizeActiveMaskGapPackLog(targetedEnvironmentRun.stderrText))
         {
             return fail("active-mask gap-pack targeted-direct emission must be parallel deterministic");
+        }
+        if (tableContiguousSerialRun.artifacts != tableContiguousParallelRun.artifacts ||
+            tableContiguousSerialRun.artifacts != tableContiguousEnvironmentRun.artifacts ||
+            normalizeActiveMaskGapPackLog(tableContiguousSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(tableContiguousParallelRun.stderrText) ||
+            normalizeActiveMaskGapPackLog(tableContiguousSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(tableContiguousEnvironmentRun.stderrText))
+        {
+            return fail("active-mask table-contiguous emission must be parallel deterministic");
+        }
+        if (tableGapSerialRun.artifacts != tableGapParallelRun.artifacts ||
+            tableGapSerialRun.artifacts != tableGapEnvironmentRun.artifacts ||
+            normalizeActiveMaskGapPackLog(tableGapSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(tableGapParallelRun.stderrText) ||
+            normalizeActiveMaskGapPackLog(tableGapSerialRun.stderrText) !=
+                normalizeActiveMaskGapPackLog(tableGapEnvironmentRun.stderrText))
+        {
+            return fail("active-mask table-gap emission must be parallel deterministic");
         }
         if (sessionKeys(fixture.session) != keysBefore)
         {
@@ -3969,17 +4039,55 @@ namespace
         const auto tableContiguous = probeStatsUnsigned(tableLine, "contiguous_writes");
         const auto tableCandidate = probeStatsUnsigned(tableLine, "candidate_writes");
         const auto tableGapSaved = probeStatsUnsigned(tableLine, "gap_saved");
+        const auto tableHoles = probeStatsUnsigned(tableLine, "hole_bytes");
+        const auto tableCoveredBytes = probeStatsUnsigned(tableLine, "candidate_covered_bytes");
+        const auto tableGapImproved = probeStatsUnsigned(tableLine, "gap_improved");
         const auto tableInvalid = probeStatsUnsigned(tableLine, "invalid_groups");
+        const auto tableWidth2 = probeStatsUnsigned(tableLine, "width2");
+        const auto tableWidth8 = probeStatsUnsigned(tableLine, "width8");
         if (!tableGroups || !tableEntries || !tableBaseline || !tableContiguous ||
-            !tableCandidate || !tableGapSaved || !tableInvalid || *tableGroups == 0u ||
+            !tableCandidate || !tableGapSaved || !tableHoles || !tableCoveredBytes ||
+            !tableGapImproved || !tableInvalid || !tableWidth2 || !tableWidth8 ||
+            *tableGroups == 0u ||
             *tableEntries != *tableGroups * 32u ||
             *tableBaseline != *tableGroups * 32u ||
-            *tableContiguous != *tableGroups * 4u ||
-            *tableCandidate != *tableContiguous ||
-            *tableGapSaved != 0u || *tableInvalid != 0u)
+            *tableContiguous != *tableGroups * 32u ||
+            *tableCandidate != *tableGroups * 8u ||
+            *tableGapSaved != *tableGroups * 24u ||
+            *tableHoles != *tableGroups * 32u ||
+            *tableCoveredBytes != *tableGroups * 64u ||
+            *tableGapImproved != *tableGroups ||
+            *tableInvalid != 0u ||
+            *tableWidth2 != 0u ||
+            *tableWidth8 != *tableGroups * 8u)
         {
             return fail("active-mask gap-pack 31/32 table threshold statistics are wrong: " +
                         std::string(tableLine));
+        }
+
+        const auto checkTableSelection = [&](const ActiveMaskGapPackEmitRun &run,
+                                             std::string_view policy,
+                                             std::size_t expectedCandidateWrites) -> bool
+        {
+            const std::string_view summary = probeLogLine(
+                run.stderrText,
+                "[GRHSIM_ACTIVE_MASK_GAP_PACK] policy=" + std::string(policy) + " ");
+            const auto groups = probeStatsUnsigned(summary, "selected_groups");
+            const auto baseline = probeStatsUnsigned(summary, "selected_baseline_writes");
+            const auto candidate = probeStatsUnsigned(summary, "selected_candidate_writes");
+            const auto savings = probeStatsUnsigned(summary, "selected_savings");
+            return groups && baseline && candidate && savings &&
+                   *groups == *tableGroups &&
+                   *baseline == *tableGroups * 32u &&
+                   *candidate == *tableGroups * expectedCandidateWrites &&
+                   *savings == *baseline - *candidate;
+        };
+        if (!checkTableSelection(tableContiguousSerialRun,
+                                 "targeted-table-contiguous",
+                                 32u) ||
+            !checkTableSelection(tableGapSerialRun, "targeted-table-gap", 8u))
+        {
+            return fail("active-mask table policy selection statistics are wrong");
         }
 
         const auto profileHeaderIt = probeRuntimeProfileRun.artifacts.find("grhsim_top.hpp");
@@ -4012,8 +4120,8 @@ namespace
             profileStateSources.find("runtime_profile_active_mask_table_evaluations_ = UINT64_C(0);") == std::string::npos ||
             profileSchedSources.find("++runtime_profile_active_mask_table_evaluations_;") == std::string::npos ||
             profileSchedSources.find("runtime_profile_active_mask_table_current_writes_ += UINT64_C(32);") == std::string::npos ||
-            profileSchedSources.find("runtime_profile_active_mask_table_contiguous_writes_ += UINT64_C(4);") == std::string::npos ||
-            profileSchedSources.find("runtime_profile_active_mask_table_zero_hole_writes_ += UINT64_C(4);") == std::string::npos)
+            profileSchedSources.find("runtime_profile_active_mask_table_contiguous_writes_ += UINT64_C(32);") == std::string::npos ||
+            profileSchedSources.find("runtime_profile_active_mask_table_zero_hole_writes_ += UINT64_C(8);") == std::string::npos)
         {
             return fail("active-mask table runtime-profile counters are missing or have wrong static costs");
         }
@@ -4075,14 +4183,75 @@ namespace
             return fail("active-mask gap-pack targeted-direct artifact set or expected schedule diff is wrong");
         }
 
+        const auto verifyTableArtifacts = [&](const ActiveMaskGapPackEmitRun &run) -> bool
+        {
+            if (run.artifacts.size() != offRun.artifacts.size())
+            {
+                return false;
+            }
+            bool schedChanged = false;
+            for (const auto &[name, content] : run.artifacts)
+            {
+                const auto baselineIt = offRun.artifacts.find(name);
+                if (baselineIt == offRun.artifacts.end())
+                {
+                    return false;
+                }
+                const bool schedSource =
+                    name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp");
+                if (!schedSource)
+                {
+                    if (content != baselineIt->second)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+                schedChanged = schedChanged || content != baselineIt->second;
+                if (conditionalWrapperLines(content) !=
+                    conditionalWrapperLines(baselineIt->second))
+                {
+                    return false;
+                }
+            }
+            if (!schedChanged)
+            {
+                return false;
+            }
+            return true;
+        };
+        if (!verifyTableArtifacts(tableContiguousSerialRun) ||
+            !verifyTableArtifacts(tableGapSerialRun) ||
+            tableContiguousSerialRun.artifacts == tableGapSerialRun.artifacts)
+        {
+            return fail("active-mask table policies changed frozen artifacts or emitted no distinct rewrite");
+        }
+        for (const auto &[name, contiguousContent] : tableContiguousSerialRun.artifacts)
+        {
+            if (!name.starts_with("grhsim_top_sched_") || !name.ends_with(".cpp"))
+            {
+                continue;
+            }
+            const std::string &gapContent = tableGapSerialRun.artifacts.at(name);
+            if (stripActiveMaskWriteStatements(contiguousContent) !=
+                stripActiveMaskWriteStatements(gapContent))
+            {
+                return fail("active-mask table policies differ outside selected write encoding: " + name);
+            }
+        }
+
         std::string schedSources;
         std::string targetedSchedSources;
+        std::string tableContiguousSchedSources;
+        std::string tableGapSchedSources;
         for (const auto &[name, content] : offRun.artifacts)
         {
             if (name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp"))
             {
                 schedSources += content;
                 targetedSchedSources += targetedSerialRun.artifacts.at(name);
+                tableContiguousSchedSources += tableContiguousSerialRun.artifacts.at(name);
+                tableGapSchedSources += tableGapSerialRun.artifacts.at(name);
             }
         }
         const std::size_t condition = schedSources.find("if (grhsim_changed_2) {");
@@ -4148,20 +4317,85 @@ namespace
         {
             return fail("active-mask gap-pack 31-entry baseline fixture is missing its tail chunks");
         }
-        if (targetedSchedSources.find("{120u, UINT8_C(") == std::string::npos ||
-            targetedSchedSources.find("{151u, UINT8_C(") == std::string::npos ||
+        if (targetedSchedSources.find("{112u, UINT8_C(") == std::string::npos ||
+            targetedSchedSources.find("{176u, UINT8_C(") == std::string::npos ||
             targetedSchedSources.find(
                 "supernode_active_curr_[entry.word_index] |= entry.mask;") == std::string::npos ||
             targetedSchedSources.find(
-                "grhsim_or_active_u64(supernode_active_curr_.data(), 120u,") != std::string::npos)
+                "grhsim_or_active_u64(supernode_active_curr_.data(), 112u,") != std::string::npos)
         {
             return fail("active-mask gap-pack targeted-direct changed the 32-entry table lowering");
+        }
+
+        for (std::size_t byteIndex : {112u, 114u, 116u, 118u, 120u, 122u, 124u, 126u,
+                                      130u, 132u, 134u, 136u, 138u, 140u, 142u, 144u,
+                                      146u, 148u, 150u, 152u, 154u, 156u, 158u, 160u,
+                                      162u, 164u, 166u, 168u, 170u, 172u, 174u, 176u})
+        {
+            if (tableContiguousSchedSources.find(
+                    "supernode_active_curr_[" + std::to_string(byteIndex) +
+                    "u] |= UINT8_C(1);") == std::string::npos)
+            {
+                return fail("active-mask table-contiguous candidate missed a sparse byte write");
+            }
+        }
+        for (std::size_t byteIndex : {112u, 120u, 130u, 138u, 146u, 154u, 162u, 170u})
+        {
+            if (tableGapSchedSources.find(
+                    "grhsim_or_active_u64(supernode_active_curr_.data(), " +
+                    std::to_string(byteIndex) +
+                    "u, UINT64_C(281479271743489));") == std::string::npos)
+            {
+                return fail("active-mask table-gap candidate missed an expected sparse u64 chunk");
+            }
+        }
+        if (tableContiguousSchedSources.find(
+                "grhsim_or_active_u64(supernode_active_curr_.data(), 112u,") != std::string::npos ||
+            tableGapSchedSources.find(
+                "supernode_active_curr_[112u] |= UINT8_C(1);") != std::string::npos)
+        {
+            return fail("active-mask table policies did not keep contiguous and gap encodings distinct");
+        }
+        const std::string_view tableLoop =
+            "supernode_active_curr_[entry.word_index] |= entry.mask;";
+        for (const std::string *candidate : {&tableContiguousSchedSources,
+                                             &tableGapSchedSources})
+        {
+            if (countSubstring(*candidate, "{112u, UINT8_C(") >=
+                    countSubstring(schedSources, "{112u, UINT8_C(") ||
+                countSubstring(*candidate, "{176u, UINT8_C(") >=
+                    countSubstring(schedSources, "{176u, UINT8_C(") ||
+                countSubstring(*candidate, tableLoop) >= countSubstring(schedSources, tableLoop))
+            {
+                return fail("active-mask table candidate retained a selected generic table loop");
+            }
+            for (std::string_view statement : {
+                     "grhsim_or_active_u64(supernode_active_curr_.data(), 80u,",
+                     "grhsim_or_active_u64(supernode_active_curr_.data(), 88u,",
+                     "grhsim_or_active_u64(supernode_active_curr_.data(), 96u,",
+                     "grhsim_or_active_u32(supernode_active_curr_.data(), 104u,",
+                     "grhsim_or_active_u16(supernode_active_curr_.data(), 108u,",
+                     "supernode_active_curr_[110u] |= UINT8_C("})
+            {
+                if (candidate->find(statement) == std::string::npos)
+                {
+                    return fail("active-mask table candidate changed the 31-entry direct lowering");
+                }
+            }
+            if (candidate->find(
+                    "grhsim_or_active_u64(supernode_active_curr_.data(), 8u, "
+                    "UINT64_C(281479271743489));") != std::string::npos ||
+                candidate->find("supernode_active_curr_[8u] |= UINT8_C(") == std::string::npos)
+            {
+                return fail("active-mask table candidate changed a non-table direct group");
+            }
         }
 
         const ActiveMaskGapPackEmitRun invalidAttributeRun = runActiveMaskGapPackEmit(
             fixture.design, fixture.session, baseDir / "invalid_attribute", "targeted", 1u);
         if (invalidAttributeRun.success || !invalidAttributeRun.diagnosticError ||
-            invalidAttributeRun.diagnostics.find("expected off, probe, or targeted-direct") == std::string::npos)
+            invalidAttributeRun.diagnostics.find("targeted-table-contiguous") == std::string::npos ||
+            invalidAttributeRun.diagnostics.find("targeted-table-gap") == std::string::npos)
         {
             return fail("active-mask gap-pack unknown attribute policy must be rejected");
         }
@@ -4170,7 +4404,8 @@ namespace
             fixture.design, fixture.session, baseDir / "invalid_environment", std::nullopt, 1u);
         ::unsetenv("WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY");
         if (invalidEnvironmentRun.success || !invalidEnvironmentRun.diagnosticError ||
-            invalidEnvironmentRun.diagnostics.find("expected off, probe, or targeted-direct") == std::string::npos)
+            invalidEnvironmentRun.diagnostics.find("targeted-table-contiguous") == std::string::npos ||
+            invalidEnvironmentRun.diagnostics.find("targeted-table-gap") == std::string::npos)
         {
             return fail("active-mask gap-pack environment policy validation is missing");
         }

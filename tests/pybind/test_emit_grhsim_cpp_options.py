@@ -65,6 +65,10 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
         _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "off"})
         _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "probe"})
         _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "targeted-direct"})
+        _compile_emit_grhsim_cpp_kwargs(
+            {"active_mask_gap_pack_policy": "targeted-table-contiguous"}
+        )
+        _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": "targeted-table-gap"})
         for value in ("", "targeted", "table", "targeted-table", " probe ", False, 1):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
@@ -87,6 +91,18 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
             for value in ("targeted", "table", "targeted-table"):
                 with self.subTest(value=value):
                     with self.assertRaisesRegex(ValueError, "active_mask_gap_pack_policy"):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            active_mask_gap_pack_policy=value,
+                        )
+
+    def test_native_active_mask_gap_pack_table_policies_are_accepted(self) -> None:
+        with wolvrix.Session() as session:
+            for value in ("targeted-table-contiguous", "targeted-table-gap"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(KeyError, "design key not found"):
                         native.session_emit_grhsim_cpp(
                             session._capsule,
                             design="missing.design",

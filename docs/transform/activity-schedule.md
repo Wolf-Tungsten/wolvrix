@@ -59,7 +59,7 @@ clone、same-Kahn-level packing 和 post-DP refinement 均为默认关闭的 bou
 | `-disable-commit-guard-event-buckets` | `false` | 关闭 commit guard/event bucket 分组 |
 | `-split-oversize-compute-nodes` | `false` | materialize 阶段拆分超过上限的单个 compute node |
 | `-declared-value-compute-node-boundary` | `false` | 把带 declared symbol 的 value 作为 compute-node 截断边界 |
-| `-final-terminal-pushforward-policy` | `off` | terminal common-target pushforward 只读策略：`off/probe` |
+| `-final-terminal-pushforward-policy` | `off` | terminal common-target pushforward 策略：`off/probe/strict` |
 | `-final-terminal-pushforward-max-node-ops` | `8` | 候选 terminal compute node 的最大 raw compute op 数 |
 | `-final-terminal-pushforward-max-inputs` | `16` | 候选 cone 的最大 external input value 数 |
 | `-final-terminal-pushforward-max-outputs` | `16` | 候选 cone 的最大 external output value 数 |
@@ -155,30 +155,42 @@ incoming_boundary_activation_edges + 1
 
 同成本时偏向更长 segment。
 
-## Final terminal common-target pushforward probe
+## Final terminal common-target pushforward
 
 `final-terminal-pushforward-policy=probe` 在 final schedule 上只读寻找完整的小型
 terminal compute node/cone `C`：`C` 当前位于 source compute supernode `S`，它的所有
 external output value 都只被同一个 target compute supernode `T` 使用。候选的所有
 external input value 必须由 `S` 中不属于 `C` 的 remaining op 定义；move 后 `S`、`T`
-都必须非空，且 `T + C` 不能超过最终 compute supernode op cap。state/memory/event/intent、
-side-effect、declared/port 和其它不满足纯组合 allowlist 的路径不会进入候选。
+都必须非空，且 `T + C` 不能超过最终 compute supernode op cap。`C` 自身不能包含
+state/memory/event/intent、side-effect、declared/port result 或不满足纯组合 allowlist 的
+op；external input 的 producer 可以是其它类别，但必须仍由 `S` 中的 remaining op 定义。
 
 probe 对每个候选按最终 schedule 的 value fanout 机械重算两项净收益：
 
 ```text
 net BAE = removed output activation edges - newly introduced input activation edges
 net boundary values = outputs losing all external fanout - inputs becoming external
+net logical bytes = removed boundary ceil(width/8) - added boundary ceil(width/8)
 ```
 
 两项净收益分别受 `min-bae-gain` 和 `min-boundary-value-gain` gate；node op、input/output
 数量与 logic width 也受各自显式上限约束。通过结构 gate 的候选按稳定顺序选择，并受
-move 数、moved-op PPM 和 touched-supernode conflict 预算约束。
+move 数、moved-op PPM 和 touched-supernode conflict 预算约束。logical bytes 是 value-width
+proxy，不代表 emitter slot、alignment 或 ELF bytes。
 
-当前只实现 `off/probe`，没有 strict mutation。probe 不修改 graph、schedule、active ID、
-session payload 或 emitter layout；它只输出候选/reject funnel、projected gain 和预算统计。
-结构正收益仍不代表端到端收益：pushforward 可能使 input 变化但 output 不变时也执行 `C`
-和 `T`，因此后续 strict 实现必须先通过单独的动态额外执行 gate。
+`probe` 不修改 graph、schedule、active ID、session payload 或 emitter layout；它只输出
+候选/reject funnel、projected gain 和预算统计。`strict` 在排序、conflict 和预算选择前，
+先过滤掉 `added BAE / boundary values / logical bytes` 任一非 `0` 的候选，即只接受 `C`
+的 input 在 baseline 已经直接激活 `T` 的 zero-add 候选。strict 从 `S` 稳定过滤 `C`，
+再把原 op 顺序不变地插到 `T` 的最早 external-output consumer 前；两个 supernode 的
+其它 op 相对顺序保持不变。
+
+strict 只支持 `final-topo-policy=level-id` 和未发生 oversize split 的 schedule，也不能与
+`final-fanin-pullback-policy=strict` 同时启用。重建 derived schedule 后，supernode/kind/op
+partition、capacity、commit、stable-splice 精确 op/node vector、DAG/topo、state-read、
+compute-commit、value fanout/source 必须逐项闭合；actual compute/total BAE、
+boundary-value 和 logical-byte gain 必须与 probe 投影完全一致。C++ native default 仍为
+`off`，结构收益仍须由 SimTop walltime 裁决。
 
 `post-dp-refine-policy=swap-probe` 只读枚举因目标 segment 满载而受阻的 equal-load
 cluster swap。候选必须保持 pair topology 和 exact quotient DAG support key，且降低 exact

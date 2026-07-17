@@ -6550,10 +6550,14 @@ int main()
             wolvrix::lib::grh::OperationId candidate;
             wolvrix::lib::grh::OperationId delay;
             wolvrix::lib::grh::OperationId barrier;
+            wolvrix::lib::grh::OperationId targetPrefix;
             wolvrix::lib::grh::OperationId tail;
+            wolvrix::lib::grh::ValueId candidateInput;
+            wolvrix::lib::grh::ValueId candidateOutput;
         };
         const auto buildFixture = [](wolvrix::lib::grh::Design &design,
-                                     const std::string &name)
+                                     const std::string &name,
+                                     bool nonZeroAdd = false)
         {
             using K = wolvrix::lib::grh::OperationKind;
             auto &graph = design.createGraph(name);
@@ -6566,6 +6570,7 @@ int main()
             const auto producer2 = makeValue(graph, "producer_2", 8);
             const auto producer3 = makeValue(graph, "producer_3", 8);
             FixtureOps ops;
+            ops.candidateInput = producer0;
             ops.producer = graph.createOperation(
                 K::kNot, graph.internSymbol("producer"));
             graph.addOperand(ops.producer, input);
@@ -6575,10 +6580,18 @@ int main()
             graph.addResult(ops.producer, producer3);
 
             const auto candidateValue = makeValue(graph, "candidate_value", 8);
+            ops.candidateOutput = candidateValue;
             ops.candidate = graph.createOperation(
                 K::kNot, graph.internSymbol("candidate"));
             graph.addOperand(ops.candidate, producer0);
             graph.addResult(ops.candidate, candidateValue);
+            std::optional<wolvrix::lib::grh::ValueId> secondCandidateValue;
+            if (nonZeroAdd)
+            {
+                secondCandidateValue =
+                    makeValue(graph, "candidate_value_1", 8);
+                graph.addResult(ops.candidate, *secondCandidateValue);
+            }
 
             const auto delayValue = makeValue(graph, "delay_value", 8);
             ops.delay = graph.createOperation(K::kNot, graph.internSymbol("delay"));
@@ -6592,11 +6605,24 @@ int main()
             graph.addOperand(ops.barrier, producer3);
             graph.addResult(ops.barrier, barrierValue);
 
+            const auto prefixValue = makeValue(graph, "target_prefix_value", 8);
+            ops.targetPrefix = graph.createOperation(
+                K::kNot, graph.internSymbol("target_prefix"));
+            graph.addOperand(ops.targetPrefix, barrierValue);
+            graph.addResult(ops.targetPrefix, prefixValue);
+
             const auto output = makeValue(graph, "output", 8);
             ops.tail = graph.createOperation(K::kXor, graph.internSymbol("tail"));
             graph.addOperand(ops.tail, candidateValue);
-            graph.addOperand(ops.tail, producer0);
-            graph.addOperand(ops.tail, barrierValue);
+            if (secondCandidateValue)
+            {
+                graph.addOperand(ops.tail, *secondCandidateValue);
+            }
+            else
+            {
+                graph.addOperand(ops.tail, producer0);
+            }
+            graph.addOperand(ops.tail, prefixValue);
             graph.addResult(ops.tail, output);
             graph.bindOutputPort("output", output);
             return ops;
@@ -6605,7 +6631,9 @@ int main()
                                    const std::string &name,
                                    std::optional<std::string> policy,
                                    SessionStore &session,
-                                   std::string *log = nullptr)
+                                   std::string *log = nullptr,
+                                   std::size_t maxMoves = 1,
+                                   std::size_t movedOpPpm = 1000000)
         {
             ActivityScheduleOptions options;
             options.path = name;
@@ -6617,8 +6645,8 @@ int main()
             {
                 options.finalTerminalPushforwardPolicy = *policy;
             }
-            options.finalTerminalPushforwardMaxMoves = 1;
-            options.finalTerminalPushforwardMaxMovedOpPpm = 1000000;
+            options.finalTerminalPushforwardMaxMoves = maxMoves;
+            options.finalTerminalPushforwardMaxMovedOpPpm = movedOpPpm;
             PassManager manager;
             manager.options().session = &session;
             if (log != nullptr)
@@ -6721,19 +6749,19 @@ int main()
             source >= probeSchedule.supernodeToOps->size() ||
             target >= probeSchedule.supernodeToOps->size() ||
             (*probeSchedule.supernodeToOps)[source].size() != 4 ||
-            (*probeSchedule.supernodeToOps)[target].size() != 1)
+            (*probeSchedule.supernodeToOps)[target].size() != 2)
         {
-            return fail("Expected terminal pushforward 4/1 source/target fixture shape");
+            return fail("Expected terminal pushforward 4/2 source/target fixture shape");
         }
         const std::string expectedCandidate =
-            "source_ops=4 target_ops=1 node_ops=1 inputs=1 outputs=1 "
+            "source_ops=4 target_ops=2 node_ops=1 inputs=1 outputs=1 "
             "max_value_width=8 output_kind=kNot pair_multiplicity=3 "
             "removed_bae=1 added_bae=0 bae_gain=1 "
             "removed_boundary_values=1 added_boundary_values=0 "
             "boundary_value_gain=1 removed_bytes=1 added_bytes=0 byte_gain=1";
         if (probeLog.find("activity-schedule final terminal pushforward probe:") ==
                 std::string::npos ||
-            parseStatField(probeLog, "scanned") != 5 ||
+            parseStatField(probeLog, "scanned") != 6 ||
             parseStatField(probeLog, "exact_eligible") != 1 ||
             parseStatField(probeLog, "selected") != 1 ||
             parseStatField(probeLog, "eligible_bae_gain") != 1 ||
@@ -6743,7 +6771,7 @@ int main()
             parseStatField(probeLog, "eligible_byte_gain") != 1 ||
             parseStatField(probeLog, "selected_byte_gain") != 1 ||
             parseStatField(probeLog, "moved_ops") != 1 ||
-            parseStatField(probeLog, "moved_op_limit") != 5 ||
+            parseStatField(probeLog, "moved_op_limit") != 6 ||
             probeLog.find("skipped_oversize=false") == std::string::npos ||
             probeLog.find(expectedCandidate) == std::string::npos)
         {
@@ -6751,7 +6779,210 @@ int main()
                         probeLog);
         }
 
-        const auto invalidOptionsFail = [&](std::string policy, std::size_t ppm)
+        wolvrix::lib::grh::Design strictDesign;
+        const FixtureOps strictOps = buildFixture(strictDesign, std::string(kName));
+        SessionStore strictSession;
+        std::string strictLog;
+        if (!runFixture(strictDesign,
+                        std::string(kName),
+                        "strict",
+                        strictSession,
+                        &strictLog))
+        {
+            return fail("Expected strict terminal pushforward schedule to succeed: " +
+                        strictLog);
+        }
+        const auto strictSchedule = loadSchedule(strictSession, std::string(kName));
+        if (strictSchedule.opToSupernode == nullptr ||
+            strictSchedule.supernodeToOps == nullptr ||
+            strictSchedule.valueFanout == nullptr ||
+            strictSchedule.summaryStats == nullptr ||
+            strictSchedule.dag == nullptr || strictSchedule.topoOrder == nullptr ||
+            strictSchedule.stateReadSupernodes == nullptr)
+        {
+            return fail("Expected strict terminal pushforward schedule outputs");
+        }
+        const uint32_t strictSource =
+            (*strictSchedule.opToSupernode)[strictOps.producer.index - 1];
+        const uint32_t strictTarget =
+            (*strictSchedule.opToSupernode)[strictOps.tail.index - 1];
+        const std::vector<wolvrix::lib::grh::OperationId> expectedStrictSource{
+            strictOps.producer, strictOps.delay, strictOps.barrier};
+        const std::vector<wolvrix::lib::grh::OperationId> expectedStrictTarget{
+            strictOps.targetPrefix, strictOps.candidate, strictOps.tail};
+        if (strictSource != source || strictTarget != target ||
+            (*strictSchedule.opToSupernode)[strictOps.candidate.index - 1] !=
+                strictTarget ||
+            (*strictSchedule.supernodeToOps)[strictSource] != expectedStrictSource ||
+            (*strictSchedule.supernodeToOps)[strictTarget] != expectedStrictTarget ||
+            *strictSchedule.dag != *offSchedule.dag ||
+            *strictSchedule.topoOrder != *offSchedule.topoOrder ||
+            *strictSchedule.stateReadSupernodes !=
+                *offSchedule.stateReadSupernodes)
+        {
+            return fail("Expected stable strict terminal pushforward partition");
+        }
+        const auto &probeInputFanout =
+            (*probeSchedule.valueFanout)[probeOps.candidateInput.index - 1];
+        const auto &strictInputFanout =
+            (*strictSchedule.valueFanout)[strictOps.candidateInput.index - 1];
+        const auto &probeOutputFanout =
+            (*probeSchedule.valueFanout)[probeOps.candidateOutput.index - 1];
+        const auto &strictOutputFanout =
+            (*strictSchedule.valueFanout)[strictOps.candidateOutput.index - 1];
+        if (probeInputFanout != strictInputFanout ||
+            probeOutputFanout != std::vector<uint32_t>{target} ||
+            !strictOutputFanout.empty() ||
+            parseJsonDoubleField(*offSchedule.summaryStats,
+                                 "compute_compute_value_pairs") != 3.0 ||
+            parseJsonDoubleField(*strictSchedule.summaryStats,
+                                 "compute_compute_value_pairs") != 2.0 ||
+            parseJsonDoubleField(*offSchedule.summaryStats,
+                                 "boundary_activation_edges") != 3.0 ||
+            parseJsonDoubleField(*strictSchedule.summaryStats,
+                                 "boundary_activation_edges") != 2.0 ||
+            parseJsonDoubleField(*offSchedule.summaryStats,
+                                 "boundary_values") != 3.0 ||
+            parseJsonDoubleField(*strictSchedule.summaryStats,
+                                 "boundary_values") != 2.0)
+        {
+            return fail("Expected exact strict terminal pushforward fanout gains");
+        }
+        const std::string expectedValidators =
+            "activity-schedule final terminal pushforward strict validators: "
+            "supernodes=true kinds=true scheduled_ops=true capacity=true commit=true "
+            "compute_partition=true stable_splice=true dag=true topo=true state_read=true "
+            "compute_commit=true value_fanout=true value_source=true bae_gain=true "
+            "boundary_activation_edge_gain=true boundary_value_gain=true "
+            "boundary_logical_byte_gain=true";
+        if (strictLog.find("activity-schedule final terminal pushforward strict:") ==
+                std::string::npos ||
+            parseStatField(strictLog, "exact_eligible") != 1 ||
+            parseStatField(strictLog, "selected") != 1 ||
+            parseStatField(strictLog, "applied") != 1 ||
+            parseStatField(strictLog, "projected_bae_gain") != 1 ||
+            parseStatField(strictLog, "actual_bae_gain") != 1 ||
+            parseStatField(strictLog,
+                           "actual_boundary_activation_edge_gain") != 1 ||
+            parseStatField(strictLog, "projected_boundary_value_gain") != 1 ||
+            parseStatField(strictLog, "actual_boundary_value_gain") != 1 ||
+            parseStatField(strictLog,
+                           "projected_boundary_logical_byte_gain") != 1 ||
+            parseStatField(strictLog,
+                           "actual_boundary_logical_byte_gain") != 1 ||
+            parseStatField(strictLog, "compute_bae_before") != 3 ||
+            parseStatField(strictLog, "compute_bae_after") != 2 ||
+            parseStatField(strictLog,
+                           "boundary_activation_edges_before") != 3 ||
+            parseStatField(strictLog,
+                           "boundary_activation_edges_after") != 2 ||
+            parseStatField(strictLog, "boundary_values_before") != 3 ||
+            parseStatField(strictLog, "boundary_values_after") != 2 ||
+            parseStatField(strictLog, "boundary_logical_bytes_before") != 3 ||
+            parseStatField(strictLog, "boundary_logical_bytes_after") != 2 ||
+            parseStatField(strictLog, "dag_edges_before") != 1 ||
+            parseStatField(strictLog, "dag_edges_after") != 1 ||
+            strictLog.find(expectedValidators) == std::string::npos)
+        {
+            return fail("Expected exact strict terminal pushforward validation: " +
+                        strictLog);
+        }
+
+        wolvrix::lib::grh::Design repeatStrictDesign;
+        buildFixture(repeatStrictDesign, std::string(kName));
+        SessionStore repeatStrictSession;
+        std::string repeatStrictLog;
+        if (!runFixture(repeatStrictDesign,
+                        std::string(kName),
+                        "strict",
+                        repeatStrictSession,
+                        &repeatStrictLog) ||
+            !schedulesEqual(strictSchedule,
+                            loadSchedule(repeatStrictSession,
+                                         std::string(kName))) ||
+            parseStatField(repeatStrictLog, "selected") != 1 ||
+            parseStatField(repeatStrictLog, "applied") != 1 ||
+            parseStatField(repeatStrictLog, "actual_bae_gain") != 1 ||
+            parseStatField(repeatStrictLog,
+                           "actual_boundary_logical_byte_gain") != 1)
+        {
+            return fail("Expected deterministic strict terminal pushforward: " +
+                        repeatStrictLog);
+        }
+
+        wolvrix::lib::grh::Design zeroMoveDesign;
+        buildFixture(zeroMoveDesign, std::string(kName));
+        SessionStore zeroMoveSession;
+        std::string zeroMoveLog;
+        if (!runFixture(zeroMoveDesign,
+                        std::string(kName),
+                        "strict",
+                        zeroMoveSession,
+                        &zeroMoveLog,
+                        0,
+                        1000000) ||
+            !schedulesEqual(offSchedule,
+                            loadSchedule(zeroMoveSession, std::string(kName))) ||
+            parseStatField(zeroMoveLog, "selected") != 0 ||
+            parseStatField(zeroMoveLog, "applied") != 0)
+        {
+            return fail("Expected zero-move strict terminal pushforward identity: " +
+                        zeroMoveLog);
+        }
+
+        constexpr std::string_view kNonZeroName =
+            "final_terminal_pushforward_non_zero_add";
+        wolvrix::lib::grh::Design nonZeroProbeDesign;
+        buildFixture(nonZeroProbeDesign, std::string(kNonZeroName), true);
+        SessionStore nonZeroProbeSession;
+        std::string nonZeroProbeLog;
+        if (!runFixture(nonZeroProbeDesign,
+                        std::string(kNonZeroName),
+                        "probe",
+                        nonZeroProbeSession,
+                        &nonZeroProbeLog) ||
+            parseStatField(nonZeroProbeLog, "exact_eligible") != 1 ||
+            parseStatField(nonZeroProbeLog, "selected") != 1 ||
+            nonZeroProbeLog.find(
+                "removed_bae=2 added_bae=1 bae_gain=1") ==
+                std::string::npos ||
+            nonZeroProbeLog.find(
+                "removed_boundary_values=2 added_boundary_values=1 "
+                "boundary_value_gain=1") == std::string::npos ||
+            nonZeroProbeLog.find(
+                "removed_bytes=2 added_bytes=1 byte_gain=1") ==
+                std::string::npos)
+        {
+            return fail("Expected probe to retain positive non-zero-add candidate: " +
+                        nonZeroProbeLog);
+        }
+        wolvrix::lib::grh::Design nonZeroStrictDesign;
+        buildFixture(nonZeroStrictDesign, std::string(kNonZeroName), true);
+        SessionStore nonZeroStrictSession;
+        std::string nonZeroStrictLog;
+        if (!runFixture(nonZeroStrictDesign,
+                        std::string(kNonZeroName),
+                        "strict",
+                        nonZeroStrictSession,
+                        &nonZeroStrictLog) ||
+            !schedulesEqual(loadSchedule(nonZeroProbeSession,
+                                         std::string(kNonZeroName)),
+                            loadSchedule(nonZeroStrictSession,
+                                         std::string(kNonZeroName))) ||
+            parseStatField(nonZeroStrictLog, "exact_eligible") != 0 ||
+            parseStatField(nonZeroStrictLog, "selected") != 0 ||
+            parseStatField(nonZeroStrictLog, "applied") != 0 ||
+            parseStatField(nonZeroStrictLog,
+                           "rejected_strict_non_zero_add") != 1)
+        {
+            return fail("Expected strict to filter positive non-zero-add candidate: " +
+                        nonZeroStrictLog);
+        }
+
+        const auto invalidOptionsFail = [&](std::string policy,
+                                            std::size_t ppm,
+                                            std::string finalTopo = "level-id",
+                                            std::string faninPolicy = "off")
         {
             wolvrix::lib::grh::Design design;
             buildFixture(design, "final_terminal_pushforward_invalid");
@@ -6759,6 +6990,8 @@ int main()
             options.path = "final_terminal_pushforward_invalid";
             options.finalTerminalPushforwardPolicy = std::move(policy);
             options.finalTerminalPushforwardMaxMovedOpPpm = ppm;
+            options.finalTopoPolicy = std::move(finalTopo);
+            options.finalFaninPullbackPolicy = std::move(faninPolicy);
             SessionStore session;
             PassManager manager;
             manager.options().session = &session;
@@ -6767,8 +7000,10 @@ int main()
             const PassManagerResult result = manager.run(design, diags);
             return !result.success && diags.hasError();
         };
-        if (!invalidOptionsFail("strict", 200) ||
-            !invalidOptionsFail("off", 1000001))
+        if (!invalidOptionsFail("invalid", 200) ||
+            !invalidOptionsFail("off", 1000001) ||
+            !invalidOptionsFail("strict", 200, "level-op") ||
+            !invalidOptionsFail("strict", 200, "level-id", "strict"))
         {
             return fail("Expected invalid terminal pushforward policy/PPM to fail");
         }

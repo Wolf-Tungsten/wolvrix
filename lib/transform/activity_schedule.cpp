@@ -11958,6 +11958,7 @@ namespace wolvrix::lib::transform
             std::size_t rejectedBaeGain = 0;
             std::size_t rejectedBoundaryValueGain = 0;
             std::size_t rejectedByteGain = 0;
+            std::size_t rejectedStrictNonZeroAdd = 0;
             std::size_t rejectedSelectionMoveLimit = 0;
             std::size_t rejectedSelectionBudget = 0;
             std::size_t rejectedSelectionTouchedSupernode = 0;
@@ -12446,6 +12447,13 @@ namespace wolvrix::lib::transform
                     ++stats.rejectedByteGain;
                     continue;
                 }
+                if (options.finalTerminalPushforwardPolicy == "strict" &&
+                    (addedBae != 0 || addedBoundaryValues != 0 ||
+                     addedBytes != 0))
+                {
+                    ++stats.rejectedStrictNonZeroAdd;
+                    continue;
+                }
 
                 FinalTerminalPushforwardCandidate candidate;
                 candidate.computeNode = computeNodeId;
@@ -12595,6 +12603,44 @@ namespace wolvrix::lib::transform
             bool baeGainValid = false;
         };
 
+        struct FinalTerminalPushforwardStrictStats
+        {
+            std::size_t applied = 0;
+            std::size_t computeBaeBefore = 0;
+            std::size_t computeBaeAfter = 0;
+            std::size_t boundaryActivationEdgesBefore = 0;
+            std::size_t boundaryActivationEdgesAfter = 0;
+            std::size_t boundaryValuesBefore = 0;
+            std::size_t boundaryValuesAfter = 0;
+            std::size_t boundaryLogicalBytesBefore = 0;
+            std::size_t boundaryLogicalBytesAfter = 0;
+            std::size_t computeCommitBefore = 0;
+            std::size_t computeCommitAfter = 0;
+            std::size_t dagEdgesBefore = 0;
+            std::size_t dagEdgesAfter = 0;
+            std::size_t actualBaeGain = 0;
+            std::size_t actualBoundaryActivationEdgeGain = 0;
+            std::size_t actualBoundaryValueGain = 0;
+            std::size_t actualBoundaryLogicalByteGain = 0;
+            bool supernodesValid = false;
+            bool kindsValid = false;
+            bool scheduledOpsValid = false;
+            bool capacityValid = false;
+            bool commitValid = false;
+            bool computePartitionValid = false;
+            bool stableSpliceValid = false;
+            bool dagValid = false;
+            bool topoValid = false;
+            bool stateReadValid = false;
+            bool computeCommitValid = false;
+            bool valueFanoutValid = false;
+            bool valueSourceValid = false;
+            bool baeGainValid = false;
+            bool boundaryActivationEdgeGainValid = false;
+            bool boundaryValueGainValid = false;
+            bool boundaryLogicalByteGainValid = false;
+        };
+
         std::size_t countFinalScheduleDagEdges(const ActivityScheduleBuild &build)
         {
             return std::accumulate(
@@ -12623,6 +12669,29 @@ namespace wolvrix::lib::transform
             return pairs;
         }
 
+        std::size_t countFinalScheduleBoundaryLogicalBytes(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleBuild &build)
+        {
+            using wolvrix::lib::grh::ValueType;
+
+            std::size_t bytes = 0;
+            for (const auto value : graph.values())
+            {
+                if (!value.valid() || value.index > build.valueFanout.size() ||
+                    build.valueFanout[value.index - 1].empty())
+                {
+                    continue;
+                }
+                const auto info = graph.getValue(value);
+                if (info.type() == ValueType::Logic && info.width() > 0)
+                {
+                    bytes += (static_cast<std::size_t>(info.width()) + 7U) / 8U;
+                }
+            }
+            return bytes;
+        }
+
         bool rebuildFinalScheduleDerivedNoSplit(const wolvrix::lib::grh::Graph &graph,
                                                 ActivityScheduleBuild &build,
                                                 std::string &error)
@@ -12633,7 +12702,7 @@ namespace wolvrix::lib::transform
             if (build.supernodeToOps.size() != build.supernodeKinds.size() ||
                 build.supernodeToOps.size() != build.computeNodesBySupernode.size())
             {
-                error = "activity-schedule final-fanin pullback strict rebuild shape mismatch";
+                error = "activity-schedule final schedule strict rebuild shape mismatch";
                 return false;
             }
 
@@ -12651,12 +12720,12 @@ namespace wolvrix::lib::transform
                 {
                     if (!opId.valid() || opId.index > maxOpIndex)
                     {
-                        error = "activity-schedule final-fanin pullback strict rebuild invalid op";
+                        error = "activity-schedule final schedule strict rebuild invalid op";
                         return false;
                     }
                     if (supernodeOfOp[opId.index] != kInvalidActivitySupernodeId)
                     {
-                        error = "activity-schedule final-fanin pullback strict rebuild duplicate op=" +
+                        error = "activity-schedule final schedule strict rebuild duplicate op=" +
                                 std::to_string(opId.index);
                         return false;
                     }
@@ -12809,13 +12878,13 @@ namespace wolvrix::lib::transform
             }
             catch (const std::exception &ex)
             {
-                error = std::string("activity-schedule final-fanin pullback strict topo rebuild failed: ") +
+                error = std::string("activity-schedule final schedule strict topo rebuild failed: ") +
                         ex.what();
                 return false;
             }
             if (build.topoOrder.size() != build.supernodeToOps.size())
             {
-                error = "activity-schedule final-fanin pullback strict topo rebuild missing supernodes";
+                error = "activity-schedule final schedule strict topo rebuild missing supernodes";
                 return false;
             }
             return true;
@@ -13130,6 +13199,667 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        bool validateStableFinalLocalOpOrder(
+            const wolvrix::lib::grh::Graph &graph,
+            const std::vector<wolvrix::lib::grh::OperationId> &ops,
+            std::string &error)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> position;
+            position.reserve(ops.size());
+            for (std::size_t index = 0; index < ops.size(); ++index)
+            {
+                if (!position.emplace(ops[index], index).second)
+                {
+                    error =
+                        "activity-schedule final schedule stable local order duplicate op=" +
+                        std::to_string(ops[index].index);
+                    return false;
+                }
+            }
+            const auto validateDependency = [&](ValueId value,
+                                                OperationId user,
+                                                std::size_t userPosition)
+            {
+                const OperationId def = graph.valueDef(value);
+                const auto defIt = position.find(def);
+                if (!def.valid() || def == user || defIt == position.end())
+                {
+                    return true;
+                }
+                if (defIt->second < userPosition)
+                {
+                    return true;
+                }
+                error =
+                    "activity-schedule final schedule stable local order dependency violation def=" +
+                    std::to_string(def.index) +
+                    " user=" + std::to_string(user.index) +
+                    " value=" + std::to_string(value.index);
+                return false;
+            };
+            for (std::size_t index = 0; index < ops.size(); ++index)
+            {
+                const OperationId opId = ops[index];
+                for (const ValueId operand : graph.opOperands(opId))
+                {
+                    if (!validateDependency(operand, opId, index))
+                    {
+                        return false;
+                    }
+                }
+                const auto op = graph.getOperation(opId);
+                if (isRegToMemIntentSlice(op))
+                {
+                    if (const auto indexValue =
+                            regToMemIntentSliceIndexValue(graph, op))
+                    {
+                        if (!validateDependency(*indexValue, opId, index))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool applyFinalTerminalPushforwardStrict(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const ComputeRewriteBuild &rewrite,
+            const ActivityScheduleBuild &baseline,
+            const std::vector<FinalTerminalPushforwardCandidate> &selected,
+            std::size_t projectedBaeGain,
+            std::size_t projectedBoundaryValueGain,
+            std::size_t projectedBoundaryLogicalByteGain,
+            ActivityScheduleBuild &build,
+            FinalTerminalPushforwardStrictStats &stats,
+            std::string &error)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+
+            stats = FinalTerminalPushforwardStrictStats{};
+            ActivityScheduleBuild candidate = baseline;
+            const std::size_t computeSupernodeCap =
+                options.maxOpInComputeSupernode == 0
+                    ? std::numeric_limits<std::size_t>::max()
+                    : options.maxOpInComputeSupernode;
+            std::set<uint32_t> touchedSupernodes;
+            auto expectedValueFanout = baseline.valueFanout;
+            auto expectedValueSourceSupernode = baseline.valueSourceSupernode;
+            auto expectedSupernodeToOps = baseline.supernodeToOps;
+            auto expectedComputeNodesBySupernode =
+                baseline.computeNodesBySupernode;
+            std::size_t selectedBaeGain = 0;
+            std::size_t selectedBoundaryValueGain = 0;
+            std::size_t selectedBoundaryLogicalByteGain = 0;
+
+            const auto baselineOwnerOfOp = [&](OperationId opId)
+            {
+                if (!opId.valid() || opId.index > baseline.opToSupernode.size())
+                {
+                    return kInvalidActivitySupernodeId;
+                }
+                return baseline.opToSupernode[opId.index - 1];
+            };
+
+            for (const auto &move : selected)
+            {
+                if (move.computeNode >= rewrite.computeNodes.size() ||
+                    move.source >= candidate.supernodeToOps.size() ||
+                    move.target >= candidate.supernodeToOps.size() ||
+                    move.source == move.target ||
+                    candidate.supernodeKinds[move.source] !=
+                        ActivityScheduleSupernodeKind::Compute ||
+                    candidate.supernodeKinds[move.target] !=
+                        ActivityScheduleSupernodeKind::Compute)
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict invalid selected owner node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+                const auto &nodeOps = rewrite.computeNodes[move.computeNode].ops;
+                if (nodeOps.empty() || nodeOps.size() != move.opCount ||
+                    move.addedBae != 0 || move.addedBoundaryValues != 0 ||
+                    move.addedBytes != 0)
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict stale or non-zero-add selected node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+                if (!touchedSupernodes.insert(move.source).second ||
+                    !touchedSupernodes.insert(move.target).second)
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict overlapping selected supernode node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+
+                auto &sourceOps = candidate.supernodeToOps[move.source];
+                auto &targetOps = candidate.supernodeToOps[move.target];
+                std::unordered_set<OperationId, OperationIdHash> moveOps(nodeOps.begin(),
+                                                                         nodeOps.end());
+                const std::size_t sourceMatches = static_cast<std::size_t>(std::count_if(
+                    sourceOps.begin(),
+                    sourceOps.end(),
+                    [&](OperationId op) { return moveOps.contains(op); }));
+                const bool targetAlreadyContains = std::any_of(
+                    targetOps.begin(),
+                    targetOps.end(),
+                    [&](OperationId op) { return moveOps.contains(op); });
+                if (sourceMatches != nodeOps.size() || targetAlreadyContains ||
+                    sourceOps.size() <= nodeOps.size() ||
+                    targetOps.size() > computeSupernodeCap ||
+                    nodeOps.size() > computeSupernodeCap - targetOps.size())
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict move precondition failed node=" +
+                        std::to_string(move.computeNode) +
+                        " source=" + std::to_string(move.source) +
+                        " target=" + std::to_string(move.target);
+                    return false;
+                }
+
+                auto &sourceNodes = candidate.computeNodesBySupernode[move.source];
+                auto &targetNodes = candidate.computeNodesBySupernode[move.target];
+                const std::size_t sourceNodeMatches = static_cast<std::size_t>(
+                    std::count(sourceNodes.begin(), sourceNodes.end(), move.computeNode));
+                if (sourceNodeMatches != 1 ||
+                    std::find(targetNodes.begin(), targetNodes.end(), move.computeNode) !=
+                        targetNodes.end())
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict node partition precondition failed node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+
+                bool invalidInput = false;
+                for (const auto input : move.inputs)
+                {
+                    const OperationId def = graph.valueDef(input);
+                    invalidInput |= !def.valid() || moveOps.contains(def) ||
+                                    baselineOwnerOfOp(def) != move.source ||
+                                    input.index == 0 ||
+                                    input.index > baseline.valueFanout.size();
+                    if (!invalidInput)
+                    {
+                        const auto &fanout = baseline.valueFanout[input.index - 1];
+                        invalidInput |= std::find(fanout.begin(),
+                                                  fanout.end(),
+                                                  move.target) == fanout.end();
+                    }
+                }
+                std::unordered_set<wolvrix::lib::grh::ValueId,
+                                   wolvrix::lib::grh::ValueIdHash>
+                    outputValues(move.outputs.begin(), move.outputs.end());
+                bool invalidOutput = move.outputs.empty();
+                for (const auto output : move.outputs)
+                {
+                    const OperationId def = graph.valueDef(output);
+                    invalidOutput |= !def.valid() || !moveOps.contains(def) ||
+                                     output.index == 0 ||
+                                     output.index > baseline.valueFanout.size() ||
+                                     output.index >=
+                                         baseline.valueSourceSupernode.size();
+                    if (!invalidOutput)
+                    {
+                        const auto &fanout = baseline.valueFanout[output.index - 1];
+                        invalidOutput |= fanout.size() != 1 ||
+                                         fanout.front() != move.target ||
+                                         baseline.valueSourceSupernode[output.index] !=
+                                             move.source;
+                    }
+                }
+                if (invalidInput || invalidOutput)
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict input/output precondition failed node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+
+                std::vector<OperationId> movedOps;
+                movedOps.reserve(nodeOps.size());
+                for (const OperationId opId : sourceOps)
+                {
+                    if (moveOps.contains(opId))
+                    {
+                        movedOps.push_back(opId);
+                    }
+                }
+                if (movedOps.size() != nodeOps.size())
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict stable source extraction failed node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+
+                std::size_t firstConsumerPosition = targetOps.size();
+                OperationId firstConsumer;
+                for (std::size_t index = 0; index < targetOps.size(); ++index)
+                {
+                    const auto operands = graph.opOperands(targetOps[index]);
+                    if (std::any_of(operands.begin(),
+                                    operands.end(),
+                                    [&](const auto value) {
+                                        return outputValues.contains(value);
+                                    }))
+                    {
+                        firstConsumerPosition = index;
+                        firstConsumer = targetOps[index];
+                        break;
+                    }
+                }
+                if (!firstConsumer.valid())
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict target consumer not found node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+                const auto targetNodeIt = std::find_if(
+                    targetNodes.begin(),
+                    targetNodes.end(),
+                    [&](uint32_t nodeId)
+                    {
+                        if (nodeId >= rewrite.computeNodes.size())
+                        {
+                            return false;
+                        }
+                        const auto &ops = rewrite.computeNodes[nodeId].ops;
+                        return std::find(ops.begin(), ops.end(), firstConsumer) != ops.end();
+                    });
+                if (targetNodeIt == targetNodes.end())
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict target consumer node not found node=" +
+                        std::to_string(move.computeNode);
+                    return false;
+                }
+                const std::size_t targetNodePosition = static_cast<std::size_t>(
+                    std::distance(targetNodes.begin(), targetNodeIt));
+
+                auto &expectedSourceOps = expectedSupernodeToOps[move.source];
+                auto &expectedTargetOps = expectedSupernodeToOps[move.target];
+                expectedSourceOps.erase(
+                    std::remove_if(expectedSourceOps.begin(),
+                                   expectedSourceOps.end(),
+                                   [&](OperationId op) { return moveOps.contains(op); }),
+                    expectedSourceOps.end());
+                expectedTargetOps.insert(
+                    expectedTargetOps.begin() + firstConsumerPosition,
+                    movedOps.begin(),
+                    movedOps.end());
+                auto &expectedSourceNodes =
+                    expectedComputeNodesBySupernode[move.source];
+                auto &expectedTargetNodes =
+                    expectedComputeNodesBySupernode[move.target];
+                expectedSourceNodes.erase(
+                    std::remove(expectedSourceNodes.begin(),
+                                expectedSourceNodes.end(),
+                                move.computeNode),
+                    expectedSourceNodes.end());
+                expectedTargetNodes.insert(
+                    expectedTargetNodes.begin() + targetNodePosition,
+                    move.computeNode);
+
+                sourceOps.erase(std::remove_if(sourceOps.begin(),
+                                               sourceOps.end(),
+                                               [&](OperationId op) {
+                                                   return moveOps.contains(op);
+                                               }),
+                                sourceOps.end());
+                targetOps.insert(targetOps.begin() + firstConsumerPosition,
+                                 movedOps.begin(),
+                                 movedOps.end());
+                sourceNodes.erase(std::remove(sourceNodes.begin(),
+                                              sourceNodes.end(),
+                                              move.computeNode),
+                                  sourceNodes.end());
+                targetNodes.insert(targetNodeIt, move.computeNode);
+
+                for (const auto output : move.outputs)
+                {
+                    expectedValueFanout[output.index - 1].clear();
+                }
+                for (const OperationId opId : movedOps)
+                {
+                    const auto op = graph.getOperation(opId);
+                    for (const wolvrix::lib::grh::ValueId result : op.results())
+                    {
+                        if (result.index == 0 ||
+                            result.index >= expectedValueSourceSupernode.size())
+                        {
+                            error =
+                                "activity-schedule final terminal pushforward strict result source out of range node=" +
+                                std::to_string(move.computeNode) +
+                                " result=" + std::to_string(result.index) +
+                                " source_size=" +
+                                std::to_string(expectedValueSourceSupernode.size());
+                            return false;
+                        }
+                        expectedValueSourceSupernode[result.index] = move.target;
+                    }
+                }
+                selectedBaeGain += move.baeGain;
+                selectedBoundaryValueGain += move.boundaryValueGain;
+                selectedBoundaryLogicalByteGain += move.byteGain;
+                ++stats.applied;
+            }
+
+            if (selectedBaeGain != projectedBaeGain ||
+                selectedBoundaryValueGain != projectedBoundaryValueGain ||
+                selectedBoundaryLogicalByteGain !=
+                    projectedBoundaryLogicalByteGain)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict selected gain sum mismatch";
+                return false;
+            }
+            for (const uint32_t supernode : touchedSupernodes)
+            {
+                if (!validateStableFinalLocalOpOrder(
+                        graph, candidate.supernodeToOps[supernode], error))
+                {
+                    error =
+                        "activity-schedule final terminal pushforward strict stable local order failed supernode=" +
+                        std::to_string(supernode) + ": " + error;
+                    return false;
+                }
+            }
+
+            if (!rebuildFinalScheduleDerivedNoSplit(graph, candidate, error))
+            {
+                return false;
+            }
+
+            stats.supernodesValid =
+                candidate.supernodeToOps.size() == baseline.supernodeToOps.size();
+            if (!stats.supernodesValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: supernode count";
+                return false;
+            }
+            stats.kindsValid = candidate.supernodeKinds == baseline.supernodeKinds;
+            if (!stats.kindsValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: supernode kinds";
+                return false;
+            }
+            stats.stableSpliceValid =
+                candidate.supernodeToOps == expectedSupernodeToOps &&
+                candidate.computeNodesBySupernode ==
+                    expectedComputeNodesBySupernode;
+            if (!stats.stableSpliceValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: stable splice";
+                return false;
+            }
+
+            std::vector<OperationId> baselineOps;
+            std::vector<OperationId> candidateOps;
+            std::unordered_set<OperationId, OperationIdHash> uniqueCandidateOps;
+            bool candidateHasDuplicate = false;
+            for (const auto &ops : baseline.supernodeToOps)
+            {
+                baselineOps.insert(baselineOps.end(), ops.begin(), ops.end());
+            }
+            for (const auto &ops : candidate.supernodeToOps)
+            {
+                candidateOps.insert(candidateOps.end(), ops.begin(), ops.end());
+                for (const OperationId op : ops)
+                {
+                    candidateHasDuplicate |= !uniqueCandidateOps.insert(op).second;
+                }
+            }
+            const auto opLess = [](OperationId lhs, OperationId rhs) {
+                return lhs.index < rhs.index;
+            };
+            std::sort(baselineOps.begin(), baselineOps.end(), opLess);
+            std::sort(candidateOps.begin(), candidateOps.end(), opLess);
+            stats.scheduledOpsValid = !candidateHasDuplicate && baselineOps == candidateOps;
+            if (!stats.scheduledOpsValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: scheduled ops";
+                return false;
+            }
+
+            stats.capacityValid = true;
+            stats.commitValid = true;
+            for (uint32_t supernode = 0; supernode < candidate.supernodeToOps.size();
+                 ++supernode)
+            {
+                if (candidate.supernodeKinds[supernode] ==
+                    ActivityScheduleSupernodeKind::Compute)
+                {
+                    stats.capacityValid &=
+                        !candidate.supernodeToOps[supernode].empty() &&
+                        candidate.supernodeToOps[supernode].size() <=
+                            computeSupernodeCap;
+                }
+                else
+                {
+                    stats.commitValid &= candidate.supernodeToOps[supernode] ==
+                                         baseline.supernodeToOps[supernode];
+                }
+            }
+            if (!stats.capacityValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: compute capacity";
+                return false;
+            }
+            if (!stats.commitValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: commit partition";
+                return false;
+            }
+
+            std::vector<std::size_t> computeNodeUses(rewrite.computeNodes.size(), 0);
+            stats.computePartitionValid =
+                candidate.computeNodesBySupernode.size() ==
+                candidate.supernodeToOps.size();
+            for (uint32_t supernode = 0;
+                 stats.computePartitionValid &&
+                 supernode < candidate.computeNodesBySupernode.size();
+                 ++supernode)
+            {
+                const auto &nodeIds = candidate.computeNodesBySupernode[supernode];
+                if (candidate.supernodeKinds[supernode] ==
+                    ActivityScheduleSupernodeKind::Commit)
+                {
+                    stats.computePartitionValid &= nodeIds.empty();
+                    continue;
+                }
+                std::unordered_set<OperationId, OperationIdHash> expectedOps;
+                for (const uint32_t nodeId : nodeIds)
+                {
+                    if (nodeId >= rewrite.computeNodes.size())
+                    {
+                        stats.computePartitionValid = false;
+                        break;
+                    }
+                    ++computeNodeUses[nodeId];
+                    for (const OperationId op : rewrite.computeNodes[nodeId].ops)
+                    {
+                        stats.computePartitionValid &= expectedOps.insert(op).second;
+                    }
+                }
+                std::unordered_set<OperationId, OperationIdHash> actualOps(
+                    candidate.supernodeToOps[supernode].begin(),
+                    candidate.supernodeToOps[supernode].end());
+                stats.computePartitionValid &=
+                    expectedOps == actualOps &&
+                    actualOps.size() == candidate.supernodeToOps[supernode].size();
+            }
+            stats.computePartitionValid &= std::all_of(
+                computeNodeUses.begin(),
+                computeNodeUses.end(),
+                [](std::size_t uses) { return uses == 1; });
+            for (const auto &move : selected)
+            {
+                const auto &sourceNodes = candidate.computeNodesBySupernode[move.source];
+                const auto &targetNodes = candidate.computeNodesBySupernode[move.target];
+                stats.computePartitionValid &=
+                    std::find(sourceNodes.begin(), sourceNodes.end(), move.computeNode) ==
+                        sourceNodes.end() &&
+                    std::count(targetNodes.begin(), targetNodes.end(), move.computeNode) == 1;
+            }
+            if (!stats.computePartitionValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: compute-node partition";
+                return false;
+            }
+
+            stats.dagEdgesBefore = countFinalScheduleDagEdges(baseline);
+            stats.dagEdgesAfter = countFinalScheduleDagEdges(candidate);
+            stats.dagValid = candidate.dag == baseline.dag;
+            stats.topoValid = candidate.topoOrder == baseline.topoOrder;
+            stats.stateReadValid =
+                candidate.stateReadSupernodes == baseline.stateReadSupernodes;
+            if (!stats.dagValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: DAG before=" +
+                    std::to_string(stats.dagEdgesBefore) +
+                    " after=" + std::to_string(stats.dagEdgesAfter);
+                return false;
+            }
+            if (!stats.topoValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: topo order";
+                return false;
+            }
+            if (!stats.stateReadValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: state-read sets";
+                return false;
+            }
+            stats.valueFanoutValid = candidate.valueFanout == expectedValueFanout;
+            stats.valueSourceValid =
+                candidate.valueSourceKind == baseline.valueSourceKind &&
+                candidate.valueSourceSupernode == expectedValueSourceSupernode;
+            if (!stats.valueFanoutValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: value fanout";
+                return false;
+            }
+            if (!stats.valueSourceValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: value source";
+                return false;
+            }
+
+            const ActivityScheduleSummaryStats baselineSummary =
+                buildActivityScheduleSummaryStats(baseline, rewrite, opData, graph);
+            const ActivityScheduleSummaryStats candidateSummary =
+                buildActivityScheduleSummaryStats(candidate, rewrite, opData, graph);
+            stats.computeBaeBefore = baselineSummary.computeComputeValuePairs;
+            stats.computeBaeAfter = candidateSummary.computeComputeValuePairs;
+            stats.boundaryActivationEdgesBefore =
+                baselineSummary.boundaryActivationEdges;
+            stats.boundaryActivationEdgesAfter =
+                candidateSummary.boundaryActivationEdges;
+            stats.boundaryValuesBefore = baselineSummary.boundaryValues;
+            stats.boundaryValuesAfter = candidateSummary.boundaryValues;
+            stats.boundaryLogicalBytesBefore =
+                countFinalScheduleBoundaryLogicalBytes(graph, baseline);
+            stats.boundaryLogicalBytesAfter =
+                countFinalScheduleBoundaryLogicalBytes(graph, candidate);
+            stats.computeCommitBefore = baselineSummary.computeCommitValuePairs;
+            stats.computeCommitAfter = candidateSummary.computeCommitValuePairs;
+            stats.computeCommitValid =
+                stats.computeCommitBefore == stats.computeCommitAfter &&
+                finalScheduleCommitValuePairs(baseline) ==
+                    finalScheduleCommitValuePairs(candidate);
+            if (!stats.computeCommitValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: compute-commit before=" +
+                    std::to_string(stats.computeCommitBefore) +
+                    " after=" + std::to_string(stats.computeCommitAfter);
+                return false;
+            }
+
+            stats.actualBaeGain =
+                stats.computeBaeBefore >= stats.computeBaeAfter
+                    ? stats.computeBaeBefore - stats.computeBaeAfter
+                    : 0;
+            stats.baeGainValid = stats.computeBaeBefore >= stats.computeBaeAfter &&
+                                 stats.actualBaeGain == projectedBaeGain;
+            stats.actualBoundaryActivationEdgeGain =
+                stats.boundaryActivationEdgesBefore >=
+                        stats.boundaryActivationEdgesAfter
+                    ? stats.boundaryActivationEdgesBefore -
+                          stats.boundaryActivationEdgesAfter
+                    : 0;
+            stats.boundaryActivationEdgeGainValid =
+                stats.boundaryActivationEdgesBefore >=
+                    stats.boundaryActivationEdgesAfter &&
+                stats.actualBoundaryActivationEdgeGain == projectedBaeGain;
+            stats.actualBoundaryValueGain =
+                stats.boundaryValuesBefore >= stats.boundaryValuesAfter
+                    ? stats.boundaryValuesBefore - stats.boundaryValuesAfter
+                    : 0;
+            stats.boundaryValueGainValid =
+                stats.boundaryValuesBefore >= stats.boundaryValuesAfter &&
+                stats.actualBoundaryValueGain == projectedBoundaryValueGain;
+            stats.actualBoundaryLogicalByteGain =
+                stats.boundaryLogicalBytesBefore >= stats.boundaryLogicalBytesAfter
+                    ? stats.boundaryLogicalBytesBefore -
+                          stats.boundaryLogicalBytesAfter
+                    : 0;
+            stats.boundaryLogicalByteGainValid =
+                stats.boundaryLogicalBytesBefore >=
+                    stats.boundaryLogicalBytesAfter &&
+                stats.actualBoundaryLogicalByteGain ==
+                    projectedBoundaryLogicalByteGain;
+            if (!stats.baeGainValid || !stats.boundaryActivationEdgeGainValid ||
+                !stats.boundaryValueGainValid ||
+                !stats.boundaryLogicalByteGainValid)
+            {
+                error =
+                    "activity-schedule final terminal pushforward strict invariant failed: gains predicted_bae=" +
+                    std::to_string(projectedBaeGain) +
+                    " actual_bae=" + std::to_string(stats.actualBaeGain) +
+                    " actual_boundary_edges=" +
+                    std::to_string(stats.actualBoundaryActivationEdgeGain) +
+                    " predicted_boundary_values=" +
+                    std::to_string(projectedBoundaryValueGain) +
+                    " actual_boundary_values=" +
+                    std::to_string(stats.actualBoundaryValueGain) +
+                    " predicted_boundary_logical_bytes=" +
+                    std::to_string(projectedBoundaryLogicalByteGain) +
+                    " actual_boundary_logical_bytes=" +
+                    std::to_string(stats.actualBoundaryLogicalByteGain);
+                return false;
+            }
+
+            build = std::move(candidate);
+            return true;
+        }
+
     } // namespace
 
     ActivitySchedulePass::ActivitySchedulePass()
@@ -13182,9 +13912,24 @@ namespace wolvrix::lib::transform
             return result;
         }
         if (options_.finalTerminalPushforwardPolicy != "off" &&
-            options_.finalTerminalPushforwardPolicy != "probe")
+            options_.finalTerminalPushforwardPolicy != "probe" &&
+            options_.finalTerminalPushforwardPolicy != "strict")
         {
-            error("activity-schedule final_terminal_pushforward_policy must be off or probe");
+            error("activity-schedule final_terminal_pushforward_policy must be off, probe, or strict");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalTerminalPushforwardPolicy == "strict" &&
+            options_.finalTopoPolicy != "level-id")
+        {
+            error("activity-schedule strict final terminal pushforward requires final_topo_policy=level-id");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalTerminalPushforwardPolicy == "strict" &&
+            options_.finalFaninPullbackPolicy == "strict")
+        {
+            error("activity-schedule final terminal pushforward and final-fanin pullback cannot both be strict");
             result.failed = true;
             return result;
         }
@@ -13845,6 +14590,8 @@ namespace wolvrix::lib::transform
                 std::to_string(probe.rejectedBoundaryValueGain) +
                 " rejected_byte_gain=" +
                 std::to_string(probe.rejectedByteGain) +
+                " rejected_strict_non_zero_add=" +
+                std::to_string(probe.rejectedStrictNonZeroAdd) +
                 " rejected_selection_move_limit=" +
                 std::to_string(probe.rejectedSelectionMoveLimit) +
                 " rejected_selection_budget=" +
@@ -13915,6 +14662,209 @@ namespace wolvrix::lib::transform
                     " output_values=" +
                     formatTerminalPushforwardValueIds(candidate.outputs));
             }
+        }
+        else if (options_.finalTerminalPushforwardPolicy == "strict")
+        {
+            if (materializePerf.splitOversizeComputeNodes != 0)
+            {
+                error(*graph,
+                      "activity-schedule strict final terminal pushforward does not support split compute nodes: split_nodes=" +
+                          std::to_string(materializePerf.splitOversizeComputeNodes) +
+                          " split_supernodes=" +
+                          std::to_string(
+                              materializePerf.splitOversizeComputeNodeSupernodes));
+                result.failed = true;
+                return result;
+            }
+            const auto strictStart = std::chrono::steady_clock::now();
+            const ActivityScheduleBuild baselineBuild = build;
+            std::vector<FinalTerminalPushforwardCandidate> selectedCandidates;
+            const FinalTerminalPushforwardProbeStats evaluation =
+                evaluateFinalTerminalPushforward(*graph,
+                                                 options_,
+                                                 rewrite,
+                                                 baselineBuild,
+                                                 materializePerf,
+                                                 &selectedCandidates);
+            if (evaluation.skippedOversize ||
+                evaluation.selected != selectedCandidates.size())
+            {
+                error(*graph,
+                      "activity-schedule strict final terminal pushforward evaluator gate failed: selected=" +
+                          std::to_string(evaluation.selected) +
+                          " plans=" +
+                          std::to_string(selectedCandidates.size()) +
+                          " skipped_oversize=" +
+                          std::string(evaluation.skippedOversize ? "true" :
+                                                                    "false"));
+                result.failed = true;
+                return result;
+            }
+            FinalTerminalPushforwardStrictStats strictStats;
+            std::string strictError;
+            if (!applyFinalTerminalPushforwardStrict(
+                    *graph,
+                    options_,
+                    opData,
+                    rewrite,
+                    baselineBuild,
+                    selectedCandidates,
+                    evaluation.selectedBaeGain,
+                    evaluation.selectedBoundaryValueGain,
+                    evaluation.selectedByteGain,
+                    build,
+                    strictStats,
+                    strictError))
+            {
+                logInfo(
+                    "activity-schedule final terminal pushforward strict failed: " +
+                    strictError);
+                error(*graph, strictError);
+                result.failed = true;
+                return result;
+            }
+            if (strictStats.applied != evaluation.selected)
+            {
+                error(*graph,
+                      "activity-schedule strict final terminal pushforward applied count mismatch: selected=" +
+                          std::to_string(evaluation.selected) +
+                          " applied=" + std::to_string(strictStats.applied));
+                result.failed = true;
+                return result;
+            }
+            const std::uint64_t strictMs = elapsedMs(strictStart);
+            logInfo(
+                "activity-schedule final terminal pushforward strict: policy=" +
+                options_.finalTerminalPushforwardPolicy +
+                " max_node_ops=" +
+                std::to_string(options_.finalTerminalPushforwardMaxNodeOps) +
+                " max_inputs=" +
+                std::to_string(options_.finalTerminalPushforwardMaxInputs) +
+                " max_outputs=" +
+                std::to_string(options_.finalTerminalPushforwardMaxOutputs) +
+                " max_value_width=" +
+                std::to_string(options_.finalTerminalPushforwardMaxValueWidth) +
+                " min_bae_gain=" +
+                std::to_string(options_.finalTerminalPushforwardMinBaeGain) +
+                " min_boundary_value_gain=" +
+                std::to_string(
+                    options_.finalTerminalPushforwardMinBoundaryValueGain) +
+                " max_moves=" +
+                std::to_string(options_.finalTerminalPushforwardMaxMoves) +
+                " max_moved_op_ppm=" +
+                std::to_string(options_.finalTerminalPushforwardMaxMovedOpPpm) +
+                " scanned=" + std::to_string(evaluation.scanned) +
+                " pure=" + std::to_string(evaluation.pure) +
+                " exact_eligible=" + std::to_string(evaluation.exactEligible) +
+                " selected=" + std::to_string(evaluation.selected) +
+                " applied=" + std::to_string(strictStats.applied) +
+                " moved_ops=" + std::to_string(evaluation.movedOps) +
+                " moved_op_limit=" + std::to_string(evaluation.movedOpLimit) +
+                " eligible_bae_gain=" +
+                std::to_string(evaluation.eligibleBaeGain) +
+                " projected_bae_gain=" +
+                std::to_string(evaluation.selectedBaeGain) +
+                " actual_bae_gain=" +
+                std::to_string(strictStats.actualBaeGain) +
+                " actual_boundary_activation_edge_gain=" +
+                std::to_string(
+                    strictStats.actualBoundaryActivationEdgeGain) +
+                " eligible_boundary_value_gain=" +
+                std::to_string(evaluation.eligibleBoundaryValueGain) +
+                " projected_boundary_value_gain=" +
+                std::to_string(evaluation.selectedBoundaryValueGain) +
+                " actual_boundary_value_gain=" +
+                std::to_string(strictStats.actualBoundaryValueGain) +
+                " eligible_boundary_logical_byte_gain=" +
+                std::to_string(evaluation.eligibleByteGain) +
+                " projected_boundary_logical_byte_gain=" +
+                std::to_string(evaluation.selectedByteGain) +
+                " actual_boundary_logical_byte_gain=" +
+                std::to_string(strictStats.actualBoundaryLogicalByteGain) +
+                " compute_bae_before=" +
+                std::to_string(strictStats.computeBaeBefore) +
+                " compute_bae_after=" +
+                std::to_string(strictStats.computeBaeAfter) +
+                " boundary_activation_edges_before=" +
+                std::to_string(strictStats.boundaryActivationEdgesBefore) +
+                " boundary_activation_edges_after=" +
+                std::to_string(strictStats.boundaryActivationEdgesAfter) +
+                " boundary_values_before=" +
+                std::to_string(strictStats.boundaryValuesBefore) +
+                " boundary_values_after=" +
+                std::to_string(strictStats.boundaryValuesAfter) +
+                " boundary_logical_bytes_before=" +
+                std::to_string(strictStats.boundaryLogicalBytesBefore) +
+                " boundary_logical_bytes_after=" +
+                std::to_string(strictStats.boundaryLogicalBytesAfter) +
+                " compute_commit_before=" +
+                std::to_string(strictStats.computeCommitBefore) +
+                " compute_commit_after=" +
+                std::to_string(strictStats.computeCommitAfter) +
+                " dag_edges_before=" +
+                std::to_string(strictStats.dagEdgesBefore) +
+                " dag_edges_after=" +
+                std::to_string(strictStats.dagEdgesAfter) +
+                " elapsed_ms=" + std::to_string(strictMs));
+            logInfo(
+                "activity-schedule final terminal pushforward strict validators: "
+                "supernodes=" +
+                std::string(strictStats.supernodesValid ? "true" : "false") +
+                " kinds=" +
+                std::string(strictStats.kindsValid ? "true" : "false") +
+                " scheduled_ops=" +
+                std::string(strictStats.scheduledOpsValid ? "true" : "false") +
+                " capacity=" +
+                std::string(strictStats.capacityValid ? "true" : "false") +
+                " commit=" +
+                std::string(strictStats.commitValid ? "true" : "false") +
+                " compute_partition=" +
+                std::string(strictStats.computePartitionValid ? "true" : "false") +
+                " stable_splice=" +
+                std::string(strictStats.stableSpliceValid ? "true" : "false") +
+                " dag=" + std::string(strictStats.dagValid ? "true" : "false") +
+                " topo=" +
+                std::string(strictStats.topoValid ? "true" : "false") +
+                " state_read=" +
+                std::string(strictStats.stateReadValid ? "true" : "false") +
+                " compute_commit=" +
+                std::string(strictStats.computeCommitValid ? "true" : "false") +
+                " value_fanout=" +
+                std::string(strictStats.valueFanoutValid ? "true" : "false") +
+                " value_source=" +
+                std::string(strictStats.valueSourceValid ? "true" : "false") +
+                " bae_gain=" +
+                std::string(strictStats.baeGainValid ? "true" : "false") +
+                " boundary_activation_edge_gain=" +
+                std::string(strictStats.boundaryActivationEdgeGainValid ? "true" :
+                                                                             "false") +
+                " boundary_value_gain=" +
+                std::string(strictStats.boundaryValueGainValid ? "true" :
+                                                                     "false") +
+                " boundary_logical_byte_gain=" +
+                std::string(strictStats.boundaryLogicalByteGainValid ? "true" :
+                                                                           "false"));
+            logInfo(
+                "activity-schedule final terminal pushforward strict selection: "
+                "rejected_move_limit=" +
+                std::to_string(evaluation.rejectedSelectionMoveLimit) +
+                " rejected_budget=" +
+                std::to_string(evaluation.rejectedSelectionBudget) +
+                " rejected_touched_supernode=" +
+                std::to_string(
+                    evaluation.rejectedSelectionTouchedSupernode) +
+                " rejected_strict_non_zero_add=" +
+                std::to_string(evaluation.rejectedStrictNonZeroAdd) +
+                " selected_by_bae_gain=" +
+                formatTopCounts(evaluation.selectedByBaeGain, 32) +
+                " selected_by_boundary_value_gain=" +
+                formatTopCounts(evaluation.selectedByBoundaryValueGain, 32) +
+                " selected_by_node_ops=" +
+                formatTopCounts(evaluation.selectedByNodeOps, 32) +
+                " selected_by_output_kind=" +
+                formatTopCounts(evaluation.selectedByOutputKind, 32) +
+                " selected_by_pair_multiplicity=" +
+                formatTopCounts(evaluation.selectedByPairMultiplicity, 32));
         }
 
         if (options_.finalFaninPullbackPolicy == "probe")

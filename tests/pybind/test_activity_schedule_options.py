@@ -11,6 +11,7 @@ class ActivityScheduleOptionTest(unittest.TestCase):
             _compile_activity_schedule_kwargs(
                 {
                     "final_terminal_pushforward_policy": "probe",
+                    "final_terminal_pushforward_profile_path": "/tmp/fire.tsv",
                     "final_terminal_pushforward_max_node_ops": 9,
                     "final_terminal_pushforward_max_inputs": 17,
                     "final_terminal_pushforward_max_outputs": 18,
@@ -19,11 +20,14 @@ class ActivityScheduleOptionTest(unittest.TestCase):
                     "final_terminal_pushforward_min_boundary_value_gain": 3,
                     "final_terminal_pushforward_max_moves": 129,
                     "final_terminal_pushforward_max_moved_op_ppm": 201,
+                    "final_terminal_pushforward_profile_min_source_fire": 1234,
                 }
             ),
             [
                 "-final-terminal-pushforward-policy",
                 "probe",
+                "-final-terminal-pushforward-profile-path",
+                "/tmp/fire.tsv",
                 "-final-terminal-pushforward-max-node-ops",
                 "9",
                 "-final-terminal-pushforward-max-inputs",
@@ -40,6 +44,8 @@ class ActivityScheduleOptionTest(unittest.TestCase):
                 "129",
                 "-final-terminal-pushforward-max-moved-op-ppm",
                 "201",
+                "-final-terminal-pushforward-profile-min-source-fire",
+                "1234",
             ],
         )
 
@@ -53,6 +59,7 @@ class ActivityScheduleOptionTest(unittest.TestCase):
             "final_terminal_pushforward_min_boundary_value_gain",
             "final_terminal_pushforward_max_moves",
             "final_terminal_pushforward_max_moved_op_ppm",
+            "final_terminal_pushforward_profile_min_source_fire",
         ):
             with self.subTest(option=option):
                 with self.assertRaisesRegex(ValueError, option):

@@ -6643,7 +6643,9 @@ int main()
                                    SessionStore &session,
                                    std::string *log = nullptr,
                                    std::size_t maxMoves = 1,
-                                   std::size_t movedOpPpm = 1000000)
+                                   std::size_t movedOpPpm = 1000000,
+                                   std::string profilePath = {},
+                                   std::size_t profileMinSourceFire = 0)
         {
             ActivityScheduleOptions options;
             options.path = name;
@@ -6657,6 +6659,10 @@ int main()
             }
             options.finalTerminalPushforwardMaxMoves = maxMoves;
             options.finalTerminalPushforwardMaxMovedOpPpm = movedOpPpm;
+            options.finalTerminalPushforwardProfilePath =
+                std::move(profilePath);
+            options.finalTerminalPushforwardProfileMinSourceFire =
+                profileMinSourceFire;
             PassManager manager;
             manager.options().session = &session;
             if (log != nullptr)
@@ -6681,6 +6687,7 @@ int main()
         const std::vector<std::string_view> separatedArgs{
             "-path", "final_terminal_pushforward_probe",
             "-final-terminal-pushforward-policy", "probe",
+            "-final-terminal-pushforward-profile-path", "/tmp/fire.tsv",
             "-final-terminal-pushforward-max-node-ops", "8",
             "-final-terminal-pushforward-max-inputs", "16",
             "-final-terminal-pushforward-max-outputs", "16",
@@ -6688,10 +6695,12 @@ int main()
             "-final-terminal-pushforward-min-bae-gain", "1",
             "-final-terminal-pushforward-min-boundary-value-gain", "1",
             "-final-terminal-pushforward-max-moves", "128",
-            "-final-terminal-pushforward-max-moved-op-ppm", "200"};
+            "-final-terminal-pushforward-max-moved-op-ppm", "200",
+            "-final-terminal-pushforward-profile-min-source-fire", "1234"};
         const std::vector<std::string_view> equalsArgs{
             "-path=final_terminal_pushforward_probe",
             "-final-terminal-pushforward-policy=probe",
+            "-final-terminal-pushforward-profile-path=/tmp/fire.tsv",
             "-final-terminal-pushforward-max-node-ops=8",
             "-final-terminal-pushforward-max-inputs=16",
             "-final-terminal-pushforward-max-outputs=16",
@@ -6699,12 +6708,17 @@ int main()
             "-final-terminal-pushforward-min-bae-gain=1",
             "-final-terminal-pushforward-min-boundary-value-gain=1",
             "-final-terminal-pushforward-max-moves=128",
-            "-final-terminal-pushforward-max-moved-op-ppm=200"};
+            "-final-terminal-pushforward-max-moved-op-ppm=200",
+            "-final-terminal-pushforward-profile-min-source-fire=1234"};
         const std::vector<std::string_view> malformedArgs{
             "-final-terminal-pushforward-max-node-ops=-1"};
+        const std::vector<std::string_view> malformedProfileArgs{
+            "-final-terminal-pushforward-profile-min-source-fire=-1"};
         if (makePass("activity-schedule", separatedArgs, parseError) == nullptr ||
             makePass("activity-schedule", equalsArgs, parseError) == nullptr ||
-            makePass("activity-schedule", malformedArgs, parseError) != nullptr)
+            makePass("activity-schedule", malformedArgs, parseError) != nullptr ||
+            makePass("activity-schedule", malformedProfileArgs, parseError) !=
+                nullptr)
         {
             return fail("Expected terminal pushforward CLI forms to parse strictly");
         }
@@ -6763,6 +6777,330 @@ int main()
         {
             return fail("Expected terminal pushforward 4/2 source/target fixture shape");
         }
+        if (probeSchedule.supernodeKinds == nullptr)
+        {
+            return fail("Expected terminal pushforward supernode kinds");
+        }
+        const std::size_t computeSupernodes = static_cast<std::size_t>(
+            std::count(probeSchedule.supernodeKinds->begin(),
+                       probeSchedule.supernodeKinds->end(),
+                       ActivityScheduleSupernodeKind::Compute));
+        const std::filesystem::path profileDir =
+            std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) /
+            "final_terminal_pushforward_profiles";
+        std::filesystem::create_directories(profileDir);
+        const auto writeProfile = [&](const std::filesystem::path &path,
+                                      std::size_t sourceFire,
+                                      std::size_t targetFire,
+                                      std::optional<std::size_t> omitted = std::nullopt,
+                                      std::optional<std::size_t> duplicate = std::nullopt,
+                                      bool malformedHeader = false)
+        {
+            std::ofstream out(path);
+            out << (malformedHeader ? "supernode_id\tphase\tfire\n"
+                                    : "supernode_id\tphase\tf\n");
+            for (std::size_t supernode = 0; supernode < computeSupernodes;
+                 ++supernode)
+            {
+                if (omitted && *omitted == supernode)
+                {
+                    continue;
+                }
+                const std::size_t fire =
+                    supernode == source
+                        ? sourceFire
+                        : (supernode == target ? targetFire : 1);
+                out << supernode << "\tcompute\t" << fire << '\n';
+            }
+            if (duplicate && *duplicate < computeSupernodes)
+            {
+                out << *duplicate << "\tcompute\t1\n";
+            }
+            out << computeSupernodes << "\tcommit\t999\n";
+            return out.good();
+        };
+
+        const std::filesystem::path validProfilePath =
+            profileDir / "valid.tsv";
+        if (!writeProfile(validProfilePath, 20, 10))
+        {
+            return fail("Failed to write valid terminal pushforward profile");
+        }
+        wolvrix::lib::grh::Design validProfileDesign;
+        buildFixture(validProfileDesign, std::string(kName));
+        SessionStore validProfileSession;
+        std::string validProfileLog;
+        if (!runFixture(validProfileDesign,
+                        std::string(kName),
+                        "probe",
+                        validProfileSession,
+                        &validProfileLog,
+                        1,
+                        1000000,
+                        validProfilePath.string(),
+                        20) ||
+            !schedulesEqual(probeSchedule,
+                            loadSchedule(validProfileSession,
+                                         std::string(kName))) ||
+            validProfileLog.find("profile_enabled=true profile_valid=true") ==
+                std::string::npos ||
+            parseStatField(validProfileLog, "profile_compute_rows") !=
+                computeSupernodes ||
+            parseStatField(validProfileLog,
+                           "profile_ignored_commit_rows") != 1 ||
+            parseStatField(validProfileLog,
+                           "rejected_profile_min_source_fire") != 0 ||
+            parseStatField(validProfileLog,
+                           "rejected_profile_target_fire_gt_source") != 0 ||
+            parseStatField(validProfileLog, "selected") != 1 ||
+            validProfileLog.find("source_fire=20 target_fire=10") ==
+                std::string::npos)
+        {
+            return fail("Expected valid profile-qualified terminal pushforward: " +
+                        validProfileLog);
+        }
+
+        const std::filesystem::path targetHotProfilePath =
+            profileDir / "target_hot.tsv";
+        if (!writeProfile(targetHotProfilePath, 10, 11))
+        {
+            return fail("Failed to write target-hot terminal pushforward profile");
+        }
+        wolvrix::lib::grh::Design targetHotDesign;
+        buildFixture(targetHotDesign, std::string(kName));
+        SessionStore targetHotSession;
+        std::string targetHotLog;
+        if (!runFixture(targetHotDesign,
+                        std::string(kName),
+                        "probe",
+                        targetHotSession,
+                        &targetHotLog,
+                        1,
+                        1000000,
+                        targetHotProfilePath.string()) ||
+            !schedulesEqual(probeSchedule,
+                            loadSchedule(targetHotSession,
+                                         std::string(kName))) ||
+            parseStatField(targetHotLog, "exact_eligible") != 0 ||
+            parseStatField(targetHotLog,
+                           "rejected_profile_target_fire_gt_source") != 1)
+        {
+            return fail("Expected target-hot profile candidate rejection: " +
+                        targetHotLog);
+        }
+
+        const std::filesystem::path equalFireProfilePath =
+            profileDir / "equal_fire.tsv";
+        if (!writeProfile(equalFireProfilePath, 10, 10))
+        {
+            return fail("Failed to write equal-fire terminal pushforward profile");
+        }
+        wolvrix::lib::grh::Design equalFireDesign;
+        buildFixture(equalFireDesign, std::string(kName));
+        SessionStore equalFireSession;
+        std::string equalFireLog;
+        if (!runFixture(equalFireDesign,
+                        std::string(kName),
+                        "probe",
+                        equalFireSession,
+                        &equalFireLog,
+                        1,
+                        1000000,
+                        equalFireProfilePath.string()) ||
+            !schedulesEqual(probeSchedule,
+                            loadSchedule(equalFireSession,
+                                         std::string(kName))) ||
+            parseStatField(equalFireLog, "exact_eligible") != 1 ||
+            parseStatField(equalFireLog, "selected") != 1 ||
+            parseStatField(equalFireLog,
+                           "rejected_profile_target_fire_gt_source") != 0 ||
+            equalFireLog.find("source_fire=10 target_fire=10") ==
+                std::string::npos)
+        {
+            return fail("Expected equal target/source fire to remain eligible: " +
+                        equalFireLog);
+        }
+
+        const std::filesystem::path belowMinProfilePath =
+            profileDir / "below_min.tsv";
+        if (!writeProfile(belowMinProfilePath, 19, 10))
+        {
+            return fail("Failed to write below-min terminal pushforward profile");
+        }
+        wolvrix::lib::grh::Design belowMinDesign;
+        buildFixture(belowMinDesign, std::string(kName));
+        SessionStore belowMinSession;
+        std::string belowMinLog;
+        if (!runFixture(belowMinDesign,
+                        std::string(kName),
+                        "probe",
+                        belowMinSession,
+                        &belowMinLog,
+                        1,
+                        1000000,
+                        belowMinProfilePath.string(),
+                        20) ||
+            !schedulesEqual(probeSchedule,
+                            loadSchedule(belowMinSession,
+                                         std::string(kName))) ||
+            parseStatField(belowMinLog, "exact_eligible") != 0 ||
+            parseStatField(belowMinLog,
+                           "rejected_profile_min_source_fire") != 1)
+        {
+            return fail("Expected minimum source-fire profile rejection: " +
+                        belowMinLog);
+        }
+
+        const std::filesystem::path missingProfilePath =
+            profileDir / "does_not_exist.tsv";
+        std::filesystem::remove(missingProfilePath);
+        wolvrix::lib::grh::Design missingProfileDesign;
+        buildFixture(missingProfileDesign, std::string(kName));
+        SessionStore missingProfileSession;
+        std::string missingProfileLog;
+        if (!runFixture(missingProfileDesign,
+                        std::string(kName),
+                        "strict",
+                        missingProfileSession,
+                        &missingProfileLog,
+                        1,
+                        1000000,
+                        missingProfilePath.string()) ||
+            !schedulesEqual(offSchedule,
+                            loadSchedule(missingProfileSession,
+                                         std::string(kName))) ||
+            missingProfileLog.find(
+                "profile_enabled=true profile_valid=false") ==
+                std::string::npos ||
+            missingProfileLog.find("profile_error=open_failed") ==
+                std::string::npos ||
+            parseStatField(missingProfileLog,
+                           "rejected_profile_invalid") != 1 ||
+            parseStatField(missingProfileLog, "selected") != 0 ||
+            parseStatField(missingProfileLog, "applied") != 0)
+        {
+            return fail("Expected missing profile to fail closed: " +
+                        missingProfileLog);
+        }
+
+        const std::filesystem::path malformedProfilePath =
+            profileDir / "malformed.tsv";
+        if (!writeProfile(malformedProfilePath, 20, 10, std::nullopt,
+                          std::nullopt, true))
+        {
+            return fail("Failed to write malformed terminal pushforward profile");
+        }
+        const std::filesystem::path duplicateProfilePath =
+            profileDir / "duplicate.tsv";
+        if (!writeProfile(duplicateProfilePath, 20, 10, std::nullopt, 0))
+        {
+            return fail("Failed to write duplicate terminal pushforward profile");
+        }
+        const std::filesystem::path incompleteProfilePath =
+            profileDir / "incomplete.tsv";
+        if (!writeProfile(incompleteProfilePath, 20, 10, 0))
+        {
+            return fail("Failed to write incomplete terminal pushforward profile");
+        }
+        const std::filesystem::path overflowProfilePath =
+            profileDir / "overflow.tsv";
+        {
+            std::ofstream out(overflowProfilePath);
+            out << "supernode_id\tphase\tf\n";
+            for (std::size_t supernode = 0; supernode < computeSupernodes;
+                 ++supernode)
+            {
+                out << supernode << "\tcompute\t"
+                    << (supernode == source
+                            ? "18446744073709551616"
+                            : "1")
+                    << '\n';
+            }
+            if (!out.good())
+            {
+                return fail("Failed to write overflow terminal pushforward profile");
+            }
+        }
+        const auto expectInvalidProfile = [&](const std::filesystem::path &path,
+                                              std::string_view errorText)
+        {
+            wolvrix::lib::grh::Design design;
+            buildFixture(design, std::string(kName));
+            SessionStore session;
+            std::string log;
+            const bool ran = runFixture(design,
+                                        std::string(kName),
+                                        "probe",
+                                        session,
+                                        &log,
+                                        1,
+                                        1000000,
+                                        path.string());
+            return ran &&
+                   schedulesEqual(probeSchedule,
+                                  loadSchedule(session, std::string(kName))) &&
+                   log.find("profile_enabled=true profile_valid=false") !=
+                       std::string::npos &&
+                   log.find(errorText) != std::string::npos &&
+                   parseStatField(log, "rejected_profile_invalid") == 1 &&
+                   parseStatField(log, "selected") == 0;
+        };
+        if (!expectInvalidProfile(malformedProfilePath,
+                                  "profile_error=invalid_header") ||
+            !expectInvalidProfile(duplicateProfilePath,
+                                  "duplicate_compute_id") ||
+            !expectInvalidProfile(incompleteProfilePath,
+                                  "profile_error=missing_compute_ids") ||
+            !expectInvalidProfile(overflowProfilePath,
+                                  "invalid_fire"))
+        {
+            return fail("Expected malformed/duplicate/incomplete profiles to fail closed");
+        }
+
+        wolvrix::lib::grh::Design offProfileDesign;
+        buildFixture(offProfileDesign, std::string(kName));
+        SessionStore offProfileSession;
+        if (!runFixture(offProfileDesign,
+                        std::string(kName),
+                        "off",
+                        offProfileSession,
+                        nullptr,
+                        1,
+                        1000000,
+                        missingProfilePath.string(),
+                        999999) ||
+            !schedulesEqual(offSchedule,
+                            loadSchedule(offProfileSession,
+                                         std::string(kName))))
+        {
+            return fail("Expected off policy to ignore profile options exactly");
+        }
+
+        wolvrix::lib::grh::Design emptyProfileDesign;
+        buildFixture(emptyProfileDesign, std::string(kName));
+        SessionStore emptyProfileSession;
+        std::string emptyProfileLog;
+        if (!runFixture(emptyProfileDesign,
+                        std::string(kName),
+                        "probe",
+                        emptyProfileSession,
+                        &emptyProfileLog,
+                        1,
+                        1000000,
+                        {},
+                        999999) ||
+            !schedulesEqual(probeSchedule,
+                            loadSchedule(emptyProfileSession,
+                                         std::string(kName))) ||
+            emptyProfileLog.find(
+                "profile_enabled=false profile_valid=true") ==
+                std::string::npos ||
+            parseStatField(emptyProfileLog, "selected") != 1)
+        {
+            return fail("Expected empty profile path to preserve probe identity: " +
+                        emptyProfileLog);
+        }
+
         const std::string expectedCandidate =
             "source_ops=4 target_ops=2 node_ops=1 inputs=1 outputs=1 "
             "max_value_width=8 output_kind=kNot pair_multiplicity=3 "
@@ -6896,6 +7234,59 @@ int main()
         {
             return fail("Expected exact strict terminal pushforward validation: " +
                         strictLog);
+        }
+
+        wolvrix::lib::grh::Design validProfileStrictDesign;
+        buildFixture(validProfileStrictDesign, std::string(kName));
+        SessionStore validProfileStrictSession;
+        std::string validProfileStrictLog;
+        if (!runFixture(validProfileStrictDesign,
+                        std::string(kName),
+                        "strict",
+                        validProfileStrictSession,
+                        &validProfileStrictLog,
+                        1,
+                        1000000,
+                        validProfilePath.string(),
+                        20) ||
+            !schedulesEqual(strictSchedule,
+                            loadSchedule(validProfileStrictSession,
+                                         std::string(kName))) ||
+            validProfileStrictLog.find(
+                "profile_enabled=true profile_valid=true") ==
+                std::string::npos ||
+            parseStatField(validProfileStrictLog, "selected") != 1 ||
+            parseStatField(validProfileStrictLog, "applied") != 1 ||
+            parseStatField(validProfileStrictLog, "actual_bae_gain") != 1)
+        {
+            return fail("Expected valid profile-qualified strict apply: " +
+                        validProfileStrictLog);
+        }
+
+        wolvrix::lib::grh::Design emptyProfileStrictDesign;
+        buildFixture(emptyProfileStrictDesign, std::string(kName));
+        SessionStore emptyProfileStrictSession;
+        std::string emptyProfileStrictLog;
+        if (!runFixture(emptyProfileStrictDesign,
+                        std::string(kName),
+                        "strict",
+                        emptyProfileStrictSession,
+                        &emptyProfileStrictLog,
+                        1,
+                        1000000,
+                        {},
+                        999999) ||
+            !schedulesEqual(strictSchedule,
+                            loadSchedule(emptyProfileStrictSession,
+                                         std::string(kName))) ||
+            emptyProfileStrictLog.find(
+                "profile_enabled=false profile_valid=true") ==
+                std::string::npos ||
+            parseStatField(emptyProfileStrictLog, "selected") != 1 ||
+            parseStatField(emptyProfileStrictLog, "applied") != 1)
+        {
+            return fail("Expected empty profile path to preserve strict identity: " +
+                        emptyProfileStrictLog);
         }
 
         wolvrix::lib::grh::Design repeatStrictDesign;

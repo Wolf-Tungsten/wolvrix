@@ -11892,6 +11892,201 @@ namespace wolvrix::lib::transform
             }
         }
 
+        struct FinalTerminalPushforwardProfile
+        {
+            bool enabled = false;
+            bool valid = true;
+            std::size_t computeRows = 0;
+            std::size_t ignoredCommitRows = 0;
+            std::vector<std::uint64_t> computeFire;
+            std::string error = "none";
+        };
+
+        std::vector<std::string_view> splitTerminalPushforwardProfileRow(
+            const std::string &line)
+        {
+            std::vector<std::string_view> fields;
+            std::size_t start = 0;
+            while (true)
+            {
+                const std::size_t end = line.find('\t', start);
+                fields.emplace_back(line.data() + start,
+                                    (end == std::string::npos ? line.size() : end) -
+                                        start);
+                if (end == std::string::npos)
+                {
+                    break;
+                }
+                start = end + 1;
+            }
+            return fields;
+        }
+
+        bool parseTerminalPushforwardProfileUnsigned(std::string_view text,
+                                                     std::uint64_t &value)
+        {
+            if (text.empty() ||
+                text.find_first_not_of("0123456789") != std::string_view::npos)
+            {
+                return false;
+            }
+            try
+            {
+                value = static_cast<std::uint64_t>(
+                    std::stoull(std::string(text)));
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        FinalTerminalPushforwardProfile loadFinalTerminalPushforwardProfile(
+            const ActivityScheduleOptions &options,
+            const ActivityScheduleBuild &build)
+        {
+            FinalTerminalPushforwardProfile profile;
+            if (options.finalTerminalPushforwardProfilePath.empty())
+            {
+                return profile;
+            }
+            profile.enabled = true;
+
+            const std::size_t computeSupernodes = static_cast<std::size_t>(
+                std::count(build.supernodeKinds.begin(),
+                           build.supernodeKinds.end(),
+                           ActivityScheduleSupernodeKind::Compute));
+            profile.computeFire.resize(computeSupernodes);
+            for (std::size_t supernode = 0;
+                 supernode < build.supernodeKinds.size();
+                 ++supernode)
+            {
+                const bool expectedCompute = supernode < computeSupernodes;
+                const bool actualCompute =
+                    build.supernodeKinds[supernode] ==
+                    ActivityScheduleSupernodeKind::Compute;
+                if (expectedCompute != actualCompute)
+                {
+                    profile.valid = false;
+                    profile.error = "non_contiguous_compute_ids";
+                    return profile;
+                }
+            }
+
+            std::ifstream input(options.finalTerminalPushforwardProfilePath);
+            if (!input.is_open())
+            {
+                profile.valid = false;
+                profile.error = "open_failed";
+                return profile;
+            }
+
+            std::vector<bool> seen(computeSupernodes, false);
+            bool haveHeader = false;
+            std::string line;
+            std::size_t lineNumber = 0;
+            while (std::getline(input, line))
+            {
+                ++lineNumber;
+                if (!line.empty() && line.back() == '\r')
+                {
+                    line.pop_back();
+                }
+                if (line.empty() || line.front() == '#')
+                {
+                    continue;
+                }
+                const auto fields = splitTerminalPushforwardProfileRow(line);
+                if (!haveHeader)
+                {
+                    haveHeader = true;
+                    if (fields.size() != 3 || fields[0] != "supernode_id" ||
+                        fields[1] != "phase" || fields[2] != "f")
+                    {
+                        profile.valid = false;
+                        profile.error = "invalid_header";
+                        return profile;
+                    }
+                    continue;
+                }
+                if (fields.size() != 3)
+                {
+                    profile.valid = false;
+                    profile.error = "line_" + std::to_string(lineNumber) +
+                                    "_column_count";
+                    return profile;
+                }
+                if (fields[1] != "compute" && fields[1] != "commit")
+                {
+                    profile.valid = false;
+                    profile.error = "line_" + std::to_string(lineNumber) +
+                                    "_invalid_phase";
+                    return profile;
+                }
+
+                std::uint64_t supernode = 0;
+                std::uint64_t fire = 0;
+                if (!parseTerminalPushforwardProfileUnsigned(fields[0], supernode))
+                {
+                    profile.valid = false;
+                    profile.error = "line_" + std::to_string(lineNumber) +
+                                    "_invalid_id";
+                    return profile;
+                }
+                if (!parseTerminalPushforwardProfileUnsigned(fields[2], fire))
+                {
+                    profile.valid = false;
+                    profile.error = "line_" + std::to_string(lineNumber) +
+                                    "_invalid_fire";
+                    return profile;
+                }
+                if (fields[1] == "commit")
+                {
+                    ++profile.ignoredCommitRows;
+                    continue;
+                }
+                if (supernode >= computeSupernodes)
+                {
+                    profile.valid = false;
+                    profile.error = "line_" + std::to_string(lineNumber) +
+                                    "_compute_id_out_of_range";
+                    return profile;
+                }
+                const std::size_t index = static_cast<std::size_t>(supernode);
+                if (seen[index])
+                {
+                    profile.valid = false;
+                    profile.error = "line_" + std::to_string(lineNumber) +
+                                    "_duplicate_compute_id";
+                    return profile;
+                }
+                seen[index] = true;
+                profile.computeFire[index] = fire;
+                ++profile.computeRows;
+            }
+            if (input.bad())
+            {
+                profile.valid = false;
+                profile.error = "read_failed";
+                return profile;
+            }
+            if (!haveHeader)
+            {
+                profile.valid = false;
+                profile.error = "missing_header";
+                return profile;
+            }
+            if (profile.computeRows != computeSupernodes ||
+                std::find(seen.begin(), seen.end(), false) != seen.end())
+            {
+                profile.valid = false;
+                profile.error = "missing_compute_ids";
+                return profile;
+            }
+            return profile;
+        }
+
         struct FinalTerminalPushforwardCandidate
         {
             uint32_t computeNode = kInvalidActivitySupernodeId;
@@ -11913,6 +12108,8 @@ namespace wolvrix::lib::transform
             std::size_t byteGain = 0;
             std::size_t topoDistance = 0;
             std::size_t storageDistance = 0;
+            std::uint64_t sourceFire = 0;
+            std::uint64_t targetFire = 0;
             wolvrix::lib::grh::OperationKind outputKind =
                 wolvrix::lib::grh::OperationKind::kConstant;
             std::vector<wolvrix::lib::grh::ValueId> inputs;
@@ -11959,10 +12156,18 @@ namespace wolvrix::lib::transform
             std::size_t rejectedBoundaryValueGain = 0;
             std::size_t rejectedByteGain = 0;
             std::size_t rejectedStrictNonZeroAdd = 0;
+            std::size_t rejectedProfileInvalid = 0;
+            std::size_t rejectedProfileMinSourceFire = 0;
+            std::size_t rejectedProfileTargetFireGtSource = 0;
             std::size_t rejectedSelectionMoveLimit = 0;
             std::size_t rejectedSelectionBudget = 0;
             std::size_t rejectedSelectionTouchedSupernode = 0;
             bool skippedOversize = false;
+            bool profileEnabled = false;
+            bool profileValid = true;
+            std::size_t profileComputeRows = 0;
+            std::size_t profileIgnoredCommitRows = 0;
+            std::string profileError = "none";
             CountMap eligibleByBaeGain;
             CountMap eligibleByBoundaryValueGain;
             CountMap eligibleByNodeOps;
@@ -12008,6 +12213,18 @@ namespace wolvrix::lib::transform
             if (selectedCandidates != nullptr)
             {
                 selectedCandidates->clear();
+            }
+            const FinalTerminalPushforwardProfile profile =
+                loadFinalTerminalPushforwardProfile(options, build);
+            stats.profileEnabled = profile.enabled;
+            stats.profileValid = profile.valid;
+            stats.profileComputeRows = profile.computeRows;
+            stats.profileIgnoredCommitRows = profile.ignoredCommitRows;
+            stats.profileError = profile.error;
+            if (profile.enabled && !profile.valid)
+            {
+                ++stats.rejectedProfileInvalid;
+                return stats;
             }
             if (materializePerf.splitOversizeComputeNodes != 0)
             {
@@ -12455,6 +12672,32 @@ namespace wolvrix::lib::transform
                     continue;
                 }
 
+                std::uint64_t sourceFire = 0;
+                std::uint64_t targetFire = 0;
+                if (profile.enabled)
+                {
+                    if (source >= profile.computeFire.size() ||
+                        target >= profile.computeFire.size())
+                    {
+                        ++stats.rejectedProfileInvalid;
+                        continue;
+                    }
+                    sourceFire = profile.computeFire[source];
+                    targetFire = profile.computeFire[target];
+                    if (sourceFire <
+                        static_cast<std::uint64_t>(
+                            options.finalTerminalPushforwardProfileMinSourceFire))
+                    {
+                        ++stats.rejectedProfileMinSourceFire;
+                        continue;
+                    }
+                    if (targetFire > sourceFire)
+                    {
+                        ++stats.rejectedProfileTargetFireGtSource;
+                        continue;
+                    }
+                }
+
                 FinalTerminalPushforwardCandidate candidate;
                 candidate.computeNode = computeNodeId;
                 candidate.source = source;
@@ -12478,6 +12721,8 @@ namespace wolvrix::lib::transform
                     removedBytes >= addedBytes ? removedBytes - addedBytes : 0;
                 candidate.storageDistance =
                     source > target ? source - target : target - source;
+                candidate.sourceFire = sourceFire;
+                candidate.targetFire = targetFire;
                 if (source < topoPosition.size() && target < topoPosition.size() &&
                     topoPosition[source] != std::numeric_limits<std::size_t>::max() &&
                     topoPosition[target] != std::numeric_limits<std::size_t>::max())
@@ -14524,6 +14769,22 @@ namespace wolvrix::lib::transform
                 std::to_string(options_.finalTerminalPushforwardMaxMoves) +
                 " max_moved_op_ppm=" +
                 std::to_string(options_.finalTerminalPushforwardMaxMovedOpPpm) +
+                " profile_path=" +
+                (options_.finalTerminalPushforwardProfilePath.empty()
+                     ? std::string("<none>")
+                     : options_.finalTerminalPushforwardProfilePath) +
+                " profile_enabled=" +
+                std::string(probe.profileEnabled ? "true" : "false") +
+                " profile_valid=" +
+                std::string(probe.profileValid ? "true" : "false") +
+                " profile_compute_rows=" +
+                std::to_string(probe.profileComputeRows) +
+                " profile_ignored_commit_rows=" +
+                std::to_string(probe.profileIgnoredCommitRows) +
+                " profile_min_source_fire=" +
+                std::to_string(
+                    options_.finalTerminalPushforwardProfileMinSourceFire) +
+                " profile_error=" + probe.profileError +
                 " scanned=" + std::to_string(probe.scanned) +
                 " pure=" + std::to_string(probe.pure) +
                 " exact_eligible=" + std::to_string(probe.exactEligible) +
@@ -14592,6 +14853,12 @@ namespace wolvrix::lib::transform
                 std::to_string(probe.rejectedByteGain) +
                 " rejected_strict_non_zero_add=" +
                 std::to_string(probe.rejectedStrictNonZeroAdd) +
+                " rejected_profile_invalid=" +
+                std::to_string(probe.rejectedProfileInvalid) +
+                " rejected_profile_min_source_fire=" +
+                std::to_string(probe.rejectedProfileMinSourceFire) +
+                " rejected_profile_target_fire_gt_source=" +
+                std::to_string(probe.rejectedProfileTargetFireGtSource) +
                 " rejected_selection_move_limit=" +
                 std::to_string(probe.rejectedSelectionMoveLimit) +
                 " rejected_selection_budget=" +
@@ -14629,6 +14896,8 @@ namespace wolvrix::lib::transform
                     " compute_node=" + std::to_string(candidate.computeNode) +
                     " source=" + std::to_string(candidate.source) +
                     " target=" + std::to_string(candidate.target) +
+                    " source_fire=" + std::to_string(candidate.sourceFire) +
+                    " target_fire=" + std::to_string(candidate.targetFire) +
                     " source_ops=" + std::to_string(candidate.sourceOps) +
                     " target_ops=" + std::to_string(candidate.targetOps) +
                     " node_ops=" + std::to_string(candidate.opCount) +
@@ -14753,6 +15022,22 @@ namespace wolvrix::lib::transform
                 std::to_string(options_.finalTerminalPushforwardMaxMoves) +
                 " max_moved_op_ppm=" +
                 std::to_string(options_.finalTerminalPushforwardMaxMovedOpPpm) +
+                " profile_path=" +
+                (options_.finalTerminalPushforwardProfilePath.empty()
+                     ? std::string("<none>")
+                     : options_.finalTerminalPushforwardProfilePath) +
+                " profile_enabled=" +
+                std::string(evaluation.profileEnabled ? "true" : "false") +
+                " profile_valid=" +
+                std::string(evaluation.profileValid ? "true" : "false") +
+                " profile_compute_rows=" +
+                std::to_string(evaluation.profileComputeRows) +
+                " profile_ignored_commit_rows=" +
+                std::to_string(evaluation.profileIgnoredCommitRows) +
+                " profile_min_source_fire=" +
+                std::to_string(
+                    options_.finalTerminalPushforwardProfileMinSourceFire) +
+                " profile_error=" + evaluation.profileError +
                 " scanned=" + std::to_string(evaluation.scanned) +
                 " pure=" + std::to_string(evaluation.pure) +
                 " exact_eligible=" + std::to_string(evaluation.exactEligible) +
@@ -14855,6 +15140,13 @@ namespace wolvrix::lib::transform
                     evaluation.rejectedSelectionTouchedSupernode) +
                 " rejected_strict_non_zero_add=" +
                 std::to_string(evaluation.rejectedStrictNonZeroAdd) +
+                " rejected_profile_invalid=" +
+                std::to_string(evaluation.rejectedProfileInvalid) +
+                " rejected_profile_min_source_fire=" +
+                std::to_string(evaluation.rejectedProfileMinSourceFire) +
+                " rejected_profile_target_fire_gt_source=" +
+                std::to_string(
+                    evaluation.rejectedProfileTargetFireGtSource) +
                 " selected_by_bae_gain=" +
                 formatTopCounts(evaluation.selectedByBaeGain, 32) +
                 " selected_by_boundary_value_gain=" +

@@ -55,6 +55,7 @@ namespace wolvrix::lib::transform
         std::size_t finalTerminalPushforwardMinBoundaryValueGain = 1;
         std::size_t finalTerminalPushforwardMaxMoves = 128;
         std::size_t finalTerminalPushforwardMaxMovedOpPpm = 200;
+        std::size_t finalTerminalPushforwardProfileMinSourceFire = 0;
         std::size_t finalSiblingFusionMinGain = 4;
         std::size_t finalSiblingFusionMaxPairs = 256;
         std::size_t finalSiblingFusionMaxFusedOpPpm = 5000;
@@ -74,6 +75,7 @@ namespace wolvrix::lib::transform
         std::string localSharedComputeCommonOwnerPolicy = "off";
         std::string finalFaninPullbackPolicy = "off";
         std::string finalTerminalPushforwardPolicy = "off";
+        std::string finalTerminalPushforwardProfilePath;
         std::string finalSiblingFusionPolicy = "off";
         std::string postDpRefinePolicy = "off";
         std::string kahnLevelPackPolicy = "off";

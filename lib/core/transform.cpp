@@ -1342,6 +1342,19 @@ namespace wolvrix::lib::transform
                     options.finalTerminalPushforwardPolicy = std::string(
                         arg.substr(std::string_view("-final-terminal-pushforward-policy=").size()));
                 }
+                else if (arg == "-final-terminal-pushforward-profile-path")
+                {
+                    if (!parseStringArg("-final-terminal-pushforward-profile-path",
+                                        options.finalTerminalPushforwardProfilePath))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-profile-path="))
+                {
+                    options.finalTerminalPushforwardProfilePath = std::string(
+                        arg.substr(std::string_view("-final-terminal-pushforward-profile-path=").size()));
+                }
                 else if (arg == "-final-sibling-fusion-policy")
                 {
                     if (!parseStringArg("-final-sibling-fusion-policy",
@@ -1629,6 +1642,25 @@ namespace wolvrix::lib::transform
                             "-final-terminal-pushforward-max-moved-op-ppm",
                             arg.substr(std::string_view("-final-terminal-pushforward-max-moved-op-ppm=").size()),
                             options.finalTerminalPushforwardMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-terminal-pushforward-profile-min-source-fire")
+                {
+                    if (!parseExactSizeArg(
+                            "-final-terminal-pushforward-profile-min-source-fire",
+                            options.finalTerminalPushforwardProfileMinSourceFire))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-terminal-pushforward-profile-min-source-fire="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-terminal-pushforward-profile-min-source-fire",
+                            arg.substr(std::string_view("-final-terminal-pushforward-profile-min-source-fire=").size()),
+                            options.finalTerminalPushforwardProfileMinSourceFire))
                     {
                         return nullptr;
                     }

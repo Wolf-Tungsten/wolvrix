@@ -654,6 +654,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("final_topo_policy", "-final-topo-policy"),
         ("final_fanin_pullback_policy", "-final-fanin-pullback-policy"),
         ("final_terminal_pushforward_policy", "-final-terminal-pushforward-policy"),
+        ("final_terminal_pushforward_profile_path", "-final-terminal-pushforward-profile-path"),
         ("final_sibling_fusion_policy", "-final-sibling-fusion-policy"),
         ("post_dp_refine_policy", "-post-dp-refine-policy"),
         ("kahn_level_pack_policy", "-kahn-level-pack-policy"),
@@ -687,6 +688,10 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ),
         ("final_terminal_pushforward_max_moves", "-final-terminal-pushforward-max-moves"),
         ("final_terminal_pushforward_max_moved_op_ppm", "-final-terminal-pushforward-max-moved-op-ppm"),
+        (
+            "final_terminal_pushforward_profile_min_source_fire",
+            "-final-terminal-pushforward-profile-min-source-fire",
+        ),
         ("final_sibling_fusion_min_gain", "-final-sibling-fusion-min-gain"),
         ("final_sibling_fusion_max_pairs", "-final-sibling-fusion-max-pairs"),
         ("final_sibling_fusion_max_fused_op_ppm", "-final-sibling-fusion-max-fused-op-ppm"),

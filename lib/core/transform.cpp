@@ -1355,6 +1355,44 @@ namespace wolvrix::lib::transform
                     options.finalTerminalPushforwardProfilePath = std::string(
                         arg.substr(std::string_view("-final-terminal-pushforward-profile-path=").size()));
                 }
+                else if (arg == "-final-shared-input-peer-policy" ||
+                         arg == "-shared-input-peer-probe-policy")
+                {
+                    if (!parseStringArg("-final-shared-input-peer-policy",
+                                        options.finalSharedInputPeerPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-policy=") ||
+                         arg.starts_with("-shared-input-peer-probe-policy="))
+                {
+                    const std::string_view prefix =
+                        arg.starts_with("-final-shared-input-peer-policy=")
+                            ? std::string_view("-final-shared-input-peer-policy=")
+                            : std::string_view("-shared-input-peer-probe-policy=");
+                    options.finalSharedInputPeerPolicy =
+                        std::string(arg.substr(prefix.size()));
+                }
+                else if (arg == "-final-shared-input-peer-profile-path" ||
+                         arg == "-shared-input-peer-profile-path")
+                {
+                    if (!parseStringArg("-final-shared-input-peer-profile-path",
+                                        options.finalSharedInputPeerProfilePath))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-profile-path=") ||
+                         arg.starts_with("-shared-input-peer-profile-path="))
+                {
+                    const std::string_view prefix =
+                        arg.starts_with("-final-shared-input-peer-profile-path=")
+                            ? std::string_view("-final-shared-input-peer-profile-path=")
+                            : std::string_view("-shared-input-peer-profile-path=");
+                    options.finalSharedInputPeerProfilePath =
+                        std::string(arg.substr(prefix.size()));
+                }
                 else if (arg == "-final-sibling-fusion-policy")
                 {
                     if (!parseStringArg("-final-sibling-fusion-policy",
@@ -1661,6 +1699,169 @@ namespace wolvrix::lib::transform
                             "-final-terminal-pushforward-profile-min-source-fire",
                             arg.substr(std::string_view("-final-terminal-pushforward-profile-min-source-fire=").size()),
                             options.finalTerminalPushforwardProfileMinSourceFire))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-node-ops")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-node-ops",
+                                           options.finalSharedInputPeerMaxNodeOps))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-node-ops="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-node-ops",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-node-ops=").size()),
+                            options.finalSharedInputPeerMaxNodeOps))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-inputs")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-inputs",
+                                           options.finalSharedInputPeerMaxInputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-inputs="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-inputs",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-inputs=").size()),
+                            options.finalSharedInputPeerMaxInputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-outputs")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-outputs",
+                                           options.finalSharedInputPeerMaxOutputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-outputs="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-outputs",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-outputs=").size()),
+                            options.finalSharedInputPeerMaxOutputs))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-value-width")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-value-width",
+                                           options.finalSharedInputPeerMaxValueWidth))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-value-width="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-value-width",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-value-width=").size()),
+                            options.finalSharedInputPeerMaxValueWidth))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-peers")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-peers",
+                                           options.finalSharedInputPeerMaxPeers))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-peers="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-peers",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-peers=").size()),
+                            options.finalSharedInputPeerMaxPeers))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-candidates")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-candidates",
+                                           options.finalSharedInputPeerMaxCandidates))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-candidates="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-candidates",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-candidates=").size()),
+                            options.finalSharedInputPeerMaxCandidates))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-moves")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-moves",
+                                           options.finalSharedInputPeerMaxMoves))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-moves="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-moves",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-moves=").size()),
+                            options.finalSharedInputPeerMaxMoves))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-max-moved-op-ppm")
+                {
+                    if (!parseExactSizeArg("-final-shared-input-peer-max-moved-op-ppm",
+                                           options.finalSharedInputPeerMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-max-moved-op-ppm="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-max-moved-op-ppm",
+                            arg.substr(std::string_view("-final-shared-input-peer-max-moved-op-ppm=").size()),
+                            options.finalSharedInputPeerMaxMovedOpPpm))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-final-shared-input-peer-profile-min-source-fire")
+                {
+                    if (!parseExactSizeArg(
+                            "-final-shared-input-peer-profile-min-source-fire",
+                            options.finalSharedInputPeerProfileMinSourceFire))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-shared-input-peer-profile-min-source-fire="))
+                {
+                    if (!parseExactSizeText(
+                            "-final-shared-input-peer-profile-min-source-fire",
+                            arg.substr(std::string_view("-final-shared-input-peer-profile-min-source-fire=").size()),
+                            options.finalSharedInputPeerProfileMinSourceFire))
                     {
                         return nullptr;
                     }

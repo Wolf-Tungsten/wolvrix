@@ -56,6 +56,17 @@ namespace wolvrix::lib::transform
         std::size_t finalTerminalPushforwardMaxMoves = 128;
         std::size_t finalTerminalPushforwardMaxMovedOpPpm = 200;
         std::size_t finalTerminalPushforwardProfileMinSourceFire = 0;
+        // Stage 27: read-only shared-input peer peel probe.  The probe is
+        // intentionally default-off and has no graph/schedule mutation path.
+        std::size_t finalSharedInputPeerMaxNodeOps = 8;
+        std::size_t finalSharedInputPeerMaxInputs = 16;
+        std::size_t finalSharedInputPeerMaxOutputs = 16;
+        std::size_t finalSharedInputPeerMaxValueWidth = 64;
+        std::size_t finalSharedInputPeerMaxPeers = 8;
+        std::size_t finalSharedInputPeerMaxCandidates = 4096;
+        std::size_t finalSharedInputPeerMaxMoves = 128;
+        std::size_t finalSharedInputPeerMaxMovedOpPpm = 200;
+        std::size_t finalSharedInputPeerProfileMinSourceFire = 0;
         std::size_t finalSiblingFusionMinGain = 4;
         std::size_t finalSiblingFusionMaxPairs = 256;
         std::size_t finalSiblingFusionMaxFusedOpPpm = 5000;
@@ -76,6 +87,8 @@ namespace wolvrix::lib::transform
         std::string finalFaninPullbackPolicy = "off";
         std::string finalTerminalPushforwardPolicy = "off";
         std::string finalTerminalPushforwardProfilePath;
+        std::string finalSharedInputPeerPolicy = "off";
+        std::string finalSharedInputPeerProfilePath;
         std::string finalSiblingFusionPolicy = "off";
         std::string postDpRefinePolicy = "off";
         std::string kahnLevelPackPolicy = "off";

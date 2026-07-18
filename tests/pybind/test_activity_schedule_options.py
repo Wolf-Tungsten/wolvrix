@@ -67,6 +67,67 @@ class ActivityScheduleOptionTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, option):
                     _compile_activity_schedule_kwargs({option: "1"})
 
+    def test_final_shared_input_peer_options_are_forwarded(self) -> None:
+        self.assertEqual(
+            _compile_activity_schedule_kwargs(
+                {
+                    "final_shared_input_peer_policy": "probe",
+                    "final_shared_input_peer_profile_path": "/tmp/shared-fire.tsv",
+                    "final_shared_input_peer_max_node_ops": 8,
+                    "final_shared_input_peer_max_inputs": 16,
+                    "final_shared_input_peer_max_outputs": 16,
+                    "final_shared_input_peer_max_value_width": 64,
+                    "final_shared_input_peer_max_peers": 8,
+                    "final_shared_input_peer_max_candidates": 4096,
+                    "final_shared_input_peer_max_moves": 128,
+                    "final_shared_input_peer_max_moved_op_ppm": 200,
+                    "final_shared_input_peer_profile_min_source_fire": 1234,
+                }
+            ),
+            [
+                "-final-shared-input-peer-policy",
+                "probe",
+                "-final-shared-input-peer-profile-path",
+                "/tmp/shared-fire.tsv",
+                "-final-shared-input-peer-max-node-ops",
+                "8",
+                "-final-shared-input-peer-max-inputs",
+                "16",
+                "-final-shared-input-peer-max-outputs",
+                "16",
+                "-final-shared-input-peer-max-value-width",
+                "64",
+                "-final-shared-input-peer-max-peers",
+                "8",
+                "-final-shared-input-peer-max-candidates",
+                "4096",
+                "-final-shared-input-peer-max-moves",
+                "128",
+                "-final-shared-input-peer-max-moved-op-ppm",
+                "200",
+                "-final-shared-input-peer-profile-min-source-fire",
+                "1234",
+            ],
+        )
+
+    def test_final_shared_input_peer_integer_options_must_be_non_negative(self) -> None:
+        for option in (
+            "final_shared_input_peer_max_node_ops",
+            "final_shared_input_peer_max_inputs",
+            "final_shared_input_peer_max_outputs",
+            "final_shared_input_peer_max_value_width",
+            "final_shared_input_peer_max_peers",
+            "final_shared_input_peer_max_candidates",
+            "final_shared_input_peer_max_moves",
+            "final_shared_input_peer_max_moved_op_ppm",
+            "final_shared_input_peer_profile_min_source_fire",
+        ):
+            with self.subTest(option=option):
+                with self.assertRaisesRegex(ValueError, option):
+                    _compile_activity_schedule_kwargs({option: -1})
+                with self.assertRaisesRegex(ValueError, option):
+                    _compile_activity_schedule_kwargs({option: "1"})
+
     def test_final_sibling_fusion_options_are_forwarded(self) -> None:
         self.assertEqual(
             _compile_activity_schedule_kwargs(

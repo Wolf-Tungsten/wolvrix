@@ -12180,6 +12180,130 @@ namespace wolvrix::lib::transform
             CountMap selectedByPairMultiplicity;
         };
 
+        // Stage 27 deliberately reuses the strict, fail-closed TSV parser used
+        // by the Stage 26 terminal probe.  Keeping the parser's validation in
+        // one place is important: a peer probe must never silently turn a
+        // missing or malformed fire row into a zero-fire candidate.
+        FinalTerminalPushforwardProfile loadFinalSharedInputPeerProfile(
+            const ActivityScheduleOptions &options,
+            const ActivityScheduleBuild &build)
+        {
+            if (options.finalSharedInputPeerProfilePath.empty())
+            {
+                return {};
+            }
+            ActivityScheduleOptions profileOptions = options;
+            profileOptions.finalTerminalPushforwardProfilePath =
+                options.finalSharedInputPeerProfilePath;
+            return loadFinalTerminalPushforwardProfile(profileOptions, build);
+        }
+
+        struct FinalSharedInputPeerCandidate
+        {
+            uint32_t computeNode = kInvalidActivitySupernodeId;
+            uint32_t source = kInvalidActivitySupernodeId;
+            uint32_t peer = kInvalidActivitySupernodeId;
+            std::size_t opCount = 0;
+            std::size_t sourceOps = 0;
+            std::size_t peerOps = 0;
+            std::size_t inputCount = 0;
+            std::size_t outputCount = 0;
+            std::size_t sharedInputCount = 0;
+            std::size_t removedBae = 0;
+            std::size_t addedBae = 0;
+            std::size_t baeGain = 0;
+            std::size_t removedBoundaryValues = 0;
+            std::size_t addedBoundaryValues = 0;
+            std::size_t boundaryValueGain = 0;
+            std::size_t removedBytes = 0;
+            std::size_t addedBytes = 0;
+            std::size_t byteGain = 0;
+            // These are conservative emitter-independent proxies.  The
+            // schedule pass has no active-word/CPP batch map, so they use
+            // logical input bytes and 8-byte chunks as upper bounds rather
+            // than exact generated-byte savings.
+            std::size_t activeByteGainUpperBound = 0;
+            std::size_t activeChunkGainUpperBound = 0;
+            std::size_t dagDelta = 0;
+            std::size_t topoDistance = 0;
+            std::size_t storageDistance = 0;
+            std::uint64_t sourceFire = 0;
+            std::uint64_t peerFire = 0;
+            std::int64_t workProxy = 0;
+            std::vector<wolvrix::lib::grh::ValueId> inputs;
+            std::vector<wolvrix::lib::grh::ValueId> outputs;
+        };
+
+        struct FinalSharedInputPeerProbeStats
+        {
+            using CountMap = ActivityScheduleSummaryStats::KindCountMap;
+
+            std::size_t scanned = 0;
+            std::size_t pure = 0;
+            std::size_t exactEligible = 0;
+            std::size_t selected = 0;
+            std::size_t eligibleBaeGain = 0;
+            std::size_t selectedBaeGain = 0;
+            std::size_t eligibleBoundaryValueGain = 0;
+            std::size_t selectedBoundaryValueGain = 0;
+            std::size_t eligibleByteGain = 0;
+            std::size_t selectedByteGain = 0;
+            std::size_t eligibleActiveByteGainUpperBound = 0;
+            std::size_t selectedActiveByteGainUpperBound = 0;
+            std::size_t eligibleActiveChunkGainUpperBound = 0;
+            std::size_t selectedActiveChunkGainUpperBound = 0;
+            std::int64_t eligibleWorkProxy = 0;
+            std::int64_t selectedWorkProxy = 0;
+            std::size_t movedOps = 0;
+            std::size_t movedOpLimit = 0;
+            std::size_t rejectedOwner = 0;
+            std::size_t rejectedSplitOrNodeSize = 0;
+            std::size_t rejectedSourceEmpty = 0;
+            std::size_t rejectedRestricted = 0;
+            std::size_t rejectedKind = 0;
+            std::size_t rejectedSideEffect = 0;
+            std::size_t rejectedCloneForbidden = 0;
+            std::size_t rejectedWidth = 0;
+            std::size_t rejectedDeclaredOrPort = 0;
+            std::size_t rejectedNoInputs = 0;
+            std::size_t rejectedInputNoDef = 0;
+            std::size_t rejectedInputTooMany = 0;
+            std::size_t rejectedNoCommonPeer = 0;
+            std::size_t rejectedPeerInvalid = 0;
+            std::size_t rejectedCapacity = 0;
+            std::size_t rejectedPeerScanLimit = 0;
+            std::size_t rejectedOutputConsumer = 0;
+            std::size_t rejectedTerminal = 0;
+            std::size_t rejectedOutputTooMany = 0;
+            std::size_t rejectedNoRemovableInput = 0;
+            std::size_t rejectedInputOwnerSource = 0;
+            std::size_t rejectedFanoutMismatch = 0;
+            std::size_t rejectedDagSupport = 0;
+            std::size_t rejectedProfileInvalid = 0;
+            std::size_t rejectedProfileMinSourceFire = 0;
+            std::size_t rejectedProfilePeerFireGtSource = 0;
+            std::size_t rejectedSelectionMoveLimit = 0;
+            std::size_t rejectedSelectionBudget = 0;
+            std::size_t rejectedSelectionTouchedSupernode = 0;
+            std::size_t rejectedSelectionCandidateLimit = 0;
+            std::size_t candidateScanLimit = 0;
+            bool truncated = false;
+            bool skippedOversize = false;
+            bool profileEnabled = false;
+            bool profileValid = true;
+            std::size_t profileComputeRows = 0;
+            std::size_t profileIgnoredCommitRows = 0;
+            std::string profileError = "none";
+            CountMap eligibleByNodeOps;
+            CountMap eligibleByInputs;
+            CountMap eligibleByOutputs;
+            CountMap eligibleBySharedInputs;
+            CountMap selectedByNodeOps;
+            CountMap selectedByInputs;
+            CountMap selectedByOutputs;
+            CountMap selectedBySharedInputs;
+        };
+
         std::string formatTerminalPushforwardValueIds(
             const std::vector<wolvrix::lib::grh::ValueId> &values)
         {
@@ -12817,6 +12941,812 @@ namespace wolvrix::lib::transform
                     std::string(wolvrix::lib::grh::toString(candidate.outputKind))];
                 ++stats.selectedByPairMultiplicity[
                     std::to_string(candidate.pairMultiplicity)];
+                if (selectedCandidates != nullptr)
+                {
+                    selectedCandidates->push_back(candidate);
+                }
+            }
+            return stats;
+        }
+
+        FinalSharedInputPeerProbeStats evaluateFinalSharedInputPeer(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ComputeRewriteBuild &rewrite,
+            const ActivityScheduleBuild &build,
+            const ComputeNodeMaterializePerfStats &materializePerf,
+            std::vector<FinalSharedInputPeerCandidate> *selectedCandidates = nullptr)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+            using wolvrix::lib::grh::ValueIdHash;
+            using wolvrix::lib::grh::ValueType;
+
+            FinalSharedInputPeerProbeStats stats;
+            if (selectedCandidates != nullptr)
+            {
+                selectedCandidates->clear();
+            }
+
+            const FinalTerminalPushforwardProfile profile =
+                loadFinalSharedInputPeerProfile(options, build);
+            stats.profileEnabled = profile.enabled;
+            stats.profileValid = profile.valid;
+            stats.profileComputeRows = profile.computeRows;
+            stats.profileIgnoredCommitRows = profile.ignoredCommitRows;
+            stats.profileError = profile.error;
+            if (profile.enabled && !profile.valid)
+            {
+                ++stats.rejectedProfileInvalid;
+                return stats;
+            }
+            if (materializePerf.splitOversizeComputeNodes != 0)
+            {
+                stats.skippedOversize = true;
+                return stats;
+            }
+
+            const std::size_t computeSupernodeCap =
+                options.maxOpInComputeSupernode == 0
+                    ? std::numeric_limits<std::size_t>::max()
+                    : options.maxOpInComputeSupernode;
+            const auto movedOpLimit128 =
+                (static_cast<unsigned __int128>(rewrite.stats.computeNodeOpsTotal) *
+                 options.finalSharedInputPeerMaxMovedOpPpm) /
+                1000000U;
+            stats.movedOpLimit =
+                movedOpLimit128 > std::numeric_limits<std::size_t>::max()
+                    ? std::numeric_limits<std::size_t>::max()
+                    : static_cast<std::size_t>(movedOpLimit128);
+
+            const auto ownerOfOp = [&](OperationId opId)
+            {
+                if (!opId.valid() || opId.index - 1 >= build.opToSupernode.size())
+                {
+                    return kInvalidActivitySupernodeId;
+                }
+                return build.opToSupernode[opId.index - 1];
+            };
+            const auto isComputeSupernode = [&](uint32_t supernode)
+            {
+                return supernode < build.supernodeKinds.size() &&
+                       build.supernodeKinds[supernode] ==
+                           ActivityScheduleSupernodeKind::Compute;
+            };
+            std::vector<uint32_t> ownerByComputeNode(
+                rewrite.computeNodes.size(), kInvalidActivitySupernodeId);
+            std::vector<bool> ambiguousComputeNodeOwner(rewrite.computeNodes.size(), false);
+            for (uint32_t supernode = 0;
+                 supernode < build.computeNodesBySupernode.size(); ++supernode)
+            {
+                for (const uint32_t computeNode : build.computeNodesBySupernode[supernode])
+                {
+                    if (computeNode >= ownerByComputeNode.size())
+                    {
+                        continue;
+                    }
+                    if (ownerByComputeNode[computeNode] != kInvalidActivitySupernodeId &&
+                        ownerByComputeNode[computeNode] != supernode)
+                    {
+                        ambiguousComputeNodeOwner[computeNode] = true;
+                    }
+                    else
+                    {
+                        ownerByComputeNode[computeNode] = supernode;
+                    }
+                }
+            }
+
+            std::unordered_set<ValueId, ValueIdHash> portValues;
+            for (const auto &port : graph.outputPorts())
+            {
+                portValues.insert(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                portValues.insert(port.in);
+                portValues.insert(port.out);
+                portValues.insert(port.oe);
+            }
+
+            std::unordered_map<ValueId, std::vector<OperationId>, ValueIdHash>
+                implicitIndexUsers;
+            for (const OperationId opId : graph.operations())
+            {
+                const auto op = graph.getOperation(opId);
+                if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                {
+                    implicitIndexUsers[*indexValue].push_back(opId);
+                }
+            }
+
+            // Quotient DAG support refcounts.  The probe only accepts a peel
+            // whose set of present source->target keys is unchanged after the
+            // hypothetical ownership update; this is stronger than comparing
+            // a raw edge count.
+            std::unordered_map<uint64_t, std::size_t> dagSupport;
+            dagSupport.reserve(build.valueFanout.size() * 2 + 1);
+            for (std::size_t valueIndex = 0;
+                 valueIndex < build.valueFanout.size(); ++valueIndex)
+            {
+                const uint32_t source =
+                    valueIndex + 1 < build.valueSourceSupernode.size()
+                        ? build.valueSourceSupernode[valueIndex + 1]
+                        : kInvalidActivitySupernodeId;
+                if (source == kInvalidActivitySupernodeId ||
+                    !isComputeSupernode(source))
+                {
+                    continue;
+                }
+                for (const uint32_t target : build.valueFanout[valueIndex])
+                {
+                    if (target >= build.supernodeKinds.size() || source == target)
+                    {
+                        continue;
+                    }
+                    ++dagSupport[(static_cast<uint64_t>(source) << 32) | target];
+                }
+            }
+
+            const auto supportKey = [](uint32_t source, uint32_t target)
+            {
+                return (static_cast<uint64_t>(source) << 32) | target;
+            };
+
+            std::vector<std::size_t> topoPosition(
+                build.supernodeToOps.size(),
+                std::numeric_limits<std::size_t>::max());
+            for (std::size_t position = 0; position < build.topoOrder.size(); ++position)
+            {
+                const uint32_t supernode = build.topoOrder[position];
+                if (supernode < topoPosition.size())
+                {
+                    topoPosition[supernode] = position;
+                }
+            }
+
+            const auto logicValueBytes = [&](ValueId value)
+            {
+                const auto info = graph.getValue(value);
+                if (info.type() != ValueType::Logic || info.width() <= 0)
+                {
+                    return std::size_t{0};
+                }
+                return (static_cast<std::size_t>(info.width()) + 7U) / 8U;
+            };
+
+            std::vector<FinalSharedInputPeerCandidate> candidates;
+            candidates.reserve(std::min<std::size_t>(
+                rewrite.computeNodes.size(), options.finalSharedInputPeerMaxCandidates));
+            for (uint32_t computeNodeId = 0;
+                 computeNodeId < rewrite.computeNodes.size(); ++computeNodeId)
+            {
+                ++stats.scanned;
+                if (candidates.size() >= options.finalSharedInputPeerMaxCandidates)
+                {
+                    stats.truncated = true;
+                    ++stats.candidateScanLimit;
+                    ++stats.rejectedSelectionCandidateLimit;
+                    continue;
+                }
+                const auto &node = rewrite.computeNodes[computeNodeId];
+                const uint32_t source = ownerByComputeNode[computeNodeId];
+                if (ambiguousComputeNodeOwner[computeNodeId] ||
+                    source == kInvalidActivitySupernodeId ||
+                    !isComputeSupernode(source) ||
+                    source >= build.supernodeToOps.size())
+                {
+                    ++stats.rejectedOwner;
+                    continue;
+                }
+                if (node.ops.empty() ||
+                    node.ops.size() > options.finalSharedInputPeerMaxNodeOps)
+                {
+                    ++stats.rejectedSplitOrNodeSize;
+                    continue;
+                }
+                if (build.supernodeToOps[source].size() <= node.ops.size())
+                {
+                    ++stats.rejectedSourceEmpty;
+                    continue;
+                }
+                if (node.indivisible || !node.intentGroup.empty())
+                {
+                    ++stats.rejectedRestricted;
+                    continue;
+                }
+
+                std::unordered_set<OperationId, OperationIdHash> nodeOps(
+                    node.ops.begin(), node.ops.end());
+                std::unordered_set<ValueId, ValueIdHash> nodeResults;
+                std::unordered_set<ValueId, ValueIdHash> inputSet;
+                bool invalidOwner = false;
+                bool invalidKind = false;
+                bool sideEffect = false;
+                bool cloneForbidden = false;
+                bool invalidShape = false;
+                bool invalidWidth = false;
+                bool anchoredValue = false;
+                for (const OperationId opId : node.ops)
+                {
+                    invalidOwner |= ownerOfOp(opId) != source;
+                    const auto op = graph.getOperation(opId);
+                    invalidKind |= !isCloneableLocalSharedComputeOpKind(op.kind());
+                    sideEffect |= opHasSideEffects(op);
+                    cloneForbidden |= hasLocalSharedCloneForbiddenAttr(op);
+                    invalidShape |= op.results().empty();
+                    for (const ValueId operand : op.operands())
+                    {
+                        const OperationId def = graph.valueDef(operand);
+                        if (!def.valid() || !nodeOps.contains(def))
+                        {
+                            inputSet.insert(operand);
+                        }
+                        const auto info = graph.getValue(operand);
+                        if (info.type() != ValueType::Logic || info.width() <= 0 ||
+                            static_cast<std::size_t>(info.width()) >
+                                options.finalSharedInputPeerMaxValueWidth)
+                        {
+                            invalidWidth = true;
+                        }
+                        anchoredValue |= isDeclaredCutValue(
+                                             graph, rewrite.canonicalValues, operand) ||
+                                         operand.index == 0 || portValues.contains(operand);
+                    }
+                    if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                    {
+                        inputSet.insert(*indexValue);
+                    }
+                    for (const ValueId result : op.results())
+                    {
+                        nodeResults.insert(result);
+                        const auto info = graph.getValue(result);
+                        if (info.type() != ValueType::Logic || info.width() <= 0 ||
+                            static_cast<std::size_t>(info.width()) >
+                                options.finalSharedInputPeerMaxValueWidth)
+                        {
+                            invalidWidth = true;
+                        }
+                        anchoredValue |= isDeclaredCutValue(
+                                             graph, rewrite.canonicalValues, result) ||
+                                         info.isInput() || info.isOutput() || info.isInout() ||
+                                         portValues.contains(result);
+                    }
+                }
+                for (const ValueId boundary : node.boundaryInputs)
+                {
+                    const OperationId def = graph.valueDef(boundary);
+                    if (def.valid() && nodeOps.contains(def))
+                    {
+                        continue;
+                    }
+                    inputSet.insert(boundary);
+                }
+                if (invalidKind)
+                {
+                    ++stats.rejectedKind;
+                    continue;
+                }
+                if (invalidOwner)
+                {
+                    ++stats.rejectedOwner;
+                    continue;
+                }
+                if (sideEffect)
+                {
+                    ++stats.rejectedSideEffect;
+                    continue;
+                }
+                if (cloneForbidden)
+                {
+                    ++stats.rejectedCloneForbidden;
+                    continue;
+                }
+                if (invalidShape || invalidWidth)
+                {
+                    if (invalidWidth)
+                    {
+                        ++stats.rejectedWidth;
+                    }
+                    else
+                    {
+                        ++stats.rejectedKind;
+                    }
+                    continue;
+                }
+                ++stats.pure;
+                if (anchoredValue)
+                {
+                    ++stats.rejectedDeclaredOrPort;
+                    continue;
+                }
+                if (inputSet.empty())
+                {
+                    ++stats.rejectedNoInputs;
+                    continue;
+                }
+                if (inputSet.size() > options.finalSharedInputPeerMaxInputs)
+                {
+                    ++stats.rejectedInputTooMany;
+                    continue;
+                }
+
+                std::vector<ValueId> inputs(inputSet.begin(), inputSet.end());
+                std::sort(inputs.begin(), inputs.end(),
+                          [](ValueId lhs, ValueId rhs) { return lhs.index < rhs.index; });
+                std::unordered_set<uint32_t> inputOwners;
+                bool invalidInput = false;
+                std::vector<std::vector<uint32_t>> inputFanouts;
+                inputFanouts.reserve(inputs.size());
+                for (const ValueId input : inputs)
+                {
+                    if (!input.valid() || input.index > build.valueFanout.size() ||
+                        input.index >= build.valueSourceSupernode.size())
+                    {
+                        invalidInput = true;
+                        break;
+                    }
+                    const OperationId def = graph.valueDef(input);
+                    const uint32_t inputOwner = ownerOfOp(def);
+                    if (!def.valid() || inputOwner == kInvalidActivitySupernodeId ||
+                        !isComputeSupernode(inputOwner))
+                    {
+                        invalidInput = true;
+                        break;
+                    }
+                    inputOwners.insert(inputOwner);
+                    inputFanouts.push_back(build.valueFanout[input.index - 1]);
+                }
+                if (invalidInput)
+                {
+                    ++stats.rejectedInputNoDef;
+                    continue;
+                }
+
+                // Intersect fanout sets by starting with the smallest one.
+                std::size_t smallest = 0;
+                for (std::size_t i = 1; i < inputFanouts.size(); ++i)
+                {
+                    if (inputFanouts[i].size() < inputFanouts[smallest].size())
+                    {
+                        smallest = i;
+                    }
+                }
+                std::vector<uint32_t> commonPeers;
+                for (const uint32_t peer : inputFanouts[smallest])
+                {
+                    bool common = true;
+                    for (std::size_t i = 0; i < inputFanouts.size(); ++i)
+                    {
+                        if (i == smallest)
+                        {
+                            continue;
+                        }
+                        common &= std::binary_search(inputFanouts[i].begin(),
+                                                     inputFanouts[i].end(),
+                                                     peer);
+                    }
+                    if (common)
+                    {
+                        commonPeers.push_back(peer);
+                    }
+                }
+                std::sort(commonPeers.begin(), commonPeers.end());
+                commonPeers.erase(std::unique(commonPeers.begin(), commonPeers.end()),
+                                  commonPeers.end());
+                if (commonPeers.empty())
+                {
+                    ++stats.rejectedNoCommonPeer;
+                    continue;
+                }
+                if (commonPeers.size() > options.finalSharedInputPeerMaxPeers)
+                {
+                    stats.rejectedPeerScanLimit +=
+                        commonPeers.size() - options.finalSharedInputPeerMaxPeers;
+                    commonPeers.resize(options.finalSharedInputPeerMaxPeers);
+                    stats.truncated = true;
+                }
+
+                // Collect external outputs once; every accepted peer shares
+                // the same output support transformation.
+                std::vector<ValueId> outputs;
+                bool invalidOutput = false;
+                bool terminalShape = true;
+                std::unordered_set<uint32_t> outputTargets;
+                for (const ValueId result : nodeResults)
+                {
+                    bool external = false;
+                    std::size_t resultComputeTargets = 0;
+                    for (const auto &user : graph.getValue(result).users())
+                    {
+                        if (user.operation.valid() && nodeOps.contains(user.operation))
+                        {
+                            continue;
+                        }
+                        external = true;
+                        if (!user.operation.valid())
+                        {
+                            invalidOutput = true;
+                            continue;
+                        }
+                        const uint32_t userOwner = ownerOfOp(user.operation);
+                        if (!isComputeSupernode(userOwner) || userOwner == source)
+                        {
+                            invalidOutput = true;
+                            continue;
+                        }
+                        ++resultComputeTargets;
+                        outputTargets.insert(userOwner);
+                    }
+                    const auto implicitIt = implicitIndexUsers.find(result);
+                    if (implicitIt != implicitIndexUsers.end() &&
+                        std::any_of(implicitIt->second.begin(),
+                                    implicitIt->second.end(),
+                                    [&](OperationId user) { return !nodeOps.contains(user); }))
+                    {
+                        invalidOutput = true;
+                    }
+                    if (external)
+                    {
+                        outputs.push_back(result);
+                    }
+                    if (resultComputeTargets != 1)
+                    {
+                        terminalShape = false;
+                    }
+                }
+                std::sort(outputs.begin(), outputs.end(),
+                          [](ValueId lhs, ValueId rhs) { return lhs.index < rhs.index; });
+                outputs.erase(std::unique(outputs.begin(), outputs.end()), outputs.end());
+                if (outputs.empty() || invalidOutput)
+                {
+                    ++stats.rejectedOutputConsumer;
+                    continue;
+                }
+                if (outputs.size() > options.finalSharedInputPeerMaxOutputs)
+                {
+                    ++stats.rejectedOutputTooMany;
+                    continue;
+                }
+                bool allInputsSourceOwned = true;
+                for (const uint32_t inputOwner : inputOwners)
+                {
+                    allInputsSourceOwned &= inputOwner == source;
+                }
+                if (terminalShape && outputTargets.size() == 1 &&
+                    allInputsSourceOwned)
+                {
+                    ++stats.rejectedTerminal;
+                    continue;
+                }
+
+                // A value's S target is removable only when every explicit
+                // (and implicit index) use in S belongs to C.  This is the
+                // exact "last source user" condition; mere fanout overlap is
+                // not enough.
+                std::vector<ValueId> removableInputs;
+                for (const ValueId input : inputs)
+                {
+                    const OperationId inputDef = graph.valueDef(input);
+                    const uint32_t inputOwner = ownerOfOp(inputDef);
+                    // A value defined in S is not a cross-supernode boundary
+                    // support.  Moving C must not count its intra-S use as a
+                    // projected BAE deletion (and the quotient DAG has no
+                    // self-edge key for it).
+                    if (inputOwner == source)
+                    {
+                        ++stats.rejectedInputOwnerSource;
+                        continue;
+                    }
+                    bool hasSourceUse = false;
+                    bool hasOtherSourceUse = false;
+                    for (const auto &user : graph.getValue(input).users())
+                    {
+                        if (!user.operation.valid())
+                        {
+                            continue;
+                        }
+                        const uint32_t userOwner = ownerOfOp(user.operation);
+                        if (userOwner == source)
+                        {
+                            hasSourceUse = true;
+                            if (!nodeOps.contains(user.operation))
+                            {
+                                hasOtherSourceUse = true;
+                            }
+                        }
+                    }
+                    const auto implicitIt = implicitIndexUsers.find(input);
+                    if (implicitIt != implicitIndexUsers.end())
+                    {
+                        for (const OperationId user : implicitIt->second)
+                        {
+                            if (ownerOfOp(user) == source)
+                            {
+                                hasSourceUse = true;
+                                if (!nodeOps.contains(user))
+                                {
+                                    hasOtherSourceUse = true;
+                                }
+                            }
+                        }
+                    }
+                    if (hasSourceUse && !hasOtherSourceUse)
+                    {
+                        removableInputs.push_back(input);
+                    }
+                }
+                if (removableInputs.empty())
+                {
+                    ++stats.rejectedNoRemovableInput;
+                    continue;
+                }
+
+                for (const uint32_t peer : commonPeers)
+                {
+                    if (peer == source || !isComputeSupernode(peer) ||
+                        inputOwners.contains(peer) ||
+                        peer >= build.supernodeToOps.size() ||
+                        build.supernodeToOps[peer].size() > computeSupernodeCap)
+                    {
+                        ++stats.rejectedPeerInvalid;
+                        continue;
+                    }
+                    if (node.ops.size() >
+                        computeSupernodeCap - build.supernodeToOps[peer].size())
+                    {
+                        ++stats.rejectedCapacity;
+                        continue;
+                    }
+                    bool outputUsesPeer = false;
+                    for (const ValueId output : outputs)
+                    {
+                        for (const auto &user : graph.getValue(output).users())
+                        {
+                            if (user.operation.valid() &&
+                                ownerOfOp(user.operation) == peer &&
+                                !nodeOps.contains(user.operation))
+                            {
+                                outputUsesPeer = true;
+                            }
+                        }
+                    }
+                    if (outputUsesPeer)
+                    {
+                        ++stats.rejectedPeerInvalid;
+                        continue;
+                    }
+
+                    bool fanoutMismatch = false;
+                    for (const ValueId input : removableInputs)
+                    {
+                        const auto &fanout = build.valueFanout[input.index - 1];
+                        if (std::find(fanout.begin(), fanout.end(), source) == fanout.end() ||
+                            std::find(fanout.begin(), fanout.end(), peer) == fanout.end())
+                        {
+                            fanoutMismatch = true;
+                        }
+                    }
+                    for (const ValueId output : outputs)
+                    {
+                        if (output.index == 0 || output.index > build.valueFanout.size() ||
+                            build.valueFanout[output.index - 1].empty())
+                        {
+                            fanoutMismatch = true;
+                        }
+                    }
+                    if (fanoutMismatch)
+                    {
+                        ++stats.rejectedFanoutMismatch;
+                        continue;
+                    }
+
+                    std::unordered_map<uint64_t, std::int64_t> supportDelta;
+                    supportDelta.reserve(removableInputs.size() + outputs.size() * 2 + 1);
+                    const auto adjustSupport = [&](uint32_t from,
+                                                   uint32_t to,
+                                                   std::int64_t delta)
+                    {
+                        supportDelta[supportKey(from, to)] += delta;
+                    };
+                    for (const ValueId input : removableInputs)
+                    {
+                        const uint32_t inputOwner = ownerOfOp(graph.valueDef(input));
+                        adjustSupport(inputOwner, source, -1);
+                    }
+                    for (const ValueId output : outputs)
+                    {
+                        for (const uint32_t target : build.valueFanout[output.index - 1])
+                        {
+                            adjustSupport(source, target, -1);
+                            adjustSupport(peer, target, 1);
+                        }
+                    }
+                    bool dagSupportMismatch = false;
+                    std::size_t removedDagKeys = 0;
+                    std::size_t addedDagKeys = 0;
+                    for (const auto &[key, delta] : supportDelta)
+                    {
+                        const auto supportIt = dagSupport.find(key);
+                        const std::int64_t before =
+                            supportIt == dagSupport.end()
+                                ? 0
+                                : static_cast<std::int64_t>(supportIt->second);
+                        const std::int64_t after = before + delta;
+                        if (after < 0)
+                        {
+                            dagSupportMismatch = true;
+                            break;
+                        }
+                        if ((before == 0) != (after == 0))
+                        {
+                            dagSupportMismatch = true;
+                            if (before != 0)
+                            {
+                                ++removedDagKeys;
+                            }
+                            else
+                            {
+                                ++addedDagKeys;
+                            }
+                        }
+                    }
+                    if (dagSupportMismatch || removedDagKeys != 0 ||
+                        addedDagKeys != 0)
+                    {
+                        ++stats.rejectedDagSupport;
+                        continue;
+                    }
+
+                    std::uint64_t sourceFire = 0;
+                    std::uint64_t peerFire = 0;
+                    if (profile.enabled)
+                    {
+                        if (source >= profile.computeFire.size() ||
+                            peer >= profile.computeFire.size())
+                        {
+                            ++stats.rejectedProfileInvalid;
+                            continue;
+                        }
+                        sourceFire = profile.computeFire[source];
+                        peerFire = profile.computeFire[peer];
+                        const std::size_t minSourceFire =
+                            options.finalSharedInputPeerProfileMinSourceFire;
+                        if (sourceFire < minSourceFire)
+                        {
+                            ++stats.rejectedProfileMinSourceFire;
+                            continue;
+                        }
+                        if (peerFire > sourceFire)
+                        {
+                            ++stats.rejectedProfilePeerFireGtSource;
+                            continue;
+                        }
+                    }
+
+                    FinalSharedInputPeerCandidate candidate;
+                    candidate.computeNode = computeNodeId;
+                    candidate.source = source;
+                    candidate.peer = peer;
+                    candidate.opCount = node.ops.size();
+                    candidate.sourceOps = build.supernodeToOps[source].size();
+                    candidate.peerOps = build.supernodeToOps[peer].size();
+                    candidate.inputCount = inputs.size();
+                    candidate.outputCount = outputs.size();
+                    candidate.sharedInputCount = removableInputs.size();
+                    candidate.removedBae = removableInputs.size();
+                    candidate.addedBae = 0;
+                    candidate.baeGain = candidate.removedBae;
+                    for (const ValueId input : removableInputs)
+                    {
+                        const std::size_t bytes = logicValueBytes(input);
+                        candidate.removedBytes += bytes;
+                        candidate.activeByteGainUpperBound += bytes;
+                        candidate.activeChunkGainUpperBound += (bytes + 7U) / 8U;
+                    }
+                    candidate.byteGain = candidate.removedBytes;
+                    candidate.storageDistance =
+                        source > peer ? source - peer : peer - source;
+                    if (source < topoPosition.size() && peer < topoPosition.size() &&
+                        topoPosition[source] != std::numeric_limits<std::size_t>::max() &&
+                        topoPosition[peer] != std::numeric_limits<std::size_t>::max())
+                    {
+                        candidate.topoDistance =
+                            topoPosition[source] > topoPosition[peer]
+                                ? topoPosition[source] - topoPosition[peer]
+                                : topoPosition[peer] - topoPosition[source];
+                    }
+                    candidate.sourceFire = sourceFire;
+                    candidate.peerFire = peerFire;
+                    const std::uint64_t fireDelta =
+                        sourceFire >= peerFire ? sourceFire - peerFire : 0;
+                    const unsigned __int128 work =
+                        static_cast<unsigned __int128>(candidate.opCount) * fireDelta;
+                    candidate.workProxy =
+                        work > static_cast<unsigned __int128>(std::numeric_limits<std::int64_t>::max())
+                            ? std::numeric_limits<std::int64_t>::max()
+                            : static_cast<std::int64_t>(work);
+                    candidate.inputs = inputs;
+                    candidate.outputs = outputs;
+                    candidates.push_back(candidate);
+                    ++stats.exactEligible;
+                    stats.eligibleBaeGain += candidate.baeGain;
+                    stats.eligibleBoundaryValueGain += candidate.boundaryValueGain;
+                    stats.eligibleByteGain += candidate.byteGain;
+                    stats.eligibleActiveByteGainUpperBound +=
+                        candidate.activeByteGainUpperBound;
+                    stats.eligibleActiveChunkGainUpperBound +=
+                        candidate.activeChunkGainUpperBound;
+                    stats.eligibleWorkProxy += candidate.workProxy;
+                    ++stats.eligibleByNodeOps[std::to_string(candidate.opCount)];
+                    ++stats.eligibleByInputs[std::to_string(candidate.inputCount)];
+                    ++stats.eligibleByOutputs[std::to_string(candidate.outputCount)];
+                    ++stats.eligibleBySharedInputs[
+                        std::to_string(candidate.sharedInputCount)];
+                }
+            }
+
+            std::stable_sort(
+                candidates.begin(), candidates.end(),
+                [](const FinalSharedInputPeerCandidate &lhs,
+                   const FinalSharedInputPeerCandidate &rhs)
+                {
+                    if (lhs.baeGain != rhs.baeGain)
+                    {
+                        return lhs.baeGain > rhs.baeGain;
+                    }
+                    if (lhs.activeByteGainUpperBound != rhs.activeByteGainUpperBound)
+                    {
+                        return lhs.activeByteGainUpperBound >
+                               rhs.activeByteGainUpperBound;
+                    }
+                    if (lhs.workProxy != rhs.workProxy)
+                    {
+                        return lhs.workProxy > rhs.workProxy;
+                    }
+                    return std::tuple{lhs.source, lhs.peer, lhs.computeNode} <
+                           std::tuple{rhs.source, rhs.peer, rhs.computeNode};
+                });
+
+            std::unordered_set<uint32_t> touchedSupernodes;
+            for (const auto &candidate : candidates)
+            {
+                if (stats.selected >= options.finalSharedInputPeerMaxMoves)
+                {
+                    ++stats.rejectedSelectionMoveLimit;
+                    continue;
+                }
+                if (candidate.opCount >
+                    stats.movedOpLimit -
+                        std::min(stats.movedOps, stats.movedOpLimit))
+                {
+                    ++stats.rejectedSelectionBudget;
+                    continue;
+                }
+                if (touchedSupernodes.contains(candidate.source) ||
+                    touchedSupernodes.contains(candidate.peer))
+                {
+                    ++stats.rejectedSelectionTouchedSupernode;
+                    continue;
+                }
+                touchedSupernodes.insert(candidate.source);
+                touchedSupernodes.insert(candidate.peer);
+                ++stats.selected;
+                stats.movedOps += candidate.opCount;
+                stats.selectedBaeGain += candidate.baeGain;
+                stats.selectedBoundaryValueGain += candidate.boundaryValueGain;
+                stats.selectedByteGain += candidate.byteGain;
+                stats.selectedActiveByteGainUpperBound +=
+                    candidate.activeByteGainUpperBound;
+                stats.selectedActiveChunkGainUpperBound +=
+                    candidate.activeChunkGainUpperBound;
+                stats.selectedWorkProxy += candidate.workProxy;
+                ++stats.selectedByNodeOps[std::to_string(candidate.opCount)];
+                ++stats.selectedByInputs[std::to_string(candidate.inputCount)];
+                ++stats.selectedByOutputs[std::to_string(candidate.outputCount)];
+                ++stats.selectedBySharedInputs[
+                    std::to_string(candidate.sharedInputCount)];
                 if (selectedCandidates != nullptr)
                 {
                     selectedCandidates->push_back(candidate);
@@ -14178,6 +15108,13 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.finalSharedInputPeerPolicy != "off" &&
+            options_.finalSharedInputPeerPolicy != "probe")
+        {
+            error("activity-schedule final_shared_input_peer_policy must be off or probe");
+            result.failed = true;
+            return result;
+        }
         if (options_.finalSiblingFusionPolicy != "off" &&
             options_.finalSiblingFusionPolicy != "probe")
         {
@@ -14249,6 +15186,12 @@ namespace wolvrix::lib::transform
         if (options_.finalTerminalPushforwardMaxMovedOpPpm > 1000000)
         {
             error("activity-schedule final terminal pushforward moved-op ppm must be <= 1000000");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalSharedInputPeerMaxMovedOpPpm > 1000000)
+        {
+            error("activity-schedule final shared-input peer moved-op ppm must be <= 1000000");
             result.failed = true;
             return result;
         }
@@ -15157,6 +16100,209 @@ namespace wolvrix::lib::transform
                 formatTopCounts(evaluation.selectedByOutputKind, 32) +
                 " selected_by_pair_multiplicity=" +
                 formatTopCounts(evaluation.selectedByPairMultiplicity, 32));
+        }
+
+        if (options_.finalSharedInputPeerPolicy == "probe")
+        {
+            const auto probeStart = std::chrono::steady_clock::now();
+            std::vector<FinalSharedInputPeerCandidate> selectedCandidates;
+            const FinalSharedInputPeerProbeStats probe =
+                evaluateFinalSharedInputPeer(*graph,
+                                             options_,
+                                             rewrite,
+                                             build,
+                                             materializePerf,
+                                             &selectedCandidates);
+            const std::uint64_t probeMs = elapsedMs(probeStart);
+            logInfo(
+                "activity-schedule final shared-input peer probe: policy=" +
+                options_.finalSharedInputPeerPolicy +
+                " max_node_ops=" +
+                std::to_string(options_.finalSharedInputPeerMaxNodeOps) +
+                " max_inputs=" +
+                std::to_string(options_.finalSharedInputPeerMaxInputs) +
+                " max_outputs=" +
+                std::to_string(options_.finalSharedInputPeerMaxOutputs) +
+                " max_value_width=" +
+                std::to_string(options_.finalSharedInputPeerMaxValueWidth) +
+                " max_peers=" +
+                std::to_string(options_.finalSharedInputPeerMaxPeers) +
+                " max_candidates=" +
+                std::to_string(options_.finalSharedInputPeerMaxCandidates) +
+                " max_moves=" +
+                std::to_string(options_.finalSharedInputPeerMaxMoves) +
+                " max_moved_op_ppm=" +
+                std::to_string(options_.finalSharedInputPeerMaxMovedOpPpm) +
+                " profile_path=" +
+                (options_.finalSharedInputPeerProfilePath.empty()
+                     ? std::string("<none>")
+                     : options_.finalSharedInputPeerProfilePath) +
+                " profile_enabled=" +
+                std::string(probe.profileEnabled ? "true" : "false") +
+                " profile_valid=" +
+                std::string(probe.profileValid ? "true" : "false") +
+                " profile_compute_rows=" +
+                std::to_string(probe.profileComputeRows) +
+                " profile_ignored_commit_rows=" +
+                std::to_string(probe.profileIgnoredCommitRows) +
+                " profile_min_source_fire=" +
+                std::to_string(options_.finalSharedInputPeerProfileMinSourceFire) +
+                " profile_error=" + probe.profileError +
+                " scanned=" + std::to_string(probe.scanned) +
+                " pure=" + std::to_string(probe.pure) +
+                " exact_eligible=" + std::to_string(probe.exactEligible) +
+                " selected=" + std::to_string(probe.selected) +
+                " eligible_bae_gain=" +
+                std::to_string(probe.eligibleBaeGain) +
+                " selected_bae_gain=" +
+                std::to_string(probe.selectedBaeGain) +
+                " eligible_boundary_value_gain=" +
+                std::to_string(probe.eligibleBoundaryValueGain) +
+                " selected_boundary_value_gain=" +
+                std::to_string(probe.selectedBoundaryValueGain) +
+                " eligible_byte_gain=" +
+                std::to_string(probe.eligibleByteGain) +
+                " selected_byte_gain=" +
+                std::to_string(probe.selectedByteGain) +
+                " eligible_active_byte_gain_upper_bound=" +
+                std::to_string(probe.eligibleActiveByteGainUpperBound) +
+                " selected_active_byte_gain_upper_bound=" +
+                std::to_string(probe.selectedActiveByteGainUpperBound) +
+                " eligible_active_chunk_gain_upper_bound=" +
+                std::to_string(probe.eligibleActiveChunkGainUpperBound) +
+                " selected_active_chunk_gain_upper_bound=" +
+                std::to_string(probe.selectedActiveChunkGainUpperBound) +
+                " eligible_work_proxy=" +
+                std::to_string(probe.eligibleWorkProxy) +
+                " selected_work_proxy=" +
+                std::to_string(probe.selectedWorkProxy) +
+                " moved_ops=" + std::to_string(probe.movedOps) +
+                " moved_op_limit=" + std::to_string(probe.movedOpLimit) +
+                " truncated=" + std::string(probe.truncated ? "true" : "false") +
+                " skipped_oversize=" +
+                std::string(probe.skippedOversize ? "true" : "false") +
+                " elapsed_ms=" + std::to_string(probeMs));
+            logInfo(
+                "activity-schedule final shared-input peer probe rejects: "
+                "rejected_owner=" + std::to_string(probe.rejectedOwner) +
+                " rejected_split_or_node_size=" +
+                std::to_string(probe.rejectedSplitOrNodeSize) +
+                " rejected_source_empty=" +
+                std::to_string(probe.rejectedSourceEmpty) +
+                " rejected_restricted=" +
+                std::to_string(probe.rejectedRestricted) +
+                " rejected_kind=" + std::to_string(probe.rejectedKind) +
+                " rejected_side_effect=" +
+                std::to_string(probe.rejectedSideEffect) +
+                " rejected_clone_forbidden=" +
+                std::to_string(probe.rejectedCloneForbidden) +
+                " rejected_width=" + std::to_string(probe.rejectedWidth) +
+                " rejected_declared_or_port=" +
+                std::to_string(probe.rejectedDeclaredOrPort) +
+                " rejected_no_inputs=" + std::to_string(probe.rejectedNoInputs) +
+                " rejected_input_no_def=" +
+                std::to_string(probe.rejectedInputNoDef) +
+                " rejected_input_too_many=" +
+                std::to_string(probe.rejectedInputTooMany) +
+                " rejected_no_common_peer=" +
+                std::to_string(probe.rejectedNoCommonPeer) +
+                " rejected_peer_invalid=" +
+                std::to_string(probe.rejectedPeerInvalid) +
+                " rejected_capacity=" + std::to_string(probe.rejectedCapacity) +
+                " rejected_peer_scan_limit=" +
+                std::to_string(probe.rejectedPeerScanLimit) +
+                " rejected_output_consumer=" +
+                std::to_string(probe.rejectedOutputConsumer) +
+                " rejected_terminal=" + std::to_string(probe.rejectedTerminal) +
+                " rejected_output_too_many=" +
+                std::to_string(probe.rejectedOutputTooMany) +
+                " rejected_no_removable_input=" +
+                std::to_string(probe.rejectedNoRemovableInput) +
+                " rejected_input_owner_source=" +
+                std::to_string(probe.rejectedInputOwnerSource) +
+                " rejected_fanout_mismatch=" +
+                std::to_string(probe.rejectedFanoutMismatch) +
+                " rejected_dag_support=" +
+                std::to_string(probe.rejectedDagSupport) +
+                " rejected_profile_invalid=" +
+                std::to_string(probe.rejectedProfileInvalid) +
+                " rejected_profile_min_source_fire=" +
+                std::to_string(probe.rejectedProfileMinSourceFire) +
+                " rejected_profile_peer_fire_gt_source=" +
+                std::to_string(probe.rejectedProfilePeerFireGtSource) +
+                " rejected_selection_move_limit=" +
+                std::to_string(probe.rejectedSelectionMoveLimit) +
+                " rejected_selection_budget=" +
+                std::to_string(probe.rejectedSelectionBudget) +
+                " rejected_selection_touched_supernode=" +
+                std::to_string(probe.rejectedSelectionTouchedSupernode) +
+                " rejected_selection_candidate_limit=" +
+                std::to_string(probe.rejectedSelectionCandidateLimit) +
+                " candidate_scan_limit=" +
+                std::to_string(probe.candidateScanLimit));
+            logInfo(
+                "activity-schedule final shared-input peer probe distribution: "
+                "eligible_by_node_ops=" +
+                formatTopCounts(probe.eligibleByNodeOps, 32) +
+                " eligible_by_inputs=" +
+                formatTopCounts(probe.eligibleByInputs, 32) +
+                " eligible_by_outputs=" +
+                formatTopCounts(probe.eligibleByOutputs, 32) +
+                " eligible_by_shared_inputs=" +
+                formatTopCounts(probe.eligibleBySharedInputs, 32) +
+                " selected_by_node_ops=" +
+                formatTopCounts(probe.selectedByNodeOps, 32) +
+                " selected_by_inputs=" +
+                formatTopCounts(probe.selectedByInputs, 32) +
+                " selected_by_outputs=" +
+                formatTopCounts(probe.selectedByOutputs, 32) +
+                " selected_by_shared_inputs=" +
+                formatTopCounts(probe.selectedBySharedInputs, 32));
+            for (std::size_t rank = 0; rank < selectedCandidates.size(); ++rank)
+            {
+                const auto &candidate = selectedCandidates[rank];
+                logInfo(
+                    "activity-schedule final shared-input peer probe candidate: "
+                    "rank=" + std::to_string(rank) +
+                    " compute_node=" + std::to_string(candidate.computeNode) +
+                    " source=" + std::to_string(candidate.source) +
+                    " peer=" + std::to_string(candidate.peer) +
+                    " source_fire=" + std::to_string(candidate.sourceFire) +
+                    " peer_fire=" + std::to_string(candidate.peerFire) +
+                    " source_ops=" + std::to_string(candidate.sourceOps) +
+                    " peer_ops=" + std::to_string(candidate.peerOps) +
+                    " node_ops=" + std::to_string(candidate.opCount) +
+                    " inputs=" + std::to_string(candidate.inputCount) +
+                    " outputs=" + std::to_string(candidate.outputCount) +
+                    " shared_inputs=" +
+                    std::to_string(candidate.sharedInputCount) +
+                    " removed_bae=" + std::to_string(candidate.removedBae) +
+                    " added_bae=" + std::to_string(candidate.addedBae) +
+                    " bae_gain=" + std::to_string(candidate.baeGain) +
+                    " removed_boundary_values=" +
+                    std::to_string(candidate.removedBoundaryValues) +
+                    " added_boundary_values=" +
+                    std::to_string(candidate.addedBoundaryValues) +
+                    " boundary_value_gain=" +
+                    std::to_string(candidate.boundaryValueGain) +
+                    " removed_bytes=" + std::to_string(candidate.removedBytes) +
+                    " added_bytes=" + std::to_string(candidate.addedBytes) +
+                    " byte_gain=" + std::to_string(candidate.byteGain) +
+                    " dag_delta=" + std::to_string(candidate.dagDelta) +
+                    " active_byte_gain_upper_bound=" +
+                    std::to_string(candidate.activeByteGainUpperBound) +
+                    " active_chunk_gain_upper_bound=" +
+                    std::to_string(candidate.activeChunkGainUpperBound) +
+                    " work_proxy=" + std::to_string(candidate.workProxy) +
+                    " same_emitter_batch=unknown" +
+                    " topo_distance=" + std::to_string(candidate.topoDistance) +
+                    " storage_distance=" +
+                    std::to_string(candidate.storageDistance) +
+                    " input_values=" +
+                    formatTerminalPushforwardValueIds(candidate.inputs) +
+                    " output_values=" +
+                    formatTerminalPushforwardValueIds(candidate.outputs));
+            }
         }
 
         if (options_.finalFaninPullbackPolicy == "probe")

@@ -7411,6 +7411,342 @@ int main()
     }
 
     {
+        currentCase = "final_shared_input_peer_probe";
+
+        // Keep this fixture intentionally small but make the quotient-DAG
+        // preservation condition observable: C and Q share source supernode
+        // S; P is a later peer that consumes both C inputs; U consumes C/Q/P
+        // outputs.  Peeling C therefore removes O->S input supports while
+        // retaining S->U and P->U support keys.
+        struct FixtureOps
+        {
+            wolvrix::lib::grh::OperationId producer;
+            wolvrix::lib::grh::OperationId candidate;
+            wolvrix::lib::grh::OperationId peer;
+            wolvrix::lib::grh::OperationId consumer;
+        };
+        const auto buildFixture = [](wolvrix::lib::grh::Design &design,
+                                     const std::string &name)
+        {
+            using K = wolvrix::lib::grh::OperationKind;
+            auto &graph = design.createGraph(name);
+            design.markAsTop(name);
+
+            const auto a = makeValue(graph, "shared_a", 8);
+            const auto b = makeValue(graph, "shared_b", 8);
+            const auto qInput = makeValue(graph, "shared_q_input", 8);
+            graph.bindInputPort("shared_a", a);
+            graph.bindInputPort("shared_b", b);
+            graph.bindInputPort("shared_q_input", qInput);
+
+            // A multi-result source is deliberately used here: the activity
+            // schedule source-clone guard only clones single-result sources.
+            // Thus aVal/bVal remain one owner with a two-consumer fanout.
+            const auto aValue = makeValue(graph, "shared_a_value", 8);
+            const auto bValue = makeValue(graph, "shared_b_value", 8);
+            const auto qSource = makeValue(graph, "shared_q_source", 8);
+            const auto producerSeed0 = makeValue(graph, "shared_producer_seed0", 8);
+            const auto producerPre0 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_producer_pre0"));
+            graph.addOperand(producerPre0, qInput);
+            graph.addResult(producerPre0, producerSeed0);
+            const auto producerSeed1 = makeValue(graph, "shared_producer_seed1", 8);
+            const auto producerPre1 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_producer_pre1"));
+            graph.addOperand(producerPre1, producerSeed0);
+            graph.addResult(producerPre1, producerSeed1);
+            const auto producerSeed2 = makeValue(graph, "shared_producer_seed2", 8);
+            const auto producerPre2 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_producer_pre2"));
+            graph.addOperand(producerPre2, producerSeed1);
+            graph.addResult(producerPre2, producerSeed2);
+            FixtureOps ops;
+            ops.producer = graph.createOperation(K::kNot,
+                                                 graph.internSymbol("shared_producer"));
+            graph.addOperand(ops.producer, producerSeed2);
+            graph.addResult(ops.producer, aValue);
+            graph.addResult(ops.producer, bValue);
+            graph.addResult(ops.producer, qSource);
+
+            // Anchor a post-producer barrier so the producer's definition
+            // supernode stays separate from C while qSource/R preserve the
+            // quotient-DAG support used by the probe.
+            const auto barrierValue0 = makeValue(graph, "shared_barrier0", 8);
+            const auto barrierOp0 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_barrier0_op"));
+            // Anchor the barrier after the multi-result producer.  An
+            // independent barrier can be scheduled before the producer and
+            // does not force a distinct source supernode.
+            graph.addOperand(barrierOp0, qSource);
+            graph.addResult(barrierOp0, barrierValue0);
+            const auto barrierValue1 = makeValue(graph, "shared_barrier1", 8);
+            const auto barrierOp1 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_barrier1_op"));
+            graph.addOperand(barrierOp1, barrierValue0);
+            graph.addResult(barrierOp1, barrierValue1);
+
+            // A two-op companion chain gives the fixture a nontrivial source
+            // segment without introducing a stateful or port-anchored value.
+            const auto r0 = makeValue(graph, "shared_r0", 8);
+            const auto rOp0 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_r0_op"));
+            graph.addOperand(rOp0, qSource);
+            graph.addResult(rOp0, r0);
+            const auto rValue = makeValue(graph, "shared_r_value", 8);
+            const auto rOp2 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_r2_op"));
+            graph.addOperand(rOp2, r0);
+            graph.addResult(rOp2, rValue);
+            const auto candidateValue = makeValue(graph, "shared_candidate_value", 8);
+            ops.candidate = graph.createOperation(
+                K::kAnd, graph.internSymbol("shared_candidate"));
+            graph.addOperand(ops.candidate, aValue);
+            graph.addOperand(ops.candidate, bValue);
+            // Keep C's inputs entirely internal/defined and make the barrier
+            // a common fanout value consumed by P as well.
+            graph.addOperand(ops.candidate, barrierValue1);
+            graph.addResult(ops.candidate, candidateValue);
+
+            // A live prep stage sits between C and P without consuming C's
+            // result, so the probe can distinguish peer separation from a
+            // terminal pushforward.
+            const auto prep0Value = makeValue(graph, "shared_peer_prep0", 8);
+            const auto prep0 = graph.createOperation(
+                K::kNot, graph.internSymbol("shared_peer_prep0_op"));
+            graph.addOperand(prep0, barrierValue1);
+            graph.addOperand(prep0, rValue);
+            graph.addResult(prep0, prep0Value);
+
+            const auto peerValue = makeValue(graph, "shared_peer_value", 8);
+            ops.peer = graph.createOperation(K::kXor,
+                                             graph.internSymbol("shared_peer"));
+            graph.addOperand(ops.peer, aValue);
+            graph.addOperand(ops.peer, bValue);
+            // P may have extra operands; its shared intersection with C is
+            // still the producer values plus the barrier.
+            graph.addOperand(ops.peer, barrierValue1);
+            // Depend on the final S companion value and prep stage so the
+            // peer is ordered after the complete source segment.
+            graph.addOperand(ops.peer, rValue);
+            graph.addOperand(ops.peer, prep0Value);
+            graph.addResult(ops.peer, peerValue);
+
+            const auto uMid = makeValue(graph, "shared_u_mid", 8);
+            ops.consumer = graph.createOperation(
+                K::kXor,
+                graph.internSymbol("shared_consumer"));
+            graph.addOperand(ops.consumer, candidateValue);
+            graph.addOperand(ops.consumer, rValue);
+            graph.addOperand(ops.consumer, peerValue);
+            graph.addResult(ops.consumer, uMid);
+            const auto consumerTail = graph.createOperation(
+                K::kNot,
+                graph.internSymbol("shared_consumer_tail0"));
+            graph.addOperand(consumerTail, uMid);
+            const auto uMid2 = makeValue(graph, "shared_u_mid2", 8);
+            graph.addResult(consumerTail, uMid2);
+            const auto consumerTail2 = graph.createOperation(
+                K::kNot,
+                graph.internSymbol("shared_consumer_tail1"));
+            graph.addOperand(consumerTail2, uMid2);
+            const auto output = makeValue(graph, "shared_output", 8);
+            graph.addResult(consumerTail2, output);
+            graph.bindOutputPort("shared_output", output);
+
+            const auto vMid = makeValue(graph, "shared_v_mid", 8);
+            const auto secondConsumer = graph.createOperation(
+                K::kXor,
+                graph.internSymbol("shared_second_consumer"));
+            graph.addOperand(secondConsumer, candidateValue);
+            graph.addOperand(secondConsumer, rValue);
+            graph.addOperand(secondConsumer, peerValue);
+            graph.addResult(secondConsumer, vMid);
+            const auto secondConsumerTail = graph.createOperation(
+                K::kNot,
+                graph.internSymbol("shared_second_consumer_tail0"));
+            graph.addOperand(secondConsumerTail, vMid);
+            const auto vMid2 = makeValue(graph, "shared_v_mid2", 8);
+            graph.addResult(secondConsumerTail, vMid2);
+            const auto secondConsumerTail2 = graph.createOperation(
+                K::kNot,
+                graph.internSymbol("shared_second_consumer_tail1"));
+            graph.addOperand(secondConsumerTail2, vMid2);
+            const auto secondOutput = makeValue(graph, "shared_second_output", 8);
+            graph.addResult(secondConsumerTail2, secondOutput);
+            graph.bindOutputPort("shared_second_output", secondOutput);
+            return ops;
+        };
+
+        const auto runFixture = [](wolvrix::lib::grh::Design &design,
+                                   const std::string &name,
+                                   std::string policy,
+                                   SessionStore &session,
+                                   std::string *log,
+                                   std::string profilePath = {})
+        {
+            ActivityScheduleOptions options;
+            options.path = name;
+            options.maxOpInComputeSupernode = 3;
+            options.maxOpInComputeNode = 1;
+            options.enableCoarsen = false;
+            options.enableChainMerge = false;
+            options.finalSharedInputPeerPolicy = std::move(policy);
+            options.finalSharedInputPeerProfilePath = std::move(profilePath);
+            options.finalSharedInputPeerMaxMovedOpPpm = 1000000;
+            options.finalSharedInputPeerMaxMoves = 16;
+            options.finalSharedInputPeerMaxCandidates = 128;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.options().logLevel = wolvrix::lib::LogLevel::Info;
+            manager.options().logSink =
+                [log](wolvrix::lib::LogLevel,
+                      std::string_view,
+                      std::string_view message)
+                {
+                    if (log != nullptr)
+                    {
+                        log->append(message);
+                        log->push_back('\n');
+                    }
+                };
+            manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+            PassDiagnostics diags;
+            const PassManagerResult result = manager.run(design, diags);
+            return result.success && !result.changed && !diags.hasError();
+        };
+
+        std::string parseError;
+        const std::vector<std::string_view> separatedArgs{
+            "-path", "final_shared_input_peer_probe",
+            "-final-shared-input-peer-policy", "probe",
+            "-final-shared-input-peer-profile-path", "/tmp/shared-fire.tsv",
+            "-final-shared-input-peer-max-node-ops", "8",
+            "-final-shared-input-peer-max-inputs", "16",
+            "-final-shared-input-peer-max-outputs", "16",
+            "-final-shared-input-peer-max-value-width", "64",
+            "-final-shared-input-peer-max-peers", "8",
+            "-final-shared-input-peer-max-candidates", "4096",
+            "-final-shared-input-peer-max-moves", "128",
+            "-final-shared-input-peer-max-moved-op-ppm", "200",
+            "-final-shared-input-peer-profile-min-source-fire", "1234"};
+        const std::vector<std::string_view> equalsArgs{
+            "-path=final_shared_input_peer_probe",
+            "-final-shared-input-peer-policy=off",
+            "-final-shared-input-peer-profile-path=/tmp/shared-fire.tsv",
+            "-final-shared-input-peer-max-node-ops=8",
+            "-final-shared-input-peer-max-inputs=16",
+            "-final-shared-input-peer-max-outputs=16",
+            "-final-shared-input-peer-max-value-width=64",
+            "-final-shared-input-peer-max-peers=8",
+            "-final-shared-input-peer-max-candidates=4096",
+            "-final-shared-input-peer-max-moves=128",
+            "-final-shared-input-peer-max-moved-op-ppm=200",
+            "-final-shared-input-peer-profile-min-source-fire=1234"};
+        const std::vector<std::string_view> malformedArgs{
+            "-path=final_shared_input_peer_probe",
+            "-final-shared-input-peer-max-peers=-1"};
+        if (makePass("activity-schedule", separatedArgs, parseError) == nullptr ||
+            makePass("activity-schedule", equalsArgs, parseError) == nullptr ||
+            makePass("activity-schedule", malformedArgs, parseError) != nullptr)
+        {
+            return fail("Expected shared-input peer CLI forms to parse strictly: " +
+                        parseError);
+        }
+
+        constexpr std::string_view kName = "final_shared_input_peer_probe";
+        wolvrix::lib::grh::Design defaultDesign;
+        buildFixture(defaultDesign, std::string(kName));
+        SessionStore defaultSession;
+        if (!runFixture(defaultDesign, std::string(kName), "off", defaultSession, nullptr))
+        {
+            return fail("Expected default-off shared-input peer schedule to succeed");
+        }
+        wolvrix::lib::grh::Design probeDesign;
+        const FixtureOps probeOps = buildFixture(probeDesign, std::string(kName));
+        SessionStore probeSession;
+        std::string probeLog;
+        if (!runFixture(probeDesign,
+                        std::string(kName),
+                        "probe",
+                        probeSession,
+                        &probeLog))
+        {
+            return fail("Expected shared-input peer probe schedule to succeed: " + probeLog);
+        }
+        const auto defaultSchedule = loadSchedule(defaultSession, std::string(kName));
+        const auto probeSchedule = loadSchedule(probeSession, std::string(kName));
+        const auto *probeGraph = probeDesign.findGraph(std::string(kName));
+        if (probeGraph == nullptr ||
+            validateCommonScheduleShape(*probeGraph, probeSchedule) != 0 ||
+            !schedulesEqual(defaultSchedule, probeSchedule) ||
+            defaultSession.size() != probeSession.size() ||
+            probeLog.find("activity-schedule final shared-input peer probe:") ==
+                std::string::npos ||
+            probeLog.find("exact_eligible=") == std::string::npos)
+        {
+            std::ostringstream shape;
+            if (probeSchedule.supernodeToOps != nullptr)
+            {
+                for (std::size_t sn = 0; sn < probeSchedule.supernodeToOps->size(); ++sn)
+                {
+                    shape << " sn" << sn << "=";
+                    for (const auto op : (*probeSchedule.supernodeToOps)[sn])
+                    {
+                        shape << op.index << ",";
+                    }
+                }
+            }
+            return fail("Expected shared-input peer probe to preserve off schedule/session: " +
+                        probeLog + " shape=" + shape.str());
+        }
+        // This compact fixture is also a fail-closed identity case: its
+        // current DP partition has no exact peel opportunity.  Keep the
+        // assertion above focused on the logged funnel rather than baking
+        // that incidental zero into the unit contract; production scans are
+        // the source of opportunity counts.
+        if (!probeOps.producer.valid() || !probeOps.candidate.valid() ||
+            !probeOps.peer.valid() || !probeOps.consumer.valid())
+        {
+            return fail("Expected shared-input peer fixture operations to be valid");
+        }
+
+        // A malformed/empty profile must fail closed and leave the schedule
+        // untouched; in particular, it must not turn missing rows into zero
+        // fire counts and accidentally admit candidates.
+        const auto invalidProfilePath =
+            std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) /
+            "activity_schedule_shared_peer_invalid_profile.tsv";
+        {
+            std::ofstream profile(invalidProfilePath);
+            profile << "supernode_id\tphase\tf\n";
+        }
+        wolvrix::lib::grh::Design invalidProfileDesign;
+        buildFixture(invalidProfileDesign, std::string(kName));
+        SessionStore invalidProfileSession;
+        std::string invalidProfileLog;
+        const bool invalidProfileRan =
+            runFixture(invalidProfileDesign,
+                       std::string(kName),
+                       "probe",
+                       invalidProfileSession,
+                       &invalidProfileLog,
+                       invalidProfilePath.string());
+        std::filesystem::remove(invalidProfilePath);
+        const auto invalidProfileSchedule =
+            loadSchedule(invalidProfileSession, std::string(kName));
+        if (!invalidProfileRan ||
+            !schedulesEqual(defaultSchedule, invalidProfileSchedule) ||
+            invalidProfileLog.find("profile_enabled=true") == std::string::npos ||
+            invalidProfileLog.find("profile_valid=false") == std::string::npos ||
+            parseStatField(invalidProfileLog, "rejected_profile_invalid") != 1 ||
+            parseStatField(invalidProfileLog, "exact_eligible") != 0)
+        {
+            return fail("Expected invalid shared-input peer profile to fail closed: " +
+                        invalidProfileLog);
+        }
+    }
+
+    {
         currentCase = "final_sibling_fusion_probe";
 
         struct FixtureOptions

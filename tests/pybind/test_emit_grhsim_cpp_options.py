@@ -86,7 +86,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": value})
 
     def test_python_deferred_activation_forward_validation(self) -> None:
-        for value in ("off", "probe"):
+        for value in ("off", "probe", "cofire-probe"):
             with self.subTest(value=value):
                 _compile_emit_grhsim_cpp_kwargs(
                     {"deferred_activation_forward_policy": value}
@@ -113,17 +113,19 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
 
     def test_native_keyword_is_accepted(self) -> None:
         with wolvrix.Session() as session:
-            with self.assertRaisesRegex(KeyError, "design key not found"):
-                native.session_emit_grhsim_cpp(
-                    session._capsule,
-                    design="missing.design",
-                    output="unused",
-                    top=[],
-                    direct_single_writer_state_reads=False,
-                    active_mask_gap_pack_policy="targeted-direct",
-                    deferred_activation_forward_policy="probe",
-                    deferred_activation_forward_profile_path="/tmp/fire.tsv",
-                )
+            for policy in ("probe", "cofire-probe"):
+                with self.subTest(policy=policy):
+                    with self.assertRaisesRegex(KeyError, "design key not found"):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            top=[],
+                            direct_single_writer_state_reads=False,
+                            active_mask_gap_pack_policy="targeted-direct",
+                            deferred_activation_forward_policy=policy,
+                            deferred_activation_forward_profile_path="/tmp/fire.tsv",
+                        )
 
     def test_native_deferred_activation_forward_policy_rejects_invalid_value(self) -> None:
         with wolvrix.Session() as session:

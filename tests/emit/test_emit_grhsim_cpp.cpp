@@ -3978,6 +3978,18 @@ namespace
             invalidProfilePath);
         const ActiveMaskGapPackEmitRun emptyProfileRun = runDeferredActivationForwardEmit(
             fixture.design, fixture.session, baseDir / "empty_profile", "probe", {});
+        const ActiveMaskGapPackEmitRun cofireWrongPairSetRun = runDeferredActivationForwardEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "cofire_wrong_pair_set",
+            "cofire-probe",
+            profilePath);
+        const ActiveMaskGapPackEmitRun cofireInvalidProfileRun = runDeferredActivationForwardEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "cofire_invalid_profile",
+            "cofire-probe",
+            invalidProfilePath);
         if (!defaultRun.success || defaultRun.diagnosticError ||
             !offRun.success || offRun.diagnosticError ||
             !probeRun.success || probeRun.diagnosticError ||
@@ -4087,6 +4099,15 @@ namespace
         {
             return fail("deferred-activation forward invalid profile must fail closed");
         }
+        if (cofireWrongPairSetRun.success || !cofireWrongPairSetRun.diagnosticError ||
+            cofireWrongPairSetRun.stderrText.find("fail_closed=pair_count expected=13") == std::string::npos ||
+            cofireWrongPairSetRun.diagnostics.find("cofire probe failed closed") == std::string::npos ||
+            cofireInvalidProfileRun.success || !cofireInvalidProfileRun.diagnosticError ||
+            cofireInvalidProfileRun.stderrText.find("profile_valid=false") == std::string::npos ||
+            cofireInvalidProfileRun.diagnostics.find("cofire probe failed closed") == std::string::npos)
+        {
+            return fail("deferred-activation cofire probe must fail closed on a changed pair set or profile");
+        }
 
         const ActiveMaskGapPackEmitRun invalidPolicyRun = runDeferredActivationForwardEmit(
             fixture.design,
@@ -4095,7 +4116,7 @@ namespace
             "strict",
             profilePath);
         if (invalidPolicyRun.success || !invalidPolicyRun.diagnosticError ||
-            invalidPolicyRun.diagnostics.find("expected off or probe") == std::string::npos)
+            invalidPolicyRun.diagnostics.find("expected off, probe, or cofire-probe") == std::string::npos)
         {
             return fail("deferred-activation forward invalid policy must be rejected");
         }

@@ -2479,6 +2479,7 @@ namespace wolvrix::lib::emit
         {
             kOff,
             kProbe,
+            kCofireProbe,
         };
 
         std::string_view deferredActivationForwardPolicyName(
@@ -2490,6 +2491,8 @@ namespace wolvrix::lib::emit
                 return "off";
             case DeferredActivationForwardPolicy::kProbe:
                 return "probe";
+            case DeferredActivationForwardPolicy::kCofireProbe:
+                return "cofire-probe";
             }
             return "off";
         }
@@ -2516,6 +2519,10 @@ namespace wolvrix::lib::emit
             if (value == "probe")
             {
                 return DeferredActivationForwardPolicy::kProbe;
+            }
+            if (value == "cofire-probe")
+            {
+                return DeferredActivationForwardPolicy::kCofireProbe;
             }
             invalidValue = std::move(value);
             return std::nullopt;
@@ -3887,6 +3894,17 @@ namespace wolvrix::lib::emit
             std::size_t maxChangedWordPpm = 20000;
         };
 
+        // A no-mutation runtime probe pair.  The pair is selected at emit time
+        // from the deferred-activation-forward analysis, but the generated
+        // simulator only observes ordinary compute dispatches for it.
+        struct DeferredActivationCofirePair
+        {
+            uint32_t source = 0;
+            uint32_t target = 0;
+            uint32_t sourceActiveId = 0;
+            uint32_t targetActiveId = 0;
+        };
+
         struct WaveformSignalDecl
         {
             enum class SourceKind
@@ -4022,6 +4040,8 @@ namespace wolvrix::lib::emit
             bool oneBitBitwiseBytes = false;
             bool pureEventComputeWordBypass = false;
             bool pureEventComputeWordProfile = false;
+            bool deferredActivationCofireProbe = false;
+            std::vector<DeferredActivationCofirePair> deferredActivationCofirePairs;
             ActiveMaskGapPackProbe *activeMaskGapPackProbe = nullptr;
             std::size_t directStateReadCount = 0;
             std::size_t directStateReadCanonicalCount = 0;
@@ -7644,7 +7664,7 @@ namespace wolvrix::lib::emit
                 deferredActivationWorkUnits(stats));
         }
 
-        void runDeferredActivationForwardProbe(
+        bool runDeferredActivationForwardProbe(
             const Graph &graph,
             const EmitModel &model,
             const ScheduleRefs &schedule,
@@ -7652,16 +7672,21 @@ namespace wolvrix::lib::emit
             std::size_t schedBatchesPerCpp,
             std::string_view cppPrefix,
             DeferredActivationForwardPolicy policy,
-            const std::filesystem::path &profilePath)
+            const std::filesystem::path &profilePath,
+            std::vector<DeferredActivationCofirePair> *cofirePairs = nullptr)
         {
             if (policy == DeferredActivationForwardPolicy::kOff)
             {
-                return;
+                return true;
             }
             constexpr std::size_t kMinSharedValues = 2;
             constexpr std::size_t kMaxAccountedCandidates = 4096;
             constexpr std::size_t kMaxSelectedCandidates = 128;
             constexpr std::size_t kMaxReportedNearSelectedCandidates = 64;
+            // Stage 29 is intentionally pinned to the 13 positive rows from
+            // the corrected Stage 28 production report.  Do not silently
+            // widen this runtime experiment when ranking changes.
+            constexpr std::size_t kExpectedCofirePairs = 13;
 
             DeferredActivationForwardProbeStats stats;
             const DeferredActivationForwardProfile profile =
@@ -7676,7 +7701,11 @@ namespace wolvrix::lib::emit
                     profile.computeRows,
                     profile.ignoredCommitRows,
                     profile.error.c_str());
-                return;
+                if (policy == DeferredActivationForwardPolicy::kCofireProbe && cofirePairs != nullptr)
+                {
+                    cofirePairs->clear();
+                }
+                return policy != DeferredActivationForwardPolicy::kCofireProbe;
             }
 
             const std::size_t supernodeCount = schedule.supernodeToOps.size();
@@ -8134,6 +8163,108 @@ namespace wolvrix::lib::emit
                         candidate.fireWeightedWorkProxyLower;
                 }
             }
+
+            // Stage 29 observes only the disjoint selected rows whose static
+            // fire-weighted work proxy is positive.  This is deliberately a
+            // bounded, no-mutation hand-off to generated runtime code; it does
+            // not alter the selected activation accounting above.
+            if (cofirePairs != nullptr && policy == DeferredActivationForwardPolicy::kCofireProbe)
+            {
+                cofirePairs->clear();
+                for (std::size_t index : selectedIndices)
+                {
+                    const auto &candidate = eligible[index];
+                    if (candidate.fireWeightedWorkProxyLower <= 0)
+                    {
+                        continue;
+                    }
+                    cofirePairs->push_back(DeferredActivationCofirePair{
+                        .source = candidate.source,
+                        .target = candidate.target,
+                        .sourceActiveId = candidate.sourceActiveId,
+                        .targetActiveId = candidate.targetActiveId});
+                }
+            }
+            if (policy == DeferredActivationForwardPolicy::kCofireProbe)
+            {
+                // The runtime experiment is intentionally tied to the exact
+                // Stage 28 production set. A changed schedule/profile must
+                // fail closed instead of silently probing a different pair.
+                constexpr std::array<std::pair<uint32_t, uint32_t>, kExpectedCofirePairs> kStage29Pairs{{
+                    {51194u, 52335u}, {51196u, 52337u}, {51195u, 52336u},
+                    {51197u, 52338u}, {51193u, 52334u}, {57291u, 57901u},
+                    {57289u, 57899u}, {57290u, 57900u}, {57294u, 57904u},
+                    {57293u, 57903u}, {57292u, 57902u}, {10635u, 27668u},
+                    {35026u, 38043u},
+                }};
+                if (cofirePairs == nullptr || cofirePairs->size() != kStage29Pairs.size())
+                {
+                    std::fprintf(stderr,
+                                 "[GRHSIM_DEFERRED_ACTIVATION_COFIRE] fail_closed=pair_count expected=13 actual=%zu\n",
+                                 cofirePairs == nullptr ? 0u : cofirePairs->size());
+                    return false;
+                }
+                std::set<std::pair<uint32_t, uint32_t>> expectedPairs(
+                    kStage29Pairs.begin(), kStage29Pairs.end());
+                std::set<std::pair<uint32_t, uint32_t>> actualPairs;
+                for (const DeferredActivationCofirePair &pair : *cofirePairs)
+                {
+                    if (pair.source >= supernodeCount || pair.target >= supernodeCount ||
+                        pair.source >= model.activeIdBySupernode.size() ||
+                        pair.target >= model.activeIdBySupernode.size() ||
+                        model.activeIdBySupernode[pair.source] == kInvalidIndex ||
+                        model.activeIdBySupernode[pair.target] == kInvalidIndex ||
+                        pair.sourceActiveId != model.activeIdBySupernode[pair.source] ||
+                        pair.targetActiveId != model.activeIdBySupernode[pair.target] ||
+                        pair.sourceActiveId >= pair.targetActiveId ||
+                        pair.sourceActiveId / kActiveFlagBitsPerWord ==
+                            pair.targetActiveId / kActiveFlagBitsPerWord ||
+                        !isComputeSupernode(pair.source) ||
+                        !isComputeSupernode(pair.target) ||
+                        schedule.supernodeToOps[pair.source].empty() ||
+                        schedule.supernodeToOps[pair.target].empty() ||
+                        (pair.source < model.supernodeHasCommitPart.size() &&
+                         model.supernodeHasCommitPart[pair.source] != 0U) ||
+                        (pair.target < model.supernodeHasCommitPart.size() &&
+                         model.supernodeHasCommitPart[pair.target] != 0U) ||
+                        !actualPairs.emplace(pair.source, pair.target).second)
+                    {
+                        std::fprintf(stderr,
+                                     "[GRHSIM_DEFERRED_ACTIVATION_COFIRE] fail_closed=pair_shape source=%u target=%u source_active_id=%u target_active_id=%u\n",
+                                     pair.source,
+                                     pair.target,
+                                     pair.sourceActiveId,
+                                     pair.targetActiveId);
+                        return false;
+                    }
+                    for (uint32_t supernodeId : {pair.source, pair.target})
+                    {
+                        for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                        {
+                            const Operation op = graph.getOperation(opId);
+                            if (!isDeferredActivationForwardPureKind(op.kind()) ||
+                                isCommitPhaseOp(op) ||
+                                getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                                isRegToMemIntentBypassOp(model, opId))
+                            {
+                                std::fprintf(stderr,
+                                             "[GRHSIM_DEFERRED_ACTIVATION_COFIRE] fail_closed=non_pure source=%u target=%u op=%u\n",
+                                             pair.source,
+                                             pair.target,
+                                             opId.index);
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if (actualPairs != expectedPairs)
+                {
+                    std::fprintf(stderr,
+                                 "[GRHSIM_DEFERRED_ACTIVATION_COFIRE] fail_closed=pair_set expected=13 actual=%zu\n",
+                                 actualPairs.size());
+                    return false;
+                }
+            }
             const std::size_t globalControlWorkUnits =
                 deferredActivationWorkUnits(controlAccounting.stats);
             const std::size_t globalCandidateWorkUnits =
@@ -8324,6 +8455,7 @@ namespace wolvrix::lib::emit
                     candidate.forward.localRmw,
                     candidate.forward.globalRmw);
             }
+            return true;
         }
 
         void emitScalarChangedValueAssign(std::ostream &stream,
@@ -18590,6 +18722,61 @@ namespace wolvrix::lib::emit
                         }
                         stream << "        }\n";
                     }
+                    if (model.deferredActivationCofireProbe && !fullpassVariant &&
+                        batch.phase == ScheduleBatch::Phase::kCompute)
+                    {
+                        for (std::size_t pairIndex = 0;
+                             pairIndex < model.deferredActivationCofirePairs.size();
+                             ++pairIndex)
+                        {
+                            const DeferredActivationCofirePair &pair =
+                                model.deferredActivationCofirePairs[pairIndex];
+                            if (pair.source == supernodeId)
+                            {
+                                const std::size_t targetWord =
+                                    pair.targetActiveId / kActiveFlagBitsPerWord;
+                                const unsigned targetMask = static_cast<unsigned>(
+                                    UINT8_C(1) << (pair.targetActiveId % kActiveFlagBitsPerWord));
+                                const bool targetSharesWord =
+                                    targetWord == word.activeFlagWordIndex;
+                                stream << "        bool cofire_before_pending_" << pairIndex << " = false;\n";
+                                stream << "        if (runtime_profile_enabled_) {\n";
+                                stream << "            ++runtime_profile_cofire_leader_fire_["
+                                       << pairIndex << "u];\n";
+                                // Sample the queue before any source operation
+                                // can update its deferred changed-value flags.
+                                // The backing byte may have been cleared at the
+                                // start of this word, so same-word later
+                                // followers must also be read from the local
+                                // dispatch byte.
+                                stream << "            cofire_before_pending_" << pairIndex << " = ";
+                                if (targetSharesWord)
+                                {
+                                    stream << "((activeWordFlags & UINT8_C(" << targetMask
+                                           << ")) != UINT8_C(0)) || ";
+                                }
+                                stream << "((supernode_active_curr_[" << targetWord << "u] & UINT8_C("
+                                       << targetMask << ")) != UINT8_C(0));\n";
+                                stream << "            if (cofire_before_pending_" << pairIndex << ") {\n";
+                                stream << "                ++runtime_profile_cofire_before_pending_["
+                                       << pairIndex << "u];\n";
+                                stream << "                ++runtime_profile_cofire_follower_already_pending_["
+                                       << pairIndex << "u];\n";
+                                stream << "            } else {\n";
+                                stream << "                ++runtime_profile_cofire_forward_would_add_["
+                                       << pairIndex << "u];\n";
+                                stream << "            }\n";
+                                stream << "        }\n";
+                            }
+                            if (pair.target == supernodeId)
+                            {
+                                stream << "        if (runtime_profile_enabled_) {\n";
+                                stream << "            ++runtime_profile_cofire_follower_fire_["
+                                       << pairIndex << "u];\n";
+                                stream << "        }\n";
+                            }
+                        }
+                    }
                     stream << "        {\n";
                 const std::vector<ScalarConcatPrefixCacheDecl> concatPrefixCacheDecls =
                     collectScalarConcatPrefixCaches(graph, schedule.supernodeToOps[supernodeId]);
@@ -19829,6 +20016,49 @@ namespace wolvrix::lib::emit
                                                               "            ",
                                                               &activationContext);
                     }
+                    if (model.deferredActivationCofireProbe && !fullpassVariant &&
+                        batch.phase == ScheduleBatch::Phase::kCompute)
+                    {
+                        for (std::size_t pairIndex = 0;
+                             pairIndex < model.deferredActivationCofirePairs.size();
+                             ++pairIndex)
+                        {
+                            const DeferredActivationCofirePair &pair =
+                                model.deferredActivationCofirePairs[pairIndex];
+                            if (pair.source != supernodeId)
+                            {
+                                continue;
+                            }
+                            const std::size_t targetWord =
+                                pair.targetActiveId / kActiveFlagBitsPerWord;
+                            const unsigned targetMask = static_cast<unsigned>(
+                                UINT8_C(1) << (pair.targetActiveId % kActiveFlagBitsPerWord));
+                            const bool targetSharesWord =
+                                targetWord == word.activeFlagWordIndex;
+                            stream << "            if (runtime_profile_enabled_) {\n";
+                            stream << "                const bool cofire_after_pending_" << pairIndex << " = ";
+                            if (targetSharesWord)
+                            {
+                                stream << "((activeWordFlags & UINT8_C(" << targetMask
+                                       << ")) != UINT8_C(0)) || ";
+                            }
+                            stream << "((supernode_active_curr_[" << targetWord << "u] & UINT8_C("
+                                   << targetMask << ")) != UINT8_C(0));\n";
+                            stream << "                if (cofire_after_pending_" << pairIndex << ") {\n";
+                            stream << "                    ++runtime_profile_cofire_follower_pending_["
+                                   << pairIndex << "u];\n";
+                            stream << "                } else {\n";
+                            stream << "                    ++runtime_profile_cofire_leader_without_follower_["
+                                   << pairIndex << "u];\n";
+                            stream << "                }\n";
+                            stream << "                if (!cofire_before_pending_" << pairIndex
+                                   << " && cofire_after_pending_" << pairIndex << ") {\n";
+                            stream << "                    ++runtime_profile_cofire_baseline_flush_added_["
+                                   << pairIndex << "u];\n";
+                            stream << "                }\n";
+                            stream << "            }\n";
+                        }
+                    }
                     if (outerCommitEventExpr.has_value())
                     {
                         stream << "            }\n";
@@ -20193,12 +20423,14 @@ namespace wolvrix::lib::emit
         {
             reportError("invalid deferred_activation_forward_policy: " +
                         invalidDeferredActivationForwardPolicy +
-                        " (expected off or probe)");
+                        " (expected off, probe, or cofire-probe)");
             result.success = false;
             return result;
         }
         const std::string deferredActivationForwardProfilePath =
             parseDeferredActivationForwardProfilePath(options);
+        const bool deferredActivationCofireProbeRequested =
+            *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe;
         std::string invalidWordPackPolicy;
         const auto pureEventWordPackPolicy =
             parsePureEventWordPackPolicy(options, invalidWordPackPolicy);
@@ -20285,7 +20517,12 @@ namespace wolvrix::lib::emit
         {
             configuredModel.emitWaveform = waveformMode != WaveformMode::kOff;
             configuredModel.emitPerf = perfMode != PerfMode::kOff;
-            configuredModel.emitRuntimeProfile = emitRuntimeProfile;
+            // The cofire probe uses the existing runtime-profile enable/dump
+            // plumbing even when the caller did not separately request the
+            // per-supernode fire TSV.  This is explicit-policy-only; default
+            // generation remains byte-identical and uninstrumented.
+            configuredModel.emitRuntimeProfile = emitRuntimeProfile ||
+                                                  deferredActivationCofireProbeRequested;
             configuredModel.inputFullpassSpecialization = inputFullpassSpecialization;
             configuredModel.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
             configuredModel.commitStateChangeUnlikely = commitStateChangeUnlikely;
@@ -20586,6 +20823,7 @@ namespace wolvrix::lib::emit
         {
             schedPaths.push_back(schedOutputPaths[batchIndex / schedBatchesPerCpp]);
         }
+        std::vector<DeferredActivationCofirePair> deferredActivationCofirePairs;
         if (*deferredActivationForwardPolicy != DeferredActivationForwardPolicy::kOff)
         {
             if (*activeMaskGapPackPolicy != ActiveMaskGapPackPolicy::kOff)
@@ -20595,10 +20833,17 @@ namespace wolvrix::lib::emit
                     "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] policy=%.*s profile_valid=false selected=0 error=active_mask_gap_pack_policy_must_be_off\n",
                     static_cast<int>(deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).size()),
                     deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).data());
+                if (*deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe)
+                {
+                    reportError("deferred activation cofire probe requires active_mask_gap_pack_policy=off",
+                                sessionPrefix);
+                    result.success = false;
+                    return result;
+                }
             }
             else
             {
-                runDeferredActivationForwardProbe(
+                if (!runDeferredActivationForwardProbe(
                     graph,
                     model,
                     schedule,
@@ -20606,8 +20851,24 @@ namespace wolvrix::lib::emit
                     schedBatchesPerCpp,
                     prefix,
                     *deferredActivationForwardPolicy,
-                    deferredActivationForwardProfilePath);
+                    deferredActivationForwardProfilePath,
+                    &deferredActivationCofirePairs))
+                {
+                    reportError("deferred activation cofire probe failed closed; see stderr for the exact reason",
+                                sessionPrefix);
+                    result.success = false;
+                    return result;
+                }
             }
+        }
+        if (deferredActivationCofireProbeRequested)
+        {
+            model.deferredActivationCofirePairs = deferredActivationCofirePairs;
+            model.deferredActivationCofireProbe = !deferredActivationCofirePairs.empty();
+            std::fprintf(stderr,
+                         "[GRHSIM_DEFERRED_ACTIVATION_COFIRE] emit_probe=%s pairs=%zu fullpass_excluded=true commit_excluded=true\n",
+                         model.deferredActivationCofireProbe ? "true" : "false",
+                         model.deferredActivationCofirePairs.size());
         }
         const std::filesystem::path makefilePath = outDir / "Makefile";
         const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
@@ -24517,6 +24778,26 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_compute_{};\n";
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_commit_{};\n";
             }
+            if (model.deferredActivationCofireProbe)
+            {
+                const std::size_t pairCount = model.deferredActivationCofirePairs.size();
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_leader_fire_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_follower_fire_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_before_pending_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_follower_pending_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_follower_already_pending_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_baseline_flush_added_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_leader_without_follower_{};\n";
+                *stream << "    std::array<std::uint64_t, " << pairCount
+                        << "> runtime_profile_cofire_forward_would_add_{};\n";
+            }
             if (activeMaskTableRuntimeProfileCompiled)
             {
                 *stream << "    std::uint64_t runtime_profile_active_mask_table_evaluations_ = UINT64_C(0);\n";
@@ -25280,6 +25561,98 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] supernode_fire_tsv=%s rows=%zu\\n\",\n";
                 *stream << "                path,\n";
                 *stream << "                kRows.size());\n";
+            }
+            if (model.deferredActivationCofireProbe)
+            {
+                *stream << "    struct DeferredActivationCofireProfileRow {\n";
+                *stream << "        std::uint32_t source = 0;\n";
+                *stream << "        std::uint32_t target = 0;\n";
+                *stream << "        std::uint32_t sourceActiveId = 0;\n";
+                *stream << "        std::uint32_t targetActiveId = 0;\n";
+                *stream << "    };\n";
+                const std::size_t pairCount = model.deferredActivationCofirePairs.size();
+                if (pairCount == 0)
+                {
+                    *stream << "    static constexpr std::array<DeferredActivationCofireProfileRow, 0> kCofireRows{};\n";
+                }
+                else
+                {
+                    *stream << "    static constexpr std::array<DeferredActivationCofireProfileRow, "
+                            << pairCount << "> kCofireRows = {{\n";
+                    for (const DeferredActivationCofirePair &pair : model.deferredActivationCofirePairs)
+                    {
+                        *stream << "        DeferredActivationCofireProfileRow{" << pair.source << "u, "
+                                << pair.target << "u, " << pair.sourceActiveId << "u, "
+                                << pair.targetActiveId << "u},\n";
+                    }
+                    *stream << "    }};\n";
+                }
+                *stream << "    const char *cofireEnvPath = std::getenv(\"WOLVRIX_GRHSIM_COFIRE_TSV\");\n";
+                *stream << "    const char *cofirePath = (cofireEnvPath != nullptr && cofireEnvPath[0] != '\\0')\n";
+                *stream << "        ? cofireEnvPath\n";
+                *stream << "        : \"" << escapeCppString((outDir / "grhsim_deferred_activation_cofire.tsv").string()) << "\";\n";
+                *stream << "    const std::filesystem::path cofireOutputPath(cofirePath);\n";
+                *stream << "    if (cofireOutputPath.has_parent_path()) {\n";
+                *stream << "        std::error_code cofireEc;\n";
+                *stream << "        std::filesystem::create_directories(cofireOutputPath.parent_path(), cofireEc);\n";
+                *stream << "        if (cofireEc) {\n";
+                *stream << "            std::fprintf(stderr,\n";
+                *stream << "                         \"[GRHSIM_DEFERRED_ACTIVATION_COFIRE] failed to create TSV directory %s: %s\\n\",\n";
+                *stream << "                         cofireOutputPath.parent_path().string().c_str(),\n";
+                *stream << "                         cofireEc.message().c_str());\n";
+                *stream << "            return;\n";
+                *stream << "        }\n";
+                *stream << "    }\n";
+                *stream << "    std::FILE *cofireFp = std::fopen(cofirePath, \"w\");\n";
+                *stream << "    if (cofireFp == nullptr) {\n";
+                *stream << "        std::fprintf(stderr,\n";
+                *stream << "                     \"[GRHSIM_DEFERRED_ACTIVATION_COFIRE] failed to open TSV %s\\n\",\n";
+                *stream << "                     cofirePath);\n";
+                *stream << "        return;\n";
+                *stream << "    }\n";
+                *stream << "    std::fprintf(cofireFp, \"source\\ttarget\\tsource_active_id\\ttarget_active_id\\tleader_fire\\tfollower_fire\\tbefore_pending\\tafter_pending\\tfollower_pending\\tfollower_already_pending\\tbaseline_flush_added\\tleader_without_follower\\tforward_would_add\\n\");\n";
+                *stream << "    for (std::size_t cofireIndex = 0; cofireIndex < kCofireRows.size(); ++cofireIndex) {\n";
+                *stream << "        const auto &cofireRow = kCofireRows[cofireIndex];\n";
+                *stream << "        const auto leaderFire = runtime_profile_cofire_leader_fire_[cofireIndex];\n";
+                *stream << "        const auto followerFire = runtime_profile_cofire_follower_fire_[cofireIndex];\n";
+                *stream << "        const auto beforePending = runtime_profile_cofire_before_pending_[cofireIndex];\n";
+                *stream << "        const auto followerPending = runtime_profile_cofire_follower_pending_[cofireIndex];\n";
+                *stream << "        const auto followerAlreadyPending = runtime_profile_cofire_follower_already_pending_[cofireIndex];\n";
+                *stream << "        const auto baselineFlushAdded = runtime_profile_cofire_baseline_flush_added_[cofireIndex];\n";
+                *stream << "        const auto leaderWithoutFollower = runtime_profile_cofire_leader_without_follower_[cofireIndex];\n";
+                *stream << "        const auto forwardWouldAdd = runtime_profile_cofire_forward_would_add_[cofireIndex];\n";
+                *stream << "        std::fprintf(cofireFp, \"%u\\t%u\\t%u\\t%u\\t%llu\\t%llu\\t%llu\\t%llu\\t%llu\\t%llu\\t%llu\\t%llu\\t%llu\\n\",\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.source),\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.target),\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.sourceActiveId),\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.targetActiveId),\n";
+                *stream << "                     static_cast<unsigned long long>(leaderFire),\n";
+                *stream << "                     static_cast<unsigned long long>(followerFire),\n";
+                *stream << "                     static_cast<unsigned long long>(beforePending),\n";
+                *stream << "                     static_cast<unsigned long long>(followerPending),\n";
+                *stream << "                     static_cast<unsigned long long>(followerPending),\n";
+                *stream << "                     static_cast<unsigned long long>(followerAlreadyPending),\n";
+                *stream << "                     static_cast<unsigned long long>(baselineFlushAdded),\n";
+                *stream << "                     static_cast<unsigned long long>(leaderWithoutFollower),\n";
+                *stream << "                     static_cast<unsigned long long>(forwardWouldAdd));\n";
+                *stream << "        std::fprintf(stderr, \"[GRHSIM_DEFERRED_ACTIVATION_COFIRE] pair=%zu source=%u target=%u source_active_id=%u target_active_id=%u leader_fire=%llu follower_fire=%llu before_pending=%llu after_pending=%llu follower_pending=%llu follower_already_pending=%llu baseline_flush_added=%llu leader_without_follower=%llu forward_would_add=%llu\\n\",\n";
+                *stream << "                     cofireIndex,\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.source),\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.target),\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.sourceActiveId),\n";
+                *stream << "                     static_cast<unsigned>(cofireRow.targetActiveId),\n";
+                *stream << "                     static_cast<unsigned long long>(leaderFire),\n";
+                *stream << "                     static_cast<unsigned long long>(followerFire),\n";
+                *stream << "                     static_cast<unsigned long long>(beforePending),\n";
+                *stream << "                     static_cast<unsigned long long>(followerPending),\n";
+                *stream << "                     static_cast<unsigned long long>(followerPending),\n";
+                *stream << "                     static_cast<unsigned long long>(followerAlreadyPending),\n";
+                *stream << "                     static_cast<unsigned long long>(baselineFlushAdded),\n";
+                *stream << "                     static_cast<unsigned long long>(leaderWithoutFollower),\n";
+                *stream << "                     static_cast<unsigned long long>(forwardWouldAdd));\n";
+                *stream << "    }\n";
+                *stream << "    std::fclose(cofireFp);\n";
+                *stream << "    std::printf(\"[GRHSIM_DEFERRED_ACTIVATION_COFIRE] tsv=%s pairs=%zu\\n\", cofirePath, kCofireRows.size());\n";
             }
             if (activeMaskTableRuntimeProfileCompiled)
             {
@@ -26954,6 +27327,17 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 {
                     *stream << "    runtime_profile_fire_compute_.fill(UINT64_C(0));\n";
                     *stream << "    runtime_profile_fire_commit_.fill(UINT64_C(0));\n";
+                }
+                if (model.deferredActivationCofireProbe)
+                {
+                    *stream << "    runtime_profile_cofire_leader_fire_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_follower_fire_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_before_pending_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_follower_pending_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_follower_already_pending_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_baseline_flush_added_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_leader_without_follower_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_cofire_forward_would_add_.fill(UINT64_C(0));\n";
                 }
                 if (activeMaskTableRuntimeProfileCompiled)
                 {

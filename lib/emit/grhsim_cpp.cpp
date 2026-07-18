@@ -1355,6 +1355,9 @@ namespace wolvrix::lib::emit
             }
         }
 
+        using BoundaryActivationFanoutMap =
+            std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash>;
+
         struct ActivationEmitContext
         {
             std::size_t currentWordIndex = 0;
@@ -1362,6 +1365,11 @@ namespace wolvrix::lib::emit
             std::string_view localActiveExpr;
             bool suppressComputePropagation = false;
             ActiveMaskGapPackProbe *activeMaskGapPackProbe = nullptr;
+            // Strict deferred-activation overlays are deliberately scoped to
+            // ordinary compute emission.  Keep the baseline model fanout map
+            // intact and let the context select a private map only when the
+            // caller explicitly requests the overlay.
+            const BoundaryActivationFanoutMap *boundaryFanoutByValue = nullptr;
         };
 
         ActiveMaskGapPackProbe *resolveActiveMaskGapPackProbe(
@@ -1419,6 +1427,7 @@ namespace wolvrix::lib::emit
         struct DeferredActivationEmitContext
         {
             DeferredActivationGroups *groups = nullptr;
+            const BoundaryActivationFanoutMap *boundaryFanoutByValue = nullptr;
         };
 
         bool containsValueId(const std::vector<ValueId> &values, ValueId value)
@@ -2480,6 +2489,7 @@ namespace wolvrix::lib::emit
             kOff,
             kProbe,
             kCofireProbe,
+            kCofireStrict,
         };
 
         std::string_view deferredActivationForwardPolicyName(
@@ -2493,6 +2503,8 @@ namespace wolvrix::lib::emit
                 return "probe";
             case DeferredActivationForwardPolicy::kCofireProbe:
                 return "cofire-probe";
+            case DeferredActivationForwardPolicy::kCofireStrict:
+                return "cofire-strict";
             }
             return "off";
         }
@@ -2523,6 +2535,10 @@ namespace wolvrix::lib::emit
             if (value == "cofire-probe")
             {
                 return DeferredActivationForwardPolicy::kCofireProbe;
+            }
+            if (value == "cofire-strict")
+            {
+                return DeferredActivationForwardPolicy::kCofireStrict;
             }
             invalidValue = std::move(value);
             return std::nullopt;
@@ -3903,7 +3919,75 @@ namespace wolvrix::lib::emit
             uint32_t target = 0;
             uint32_t sourceActiveId = 0;
             uint32_t targetActiveId = 0;
+            std::size_t sourceBatch = kInvalidIndex;
+            std::size_t targetBatch = kInvalidIndex;
+            std::size_t sourceOps = 0;
+            std::size_t targetOps = 0;
+            std::vector<ValueId> values;
         };
+
+        struct DeferredActivationStrictPairSpec
+        {
+            uint32_t source = 0;
+            uint32_t target = 0;
+            uint32_t sourceActiveId = 0;
+            uint32_t targetActiveId = 0;
+            std::size_t sourceBatch = kInvalidIndex;
+            std::size_t targetBatch = kInvalidIndex;
+            std::size_t sourceOps = 0;
+            std::size_t targetOps = 0;
+            std::size_t valueCount = 0;
+            // Fingerprint of the immutable Stage 29 production value set.
+            std::uint64_t valueFingerprint = 0;
+            std::uint64_t sourceFire = 0;
+            std::uint64_t targetFire = 0;
+        };
+
+        // Stage 30 is intentionally pinned to the first twelve Stage 29
+        // cofire rows.  The final row (35026 -> 38043) is excluded because
+        // its 50k no-mutation counter observed leader misses.
+        constexpr std::array<DeferredActivationStrictPairSpec, 12> kStage30StrictPairSpecs{{
+            {51194u, 52335u, 51478u, 52351u, 53u, 54u, 108u, 108u, 54u, UINT64_C(0xd6b8d38a9413c355), 8221u, 8313u},
+            {51196u, 52337u, 52773u, 53422u, 54u, 55u, 108u, 108u, 54u, UINT64_C(0x035f8b35b0375355), 8012u, 8102u},
+            {51195u, 52336u, 50520u, 51576u, 52u, 53u, 108u, 108u, 54u, UINT64_C(0xbcafeef193c07b7d), 7928u, 8013u},
+            {51197u, 52338u, 52774u, 53423u, 54u, 55u, 108u, 108u, 54u, UINT64_C(0x1562ab8ec5578fde), 7786u, 7865u},
+            {51193u, 52334u, 51477u, 52350u, 53u, 54u, 108u, 108u, 54u, UINT64_C(0x8f9d62b3770226e4), 7780u, 7857u},
+            {57291u, 57901u, 57683u, 57992u, 59u, 59u, 108u, 108u, 54u, UINT64_C(0x84022401f219d448), 7332u, 7401u},
+            {57289u, 57899u, 55132u, 55360u, 57u, 57u, 108u, 108u, 54u, UINT64_C(0xe36c57ac0640cf84), 7292u, 7370u},
+            {57290u, 57900u, 54927u, 55148u, 56u, 57u, 108u, 108u, 54u, UINT64_C(0x57d51ac3c23dad6d), 7283u, 7358u},
+            {57294u, 57904u, 58315u, 58724u, 60u, 60u, 108u, 108u, 54u, UINT64_C(0x582ffefe213c6ba9), 7272u, 7325u},
+            {57293u, 57903u, 57912u, 58351u, 59u, 60u, 108u, 108u, 54u, UINT64_C(0xe36af26be022d66b), 7111u, 7185u},
+            {57292u, 57902u, 57911u, 58350u, 59u, 60u, 108u, 108u, 54u, UINT64_C(0xacb7a38891c7e847), 7091u, 7155u},
+            {10635u, 27668u, 10260u, 28585u, 11u, 30u, 108u, 108u, 54u, UINT64_C(0x018b03789bbb07c4), 3557u, 3559u},
+        }};
+
+        std::uint64_t deferredActivationValueFingerprint(
+            const std::vector<ValueId> &values) noexcept
+        {
+            // Stable byte-wise FNV-1a fingerprint over the sorted ValueId
+            // tuple.  Explicit little-endian field mixing avoids std::hash
+            // ABI drift between host toolchains and keeps the strict value
+            // contract reproducible across emit runs.
+            constexpr std::uint64_t kOffset = UINT64_C(14695981039346656037);
+            constexpr std::uint64_t kPrime = UINT64_C(1099511628211);
+            std::uint64_t hash = kOffset;
+            const auto mix = [&](std::uint32_t value)
+            {
+                for (unsigned shift = 0; shift < 32; shift += 8)
+                {
+                    hash ^= static_cast<std::uint8_t>(value >> shift);
+                    hash *= kPrime;
+                }
+            };
+            for (const ValueId value : values)
+            {
+                mix(value.graph.index);
+                mix(value.graph.generation);
+                mix(value.index);
+                mix(value.generation);
+            }
+            return hash;
+        }
 
         struct WaveformSignalDecl
         {
@@ -4042,6 +4126,10 @@ namespace wolvrix::lib::emit
             bool pureEventComputeWordProfile = false;
             bool deferredActivationCofireProbe = false;
             std::vector<DeferredActivationCofirePair> deferredActivationCofirePairs;
+            bool deferredActivationCofireStrict = false;
+            BoundaryActivationFanoutMap deferredActivationCofireStrictFanoutByValue;
+            std::unordered_map<uint32_t, std::vector<uint32_t>>
+                deferredActivationCofireStrictTargetsBySource;
             ActiveMaskGapPackProbe *activeMaskGapPackProbe = nullptr;
             std::size_t directStateReadCount = 0;
             std::size_t directStateReadCanonicalCount = 0;
@@ -6432,8 +6520,12 @@ namespace wolvrix::lib::emit
                                          std::string_view indent,
                                          const ActivationEmitContext *context)
         {
-            const auto it = model.boundaryFanoutByValue.find(resultValue);
-            if (it == model.boundaryFanoutByValue.end())
+            const BoundaryActivationFanoutMap &fanoutByValue =
+                context != nullptr && context->boundaryFanoutByValue != nullptr
+                    ? *context->boundaryFanoutByValue
+                    : model.boundaryFanoutByValue;
+            const auto it = fanoutByValue.find(resultValue);
+            if (it == fanoutByValue.end())
             {
                 return;
             }
@@ -6689,6 +6781,18 @@ namespace wolvrix::lib::emit
             return it != model.boundaryFanoutByValue.end() && !it->second.empty();
         }
 
+        bool valueNeedsChangeDetect(const EmitModel &model,
+                                    ValueId resultValue,
+                                    const ActivationEmitContext *context)
+        {
+            if (context == nullptr || context->boundaryFanoutByValue == nullptr)
+            {
+                return valueNeedsChangeDetect(model, resultValue);
+            }
+            const auto it = context->boundaryFanoutByValue->find(resultValue);
+            return it != context->boundaryFanoutByValue->end() && !it->second.empty();
+        }
+
         bool isEventValue(const EmitModel &model, ValueId value)
         {
             return model.eventEdgeFieldByValue.find(value) != model.eventEdgeFieldByValue.end();
@@ -6703,6 +6807,13 @@ namespace wolvrix::lib::emit
         bool valueNeedsTrackedChange(const EmitModel &model, ValueId resultValue)
         {
             return valueNeedsChangeDetect(model, resultValue) || isEventValue(model, resultValue);
+        }
+
+        bool valueNeedsTrackedChange(const EmitModel &model,
+                                     ValueId resultValue,
+                                     const ActivationEmitContext *context)
+        {
+            return valueNeedsChangeDetect(model, resultValue, context) || isEventValue(model, resultValue);
         }
 
         bool isMaterializedValue(const EmitModel &model, ValueId value);
@@ -6747,8 +6858,14 @@ namespace wolvrix::lib::emit
             {
                 return;
             }
-            const auto fanoutIt = model.boundaryFanoutByValue.find(resultValue);
-            if (fanoutIt == model.boundaryFanoutByValue.end())
+            const BoundaryActivationFanoutMap *overlayFanout =
+                deferredContext != nullptr && deferredContext->boundaryFanoutByValue != nullptr
+                    ? deferredContext->boundaryFanoutByValue
+                    : (context != nullptr ? context->boundaryFanoutByValue : nullptr);
+            const BoundaryActivationFanoutMap &fanoutByValue =
+                overlayFanout != nullptr ? *overlayFanout : model.boundaryFanoutByValue;
+            const auto fanoutIt = fanoutByValue.find(resultValue);
+            if (fanoutIt == fanoutByValue.end())
             {
                 return;
             }
@@ -6802,9 +6919,6 @@ namespace wolvrix::lib::emit
                                                 nullptr,
                                                 ActiveMaskGapPackSite::kGeneric);
         }
-
-        using BoundaryActivationFanoutMap =
-            std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash>;
 
         DeferredActivationGroups buildDeferredActivationGroupsForFanout(
             const Graph &graph,
@@ -7687,6 +7801,7 @@ namespace wolvrix::lib::emit
             // the corrected Stage 28 production report.  Do not silently
             // widen this runtime experiment when ranking changes.
             constexpr std::size_t kExpectedCofirePairs = 13;
+            const bool strictOverlay = policy == DeferredActivationForwardPolicy::kCofireStrict;
 
             DeferredActivationForwardProbeStats stats;
             const DeferredActivationForwardProfile profile =
@@ -7701,11 +7816,24 @@ namespace wolvrix::lib::emit
                     profile.computeRows,
                     profile.ignoredCommitRows,
                     profile.error.c_str());
-                if (policy == DeferredActivationForwardPolicy::kCofireProbe && cofirePairs != nullptr)
+                if ((policy == DeferredActivationForwardPolicy::kCofireProbe || strictOverlay) &&
+                    cofirePairs != nullptr)
                 {
                     cofirePairs->clear();
                 }
-                return policy != DeferredActivationForwardPolicy::kCofireProbe;
+                return policy != DeferredActivationForwardPolicy::kCofireProbe && !strictOverlay;
+            }
+            if (strictOverlay && (profile.computeRows != 63241u || profile.ignoredCommitRows != 485u))
+            {
+                std::fprintf(stderr,
+                             "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=profile_shape compute_rows=%zu expected_compute_rows=63241 ignored_commit_rows=%zu expected_ignored_commit_rows=485\n",
+                             profile.computeRows,
+                             profile.ignoredCommitRows);
+                if (cofirePairs != nullptr)
+                {
+                    cofirePairs->clear();
+                }
+                return false;
             }
 
             const std::size_t supernodeCount = schedule.supernodeToOps.size();
@@ -8182,7 +8310,12 @@ namespace wolvrix::lib::emit
                         .source = candidate.source,
                         .target = candidate.target,
                         .sourceActiveId = candidate.sourceActiveId,
-                        .targetActiveId = candidate.targetActiveId});
+                        .targetActiveId = candidate.targetActiveId,
+                        .sourceBatch = candidate.sourceBatch,
+                        .targetBatch = candidate.targetBatch,
+                        .sourceOps = candidate.sourceOps,
+                        .targetOps = candidate.targetOps,
+                        .values = candidate.values});
                 }
             }
             if (policy == DeferredActivationForwardPolicy::kCofireProbe)
@@ -8264,6 +8397,276 @@ namespace wolvrix::lib::emit
                                  actualPairs.size());
                     return false;
                 }
+            }
+            if (strictOverlay)
+            {
+                if (cofirePairs == nullptr)
+                {
+                    std::fprintf(stderr,
+                                 "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=missing_output\n");
+                    return false;
+                }
+                cofirePairs->clear();
+                std::map<std::pair<uint32_t, uint32_t>, const DeferredActivationForwardCandidate *>
+                    candidatesByPair;
+                for (const auto &candidate : eligible)
+                {
+                    candidatesByPair.emplace(
+                        std::make_pair(candidate.source, candidate.target),
+                        &candidate);
+                }
+                std::unordered_set<uint32_t> strictSupernodes;
+                std::unordered_set<ValueId, ValueIdHash> strictValues;
+                const auto strictSupernodePure = [&](uint32_t supernodeId)
+                {
+                    if (!isComputeSupernode(supernodeId) ||
+                        supernodeId >= schedule.supernodeToOps.size() ||
+                        schedule.supernodeToOps[supernodeId].empty() ||
+                        (supernodeId < model.supernodeHasCommitPart.size() &&
+                         model.supernodeHasCommitPart[supernodeId] != 0U))
+                    {
+                        return false;
+                    }
+                    for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        if (!isDeferredActivationForwardPureKind(op.kind()) ||
+                            isCommitPhaseOp(op) ||
+                            getAttribute<bool>(op, "hasSideEffects").value_or(false) ||
+                            isRegToMemIntentBypassOp(model, opId))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                for (std::size_t specIndex = 0; specIndex < kStage30StrictPairSpecs.size(); ++specIndex)
+                {
+                    const DeferredActivationStrictPairSpec &spec =
+                        kStage30StrictPairSpecs[specIndex];
+                    const auto candidateIt = candidatesByPair.find({spec.source, spec.target});
+                    if (candidateIt == candidatesByPair.end())
+                    {
+                        std::fprintf(stderr,
+                                     "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=pair_missing pair=%zu source=%u target=%u\n",
+                                     specIndex,
+                                     spec.source,
+                                     spec.target);
+                        return false;
+                    }
+                    const DeferredActivationForwardCandidate &candidate = *candidateIt->second;
+                    const std::uint64_t fingerprint =
+                        deferredActivationValueFingerprint(candidate.values);
+                    const bool supernodeOverlap =
+                        strictSupernodes.contains(candidate.source) ||
+                        strictSupernodes.contains(candidate.target) ||
+                        candidate.source == candidate.target;
+                    if (candidate.sourceActiveId != spec.sourceActiveId ||
+                        candidate.targetActiveId != spec.targetActiveId ||
+                        candidate.sourceBatch != spec.sourceBatch ||
+                        candidate.targetBatch != spec.targetBatch ||
+                        candidate.sourceOps != spec.sourceOps ||
+                        candidate.targetOps != spec.targetOps ||
+                        candidate.sourceFire != spec.sourceFire ||
+                        candidate.targetFire != spec.targetFire ||
+                        candidate.values.size() != spec.valueCount ||
+                        spec.valueFingerprint == 0u ||
+                        fingerprint != spec.valueFingerprint ||
+                        candidate.sourceActiveId >= candidate.targetActiveId ||
+                        candidate.sourceActiveId / kActiveFlagBitsPerWord ==
+                            candidate.targetActiveId / kActiveFlagBitsPerWord ||
+                        supernodeOverlap ||
+                        !strictSupernodePure(candidate.source) ||
+                        !strictSupernodePure(candidate.target))
+                    {
+                        std::fprintf(stderr,
+                                     "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=pair_metadata pair=%zu source=%u target=%u active=%u->%u expected_active=%u->%u batch=%zu->%zu expected_batch=%zu->%zu ops=%zu->%zu expected_ops=%zu->%zu fire=%llu->%llu expected_fire=%llu->%llu values=%zu expected_values=%zu fingerprint=%016llx expected_fingerprint=%016llx\n",
+                                     specIndex,
+                                     candidate.source,
+                                     candidate.target,
+                                     candidate.sourceActiveId,
+                                     candidate.targetActiveId,
+                                     spec.sourceActiveId,
+                                     spec.targetActiveId,
+                                     candidate.sourceBatch,
+                                     candidate.targetBatch,
+                                     spec.sourceBatch,
+                                     spec.targetBatch,
+                                     candidate.sourceOps,
+                                     candidate.targetOps,
+                                     spec.sourceOps,
+                                     spec.targetOps,
+                                     static_cast<unsigned long long>(candidate.sourceFire),
+                                     static_cast<unsigned long long>(candidate.targetFire),
+                                     static_cast<unsigned long long>(spec.sourceFire),
+                                     static_cast<unsigned long long>(spec.targetFire),
+                                     candidate.values.size(),
+                                     spec.valueCount,
+                                     static_cast<unsigned long long>(fingerprint),
+                                     static_cast<unsigned long long>(spec.valueFingerprint));
+                        return false;
+                    }
+                    std::fprintf(stderr,
+                                 "[GRHSIM_DEFERRED_ACTIVATION_STRICT] value_fingerprint pair=%zu source=%u target=%u count=%zu fingerprint=%016llx\n",
+                                 specIndex,
+                                 candidate.source,
+                                 candidate.target,
+                                 candidate.values.size(),
+                                 static_cast<unsigned long long>(fingerprint));
+                    strictSupernodes.insert(candidate.source);
+                    strictSupernodes.insert(candidate.target);
+                    for (ValueId value : candidate.values)
+                    {
+                        if (!strictValues.emplace(value).second)
+                        {
+                            std::fprintf(stderr,
+                                         "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=value_overlap pair=%zu value=%u\n",
+                                         specIndex,
+                                         value.index);
+                            return false;
+                        }
+                    }
+                    cofirePairs->push_back(DeferredActivationCofirePair{
+                        .source = candidate.source,
+                        .target = candidate.target,
+                        .sourceActiveId = candidate.sourceActiveId,
+                        .targetActiveId = candidate.targetActiveId,
+                        .sourceBatch = candidate.sourceBatch,
+                        .targetBatch = candidate.targetBatch,
+                        .sourceOps = candidate.sourceOps,
+                        .targetOps = candidate.targetOps,
+                        .values = candidate.values});
+                }
+                DeferredActivationLoweringStats strictControlStats;
+                DeferredActivationLoweringStats strictOverlayStats;
+                for (const DeferredActivationCofirePair &pair : *cofirePairs)
+                {
+                    BoundaryActivationFanoutMap sourceFanout;
+                    if (pair.source >= schedule.supernodeToOps.size())
+                    {
+                        std::fprintf(stderr,
+                                     "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=accounting_source source=%u\n",
+                                     pair.source);
+                        return false;
+                    }
+                    for (OperationId opId : schedule.supernodeToOps[pair.source])
+                    {
+                        for (ValueId result : graph.opResults(opId))
+                        {
+                            if (const auto fanoutIt = model.boundaryFanoutByValue.find(result);
+                                fanoutIt != model.boundaryFanoutByValue.end())
+                            {
+                                sourceFanout.emplace(result, fanoutIt->second);
+                            }
+                        }
+                    }
+                    strictControlStats += accountDeferredActivationSource(
+                                                graph,
+                                                model,
+                                                schedule.supernodeToOps,
+                                                pair.source,
+                                                sourceFanout)
+                                                .stats;
+                    BoundaryActivationFanoutMap privateFanout = sourceFanout;
+                    for (ValueId value : pair.values)
+                    {
+                        auto fanoutIt = privateFanout.find(value);
+                        if (fanoutIt == privateFanout.end() || fanoutIt->second.size() != 1u ||
+                            fanoutIt->second.front() != pair.targetActiveId)
+                        {
+                            std::fprintf(stderr,
+                                         "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=accounting_value source=%u target=%u value=%u\n",
+                                         pair.source,
+                                         pair.target,
+                                         value.index);
+                            return false;
+                        }
+                        fanoutIt->second.clear();
+                    }
+                    strictOverlayStats += accountDeferredActivationSource(
+                                                  graph,
+                                                  model,
+                                                  schedule.supernodeToOps,
+                                                  pair.source,
+                                                  privateFanout)
+                                                  .stats;
+                    DeferredActivationLoweringStats forwardStats;
+                    accountUnconditionalActivation(
+                        {pair.targetActiveId}, pair.sourceActiveId, forwardStats);
+                    strictOverlayStats += forwardStats;
+                }
+                const std::size_t strictControlWork =
+                    deferredActivationWorkUnits(strictControlStats);
+                const std::size_t strictOverlayWork =
+                    deferredActivationWorkUnits(strictOverlayStats);
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_DEFERRED_ACTIVATION_STRICT] accounting=control compute_sources=%zu tracked_change_values=%zu direct_value_groups=%zu deferred_groups=%zu deferred_source_value_updates=%zu deferred_direct_groups=%zu deferred_aggregate_groups=%zu forward_groups=%zu active_mask_entries=%zu planned_chunks=%zu chunk1=%zu chunk2=%zu chunk4=%zu chunk8=%zu branchless_groups=%zu guarded_groups=%zu conditional_mask_updates=%zu local_rmw=%zu global_rmw=%zu updated_bytes=%zu estimated_activation_lines=%zu work_units=%zu\n",
+                    strictControlStats.computeSources,
+                    strictControlStats.trackedChangeValues,
+                    strictControlStats.directValueGroups,
+                    strictControlStats.deferredGroups,
+                    strictControlStats.deferredSourceValueUpdates,
+                    strictControlStats.deferredDirectGroups,
+                    strictControlStats.deferredAggregateGroups,
+                    strictControlStats.unconditionalForwardGroups,
+                    strictControlStats.activeMaskEntries,
+                    strictControlStats.plannedChunks,
+                    strictControlStats.emittedChunksByWidth[0],
+                    strictControlStats.emittedChunksByWidth[1],
+                    strictControlStats.emittedChunksByWidth[2],
+                    strictControlStats.emittedChunksByWidth[3],
+                    strictControlStats.branchlessGroups,
+                    strictControlStats.guardedGroups,
+                    strictControlStats.conditionalMaskUpdates,
+                    strictControlStats.localRmw,
+                    strictControlStats.globalRmw,
+                    strictControlStats.updatedBytes,
+                    strictControlStats.estimatedActivationLines,
+                    strictControlWork);
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_DEFERRED_ACTIVATION_STRICT] accounting=overlay compute_sources=%zu tracked_change_values=%zu direct_value_groups=%zu deferred_groups=%zu deferred_source_value_updates=%zu deferred_direct_groups=%zu deferred_aggregate_groups=%zu forward_groups=%zu active_mask_entries=%zu planned_chunks=%zu chunk1=%zu chunk2=%zu chunk4=%zu chunk8=%zu branchless_groups=%zu guarded_groups=%zu conditional_mask_updates=%zu local_rmw=%zu global_rmw=%zu updated_bytes=%zu estimated_activation_lines=%zu work_units=%zu\n",
+                    strictOverlayStats.computeSources,
+                    strictOverlayStats.trackedChangeValues,
+                    strictOverlayStats.directValueGroups,
+                    strictOverlayStats.deferredGroups,
+                    strictOverlayStats.deferredSourceValueUpdates,
+                    strictOverlayStats.deferredDirectGroups,
+                    strictOverlayStats.deferredAggregateGroups,
+                    strictOverlayStats.unconditionalForwardGroups,
+                    strictOverlayStats.activeMaskEntries,
+                    strictOverlayStats.plannedChunks,
+                    strictOverlayStats.emittedChunksByWidth[0],
+                    strictOverlayStats.emittedChunksByWidth[1],
+                    strictOverlayStats.emittedChunksByWidth[2],
+                    strictOverlayStats.emittedChunksByWidth[3],
+                    strictOverlayStats.branchlessGroups,
+                    strictOverlayStats.guardedGroups,
+                    strictOverlayStats.conditionalMaskUpdates,
+                    strictOverlayStats.localRmw,
+                    strictOverlayStats.globalRmw,
+                    strictOverlayStats.updatedBytes,
+                    strictOverlayStats.estimatedActivationLines,
+                    strictOverlayWork);
+                if (strictControlWork != 3262u || strictOverlayWork != 1953u ||
+                    strictControlStats.estimatedActivationLines != 423u ||
+                    strictOverlayStats.estimatedActivationLines != 445u ||
+                    strictOverlayStats.unconditionalForwardGroups != 12u)
+                {
+                    std::fprintf(stderr,
+                                 "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=accounting expected_control_work=3262 actual_control_work=%zu expected_overlay_work=1953 actual_overlay_work=%zu expected_control_lines=423 actual_control_lines=%zu expected_overlay_lines=445 actual_overlay_lines=%zu expected_forward_groups=12 actual_forward_groups=%zu\n",
+                                 strictControlWork,
+                                 strictOverlayWork,
+                                 strictControlStats.estimatedActivationLines,
+                                 strictOverlayStats.estimatedActivationLines,
+                                 strictOverlayStats.unconditionalForwardGroups);
+                    return false;
+                }
+                std::fprintf(stderr,
+                             "[GRHSIM_DEFERRED_ACTIVATION_STRICT] validated=true pairs=%zu values=%zu\n",
+                             cofirePairs->size(),
+                             strictValues.size());
             }
             const std::size_t globalControlWorkUnits =
                 deferredActivationWorkUnits(controlAccounting.stats);
@@ -13818,7 +14221,7 @@ namespace wolvrix::lib::emit
             const std::string lhs = resolvedStoredValueRefExpr(model, resultValue, context);
             const int32_t resultWidth = graph.valueWidth(resultValue);
             const bool materialized = isMaterializedValue(model, resultValue);
-            const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
+            const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, activationContext);
             if (!materialized)
             {
                 emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
@@ -13920,7 +14323,7 @@ namespace wolvrix::lib::emit
                        << ">(" << boolExpr << ");\n";
                 return;
             }
-            const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
+            const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, activationContext);
             emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
             stream << "        {\n";
             stream << "            const auto next_value = static_cast<" << cppTypeForValue(graph, resultValue)
@@ -13970,7 +14373,7 @@ namespace wolvrix::lib::emit
                 return;
             }
 
-            const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
+            const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, activationContext);
             emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
             stream << "        {\n";
             stream << "            const " << cppType << " next_value = " << initializerExpr << ";\n";
@@ -14288,7 +14691,7 @@ namespace wolvrix::lib::emit
             const std::size_t tempScopeId = resultValue.index;
             const std::string lhs = resolvedStoredValueRefExpr(model, resultValue, context);
             const bool materialized = isMaterializedValue(model, resultValue);
-            const bool needsActivation = valueNeedsChangeDetect(model, resultValue);
+            const bool needsActivation = valueNeedsChangeDetect(model, resultValue, activationContext);
             const auto operands = op.operands();
             std::vector<std::string> operandExprs;
             operandExprs.reserve(operands.size());
@@ -14396,7 +14799,8 @@ namespace wolvrix::lib::emit
                                           static_cast<std::size_t>(view->elementWidth))
                        << ");\n";
             }
-            if (materialized && view->sourceValue == view->value && valueNeedsChangeDetect(model, view->value))
+            if (materialized && view->sourceValue == view->value &&
+                valueNeedsChangeDetect(model, view->value, activationContext))
             {
                 emitChangedValuePropagation(stream, model, view->value, "        ", activationContext);
             }
@@ -14422,7 +14826,8 @@ namespace wolvrix::lib::emit
             }
             (void)stream;
             (void)context;
-            if (isMaterializedValue(model, resultValue) && valueNeedsChangeDetect(model, resultValue))
+            if (isMaterializedValue(model, resultValue) &&
+                valueNeedsChangeDetect(model, resultValue, activationContext))
             {
                 emitChangedValuePropagation(stream, model, resultValue, "        ", activationContext);
             }
@@ -18697,7 +19102,13 @@ namespace wolvrix::lib::emit
                         .currentActiveId = activeId,
                         .localActiveExpr = "activeWordFlags",
                         .suppressComputePropagation = fullpassVariant,
-                        .activeMaskGapPackProbe = model.activeMaskGapPackProbe};
+                        .activeMaskGapPackProbe = model.activeMaskGapPackProbe,
+                        .boundaryFanoutByValue =
+                            model.deferredActivationCofireStrict &&
+                                    batch.phase == ScheduleBatch::Phase::kCompute &&
+                                    !fullpassVariant
+                                ? &model.deferredActivationCofireStrictFanoutByValue
+                                : nullptr};
                     const std::uint8_t supernodeMask =
                         static_cast<std::uint8_t>(UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
                     stream << "    \n";
@@ -18800,15 +19211,29 @@ namespace wolvrix::lib::emit
                 DeferredActivationGroups deferredActivationGroups;
                 if (batch.phase == ScheduleBatch::Phase::kCompute && !fullpassVariant)
                 {
-                    deferredActivationGroups =
-                        buildDeferredActivationGroups(graph, model, schedule.supernodeToOps, supernodeId);
+                    const BoundaryActivationFanoutMap &fanoutByValue =
+                        model.deferredActivationCofireStrict
+                            ? model.deferredActivationCofireStrictFanoutByValue
+                            : model.boundaryFanoutByValue;
+                    deferredActivationGroups = buildDeferredActivationGroupsForFanout(
+                        graph,
+                        model,
+                        schedule.supernodeToOps,
+                        supernodeId,
+                        fanoutByValue);
                     for (const auto &group : deferredActivationGroups)
                     {
                         stream << "            bool " << group.changedExpr << " = false;\n";
                     }
                 }
                 DeferredActivationEmitContext deferredActivationContext{
-                    .groups = deferredActivationGroups.empty() ? nullptr : &deferredActivationGroups};
+                    .groups = deferredActivationGroups.empty() ? nullptr : &deferredActivationGroups,
+                    .boundaryFanoutByValue =
+                        model.deferredActivationCofireStrict &&
+                                batch.phase == ScheduleBatch::Phase::kCompute &&
+                                !fullpassVariant
+                            ? &model.deferredActivationCofireStrictFanoutByValue
+                            : nullptr};
                 for (OperationId useOpId : supernodeOps)
                 {
                     const Operation useOp = graph.getOperation(useOpId);
@@ -19140,7 +19565,7 @@ namespace wolvrix::lib::emit
                         }
                         const std::string lhs = resolvedStoredValueRefExpr(model, resultValue, &localExprContext);
                         const bool materialized = isMaterializedValue(model, resultValue);
-                        const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
+                        const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, &activationContext);
                         if (!materialized)
                         {
                             if (graph.valueType(resultValue) == ValueType::Logic)
@@ -19210,7 +19635,7 @@ namespace wolvrix::lib::emit
                         const std::string lhs =
                             resolvedStoredValueRefExpr(model, op.results().front(), &localExprContext);
                         const bool materialized = isMaterializedValue(model, resultValue);
-                        const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
+                        const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, &activationContext);
                         if (!materialized)
                         {
                             if (isWideLogicValue(graph, resultValue))
@@ -19333,7 +19758,7 @@ namespace wolvrix::lib::emit
                             resolvedStoredValueRefExpr(model, op.results().front(), &localExprContext);
                         const ValueId resultValue = op.results().front();
                         const bool materialized = isMaterializedValue(model, resultValue);
-                        const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
+                        const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue, &activationContext);
                         const std::string addrExpr = resolvedScheduleValueExpr(model, operands[0], &localExprContext);
                         const MemoryRowAccessExpr rowAccess =
                             memoryRowAccessExpr(graph, operands[0], addrExpr, state.rowCount);
@@ -20016,6 +20441,30 @@ namespace wolvrix::lib::emit
                                                               "            ",
                                                               &activationContext);
                     }
+                    if (model.deferredActivationCofireStrict && !fullpassVariant &&
+                        batch.phase == ScheduleBatch::Phase::kCompute)
+                    {
+                        const auto forwardIt =
+                            model.deferredActivationCofireStrictTargetsBySource.find(supernodeId);
+                        if (forwardIt != model.deferredActivationCofireStrictTargetsBySource.end())
+                        {
+                            // The strict overlay intentionally leaves the
+                            // baseline changed-value/deferred flush above in
+                            // place for every non-selected value, then adds a
+                            // single unconditional source -> target write for
+                            // the selected exclusive values.  This block is
+                            // unreachable from fullpass, commit, or seed code.
+                            emitActivationStatements(stream,
+                                                     "supernode_active_curr_",
+                                                     "active_count_",
+                                                     forwardIt->second,
+                                                     "            ",
+                                                     &activationContext,
+                                                     nullptr,
+                                                     nullptr,
+                                                     ActiveMaskGapPackSite::kGeneric);
+                        }
+                    }
                     if (model.deferredActivationCofireProbe && !fullpassVariant &&
                         batch.phase == ScheduleBatch::Phase::kCompute)
                     {
@@ -20423,7 +20872,7 @@ namespace wolvrix::lib::emit
         {
             reportError("invalid deferred_activation_forward_policy: " +
                         invalidDeferredActivationForwardPolicy +
-                        " (expected off, probe, or cofire-probe)");
+                        " (expected off, probe, cofire-probe, or cofire-strict)");
             result.success = false;
             return result;
         }
@@ -20431,6 +20880,8 @@ namespace wolvrix::lib::emit
             parseDeferredActivationForwardProfilePath(options);
         const bool deferredActivationCofireProbeRequested =
             *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe;
+        const bool deferredActivationCofireStrictRequested =
+            *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireStrict;
         std::string invalidWordPackPolicy;
         const auto pureEventWordPackPolicy =
             parsePureEventWordPackPolicy(options, invalidWordPackPolicy);
@@ -20833,9 +21284,10 @@ namespace wolvrix::lib::emit
                     "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] policy=%.*s profile_valid=false selected=0 error=active_mask_gap_pack_policy_must_be_off\n",
                     static_cast<int>(deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).size()),
                     deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).data());
-                if (*deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe)
+                if (*deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe ||
+                    *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireStrict)
                 {
-                    reportError("deferred activation cofire probe requires active_mask_gap_pack_policy=off",
+                    reportError("deferred activation cofire policy requires active_mask_gap_pack_policy=off",
                                 sessionPrefix);
                     result.success = false;
                     return result;
@@ -20844,17 +21296,17 @@ namespace wolvrix::lib::emit
             else
             {
                 if (!runDeferredActivationForwardProbe(
-                    graph,
-                    model,
-                    schedule,
-                    scheduleBatches,
-                    schedBatchesPerCpp,
-                    prefix,
-                    *deferredActivationForwardPolicy,
-                    deferredActivationForwardProfilePath,
-                    &deferredActivationCofirePairs))
+                        graph,
+                        model,
+                        schedule,
+                        scheduleBatches,
+                        schedBatchesPerCpp,
+                        prefix,
+                        *deferredActivationForwardPolicy,
+                        deferredActivationForwardProfilePath,
+                        &deferredActivationCofirePairs))
                 {
-                    reportError("deferred activation cofire probe failed closed; see stderr for the exact reason",
+                    reportError("deferred activation cofire policy failed closed; see stderr for the exact reason",
                                 sessionPrefix);
                     result.success = false;
                     return result;
@@ -20869,6 +21321,61 @@ namespace wolvrix::lib::emit
                          "[GRHSIM_DEFERRED_ACTIVATION_COFIRE] emit_probe=%s pairs=%zu fullpass_excluded=true commit_excluded=true\n",
                          model.deferredActivationCofireProbe ? "true" : "false",
                          model.deferredActivationCofirePairs.size());
+        }
+        if (deferredActivationCofireStrictRequested)
+        {
+            if (deferredActivationCofirePairs.size() != kStage30StrictPairSpecs.size())
+            {
+                reportError("deferred activation cofire strict produced an unexpected pair count",
+                            sessionPrefix);
+                result.success = false;
+                return result;
+            }
+            BoundaryActivationFanoutMap strictFanout = model.boundaryFanoutByValue;
+            std::unordered_map<uint32_t, std::vector<uint32_t>> strictTargetsBySource;
+            std::unordered_set<ValueId, ValueIdHash> strictValues;
+            for (std::size_t pairIndex = 0;
+                 pairIndex < deferredActivationCofirePairs.size();
+                 ++pairIndex)
+            {
+                const DeferredActivationCofirePair &pair = deferredActivationCofirePairs[pairIndex];
+                const DeferredActivationStrictPairSpec &spec = kStage30StrictPairSpecs[pairIndex];
+                if (pair.source != spec.source || pair.target != spec.target ||
+                    pair.values.size() != spec.valueCount)
+                {
+                    reportError("deferred activation cofire strict pair/value reconstruction mismatch",
+                                sessionPrefix);
+                    result.success = false;
+                    return result;
+                }
+                for (ValueId value : pair.values)
+                {
+                    const auto fanoutIt = strictFanout.find(value);
+                    if (fanoutIt == strictFanout.end() || fanoutIt->second.size() != 1u ||
+                        fanoutIt->second.front() != pair.targetActiveId ||
+                        !strictValues.emplace(value).second)
+                    {
+                        reportError("deferred activation cofire strict value fanout is not exclusive",
+                                    sessionPrefix);
+                        result.success = false;
+                        return result;
+                    }
+                    fanoutIt->second.clear();
+                }
+                strictTargetsBySource[pair.source].push_back(pair.targetActiveId);
+            }
+            for (auto &[source, targets] : strictTargetsBySource)
+            {
+                (void)source;
+                sortUniqueVector(targets);
+            }
+            model.deferredActivationCofireStrictFanoutByValue = std::move(strictFanout);
+            model.deferredActivationCofireStrictTargetsBySource = std::move(strictTargetsBySource);
+            model.deferredActivationCofireStrict = true;
+            std::fprintf(stderr,
+                         "[GRHSIM_DEFERRED_ACTIVATION_STRICT] overlay=true pairs=%zu values=%zu fullpass_excluded=true commit_excluded=true seed_excluded=true\n",
+                         deferredActivationCofirePairs.size(),
+                         strictValues.size());
         }
         const std::filesystem::path makefilePath = outDir / "Makefile";
         const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";

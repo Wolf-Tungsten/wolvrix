@@ -4014,6 +4014,28 @@ namespace
             "cofire-strict",
             profilePath,
             "probe");
+        const ActiveMaskGapPackEmitRun cofireStrictExtendedWrongPairSetRun =
+            runDeferredActivationForwardEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "cofire_strict_extended_wrong_pair_set",
+                "cofire-strict-extended",
+                profilePath);
+        const ActiveMaskGapPackEmitRun cofireStrictExtendedInvalidProfileRun =
+            runDeferredActivationForwardEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "cofire_strict_extended_invalid_profile",
+                "cofire-strict-extended",
+                invalidProfilePath);
+        const ActiveMaskGapPackEmitRun cofireStrictExtendedActiveMaskRun =
+            runDeferredActivationForwardEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "cofire_strict_extended_active_mask",
+                "cofire-strict-extended",
+                profilePath,
+                "probe");
         if (!defaultRun.success || defaultRun.diagnosticError ||
             !offRun.success || offRun.diagnosticError ||
             !probeRun.success || probeRun.diagnosticError ||
@@ -4144,6 +4166,28 @@ namespace
         {
             return fail("deferred-activation cofire strict must fail closed on a changed pair set or profile");
         }
+        if (cofireStrictExtendedWrongPairSetRun.success ||
+            !cofireStrictExtendedWrongPairSetRun.diagnosticError ||
+            (cofireStrictExtendedWrongPairSetRun.stderrText.find("fail_closed=pair_missing") ==
+                 std::string::npos &&
+             cofireStrictExtendedWrongPairSetRun.stderrText.find("fail_closed=profile_shape") ==
+                 std::string::npos) ||
+            cofireStrictExtendedWrongPairSetRun.diagnostics.find("cofire policy failed closed") ==
+                std::string::npos ||
+            cofireStrictExtendedInvalidProfileRun.success ||
+            !cofireStrictExtendedInvalidProfileRun.diagnosticError ||
+            cofireStrictExtendedInvalidProfileRun.stderrText.find("profile_valid=false") ==
+                std::string::npos ||
+            cofireStrictExtendedInvalidProfileRun.diagnostics.find("cofire policy failed closed") ==
+                std::string::npos ||
+            cofireStrictExtendedActiveMaskRun.success ||
+            !cofireStrictExtendedActiveMaskRun.diagnosticError ||
+            cofireStrictExtendedActiveMaskRun.diagnostics.find(
+                "active_mask_gap_pack_policy=off") == std::string::npos)
+        {
+            return fail(
+                "deferred-activation cofire strict extended must fail closed on a changed pair set or profile");
+        }
 
         const ActiveMaskGapPackEmitRun invalidPolicyRun = runDeferredActivationForwardEmit(
             fixture.design,
@@ -4152,7 +4196,9 @@ namespace
             "strict",
             profilePath);
         if (invalidPolicyRun.success || !invalidPolicyRun.diagnosticError ||
-            invalidPolicyRun.diagnostics.find("expected off, probe, cofire-probe, or cofire-strict") == std::string::npos)
+            invalidPolicyRun.diagnostics.find(
+                "expected off, probe, cofire-probe, cofire-strict, or cofire-strict-extended") ==
+                std::string::npos)
         {
             return fail("deferred-activation forward invalid policy must be rejected");
         }

@@ -234,10 +234,10 @@ namespace wolvrix::app::pybind
         {
             const std::string policy(deferredActivationForwardPolicy);
             if (policy != "off" && policy != "probe" && policy != "cofire-probe" &&
-                policy != "cofire-strict")
+                policy != "cofire-strict" && policy != "cofire-strict-extended")
             {
                 PyErr_SetString(PyExc_ValueError,
-                                "deferred_activation_forward_policy must be one of: off, probe, cofire-probe, cofire-strict");
+                                "deferred_activation_forward_policy must be one of: off, probe, cofire-probe, cofire-strict, cofire-strict-extended");
                 return nullptr;
             }
         }

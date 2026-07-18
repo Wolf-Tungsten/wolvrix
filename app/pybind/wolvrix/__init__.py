@@ -860,9 +860,16 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
     if deferred_activation_forward_policy is not None:
         if not isinstance(deferred_activation_forward_policy, str):
             raise ValueError("emit_grhsim_cpp deferred_activation_forward_policy must be a string")
-        if deferred_activation_forward_policy not in {"off", "probe", "cofire-probe", "cofire-strict"}:
+        if deferred_activation_forward_policy not in {
+            "off",
+            "probe",
+            "cofire-probe",
+            "cofire-strict",
+            "cofire-strict-extended",
+        }:
             raise ValueError(
-                "emit_grhsim_cpp deferred_activation_forward_policy must be one of: off, probe, cofire-probe, cofire-strict"
+                "emit_grhsim_cpp deferred_activation_forward_policy must be one of: "
+                "off, probe, cofire-probe, cofire-strict, cofire-strict-extended"
             )
     deferred_activation_forward_profile_path = local.pop(
         "deferred_activation_forward_profile_path", None

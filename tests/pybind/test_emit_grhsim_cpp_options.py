@@ -86,7 +86,13 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": value})
 
     def test_python_deferred_activation_forward_validation(self) -> None:
-        for value in ("off", "probe", "cofire-probe", "cofire-strict"):
+        for value in (
+            "off",
+            "probe",
+            "cofire-probe",
+            "cofire-strict",
+            "cofire-strict-extended",
+        ):
             with self.subTest(value=value):
                 _compile_emit_grhsim_cpp_kwargs(
                     {"deferred_activation_forward_policy": value}
@@ -113,7 +119,12 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
 
     def test_native_keyword_is_accepted(self) -> None:
         with wolvrix.Session() as session:
-            for policy in ("probe", "cofire-probe", "cofire-strict"):
+            for policy in (
+                "probe",
+                "cofire-probe",
+                "cofire-strict",
+                "cofire-strict-extended",
+            ):
                 with self.subTest(policy=policy):
                     with self.assertRaisesRegex(KeyError, "design key not found"):
                         native.session_emit_grhsim_cpp(

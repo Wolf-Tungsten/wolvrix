@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <set>
 #include <sstream>
 #include <streambuf>
@@ -2490,6 +2491,7 @@ namespace wolvrix::lib::emit
             kProbe,
             kCofireProbe,
             kCofireStrict,
+            kCofireStrictExtended,
         };
 
         std::string_view deferredActivationForwardPolicyName(
@@ -2505,6 +2507,8 @@ namespace wolvrix::lib::emit
                 return "cofire-probe";
             case DeferredActivationForwardPolicy::kCofireStrict:
                 return "cofire-strict";
+            case DeferredActivationForwardPolicy::kCofireStrictExtended:
+                return "cofire-strict-extended";
             }
             return "off";
         }
@@ -2539,6 +2543,10 @@ namespace wolvrix::lib::emit
             if (value == "cofire-strict")
             {
                 return DeferredActivationForwardPolicy::kCofireStrict;
+            }
+            if (value == "cofire-strict-extended")
+            {
+                return DeferredActivationForwardPolicy::kCofireStrictExtended;
             }
             invalidValue = std::move(value);
             return std::nullopt;
@@ -3960,6 +3968,48 @@ namespace wolvrix::lib::emit
             {57292u, 57902u, 57911u, 58350u, 59u, 60u, 108u, 108u, 54u, UINT64_C(0xacb7a38891c7e847), 7091u, 7155u},
             {10635u, 27668u, 10260u, 28585u, 11u, 30u, 108u, 108u, 54u, UINT64_C(0x018b03789bbb07c4), 3557u, 3559u},
         }};
+
+        // Stage 31 keeps the Stage 30 contract byte-for-byte and appends the
+        // final Stage 29 row as an explicit extended experiment.  Its 141
+        // observed leader misses can add pure target work, but the immutable
+        // Stage 28 lower-bound proxy remains positive even if every source
+        // fire adds one target execution.
+        constexpr DeferredActivationStrictPairSpec kStage31ExtendedPairSpec{
+            35026u,
+            38043u,
+            25864u,
+            27857u,
+            28u,
+            30u,
+            92u,
+            86u,
+            43u,
+            UINT64_C(0x91cd730c99b00052),
+            3220u,
+            3649u,
+        };
+
+        constexpr std::array<DeferredActivationStrictPairSpec, 13>
+            kStage31StrictExtendedPairSpecs = []
+        {
+            std::array<DeferredActivationStrictPairSpec, 13> specs{};
+            for (std::size_t index = 0; index < kStage30StrictPairSpecs.size(); ++index)
+            {
+                specs[index] = kStage30StrictPairSpecs[index];
+            }
+            specs.back() = kStage31ExtendedPairSpec;
+            return specs;
+        }();
+
+        std::span<const DeferredActivationStrictPairSpec> deferredActivationStrictPairSpecs(
+            DeferredActivationForwardPolicy policy) noexcept
+        {
+            if (policy == DeferredActivationForwardPolicy::kCofireStrictExtended)
+            {
+                return kStage31StrictExtendedPairSpecs;
+            }
+            return kStage30StrictPairSpecs;
+        }
 
         std::uint64_t deferredActivationValueFingerprint(
             const std::vector<ValueId> &values) noexcept
@@ -7801,7 +7851,9 @@ namespace wolvrix::lib::emit
             // the corrected Stage 28 production report.  Do not silently
             // widen this runtime experiment when ranking changes.
             constexpr std::size_t kExpectedCofirePairs = 13;
-            const bool strictOverlay = policy == DeferredActivationForwardPolicy::kCofireStrict;
+            const bool strictOverlay =
+                policy == DeferredActivationForwardPolicy::kCofireStrict ||
+                policy == DeferredActivationForwardPolicy::kCofireStrictExtended;
 
             DeferredActivationForwardProbeStats stats;
             const DeferredActivationForwardProfile profile =
@@ -8417,6 +8469,8 @@ namespace wolvrix::lib::emit
                 }
                 std::unordered_set<uint32_t> strictSupernodes;
                 std::unordered_set<ValueId, ValueIdHash> strictValues;
+                const std::span<const DeferredActivationStrictPairSpec> strictPairSpecs =
+                    deferredActivationStrictPairSpecs(policy);
                 const auto strictSupernodePure = [&](uint32_t supernodeId)
                 {
                     if (!isComputeSupernode(supernodeId) ||
@@ -8440,10 +8494,9 @@ namespace wolvrix::lib::emit
                     }
                     return true;
                 };
-                for (std::size_t specIndex = 0; specIndex < kStage30StrictPairSpecs.size(); ++specIndex)
+                for (std::size_t specIndex = 0; specIndex < strictPairSpecs.size(); ++specIndex)
                 {
-                    const DeferredActivationStrictPairSpec &spec =
-                        kStage30StrictPairSpecs[specIndex];
+                    const DeferredActivationStrictPairSpec &spec = strictPairSpecs[specIndex];
                     const auto candidateIt = candidatesByPair.find({spec.source, spec.target});
                     if (candidateIt == candidatesByPair.end())
                     {
@@ -8649,17 +8702,30 @@ namespace wolvrix::lib::emit
                     strictOverlayStats.updatedBytes,
                     strictOverlayStats.estimatedActivationLines,
                     strictOverlayWork);
-                if (strictControlWork != 3262u || strictOverlayWork != 1953u ||
-                    strictControlStats.estimatedActivationLines != 423u ||
-                    strictOverlayStats.estimatedActivationLines != 445u ||
-                    strictOverlayStats.unconditionalForwardGroups != 12u)
+                const bool extendedStrict =
+                    policy == DeferredActivationForwardPolicy::kCofireStrictExtended;
+                const std::size_t expectedControlWork = extendedStrict ? 3525u : 3262u;
+                const std::size_t expectedOverlayWork = extendedStrict ? 2129u : 1953u;
+                const std::size_t expectedControlLines = extendedStrict ? 442u : 423u;
+                const std::size_t expectedOverlayLines = extendedStrict ? 466u : 445u;
+                const std::size_t expectedForwardGroups = extendedStrict ? 13u : 12u;
+                if (strictControlWork != expectedControlWork ||
+                    strictOverlayWork != expectedOverlayWork ||
+                    strictControlStats.estimatedActivationLines != expectedControlLines ||
+                    strictOverlayStats.estimatedActivationLines != expectedOverlayLines ||
+                    strictOverlayStats.unconditionalForwardGroups != expectedForwardGroups)
                 {
                     std::fprintf(stderr,
-                                 "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=accounting expected_control_work=3262 actual_control_work=%zu expected_overlay_work=1953 actual_overlay_work=%zu expected_control_lines=423 actual_control_lines=%zu expected_overlay_lines=445 actual_overlay_lines=%zu expected_forward_groups=12 actual_forward_groups=%zu\n",
+                                 "[GRHSIM_DEFERRED_ACTIVATION_STRICT] fail_closed=accounting expected_control_work=%zu actual_control_work=%zu expected_overlay_work=%zu actual_overlay_work=%zu expected_control_lines=%zu actual_control_lines=%zu expected_overlay_lines=%zu actual_overlay_lines=%zu expected_forward_groups=%zu actual_forward_groups=%zu\n",
+                                 expectedControlWork,
                                  strictControlWork,
+                                 expectedOverlayWork,
                                  strictOverlayWork,
+                                 expectedControlLines,
                                  strictControlStats.estimatedActivationLines,
+                                 expectedOverlayLines,
                                  strictOverlayStats.estimatedActivationLines,
+                                 expectedForwardGroups,
                                  strictOverlayStats.unconditionalForwardGroups);
                     return false;
                 }
@@ -20872,7 +20938,8 @@ namespace wolvrix::lib::emit
         {
             reportError("invalid deferred_activation_forward_policy: " +
                         invalidDeferredActivationForwardPolicy +
-                        " (expected off, probe, cofire-probe, or cofire-strict)");
+                        " (expected off, probe, cofire-probe, cofire-strict, or "
+                        "cofire-strict-extended)");
             result.success = false;
             return result;
         }
@@ -20881,7 +20948,9 @@ namespace wolvrix::lib::emit
         const bool deferredActivationCofireProbeRequested =
             *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe;
         const bool deferredActivationCofireStrictRequested =
-            *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireStrict;
+            *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireStrict ||
+            *deferredActivationForwardPolicy ==
+                DeferredActivationForwardPolicy::kCofireStrictExtended;
         std::string invalidWordPackPolicy;
         const auto pureEventWordPackPolicy =
             parsePureEventWordPackPolicy(options, invalidWordPackPolicy);
@@ -21285,7 +21354,9 @@ namespace wolvrix::lib::emit
                     static_cast<int>(deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).size()),
                     deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).data());
                 if (*deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireProbe ||
-                    *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireStrict)
+                    *deferredActivationForwardPolicy == DeferredActivationForwardPolicy::kCofireStrict ||
+                    *deferredActivationForwardPolicy ==
+                        DeferredActivationForwardPolicy::kCofireStrictExtended)
                 {
                     reportError("deferred activation cofire policy requires active_mask_gap_pack_policy=off",
                                 sessionPrefix);
@@ -21324,7 +21395,9 @@ namespace wolvrix::lib::emit
         }
         if (deferredActivationCofireStrictRequested)
         {
-            if (deferredActivationCofirePairs.size() != kStage30StrictPairSpecs.size())
+            const std::span<const DeferredActivationStrictPairSpec> strictPairSpecs =
+                deferredActivationStrictPairSpecs(*deferredActivationForwardPolicy);
+            if (deferredActivationCofirePairs.size() != strictPairSpecs.size())
             {
                 reportError("deferred activation cofire strict produced an unexpected pair count",
                             sessionPrefix);
@@ -21339,7 +21412,7 @@ namespace wolvrix::lib::emit
                  ++pairIndex)
             {
                 const DeferredActivationCofirePair &pair = deferredActivationCofirePairs[pairIndex];
-                const DeferredActivationStrictPairSpec &spec = kStage30StrictPairSpecs[pairIndex];
+                const DeferredActivationStrictPairSpec &spec = strictPairSpecs[pairIndex];
                 if (pair.source != spec.source || pair.target != spec.target ||
                     pair.values.size() != spec.valueCount)
                 {

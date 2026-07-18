@@ -446,6 +446,12 @@ target_compile_definitions(emit-grhsim-cpp
 )
 
 register_test_exe(emit-grhsim-cpp)
+add_test(NAME emit-grhsim-cpp-deferred-activation-forward
+         COMMAND emit-grhsim-cpp)
+set_tests_properties(
+    emit-grhsim-cpp-deferred-activation-forward
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_DEFERRED_ACTIVATION_FORWARD=1"
+)
 
 add_executable(emit-grhsim-cpp-memory-fill
     tests/emit/test_emit_grhsim_cpp_memory_fill.cpp

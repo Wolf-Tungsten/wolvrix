@@ -36,10 +36,14 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 direct_single_writer_state_reads=None,
                 pure_event_compute_word_bypass=None,
                 active_mask_gap_pack_policy=None,
+                deferred_activation_forward_policy=None,
+                deferred_activation_forward_profile_path=None,
             )
             self.assertNotIn("direct_single_writer_state_reads", calls[-1][1])
             self.assertNotIn("pure_event_compute_word_bypass", calls[-1][1])
             self.assertNotIn("active_mask_gap_pack_policy", calls[-1][1])
+            self.assertNotIn("deferred_activation_forward_policy", calls[-1][1])
+            self.assertNotIn("deferred_activation_forward_profile_path", calls[-1][1])
 
             wolvrix.Session.emit_grhsim_cpp(
                 DummySession(),
@@ -48,10 +52,17 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 direct_single_writer_state_reads=False,
                 pure_event_compute_word_bypass=False,
                 active_mask_gap_pack_policy="targeted-direct",
+                deferred_activation_forward_policy="probe",
+                deferred_activation_forward_profile_path="/tmp/fire.tsv",
             )
             self.assertIs(calls[-1][1]["direct_single_writer_state_reads"], False)
             self.assertIs(calls[-1][1]["pure_event_compute_word_bypass"], False)
             self.assertEqual(calls[-1][1]["active_mask_gap_pack_policy"], "targeted-direct")
+            self.assertEqual(calls[-1][1]["deferred_activation_forward_policy"], "probe")
+            self.assertEqual(
+                calls[-1][1]["deferred_activation_forward_profile_path"],
+                "/tmp/fire.tsv",
+            )
         finally:
             wolvrix._native = original_native
 
@@ -74,6 +85,32 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _compile_emit_grhsim_cpp_kwargs({"active_mask_gap_pack_policy": value})
 
+    def test_python_deferred_activation_forward_validation(self) -> None:
+        for value in ("off", "probe"):
+            with self.subTest(value=value):
+                _compile_emit_grhsim_cpp_kwargs(
+                    {"deferred_activation_forward_policy": value}
+                )
+        _compile_emit_grhsim_cpp_kwargs(
+            {"deferred_activation_forward_profile_path": "/tmp/fire.tsv"}
+        )
+        for value in ("", "strict", " probe ", False, 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "deferred_activation_forward_policy"
+                ):
+                    _compile_emit_grhsim_cpp_kwargs(
+                        {"deferred_activation_forward_policy": value}
+                    )
+        for value in (False, 1, ["/tmp/fire.tsv"]):
+            with self.subTest(profile_path=value):
+                with self.assertRaisesRegex(
+                    ValueError, "deferred_activation_forward_profile_path"
+                ):
+                    _compile_emit_grhsim_cpp_kwargs(
+                        {"deferred_activation_forward_profile_path": value}
+                    )
+
     def test_native_keyword_is_accepted(self) -> None:
         with wolvrix.Session() as session:
             with self.assertRaisesRegex(KeyError, "design key not found"):
@@ -84,6 +121,43 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     top=[],
                     direct_single_writer_state_reads=False,
                     active_mask_gap_pack_policy="targeted-direct",
+                    deferred_activation_forward_policy="probe",
+                    deferred_activation_forward_profile_path="/tmp/fire.tsv",
+                )
+
+    def test_native_deferred_activation_forward_policy_rejects_invalid_value(self) -> None:
+        with wolvrix.Session() as session:
+            for value in ("", "strict", "targeted"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "deferred_activation_forward_policy"
+                    ):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            deferred_activation_forward_policy=value,
+                        )
+
+    def test_native_deferred_activation_forward_accepts_explicit_none(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    deferred_activation_forward_policy=None,
+                    deferred_activation_forward_profile_path=None,
+                )
+
+    def test_native_deferred_activation_forward_profile_path_rejects_non_string(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaises(TypeError):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    deferred_activation_forward_profile_path=1,
                 )
 
     def test_native_active_mask_gap_pack_policy_rejects_invalid_value(self) -> None:
@@ -149,9 +223,18 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 native.session_emit_grhsim_cpp(*legacy_args)
             with self.assertRaisesRegex(KeyError, "design key not found"):
                 native.session_emit_grhsim_cpp(*legacy_args, "targeted-direct")
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    *legacy_args,
+                    "targeted-direct",
+                    "probe",
+                    "/tmp/fire.tsv",
+                )
 
         self.assertIn(
-            "direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None",
+            "direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None, "
+            "deferred_activation_forward_policy=None, "
+            "deferred_activation_forward_profile_path=None",
             native.session_emit_grhsim_cpp.__doc__,
         )
 

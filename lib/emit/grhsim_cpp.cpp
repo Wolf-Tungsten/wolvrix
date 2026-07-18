@@ -2475,6 +2475,66 @@ namespace wolvrix::lib::emit
             return std::nullopt;
         }
 
+        enum class DeferredActivationForwardPolicy
+        {
+            kOff,
+            kProbe,
+        };
+
+        std::string_view deferredActivationForwardPolicyName(
+            DeferredActivationForwardPolicy policy) noexcept
+        {
+            switch (policy)
+            {
+            case DeferredActivationForwardPolicy::kOff:
+                return "off";
+            case DeferredActivationForwardPolicy::kProbe:
+                return "probe";
+            }
+            return "off";
+        }
+
+        std::optional<DeferredActivationForwardPolicy> parseDeferredActivationForwardPolicy(
+            const EmitOptions &options,
+            std::string &invalidValue)
+        {
+            std::string value = "off";
+            if (const auto it = options.attributes.find("deferred_activation_forward_policy");
+                it != options.attributes.end())
+            {
+                value = it->second;
+            }
+            else if (const char *env = std::getenv("WOLVRIX_GRHSIM_DEFERRED_ACTIVATION_FORWARD_POLICY"))
+            {
+                value = env;
+            }
+
+            if (value.empty() || value == "off")
+            {
+                return DeferredActivationForwardPolicy::kOff;
+            }
+            if (value == "probe")
+            {
+                return DeferredActivationForwardPolicy::kProbe;
+            }
+            invalidValue = std::move(value);
+            return std::nullopt;
+        }
+
+        std::string parseDeferredActivationForwardProfilePath(const EmitOptions &options)
+        {
+            if (const auto it = options.attributes.find("deferred_activation_forward_profile_path");
+                it != options.attributes.end())
+            {
+                return it->second;
+            }
+            if (const char *env = std::getenv("WOLVRIX_GRHSIM_DEFERRED_ACTIVATION_FORWARD_PROFILE_PATH"))
+            {
+                return env;
+            }
+            return {};
+        }
+
         enum class PureEventWordPackPolicy
         {
             kOff,
@@ -6723,10 +6783,15 @@ namespace wolvrix::lib::emit
                                                 ActiveMaskGapPackSite::kGeneric);
         }
 
-        DeferredActivationGroups buildDeferredActivationGroups(const Graph &graph,
-                                                               const EmitModel &model,
-                                                               const ActivityScheduleSupernodeToOps &supernodeToOps,
-                                                               uint32_t supernodeId)
+        using BoundaryActivationFanoutMap =
+            std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash>;
+
+        DeferredActivationGroups buildDeferredActivationGroupsForFanout(
+            const Graph &graph,
+            const EmitModel &model,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            uint32_t supernodeId,
+            const BoundaryActivationFanoutMap &boundaryFanoutByValue)
         {
             constexpr std::size_t kMinDeferredGroupValues = 2;
             constexpr std::size_t kMaxDeferredGroupsPerSupernode = 16;
@@ -6758,8 +6823,8 @@ namespace wolvrix::lib::emit
                     {
                         continue;
                     }
-                    const auto fanoutIt = model.boundaryFanoutByValue.find(resultValue);
-                    if (fanoutIt == model.boundaryFanoutByValue.end() || fanoutIt->second.empty())
+                    const auto fanoutIt = boundaryFanoutByValue.find(resultValue);
+                    if (fanoutIt == boundaryFanoutByValue.end() || fanoutIt->second.empty())
                     {
                         continue;
                     }
@@ -6836,6 +6901,1429 @@ namespace wolvrix::lib::emit
                 groups[i].changedExpr = "grhsim_any_changed_" + std::to_string(supernodeId) + "_" + std::to_string(i);
             }
             return groups;
+        }
+
+        DeferredActivationGroups buildDeferredActivationGroups(
+            const Graph &graph,
+            const EmitModel &model,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            uint32_t supernodeId)
+        {
+            return buildDeferredActivationGroupsForFanout(
+                graph,
+                model,
+                supernodeToOps,
+                supernodeId,
+                model.boundaryFanoutByValue);
+        }
+
+        struct DeferredActivationLoweringStats
+        {
+            std::size_t computeSources = 0;
+            std::size_t trackedChangeValues = 0;
+            std::size_t directValueGroups = 0;
+            std::size_t deferredGroups = 0;
+            std::size_t deferredSourceValueUpdates = 0;
+            std::size_t deferredDirectGroups = 0;
+            std::size_t deferredAggregateGroups = 0;
+            std::size_t unconditionalForwardGroups = 0;
+            std::size_t activeMaskEntries = 0;
+            std::size_t plannedChunks = 0;
+            std::array<std::size_t, 4> emittedChunksByWidth{};
+            std::size_t tableGroups = 0;
+            std::size_t tableEntries = 0;
+            std::size_t branchlessGroups = 0;
+            std::size_t guardedGroups = 0;
+            std::size_t conditionalMaskUpdates = 0;
+            std::size_t localRmw = 0;
+            std::size_t globalRmw = 0;
+            std::size_t updatedBytes = 0;
+            std::size_t estimatedActivationLines = 0;
+
+            DeferredActivationLoweringStats &operator+=(
+                const DeferredActivationLoweringStats &other) noexcept
+            {
+                computeSources += other.computeSources;
+                trackedChangeValues += other.trackedChangeValues;
+                directValueGroups += other.directValueGroups;
+                deferredGroups += other.deferredGroups;
+                deferredSourceValueUpdates += other.deferredSourceValueUpdates;
+                deferredDirectGroups += other.deferredDirectGroups;
+                deferredAggregateGroups += other.deferredAggregateGroups;
+                unconditionalForwardGroups += other.unconditionalForwardGroups;
+                activeMaskEntries += other.activeMaskEntries;
+                plannedChunks += other.plannedChunks;
+                for (std::size_t i = 0; i < emittedChunksByWidth.size(); ++i)
+                {
+                    emittedChunksByWidth[i] += other.emittedChunksByWidth[i];
+                }
+                tableGroups += other.tableGroups;
+                tableEntries += other.tableEntries;
+                branchlessGroups += other.branchlessGroups;
+                guardedGroups += other.guardedGroups;
+                conditionalMaskUpdates += other.conditionalMaskUpdates;
+                localRmw += other.localRmw;
+                globalRmw += other.globalRmw;
+                updatedBytes += other.updatedBytes;
+                estimatedActivationLines += other.estimatedActivationLines;
+                return *this;
+            }
+        };
+
+        enum class DeferredActivationFlushPath
+        {
+            kNone,
+            kDirect,
+            kAggregate,
+        };
+
+        struct DeferredActivationSourceAccounting
+        {
+            DeferredActivationLoweringStats stats;
+            DeferredActivationFlushPath flushPath = DeferredActivationFlushPath::kNone;
+        };
+
+        struct DeferredActivationAccountingResult
+        {
+            DeferredActivationLoweringStats stats;
+            std::vector<DeferredActivationSourceAccounting> bySupernode;
+        };
+
+        struct ActiveIdPartition
+        {
+            std::vector<uint32_t> local;
+            std::vector<uint32_t> global;
+        };
+
+        ActiveIdPartition partitionActiveIdsForSource(
+            const std::vector<uint32_t> &activeIds,
+            std::size_t currentActiveId)
+        {
+            ActiveIdPartition partition;
+            partition.local.reserve(activeIds.size());
+            partition.global.reserve(activeIds.size());
+            const std::size_t currentWordIndex = currentActiveId / kActiveFlagBitsPerWord;
+            const std::size_t currentBitIndex = currentActiveId % kActiveFlagBitsPerWord;
+            for (uint32_t activeId : activeIds)
+            {
+                const std::size_t targetWordIndex =
+                    static_cast<std::size_t>(activeId) / kActiveFlagBitsPerWord;
+                const std::size_t targetBitIndex =
+                    static_cast<std::size_t>(activeId) % kActiveFlagBitsPerWord;
+                if (targetWordIndex == currentWordIndex && targetBitIndex > currentBitIndex)
+                {
+                    partition.local.push_back(activeId);
+                }
+                else
+                {
+                    partition.global.push_back(activeId);
+                }
+            }
+            return partition;
+        }
+
+        std::size_t activeMaskChunkWidthIndex(std::size_t width) noexcept
+        {
+            switch (width)
+            {
+            case 1:
+                return 0;
+            case 2:
+                return 1;
+            case 4:
+                return 2;
+            case 8:
+                return 3;
+            default:
+                return 0;
+            }
+        }
+
+        void accountEmittedChunks(const std::vector<ActiveMaskChunk> &chunks,
+                                  DeferredActivationLoweringStats &stats)
+        {
+            for (const auto &chunk : chunks)
+            {
+                ++stats.emittedChunksByWidth[activeMaskChunkWidthIndex(chunk.byteWidth)];
+                ++stats.globalRmw;
+                stats.updatedBytes += chunk.byteWidth;
+            }
+        }
+
+        void accountConditionalActivation(const std::vector<uint32_t> &activeIds,
+                                          std::size_t currentActiveId,
+                                          DeferredActivationLoweringStats &stats)
+        {
+            if (activeIds.empty())
+            {
+                return;
+            }
+            const ActiveIdPartition partition =
+                partitionActiveIdsForSource(activeIds, currentActiveId);
+            const std::vector<ActiveMaskEntry> entries =
+                buildActiveMaskEntries(partition.global);
+            const std::vector<ActiveMaskChunk> chunks = buildActiveMaskChunks(entries);
+            stats.activeMaskEntries += entries.size();
+            stats.plannedChunks += chunks.size();
+            const std::size_t statementCount =
+                (partition.local.empty() ? 0u : 1u) + chunks.size();
+            const bool table = entries.size() >= kActivationTableThreshold;
+            const bool guarded = table || statementCount > 3u;
+            if (guarded)
+            {
+                const ActivationEmitContext context{
+                    .currentWordIndex = currentActiveId / kActiveFlagBitsPerWord,
+                    .currentActiveId = currentActiveId,
+                    .localActiveExpr = "activeWordFlags"};
+                ++stats.guardedGroups;
+                stats.estimatedActivationLines +=
+                    2u + estimateActivationEmitLines(activeIds, &context);
+            }
+            else
+            {
+                ++stats.branchlessGroups;
+                stats.estimatedActivationLines += statementCount;
+                stats.conditionalMaskUpdates += statementCount;
+            }
+            if (!partition.local.empty())
+            {
+                ++stats.localRmw;
+                ++stats.updatedBytes;
+            }
+            if (table)
+            {
+                ++stats.tableGroups;
+                stats.tableEntries += entries.size();
+                stats.globalRmw += entries.size();
+                stats.updatedBytes += entries.size();
+            }
+            else
+            {
+                accountEmittedChunks(chunks, stats);
+            }
+        }
+
+        void accountUnconditionalActivation(const std::vector<uint32_t> &activeIds,
+                                            std::size_t currentActiveId,
+                                            DeferredActivationLoweringStats &stats)
+        {
+            if (activeIds.empty())
+            {
+                return;
+            }
+            ++stats.unconditionalForwardGroups;
+            const ActiveIdPartition partition =
+                partitionActiveIdsForSource(activeIds, currentActiveId);
+            const std::vector<ActiveMaskEntry> entries =
+                buildActiveMaskEntries(partition.global);
+            const std::vector<ActiveMaskChunk> chunks = buildActiveMaskChunks(entries);
+            stats.activeMaskEntries += entries.size();
+            stats.plannedChunks += chunks.size();
+            const ActivationEmitContext context{
+                .currentWordIndex = currentActiveId / kActiveFlagBitsPerWord,
+                .currentActiveId = currentActiveId,
+                .localActiveExpr = "activeWordFlags"};
+            stats.estimatedActivationLines +=
+                estimateActivationEmitLines(activeIds, &context);
+            if (!partition.local.empty())
+            {
+                ++stats.localRmw;
+                ++stats.updatedBytes;
+            }
+            if (entries.size() >= kActivationTableThreshold)
+            {
+                ++stats.tableGroups;
+                stats.tableEntries += entries.size();
+                stats.globalRmw += entries.size();
+                stats.updatedBytes += entries.size();
+            }
+            else
+            {
+                accountEmittedChunks(chunks, stats);
+            }
+        }
+
+        DeferredActivationSourceAccounting accountDeferredActivationSource(
+            const Graph &graph,
+            const EmitModel &model,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            uint32_t supernodeId,
+            const BoundaryActivationFanoutMap &boundaryFanoutByValue)
+        {
+            DeferredActivationSourceAccounting accounting;
+            if (supernodeId >= supernodeToOps.size() ||
+                supernodeId >= model.activeIdBySupernode.size() ||
+                model.activeIdBySupernode[supernodeId] == kInvalidIndex)
+            {
+                return accounting;
+            }
+            const std::size_t currentActiveId = model.activeIdBySupernode[supernodeId];
+            const DeferredActivationGroups groups =
+                buildDeferredActivationGroupsForFanout(
+                    graph,
+                    model,
+                    supernodeToOps,
+                    supernodeId,
+                    boundaryFanoutByValue);
+            accounting.stats.computeSources = 1;
+            accounting.stats.deferredGroups = groups.size();
+            for (const auto &group : groups)
+            {
+                accounting.stats.deferredSourceValueUpdates += group.sourceValues.size();
+            }
+
+            for (OperationId opId : supernodeToOps[supernodeId])
+            {
+                const Operation op = graph.getOperation(opId);
+                for (ValueId resultValue : op.results())
+                {
+                    const auto fanoutIt = boundaryFanoutByValue.find(resultValue);
+                    const bool eventValue = isEventValue(model, resultValue);
+                    if (eventValue ||
+                        (fanoutIt != boundaryFanoutByValue.end() && !fanoutIt->second.empty()))
+                    {
+                        ++accounting.stats.trackedChangeValues;
+                    }
+                    if (fanoutIt == boundaryFanoutByValue.end() || fanoutIt->second.empty() ||
+                        model.directStateReadSymbolByValue.contains(resultValue))
+                    {
+                        continue;
+                    }
+                    std::vector<uint32_t> directActiveIds = fanoutIt->second;
+                    if (!eventValue)
+                    {
+                        for (const auto &group : groups)
+                        {
+                            if (!containsValueId(group.sourceValues, resultValue))
+                            {
+                                continue;
+                            }
+                            std::vector<uint32_t> remaining;
+                            remaining.reserve(directActiveIds.size());
+                            std::set_difference(directActiveIds.begin(),
+                                                directActiveIds.end(),
+                                                group.activeIds.begin(),
+                                                group.activeIds.end(),
+                                                std::back_inserter(remaining));
+                            directActiveIds = std::move(remaining);
+                        }
+                    }
+                    if (!directActiveIds.empty())
+                    {
+                        ++accounting.stats.directValueGroups;
+                        accountConditionalActivation(
+                            directActiveIds,
+                            currentActiveId,
+                            accounting.stats);
+                    }
+                }
+            }
+
+            if (groups.empty())
+            {
+                return accounting;
+            }
+
+            std::size_t directCost = 0;
+            std::size_t aggregateUpdateCost = 0;
+            std::size_t aggregatePlannedChunks = 0;
+            std::size_t localUpdates = 0;
+            std::map<std::size_t, std::size_t> updatesByWord;
+            std::size_t totalGlobalEntries = 0;
+            for (const auto &group : groups)
+            {
+                const ActivationEmitContext context{
+                    .currentWordIndex = currentActiveId / kActiveFlagBitsPerWord,
+                    .currentActiveId = currentActiveId,
+                    .localActiveExpr = "activeWordFlags"};
+                directCost += estimateConditionalActivationEmitCost(group.activeIds, &context);
+                const ActiveIdPartition partition =
+                    partitionActiveIdsForSource(group.activeIds, currentActiveId);
+                if (!partition.local.empty())
+                {
+                    ++localUpdates;
+                }
+                const std::vector<ActiveMaskEntry> entries =
+                    buildActiveMaskEntries(partition.global);
+                totalGlobalEntries += entries.size();
+                aggregatePlannedChunks += buildActiveMaskChunks(entries).size();
+                for (const auto &entry : entries)
+                {
+                    ++updatesByWord[entry.wordIndex];
+                    ++aggregateUpdateCost;
+                }
+            }
+            const std::size_t aggregateCost =
+                localUpdates + aggregateUpdateCost + (updatesByWord.size() * 2u);
+            if (updatesByWord.empty() || aggregateCost + 2u >= directCost)
+            {
+                accounting.flushPath = DeferredActivationFlushPath::kDirect;
+                accounting.stats.deferredDirectGroups += groups.size();
+                for (const auto &group : groups)
+                {
+                    accountConditionalActivation(
+                        group.activeIds,
+                        currentActiveId,
+                        accounting.stats);
+                }
+                return accounting;
+            }
+
+            accounting.flushPath = DeferredActivationFlushPath::kAggregate;
+            accounting.stats.deferredAggregateGroups += groups.size();
+            accounting.stats.branchlessGroups += groups.size();
+            accounting.stats.activeMaskEntries += totalGlobalEntries;
+            accounting.stats.plannedChunks += aggregatePlannedChunks;
+            accounting.stats.conditionalMaskUpdates += localUpdates + aggregateUpdateCost;
+            accounting.stats.localRmw += localUpdates;
+            accounting.stats.globalRmw += updatesByWord.size();
+            accounting.stats.updatedBytes += localUpdates + updatesByWord.size();
+            accounting.stats.estimatedActivationLines += aggregateCost;
+            accounting.stats.emittedChunksByWidth[0] += updatesByWord.size();
+            return accounting;
+        }
+
+        DeferredActivationAccountingResult accountDeferredActivationLowering(
+            const Graph &graph,
+            const EmitModel &model,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            const BoundaryActivationFanoutMap &boundaryFanoutByValue)
+        {
+            DeferredActivationAccountingResult result;
+            result.bySupernode.resize(supernodeToOps.size());
+            for (uint32_t supernodeId : model.computeSupernodeIds)
+            {
+                DeferredActivationSourceAccounting source =
+                    accountDeferredActivationSource(
+                        graph,
+                        model,
+                        supernodeToOps,
+                        supernodeId,
+                        boundaryFanoutByValue);
+                result.stats += source.stats;
+                result.bySupernode[supernodeId] = std::move(source);
+            }
+            return result;
+        }
+
+        struct DeferredActivationForwardProfile
+        {
+            bool valid = false;
+            std::size_t computeRows = 0;
+            std::size_t ignoredCommitRows = 0;
+            std::unordered_map<uint32_t, std::uint64_t> computeFire;
+            std::string error;
+        };
+
+        std::vector<std::string_view> splitTsvFields(std::string_view line)
+        {
+            std::vector<std::string_view> fields;
+            std::size_t begin = 0;
+            while (true)
+            {
+                const std::size_t end = line.find('\t', begin);
+                fields.push_back(line.substr(
+                    begin,
+                    end == std::string_view::npos ? line.size() - begin : end - begin));
+                if (end == std::string_view::npos)
+                {
+                    break;
+                }
+                begin = end + 1u;
+            }
+            return fields;
+        }
+
+        std::optional<std::uint64_t> parseStrictUnsigned64(std::string_view text)
+        {
+            if (text.empty() ||
+                !std::all_of(text.begin(), text.end(), [](unsigned char ch) { return std::isdigit(ch); }))
+            {
+                return std::nullopt;
+            }
+            try
+            {
+                std::size_t consumed = 0;
+                const unsigned long long value = std::stoull(std::string(text), &consumed, 10);
+                if (consumed != text.size())
+                {
+                    return std::nullopt;
+                }
+                return static_cast<std::uint64_t>(value);
+            }
+            catch (const std::exception &)
+            {
+                return std::nullopt;
+            }
+        }
+
+        DeferredActivationForwardProfile loadDeferredActivationForwardProfile(
+            const std::filesystem::path &path,
+            const std::vector<uint32_t> &computeSupernodeIds)
+        {
+            DeferredActivationForwardProfile profile;
+            if (path.empty())
+            {
+                profile.error = "profile path is empty";
+                return profile;
+            }
+            std::ifstream stream(path);
+            if (!stream.is_open())
+            {
+                profile.error = "failed to open profile";
+                return profile;
+            }
+            std::string line;
+            if (!std::getline(stream, line))
+            {
+                profile.error = "profile is empty";
+                return profile;
+            }
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
+            if (line != "supernode_id\tphase\tf")
+            {
+                profile.error = "profile header must be supernode_id, phase, f";
+                return profile;
+            }
+            std::unordered_set<uint32_t> expectedCompute(
+                computeSupernodeIds.begin(), computeSupernodeIds.end());
+            std::size_t lineNumber = 1;
+            while (std::getline(stream, line))
+            {
+                ++lineNumber;
+                if (!line.empty() && line.back() == '\r')
+                {
+                    line.pop_back();
+                }
+                if (line.empty())
+                {
+                    profile.error = "empty row at line " + std::to_string(lineNumber);
+                    return profile;
+                }
+                const auto fields = splitTsvFields(line);
+                if (fields.size() != 3)
+                {
+                    profile.error = "malformed row at line " + std::to_string(lineNumber);
+                    return profile;
+                }
+                const auto idValue = parseStrictUnsigned64(fields[0]);
+                const auto fireValue = parseStrictUnsigned64(fields[2]);
+                if (!idValue || !fireValue ||
+                    *idValue > std::numeric_limits<uint32_t>::max())
+                {
+                    profile.error = "invalid numeric field at line " + std::to_string(lineNumber);
+                    return profile;
+                }
+                const uint32_t supernodeId = static_cast<uint32_t>(*idValue);
+                if (fields[1] == "commit")
+                {
+                    ++profile.ignoredCommitRows;
+                    continue;
+                }
+                if (fields[1] != "compute" || !expectedCompute.contains(supernodeId))
+                {
+                    profile.error = "unknown compute row at line " + std::to_string(lineNumber);
+                    return profile;
+                }
+                if (!profile.computeFire.emplace(supernodeId, *fireValue).second)
+                {
+                    profile.error = "duplicate compute row at line " + std::to_string(lineNumber);
+                    return profile;
+                }
+                ++profile.computeRows;
+            }
+            if (stream.bad())
+            {
+                profile.error = "failed while reading profile";
+                return profile;
+            }
+            if (profile.computeFire.size() != expectedCompute.size())
+            {
+                profile.error = "profile does not cover every compute supernode";
+                return profile;
+            }
+            profile.valid = true;
+            return profile;
+        }
+
+        bool isDeferredActivationForwardPureKind(OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case OperationKind::kConstant:
+            case OperationKind::kAdd:
+            case OperationKind::kSub:
+            case OperationKind::kMul:
+            case OperationKind::kDiv:
+            case OperationKind::kMod:
+            case OperationKind::kEq:
+            case OperationKind::kNe:
+            case OperationKind::kCaseEq:
+            case OperationKind::kCaseNe:
+            case OperationKind::kWildcardEq:
+            case OperationKind::kWildcardNe:
+            case OperationKind::kLt:
+            case OperationKind::kLe:
+            case OperationKind::kGt:
+            case OperationKind::kGe:
+            case OperationKind::kAnd:
+            case OperationKind::kOr:
+            case OperationKind::kXor:
+            case OperationKind::kXnor:
+            case OperationKind::kNot:
+            case OperationKind::kLogicAnd:
+            case OperationKind::kLogicOr:
+            case OperationKind::kLogicNot:
+            case OperationKind::kReduceAnd:
+            case OperationKind::kReduceOr:
+            case OperationKind::kReduceXor:
+            case OperationKind::kReduceNor:
+            case OperationKind::kReduceNand:
+            case OperationKind::kReduceXnor:
+            case OperationKind::kShl:
+            case OperationKind::kLShr:
+            case OperationKind::kAShr:
+            case OperationKind::kMux:
+            case OperationKind::kAssign:
+            case OperationKind::kConcat:
+            case OperationKind::kReplicate:
+            case OperationKind::kSliceStatic:
+            case OperationKind::kSliceDynamic:
+            case OperationKind::kSliceArray:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        struct DeferredActivationForwardPairKey
+        {
+            uint32_t source = 0;
+            uint32_t target = 0;
+
+            bool operator<(const DeferredActivationForwardPairKey &other) const noexcept
+            {
+                return std::tie(source, target) < std::tie(other.source, other.target);
+            }
+        };
+
+        struct DeferredActivationForwardCandidate
+        {
+            uint32_t source = 0;
+            uint32_t target = 0;
+            uint32_t sourceActiveId = 0;
+            uint32_t targetActiveId = 0;
+            std::vector<ValueId> values;
+            std::uint64_t sourceFire = 0;
+            std::uint64_t targetFire = 0;
+            std::size_t sourceOps = 0;
+            std::size_t targetOps = 0;
+            std::size_t sourceBatch = kInvalidIndex;
+            std::size_t targetBatch = kInvalidIndex;
+            std::size_t sourceCpp = kInvalidIndex;
+            std::size_t targetCpp = kInvalidIndex;
+            DeferredActivationLoweringStats control;
+            DeferredActivationLoweringStats candidate;
+            DeferredActivationLoweringStats forward;
+            std::size_t staticSavedUnits = 0;
+            unsigned __int128 fireWeightedWorkProxyUpper = 0;
+            __int128 fireWeightedWorkProxyLower = 0;
+            bool selected = false;
+        };
+
+        struct DeferredActivationForwardProbeStats
+        {
+            std::size_t rawPairs = 0;
+            std::size_t sharedValuePairs = 0;
+            std::size_t exactEligible = 0;
+            std::size_t accounted = 0;
+            std::size_t staticPositive = 0;
+            std::size_t selected = 0;
+            std::size_t selectedValues = 0;
+            std::size_t rejectedMultiplicity = 0;
+            std::size_t rejectedPhaseOrOrder = 0;
+            std::size_t rejectedInputHead = 0;
+            std::size_t rejectedStateHead = 0;
+            std::size_t rejectedMemoryHead = 0;
+            std::size_t rejectedEventHead = 0;
+            std::size_t rejectedTargetKind = 0;
+            std::size_t rejectedNonexclusive = 0;
+            std::size_t rejectedProfile = 0;
+            std::size_t rejectedFireNecessary = 0;
+            std::size_t rejectedAccounting = 0;
+            std::size_t rejectedOverlap = 0;
+            std::size_t rejectedLimit = 0;
+            bool candidateScanTruncated = false;
+            std::size_t directToAggregate = 0;
+            std::size_t aggregateToDirect = 0;
+            std::size_t branchlessToGuarded = 0;
+            std::size_t guardedToBranchless = 0;
+            std::size_t tableEntered = 0;
+            std::size_t tableExited = 0;
+            std::size_t branchlessChangedSources = 0;
+            std::size_t guardedChangedSources = 0;
+            std::size_t tableChangedSources = 0;
+        };
+
+        std::size_t deferredActivationWorkUnits(
+            const DeferredActivationLoweringStats &stats) noexcept
+        {
+            return stats.trackedChangeValues +
+                   stats.deferredSourceValueUpdates +
+                   stats.conditionalMaskUpdates +
+                   stats.localRmw +
+                   stats.globalRmw +
+                   stats.guardedGroups;
+        }
+
+        std::string unsigned128Text(unsigned __int128 value)
+        {
+            if (value == 0)
+            {
+                return "0";
+            }
+            std::string text;
+            while (value != 0)
+            {
+                text.push_back(static_cast<char>('0' + (value % 10)));
+                value /= 10;
+            }
+            std::reverse(text.begin(), text.end());
+            return text;
+        }
+
+        std::string signed128Text(__int128 value)
+        {
+            if (value >= 0)
+            {
+                return unsigned128Text(static_cast<unsigned __int128>(value));
+            }
+            return "-" + unsigned128Text(static_cast<unsigned __int128>(-value));
+        }
+
+        std::string sizeDeltaText(std::size_t candidate, std::size_t control)
+        {
+            return candidate >= control
+                       ? "+" + std::to_string(candidate - control)
+                       : "-" + std::to_string(control - candidate);
+        }
+
+        void reportDeferredActivationAccounting(const char *kind,
+                                                const DeferredActivationLoweringStats &stats)
+        {
+            std::fprintf(
+                stderr,
+                "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] accounting=%s compute_sources=%zu tracked_change_values=%zu direct_value_groups=%zu deferred_groups=%zu deferred_source_value_updates=%zu deferred_direct_groups=%zu deferred_aggregate_groups=%zu forward_groups=%zu active_mask_entries=%zu planned_chunks=%zu chunk1=%zu chunk2=%zu chunk4=%zu chunk8=%zu table_groups=%zu table_entries=%zu branchless_groups=%zu guarded_groups=%zu conditional_mask_updates=%zu local_rmw=%zu global_rmw=%zu updated_bytes=%zu estimated_activation_lines=%zu work_units=%zu\n",
+                kind,
+                stats.computeSources,
+                stats.trackedChangeValues,
+                stats.directValueGroups,
+                stats.deferredGroups,
+                stats.deferredSourceValueUpdates,
+                stats.deferredDirectGroups,
+                stats.deferredAggregateGroups,
+                stats.unconditionalForwardGroups,
+                stats.activeMaskEntries,
+                stats.plannedChunks,
+                stats.emittedChunksByWidth[0],
+                stats.emittedChunksByWidth[1],
+                stats.emittedChunksByWidth[2],
+                stats.emittedChunksByWidth[3],
+                stats.tableGroups,
+                stats.tableEntries,
+                stats.branchlessGroups,
+                stats.guardedGroups,
+                stats.conditionalMaskUpdates,
+                stats.localRmw,
+                stats.globalRmw,
+                stats.updatedBytes,
+                stats.estimatedActivationLines,
+                deferredActivationWorkUnits(stats));
+        }
+
+        void runDeferredActivationForwardProbe(
+            const Graph &graph,
+            const EmitModel &model,
+            const ScheduleRefs &schedule,
+            const std::vector<ScheduleBatch> &scheduleBatches,
+            std::size_t schedBatchesPerCpp,
+            std::string_view cppPrefix,
+            DeferredActivationForwardPolicy policy,
+            const std::filesystem::path &profilePath)
+        {
+            if (policy == DeferredActivationForwardPolicy::kOff)
+            {
+                return;
+            }
+            constexpr std::size_t kMinSharedValues = 2;
+            constexpr std::size_t kMaxAccountedCandidates = 4096;
+            constexpr std::size_t kMaxSelectedCandidates = 128;
+            constexpr std::size_t kMaxReportedNearSelectedCandidates = 64;
+
+            DeferredActivationForwardProbeStats stats;
+            const DeferredActivationForwardProfile profile =
+                loadDeferredActivationForwardProfile(profilePath, model.computeSupernodeIds);
+            if (!profile.valid)
+            {
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] policy=%.*s profile_valid=false profile_compute_rows=%zu profile_ignored_commit_rows=%zu selected=0 error=%s\n",
+                    static_cast<int>(deferredActivationForwardPolicyName(policy).size()),
+                    deferredActivationForwardPolicyName(policy).data(),
+                    profile.computeRows,
+                    profile.ignoredCommitRows,
+                    profile.error.c_str());
+                return;
+            }
+
+            const std::size_t supernodeCount = schedule.supernodeToOps.size();
+            std::vector<uint32_t> ownerByOp;
+            if (!graph.operations().empty())
+            {
+                ownerByOp.assign(
+                    graph.operations().back().index + 1u,
+                    std::numeric_limits<uint32_t>::max());
+            }
+            for (uint32_t supernodeId = 0; supernodeId < supernodeCount; ++supernodeId)
+            {
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    if (opId.index >= ownerByOp.size())
+                    {
+                        ownerByOp.resize(
+                            opId.index + 1u,
+                            std::numeric_limits<uint32_t>::max());
+                    }
+                    ownerByOp[opId.index] = supernodeId;
+                }
+            }
+            const auto ownerOfValue = [&](ValueId value)
+            {
+                const OperationId def = graph.valueDef(value);
+                return def.valid() && def.index < ownerByOp.size()
+                           ? ownerByOp[def.index]
+                           : std::numeric_limits<uint32_t>::max();
+            };
+            const auto isComputeSupernode = [&](uint32_t supernodeId)
+            {
+                return supernodeId < model.supernodeHasComputePart.size() &&
+                       model.supernodeHasComputePart[supernodeId] != 0;
+            };
+
+            std::vector<std::size_t> batchBySupernode(supernodeCount, kInvalidIndex);
+            for (const auto &batch : scheduleBatches)
+            {
+                for (uint32_t supernodeId : batch.supernodeIds)
+                {
+                    if (supernodeId < batchBySupernode.size())
+                    {
+                        batchBySupernode[supernodeId] = batch.index;
+                    }
+                }
+            }
+            std::unordered_set<uint32_t> inputHeads;
+            std::unordered_set<uint32_t> stateHeads;
+            std::unordered_set<uint32_t> memoryHeads;
+            std::unordered_set<uint32_t> eventHeads;
+            for (const auto &[_, activeIds] : model.inputHeadSupernodesByValue)
+            {
+                inputHeads.insert(activeIds.begin(), activeIds.end());
+            }
+            for (const auto &[_, activeIds] : model.stateHeadSupernodesBySymbol)
+            {
+                stateHeads.insert(activeIds.begin(), activeIds.end());
+            }
+            for (const auto &activation : model.memoryRowReaderActivations)
+            {
+                memoryHeads.insert(
+                    activation.dynamicReaderActiveIds.begin(),
+                    activation.dynamicReaderActiveIds.end());
+                for (const auto &entry : activation.rowEntries)
+                {
+                    for (std::size_t bit = 0; bit < kActiveFlagBitsPerWord; ++bit)
+                    {
+                        if ((entry.mask & (UINT8_C(1) << bit)) != 0)
+                        {
+                            memoryHeads.insert(static_cast<uint32_t>(
+                                entry.wordIndex * kActiveFlagBitsPerWord + bit));
+                        }
+                    }
+                }
+            }
+            for (const auto &[value, _] : model.eventEdgeFieldByValue)
+            {
+                if (const auto it = model.boundaryFanoutByValue.find(value);
+                    it != model.boundaryFanoutByValue.end())
+                {
+                    eventHeads.insert(it->second.begin(), it->second.end());
+                }
+            }
+            std::unordered_set<ValueId, ValueIdHash> anchoredValues;
+            for (const auto &port : graph.outputPorts())
+            {
+                anchoredValues.insert(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                anchoredValues.insert(port.in);
+                anchoredValues.insert(port.out);
+                anchoredValues.insert(port.oe);
+            }
+            std::unordered_set<ValueId, ValueIdHash> waveformValues;
+            for (const auto &signal : model.waveformSignals)
+            {
+                if (signal.sourceKind == WaveformSignalDecl::SourceKind::kValue)
+                {
+                    waveformValues.insert(signal.value);
+                }
+            }
+
+            std::map<DeferredActivationForwardPairKey, std::vector<ValueId>> valuesByPair;
+            for (const auto &[value, activeIds] : model.boundaryFanoutByValue)
+            {
+                const uint32_t source = ownerOfValue(value);
+                if (!isComputeSupernode(source))
+                {
+                    continue;
+                }
+                for (uint32_t targetActiveId : activeIds)
+                {
+                    if (targetActiveId >= schedule.topoOrder.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t target = schedule.topoOrder[targetActiveId];
+                    if (!isComputeSupernode(target) || target == source)
+                    {
+                        continue;
+                    }
+                    valuesByPair[{.source = source, .target = target}].push_back(value);
+                }
+            }
+            stats.rawPairs = valuesByPair.size();
+
+            std::vector<DeferredActivationForwardCandidate> eligible;
+            eligible.reserve(valuesByPair.size() / 8u + 1u);
+            for (auto &[pair, values] : valuesByPair)
+            {
+                sortUniqueValueIds(values);
+                if (values.size() < kMinSharedValues)
+                {
+                    ++stats.rejectedMultiplicity;
+                    continue;
+                }
+                ++stats.sharedValuePairs;
+                if (pair.source >= model.activeIdBySupernode.size() ||
+                    pair.target >= model.activeIdBySupernode.size() ||
+                    model.activeIdBySupernode[pair.source] == kInvalidIndex ||
+                    model.activeIdBySupernode[pair.target] == kInvalidIndex ||
+                    model.activeIdBySupernode[pair.source] >= model.activeIdBySupernode[pair.target] ||
+                    batchBySupernode[pair.source] == kInvalidIndex ||
+                    batchBySupernode[pair.target] == kInvalidIndex ||
+                    batchBySupernode[pair.source] > batchBySupernode[pair.target])
+                {
+                    ++stats.rejectedPhaseOrOrder;
+                    continue;
+                }
+                const uint32_t targetActiveId =
+                    static_cast<uint32_t>(model.activeIdBySupernode[pair.target]);
+                if (inputHeads.contains(targetActiveId))
+                {
+                    ++stats.rejectedInputHead;
+                    continue;
+                }
+                if (memoryHeads.contains(targetActiveId))
+                {
+                    ++stats.rejectedMemoryHead;
+                    continue;
+                }
+                if (stateHeads.contains(targetActiveId))
+                {
+                    ++stats.rejectedStateHead;
+                    continue;
+                }
+                if (eventHeads.contains(targetActiveId))
+                {
+                    ++stats.rejectedEventHead;
+                    continue;
+                }
+                bool targetPure = !schedule.supernodeToOps[pair.target].empty();
+                for (OperationId opId : schedule.supernodeToOps[pair.target])
+                {
+                    const Operation op = graph.getOperation(opId);
+                    targetPure = targetPure && isDeferredActivationForwardPureKind(op.kind()) &&
+                                 !getAttribute<bool>(op, "hasSideEffects").value_or(false) &&
+                                 !isRegToMemIntentBypassOp(model, opId);
+                }
+                if (!targetPure)
+                {
+                    ++stats.rejectedTargetKind;
+                    continue;
+                }
+                bool exclusive = true;
+                for (ValueId value : values)
+                {
+                    const auto fanoutIt = model.boundaryFanoutByValue.find(value);
+                    bool allUsersAreTarget = true;
+                    for (const auto &user : graph.getValue(value).users())
+                    {
+                        allUsersAreTarget =
+                            allUsersAreTarget && user.operation.valid() &&
+                            user.operation.index < ownerByOp.size() &&
+                            ownerByOp[user.operation.index] == pair.target;
+                    }
+                    exclusive = exclusive &&
+                                fanoutIt != model.boundaryFanoutByValue.end() &&
+                                fanoutIt->second.size() == 1u &&
+                                fanoutIt->second.front() == targetActiveId &&
+                                allUsersAreTarget &&
+                                !model.eventEdgeFieldByValue.contains(value) &&
+                                !model.directStateReadSymbolByValue.contains(value) &&
+                                !anchoredValues.contains(value) &&
+                                !waveformValues.contains(value);
+                }
+                if (!exclusive)
+                {
+                    ++stats.rejectedNonexclusive;
+                    continue;
+                }
+                const auto sourceFireIt = profile.computeFire.find(pair.source);
+                const auto targetFireIt = profile.computeFire.find(pair.target);
+                if (sourceFireIt == profile.computeFire.end() ||
+                    targetFireIt == profile.computeFire.end() ||
+                    sourceFireIt->second == 0)
+                {
+                    ++stats.rejectedProfile;
+                    continue;
+                }
+                if (targetFireIt->second < sourceFireIt->second)
+                {
+                    ++stats.rejectedFireNecessary;
+                    continue;
+                }
+                DeferredActivationForwardCandidate candidate{
+                    .source = pair.source,
+                    .target = pair.target,
+                    .sourceActiveId = static_cast<uint32_t>(model.activeIdBySupernode[pair.source]),
+                    .targetActiveId = targetActiveId,
+                    .values = std::move(values),
+                    .sourceFire = sourceFireIt->second,
+                    .targetFire = targetFireIt->second,
+                    .sourceOps = schedule.supernodeToOps[pair.source].size(),
+                    .targetOps = schedule.supernodeToOps[pair.target].size(),
+                    .sourceBatch = batchBySupernode[pair.source],
+                    .targetBatch = batchBySupernode[pair.target],
+                };
+                candidate.sourceCpp = candidate.sourceBatch / schedBatchesPerCpp;
+                candidate.targetCpp = candidate.targetBatch / schedBatchesPerCpp;
+                eligible.push_back(std::move(candidate));
+            }
+            stats.exactEligible = eligible.size();
+            std::sort(eligible.begin(),
+                      eligible.end(),
+                      [](const auto &lhs, const auto &rhs)
+                      {
+                          const unsigned __int128 lhsProxy =
+                              static_cast<unsigned __int128>(lhs.values.size()) * lhs.sourceFire;
+                          const unsigned __int128 rhsProxy =
+                              static_cast<unsigned __int128>(rhs.values.size()) * rhs.sourceFire;
+                          return std::tuple{rhsProxy, rhs.values.size(), lhs.source, lhs.target} <
+                                 std::tuple{lhsProxy, lhs.values.size(), rhs.source, rhs.target};
+                      });
+            if (eligible.size() > kMaxAccountedCandidates)
+            {
+                eligible.resize(kMaxAccountedCandidates);
+                stats.candidateScanTruncated = true;
+            }
+
+            for (auto &candidate : eligible)
+            {
+                BoundaryActivationFanoutMap sourceFanout;
+                for (OperationId opId : schedule.supernodeToOps[candidate.source])
+                {
+                    for (ValueId result : graph.opResults(opId))
+                    {
+                        if (const auto it = model.boundaryFanoutByValue.find(result);
+                            it != model.boundaryFanoutByValue.end())
+                        {
+                            sourceFanout.emplace(result, it->second);
+                        }
+                    }
+                }
+                candidate.control = accountDeferredActivationSource(
+                                        graph,
+                                        model,
+                                        schedule.supernodeToOps,
+                                        candidate.source,
+                                        sourceFanout)
+                                        .stats;
+                BoundaryActivationFanoutMap privateFanout = sourceFanout;
+                for (ValueId value : candidate.values)
+                {
+                    auto it = privateFanout.find(value);
+                    if (it == privateFanout.end())
+                    {
+                        continue;
+                    }
+                    std::erase(it->second, candidate.targetActiveId);
+                }
+                candidate.candidate = accountDeferredActivationSource(
+                                          graph,
+                                          model,
+                                          schedule.supernodeToOps,
+                                          candidate.source,
+                                          privateFanout)
+                                          .stats;
+                accountUnconditionalActivation(
+                    {candidate.targetActiveId},
+                    candidate.sourceActiveId,
+                    candidate.forward);
+                candidate.candidate += candidate.forward;
+                ++stats.accounted;
+                const std::size_t controlUnits = deferredActivationWorkUnits(candidate.control);
+                const std::size_t candidateUnits = deferredActivationWorkUnits(candidate.candidate);
+                if (candidateUnits >= controlUnits)
+                {
+                    ++stats.rejectedAccounting;
+                    continue;
+                }
+                candidate.staticSavedUnits = controlUnits - candidateUnits;
+                candidate.fireWeightedWorkProxyUpper =
+                    static_cast<unsigned __int128>(candidate.staticSavedUnits) * candidate.sourceFire;
+                candidate.fireWeightedWorkProxyLower =
+                    static_cast<__int128>(candidate.fireWeightedWorkProxyUpper) -
+                    static_cast<__int128>(candidate.targetOps) * candidate.sourceFire;
+                ++stats.staticPositive;
+            }
+            eligible.erase(
+                std::remove_if(eligible.begin(),
+                               eligible.end(),
+                               [](const auto &candidate) { return candidate.staticSavedUnits == 0; }),
+                eligible.end());
+            std::sort(eligible.begin(),
+                      eligible.end(),
+                      [](const auto &lhs, const auto &rhs)
+                      {
+                          return std::tuple{rhs.fireWeightedWorkProxyUpper,
+                                            rhs.staticSavedUnits,
+                                            rhs.values.size(),
+                                            lhs.source,
+                                            lhs.target} <
+                                 std::tuple{lhs.fireWeightedWorkProxyUpper,
+                                            lhs.staticSavedUnits,
+                                            lhs.values.size(),
+                                            rhs.source,
+                                            rhs.target};
+                      });
+
+            std::unordered_set<uint32_t> touchedSupernodes;
+            std::vector<std::size_t> selectedIndices;
+            for (std::size_t index = 0; index < eligible.size(); ++index)
+            {
+                auto &candidate = eligible[index];
+                if (touchedSupernodes.contains(candidate.source) ||
+                    touchedSupernodes.contains(candidate.target))
+                {
+                    ++stats.rejectedOverlap;
+                    continue;
+                }
+                if (selectedIndices.size() >= kMaxSelectedCandidates)
+                {
+                    ++stats.rejectedLimit;
+                    continue;
+                }
+                candidate.selected = true;
+                selectedIndices.push_back(index);
+                touchedSupernodes.insert(candidate.source);
+                touchedSupernodes.insert(candidate.target);
+                ++stats.selected;
+                stats.selectedValues += candidate.values.size();
+            }
+
+            const DeferredActivationAccountingResult controlAccounting =
+                accountDeferredActivationLowering(
+                    graph,
+                    model,
+                    schedule.supernodeToOps,
+                    model.boundaryFanoutByValue);
+            BoundaryActivationFanoutMap privateFanout = model.boundaryFanoutByValue;
+            std::unordered_map<uint32_t, std::vector<uint32_t>> forwardTargetsBySource;
+            for (std::size_t index : selectedIndices)
+            {
+                const auto &candidate = eligible[index];
+                for (ValueId value : candidate.values)
+                {
+                    if (auto it = privateFanout.find(value); it != privateFanout.end())
+                    {
+                        std::erase(it->second, candidate.targetActiveId);
+                    }
+                }
+                forwardTargetsBySource[candidate.source].push_back(candidate.targetActiveId);
+            }
+            DeferredActivationAccountingResult candidateAccounting =
+                accountDeferredActivationLowering(
+                    graph,
+                    model,
+                    schedule.supernodeToOps,
+                    privateFanout);
+            for (auto &[source, targets] : forwardTargetsBySource)
+            {
+                sortUniqueVector(targets);
+                DeferredActivationLoweringStats forward;
+                accountUnconditionalActivation(
+                    targets,
+                    model.activeIdBySupernode[source],
+                    forward);
+                candidateAccounting.stats += forward;
+                candidateAccounting.bySupernode[source].stats += forward;
+            }
+            for (uint32_t source : model.computeSupernodeIds)
+            {
+                const auto &control = controlAccounting.bySupernode[source];
+                const auto &candidate = candidateAccounting.bySupernode[source];
+                stats.directToAggregate +=
+                    control.flushPath == DeferredActivationFlushPath::kDirect &&
+                            candidate.flushPath == DeferredActivationFlushPath::kAggregate
+                        ? 1u
+                        : 0u;
+                stats.aggregateToDirect +=
+                    control.flushPath == DeferredActivationFlushPath::kAggregate &&
+                            candidate.flushPath == DeferredActivationFlushPath::kDirect
+                        ? 1u
+                        : 0u;
+                stats.branchlessToGuarded +=
+                    control.stats.guardedGroups == 0 && candidate.stats.guardedGroups != 0 ? 1u : 0u;
+                stats.guardedToBranchless +=
+                    control.stats.guardedGroups != 0 && candidate.stats.guardedGroups == 0 ? 1u : 0u;
+                stats.tableEntered +=
+                    control.stats.tableGroups == 0 && candidate.stats.tableGroups != 0 ? 1u : 0u;
+                stats.tableExited +=
+                    control.stats.tableGroups != 0 && candidate.stats.tableGroups == 0 ? 1u : 0u;
+                stats.branchlessChangedSources +=
+                    control.stats.branchlessGroups != candidate.stats.branchlessGroups ? 1u : 0u;
+                stats.guardedChangedSources +=
+                    control.stats.guardedGroups != candidate.stats.guardedGroups ? 1u : 0u;
+                stats.tableChangedSources +=
+                    control.stats.tableGroups != candidate.stats.tableGroups ? 1u : 0u;
+            }
+            unsigned __int128 selectedFireWeightedWorkProxyUpper = 0;
+            __int128 selectedFireWeightedWorkProxyLower = 0;
+            std::size_t selectedPositiveWorkProxyCandidates = 0;
+            std::size_t selectedPositiveWorkProxyValues = 0;
+            std::size_t selectedPositiveStaticSavedUnits = 0;
+            std::size_t selectedPositiveTargetOps = 0;
+            unsigned __int128 selectedPositiveFireWeightedWorkProxyUpper = 0;
+            __int128 selectedPositiveFireWeightedWorkProxyLower = 0;
+            for (std::size_t index : selectedIndices)
+            {
+                const auto &candidate = eligible[index];
+                selectedFireWeightedWorkProxyUpper += candidate.fireWeightedWorkProxyUpper;
+                selectedFireWeightedWorkProxyLower += candidate.fireWeightedWorkProxyLower;
+                if (candidate.fireWeightedWorkProxyLower > 0)
+                {
+                    ++selectedPositiveWorkProxyCandidates;
+                    selectedPositiveWorkProxyValues += candidate.values.size();
+                    selectedPositiveStaticSavedUnits += candidate.staticSavedUnits;
+                    selectedPositiveTargetOps += candidate.targetOps;
+                    selectedPositiveFireWeightedWorkProxyUpper +=
+                        candidate.fireWeightedWorkProxyUpper;
+                    selectedPositiveFireWeightedWorkProxyLower +=
+                        candidate.fireWeightedWorkProxyLower;
+                }
+            }
+            const std::size_t globalControlWorkUnits =
+                deferredActivationWorkUnits(controlAccounting.stats);
+            const std::size_t globalCandidateWorkUnits =
+                deferredActivationWorkUnits(candidateAccounting.stats);
+            const std::size_t unselectedCandidates =
+                eligible.size() >= selectedIndices.size()
+                    ? eligible.size() - selectedIndices.size()
+                    : 0u;
+            const std::size_t reportedNearSelected = std::min(
+                unselectedCandidates,
+                kMaxReportedNearSelectedCandidates);
+
+            std::fprintf(
+                stderr,
+                "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] policy=%.*s profile_valid=true profile_compute_rows=%zu profile_ignored_commit_rows=%zu raw_pairs=%zu shared_value_pairs=%zu exact_eligible=%zu accounted=%zu static_positive=%zu selected=%zu selected_values=%zu reported_selected=%zu reported_near_selected=%zu max_accounted=%zu max_selected=%zu max_reported_near_selected=%zu truncated=%s global_control_work_units=%zu global_candidate_work_units=%zu global_work_units_delta=%s selected_fire_weighted_work_proxy_lower=%s selected_fire_weighted_work_proxy_upper=%s selected_positive_work_proxy_candidates=%zu selected_positive_work_proxy_values=%zu selected_positive_static_saved_units=%zu selected_positive_target_ops=%zu selected_positive_fire_weighted_work_proxy_lower=%s selected_positive_fire_weighted_work_proxy_upper=%s physical_supernode_tests_saved=0\n",
+                static_cast<int>(deferredActivationForwardPolicyName(policy).size()),
+                deferredActivationForwardPolicyName(policy).data(),
+                profile.computeRows,
+                profile.ignoredCommitRows,
+                stats.rawPairs,
+                stats.sharedValuePairs,
+                stats.exactEligible,
+                stats.accounted,
+                stats.staticPositive,
+                stats.selected,
+                stats.selectedValues,
+                stats.selected,
+                reportedNearSelected,
+                kMaxAccountedCandidates,
+                kMaxSelectedCandidates,
+                kMaxReportedNearSelectedCandidates,
+                stats.candidateScanTruncated ? "true" : "false",
+                globalControlWorkUnits,
+                globalCandidateWorkUnits,
+                sizeDeltaText(globalCandidateWorkUnits, globalControlWorkUnits).c_str(),
+                signed128Text(selectedFireWeightedWorkProxyLower).c_str(),
+                unsigned128Text(selectedFireWeightedWorkProxyUpper).c_str(),
+                selectedPositiveWorkProxyCandidates,
+                selectedPositiveWorkProxyValues,
+                selectedPositiveStaticSavedUnits,
+                selectedPositiveTargetOps,
+                signed128Text(selectedPositiveFireWeightedWorkProxyLower).c_str(),
+                unsigned128Text(selectedPositiveFireWeightedWorkProxyUpper).c_str());
+            std::fprintf(
+                stderr,
+                "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] rejects rejected_multiplicity=%zu rejected_phase_or_order=%zu rejected_input_head=%zu rejected_state_head=%zu rejected_memory_head=%zu rejected_event_head=%zu rejected_target_kind=%zu rejected_nonexclusive=%zu rejected_profile=%zu rejected_fire_necessary=%zu rejected_accounting=%zu rejected_overlap=%zu rejected_limit=%zu\n",
+                stats.rejectedMultiplicity,
+                stats.rejectedPhaseOrOrder,
+                stats.rejectedInputHead,
+                stats.rejectedStateHead,
+                stats.rejectedMemoryHead,
+                stats.rejectedEventHead,
+                stats.rejectedTargetKind,
+                stats.rejectedNonexclusive,
+                stats.rejectedProfile,
+                stats.rejectedFireNecessary,
+                stats.rejectedAccounting,
+                stats.rejectedOverlap,
+                stats.rejectedLimit);
+            reportDeferredActivationAccounting("control", controlAccounting.stats);
+            reportDeferredActivationAccounting("candidate", candidateAccounting.stats);
+            std::fprintf(
+                stderr,
+                "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] net tracked_change_values=%s direct_value_groups=%s deferred_groups=%s deferred_source_value_updates=%s deferred_direct_groups=%s deferred_aggregate_groups=%s forward_groups=%s active_mask_entries=%s planned_chunks=%s chunk1=%s chunk2=%s chunk4=%s chunk8=%s table_groups=%s table_entries=%s branchless_groups=%s guarded_groups=%s conditional_mask_updates=%s local_rmw=%s global_rmw=%s updated_bytes=%s estimated_activation_lines=%s work_units=%s direct_to_aggregate=%zu aggregate_to_direct=%zu branchless_to_guarded=%zu guarded_to_branchless=%zu table_entered=%zu table_exited=%zu branchless_changed_sources=%zu guarded_changed_sources=%zu table_changed_sources=%zu physical_supernode_tests_saved=0\n",
+                sizeDeltaText(candidateAccounting.stats.trackedChangeValues, controlAccounting.stats.trackedChangeValues).c_str(),
+                sizeDeltaText(candidateAccounting.stats.directValueGroups, controlAccounting.stats.directValueGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.deferredGroups, controlAccounting.stats.deferredGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.deferredSourceValueUpdates, controlAccounting.stats.deferredSourceValueUpdates).c_str(),
+                sizeDeltaText(candidateAccounting.stats.deferredDirectGroups, controlAccounting.stats.deferredDirectGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.deferredAggregateGroups, controlAccounting.stats.deferredAggregateGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.unconditionalForwardGroups, controlAccounting.stats.unconditionalForwardGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.activeMaskEntries, controlAccounting.stats.activeMaskEntries).c_str(),
+                sizeDeltaText(candidateAccounting.stats.plannedChunks, controlAccounting.stats.plannedChunks).c_str(),
+                sizeDeltaText(candidateAccounting.stats.emittedChunksByWidth[0], controlAccounting.stats.emittedChunksByWidth[0]).c_str(),
+                sizeDeltaText(candidateAccounting.stats.emittedChunksByWidth[1], controlAccounting.stats.emittedChunksByWidth[1]).c_str(),
+                sizeDeltaText(candidateAccounting.stats.emittedChunksByWidth[2], controlAccounting.stats.emittedChunksByWidth[2]).c_str(),
+                sizeDeltaText(candidateAccounting.stats.emittedChunksByWidth[3], controlAccounting.stats.emittedChunksByWidth[3]).c_str(),
+                sizeDeltaText(candidateAccounting.stats.tableGroups, controlAccounting.stats.tableGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.tableEntries, controlAccounting.stats.tableEntries).c_str(),
+                sizeDeltaText(candidateAccounting.stats.branchlessGroups, controlAccounting.stats.branchlessGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.guardedGroups, controlAccounting.stats.guardedGroups).c_str(),
+                sizeDeltaText(candidateAccounting.stats.conditionalMaskUpdates, controlAccounting.stats.conditionalMaskUpdates).c_str(),
+                sizeDeltaText(candidateAccounting.stats.localRmw, controlAccounting.stats.localRmw).c_str(),
+                sizeDeltaText(candidateAccounting.stats.globalRmw, controlAccounting.stats.globalRmw).c_str(),
+                sizeDeltaText(candidateAccounting.stats.updatedBytes, controlAccounting.stats.updatedBytes).c_str(),
+                sizeDeltaText(candidateAccounting.stats.estimatedActivationLines, controlAccounting.stats.estimatedActivationLines).c_str(),
+                sizeDeltaText(deferredActivationWorkUnits(candidateAccounting.stats), deferredActivationWorkUnits(controlAccounting.stats)).c_str(),
+                stats.directToAggregate,
+                stats.aggregateToDirect,
+                stats.branchlessToGuarded,
+                stats.guardedToBranchless,
+                stats.tableEntered,
+                stats.tableExited,
+                stats.branchlessChangedSources,
+                stats.guardedChangedSources,
+                stats.tableChangedSources);
+
+            std::vector<std::size_t> reportIndices;
+            reportIndices.reserve(stats.selected + reportedNearSelected);
+            for (std::size_t rank = 0; rank < eligible.size(); ++rank)
+            {
+                if (eligible[rank].selected)
+                {
+                    reportIndices.push_back(rank);
+                }
+            }
+            std::size_t appendedNearSelected = 0;
+            for (std::size_t rank = 0;
+                 rank < eligible.size() &&
+                 appendedNearSelected < kMaxReportedNearSelectedCandidates;
+                 ++rank)
+            {
+                if (!eligible[rank].selected)
+                {
+                    reportIndices.push_back(rank);
+                    ++appendedNearSelected;
+                }
+            }
+            const std::string scheduleCppMarker =
+                schedBatchesPerCpp == 1 ? "_sched_" : "_sched_group_";
+            for (std::size_t rank : reportIndices)
+            {
+                const auto &candidate = eligible[rank];
+                const std::string sourceCpp =
+                    std::string(cppPrefix) + scheduleCppMarker +
+                    std::to_string(candidate.sourceCpp) + ".cpp";
+                const std::string targetCpp =
+                    std::string(cppPrefix) + scheduleCppMarker +
+                    std::to_string(candidate.targetCpp) + ".cpp";
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] candidate rank=%zu report_kind=%s selected=%s source=%u target=%u source_active_id=%u target_active_id=%u source_active_byte=%u target_active_byte=%u source_batch=%zu target_batch=%zu source_cpp=%s target_cpp=%s source_ops=%zu target_ops=%zu shared_values=%zu input_heads=0 state_heads=0 memory_heads=0 event_heads=0 source_fire=%llu target_fire=%llu control_work_units=%zu candidate_work_units=%zu static_saved_units=%zu fire_weighted_work_proxy_lower=%s fire_weighted_work_proxy_upper=%s control_deferred_direct=%zu control_deferred_aggregate=%zu candidate_deferred_direct=%zu candidate_deferred_aggregate=%zu control_branchless=%zu control_guarded=%zu candidate_branchless=%zu candidate_guarded=%zu control_entries=%zu candidate_entries=%zu control_chunk1=%zu control_chunk2=%zu control_chunk4=%zu control_chunk8=%zu candidate_chunk1=%zu candidate_chunk2=%zu candidate_chunk4=%zu candidate_chunk8=%zu control_table_entries=%zu candidate_table_entries=%zu control_local_rmw=%zu candidate_local_rmw=%zu control_global_rmw=%zu candidate_global_rmw=%zu control_lines=%zu candidate_lines=%zu forward_entries=%zu forward_chunk1=%zu forward_chunk2=%zu forward_chunk4=%zu forward_chunk8=%zu forward_table_entries=%zu forward_local_rmw=%zu forward_global_rmw=%zu physical_supernode_tests_saved=0\n",
+                    rank,
+                    candidate.selected ? "selected" : "near_selected",
+                    candidate.selected ? "true" : "false",
+                    candidate.source,
+                    candidate.target,
+                    candidate.sourceActiveId,
+                    candidate.targetActiveId,
+                    candidate.sourceActiveId / static_cast<uint32_t>(kActiveFlagBitsPerWord),
+                    candidate.targetActiveId / static_cast<uint32_t>(kActiveFlagBitsPerWord),
+                    candidate.sourceBatch,
+                    candidate.targetBatch,
+                    sourceCpp.c_str(),
+                    targetCpp.c_str(),
+                    candidate.sourceOps,
+                    candidate.targetOps,
+                    candidate.values.size(),
+                    static_cast<unsigned long long>(candidate.sourceFire),
+                    static_cast<unsigned long long>(candidate.targetFire),
+                    deferredActivationWorkUnits(candidate.control),
+                    deferredActivationWorkUnits(candidate.candidate),
+                    candidate.staticSavedUnits,
+                    signed128Text(candidate.fireWeightedWorkProxyLower).c_str(),
+                    unsigned128Text(candidate.fireWeightedWorkProxyUpper).c_str(),
+                    candidate.control.deferredDirectGroups,
+                    candidate.control.deferredAggregateGroups,
+                    candidate.candidate.deferredDirectGroups,
+                    candidate.candidate.deferredAggregateGroups,
+                    candidate.control.branchlessGroups,
+                    candidate.control.guardedGroups,
+                    candidate.candidate.branchlessGroups,
+                    candidate.candidate.guardedGroups,
+                    candidate.control.activeMaskEntries,
+                    candidate.candidate.activeMaskEntries,
+                    candidate.control.emittedChunksByWidth[0],
+                    candidate.control.emittedChunksByWidth[1],
+                    candidate.control.emittedChunksByWidth[2],
+                    candidate.control.emittedChunksByWidth[3],
+                    candidate.candidate.emittedChunksByWidth[0],
+                    candidate.candidate.emittedChunksByWidth[1],
+                    candidate.candidate.emittedChunksByWidth[2],
+                    candidate.candidate.emittedChunksByWidth[3],
+                    candidate.control.tableEntries,
+                    candidate.candidate.tableEntries,
+                    candidate.control.localRmw,
+                    candidate.candidate.localRmw,
+                    candidate.control.globalRmw,
+                    candidate.candidate.globalRmw,
+                    candidate.control.estimatedActivationLines,
+                    candidate.candidate.estimatedActivationLines,
+                    candidate.forward.activeMaskEntries,
+                    candidate.forward.emittedChunksByWidth[0],
+                    candidate.forward.emittedChunksByWidth[1],
+                    candidate.forward.emittedChunksByWidth[2],
+                    candidate.forward.emittedChunksByWidth[3],
+                    candidate.forward.tableEntries,
+                    candidate.forward.localRmw,
+                    candidate.forward.globalRmw);
+            }
         }
 
         void emitScalarChangedValueAssign(std::ostream &stream,
@@ -18696,6 +20184,21 @@ namespace wolvrix::lib::emit
             result.success = false;
             return result;
         }
+        std::string invalidDeferredActivationForwardPolicy;
+        const auto deferredActivationForwardPolicy =
+            parseDeferredActivationForwardPolicy(
+                options,
+                invalidDeferredActivationForwardPolicy);
+        if (!deferredActivationForwardPolicy)
+        {
+            reportError("invalid deferred_activation_forward_policy: " +
+                        invalidDeferredActivationForwardPolicy +
+                        " (expected off or probe)");
+            result.success = false;
+            return result;
+        }
+        const std::string deferredActivationForwardProfilePath =
+            parseDeferredActivationForwardProfilePath(options);
         std::string invalidWordPackPolicy;
         const auto pureEventWordPackPolicy =
             parsePureEventWordPackPolicy(options, invalidWordPackPolicy);
@@ -19082,6 +20585,29 @@ namespace wolvrix::lib::emit
         for (std::size_t batchIndex = 0; batchIndex < scheduleBatches.size(); ++batchIndex)
         {
             schedPaths.push_back(schedOutputPaths[batchIndex / schedBatchesPerCpp]);
+        }
+        if (*deferredActivationForwardPolicy != DeferredActivationForwardPolicy::kOff)
+        {
+            if (*activeMaskGapPackPolicy != ActiveMaskGapPackPolicy::kOff)
+            {
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] policy=%.*s profile_valid=false selected=0 error=active_mask_gap_pack_policy_must_be_off\n",
+                    static_cast<int>(deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).size()),
+                    deferredActivationForwardPolicyName(*deferredActivationForwardPolicy).data());
+            }
+            else
+            {
+                runDeferredActivationForwardProbe(
+                    graph,
+                    model,
+                    schedule,
+                    scheduleBatches,
+                    schedBatchesPerCpp,
+                    prefix,
+                    *deferredActivationForwardPolicy,
+                    deferredActivationForwardProfilePath);
+            }
         }
         const std::filesystem::path makefilePath = outDir / "Makefile";
         const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";

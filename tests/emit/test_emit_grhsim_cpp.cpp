@@ -3529,6 +3529,169 @@ namespace
         return fixture;
     }
 
+    ActiveMaskGapPackFixture buildDeferredActivationForwardFixture()
+    {
+        constexpr std::size_t kSupernodeCount = 128u;
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        const ValueId trigger = makeLogicValue(graph, "forward_trigger", 1);
+        graph.bindInputPort("trigger", trigger);
+        const ValueId eventFormat = addConstant(
+            graph,
+            "forward_event_format_op",
+            "forward_event_format",
+            0,
+            "\"event=%0d\"",
+            ValueType::String);
+
+        ActivityScheduleSupernodeToOps supernodeToOps(kSupernodeCount);
+        struct FanoutSpec
+        {
+            ValueId value;
+            std::vector<uint32_t> targets;
+        };
+        std::vector<FanoutSpec> fanouts;
+        std::map<uint32_t, std::vector<ValueId>> targetOperands;
+        const auto addSourceGroup = [&](uint32_t source,
+                                        std::initializer_list<uint32_t> targets,
+                                        std::string_view name)
+        {
+            std::vector<ValueId> values;
+            for (std::size_t valueIndex = 0; valueIndex < 2u; ++valueIndex)
+            {
+                const std::string suffix = std::string(name) + "_" + std::to_string(valueIndex);
+                const ValueId value = makeLogicValue(graph, suffix + "_value", 1);
+                const OperationId op = graph.createOperation(
+                    OperationKind::kAssign,
+                    graph.internSymbol(suffix + "_op"));
+                graph.addOperand(op, trigger);
+                graph.addResult(op, value);
+                supernodeToOps[source].push_back(op);
+                values.push_back(value);
+                FanoutSpec spec{.value = value};
+                spec.targets.assign(targets.begin(), targets.end());
+                fanouts.push_back(std::move(spec));
+            }
+            for (uint32_t target : targets)
+            {
+                targetOperands[target].insert(
+                    targetOperands[target].end(), values.begin(), values.end());
+            }
+        };
+
+        const ValueId eventClock = makeLogicValue(graph, "forward_event_clock", 1);
+        const OperationId eventClockOp = graph.createOperation(
+            OperationKind::kAssign,
+            graph.internSymbol("forward_event_clock_op"));
+        graph.addOperand(eventClockOp, trigger);
+        graph.addResult(eventClockOp, eventClock);
+        supernodeToOps[13u].push_back(eventClockOp);
+        fanouts.push_back(FanoutSpec{.value = eventClock, .targets = {12u}});
+
+        // Exact same-byte candidate.
+        addSourceGroup(0u, {1u}, "same_byte");
+        // Nonexclusive control groups exercise 8/4/2-byte chunk accounting but are rejected.
+        addSourceGroup(2u, {8u, 16u, 24u, 32u, 40u, 48u, 56u, 64u}, "chunk8");
+        addSourceGroup(3u, {80u, 88u, 96u, 104u}, "chunk4");
+        addSourceGroup(4u, {112u, 120u}, "chunk2");
+        // Cross-byte exact candidate.
+        addSourceGroup(5u, {72u}, "global_byte");
+        // Static special-head rejections.
+        addSourceGroup(6u, {7u}, "state_head");
+        addSourceGroup(9u, {10u}, "input_head");
+        addSourceGroup(11u, {12u}, "event_head");
+
+        for (std::size_t supernode = 0; supernode < kSupernodeCount; ++supernode)
+        {
+            if (!supernodeToOps[supernode].empty())
+            {
+                continue;
+            }
+            const auto targetIt = targetOperands.find(static_cast<uint32_t>(supernode));
+            const ValueId result = makeLogicValue(
+                graph,
+                "forward_result_" + std::to_string(supernode),
+                1);
+            OperationId op;
+            if (targetIt != targetOperands.end())
+            {
+                op = graph.createOperation(
+                    OperationKind::kAnd,
+                    graph.internSymbol("forward_target_" + std::to_string(supernode)));
+                graph.addOperand(op, targetIt->second[0]);
+                graph.addOperand(op, targetIt->second[1]);
+            }
+            else
+            {
+                op = graph.createOperation(
+                    OperationKind::kAssign,
+                    graph.internSymbol("forward_filler_" + std::to_string(supernode)));
+                graph.addOperand(op, trigger);
+            }
+            graph.addResult(op, result);
+            supernodeToOps[supernode].push_back(op);
+            if (supernode == 10u)
+            {
+                const ValueId inputResult = makeLogicValue(graph, "forward_input_head_result", 1);
+                const OperationId inputOp = graph.createOperation(
+                    OperationKind::kAssign,
+                    graph.internSymbol("forward_input_head_op"));
+                graph.addOperand(inputOp, trigger);
+                graph.addResult(inputOp, inputResult);
+                supernodeToOps[supernode].push_back(inputOp);
+            }
+            else if (supernode == 12u)
+            {
+                const ValueId eventUseResult = makeLogicValue(
+                    graph,
+                    "forward_event_use_result",
+                    1);
+                const OperationId eventUse = graph.createOperation(
+                    OperationKind::kAssign,
+                    graph.internSymbol("forward_event_use_op"));
+                graph.addOperand(eventUse, eventClock);
+                graph.addResult(eventUse, eventUseResult);
+                supernodeToOps[supernode].push_back(eventUse);
+                const OperationId task = graph.createOperation(
+                    OperationKind::kSystemTask,
+                    graph.internSymbol("forward_event_head_task"));
+                graph.addOperand(task, result);
+                graph.addOperand(task, eventFormat);
+                graph.addOperand(task, result);
+                graph.addOperand(task, eventClock);
+                graph.setAttr(task, "name", std::string("display"));
+                graph.setAttr(task, "procKind", std::string("always_ff"));
+                graph.setAttr(task, "hasTiming", false);
+                graph.setAttr(task, "hasSideEffects", true);
+                graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+                supernodeToOps[supernode].push_back(task);
+            }
+        }
+
+        ActivityScheduleValueFanout valueFanout(graph.values().size());
+        for (const auto &spec : fanouts)
+        {
+            valueFanout[spec.value.index - 1u] = spec.targets;
+        }
+        ActivityScheduleTopoOrder topoOrder(kSupernodeCount);
+        for (std::size_t index = 0; index < topoOrder.size(); ++index)
+        {
+            topoOrder[index] = static_cast<uint32_t>(index);
+        }
+        ActivityScheduleStateReadSupernodes stateReads;
+        stateReads["fixture_state"] = {7u};
+        setActivityScheduleFixtureSlot(
+            fixture.session, "supernode_to_ops", std::move(supernodeToOps));
+        setActivityScheduleFixtureSlot(
+            fixture.session, "value_fanout", std::move(valueFanout));
+        setActivityScheduleFixtureSlot(
+            fixture.session, "topo_order", std::move(topoOrder));
+        setActivityScheduleFixtureSlot(
+            fixture.session, "state_read_supernodes", std::move(stateReads));
+        return fixture;
+    }
+
     class StderrCapture
     {
     public:
@@ -3665,6 +3828,62 @@ namespace
         return run;
     }
 
+    ActiveMaskGapPackEmitRun runDeferredActivationForwardEmit(
+        const Design &design,
+        SessionStore &session,
+        const std::filesystem::path &outDir,
+        std::optional<std::string_view> policy,
+        const std::filesystem::path &profilePath)
+    {
+        std::filesystem::remove_all(outDir);
+        std::filesystem::create_directories(outDir);
+        EmitOptions options;
+        options.outputDir = outDir.string();
+        options.session = &session;
+        options.sessionPathPrefix = std::string("top");
+        options.attributes["sched_batch_max_ops"] = "16";
+        options.attributes["sched_batch_max_estimated_lines"] = "256";
+        options.attributes["sched_batches_per_cpp"] = "2";
+        options.attributes["emit_parallelism"] = "2";
+        if (policy)
+        {
+            options.attributes["deferred_activation_forward_policy"] = std::string(*policy);
+        }
+        if (!profilePath.empty())
+        {
+            options.attributes["deferred_activation_forward_profile_path"] =
+                profilePath.string();
+        }
+
+        EmitDiagnostics diagnostics;
+        EmitGrhSimCpp emitter(&diagnostics);
+        StderrCapture capture;
+        ActiveMaskGapPackEmitRun run;
+        if (!capture.valid())
+        {
+            run.diagnostics = "failed to capture stderr";
+            return run;
+        }
+        const EmitResult result = emitter.emit(design, options);
+        run.stderrText = capture.finish();
+        run.success = result.success;
+        run.diagnosticError = diagnostics.hasError();
+        for (const auto &message : diagnostics.messages())
+        {
+            if (!run.diagnostics.empty())
+            {
+                run.diagnostics.push_back('\n');
+            }
+            run.diagnostics += message.message;
+        }
+        for (const std::string &artifact : result.artifacts)
+        {
+            const std::filesystem::path path(artifact);
+            run.artifacts.insert_or_assign(path.filename().string(), readFile(path));
+        }
+        return run;
+    }
+
     std::vector<std::string> sessionKeys(const SessionStore &session)
     {
         std::vector<std::string> keys;
@@ -3715,6 +3934,172 @@ namespace
         {
             return std::nullopt;
         }
+    }
+
+    int runDeferredActivationForwardFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture = buildDeferredActivationForwardFixture();
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            "grhsim_cpp_deferred_activation_forward";
+        std::filesystem::remove_all(baseDir);
+        std::filesystem::create_directories(baseDir);
+        const std::filesystem::path profilePath = baseDir / "profile.tsv";
+        {
+            std::ofstream profile(profilePath);
+            profile << "supernode_id\tphase\tf\n";
+            for (std::size_t supernode = 0; supernode < 128u; ++supernode)
+            {
+                profile << supernode << "\tcompute\t100\n";
+            }
+        }
+        const std::filesystem::path invalidProfilePath = baseDir / "invalid_profile.tsv";
+        {
+            std::ofstream profile(invalidProfilePath);
+            profile << "supernode_id\tphase\tf\n0\tcompute\t100\n";
+        }
+
+        ::unsetenv("WOLVRIX_GRHSIM_DEFERRED_ACTIVATION_FORWARD_POLICY");
+        ::unsetenv("WOLVRIX_GRHSIM_DEFERRED_ACTIVATION_FORWARD_PROFILE_PATH");
+        const std::vector<std::string> sessionKeysBefore = sessionKeys(fixture.session);
+        const ActiveMaskGapPackEmitRun defaultRun = runDeferredActivationForwardEmit(
+            fixture.design, fixture.session, baseDir / "default", std::nullopt, {});
+        const ActiveMaskGapPackEmitRun offRun = runDeferredActivationForwardEmit(
+            fixture.design, fixture.session, baseDir / "off", "off", profilePath);
+        const ActiveMaskGapPackEmitRun probeRun = runDeferredActivationForwardEmit(
+            fixture.design, fixture.session, baseDir / "probe", "probe", profilePath);
+        const ActiveMaskGapPackEmitRun probeRepeatRun = runDeferredActivationForwardEmit(
+            fixture.design, fixture.session, baseDir / "probe_repeat", "probe", profilePath);
+        const ActiveMaskGapPackEmitRun invalidProfileRun = runDeferredActivationForwardEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "invalid_profile",
+            "probe",
+            invalidProfilePath);
+        const ActiveMaskGapPackEmitRun emptyProfileRun = runDeferredActivationForwardEmit(
+            fixture.design, fixture.session, baseDir / "empty_profile", "probe", {});
+        if (!defaultRun.success || defaultRun.diagnosticError ||
+            !offRun.success || offRun.diagnosticError ||
+            !probeRun.success || probeRun.diagnosticError ||
+            !probeRepeatRun.success || probeRepeatRun.diagnosticError ||
+            !invalidProfileRun.success || invalidProfileRun.diagnosticError ||
+            !emptyProfileRun.success || emptyProfileRun.diagnosticError)
+        {
+            return fail("deferred-activation forward fixture emission failed");
+        }
+        if (defaultRun.artifacts != offRun.artifacts ||
+            defaultRun.artifacts != probeRun.artifacts ||
+            defaultRun.artifacts != probeRepeatRun.artifacts ||
+            defaultRun.artifacts != invalidProfileRun.artifacts ||
+            defaultRun.artifacts != emptyProfileRun.artifacts)
+        {
+            return fail("deferred-activation forward off/probe must preserve every generated artifact byte");
+        }
+        if (probeRun.stderrText != probeRepeatRun.stderrText)
+        {
+            return fail("deferred-activation forward probe selection and reporting must be deterministic");
+        }
+        if (sessionKeys(fixture.session) != sessionKeysBefore)
+        {
+            return fail("deferred-activation forward probe must not change the session key set");
+        }
+        constexpr std::string_view marker = "[GRHSIM_DEFERRED_ACTIVATION_FORWARD]";
+        if (defaultRun.stderrText.find(marker) != std::string::npos ||
+            offRun.stderrText.find(marker) != std::string::npos)
+        {
+            return fail("deferred-activation forward default/off should not emit probe logs");
+        }
+        const std::string_view summary = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] policy=probe ");
+        const std::string_view rejects = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] rejects ");
+        const std::string_view control = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] accounting=control ");
+        const std::string_view candidate = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] accounting=candidate ");
+        const std::string_view net = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] net ");
+        if (summary.empty() || rejects.empty() || control.empty() || candidate.empty() || net.empty() ||
+            summary.find("profile_valid=true") == std::string_view::npos ||
+            summary.find("accounted=") == std::string_view::npos ||
+            summary.find("static_positive=") == std::string_view::npos ||
+            summary.find("selected_fire_weighted_work_proxy_lower=") == std::string_view::npos ||
+            summary.find("selected_fire_weighted_work_proxy_upper=") == std::string_view::npos ||
+            summary.find("selected_positive_work_proxy_candidates=") == std::string_view::npos ||
+            summary.find("selected_positive_fire_weighted_work_proxy_lower=") == std::string_view::npos ||
+            summary.find("selected_positive_fire_weighted_work_proxy_upper=") == std::string_view::npos ||
+            !probeStatsUnsigned(summary, "selected").value_or(0) ||
+            !probeStatsUnsigned(rejects, "rejected_nonexclusive").value_or(0) ||
+            !probeStatsUnsigned(rejects, "rejected_state_head").value_or(0) ||
+            !probeStatsUnsigned(rejects, "rejected_input_head").value_or(0) ||
+            !probeStatsUnsigned(control, "chunk8").value_or(0) ||
+            !probeStatsUnsigned(control, "chunk4").value_or(0) ||
+            !probeStatsUnsigned(control, "chunk2").value_or(0) ||
+            net.find("direct_to_aggregate=") == std::string_view::npos ||
+            net.find("aggregate_to_direct=") == std::string_view::npos ||
+            net.find("branchless_to_guarded=") == std::string_view::npos ||
+            net.find("guarded_to_branchless=") == std::string_view::npos ||
+            net.find("branchless_changed_sources=") == std::string_view::npos ||
+            net.find("guarded_changed_sources=") == std::string_view::npos ||
+            net.find("table_changed_sources=") == std::string_view::npos)
+        {
+            return fail("deferred-activation forward absolute accounting or reject funnel is incomplete");
+        }
+        if (!probeStatsUnsigned(rejects, "rejected_event_head").value_or(0))
+        {
+            return fail(
+                "deferred-activation forward event-head rejection is missing: " +
+                std::string(rejects));
+        }
+        const std::string_view sameByteRow = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] candidate rank=0 ");
+        if (sameByteRow.find("source=0 target=1") == std::string_view::npos ||
+            sameByteRow.find("report_kind=selected") == std::string_view::npos ||
+            sameByteRow.find("source_cpp=grhsim_top_sched_group_0.cpp") == std::string_view::npos ||
+            sameByteRow.find("target_cpp=grhsim_top_sched_group_0.cpp") == std::string_view::npos ||
+            sameByteRow.find("fire_weighted_work_proxy_lower=") == std::string_view::npos ||
+            sameByteRow.find("fire_weighted_work_proxy_upper=") == std::string_view::npos ||
+            sameByteRow.find("forward_local_rmw=1") == std::string_view::npos ||
+            sameByteRow.find("physical_supernode_tests_saved=0") == std::string_view::npos)
+        {
+            return fail("deferred-activation forward same-byte candidate accounting is missing");
+        }
+        const std::size_t expectedReportedRows =
+            probeStatsUnsigned(summary, "reported_selected").value_or(0) +
+            probeStatsUnsigned(summary, "reported_near_selected").value_or(0);
+        if (expectedReportedRows == 0 ||
+            countSubstring(
+                probeRun.stderrText,
+                "[GRHSIM_DEFERRED_ACTIVATION_FORWARD] candidate ") != expectedReportedRows)
+        {
+            return fail("deferred-activation forward must report every selected and capped near-selected row");
+        }
+        if (invalidProfileRun.stderrText.find("profile_valid=false") == std::string::npos ||
+            invalidProfileRun.stderrText.find("selected=0") == std::string::npos ||
+            emptyProfileRun.stderrText.find("profile path is empty") == std::string::npos ||
+            emptyProfileRun.stderrText.find("selected=0") == std::string::npos)
+        {
+            return fail("deferred-activation forward invalid profile must fail closed");
+        }
+
+        const ActiveMaskGapPackEmitRun invalidPolicyRun = runDeferredActivationForwardEmit(
+            fixture.design,
+            fixture.session,
+            baseDir / "invalid_policy",
+            "strict",
+            profilePath);
+        if (invalidPolicyRun.success || !invalidPolicyRun.diagnosticError ||
+            invalidPolicyRun.diagnostics.find("expected off or probe") == std::string::npos)
+        {
+            return fail("deferred-activation forward invalid policy must be rejected");
+        }
+        return 0;
     }
 
     std::string normalizeActiveMaskGapPackLog(std::string log)
@@ -4420,6 +4805,10 @@ namespace
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_DEFERRED_ACTIVATION_FORWARD") != nullptr)
+    {
+        return runDeferredActivationForwardFocusedTests();
+    }
     if (std::getenv("WOLVRIX_TEST_ACTIVE_MASK_GAP_PACK") != nullptr)
     {
         return runActiveMaskGapPackFocusedTests();

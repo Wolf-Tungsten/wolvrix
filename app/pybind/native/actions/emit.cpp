@@ -159,6 +159,8 @@ namespace wolvrix::app::pybind
         PyObject *pureEventWordPackMaxMovedSupernodePpmObj = Py_None;
         PyObject *pureEventWordPackMaxChangedWordPpmObj = Py_None;
         const char *activeMaskGapPackPolicy = nullptr;
+        const char *deferredActivationForwardPolicy = nullptr;
+        const char *deferredActivationForwardProfilePath = nullptr;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -181,10 +183,12 @@ namespace wolvrix::app::pybind
                                        "pure_event_word_pack_max_changed_word_ppm",
                                        "direct_single_writer_state_reads",
                                        "active_mask_gap_pack_policy",
+                                       "deferred_activation_forward_policy",
+                                       "deferred_activation_forward_profile_path",
                                        nullptr};
         if (!PyArg_ParseTupleAndKeywords(args,
                                          kwargs,
-                                         "Oss|OOOOOOOssOOOOOsOOOz",
+                                         "Oss|OOOOOOOssOOOOOsOOOzzz",
                                          const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
@@ -207,7 +211,9 @@ namespace wolvrix::app::pybind
                                          &pureEventWordPackMaxMovedSupernodePpmObj,
                                          &pureEventWordPackMaxChangedWordPpmObj,
                                          &directSingleWriterStateReadsObj,
-                                         &activeMaskGapPackPolicy))
+                                         &activeMaskGapPackPolicy,
+                                         &deferredActivationForwardPolicy,
+                                         &deferredActivationForwardProfilePath))
         {
             return nullptr;
         }
@@ -221,6 +227,16 @@ namespace wolvrix::app::pybind
                                 "active_mask_gap_pack_policy must be one of: "
                                 "off, probe, targeted-direct, targeted-table-contiguous, "
                                 "targeted-table-gap");
+                return nullptr;
+            }
+        }
+        if (deferredActivationForwardPolicy != nullptr)
+        {
+            const std::string policy(deferredActivationForwardPolicy);
+            if (policy != "off" && policy != "probe")
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "deferred_activation_forward_policy must be one of: off, probe");
                 return nullptr;
             }
         }
@@ -415,6 +431,16 @@ namespace wolvrix::app::pybind
         if (activeMaskGapPackPolicy != nullptr)
         {
             options.attributes["active_mask_gap_pack_policy"] = activeMaskGapPackPolicy;
+        }
+        if (deferredActivationForwardPolicy != nullptr)
+        {
+            options.attributes["deferred_activation_forward_policy"] =
+                deferredActivationForwardPolicy;
+        }
+        if (deferredActivationForwardProfilePath != nullptr)
+        {
+            options.attributes["deferred_activation_forward_profile_path"] =
+                deferredActivationForwardProfilePath;
         }
 
         const auto result = emitter.emit(*design, options);

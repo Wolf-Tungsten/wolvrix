@@ -309,6 +309,8 @@ class Session:
         active_mask_gap_pack_policy: str | None = None,
         deferred_activation_forward_policy: str | None = None,
         deferred_activation_forward_profile_path: str | None = None,
+        same_batch_activation_cohort_policy: str | None = None,
+        same_batch_activation_cohort_profile_path: str | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
@@ -323,7 +325,9 @@ class Session:
                 pure_event_word_pack_max_changed_word_ppm is not None or
                 active_mask_gap_pack_policy is not None or
                 deferred_activation_forward_policy is not None or
-                deferred_activation_forward_profile_path is not None):
+                deferred_activation_forward_profile_path is not None or
+                same_batch_activation_cohort_policy is not None or
+                same_batch_activation_cohort_profile_path is not None):
             named_args = dict(named_args)
         if max_cpp_file_bytes is not None:
             named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
@@ -363,6 +367,10 @@ class Session:
             named_args["deferred_activation_forward_policy"] = deferred_activation_forward_policy
         if deferred_activation_forward_profile_path is not None:
             named_args["deferred_activation_forward_profile_path"] = deferred_activation_forward_profile_path
+        if same_batch_activation_cohort_policy is not None:
+            named_args["same_batch_activation_cohort_policy"] = same_batch_activation_cohort_policy
+        if same_batch_activation_cohort_profile_path is not None:
+            named_args["same_batch_activation_cohort_profile_path"] = same_batch_activation_cohort_profile_path
         _compile_emit_grhsim_cpp_kwargs(named_args)
         success, diagnostics = _native.session_emit_grhsim_cpp(
             self._capsule,
@@ -878,6 +886,27 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
         if not isinstance(deferred_activation_forward_profile_path, str):
             raise ValueError(
                 "emit_grhsim_cpp deferred_activation_forward_profile_path must be a string"
+            )
+    same_batch_activation_cohort_policy = local.pop(
+        "same_batch_activation_cohort_policy", None
+    )
+    if same_batch_activation_cohort_policy is not None:
+        if not isinstance(same_batch_activation_cohort_policy, str):
+            raise ValueError(
+                "emit_grhsim_cpp same_batch_activation_cohort_policy must be a string"
+            )
+        if same_batch_activation_cohort_policy not in {"off", "probe"}:
+            raise ValueError(
+                "emit_grhsim_cpp same_batch_activation_cohort_policy must be one of: "
+                "off, probe"
+            )
+    same_batch_activation_cohort_profile_path = local.pop(
+        "same_batch_activation_cohort_profile_path", None
+    )
+    if same_batch_activation_cohort_profile_path is not None:
+        if not isinstance(same_batch_activation_cohort_profile_path, str):
+            raise ValueError(
+                "emit_grhsim_cpp same_batch_activation_cohort_profile_path must be a string"
             )
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 

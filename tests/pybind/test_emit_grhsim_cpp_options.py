@@ -38,12 +38,16 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 active_mask_gap_pack_policy=None,
                 deferred_activation_forward_policy=None,
                 deferred_activation_forward_profile_path=None,
+                same_batch_activation_cohort_policy=None,
+                same_batch_activation_cohort_profile_path=None,
             )
             self.assertNotIn("direct_single_writer_state_reads", calls[-1][1])
             self.assertNotIn("pure_event_compute_word_bypass", calls[-1][1])
             self.assertNotIn("active_mask_gap_pack_policy", calls[-1][1])
             self.assertNotIn("deferred_activation_forward_policy", calls[-1][1])
             self.assertNotIn("deferred_activation_forward_profile_path", calls[-1][1])
+            self.assertNotIn("same_batch_activation_cohort_policy", calls[-1][1])
+            self.assertNotIn("same_batch_activation_cohort_profile_path", calls[-1][1])
 
             wolvrix.Session.emit_grhsim_cpp(
                 DummySession(),
@@ -54,6 +58,8 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 active_mask_gap_pack_policy="targeted-direct",
                 deferred_activation_forward_policy="probe",
                 deferred_activation_forward_profile_path="/tmp/fire.tsv",
+                same_batch_activation_cohort_policy="probe",
+                same_batch_activation_cohort_profile_path="/tmp/cohort-fire.tsv",
             )
             self.assertIs(calls[-1][1]["direct_single_writer_state_reads"], False)
             self.assertIs(calls[-1][1]["pure_event_compute_word_bypass"], False)
@@ -62,6 +68,11 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
             self.assertEqual(
                 calls[-1][1]["deferred_activation_forward_profile_path"],
                 "/tmp/fire.tsv",
+            )
+            self.assertEqual(calls[-1][1]["same_batch_activation_cohort_policy"], "probe")
+            self.assertEqual(
+                calls[-1][1]["same_batch_activation_cohort_profile_path"],
+                "/tmp/cohort-fire.tsv",
             )
         finally:
             wolvrix._native = original_native
@@ -117,6 +128,32 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                         {"deferred_activation_forward_profile_path": value}
                     )
 
+    def test_python_same_batch_activation_cohort_validation(self) -> None:
+        for value in ("off", "probe"):
+            with self.subTest(value=value):
+                _compile_emit_grhsim_cpp_kwargs(
+                    {"same_batch_activation_cohort_policy": value}
+                )
+        _compile_emit_grhsim_cpp_kwargs(
+            {"same_batch_activation_cohort_profile_path": "/tmp/fire.tsv"}
+        )
+        for value in ("", "strict", " probe ", False, 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "same_batch_activation_cohort_policy"
+                ):
+                    _compile_emit_grhsim_cpp_kwargs(
+                        {"same_batch_activation_cohort_policy": value}
+                    )
+        for value in (False, 1, ["/tmp/fire.tsv"]):
+            with self.subTest(profile_path=value):
+                with self.assertRaisesRegex(
+                    ValueError, "same_batch_activation_cohort_profile_path"
+                ):
+                    _compile_emit_grhsim_cpp_kwargs(
+                        {"same_batch_activation_cohort_profile_path": value}
+                    )
+
     def test_native_keyword_is_accepted(self) -> None:
         with wolvrix.Session() as session:
             for policy in (
@@ -136,7 +173,56 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                             active_mask_gap_pack_policy="targeted-direct",
                             deferred_activation_forward_policy=policy,
                             deferred_activation_forward_profile_path="/tmp/fire.tsv",
+                            same_batch_activation_cohort_policy="probe",
+                            same_batch_activation_cohort_profile_path="/tmp/cohort-fire.tsv",
                         )
+
+    def test_native_same_batch_activation_cohort_policies_are_accepted(self) -> None:
+        with wolvrix.Session() as session:
+            for value in ("off", "probe"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(KeyError, "design key not found"):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            same_batch_activation_cohort_policy=value,
+                        )
+
+    def test_native_same_batch_activation_cohort_policy_rejects_invalid_value(self) -> None:
+        with wolvrix.Session() as session:
+            for value in ("", "strict", "targeted"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "same_batch_activation_cohort_policy"
+                    ):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            same_batch_activation_cohort_policy=value,
+                        )
+
+    def test_native_same_batch_activation_cohort_accepts_explicit_none(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    same_batch_activation_cohort_policy=None,
+                    same_batch_activation_cohort_profile_path=None,
+                )
+
+    def test_native_same_batch_activation_cohort_profile_path_rejects_non_string(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaises(TypeError):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    same_batch_activation_cohort_profile_path=1,
+                )
 
     def test_native_deferred_activation_forward_policy_rejects_invalid_value(self) -> None:
         with wolvrix.Session() as session:
@@ -243,11 +329,22 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     "probe",
                     "/tmp/fire.tsv",
                 )
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    *legacy_args,
+                    "targeted-direct",
+                    "probe",
+                    "/tmp/fire.tsv",
+                    "probe",
+                    "/tmp/cohort-fire.tsv",
+                )
 
         self.assertIn(
             "direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None, "
             "deferred_activation_forward_policy=None, "
-            "deferred_activation_forward_profile_path=None",
+            "deferred_activation_forward_profile_path=None, "
+            "same_batch_activation_cohort_policy=None, "
+            "same_batch_activation_cohort_profile_path=None",
             native.session_emit_grhsim_cpp.__doc__,
         )
 

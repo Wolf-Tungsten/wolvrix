@@ -161,6 +161,8 @@ namespace wolvrix::app::pybind
         const char *activeMaskGapPackPolicy = nullptr;
         const char *deferredActivationForwardPolicy = nullptr;
         const char *deferredActivationForwardProfilePath = nullptr;
+        const char *sameBatchActivationCohortPolicy = nullptr;
+        const char *sameBatchActivationCohortProfilePath = nullptr;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -185,10 +187,12 @@ namespace wolvrix::app::pybind
                                        "active_mask_gap_pack_policy",
                                        "deferred_activation_forward_policy",
                                        "deferred_activation_forward_profile_path",
+                                       "same_batch_activation_cohort_policy",
+                                       "same_batch_activation_cohort_profile_path",
                                        nullptr};
         if (!PyArg_ParseTupleAndKeywords(args,
                                          kwargs,
-                                         "Oss|OOOOOOOssOOOOOsOOOzzz",
+                                         "Oss|OOOOOOOssOOOOOsOOOzzzzz",
                                          const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
@@ -213,7 +217,9 @@ namespace wolvrix::app::pybind
                                          &directSingleWriterStateReadsObj,
                                          &activeMaskGapPackPolicy,
                                          &deferredActivationForwardPolicy,
-                                         &deferredActivationForwardProfilePath))
+                                         &deferredActivationForwardProfilePath,
+                                         &sameBatchActivationCohortPolicy,
+                                         &sameBatchActivationCohortProfilePath))
         {
             return nullptr;
         }
@@ -238,6 +244,17 @@ namespace wolvrix::app::pybind
             {
                 PyErr_SetString(PyExc_ValueError,
                                 "deferred_activation_forward_policy must be one of: off, probe, cofire-probe, cofire-strict, cofire-strict-extended");
+                return nullptr;
+            }
+        }
+        if (sameBatchActivationCohortPolicy != nullptr)
+        {
+            const std::string policy(sameBatchActivationCohortPolicy);
+            if (policy != "off" && policy != "probe")
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "same_batch_activation_cohort_policy must be one of: "
+                                "off, probe");
                 return nullptr;
             }
         }
@@ -442,6 +459,16 @@ namespace wolvrix::app::pybind
         {
             options.attributes["deferred_activation_forward_profile_path"] =
                 deferredActivationForwardProfilePath;
+        }
+        if (sameBatchActivationCohortPolicy != nullptr)
+        {
+            options.attributes["same_batch_activation_cohort_policy"] =
+                sameBatchActivationCohortPolicy;
+        }
+        if (sameBatchActivationCohortProfilePath != nullptr)
+        {
+            options.attributes["same_batch_activation_cohort_profile_path"] =
+                sameBatchActivationCohortProfilePath;
         }
 
         const auto result = emitter.emit(*design, options);

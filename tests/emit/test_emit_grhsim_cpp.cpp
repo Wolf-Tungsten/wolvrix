@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -3391,10 +3392,11 @@ namespace
     template <typename T>
     void setActivityScheduleFixtureSlot(SessionStore &session,
                                         std::string_view name,
-                                        T value)
+                                        T value,
+                                        std::string_view prefix = "top")
     {
         session.insert_or_assign(
-            "top.activity_schedule." + std::string(name),
+            std::string(prefix) + ".activity_schedule." + std::string(name),
             std::make_unique<SessionSlotValue<T>>(std::move(value), "active-mask-gap-pack-test"));
     }
 
@@ -3692,6 +3694,73 @@ namespace
         return fixture;
     }
 
+    ActiveMaskGapPackFixture buildSameBatchActivationCohortFixture(
+        std::string_view graphSymbol = "top")
+    {
+        constexpr std::size_t kSupernodeCount = 16u;
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph(std::string(graphSymbol));
+        fixture.design.markAsTop(graph.symbol());
+
+        const ValueId input = makeLogicValue(graph, "in", 8);
+        graph.bindInputPort("in", input);
+        const ValueId shared = makeLogicValue(graph, "shared", 8);
+        ActivityScheduleSupernodeToOps supernodeToOps(kSupernodeCount);
+
+        const OperationId producer = graph.createOperation(
+            OperationKind::kAssign,
+            graph.internSymbol("cohort_producer"));
+        graph.addOperand(producer, input);
+        graph.addResult(producer, shared);
+        supernodeToOps[0].push_back(producer);
+
+        for (std::size_t supernode = 1; supernode < kSupernodeCount; ++supernode)
+        {
+            const ValueId result = makeLogicValue(
+                graph,
+                "cohort_result_" + std::to_string(supernode),
+                8);
+            if (supernode >= 8u && supernode <= 12u)
+            {
+                const OperationId op = graph.createOperation(
+                    OperationKind::kAssign,
+                    graph.internSymbol("cohort_member_" + std::to_string(supernode)));
+                graph.addOperand(op, shared);
+                graph.addResult(op, result);
+                supernodeToOps[supernode].push_back(op);
+            }
+            else
+            {
+                const OperationId op = graph.createOperation(
+                    OperationKind::kConstant,
+                    graph.internSymbol("cohort_padding_" + std::to_string(supernode)));
+                graph.addResult(op, result);
+                graph.setAttr(op, "constValue", std::string("8'd") +
+                                                    std::to_string(supernode));
+                supernodeToOps[supernode].push_back(op);
+            }
+        }
+
+        ActivityScheduleValueFanout valueFanout(graph.values().size());
+        valueFanout[shared.index - 1u] = {8u, 9u, 10u, 11u, 12u};
+        ActivityScheduleTopoOrder topoOrder(kSupernodeCount);
+        std::iota(topoOrder.begin(), topoOrder.end(), 0u);
+        ActivityScheduleStateReadSupernodes stateReads;
+        ActivityScheduleDag dag(kSupernodeCount);
+        dag[0] = {8u, 9u, 10u, 11u, 12u};
+        setActivityScheduleFixtureSlot(
+            fixture.session, "supernode_to_ops", std::move(supernodeToOps), graphSymbol);
+        setActivityScheduleFixtureSlot(
+            fixture.session, "value_fanout", std::move(valueFanout), graphSymbol);
+        setActivityScheduleFixtureSlot(
+            fixture.session, "topo_order", std::move(topoOrder), graphSymbol);
+        setActivityScheduleFixtureSlot(
+            fixture.session, "state_read_supernodes", std::move(stateReads), graphSymbol);
+        setActivityScheduleFixtureSlot(
+            fixture.session, "dag", std::move(dag), graphSymbol);
+        return fixture;
+    }
+
     class StderrCapture
     {
     public:
@@ -3857,6 +3926,64 @@ namespace
         if (!profilePath.empty())
         {
             options.attributes["deferred_activation_forward_profile_path"] =
+                profilePath.string();
+        }
+
+        EmitDiagnostics diagnostics;
+        EmitGrhSimCpp emitter(&diagnostics);
+        StderrCapture capture;
+        ActiveMaskGapPackEmitRun run;
+        if (!capture.valid())
+        {
+            run.diagnostics = "failed to capture stderr";
+            return run;
+        }
+        const EmitResult result = emitter.emit(design, options);
+        run.stderrText = capture.finish();
+        run.success = result.success;
+        run.diagnosticError = diagnostics.hasError();
+        for (const auto &message : diagnostics.messages())
+        {
+            if (!run.diagnostics.empty())
+            {
+                run.diagnostics.push_back('\n');
+            }
+            run.diagnostics += message.message;
+        }
+        for (const std::string &artifact : result.artifacts)
+        {
+            const std::filesystem::path path(artifact);
+            run.artifacts.insert_or_assign(path.filename().string(), readFile(path));
+        }
+        return run;
+    }
+
+    ActiveMaskGapPackEmitRun runSameBatchActivationCohortEmit(
+        const Design &design,
+        SessionStore &session,
+        const std::filesystem::path &outDir,
+        std::optional<std::string_view> policy,
+        const std::filesystem::path &profilePath,
+        std::string_view sessionPrefix = "top")
+    {
+        std::filesystem::remove_all(outDir);
+        std::filesystem::create_directories(outDir);
+        EmitOptions options;
+        options.outputDir = outDir.string();
+        options.session = &session;
+        options.sessionPathPrefix = std::string(sessionPrefix);
+        options.attributes["sched_batch_max_ops"] = "8";
+        options.attributes["sched_batch_max_estimated_lines"] = "100000";
+        options.attributes["sched_batches_per_cpp"] = "1";
+        options.attributes["emit_parallelism"] = "1";
+        if (policy)
+        {
+            options.attributes["same_batch_activation_cohort_policy"] =
+                std::string(*policy);
+        }
+        if (!profilePath.empty())
+        {
+            options.attributes["same_batch_activation_cohort_profile_path"] =
                 profilePath.string();
         }
 
@@ -4201,6 +4328,251 @@ namespace
                 std::string::npos)
         {
             return fail("deferred-activation forward invalid policy must be rejected");
+        }
+        return 0;
+    }
+
+    int runSameBatchActivationCohortFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture =
+            buildSameBatchActivationCohortFixture();
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            "grhsim_cpp_same_batch_activation_cohort";
+        std::filesystem::remove_all(baseDir);
+        std::filesystem::create_directories(baseDir);
+        const std::filesystem::path profilePath = baseDir / "profile.tsv";
+        {
+            std::ofstream profile(profilePath);
+            profile << "supernode_id\tphase\tf\n";
+            for (std::size_t supernode = 0; supernode < 16u; ++supernode)
+            {
+                const std::uint64_t fire =
+                    supernode >= 8u && supernode <= 12u ? 10u : supernode + 1u;
+                profile << supernode << "\tcompute\t" << fire << '\n';
+            }
+        }
+
+        ::unsetenv("WOLVRIX_GRHSIM_SAME_BATCH_ACTIVATION_COHORT_POLICY");
+        ::unsetenv("WOLVRIX_GRHSIM_SAME_BATCH_ACTIVATION_COHORT_PROFILE_PATH");
+        const std::vector<std::string> keysBefore = sessionKeys(fixture.session);
+        const ActiveMaskGapPackEmitRun defaultRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "default",
+                std::nullopt,
+                profilePath);
+        const ActiveMaskGapPackEmitRun offRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "off",
+                "off",
+                profilePath);
+        const ActiveMaskGapPackEmitRun probeRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "probe",
+                "probe",
+                profilePath);
+        const ActiveMaskGapPackEmitRun probeRepeatRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "probe_repeat",
+                "probe",
+                profilePath);
+        const ActiveMaskGapPackEmitRun missingProfileRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "missing_profile",
+                "probe",
+                {});
+        const ActiveMaskGapPackEmitRun invalidPolicyRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "invalid_policy",
+                "strict",
+                profilePath);
+        ActiveMaskGapPackFixture productionContractFixture =
+            buildSameBatchActivationCohortFixture("SimTop");
+        const ActiveMaskGapPackEmitRun missingProductionWitnessRun =
+            runSameBatchActivationCohortEmit(
+                productionContractFixture.design,
+                productionContractFixture.session,
+                baseDir / "missing_production_witness",
+                "probe",
+                profilePath,
+                "SimTop");
+
+        if (!defaultRun.success || defaultRun.diagnosticError ||
+            !offRun.success || offRun.diagnosticError ||
+            !probeRun.success || probeRun.diagnosticError ||
+            !probeRepeatRun.success || probeRepeatRun.diagnosticError)
+        {
+            return fail("same-batch activation cohort fixture emission failed");
+        }
+        if (defaultRun.artifacts != offRun.artifacts)
+        {
+            return fail("same-batch activation cohort default/off artifacts must be byte-identical");
+        }
+        if (probeRun.stderrText != probeRepeatRun.stderrText ||
+            probeRun.artifacts.at("grhsim_top.hpp") !=
+                probeRepeatRun.artifacts.at("grhsim_top.hpp") ||
+            probeRun.artifacts.at("grhsim_top_sched_1.cpp") !=
+                probeRepeatRun.artifacts.at("grhsim_top_sched_1.cpp"))
+        {
+            return fail("same-batch activation cohort probe must be deterministic");
+        }
+        if (sessionKeys(fixture.session) != keysBefore)
+        {
+            return fail("same-batch activation cohort probe must not mutate session keys");
+        }
+        constexpr std::string_view marker =
+            "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT]";
+        if (defaultRun.stderrText.find(marker) != std::string::npos ||
+            offRun.stderrText.find(marker) != std::string::npos)
+        {
+            return fail("same-batch activation cohort default/off must stay silent");
+        }
+        const std::string_view summary = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] policy=probe ");
+        const std::string_view row = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] cohort=0 ");
+        if (summary.find("selected=1 members=5 ops=5 control_bae=5 projected_bae=1") ==
+                std::string_view::npos ||
+            summary.find("no_mutation=true") == std::string_view::npos ||
+            row.find("batch=1") == std::string_view::npos ||
+            row.find("first_supernode=8 last_supernode=12") == std::string_view::npos ||
+            row.find("first_active_id=8 last_active_id=12") == std::string_view::npos ||
+            row.find("profile_fire=10") == std::string_view::npos)
+        {
+            return fail("same-batch activation cohort exact static row is incomplete");
+        }
+        if (missingProfileRun.success || !missingProfileRun.diagnosticError ||
+            missingProfileRun.stderrText.find("profile path is empty") == std::string::npos ||
+            missingProfileRun.diagnostics.find("probe failed closed") == std::string::npos ||
+            invalidPolicyRun.success || !invalidPolicyRun.diagnosticError ||
+            invalidPolicyRun.diagnostics.find("expected off or probe") == std::string::npos ||
+            missingProductionWitnessRun.success ||
+            !missingProductionWitnessRun.diagnosticError ||
+            missingProductionWitnessRun.stderrText.find(
+                "fail_closed=production_witness_missing production_request=true") ==
+                std::string::npos ||
+            missingProductionWitnessRun.diagnostics.find("probe failed closed") ==
+                std::string::npos)
+        {
+            return fail("same-batch activation cohort policy/profile fail-closed gate is missing");
+        }
+
+        const auto schedIt = probeRun.artifacts.find("grhsim_top_sched_1.cpp");
+        const auto headerIt = probeRun.artifacts.find("grhsim_top.hpp");
+        const auto stateIt = probeRun.artifacts.find("grhsim_top_state.cpp");
+        if (schedIt == probeRun.artifacts.end() ||
+            headerIt == probeRun.artifacts.end() ||
+            stateIt == probeRun.artifacts.end())
+        {
+            return fail("same-batch activation cohort generated artifacts are missing");
+        }
+        const std::string &sched = schedIt->second;
+        const std::size_t method = sched.find("void GrhSIM_top::eval_compute_batch_");
+        const std::size_t entryCounter = sched.find(
+            "++runtime_profile_same_batch_cohort_entry_batch_count_[0u]",
+            method);
+        const std::size_t firstWordLoad = sched.find(
+            "& dispatchMask",
+            method);
+        const std::size_t exitCounter = sched.find(
+            "++runtime_profile_same_batch_cohort_exit_batch_count_[0u]",
+            method);
+        if (method == std::string::npos || entryCounter == std::string::npos ||
+            firstWordLoad == std::string::npos || exitCounter == std::string::npos ||
+            !(method < entryCounter && entryCounter < firstWordLoad &&
+              firstWordLoad < exitCounter) ||
+            sched.find("++runtime_profile_same_batch_cohort_body_fire_[0u]") ==
+                std::string::npos ||
+            headerIt->second.find("runtime_profile_same_batch_cohort_entry_pending_") ==
+                std::string::npos)
+        {
+            return fail("same-batch activation cohort counters are not placed around word consumption");
+        }
+        bool resetPresent = false;
+        for (const auto &[name, source] : probeRun.artifacts)
+        {
+            (void)name;
+            if (source.find(
+                    "runtime_profile_same_batch_cohort_entry_pending_.fill(UINT64_C(0));") !=
+                std::string::npos)
+            {
+                resetPresent = true;
+                break;
+            }
+        }
+        if (!resetPresent)
+        {
+            return fail("same-batch activation cohort runtime counters are not reset");
+        }
+
+        const std::filesystem::path probeDir = baseDir / "probe";
+        const std::string buildCommand =
+            "make -C " + probeDir.string() + " CXX=clang++ CXXFLAGS='" +
+            std::string(kHarnessCompileFlags) + "'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("same-batch activation cohort generated archive failed to build");
+        }
+        const std::filesystem::path harnessPath = probeDir / "cohort_harness.cpp";
+        {
+            std::ofstream harness(harnessPath);
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "int main() { GrhSIM_top sim; sim.set_runtime_profile_enabled(true); "
+                       "sim.init(); sim.in = 3; sim.eval(); sim.dump_runtime_profile(); return 0; }\n";
+        }
+        const std::filesystem::path harnessExe = probeDir / "cohort_harness";
+        const std::string compileCommand =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" +
+            probeDir.string() + " " + harnessPath.string() + " " +
+            (probeDir / "libgrhsim_top.a").string() + " -o " +
+            harnessExe.string();
+        if (std::system(compileCommand.c_str()) != 0)
+        {
+            return fail("same-batch activation cohort harness failed to compile");
+        }
+        const std::filesystem::path cohortTsv = probeDir / "cohort.tsv";
+        const std::filesystem::path fireTsv = probeDir / "fire.tsv";
+        const std::string runCommand =
+            "WOLVRIX_GRHSIM_SAME_BATCH_ACTIVATION_COHORT_TSV=" +
+            cohortTsv.string() + " WOLVRIX_GRHSIM_SUPERNODE_TSV=" +
+            fireTsv.string() + " " + harnessExe.string();
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("same-batch activation cohort harness failed to run");
+        }
+        const std::string tsv = readFile(cohortTsv);
+        const std::size_t firstNewline = tsv.find('\n');
+        const std::size_t secondNewline =
+            firstNewline == std::string::npos ? std::string::npos :
+                                                tsv.find('\n', firstNewline + 1u);
+        const std::string_view firstRow =
+            firstNewline == std::string::npos
+                ? std::string_view{}
+                : std::string_view(tsv).substr(
+                      firstNewline + 1u,
+                      secondNewline == std::string::npos
+                          ? std::string_view::npos
+                          : secondNewline - firstNewline - 1u);
+        const std::vector<std::string_view> fields = splitTabs(firstRow);
+        if (tsv.find("cohort_id\tbatch_id\tsource_count") != 0u ||
+            fields.size() != 28u || fields[6] != "5" || fields[16] != "0" ||
+            fields[20] != "0" || fields[24] != "0" || fields[18] != fields[19])
+        {
+            return fail("same-batch activation cohort runtime TSV counters are inconsistent");
         }
         return 0;
     }
@@ -4911,6 +5283,10 @@ int main()
     if (std::getenv("WOLVRIX_TEST_DEFERRED_ACTIVATION_FORWARD") != nullptr)
     {
         return runDeferredActivationForwardFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_SAME_BATCH_ACTIVATION_COHORT") != nullptr)
+    {
+        return runSameBatchActivationCohortFocusedTests();
     }
     if (std::getenv("WOLVRIX_TEST_ACTIVE_MASK_GAP_PACK") != nullptr)
     {

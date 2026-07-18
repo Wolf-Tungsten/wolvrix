@@ -452,6 +452,12 @@ set_tests_properties(
     emit-grhsim-cpp-deferred-activation-forward
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_DEFERRED_ACTIVATION_FORWARD=1"
 )
+add_test(NAME emit-grhsim-cpp-same-batch-activation-cohort
+         COMMAND emit-grhsim-cpp)
+set_tests_properties(
+    emit-grhsim-cpp-same-batch-activation-cohort
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SAME_BATCH_ACTIVATION_COHORT=1"
+)
 
 add_executable(emit-grhsim-cpp-memory-fill
     tests/emit/test_emit_grhsim_cpp_memory_fill.cpp

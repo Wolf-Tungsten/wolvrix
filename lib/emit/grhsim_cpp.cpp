@@ -2571,6 +2571,7 @@ namespace wolvrix::lib::emit
         {
             kOff,
             kProbe,
+            kStrict,
         };
 
         std::string_view sameBatchActivationCohortPolicyName(
@@ -2582,6 +2583,8 @@ namespace wolvrix::lib::emit
                 return "off";
             case SameBatchActivationCohortPolicy::kProbe:
                 return "probe";
+            case SameBatchActivationCohortPolicy::kStrict:
+                return "strict";
             }
             return "off";
         }
@@ -2608,6 +2611,10 @@ namespace wolvrix::lib::emit
             if (value == "probe")
             {
                 return SameBatchActivationCohortPolicy::kProbe;
+            }
+            if (value == "strict")
+            {
+                return SameBatchActivationCohortPolicy::kStrict;
             }
             invalidValue = std::move(value);
             return std::nullopt;
@@ -4003,6 +4010,9 @@ namespace wolvrix::lib::emit
             std::vector<uint32_t> activeIds;
             std::vector<std::size_t> opCounts;
             std::vector<ValueId> sourceValues;
+            std::vector<uint32_t> sourceOwnerSupernodes;
+            std::vector<std::size_t> sourceOwnerBatches;
+            std::vector<std::uint64_t> sourceOwnerProfileFire;
             std::vector<uint32_t> sourceSupernodes;
             std::vector<std::size_t> sourceBatches;
             std::uint64_t profileFire = 0;
@@ -4042,6 +4052,82 @@ namespace wolvrix::lib::emit
             bool productionRequest = false;
             bool productionWitnessValid = false;
         };
+
+        constexpr std::uint64_t kSameBatchActivationCohortManifestMagic =
+            UINT64_C(0x534241434f484f52);
+        constexpr std::uint64_t kSameBatchActivationCohortManifestVersion = UINT64_C(2);
+        constexpr std::uint64_t kSameBatchActivationCohortFnvOffset =
+            UINT64_C(14695981039346656037);
+        constexpr std::uint64_t kSameBatchActivationCohortFnvPrime =
+            UINT64_C(1099511628211);
+        constexpr std::uint64_t kSimTopSameBatchActivationCohortManifest =
+            UINT64_C(0x2221bbc3ffd74a71);
+
+        void appendSameBatchActivationCohortManifestU64(
+            std::uint64_t &fingerprint,
+            std::uint64_t value) noexcept
+        {
+            for (unsigned byte = 0; byte < 8u; ++byte)
+            {
+                fingerprint ^= static_cast<std::uint8_t>(value >> (byte * 8u));
+                fingerprint *= kSameBatchActivationCohortFnvPrime;
+            }
+        }
+
+        std::uint64_t sameBatchActivationCohortManifestFingerprint(
+            const std::vector<SameBatchActivationCohort> &cohorts,
+            const SameBatchActivationCohortProbeStats &stats) noexcept
+        {
+            std::uint64_t fingerprint = kSameBatchActivationCohortFnvOffset;
+            const auto append = [&](std::uint64_t value)
+            {
+                appendSameBatchActivationCohortManifestU64(fingerprint, value);
+            };
+            append(kSameBatchActivationCohortManifestMagic);
+            append(kSameBatchActivationCohortManifestVersion);
+            append(cohorts.size());
+            for (std::size_t cohortIndex = 0; cohortIndex < cohorts.size(); ++cohortIndex)
+            {
+                const SameBatchActivationCohort &cohort = cohorts[cohortIndex];
+                append(cohortIndex);
+                append(cohort.batchIndex);
+                append(cohort.sourceValues.size());
+                for (std::size_t sourceIndex = 0;
+                     sourceIndex < cohort.sourceValues.size();
+                     ++sourceIndex)
+                {
+                    const ValueId value = cohort.sourceValues[sourceIndex];
+                    append(value.graph.index);
+                    append(value.graph.generation);
+                    append(value.index);
+                    append(value.generation);
+                    append(cohort.sourceOwnerSupernodes[sourceIndex]);
+                    append(cohort.sourceOwnerBatches[sourceIndex]);
+                    append(cohort.sourceOwnerProfileFire[sourceIndex]);
+                }
+                append(cohort.profileFire);
+                append(cohort.supernodes.size());
+                for (std::size_t memberIndex = 0;
+                     memberIndex < cohort.supernodes.size();
+                     ++memberIndex)
+                {
+                    append(cohort.supernodes[memberIndex]);
+                    append(cohort.activeIds[memberIndex]);
+                    append(cohort.opCounts[memberIndex]);
+                    append(cohort.profileFire);
+                }
+            }
+            append(stats.selectedCohorts);
+            append(stats.selectedMembers);
+            append(stats.selectedOps);
+            append(stats.controlBae);
+            append(stats.projectedBae);
+            append(stats.controlEntries);
+            append(stats.projectedEntries);
+            append(stats.controlChunks);
+            append(stats.projectedChunks);
+            return fingerprint;
+        }
 
         struct DeferredActivationStrictPairSpec
         {
@@ -4286,7 +4372,12 @@ namespace wolvrix::lib::emit
             bool deferredActivationCofireProbe = false;
             std::vector<DeferredActivationCofirePair> deferredActivationCofirePairs;
             bool sameBatchActivationCohortProbe = false;
+            bool sameBatchActivationCohortStrict = false;
             std::vector<SameBatchActivationCohort> sameBatchActivationCohorts;
+            BoundaryActivationFanoutMap sameBatchActivationCohortStrictFanoutByValue;
+            std::unordered_map<uint32_t, std::size_t>
+                sameBatchActivationCohortStrictIndexByLeader;
+            std::unordered_set<uint32_t> sameBatchActivationCohortStrictFollowers;
             bool deferredActivationCofireStrict = false;
             BoundaryActivationFanoutMap deferredActivationCofireStrictFanoutByValue;
             std::unordered_map<uint32_t, std::vector<uint32_t>>
@@ -4333,6 +4424,29 @@ namespace wolvrix::lib::emit
                 offset += cohort.supernodes.size();
             }
             return std::nullopt;
+        }
+
+        bool isSameBatchActivationCohortStrictFollower(
+            const EmitModel &model,
+            uint32_t supernode) noexcept
+        {
+            return model.sameBatchActivationCohortStrict &&
+                   model.sameBatchActivationCohortStrictFollowers.contains(supernode);
+        }
+
+        const SameBatchActivationCohort *sameBatchActivationCohortStrictLeader(
+            const EmitModel &model,
+            uint32_t supernode) noexcept
+        {
+            if (!model.sameBatchActivationCohortStrict)
+            {
+                return nullptr;
+            }
+            const auto it =
+                model.sameBatchActivationCohortStrictIndexByLeader.find(supernode);
+            return it == model.sameBatchActivationCohortStrictIndexByLeader.end()
+                       ? nullptr
+                       : &model.sameBatchActivationCohorts[it->second];
         }
 
         ValueId canonicalMaterializedStorageValue(const EmitModel &model, ValueId value) noexcept
@@ -4438,6 +4552,10 @@ namespace wolvrix::lib::emit
             activeIds.reserve(model.computeSupernodeIds.size());
             for (uint32_t supernodeId : model.computeSupernodeIds)
             {
+                if (isSameBatchActivationCohortStrictFollower(model, supernodeId))
+                {
+                    continue;
+                }
                 if (supernodeId >= model.activeIdBySupernode.size())
                 {
                     continue;
@@ -7834,6 +7952,7 @@ namespace wolvrix::lib::emit
             const ScheduleRefs &schedule,
             const std::vector<ScheduleBatch> &scheduleBatches,
             std::string_view profilePath,
+            SameBatchActivationCohortPolicy policy,
             std::vector<SameBatchActivationCohort> &cohorts)
         {
             cohorts.clear();
@@ -7846,7 +7965,9 @@ namespace wolvrix::lib::emit
             {
                 std::fprintf(
                     stderr,
-                    "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] policy=probe profile_valid=false profile_compute_rows=%zu profile_ignored_commit_rows=%zu selected=0 error=%s\n",
+                    "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] policy=%.*s profile_valid=false profile_compute_rows=%zu profile_ignored_commit_rows=%zu selected=0 error=%s\n",
+                    static_cast<int>(sameBatchActivationCohortPolicyName(policy).size()),
+                    sameBatchActivationCohortPolicyName(policy).data(),
                     profile.computeRows,
                     profile.ignoredCommitRows,
                     profile.error.c_str());
@@ -7987,6 +8108,9 @@ namespace wolvrix::lib::emit
             {
                 bool eligible = false;
                 std::vector<ValueId> sourceValues;
+                std::vector<uint32_t> sourceOwnerSupernodes;
+                std::vector<std::size_t> sourceOwnerBatches;
+                std::vector<std::uint64_t> sourceOwnerProfileFire;
                 std::vector<uint32_t> sourceSupernodes;
                 std::vector<std::size_t> sourceBatches;
                 std::uint64_t fire = 0;
@@ -8057,6 +8181,9 @@ namespace wolvrix::lib::emit
                 }
                 bool sourceValid = true;
                 bool sourceOrdered = true;
+                std::vector<uint32_t> sourceOwnerSupernodes;
+                std::vector<std::size_t> sourceOwnerBatches;
+                std::vector<std::uint64_t> sourceOwnerProfileFire;
                 std::vector<uint32_t> sourceSupernodes;
                 std::vector<std::size_t> sourceBatches;
                 for (ValueId sourceValue : sourceValues)
@@ -8083,6 +8210,17 @@ namespace wolvrix::lib::emit
                         sourceValid = false;
                         break;
                     }
+                    const auto sourceFireIt =
+                        profile.computeFire.find(sourceSupernode);
+                    if (sourceFireIt == profile.computeFire.end())
+                    {
+                        sourceValid = false;
+                        break;
+                    }
+                    sourceOwnerSupernodes.push_back(sourceSupernode);
+                    sourceOwnerBatches.push_back(
+                        batchBySupernode[sourceSupernode]);
+                    sourceOwnerProfileFire.push_back(sourceFireIt->second);
                     sourceSupernodes.push_back(sourceSupernode);
                     sourceBatches.push_back(batchBySupernode[sourceSupernode]);
                     if (batchBySupernode[sourceSupernode] >= batchBySupernode[supernode])
@@ -8114,6 +8252,9 @@ namespace wolvrix::lib::emit
                 eligibleBySupernode[supernode] = EligibleNode{
                     .eligible = true,
                     .sourceValues = sourceValues,
+                    .sourceOwnerSupernodes = std::move(sourceOwnerSupernodes),
+                    .sourceOwnerBatches = std::move(sourceOwnerBatches),
+                    .sourceOwnerProfileFire = std::move(sourceOwnerProfileFire),
                     .sourceSupernodes = std::move(sourceSupernodes),
                     .sourceBatches = std::move(sourceBatches),
                     .fire = fireIt->second,
@@ -8144,6 +8285,9 @@ namespace wolvrix::lib::emit
                 SameBatchActivationCohort cohort;
                 cohort.batchIndex = batch.index;
                 cohort.sourceValues = first.sourceValues;
+                cohort.sourceOwnerSupernodes = first.sourceOwnerSupernodes;
+                cohort.sourceOwnerBatches = first.sourceOwnerBatches;
+                cohort.sourceOwnerProfileFire = first.sourceOwnerProfileFire;
                 cohort.sourceSupernodes = first.sourceSupernodes;
                 cohort.sourceBatches = first.sourceBatches;
                 cohort.profileFire = first.fire;
@@ -8219,8 +8363,29 @@ namespace wolvrix::lib::emit
                 }
             }
 
-            for (const SameBatchActivationCohort &cohort : cohorts)
+            for (std::size_t cohortIndex = 0; cohortIndex < cohorts.size(); ++cohortIndex)
             {
+                const SameBatchActivationCohort &cohort = cohorts[cohortIndex];
+                if (cohort.sourceValues.size() != cohort.sourceOwnerSupernodes.size() ||
+                    cohort.sourceValues.size() != cohort.sourceOwnerBatches.size() ||
+                    cohort.sourceValues.size() != cohort.sourceOwnerProfileFire.size() ||
+                    cohort.supernodes.size() != cohort.activeIds.size() ||
+                    cohort.supernodes.size() != cohort.opCounts.size())
+                {
+                    std::fprintf(
+                        stderr,
+                        "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] fail_closed=manifest_shape cohort=%zu source_values=%zu source_owners=%zu source_batches=%zu source_fires=%zu members=%zu active_ids=%zu op_counts=%zu\n",
+                        cohortIndex,
+                        cohort.sourceValues.size(),
+                        cohort.sourceOwnerSupernodes.size(),
+                        cohort.sourceOwnerBatches.size(),
+                        cohort.sourceOwnerProfileFire.size(),
+                        cohort.supernodes.size(),
+                        cohort.activeIds.size(),
+                        cohort.opCounts.size());
+                    cohorts.clear();
+                    return false;
+                }
                 ++stats.selectedCohorts;
                 stats.selectedMembers += cohort.supernodes.size();
                 stats.selectedOps +=
@@ -8232,6 +8397,10 @@ namespace wolvrix::lib::emit
                 stats.controlChunks += cohort.controlChunks;
                 stats.projectedChunks += cohort.projectedChunks;
             }
+            const std::uint64_t manifestFingerprint =
+                sameBatchActivationCohortManifestFingerprint(
+                    cohorts,
+                    stats);
 
             if (stats.productionRequest)
             {
@@ -8280,9 +8449,43 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            if (policy == SameBatchActivationCohortPolicy::kStrict &&
+                stats.productionRequest &&
+                (stats.selectedCohorts != 252u ||
+                 stats.selectedMembers != 902u ||
+                 stats.selectedOps != 88334u ||
+                 stats.controlBae != 3619u ||
+                 stats.projectedBae != 1450u ||
+                 stats.controlEntries != 342u ||
+                 stats.projectedEntries != 252u ||
+                 stats.controlChunks != 257u ||
+                 stats.projectedChunks != 252u ||
+                 manifestFingerprint != kSimTopSameBatchActivationCohortManifest))
+            {
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] fail_closed=strict_production_contract selected=%zu members=%zu ops=%zu control_bae=%zu projected_bae=%zu control_entries=%zu projected_entries=%zu control_chunks=%zu projected_chunks=%zu manifest_fnv1a64=%016llx expected_manifest_fnv1a64=%016llx\n",
+                    stats.selectedCohorts,
+                    stats.selectedMembers,
+                    stats.selectedOps,
+                    stats.controlBae,
+                    stats.projectedBae,
+                    stats.controlEntries,
+                    stats.projectedEntries,
+                    stats.controlChunks,
+                    stats.projectedChunks,
+                    static_cast<unsigned long long>(manifestFingerprint),
+                    static_cast<unsigned long long>(
+                        kSimTopSameBatchActivationCohortManifest));
+                cohorts.clear();
+                return false;
+            }
+
             std::fprintf(
                 stderr,
-                "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] policy=probe profile_valid=true profile_compute_rows=%zu profile_ignored_commit_rows=%zu compute_supernodes=%zu pure_boundary_only=%zu signature_runs=%zu selected=%zu members=%zu ops=%zu control_bae=%zu projected_bae=%zu bae_saved=%zu control_entries=%zu projected_entries=%zu control_chunks=%zu projected_chunks=%zu production_request=%s production_witness_valid=%s no_mutation=true\n",
+                "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] policy=%.*s profile_valid=true profile_compute_rows=%zu profile_ignored_commit_rows=%zu compute_supernodes=%zu pure_boundary_only=%zu signature_runs=%zu selected=%zu members=%zu ops=%zu control_bae=%zu projected_bae=%zu bae_saved=%zu control_entries=%zu projected_entries=%zu control_chunks=%zu projected_chunks=%zu manifest_fnv1a64=%016llx production_request=%s production_witness_valid=%s scan_no_mutation=true emit_mutation=%s no_mutation=%s\n",
+                static_cast<int>(sameBatchActivationCohortPolicyName(policy).size()),
+                sameBatchActivationCohortPolicyName(policy).data(),
                 profile.computeRows,
                 profile.ignoredCommitRows,
                 stats.computeSupernodes,
@@ -8298,8 +8501,15 @@ namespace wolvrix::lib::emit
                 stats.projectedEntries,
                 stats.controlChunks,
                 stats.projectedChunks,
+                static_cast<unsigned long long>(manifestFingerprint),
                 stats.productionRequest ? "true" : "false",
-                stats.productionWitnessValid ? "true" : "false");
+                stats.productionWitnessValid ? "true" : "false",
+                policy == SameBatchActivationCohortPolicy::kStrict
+                    ? "strict_overlay"
+                    : "none",
+                policy == SameBatchActivationCohortPolicy::kStrict
+                    ? "false"
+                    : "true");
             std::fprintf(
                 stderr,
                 "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] rejects commit=%zu impure=%zu input=%zu state=%zu memory=%zu event=%zu empty_source=%zu source_owner=%zu source_order=%zu profile=%zu noncontiguous=%zu\n",
@@ -8345,6 +8555,222 @@ namespace wolvrix::lib::emit
                     cohort.projectedChunks,
                     cohort.supernodes.size() - 1u);
             }
+            return true;
+        }
+
+        bool configureSameBatchActivationCohortStrictOverlay(
+            const std::vector<ScheduleBatch> &scheduleBatches,
+            EmitModel &model,
+            std::size_t &removedFollowerEdges,
+            std::string &error)
+        {
+            removedFollowerEdges = 0;
+            if (model.sameBatchActivationCohorts.empty())
+            {
+                error = "strict cohort set is empty";
+                return false;
+            }
+
+            BoundaryActivationFanoutMap strictFanout = model.boundaryFanoutByValue;
+            std::unordered_map<uint32_t, std::size_t> cohortIndexByLeader;
+            std::unordered_set<uint32_t> followers;
+            std::unordered_set<uint32_t> followerActiveIds;
+            std::unordered_set<uint32_t> allMembers;
+            std::unordered_set<uint32_t> nonBoundaryActivationIds;
+            for (const auto &[_, activeIds] : model.inputHeadSupernodesByValue)
+            {
+                nonBoundaryActivationIds.insert(activeIds.begin(), activeIds.end());
+            }
+            for (const auto &[_, activeIds] : model.stateHeadSupernodesBySymbol)
+            {
+                nonBoundaryActivationIds.insert(activeIds.begin(), activeIds.end());
+            }
+            for (const MemoryRowReaderActivationDecl &activation :
+                 model.memoryRowReaderActivations)
+            {
+                nonBoundaryActivationIds.insert(
+                    activation.dynamicReaderActiveIds.begin(),
+                    activation.dynamicReaderActiveIds.end());
+                for (const ActiveMaskEntry &entry : activation.rowEntries)
+                {
+                    for (std::size_t bit = 0; bit < kActiveFlagBitsPerWord; ++bit)
+                    {
+                        if ((entry.mask & (UINT8_C(1) << bit)) != UINT8_C(0))
+                        {
+                            nonBoundaryActivationIds.emplace(
+                                static_cast<uint32_t>(
+                                    entry.wordIndex * kActiveFlagBitsPerWord + bit));
+                        }
+                    }
+                }
+            }
+            for (std::size_t cohortIndex = 0;
+                 cohortIndex < model.sameBatchActivationCohorts.size();
+                 ++cohortIndex)
+            {
+                const SameBatchActivationCohort &cohort =
+                    model.sameBatchActivationCohorts[cohortIndex];
+                if (cohort.supernodes.size() < 2u ||
+                    cohort.supernodes.size() != cohort.activeIds.size() ||
+                    cohort.supernodes.size() != cohort.opCounts.size() ||
+                    cohort.sourceValues.empty() ||
+                    cohort.sourceValues.size() !=
+                        cohort.sourceOwnerSupernodes.size() ||
+                    cohort.sourceValues.size() != cohort.sourceOwnerBatches.size() ||
+                    cohort.sourceValues.size() !=
+                        cohort.sourceOwnerProfileFire.size())
+                {
+                    error = "malformed strict cohort " + std::to_string(cohortIndex);
+                    return false;
+                }
+                const auto batchIt = std::find_if(
+                    scheduleBatches.begin(),
+                    scheduleBatches.end(),
+                    [&](const ScheduleBatch &batch)
+                    {
+                        return batch.index == cohort.batchIndex;
+                    });
+                if (batchIt == scheduleBatches.end() ||
+                    batchIt->phase != ScheduleBatch::Phase::kCompute)
+                {
+                    error = "strict cohort batch is missing or not compute: " +
+                            std::to_string(cohortIndex);
+                    return false;
+                }
+                for (std::size_t memberIndex = 0;
+                     memberIndex < cohort.supernodes.size();
+                     ++memberIndex)
+                {
+                    const uint32_t supernode = cohort.supernodes[memberIndex];
+                    const uint32_t activeId = cohort.activeIds[memberIndex];
+                    if (!allMembers.emplace(supernode).second)
+                    {
+                        error = "strict cohort member appears more than once: " +
+                                std::to_string(supernode);
+                        return false;
+                    }
+                    std::size_t wordMatches = 0;
+                    for (const ScheduleBatch::Word &word : batchIt->words)
+                    {
+                        if (std::find(word.supernodeIds.begin(),
+                                      word.supernodeIds.end(),
+                                      supernode) == word.supernodeIds.end())
+                        {
+                            continue;
+                        }
+                        ++wordMatches;
+                        if (word.activeFlagWordIndex !=
+                                activeId / kActiveFlagBitsPerWord ||
+                            word.emitAsHelper || !word.helperChunks.empty())
+                        {
+                            error = "strict cohort selected a mismatched or helper-split word: " +
+                                    std::to_string(supernode);
+                            return false;
+                        }
+                    }
+                    if (wordMatches != 1u)
+                    {
+                        error = "strict cohort member does not have exactly one word: " +
+                                std::to_string(supernode);
+                        return false;
+                    }
+                    if (memberIndex != 0u)
+                    {
+                        if (nonBoundaryActivationIds.contains(activeId))
+                        {
+                            error = "strict cohort follower has a non-boundary activation source: " +
+                                    std::to_string(supernode);
+                            return false;
+                        }
+                        followers.emplace(supernode);
+                        followerActiveIds.emplace(activeId);
+                    }
+                }
+                if (!cohortIndexByLeader.emplace(cohort.supernodes.front(), cohortIndex).second)
+                {
+                    error = "strict cohort leader appears more than once";
+                    return false;
+                }
+                for (ValueId sourceValue : cohort.sourceValues)
+                {
+                    const auto fanoutIt = strictFanout.find(sourceValue);
+                    if (fanoutIt == strictFanout.end())
+                    {
+                        error = "strict cohort source fanout is missing";
+                        return false;
+                    }
+                    auto &activeIds = fanoutIt->second;
+                    if (std::count(activeIds.begin(),
+                                   activeIds.end(),
+                                   cohort.activeIds.front()) != 1)
+                    {
+                        error = "strict cohort leader fanout is not unique";
+                        return false;
+                    }
+                    for (std::size_t memberIndex = 1;
+                         memberIndex < cohort.activeIds.size();
+                         ++memberIndex)
+                    {
+                        const uint32_t followerActiveId = cohort.activeIds[memberIndex];
+                        if (std::count(activeIds.begin(),
+                                       activeIds.end(),
+                                       followerActiveId) != 1)
+                        {
+                            error = "strict cohort follower fanout is not unique";
+                            return false;
+                        }
+                        const auto followerIt =
+                            std::find(activeIds.begin(), activeIds.end(), followerActiveId);
+                        if (followerIt == activeIds.end())
+                        {
+                            error = "strict cohort follower fanout is missing";
+                            return false;
+                        }
+                        activeIds.erase(followerIt);
+                        ++removedFollowerEdges;
+                    }
+                }
+            }
+
+            std::size_t expectedRemovedFollowerEdges = 0;
+            for (const SameBatchActivationCohort &cohort :
+                 model.sameBatchActivationCohorts)
+            {
+                expectedRemovedFollowerEdges +=
+                    cohort.sourceValues.size() * (cohort.supernodes.size() - 1u);
+            }
+            if (removedFollowerEdges != expectedRemovedFollowerEdges)
+            {
+                error = "strict cohort follower edge accounting mismatch";
+                return false;
+            }
+            for (const auto &[_, activeIds] : strictFanout)
+            {
+                for (uint32_t activeId : activeIds)
+                {
+                    if (followerActiveIds.contains(activeId))
+                    {
+                        error = "strict fanout retains a follower active ID: " +
+                                std::to_string(activeId);
+                        return false;
+                    }
+                }
+            }
+            for (const auto &[leader, _] : cohortIndexByLeader)
+            {
+                if (followers.contains(leader))
+                {
+                    error = "strict cohort leader is also a follower";
+                    return false;
+                }
+            }
+
+            model.sameBatchActivationCohortStrictFanoutByValue =
+                std::move(strictFanout);
+            model.sameBatchActivationCohortStrictIndexByLeader =
+                std::move(cohortIndexByLeader);
+            model.sameBatchActivationCohortStrictFollowers = std::move(followers);
+            model.sameBatchActivationCohortStrict = true;
             return true;
         }
 
@@ -19824,14 +20250,104 @@ namespace wolvrix::lib::emit
                            << (pureEventHitExpr.empty() ? *pureEventWordExpr : pureEventHitExpr)
                            << ") {\n";
                 }
-                for (uint32_t supernodeId : word.supernodeIds)
+                std::uint8_t strictFollowerMask = UINT8_C(0);
+                if (model.sameBatchActivationCohortStrict && !fullpassVariant &&
+                    batch.phase == ScheduleBatch::Phase::kCompute)
                 {
+                    for (uint32_t supernodeId : word.supernodeIds)
+                    {
+                        if (!isSameBatchActivationCohortStrictFollower(model, supernodeId))
+                        {
+                            continue;
+                        }
+                        const std::size_t activeId =
+                            supernodeId < model.activeIdBySupernode.size()
+                                ? model.activeIdBySupernode[supernodeId]
+                                : kInvalidIndex;
+                        if (activeId != kInvalidIndex)
+                        {
+                            strictFollowerMask = static_cast<std::uint8_t>(
+                                strictFollowerMask |
+                                (UINT8_C(1) <<
+                                 (activeId % kActiveFlagBitsPerWord)));
+                        }
+                    }
+                }
+                if (strictFollowerMask != UINT8_C(0))
+                {
+                    // Retain follower bits in dispatch/clearMask so an
+                    // unexpected residual is consumed, but never emit a
+                    // follower guard or body at its original position.
+                    stream << "                activeWordFlags = static_cast<std::uint8_t>(activeWordFlags & static_cast<std::uint8_t>(~UINT8_C("
+                           << static_cast<unsigned>(strictFollowerMask)
+                           << ")));\n";
+                }
+                for (uint32_t dispatchSupernodeId : word.supernodeIds)
+                {
+                    const bool strictOrdinaryCompute =
+                        model.sameBatchActivationCohortStrict &&
+                        !fullpassVariant &&
+                        batch.phase == ScheduleBatch::Phase::kCompute;
+                    if (strictOrdinaryCompute &&
+                        isSameBatchActivationCohortStrictFollower(
+                            model,
+                            dispatchSupernodeId))
+                    {
+                        continue;
+                    }
+                    std::vector<uint32_t> payloadSupernodes{dispatchSupernodeId};
+                    if (strictOrdinaryCompute)
+                    {
+                        if (const SameBatchActivationCohort *cohort =
+                                sameBatchActivationCohortStrictLeader(
+                                    model,
+                                    dispatchSupernodeId))
+                        {
+                            payloadSupernodes = cohort->supernodes;
+                        }
+                    }
+                    const bool strictCohortLeader = payloadSupernodes.size() > 1u;
+                    std::size_t strictPayloadWordIndex = word.activeFlagWordIndex;
+                    for (std::size_t payloadIndex = 0;
+                         payloadIndex < payloadSupernodes.size();
+                         ++payloadIndex)
+                    {
+                    const uint32_t supernodeId = payloadSupernodes[payloadIndex];
                     const std::size_t activeId =
                         supernodeId < model.activeIdBySupernode.size() ? model.activeIdBySupernode[supernodeId] : kInvalidIndex;
+                    const std::size_t payloadWordIndex =
+                        activeId / kActiveFlagBitsPerWord;
+                    if (strictCohortLeader && payloadIndex != 0u &&
+                        payloadWordIndex != strictPayloadWordIndex)
+                    {
+                        if (strictPayloadWordIndex != word.activeFlagWordIndex)
+                        {
+                            stream << "            supernode_active_curr_["
+                                   << strictPayloadWordIndex
+                                   << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
+                                   << strictPayloadWordIndex
+                                   << "u] | same_batch_cohort_"
+                                   << dispatchSupernodeId << "_word_"
+                                   << strictPayloadWordIndex << "_flags);\n";
+                        }
+                        strictPayloadWordIndex = payloadWordIndex;
+                        stream << "            std::uint8_t same_batch_cohort_"
+                               << dispatchSupernodeId << "_word_"
+                               << strictPayloadWordIndex
+                               << "_flags = UINT8_C(0);\n";
+                    }
+                    const std::string strictLocalActiveExpr =
+                        strictCohortLeader &&
+                                payloadWordIndex != word.activeFlagWordIndex
+                            ? "same_batch_cohort_" +
+                                  std::to_string(dispatchSupernodeId) +
+                                  "_word_" +
+                                  std::to_string(payloadWordIndex) + "_flags"
+                            : "activeWordFlags";
                     const ActivationEmitContext activationContext{
-                        .currentWordIndex = word.activeFlagWordIndex,
+                        .currentWordIndex = payloadWordIndex,
                         .currentActiveId = activeId,
-                        .localActiveExpr = "activeWordFlags",
+                        .localActiveExpr = strictLocalActiveExpr,
                         .suppressComputePropagation = fullpassVariant,
                         .activeMaskGapPackProbe = model.activeMaskGapPackProbe,
                         .boundaryFanoutByValue =
@@ -19839,17 +20355,37 @@ namespace wolvrix::lib::emit
                                     batch.phase == ScheduleBatch::Phase::kCompute &&
                                     !fullpassVariant
                                 ? &model.deferredActivationCofireStrictFanoutByValue
-                                : nullptr};
+                                : (model.sameBatchActivationCohortStrict &&
+                                           batch.phase == ScheduleBatch::Phase::kCompute &&
+                                           !fullpassVariant
+                                       ? &model.sameBatchActivationCohortStrictFanoutByValue
+                                       : nullptr)};
                     const std::uint8_t supernodeMask =
                         static_cast<std::uint8_t>(UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
-                    stream << "    \n";
-                    stream << "        // Supernode " << supernodeId << ": run when its activity flag is set.\n";
-                    stream << "        if (unlikely(activeWordFlags & UINT8_C(" << static_cast<unsigned>(supernodeMask) << "))) {\n";
-                    if (!consumeFullActiveWord)
+                    if (payloadIndex == 0u)
                     {
-                        stream << "        activeWordFlags = static_cast<std::uint8_t>(\n";
-                        stream << "            activeWordFlags & static_cast<std::uint8_t>(~UINT8_C("
-                               << static_cast<unsigned>(supernodeMask) << ")));\n";
+                        stream << "    \n";
+                        stream << "        // Supernode " << supernodeId << ": run when its activity flag is set.\n";
+                        stream << "        if (unlikely(activeWordFlags & UINT8_C(" << static_cast<unsigned>(supernodeMask) << "))) {\n";
+                        if (strictCohortLeader)
+                        {
+                            stream << "        // Strict same-batch cohort leader "
+                                   << dispatchSupernodeId << " executes "
+                                   << payloadSupernodes.size()
+                                   << " ordered payloads under this single guard.\n";
+                        }
+                        if (!consumeFullActiveWord)
+                        {
+                            stream << "        activeWordFlags = static_cast<std::uint8_t>(\n";
+                            stream << "            activeWordFlags & static_cast<std::uint8_t>(~UINT8_C("
+                                   << static_cast<unsigned>(supernodeMask) << ")));\n";
+                        }
+                    }
+                    else
+                    {
+                        stream << "    \n";
+                        stream << "        // Strict cohort follower payload for supernode "
+                               << supernodeId << "; no follower activity guard.\n";
                     }
                     if (model.emitRuntimeProfile)
                     {
@@ -19957,7 +20493,9 @@ namespace wolvrix::lib::emit
                     const BoundaryActivationFanoutMap &fanoutByValue =
                         model.deferredActivationCofireStrict
                             ? model.deferredActivationCofireStrictFanoutByValue
-                            : model.boundaryFanoutByValue;
+                            : (model.sameBatchActivationCohortStrict
+                                   ? model.sameBatchActivationCohortStrictFanoutByValue
+                                   : model.boundaryFanoutByValue);
                     deferredActivationGroups = buildDeferredActivationGroupsForFanout(
                         graph,
                         model,
@@ -19976,7 +20514,11 @@ namespace wolvrix::lib::emit
                                 batch.phase == ScheduleBatch::Phase::kCompute &&
                                 !fullpassVariant
                             ? &model.deferredActivationCofireStrictFanoutByValue
-                            : nullptr};
+                            : (model.sameBatchActivationCohortStrict &&
+                                       batch.phase == ScheduleBatch::Phase::kCompute &&
+                                       !fullpassVariant
+                                   ? &model.sameBatchActivationCohortStrictFanoutByValue
+                                   : nullptr)};
                 for (OperationId useOpId : supernodeOps)
                 {
                     const Operation useOp = graph.getOperation(useOpId);
@@ -21255,8 +21797,24 @@ namespace wolvrix::lib::emit
                     {
                         stream << "            }\n";
                     }
+                    stream << "        }\n";
+                    if (strictCohortLeader &&
+                        payloadIndex + 1u == payloadSupernodes.size() &&
+                        strictPayloadWordIndex != word.activeFlagWordIndex)
+                    {
+                        stream << "            supernode_active_curr_["
+                               << strictPayloadWordIndex
+                               << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
+                               << strictPayloadWordIndex
+                               << "u] | same_batch_cohort_"
+                               << dispatchSupernodeId << "_word_"
+                               << strictPayloadWordIndex << "_flags);\n";
+                    }
+                    if (payloadIndex + 1u == payloadSupernodes.size())
+                    {
                         stream << "        }\n";
-                        stream << "        }\n";
+                    }
+                    }
                 }
                 if (!fullpassVariant && !consumeFullActiveWord)
                 {
@@ -21729,7 +22287,7 @@ namespace wolvrix::lib::emit
         {
             reportError("invalid same_batch_activation_cohort_policy: " +
                         invalidSameBatchActivationCohortPolicy +
-                        " (expected off or probe)");
+                        " (expected off, probe, or strict)");
             result.success = false;
             return result;
         }
@@ -21738,6 +22296,12 @@ namespace wolvrix::lib::emit
         const bool sameBatchActivationCohortProbeRequested =
             *sameBatchActivationCohortPolicy ==
             SameBatchActivationCohortPolicy::kProbe;
+        const bool sameBatchActivationCohortStrictRequested =
+            *sameBatchActivationCohortPolicy ==
+            SameBatchActivationCohortPolicy::kStrict;
+        const bool sameBatchActivationCohortRequested =
+            sameBatchActivationCohortProbeRequested ||
+            sameBatchActivationCohortStrictRequested;
         std::string invalidWordPackPolicy;
         const auto pureEventWordPackPolicy =
             parsePureEventWordPackPolicy(options, invalidWordPackPolicy);
@@ -21754,15 +22318,25 @@ namespace wolvrix::lib::emit
             result.success = false;
             return result;
         }
-        if (sameBatchActivationCohortProbeRequested &&
+        if (sameBatchActivationCohortRequested &&
             (*activeMaskGapPackPolicy != ActiveMaskGapPackPolicy::kOff ||
              *deferredActivationForwardPolicy != DeferredActivationForwardPolicy::kOff ||
              *pureEventWordPackPolicy != PureEventWordPackPolicy::kOff))
         {
-            reportError("same_batch_activation_cohort_policy=probe requires "
+            reportError("same_batch_activation_cohort_policy=" +
+                        std::string(sameBatchActivationCohortPolicyName(
+                            *sameBatchActivationCohortPolicy)) +
+                        " requires "
                         "active_mask_gap_pack_policy=off, "
                         "deferred_activation_forward_policy=off, and "
                         "pure_event_word_pack_policy=off");
+            result.success = false;
+            return result;
+        }
+        if (sameBatchActivationCohortStrictRequested && fullActiveWordConsume)
+        {
+            reportError("same_batch_activation_cohort_policy=strict requires "
+                        "full_active_word_consume=false");
             result.success = false;
             return result;
         }
@@ -22068,7 +22642,7 @@ namespace wolvrix::lib::emit
                                          schedule.commitLocalityGroupByOp,
                                          schedule.commitLocalityGroupOrder);
         rebuildMaterializedValueStorage(graph, batchReadLocalityValueOrder, model);
-        if (sameBatchActivationCohortProbeRequested)
+        if (sameBatchActivationCohortRequested)
         {
             std::vector<SameBatchActivationCohort> cohorts;
             if (!runSameBatchActivationCohortProbe(
@@ -22077,22 +22651,54 @@ namespace wolvrix::lib::emit
                     schedule,
                     scheduleBatches,
                     sameBatchActivationCohortProfilePath,
+                    *sameBatchActivationCohortPolicy,
                     cohorts))
             {
-                reportError("same-batch activation cohort probe failed closed; "
+                reportError("same-batch activation cohort policy failed closed; "
                             "see stderr for the exact reason",
                             sessionPrefix);
                 result.success = false;
                 return result;
             }
             model.sameBatchActivationCohorts = std::move(cohorts);
-            model.sameBatchActivationCohortProbe =
-                !model.sameBatchActivationCohorts.empty();
-            std::fprintf(
-                stderr,
-                "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] emit_probe=%s cohorts=%zu fullpass_excluded=true commit_excluded=true seed_mutation=false\n",
-                model.sameBatchActivationCohortProbe ? "true" : "false",
-                model.sameBatchActivationCohorts.size());
+            if (sameBatchActivationCohortProbeRequested)
+            {
+                model.sameBatchActivationCohortProbe =
+                    !model.sameBatchActivationCohorts.empty();
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] emit_probe=%s cohorts=%zu fullpass_excluded=true commit_excluded=true seed_mutation=false\n",
+                    model.sameBatchActivationCohortProbe ? "true" : "false",
+                    model.sameBatchActivationCohorts.size());
+            }
+            if (sameBatchActivationCohortStrictRequested)
+            {
+                std::size_t removedFollowerEdges = 0;
+                std::string strictError;
+                if (!configureSameBatchActivationCohortStrictOverlay(
+                        scheduleBatches,
+                        model,
+                        removedFollowerEdges,
+                        strictError))
+                {
+                    std::fprintf(
+                        stderr,
+                        "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] fail_closed=strict_overlay error=%s\n",
+                        strictError.c_str());
+                    reportError("same-batch activation cohort strict overlay failed closed: " +
+                                    strictError,
+                                sessionPrefix);
+                    result.success = false;
+                    return result;
+                }
+                std::fprintf(
+                    stderr,
+                    "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] emit_strict=true cohorts=%zu members=%zu followers=%zu removed_follower_bae=%zu fullpass_unchanged=true commit_unchanged=true runtime_probe_compiled=false\n",
+                    model.sameBatchActivationCohorts.size(),
+                    sameBatchActivationCohortMemberCount(model),
+                    model.sameBatchActivationCohortStrictFollowers.size(),
+                    removedFollowerEdges);
+            }
         }
         const bool runtimeProfileCompiled =
             model.emitRuntimeProfile || model.pureEventComputeWordProfile;

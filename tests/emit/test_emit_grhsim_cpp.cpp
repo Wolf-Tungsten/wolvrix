@@ -3697,7 +3697,7 @@ namespace
     ActiveMaskGapPackFixture buildSameBatchActivationCohortFixture(
         std::string_view graphSymbol = "top")
     {
-        constexpr std::size_t kSupernodeCount = 16u;
+        constexpr std::size_t kSupernodeCount = 24u;
         ActiveMaskGapPackFixture fixture;
         Graph &graph = fixture.design.createGraph(std::string(graphSymbol));
         fixture.design.markAsTop(graph.symbol());
@@ -3706,6 +3706,7 @@ namespace
         graph.bindInputPort("in", input);
         const ValueId shared = makeLogicValue(graph, "shared", 8);
         ActivityScheduleSupernodeToOps supernodeToOps(kSupernodeCount);
+        std::vector<ValueId> results(kSupernodeCount);
 
         const OperationId producer = graph.createOperation(
             OperationKind::kAssign,
@@ -3713,6 +3714,13 @@ namespace
         graph.addOperand(producer, input);
         graph.addResult(producer, shared);
         supernodeToOps[0].push_back(producer);
+        const ValueId producerPadding = makeLogicValue(graph, "producer_padding", 8);
+        const OperationId producerPaddingOp = graph.createOperation(
+            OperationKind::kConstant,
+            graph.internSymbol("cohort_producer_padding"));
+        graph.addResult(producerPaddingOp, producerPadding);
+        graph.setAttr(producerPaddingOp, "constValue", std::string("8'd0"));
+        supernodeToOps[0].push_back(producerPaddingOp);
 
         for (std::size_t supernode = 1; supernode < kSupernodeCount; ++supernode)
         {
@@ -3720,7 +3728,9 @@ namespace
                 graph,
                 "cohort_result_" + std::to_string(supernode),
                 8);
-            if (supernode >= 8u && supernode <= 12u)
+            results[supernode] = result;
+            if ((supernode >= 8u && supernode <= 12u) ||
+                (supernode >= 14u && supernode <= 18u))
             {
                 const OperationId op = graph.createOperation(
                     OperationKind::kAssign,
@@ -3728,6 +3738,19 @@ namespace
                 graph.addOperand(op, shared);
                 graph.addResult(op, result);
                 supernodeToOps[supernode].push_back(op);
+                graph.bindOutputPort(
+                    "out_" + std::to_string(supernode),
+                    result);
+            }
+            else if (supernode == 19u)
+            {
+                const OperationId op = graph.createOperation(
+                    OperationKind::kAssign,
+                    graph.internSymbol("cohort_follower_consumer"));
+                graph.addOperand(op, results[18u]);
+                graph.addResult(op, result);
+                supernodeToOps[supernode].push_back(op);
+                graph.bindOutputPort("out_19", result);
             }
             else
             {
@@ -3742,12 +3765,16 @@ namespace
         }
 
         ActivityScheduleValueFanout valueFanout(graph.values().size());
-        valueFanout[shared.index - 1u] = {8u, 9u, 10u, 11u, 12u};
+        valueFanout[shared.index - 1u] = {8u, 9u, 10u, 11u, 12u,
+                                          14u, 15u, 16u, 17u, 18u};
+        valueFanout[results[18u].index - 1u] = {19u};
         ActivityScheduleTopoOrder topoOrder(kSupernodeCount);
         std::iota(topoOrder.begin(), topoOrder.end(), 0u);
         ActivityScheduleStateReadSupernodes stateReads;
         ActivityScheduleDag dag(kSupernodeCount);
-        dag[0] = {8u, 9u, 10u, 11u, 12u};
+        dag[0] = {8u, 9u, 10u, 11u, 12u,
+                  14u, 15u, 16u, 17u, 18u};
+        dag[18u] = {19u};
         setActivityScheduleFixtureSlot(
             fixture.session, "supernode_to_ops", std::move(supernodeToOps), graphSymbol);
         setActivityScheduleFixtureSlot(
@@ -3964,7 +3991,8 @@ namespace
         const std::filesystem::path &outDir,
         std::optional<std::string_view> policy,
         const std::filesystem::path &profilePath,
-        std::string_view sessionPrefix = "top")
+        std::string_view sessionPrefix = "top",
+        bool fullActiveWordConsume = false)
     {
         std::filesystem::remove_all(outDir);
         std::filesystem::create_directories(outDir);
@@ -3972,10 +4000,14 @@ namespace
         options.outputDir = outDir.string();
         options.session = &session;
         options.sessionPathPrefix = std::string(sessionPrefix);
-        options.attributes["sched_batch_max_ops"] = "8";
+        options.attributes["sched_batch_max_ops"] = "16";
         options.attributes["sched_batch_max_estimated_lines"] = "100000";
         options.attributes["sched_batches_per_cpp"] = "1";
         options.attributes["emit_parallelism"] = "1";
+        if (fullActiveWordConsume)
+        {
+            options.attributes["full_active_word_consume"] = "1";
+        }
         if (policy)
         {
             options.attributes["same_batch_activation_cohort_policy"] =
@@ -4345,10 +4377,13 @@ namespace
         {
             std::ofstream profile(profilePath);
             profile << "supernode_id\tphase\tf\n";
-            for (std::size_t supernode = 0; supernode < 16u; ++supernode)
+            for (std::size_t supernode = 0; supernode < 24u; ++supernode)
             {
                 const std::uint64_t fire =
-                    supernode >= 8u && supernode <= 12u ? 10u : supernode + 1u;
+                    ((supernode >= 8u && supernode <= 12u) ||
+                     (supernode >= 14u && supernode <= 18u))
+                        ? 10u
+                        : supernode + 1u;
                 profile << supernode << "\tcompute\t" << fire << '\n';
             }
         }
@@ -4384,6 +4419,22 @@ namespace
                 baseDir / "probe_repeat",
                 "probe",
                 profilePath);
+        const ActiveMaskGapPackEmitRun strictRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "strict",
+                "strict",
+                profilePath);
+        const ActiveMaskGapPackEmitRun strictFullActiveRun =
+            runSameBatchActivationCohortEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / "strict_full_active_word",
+                "strict",
+                profilePath,
+                "top",
+                true);
         const ActiveMaskGapPackEmitRun missingProfileRun =
             runSameBatchActivationCohortEmit(
                 fixture.design,
@@ -4396,7 +4447,7 @@ namespace
                 fixture.design,
                 fixture.session,
                 baseDir / "invalid_policy",
-                "strict",
+                "targeted",
                 profilePath);
         ActiveMaskGapPackFixture productionContractFixture =
             buildSameBatchActivationCohortFixture("SimTop");
@@ -4412,7 +4463,8 @@ namespace
         if (!defaultRun.success || defaultRun.diagnosticError ||
             !offRun.success || offRun.diagnosticError ||
             !probeRun.success || probeRun.diagnosticError ||
-            !probeRepeatRun.success || probeRepeatRun.diagnosticError)
+            !probeRepeatRun.success || probeRepeatRun.diagnosticError ||
+            !strictRun.success || strictRun.diagnosticError)
         {
             return fail("same-batch activation cohort fixture emission failed");
         }
@@ -4445,28 +4497,38 @@ namespace
         const std::string_view row = probeLogLine(
             probeRun.stderrText,
             "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] cohort=0 ");
-        if (summary.find("selected=1 members=5 ops=5 control_bae=5 projected_bae=1") ==
+        const std::string_view row1 = probeLogLine(
+            probeRun.stderrText,
+            "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] cohort=1 ");
+        if (summary.find("selected=2 members=10 ops=10 control_bae=10 projected_bae=2") ==
                 std::string_view::npos ||
             summary.find("no_mutation=true") == std::string_view::npos ||
             row.find("batch=1") == std::string_view::npos ||
             row.find("first_supernode=8 last_supernode=12") == std::string_view::npos ||
             row.find("first_active_id=8 last_active_id=12") == std::string_view::npos ||
-            row.find("profile_fire=10") == std::string_view::npos)
+            row.find("profile_fire=10") == std::string_view::npos ||
+            row1.find("batch=1") == std::string_view::npos ||
+            row1.find("first_supernode=14 last_supernode=18") == std::string_view::npos ||
+            row1.find("first_active_id=14 last_active_id=18") == std::string_view::npos ||
+            row1.find("profile_fire=10") == std::string_view::npos)
         {
             return fail("same-batch activation cohort exact static row is incomplete");
         }
         if (missingProfileRun.success || !missingProfileRun.diagnosticError ||
             missingProfileRun.stderrText.find("profile path is empty") == std::string::npos ||
-            missingProfileRun.diagnostics.find("probe failed closed") == std::string::npos ||
+            missingProfileRun.diagnostics.find("policy failed closed") == std::string::npos ||
             invalidPolicyRun.success || !invalidPolicyRun.diagnosticError ||
-            invalidPolicyRun.diagnostics.find("expected off or probe") == std::string::npos ||
+            invalidPolicyRun.diagnostics.find("expected off, probe, or strict") == std::string::npos ||
             missingProductionWitnessRun.success ||
             !missingProductionWitnessRun.diagnosticError ||
             missingProductionWitnessRun.stderrText.find(
                 "fail_closed=production_witness_missing production_request=true") ==
                 std::string::npos ||
-            missingProductionWitnessRun.diagnostics.find("probe failed closed") ==
-                std::string::npos)
+            missingProductionWitnessRun.diagnostics.find("policy failed closed") ==
+                std::string::npos ||
+            strictFullActiveRun.success || !strictFullActiveRun.diagnosticError ||
+            strictFullActiveRun.diagnostics.find(
+                "requires full_active_word_consume=false") == std::string::npos)
         {
             return fail("same-batch activation cohort policy/profile fail-closed gate is missing");
         }
@@ -4517,6 +4579,76 @@ namespace
         if (!resetPresent)
         {
             return fail("same-batch activation cohort runtime counters are not reset");
+        }
+
+        const std::string_view strictSummary = probeLogLine(
+            strictRun.stderrText,
+            "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] policy=strict ");
+        const std::string_view strictOverlay = probeLogLine(
+            strictRun.stderrText,
+            "[GRHSIM_SAME_BATCH_ACTIVATION_COHORT] emit_strict=true ");
+        const auto strictSched0It =
+            strictRun.artifacts.find("grhsim_top_sched_0.cpp");
+        const auto strictSched1It =
+            strictRun.artifacts.find("grhsim_top_sched_1.cpp");
+        const auto strictEvalIt =
+            strictRun.artifacts.find("grhsim_top_eval.cpp");
+        const auto strictHeaderIt =
+            strictRun.artifacts.find("grhsim_top.hpp");
+        if (strictSummary.find(
+                "selected=2 members=10 ops=10 control_bae=10 projected_bae=2") ==
+                std::string_view::npos ||
+            strictSummary.find("emit_mutation=strict_overlay no_mutation=false") ==
+                std::string_view::npos ||
+            strictOverlay.find(
+                "cohorts=2 members=10 followers=8 removed_follower_bae=8") ==
+                std::string_view::npos ||
+            strictSched0It == strictRun.artifacts.end() ||
+            strictSched1It == strictRun.artifacts.end() ||
+            strictEvalIt == strictRun.artifacts.end() ||
+            strictHeaderIt == strictRun.artifacts.end())
+        {
+            return fail("same-batch activation cohort strict summary/artifacts are incomplete");
+        }
+        const std::string &strictSched0 = strictSched0It->second;
+        const std::string &strictSched1 = strictSched1It->second;
+        const std::string &strictEval = strictEvalIt->second;
+        if (strictSched1.find(
+                "Strict same-batch cohort leader 14 executes 5 ordered payloads under this single guard") ==
+                std::string::npos ||
+            countSubstring(strictSched1, "Strict cohort follower payload for supernode ") != 8u ||
+            strictSched1.find("// Supernode 15: run when its activity flag is set") !=
+                std::string::npos ||
+            strictSched1.find("// Supernode 16: run when its activity flag is set") !=
+                std::string::npos ||
+            strictSched1.find("// Supernode 17: run when its activity flag is set") !=
+                std::string::npos ||
+            strictSched1.find("// Supernode 18: run when its activity flag is set") !=
+                std::string::npos ||
+            strictSched1.find(
+                "std::uint8_t same_batch_cohort_14_word_2_flags = UINT8_C(0)") ==
+                std::string::npos ||
+            strictSched1.find(
+                "supernode_active_curr_[2u] | same_batch_cohort_14_word_2_flags") ==
+                std::string::npos ||
+            strictSched0.find(
+                "grhsim_changed_2)) & UINT8_C(65)") ==
+                std::string::npos ||
+            strictEval.find("{1u, UINT8_C(97)}") == std::string::npos ||
+            strictEval.find("{2u, UINT8_C(248)}") == std::string::npos ||
+            strictHeaderIt->second.find(
+                "static constexpr bool kRuntimeProfileCompiled = false") ==
+                std::string::npos)
+        {
+            return fail("same-batch activation cohort strict lowering is incomplete");
+        }
+        for (const auto &[_, source] : strictRun.artifacts)
+        {
+            if (source.find("runtime_profile_same_batch_cohort_") !=
+                std::string::npos)
+            {
+                return fail("same-batch activation cohort strict compiled probe counters");
+            }
         }
 
         const std::filesystem::path probeDir = baseDir / "probe";
@@ -4573,6 +4705,59 @@ namespace
             fields[20] != "0" || fields[24] != "0" || fields[18] != fields[19])
         {
             return fail("same-batch activation cohort runtime TSV counters are inconsistent");
+        }
+
+        const auto runFunctionalHarness = [&](const std::filesystem::path &dir,
+                                              std::string_view tag) -> bool
+        {
+            const std::string makeCommand =
+                "make -C " + dir.string() + " CXX=clang++ CXXFLAGS='" +
+                std::string(kHarnessCompileFlags) + "'";
+            if (std::system(makeCommand.c_str()) != 0)
+            {
+                return false;
+            }
+            const std::filesystem::path sourcePath =
+                dir / (std::string(tag) + "_functional_harness.cpp");
+            {
+                std::ofstream harness(sourcePath);
+                harness << "#include \"grhsim_top.hpp\"\n";
+                harness << "#include <cstdint>\n";
+                harness << "static int check(const GrhSIM_top &sim, std::uint8_t expected, int base) {\n";
+                harness << "    if (sim.out_8 != expected) return base + 0;\n";
+                harness << "    if (sim.out_9 != expected) return base + 1;\n";
+                harness << "    if (sim.out_10 != expected) return base + 2;\n";
+                harness << "    if (sim.out_11 != expected) return base + 3;\n";
+                harness << "    if (sim.out_12 != expected) return base + 4;\n";
+                harness << "    if (sim.out_14 != expected) return base + 5;\n";
+                harness << "    if (sim.out_15 != expected) return base + 6;\n";
+                harness << "    if (sim.out_16 != expected) return base + 7;\n";
+                harness << "    if (sim.out_17 != expected) return base + 8;\n";
+                harness << "    if (sim.out_18 != expected) return base + 9;\n";
+                harness << "    if (sim.out_19 != expected) return base + 10;\n";
+                harness << "    return 0;\n}\n";
+                harness << "int main() {\n";
+                harness << "    GrhSIM_top sim; sim.init();\n";
+                harness << "    sim.in = 3; sim.eval(); if (int rc = check(sim, 3, 10)) return rc;\n";
+                harness << "    sim.eval(); if (int rc = check(sim, 3, 20)) return rc;\n";
+                harness << "    sim.in = 9; sim.eval(); if (int rc = check(sim, 9, 30)) return rc;\n";
+                harness << "    sim.eval(); if (int rc = check(sim, 9, 40)) return rc;\n";
+                harness << "    sim.in = 17; sim.eval(); if (int rc = check(sim, 17, 50)) return rc;\n";
+                harness << "    return 0;\n}\n";
+            }
+            const std::filesystem::path exePath =
+                dir / (std::string(tag) + "_functional_harness");
+            const std::string compileHarnessCommand =
+                "clang++ " + std::string(kHarnessCompileFlags) + " -I" +
+                dir.string() + " " + sourcePath.string() + " " +
+                (dir / "libgrhsim_top.a").string() + " -o " + exePath.string();
+            return std::system(compileHarnessCommand.c_str()) == 0 &&
+                   std::system(exePath.string().c_str()) == 0;
+        };
+        if (!runFunctionalHarness(baseDir / "default", "default") ||
+            !runFunctionalHarness(baseDir / "strict", "strict"))
+        {
+            return fail("same-batch activation cohort default/strict functional harness failed");
         }
         return 0;
     }

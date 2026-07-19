@@ -250,11 +250,11 @@ namespace wolvrix::app::pybind
         if (sameBatchActivationCohortPolicy != nullptr)
         {
             const std::string policy(sameBatchActivationCohortPolicy);
-            if (policy != "off" && policy != "probe")
+            if (policy != "off" && policy != "probe" && policy != "strict")
             {
                 PyErr_SetString(PyExc_ValueError,
                                 "same_batch_activation_cohort_policy must be one of: "
-                                "off, probe");
+                                "off, probe, strict");
                 return nullptr;
             }
         }

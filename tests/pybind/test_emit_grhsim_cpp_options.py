@@ -129,7 +129,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     )
 
     def test_python_same_batch_activation_cohort_validation(self) -> None:
-        for value in ("off", "probe"):
+        for value in ("off", "probe", "strict"):
             with self.subTest(value=value):
                 _compile_emit_grhsim_cpp_kwargs(
                     {"same_batch_activation_cohort_policy": value}
@@ -137,7 +137,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
         _compile_emit_grhsim_cpp_kwargs(
             {"same_batch_activation_cohort_profile_path": "/tmp/fire.tsv"}
         )
-        for value in ("", "strict", " probe ", False, 1):
+        for value in ("", "targeted", " probe ", False, 1):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(
                     ValueError, "same_batch_activation_cohort_policy"
@@ -179,7 +179,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
 
     def test_native_same_batch_activation_cohort_policies_are_accepted(self) -> None:
         with wolvrix.Session() as session:
-            for value in ("off", "probe"):
+            for value in ("off", "probe", "strict"):
                 with self.subTest(value=value):
                     with self.assertRaisesRegex(KeyError, "design key not found"):
                         native.session_emit_grhsim_cpp(
@@ -191,7 +191,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
 
     def test_native_same_batch_activation_cohort_policy_rejects_invalid_value(self) -> None:
         with wolvrix.Session() as session:
-            for value in ("", "strict", "targeted"):
+            for value in ("", "targeted", "cohort-strict"):
                 with self.subTest(value=value):
                     with self.assertRaisesRegex(
                         ValueError, "same_batch_activation_cohort_policy"

@@ -895,10 +895,10 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
             raise ValueError(
                 "emit_grhsim_cpp same_batch_activation_cohort_policy must be a string"
             )
-        if same_batch_activation_cohort_policy not in {"off", "probe"}:
+        if same_batch_activation_cohort_policy not in {"off", "probe", "strict"}:
             raise ValueError(
                 "emit_grhsim_cpp same_batch_activation_cohort_policy must be one of: "
-                "off, probe"
+                "off, probe, strict"
             )
     same_batch_activation_cohort_profile_path = local.pop(
         "same_batch_activation_cohort_profile_path", None

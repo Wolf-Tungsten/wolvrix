@@ -1754,6 +1754,106 @@ namespace
         return design;
     }
 
+    Design buildCommitExactEventPolicyDesign(std::size_t singletonGuardCount,
+                                             bool includeLockstepPair)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId clk = makeLogicValue(graph, "exact_policy_clk", 1);
+        const ValueId data = makeLogicValue(graph, "exact_policy_data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("data", data);
+
+        const ValueId one = addConstant(
+            graph, "exact_policy_one_op", "exact_policy_one", 8, "8'h01");
+        const ValueId zero = addConstant(
+            graph, "exact_policy_zero_op", "exact_policy_zero", 8, "8'h00");
+        const ValueId mask = addConstant(
+            graph, "exact_policy_mask_op", "exact_policy_mask", 8, "8'hff");
+
+        const ValueId materializedData =
+            makeLogicValue(graph, "exact_policy_materialized_data", 8);
+        const OperationId materializeData = graph.createOperation(
+            OperationKind::kAdd, graph.internSymbol("exact_policy_materialize_data_op"));
+        graph.addOperand(materializeData, data);
+        graph.addOperand(materializeData, zero);
+        graph.addResult(materializeData, materializedData);
+
+        const auto addRegister = [&](const std::string &name)
+        {
+            const OperationId reg = graph.createOperation(
+                OperationKind::kRegister, graph.internSymbol(name));
+            graph.setAttr(reg, "width", static_cast<int64_t>(8));
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("8'h00"));
+        };
+        const auto addWrite = [&](const std::string &name,
+                                  const std::string &regName,
+                                  ValueId guard)
+        {
+            const OperationId write = graph.createOperation(
+                OperationKind::kRegisterWritePort, graph.internSymbol(name));
+            graph.addOperand(write, guard);
+            graph.addOperand(write, materializedData);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", regName);
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+
+        for (std::size_t index = 0; index < singletonGuardCount; ++index)
+        {
+            const std::string suffix = std::to_string(index);
+            const ValueId fire = makeLogicValue(graph, "exact_policy_fire_" + suffix, 8);
+            graph.bindInputPort("fire_" + suffix, fire);
+
+            const ValueId guard = makeLogicValue(graph, "exact_policy_guard_" + suffix, 1);
+            const OperationId compare = graph.createOperation(
+                OperationKind::kEq,
+                graph.internSymbol("exact_policy_guard_op_" + suffix));
+            graph.addOperand(compare, fire);
+            graph.addOperand(compare, one);
+            graph.addResult(compare, guard);
+
+            const std::string regName = "exact_policy_reg_" + suffix;
+            addRegister(regName);
+            addWrite("exact_policy_write_" + suffix, regName, guard);
+        }
+
+        if (includeLockstepPair)
+        {
+            const ValueId sharedFire = makeLogicValue(graph, "exact_policy_shared_fire", 8);
+            graph.bindInputPort("shared_fire", sharedFire);
+            const ValueId sharedGuard = makeLogicValue(graph, "exact_policy_shared_guard", 1);
+            const OperationId compare = graph.createOperation(
+                OperationKind::kEq, graph.internSymbol("exact_policy_shared_guard_op"));
+            graph.addOperand(compare, sharedFire);
+            graph.addOperand(compare, one);
+            graph.addResult(compare, sharedGuard);
+
+            for (std::size_t index = 0; index < 2u; ++index)
+            {
+                const std::string suffix = std::to_string(index);
+                const std::string regName = "exact_policy_lockstep_reg_" + suffix;
+                addRegister(regName);
+                addWrite("exact_policy_lockstep_write_" + suffix, regName, sharedGuard);
+
+                const ValueId readValue =
+                    makeLogicValue(graph, "exact_policy_lockstep_read_value_" + suffix, 8);
+                const OperationId read = graph.createOperation(
+                    OperationKind::kRegisterReadPort,
+                    graph.internSymbol("exact_policy_lockstep_read_" + suffix));
+                graph.addResult(read, readValue);
+                graph.setAttr(read, "regSymbol", regName);
+                graph.bindOutputPort("lockstep_q" + suffix, readValue);
+            }
+        }
+
+        return design;
+    }
+
     Design buildCommitLocalityPartitionDesign()
     {
         Design design;
@@ -3924,6 +4024,78 @@ namespace
         return run;
     }
 
+    ActiveMaskGapPackEmitRun runCommitExactEventEmit(
+        const Design &design,
+        SessionStore &session,
+        const std::filesystem::path &outDir,
+        std::optional<std::string_view> policy,
+        std::optional<std::string_view> activeMaskPolicy,
+        std::size_t parallelism,
+        bool perf = false,
+        bool runtimeProfile = false,
+        bool posedgeFullpass = false)
+    {
+        std::filesystem::remove_all(outDir);
+        std::filesystem::create_directories(outDir);
+        EmitOptions options;
+        options.outputDir = outDir.string();
+        options.session = &session;
+        options.sessionPathPrefix = std::string("top");
+        options.attributes["sched_batch_max_ops"] = "4096";
+        options.attributes["sched_batch_max_estimated_lines"] = "1000000";
+        options.attributes["sched_batches_per_cpp"] = "1";
+        options.attributes["emit_parallelism"] = std::to_string(parallelism);
+        if (policy)
+        {
+            options.attributes["commit_exact_event_policy"] = std::string(*policy);
+        }
+        if (activeMaskPolicy)
+        {
+            options.attributes["active_mask_gap_pack_policy"] =
+                std::string(*activeMaskPolicy);
+        }
+        if (perf)
+        {
+            options.attributes["perf"] = "eval";
+        }
+        if (runtimeProfile)
+        {
+            options.attributes["emit_runtime_profile"] = "1";
+        }
+        if (posedgeFullpass)
+        {
+            options.attributes["posedge_fullpass_specialization"] = "1";
+        }
+
+        EmitDiagnostics diagnostics;
+        EmitGrhSimCpp emitter(&diagnostics);
+        StderrCapture capture;
+        ActiveMaskGapPackEmitRun run;
+        if (!capture.valid())
+        {
+            run.diagnostics = "failed to capture stderr";
+            return run;
+        }
+        const EmitResult result = emitter.emit(design, options);
+        run.stderrText = capture.finish();
+        run.success = result.success;
+        run.diagnosticError = diagnostics.hasError();
+        for (const auto &message : diagnostics.messages())
+        {
+            if (!run.diagnostics.empty())
+            {
+                run.diagnostics.push_back('\n');
+            }
+            run.diagnostics += message.message;
+        }
+        for (const std::string &artifact : result.artifacts)
+        {
+            const std::filesystem::path path(artifact);
+            run.artifacts.insert_or_assign(path.filename().string(), readFile(path));
+        }
+        return run;
+    }
+
     ActiveMaskGapPackEmitRun runDeferredActivationForwardEmit(
         const Design &design,
         SessionStore &session,
@@ -4831,6 +5003,484 @@ namespace
         return wrappers;
     }
 
+    int runCommitExactEventPolicyFocusedTests()
+    {
+        constexpr std::string_view kExpectedDefaultPolicy = "targeted-cold-layout";
+        constexpr const char *kPolicyEnv =
+            "WOLVRIX_GRHSIM_COMMIT_EXACT_EVENT_POLICY";
+        constexpr const char *kGapPolicyEnv =
+            "WOLVRIX_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY";
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            "grhsim_cpp_commit_exact_event";
+
+        const auto schedText = [](const ActiveMaskGapPackEmitRun &run)
+        {
+            std::string text;
+            for (const auto &[name, content] : run.artifacts)
+            {
+                if (name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp"))
+                {
+                    text += content;
+                }
+            }
+            return text;
+        };
+        const auto exactSummary = [](const ActiveMaskGapPackEmitRun &run)
+        {
+            return probeLogLine(run.stderrText, "[GRHSIM_COMMIT_EXACT_EVENT] ");
+        };
+        const auto hasSelectedMarkers = [&](const ActiveMaskGapPackEmitRun &run)
+        {
+            const auto header = run.artifacts.find("grhsim_top.hpp");
+            const auto runtime = run.artifacts.find("grhsim_top_runtime.hpp");
+            const auto eval = run.artifacts.find("grhsim_top_eval.cpp");
+            if (header == run.artifacts.end() || runtime == run.artifacts.end() ||
+                eval == run.artifacts.end())
+            {
+                return false;
+            }
+            return header->second.find(
+                       "alignas(64) std::array<std::uint8_t, "
+                       "kActiveFlagWordCount> supernode_active_curr_{};") !=
+                       std::string::npos &&
+                   runtime->second.find("grhsim_any_event_edges(") !=
+                       std::string::npos &&
+                   eval->second.find(
+                       "grhsim_any_event_edges(event_edge_slots_, "
+                       "kEventEdgeStorageBytes)") != std::string::npos;
+        };
+        const auto hasAnySelectedMarker = [&](const ActiveMaskGapPackEmitRun &run)
+        {
+            const auto header = run.artifacts.find("grhsim_top.hpp");
+            const auto runtime = run.artifacts.find("grhsim_top_runtime.hpp");
+            const auto eval = run.artifacts.find("grhsim_top_eval.cpp");
+            return (header != run.artifacts.end() &&
+                    header->second.find(
+                        "alignas(64) std::array<std::uint8_t, "
+                        "kActiveFlagWordCount> supernode_active_curr_{};") !=
+                        std::string::npos) ||
+                   (runtime != run.artifacts.end() &&
+                    runtime->second.find("grhsim_any_event_edges(") !=
+                        std::string::npos) ||
+                   (eval != run.artifacts.end() &&
+                    eval->second.find(
+                        "grhsim_any_event_edges(event_edge_slots_, "
+                        "kEventEdgeStorageBytes)") != std::string::npos) ||
+                   schedText(run).find(
+                       "Lockstep scalar register writes share one change predicate.") !=
+                       std::string::npos;
+        };
+        const auto selectedSummaryMatches = [&](const ActiveMaskGapPackEmitRun &run,
+                                                std::string_view policy,
+                                                bool selected)
+        {
+            const std::string_view summary = exactSummary(run);
+            return summary.find("policy=" + std::string(policy)) !=
+                       std::string_view::npos &&
+                   summary.find(selected ? "selected=1" : "selected=0") !=
+                       std::string_view::npos;
+        };
+
+        ::unsetenv(kPolicyEnv);
+        ::unsetenv(kGapPolicyEnv);
+        Design smallDesign = buildCommitExactEventPolicyDesign(0u, true);
+        SessionStore smallSession;
+        if (!runActivitySchedule(smallDesign, smallSession))
+        {
+            return fail("commit exact-event focused activity-schedule pass failed");
+        }
+
+        const ActiveMaskGapPackEmitRun explicitOffRun = runCommitExactEventEmit(
+            smallDesign, smallSession, baseDir / "off", "off", "off", 1u);
+        const ActiveMaskGapPackEmitRun targetedSerialRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "targeted_serial",
+            "targeted-cold-layout",
+            "off",
+            1u);
+        const ActiveMaskGapPackEmitRun targetedParallelRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "targeted_parallel",
+            "targeted-cold-layout",
+            "off",
+            4u);
+        const ActiveMaskGapPackEmitRun defaultRun = runCommitExactEventEmit(
+            smallDesign, smallSession, baseDir / "default", std::nullopt, "off", 2u);
+
+        ::setenv(kPolicyEnv, "targeted-cold-layout", 1);
+        const ActiveMaskGapPackEmitRun environmentTargetedRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "environment_targeted",
+            std::nullopt,
+            "off",
+            2u);
+        ::setenv(kPolicyEnv, "off", 1);
+        const ActiveMaskGapPackEmitRun environmentOffRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "environment_off",
+            std::nullopt,
+            "off",
+            2u);
+        const ActiveMaskGapPackEmitRun attributeTargetedEnvironmentOffRun =
+            runCommitExactEventEmit(
+                smallDesign,
+                smallSession,
+                baseDir / "attribute_targeted_environment_off",
+                "targeted-cold-layout",
+                "off",
+                2u);
+        ::setenv(kPolicyEnv, "targeted-cold-layout", 1);
+        const ActiveMaskGapPackEmitRun attributeOffEnvironmentTargetedRun =
+            runCommitExactEventEmit(
+                smallDesign,
+                smallSession,
+                baseDir / "attribute_off_environment_targeted",
+                "off",
+                "off",
+                2u);
+        ::unsetenv(kPolicyEnv);
+
+        const ActiveMaskGapPackEmitRun targetedGapOffRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "targeted_gap_off",
+            "targeted-cold-layout",
+            "off",
+            2u);
+        const ActiveMaskGapPackEmitRun targetedGapOnRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "targeted_gap_on",
+            "targeted-cold-layout",
+            "targeted-direct",
+            2u);
+        const ActiveMaskGapPackEmitRun exactOffGapOnRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "exact_off_gap_on",
+            "off",
+            "targeted-direct",
+            2u);
+
+        const ActiveMaskGapPackEmitRun perfFallbackRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "fallback_perf",
+            "targeted-cold-layout",
+            "off",
+            2u,
+            true);
+        const ActiveMaskGapPackEmitRun runtimeProfileFallbackRun =
+            runCommitExactEventEmit(
+                smallDesign,
+                smallSession,
+                baseDir / "fallback_runtime_profile",
+                "targeted-cold-layout",
+                "off",
+                2u,
+                false,
+                true);
+        const ActiveMaskGapPackEmitRun fullpassFallbackRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "fallback_fullpass",
+            "targeted-cold-layout",
+            "off",
+            2u,
+            false,
+            false,
+            true);
+        smallSession.erase("top.activity_schedule.dag");
+        const ActiveMaskGapPackEmitRun missingDagFallbackRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "fallback_missing_dag",
+            "targeted-cold-layout",
+            "off",
+            2u);
+
+        const ActiveMaskGapPackEmitRun invalidAttributeRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "invalid_attribute",
+            "targeted",
+            "off",
+            1u);
+        ::setenv(kPolicyEnv, "invalid", 1);
+        const ActiveMaskGapPackEmitRun invalidEnvironmentRun = runCommitExactEventEmit(
+            smallDesign,
+            smallSession,
+            baseDir / "invalid_environment",
+            std::nullopt,
+            "off",
+            1u);
+        ::unsetenv(kPolicyEnv);
+
+        const std::array<const ActiveMaskGapPackEmitRun *, 15> successfulRuns = {
+            &explicitOffRun,
+            &targetedSerialRun,
+            &targetedParallelRun,
+            &defaultRun,
+            &environmentTargetedRun,
+            &environmentOffRun,
+            &attributeTargetedEnvironmentOffRun,
+            &attributeOffEnvironmentTargetedRun,
+            &targetedGapOffRun,
+            &targetedGapOnRun,
+            &exactOffGapOnRun,
+            &perfFallbackRun,
+            &runtimeProfileFallbackRun,
+            &fullpassFallbackRun,
+            &missingDagFallbackRun,
+        };
+        for (const ActiveMaskGapPackEmitRun *run : successfulRuns)
+        {
+            if (run != nullptr && (!run->success || run->diagnosticError))
+            {
+                return fail("commit exact-event focused fixture emission failed: " +
+                            run->diagnostics);
+            }
+        }
+
+        if (!hasSelectedMarkers(targetedSerialRun) ||
+            schedText(targetedSerialRun).find(
+                "Lockstep scalar register writes share one change predicate.") ==
+                std::string::npos ||
+            !selectedSummaryMatches(
+                targetedSerialRun, "targeted-cold-layout", true))
+        {
+            return fail("commit exact-event targeted policy did not select the eligible fixture");
+        }
+        if (hasAnySelectedMarker(explicitOffRun) ||
+            !selectedSummaryMatches(explicitOffRun, "off", false))
+        {
+            return fail("commit exact-event explicit off policy changed generated lowering");
+        }
+        if (targetedSerialRun.artifacts != targetedParallelRun.artifacts ||
+            exactSummary(targetedSerialRun) != exactSummary(targetedParallelRun))
+        {
+            return fail("commit exact-event selected emission is not parallel deterministic");
+        }
+        if (kExpectedDefaultPolicy == "targeted-cold-layout")
+        {
+            if (defaultRun.artifacts != targetedSerialRun.artifacts ||
+                !selectedSummaryMatches(defaultRun, kExpectedDefaultPolicy, true))
+            {
+                return fail("commit exact-event native default is not targeted-cold-layout");
+            }
+        }
+        else if (defaultRun.artifacts != explicitOffRun.artifacts ||
+                 !selectedSummaryMatches(defaultRun, kExpectedDefaultPolicy, false))
+        {
+            return fail("commit exact-event native default does not match the focused expectation");
+        }
+        if (environmentTargetedRun.artifacts != targetedSerialRun.artifacts ||
+            environmentOffRun.artifacts != explicitOffRun.artifacts ||
+            attributeTargetedEnvironmentOffRun.artifacts != targetedSerialRun.artifacts ||
+            attributeOffEnvironmentTargetedRun.artifacts != explicitOffRun.artifacts)
+        {
+            return fail("commit exact-event attribute/environment precedence is wrong");
+        }
+        if (!hasSelectedMarkers(targetedGapOffRun) ||
+            !hasSelectedMarkers(targetedGapOnRun) ||
+            hasAnySelectedMarker(exactOffGapOnRun) ||
+            !selectedSummaryMatches(targetedGapOffRun, "targeted-cold-layout", true) ||
+            !selectedSummaryMatches(targetedGapOnRun, "targeted-cold-layout", true) ||
+            !selectedSummaryMatches(exactOffGapOnRun, "off", false))
+        {
+            return fail("commit exact-event and active-mask gap-pack policies are not orthogonal");
+        }
+        if (targetedGapOnRun.stderrText.find(
+                "[GRHSIM_ACTIVE_MASK_GAP_PACK] policy=targeted-direct ") ==
+                std::string::npos ||
+            exactOffGapOnRun.stderrText.find(
+                "[GRHSIM_ACTIVE_MASK_GAP_PACK] policy=targeted-direct ") ==
+                std::string::npos)
+        {
+            return fail("commit exact-event focused runs did not preserve gap-pack reporting");
+        }
+
+        for (const ActiveMaskGapPackEmitRun *fallback : {
+                 &perfFallbackRun,
+                 &runtimeProfileFallbackRun,
+                 &fullpassFallbackRun,
+                 &missingDagFallbackRun})
+        {
+            if (hasAnySelectedMarker(*fallback) ||
+                !selectedSummaryMatches(*fallback, "targeted-cold-layout", false))
+            {
+                return fail("commit exact-event fail-closed gate emitted a selected-path marker");
+            }
+        }
+        if (invalidAttributeRun.success || !invalidAttributeRun.diagnosticError ||
+            invalidAttributeRun.diagnostics.find(
+                "expected off or targeted-cold-layout") == std::string::npos ||
+            invalidEnvironmentRun.success || !invalidEnvironmentRun.diagnosticError ||
+            invalidEnvironmentRun.diagnostics.find(
+                "expected off or targeted-cold-layout") == std::string::npos)
+        {
+            return fail("commit exact-event invalid policy validation is missing");
+        }
+
+        const auto runBehaviorHarness = [&](const std::filesystem::path &dir) -> bool
+        {
+            const std::vector<std::filesystem::path> stateFiles =
+                collectSchedFiles(dir, "grhsim_top_state");
+            const std::vector<std::filesystem::path> schedFiles =
+                collectSchedFiles(dir, "grhsim_top_sched_");
+            if (stateFiles.empty() || schedFiles.empty())
+            {
+                return false;
+            }
+            const std::filesystem::path harnessPath =
+                dir / "grhsim_top_exact_policy_harness.cpp";
+            {
+                std::ofstream harness(harnessPath);
+                if (!harness.is_open())
+                {
+                    return false;
+                }
+                harness << "#include \"grhsim_top.hpp\"\n";
+                harness << "#include <cstdint>\n\n";
+                harness << "int main()\n";
+                harness << "{\n";
+                harness << "    GrhSIM_top sim;\n";
+                harness << "    sim.init();\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(7);\n";
+                harness << "    sim.shared_fire = static_cast<std::uint8_t>(1);\n";
+                harness << "    sim.eval();\n";
+                harness << "    if (sim.lockstep_q0 != 0 || sim.lockstep_q1 != 0) return 1;\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                harness << "    if (sim.lockstep_q0 != 7 || sim.lockstep_q1 != 7) return 2;\n";
+                harness << "    sim.eval();\n";
+                harness << "    if (sim.lockstep_q0 != 7 || sim.lockstep_q1 != 7) return 3;\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(9);\n";
+                harness << "    sim.shared_fire = static_cast<std::uint8_t>(0);\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                harness << "    if (sim.lockstep_q0 != 7 || sim.lockstep_q1 != 7) return 4;\n";
+                harness << "    sim.shared_fire = static_cast<std::uint8_t>(1);\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                harness << "    if (sim.lockstep_q0 != 9 || sim.lockstep_q1 != 9) return 5;\n";
+                harness << "    return 0;\n";
+                harness << "}\n";
+            }
+            const std::filesystem::path harnessExe =
+                dir / "grhsim_top_exact_policy_harness";
+            std::string compileCommand =
+                "clang++ " + std::string(kHarnessCompileFlags) + " -I" + dir.string();
+            for (const auto &stateFile : stateFiles)
+            {
+                compileCommand += " " + stateFile.string();
+            }
+            compileCommand += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &schedFile : schedFiles)
+            {
+                compileCommand += " " + schedFile.string();
+            }
+            compileCommand +=
+                " " + harnessPath.string() + " -o " + harnessExe.string();
+            return std::system(compileCommand.c_str()) == 0 &&
+                   std::system(harnessExe.string().c_str()) == 0;
+        };
+        if (!runBehaviorHarness(baseDir / "off") ||
+            !runBehaviorHarness(baseDir / "targeted_serial"))
+        {
+            return fail("commit exact-event off/targeted generated behavior diverged");
+        }
+
+        ActiveMaskGapPackFixture gapFixture = buildActiveMaskGapPackFixture();
+        const ActiveMaskGapPackEmitRun legacyGapExactOffRun = runCommitExactEventEmit(
+            gapFixture.design,
+            gapFixture.session,
+            baseDir / "legacy_gap_exact_off",
+            "off",
+            "targeted-direct",
+            2u);
+        const ActiveMaskGapPackEmitRun legacyGapDefaultExactRun = runCommitExactEventEmit(
+            gapFixture.design,
+            gapFixture.session,
+            baseDir / "legacy_gap_default_exact",
+            std::nullopt,
+            "targeted-direct",
+            2u);
+        if (!legacyGapExactOffRun.success || legacyGapExactOffRun.diagnosticError ||
+            !legacyGapDefaultExactRun.success || legacyGapDefaultExactRun.diagnosticError ||
+            legacyGapExactOffRun.artifacts != legacyGapDefaultExactRun.artifacts ||
+            hasAnySelectedMarker(legacyGapExactOffRun) ||
+            hasAnySelectedMarker(legacyGapDefaultExactRun))
+        {
+            return fail("commit exact-event policy changed legacy targeted-direct output on an ineligible design");
+        }
+
+        const auto runThresholdCase = [&](std::size_t guardCount,
+                                          std::string_view suffix,
+                                          std::size_t expectedAddedHints) -> int
+        {
+            Design design = buildCommitExactEventPolicyDesign(guardCount, false);
+            SessionStore session;
+            if (!runActivitySchedule(design, session))
+            {
+                return fail("commit exact-event cold-threshold activity-schedule pass failed");
+            }
+            const ActiveMaskGapPackEmitRun offRun = runCommitExactEventEmit(
+                design,
+                session,
+                baseDir / (std::string(suffix) + "_off"),
+                "off",
+                "off",
+                2u);
+            const ActiveMaskGapPackEmitRun targetedRun = runCommitExactEventEmit(
+                design,
+                session,
+                baseDir / (std::string(suffix) + "_targeted"),
+                "targeted-cold-layout",
+                "off",
+                2u);
+            if (!offRun.success || offRun.diagnosticError ||
+                !targetedRun.success || targetedRun.diagnosticError ||
+                !hasSelectedMarkers(targetedRun))
+            {
+                return fail("commit exact-event cold-threshold fixture emission failed");
+            }
+            const std::string offSched = schedText(offRun);
+            const std::string targetedSched = schedText(targetedRun);
+            const std::size_t offHints = countSubstring(offSched, "if (unlikely(");
+            const std::size_t targetedHints =
+                countSubstring(targetedSched, "if (unlikely(");
+            if (targetedHints != offHints + expectedAddedHints)
+            {
+                return fail("commit exact-event cold-hint threshold mismatch for " +
+                            std::string(suffix) + ": off=" +
+                            std::to_string(offHints) + " targeted=" +
+                            std::to_string(targetedHints) + " expected_added=" +
+                            std::to_string(expectedAddedHints));
+            }
+            return 0;
+        };
+        if (const int result = runThresholdCase(1023u, "threshold_1023", 0u))
+        {
+            return result;
+        }
+        if (const int result = runThresholdCase(1024u, "threshold_1024", 1024u))
+        {
+            return result;
+        }
+        return 0;
+    }
+
     int runActiveMaskGapPackFocusedTests()
     {
         ActiveMaskGapPackFixture fixture = buildActiveMaskGapPackFixture();
@@ -5465,6 +6115,10 @@ namespace
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_COMMIT_EXACT_EVENT") != nullptr)
+    {
+        return runCommitExactEventPolicyFocusedTests();
+    }
     if (std::getenv("WOLVRIX_TEST_DEFERRED_ACTIVATION_FORWARD") != nullptr)
     {
         return runDeferredActivationForwardFocusedTests();
@@ -5849,7 +6503,7 @@ int main()
         eval.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
         eval.find("this->eval_compute_batch_0();") == std::string::npos ||
         eval.find("this->eval_commit_batch_") == std::string::npos ||
-        eval.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos)
+        eval.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos)
     {
         return fail("Missing compute/commit fixed-point eval loop");
     }
@@ -8320,7 +8974,7 @@ int main()
             gatedEvalText.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
             gatedEvalText.find("this->eval_compute_batch_0();") == std::string::npos ||
             gatedEvalText.find("this->eval_commit_batch_") == std::string::npos ||
-            gatedEvalText.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos)
+            gatedEvalText.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos)
         {
             return fail("gated-clock eval should iterate until compute/commit reaches a fixed point");
         }

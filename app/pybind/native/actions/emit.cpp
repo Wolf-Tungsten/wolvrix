@@ -163,6 +163,7 @@ namespace wolvrix::app::pybind
         const char *deferredActivationForwardProfilePath = nullptr;
         const char *sameBatchActivationCohortPolicy = nullptr;
         const char *sameBatchActivationCohortProfilePath = nullptr;
+        const char *commitExactEventPolicy = nullptr;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -189,10 +190,11 @@ namespace wolvrix::app::pybind
                                        "deferred_activation_forward_profile_path",
                                        "same_batch_activation_cohort_policy",
                                        "same_batch_activation_cohort_profile_path",
+                                       "commit_exact_event_policy",
                                        nullptr};
         if (!PyArg_ParseTupleAndKeywords(args,
                                          kwargs,
-                                         "Oss|OOOOOOOssOOOOOsOOOzzzzz",
+                                         "Oss|OOOOOOOssOOOOOsOOOzzzzzz",
                                          const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
@@ -219,7 +221,8 @@ namespace wolvrix::app::pybind
                                          &deferredActivationForwardPolicy,
                                          &deferredActivationForwardProfilePath,
                                          &sameBatchActivationCohortPolicy,
-                                         &sameBatchActivationCohortProfilePath))
+                                         &sameBatchActivationCohortProfilePath,
+                                         &commitExactEventPolicy))
         {
             return nullptr;
         }
@@ -255,6 +258,17 @@ namespace wolvrix::app::pybind
                 PyErr_SetString(PyExc_ValueError,
                                 "same_batch_activation_cohort_policy must be one of: "
                                 "off, probe, strict");
+                return nullptr;
+            }
+        }
+        if (commitExactEventPolicy != nullptr)
+        {
+            const std::string policy(commitExactEventPolicy);
+            if (policy != "off" && policy != "targeted-cold-layout")
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "commit_exact_event_policy must be one of: "
+                                "off, targeted-cold-layout");
                 return nullptr;
             }
         }
@@ -469,6 +483,10 @@ namespace wolvrix::app::pybind
         {
             options.attributes["same_batch_activation_cohort_profile_path"] =
                 sameBatchActivationCohortProfilePath;
+        }
+        if (commitExactEventPolicy != nullptr)
+        {
+            options.attributes["commit_exact_event_policy"] = commitExactEventPolicy;
         }
 
         const auto result = emitter.emit(*design, options);

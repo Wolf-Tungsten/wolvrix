@@ -5,6 +5,7 @@
 #include "slang/numeric/SVInt.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -313,6 +314,34 @@ namespace wolvrix::lib::emit
             kTargetedTableContiguous,
             kTargetedTableGap,
         };
+
+        enum class CommitExactEventPolicy
+        {
+            kOff,
+            kTargetedColdLayout,
+        };
+
+        constexpr std::size_t kCommitExactEventColdGuardMinCount = 1024u;
+
+        struct CommitExactEventStats
+        {
+            std::atomic<std::size_t> coldRuns = 0u;
+            std::atomic<std::size_t> coldGuards = 0u;
+            std::atomic<std::size_t> lockstepGroups = 0u;
+            std::atomic<std::size_t> lockstepWrites = 0u;
+        };
+
+        std::string_view commitExactEventPolicyName(CommitExactEventPolicy policy) noexcept
+        {
+            switch (policy)
+            {
+            case CommitExactEventPolicy::kOff:
+                return "off";
+            case CommitExactEventPolicy::kTargetedColdLayout:
+                return "targeted-cold-layout";
+            }
+            return "unknown";
+        }
 
         std::string_view activeMaskGapPackPolicyName(ActiveMaskGapPackPolicy policy) noexcept
         {
@@ -2486,6 +2515,36 @@ namespace wolvrix::lib::emit
             return std::nullopt;
         }
 
+        std::optional<CommitExactEventPolicy> parseCommitExactEventPolicy(
+            const EmitOptions &options,
+            std::string &invalidValue)
+        {
+            std::optional<std::string> configuredValue;
+            if (const auto it = options.attributes.find("commit_exact_event_policy");
+                it != options.attributes.end())
+            {
+                configuredValue = it->second;
+            }
+            else if (const char *env = std::getenv("WOLVRIX_GRHSIM_COMMIT_EXACT_EVENT_POLICY"))
+            {
+                configuredValue = env;
+            }
+            if (!configuredValue)
+            {
+                return CommitExactEventPolicy::kTargetedColdLayout;
+            }
+            if (*configuredValue == "off")
+            {
+                return CommitExactEventPolicy::kOff;
+            }
+            if (*configuredValue == "targeted-cold-layout")
+            {
+                return CommitExactEventPolicy::kTargetedColdLayout;
+            }
+            invalidValue = std::move(*configuredValue);
+            return std::nullopt;
+        }
+
         enum class DeferredActivationForwardPolicy
         {
             kOff,
@@ -4287,6 +4346,7 @@ namespace wolvrix::lib::emit
             std::unordered_map<OperationId, std::string, OperationIdHash> regToMemIntentReadGroupByOp;
             std::unordered_set<OperationId, OperationIdHash> regToMemIntentBypassOps;
             std::unordered_map<std::string, std::vector<uint32_t>> stateHeadSupernodesBySymbol;
+            std::unordered_map<std::string, std::size_t> stateWriteCountBySymbol;
             std::unordered_map<std::string, std::size_t> memoryRowReaderActivationBySymbol;
             std::vector<MemoryRowReaderActivationDecl> memoryRowReaderActivations;
             std::unordered_map<OperationId, WriteDecl, OperationIdHash> writeByOp;
@@ -11681,6 +11741,7 @@ namespace wolvrix::lib::emit
             model.regToMemIntentReadGroupByOp.clear();
             model.regToMemIntentBypassOps.clear();
             model.stateHeadSupernodesBySymbol.clear();
+            model.stateWriteCountBySymbol.clear();
             model.memoryRowReaderActivationBySymbol.clear();
             model.memoryRowReaderActivations.clear();
             model.stateLogicScalarSlotCounts = {};
@@ -12219,6 +12280,7 @@ namespace wolvrix::lib::emit
                     }
                     model.writeByOp.emplace(opId, write);
                     model.writes.push_back(write);
+                    ++model.stateWriteCountBySymbol[write.symbol];
                 }
             }
 
@@ -18457,6 +18519,86 @@ namespace wolvrix::lib::emit
             return true;
         }
 
+        bool canUseEventQualifiedBitmapContinuation(const Graph &graph,
+                                                    const EmitModel &model,
+                                                    const ScheduleRefs &schedule)
+        {
+            if (schedule.dag == nullptr ||
+                model.deferredActivationCofireStrict ||
+                model.sameBatchActivationCohortStrict)
+            {
+                return false;
+            }
+            std::vector<std::size_t> positionBySupernode;
+            std::string topoError;
+            if (!validateActivityScheduleTopo(
+                    *schedule.dag, schedule.topoOrder, positionBySupernode, topoError) ||
+                model.activeIdBySupernode != positionBySupernode)
+            {
+                return false;
+            }
+
+            const auto isComputeActiveId = [&](std::size_t activeId)
+            {
+                return activeId < schedule.topoOrder.size() &&
+                       isComputeSupernode(model, schedule.topoOrder[activeId]);
+            };
+            std::unordered_map<OperationId, uint32_t, OperationIdHash> supernodeByOp;
+            supernodeByOp.reserve(graph.operations().size());
+            for (std::size_t supernodeId = 0;
+                 supernodeId < schedule.supernodeToOps.size();
+                 ++supernodeId)
+            {
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    if (!supernodeByOp.emplace(
+                            opId, static_cast<uint32_t>(supernodeId)).second)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            for (const auto &[valueId, targetActiveIds] : model.boundaryFanoutByValue)
+            {
+                const OperationId defOpId = graph.valueDef(valueId);
+                const auto sourceIt = supernodeByOp.find(defOpId);
+                if (!defOpId.valid() || sourceIt == supernodeByOp.end() ||
+                    !isComputeSupernode(model, sourceIt->second))
+                {
+                    return false;
+                }
+                const std::size_t sourceActiveId =
+                    model.activeIdBySupernode[sourceIt->second];
+                for (uint32_t targetActiveId : targetActiveIds)
+                {
+                    if (targetActiveId <= sourceActiveId ||
+                        !isComputeActiveId(targetActiveId))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            const auto allComputeActiveIds = [&](const auto &activeIdsBySource)
+            {
+                for (const auto &[source, activeIds] : activeIdsBySource)
+                {
+                    (void)source;
+                    if (std::any_of(activeIds.begin(),
+                                    activeIds.end(),
+                                    [&](uint32_t activeId)
+                                    { return !isComputeActiveId(activeId); }))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            return allComputeActiveIds(model.inputHeadSupernodesByValue) &&
+                   allComputeActiveIds(model.stateHeadSupernodesBySymbol);
+        }
+
         bool buildTargetedPureEventWordPack(
             const Graph &graph,
             const EmitModel &baselineModel,
@@ -19900,6 +20042,208 @@ namespace wolvrix::lib::emit
             return std::nullopt;
         }
 
+        struct LockstepCommitScalarStateWriteKey
+        {
+            ValueSlotScalarKind kind = ValueSlotScalarKind::kBool;
+            int32_t width = 0;
+            std::string nextExpr;
+            std::string initExpr;
+
+            bool operator==(const LockstepCommitScalarStateWriteKey &) const = default;
+        };
+
+        struct LockstepCommitScalarStateWriteGroup
+        {
+            LockstepCommitScalarStateWriteKey key;
+            std::vector<std::size_t> runIndices;
+        };
+
+        std::optional<LockstepCommitScalarStateWriteKey>
+        lockstepCommitScalarStateWriteKey(const Graph &graph,
+                                          const EmitModel &model,
+                                          OperationId opId,
+                                          const Operation &op,
+                                          const SupernodeLocalExprContext *context)
+        {
+            if (op.kind() != OperationKind::kRegisterWritePort || !isCommitPhaseOp(op))
+            {
+                return std::nullopt;
+            }
+            const auto writeIt = model.writeByOp.find(opId);
+            if (writeIt == model.writeByOp.end() ||
+                writeIt->second.kind != StateDecl::Kind::Register)
+            {
+                return std::nullopt;
+            }
+            const WriteDecl &write = writeIt->second;
+            const auto stateIt = model.stateBySymbol.find(write.symbol);
+            if (stateIt == model.stateBySymbol.end())
+            {
+                return std::nullopt;
+            }
+            const StateDecl &state = stateIt->second;
+            if (state.kind != StateDecl::Kind::Register ||
+                state.regToMemIntentStorage ||
+                isWideLogicWidth(state.width) ||
+                state.slotIndex == kInvalidIndex)
+            {
+                return std::nullopt;
+            }
+            const auto writeCountIt =
+                model.stateWriteCountBySymbol.find(write.symbol);
+            if (writeCountIt == model.stateWriteCountBySymbol.end() ||
+                writeCountIt->second != 1u)
+            {
+                return std::nullopt;
+            }
+            const auto operands = op.operands();
+            if (operands.size() < 3 ||
+                graph.valueWidth(operands[1]) != state.width ||
+                !isConstLogicAllOnes(graph, operands[2], state.width) ||
+                model.directStateReadSymbolByValue.contains(operands[1]))
+            {
+                return std::nullopt;
+            }
+            const auto nextIt = model.valueScalarSlotByValue.find(operands[1]);
+            if (nextIt == model.valueScalarSlotByValue.end() ||
+                nextIt->second.kind != state.scalarKind ||
+                (state.initExpr && state.initExpr->requiresRuntime))
+            {
+                return std::nullopt;
+            }
+            return LockstepCommitScalarStateWriteKey{
+                .kind = state.scalarKind,
+                .width = state.width,
+                .nextExpr = resolvedScheduleValueExpr(model, operands[1], context),
+                .initExpr = state.initExpr
+                                ? state.initExpr->expr
+                                : defaultInitExprForLogicWidth(state.width),
+            };
+        }
+
+        std::vector<LockstepCommitScalarStateWriteGroup>
+        buildLockstepCommitScalarStateWriteGroups(
+            const Graph &graph,
+            const EmitModel &model,
+            std::span<const OperationId> runOpIds,
+            const CommitWriteGuardGroup &guardGroup,
+            const SupernodeLocalExprContext *context)
+        {
+            std::vector<LockstepCommitScalarStateWriteGroup> groups;
+            std::size_t openGroupIndex = kInvalidIndex;
+            for (const std::size_t runIndex : guardGroup.runIndices)
+            {
+                const OperationId opId = runOpIds[runIndex];
+                const Operation op = graph.getOperation(opId);
+                const auto key = lockstepCommitScalarStateWriteKey(
+                    graph, model, opId, op, context);
+                if (!key)
+                {
+                    openGroupIndex = kInvalidIndex;
+                    continue;
+                }
+                if (openGroupIndex == kInvalidIndex ||
+                    !(groups[openGroupIndex].key == *key))
+                {
+                    groups.push_back(LockstepCommitScalarStateWriteGroup{
+                        .key = *key,
+                        .runIndices = {runIndex},
+                    });
+                    openGroupIndex = groups.size() - 1u;
+                }
+                else
+                {
+                    groups[openGroupIndex].runIndices.push_back(runIndex);
+                }
+            }
+            groups.erase(
+                std::remove_if(
+                    groups.begin(),
+                    groups.end(),
+                    [](const LockstepCommitScalarStateWriteGroup &group)
+                    {
+                        return group.runIndices.size() < 2u;
+                    }),
+                groups.end());
+            return groups;
+        }
+
+        std::optional<std::string> emitLockstepCommitScalarStateWriteGroup(
+            std::ostream &stream,
+            const Graph &graph,
+            const EmitModel &model,
+            std::span<const OperationId> runOpIds,
+            const LockstepCommitScalarStateWriteGroup &group,
+            std::string_view indent,
+            const ActivationEmitContext *activationContext,
+            const SupernodeLocalExprContext *context,
+            bool trackCommitActivation)
+        {
+            if (group.runIndices.size() < 2u)
+            {
+                return "lockstep scalar state write group has fewer than two writes";
+            }
+            const Operation firstOp =
+                graph.getOperation(runOpIds[group.runIndices.front()]);
+            const WriteDecl &firstWrite = model.writeByOp.at(firstOp.id());
+            const StateDecl &firstState = model.stateBySymbol.at(firstWrite.symbol);
+            stream << indent
+                   << "// Lockstep scalar register writes share one change predicate.\n";
+            stream << indent << "{\n";
+            const std::string innerIndent = std::string(indent) + "    ";
+            stream << innerIndent << "const auto next_value = static_cast<"
+                   << firstState.cppType << ">(" << group.key.nextExpr << ");\n";
+            std::string changeCondition =
+                resolvedStateRefExpr(firstState, context) + " != next_value";
+            if (model.commitStateChangeUnlikely)
+            {
+                changeCondition = "unlikely(" + changeCondition + ")";
+            }
+            stream << innerIndent << "if (" << changeCondition << ") {\n";
+            for (const std::size_t runIndex : group.runIndices)
+            {
+                const Operation op = graph.getOperation(runOpIds[runIndex]);
+                const auto writeIt = model.writeByOp.find(op.id());
+                if (writeIt == model.writeByOp.end())
+                {
+                    return std::string("write metadata missing: ") +
+                           std::string(op.symbolText());
+                }
+                const auto stateIt = model.stateBySymbol.find(writeIt->second.symbol);
+                if (stateIt == model.stateBySymbol.end())
+                {
+                    return std::string("write state missing: ") + writeIt->second.symbol;
+                }
+                const StateDecl &state = stateIt->second;
+                emitOpComment(stream, op, innerIndent + "    ");
+                stream << innerIndent << "    "
+                       << resolvedStateRefExpr(state, context) << " = next_value;\n";
+                emitPerfCounterIncrement(
+                    stream, model, innerIndent + "    ", "touchedWriteCount");
+                const auto headIt =
+                    model.stateHeadSupernodesBySymbol.find(writeIt->second.symbol);
+                if (headIt == model.stateHeadSupernodesBySymbol.end() ||
+                    headIt->second.empty())
+                {
+                    continue;
+                }
+                if (trackCommitActivation)
+                {
+                    stream << innerIndent
+                           << "    commit_activated_readers_ = true;\n";
+                }
+                emitStateReaderActivationStatements(
+                    stream,
+                    model,
+                    writeIt->second.symbol,
+                    innerIndent + "    ",
+                    activationContext);
+            }
+            stream << innerIndent << "}\n";
+            stream << indent << "}\n";
+            return std::nullopt;
+        }
+
         std::string orderedMemoryWriteAffineIndexExpr(std::uint32_t first,
                                                       std::int64_t step,
                                                       std::string_view indexExpr)
@@ -20044,6 +20388,8 @@ namespace wolvrix::lib::emit
                                                       const ScheduleRefs &schedule,
                                                       std::span<const ScheduleBatch> batches,
                                                       std::size_t waveformBatchCount,
+                                                      bool eventQualifiedBitmapContinuation,
+                                                      CommitExactEventStats *commitExactEventStats,
                                                       std::uint64_t maxOutputFileBytes)
         {
             if (auto error = ensureOutputDirectory(schedPath))
@@ -20583,6 +20929,9 @@ namespace wolvrix::lib::emit
                         {
                             return emitError("unsupported exact event expression emit", std::string(op.symbolText()));
                         }
+                        const bool trackCommitActivation =
+                            batch.phase == ScheduleBatch::Phase::kCommit &&
+                            (!eventQualifiedBitmapContinuation || *eventExpr == "true");
                         const bool eventAlreadyHandled =
                             batch.phase == ScheduleBatch::Phase::kCommit &&
                             (commitEventHandledByDispatch || outerCommitEventExpr.has_value());
@@ -20697,6 +21046,39 @@ namespace wolvrix::lib::emit
                                     model,
                                     std::span<const OperationId>(supernodeOps.data() + opIndex, runEnd - opIndex),
                                     std::span<const CommitWriteGuardGroup>(guardGroups.data(), guardGroups.size()));
+                            const auto isColdSingletonRegisterGuard =
+                                [&](const CommitWriteGuardGroup &group)
+                                {
+                                    if (group.condExpr == "true" ||
+                                        group.runIndices.size() != 1u)
+                                    {
+                                        return false;
+                                    }
+                                    const std::size_t relativeRunIndex =
+                                        group.runIndices.front();
+                                    return relativeRunIndex < runEnd - opIndex &&
+                                           graph.getOperation(
+                                               supernodeOps[opIndex + relativeRunIndex])
+                                                   .kind() == OperationKind::kRegisterWritePort;
+                                };
+                            const std::size_t coldSingletonRegisterGuardCount =
+                                eventQualifiedBitmapContinuation
+                                    ? static_cast<std::size_t>(
+                                          std::count_if(guardGroups.begin(),
+                                                        guardGroups.end(),
+                                                        isColdSingletonRegisterGuard))
+                                    : 0u;
+                            const bool coldLargeCommitGuardRun =
+                                coldSingletonRegisterGuardCount >=
+                                kCommitExactEventColdGuardMinCount;
+                            if (coldLargeCommitGuardRun && commitExactEventStats != nullptr)
+                            {
+                                commitExactEventStats->coldRuns.fetch_add(
+                                    1u, std::memory_order_relaxed);
+                                commitExactEventStats->coldGuards.fetch_add(
+                                    coldSingletonRegisterGuardCount,
+                                    std::memory_order_relaxed);
+                            }
                             if (effectiveEventExpr != "true")
                             {
                                 stream << "            if (" << effectiveEventExpr << ") {\n";
@@ -20720,7 +21102,7 @@ namespace wolvrix::lib::emit
                                                                                        "            ",
                                                                                        &activationContext,
                                                                                        &localExprContext,
-                                                                                       true))
+                                                                                       trackCommitActivation))
                                     {
                                         return emitError(*error, orderedGroupIt->stateSymbol);
                                     }
@@ -20731,10 +21113,90 @@ namespace wolvrix::lib::emit
                                 const bool needCondGuard = guardGroup.condExpr != "true";
                                 if (needCondGuard)
                                 {
-                                    stream << "            if (" << guardGroup.condExpr << ") {\n";
+                                    stream << "            if (";
+                                    if (coldLargeCommitGuardRun &&
+                                        isColdSingletonRegisterGuard(guardGroup))
+                                    {
+                                        stream << "unlikely(" << guardGroup.condExpr << ")";
+                                    }
+                                    else
+                                    {
+                                        stream << guardGroup.condExpr;
+                                    }
+                                    stream << ") {\n";
+                                }
+                                const std::span<const OperationId> runOpIds(
+                                    supernodeOps.data() + opIndex,
+                                    runEnd - opIndex);
+                                const std::vector<LockstepCommitScalarStateWriteGroup>
+                                    lockstepGroups =
+                                        eventQualifiedBitmapContinuation
+                                            ? buildLockstepCommitScalarStateWriteGroups(
+                                                  graph,
+                                                  model,
+                                                  runOpIds,
+                                                  guardGroup,
+                                                  &localExprContext)
+                                            : std::vector<
+                                                  LockstepCommitScalarStateWriteGroup>{};
+                                if (!lockstepGroups.empty() && commitExactEventStats != nullptr)
+                                {
+                                    std::size_t lockstepWriteCount = 0u;
+                                    for (const auto &lockstepGroup : lockstepGroups)
+                                    {
+                                        lockstepWriteCount += lockstepGroup.runIndices.size();
+                                    }
+                                    commitExactEventStats->lockstepGroups.fetch_add(
+                                        lockstepGroups.size(), std::memory_order_relaxed);
+                                    commitExactEventStats->lockstepWrites.fetch_add(
+                                        lockstepWriteCount, std::memory_order_relaxed);
+                                }
+                                std::vector<std::size_t> lockstepGroupByRunIndex(
+                                    runEnd - opIndex,
+                                    kInvalidIndex);
+                                for (std::size_t groupIndex = 0;
+                                     groupIndex < lockstepGroups.size();
+                                     ++groupIndex)
+                                {
+                                    for (const std::size_t relativeRunIndex :
+                                         lockstepGroups[groupIndex].runIndices)
+                                    {
+                                        lockstepGroupByRunIndex[relativeRunIndex] = groupIndex;
+                                    }
                                 }
                                 for (const std::size_t relativeRunIndex : guardGroup.runIndices)
                                 {
+                                    const std::size_t lockstepGroupIndex =
+                                        lockstepGroupByRunIndex[relativeRunIndex];
+                                    if (lockstepGroupIndex != kInvalidIndex)
+                                    {
+                                        const auto &lockstepGroup =
+                                            lockstepGroups[lockstepGroupIndex];
+                                        if (relativeRunIndex !=
+                                            lockstepGroup.runIndices.front())
+                                        {
+                                            continue;
+                                        }
+                                        if (auto error =
+                                                emitLockstepCommitScalarStateWriteGroup(
+                                                    stream,
+                                                    graph,
+                                                    model,
+                                                    runOpIds,
+                                                    lockstepGroup,
+                                                    needCondGuard
+                                                        ? "                "
+                                                        : "            ",
+                                                    &activationContext,
+                                                    &localExprContext,
+                                                    trackCommitActivation))
+                                        {
+                                            return emitError(
+                                                *error,
+                                                "lockstep scalar commit write group");
+                                        }
+                                        continue;
+                                    }
                                     const std::size_t guardRunIndex = opIndex + relativeRunIndex;
                                     const auto guardRunOpId = supernodeOps[guardRunIndex];
                                     const Operation guardRunOp = graph.getOperation(guardRunOpId);
@@ -20747,7 +21209,7 @@ namespace wolvrix::lib::emit
                                                               needCondGuard ? "                " : "            ",
                                                               &activationContext,
                                                               &localExprContext,
-                                                              true))
+                                                              trackCommitActivation))
                                     {
                                         return emitError(*error, std::string(guardRunOp.symbolText()));
                                     }
@@ -20819,7 +21281,7 @@ namespace wolvrix::lib::emit
                                                       "            ",
                                                       &activationContext,
                                                       &localExprContext,
-                                                      batch.phase == ScheduleBatch::Phase::kCommit))
+                                                      trackCommitActivation))
                             {
                                 return emitError(*error, std::string(runOp.symbolText()));
                             }
@@ -22256,6 +22718,17 @@ namespace wolvrix::lib::emit
             result.success = false;
             return result;
         }
+        std::string invalidCommitExactEventPolicy;
+        const auto commitExactEventPolicy =
+            parseCommitExactEventPolicy(options, invalidCommitExactEventPolicy);
+        if (!commitExactEventPolicy)
+        {
+            reportError("invalid commit_exact_event_policy: " +
+                        invalidCommitExactEventPolicy +
+                        " (expected off or targeted-cold-layout)");
+            result.success = false;
+            return result;
+        }
         std::string invalidDeferredActivationForwardPolicy;
         const auto deferredActivationForwardPolicy =
             parseDeferredActivationForwardPolicy(
@@ -22882,6 +23355,57 @@ namespace wolvrix::lib::emit
                          deferredActivationCofirePairs.size(),
                          strictValues.size());
         }
+        bool eventQualifiedBitmapContinuation = false;
+        std::string_view commitExactEventFallback = "none";
+        if (*commitExactEventPolicy == CommitExactEventPolicy::kOff)
+        {
+            commitExactEventFallback = "policy_off";
+        }
+        else if (model.emitPerf)
+        {
+            commitExactEventFallback = "perf";
+        }
+        else if (model.emitWaveform)
+        {
+            commitExactEventFallback = "waveform";
+        }
+        else if (runtimeProfileCompiled)
+        {
+            commitExactEventFallback = "runtime_profile";
+        }
+        else if (model.inputFullpassSpecialization)
+        {
+            commitExactEventFallback = "input_fullpass";
+        }
+        else if (model.posedgeFullpassSpecialization)
+        {
+            commitExactEventFallback = "posedge_fullpass";
+        }
+        else if (!model.stateShadows.empty())
+        {
+            commitExactEventFallback = "state_shadows";
+        }
+        else if (model.eventEdgeSlotCount == 0u)
+        {
+            commitExactEventFallback = "no_event_edges";
+        }
+        else if (!canUseEventQualifiedBitmapContinuation(graph, model, schedule))
+        {
+            commitExactEventFallback = "proof";
+        }
+        else
+        {
+            eventQualifiedBitmapContinuation = true;
+        }
+        CommitExactEventStats commitExactEventStats;
+        const std::string_view pendingEvalRoundExpr =
+            eventQualifiedBitmapContinuation
+                ? "commit_activated_readers_ || "
+                  "(grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && "
+                  "grhsim_any_active_flags(supernode_active_curr_))"
+                : "commit_activated_readers_ || "
+                  "grhsim_any_active_flags(supernode_active_curr_)";
+
         const std::filesystem::path makefilePath = outDir / "Makefile";
         const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
         const std::uint64_t maxOutputFileBytes = effectiveMaxOutputFileBytes(options);
@@ -25683,6 +26207,19 @@ inline std::array<std::uint64_t, N> grhsim_ashr_words(const std::array<std::uint
             *stream << "    }\n";
             *stream << "    return false;\n";
             *stream << "}\n\n";
+            if (eventQualifiedBitmapContinuation)
+            {
+                *stream << "struct grhsim_event_edge_byte_view {\n";
+                *stream << "    const std::uint8_t *bytes;\n";
+                *stream << "    std::size_t byte_count;\n";
+                *stream << "    const std::uint8_t *data() const noexcept { return bytes; }\n";
+                *stream << "    std::size_t size() const noexcept { return byte_count; }\n";
+                *stream << "};\n\n";
+                *stream << "inline bool grhsim_any_event_edges(const grhsim_event_edge_kind *eventEdges, std::size_t byteCount)\n{\n";
+                *stream << "    return grhsim_any_active_flags(grhsim_event_edge_byte_view{\n";
+                *stream << "        reinterpret_cast<const std::uint8_t *>(eventEdges), byteCount});\n";
+                *stream << "}\n\n";
+            }
             *stream << "template <typename ActiveFlags>\n";
             *stream << "inline std::size_t grhsim_count_active_supernodes(const ActiveFlags &activeFlags)\n{\n";
             *stream << "    std::size_t total = 0;\n";
@@ -26878,7 +27415,12 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::unordered_map<std::uint64_t, FileHandleEntry> file_handles_;\n";
                 *stream << "    std::vector<PendingSystemTaskText> deferred_system_task_texts_;\n";
             }
-            *stream << "    std::array<std::uint8_t, kActiveFlagWordCount> supernode_active_curr_{};\n";
+            *stream << "    ";
+            if (eventQualifiedBitmapContinuation)
+            {
+                *stream << "alignas(64) ";
+            }
+            *stream << "std::array<std::uint8_t, kActiveFlagWordCount> supernode_active_curr_{};\n";
             *stream << "    bool commit_activated_readers_ = false;\n";
             if (!model.stateShadows.empty())
             {
@@ -30256,7 +30798,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                    std::chrono::steady_clock::now() - commit_begin_time)\n";
                 *stream << "                    .count());\n";
                 *stream << "        }\n";
-                *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
+                *stream << "        pending_eval_round = " << pendingEvalRoundExpr << ";\n";
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Event edges are per-fixed-point-round signals, so clear them before the next round.\n";
@@ -30347,7 +30889,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        // Then commit sink supernodes in direct schedule order.\n";
                 emitDirectPhaseDispatch(commitScheduleBatches, "commit", "commitBatchExecCount", false);
-                *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
+                *stream << "        pending_eval_round = " << pendingEvalRoundExpr << ";\n";
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Event edges are per-fixed-point-round signals, so clear them before the next round.\n";
@@ -30400,6 +30942,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                                       std::span<const ScheduleBatch>(scheduleBatches.data() + beginBatch,
                                                                      endBatch - beginBatch),
                                       scheduleBatches.size(),
+                                      eventQualifiedBitmapContinuation,
+                                      &commitExactEventStats,
                                       maxOutputFileBytes);
         };
         if (emitParallelism <= 1 || schedOutputPaths.size() <= 1)
@@ -30585,6 +31129,17 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             result.artifacts.push_back(schedPath.string());
         }
         result.artifacts.push_back(makefilePath.string());
+        std::fprintf(stderr,
+                     "[GRHSIM_COMMIT_EXACT_EVENT] policy=%.*s selected=%u fallback=%.*s cold_runs=%zu cold_guards=%zu lockstep_groups=%zu lockstep_writes=%zu\n",
+                     static_cast<int>(commitExactEventPolicyName(*commitExactEventPolicy).size()),
+                     commitExactEventPolicyName(*commitExactEventPolicy).data(),
+                     eventQualifiedBitmapContinuation ? 1u : 0u,
+                     static_cast<int>(commitExactEventFallback.size()),
+                     commitExactEventFallback.data(),
+                     commitExactEventStats.coldRuns.load(std::memory_order_relaxed),
+                     commitExactEventStats.coldGuards.load(std::memory_order_relaxed),
+                     commitExactEventStats.lockstepGroups.load(std::memory_order_relaxed),
+                     commitExactEventStats.lockstepWrites.load(std::memory_order_relaxed));
         if (activeMaskGapPackProbe != nullptr)
         {
             activeMaskGapPackProbe->report();

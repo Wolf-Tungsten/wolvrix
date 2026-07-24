@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import inspect
 import types
 import unittest
 
@@ -19,6 +20,13 @@ class DummySession:
 
 
 class EmitGrhsimCppOptionTest(unittest.TestCase):
+    def test_python_commit_exact_event_policy_is_keyword_only(self) -> None:
+        parameter = inspect.signature(
+            wolvrix.Session.emit_grhsim_cpp
+        ).parameters["commit_exact_event_policy"]
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
+
     def test_python_none_is_omitted_and_false_is_forwarded(self) -> None:
         calls = []
 
@@ -40,6 +48,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 deferred_activation_forward_profile_path=None,
                 same_batch_activation_cohort_policy=None,
                 same_batch_activation_cohort_profile_path=None,
+                commit_exact_event_policy=None,
             )
             self.assertNotIn("direct_single_writer_state_reads", calls[-1][1])
             self.assertNotIn("pure_event_compute_word_bypass", calls[-1][1])
@@ -48,6 +57,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
             self.assertNotIn("deferred_activation_forward_profile_path", calls[-1][1])
             self.assertNotIn("same_batch_activation_cohort_policy", calls[-1][1])
             self.assertNotIn("same_batch_activation_cohort_profile_path", calls[-1][1])
+            self.assertNotIn("commit_exact_event_policy", calls[-1][1])
 
             wolvrix.Session.emit_grhsim_cpp(
                 DummySession(),
@@ -60,6 +70,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 deferred_activation_forward_profile_path="/tmp/fire.tsv",
                 same_batch_activation_cohort_policy="probe",
                 same_batch_activation_cohort_profile_path="/tmp/cohort-fire.tsv",
+                commit_exact_event_policy="targeted-cold-layout",
             )
             self.assertIs(calls[-1][1]["direct_single_writer_state_reads"], False)
             self.assertIs(calls[-1][1]["pure_event_compute_word_bypass"], False)
@@ -73,6 +84,10 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
             self.assertEqual(
                 calls[-1][1]["same_batch_activation_cohort_profile_path"],
                 "/tmp/cohort-fire.tsv",
+            )
+            self.assertEqual(
+                calls[-1][1]["commit_exact_event_policy"],
+                "targeted-cold-layout",
             )
         finally:
             wolvrix._native = original_native
@@ -126,6 +141,19 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 ):
                     _compile_emit_grhsim_cpp_kwargs(
                         {"deferred_activation_forward_profile_path": value}
+                    )
+
+    def test_python_commit_exact_event_policy_validation(self) -> None:
+        for value in ("off", "targeted-cold-layout"):
+            with self.subTest(value=value):
+                _compile_emit_grhsim_cpp_kwargs(
+                    {"commit_exact_event_policy": value}
+                )
+        for value in ("", "targeted", " cold ", False, 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "commit_exact_event_policy"):
+                    _compile_emit_grhsim_cpp_kwargs(
+                        {"commit_exact_event_policy": value}
                     )
 
     def test_python_same_batch_activation_cohort_validation(self) -> None:
@@ -188,6 +216,40 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                             output="unused",
                             same_batch_activation_cohort_policy=value,
                         )
+
+    def test_native_commit_exact_event_policies_are_accepted(self) -> None:
+        with wolvrix.Session() as session:
+            for value in ("off", "targeted-cold-layout"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(KeyError, "design key not found"):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            commit_exact_event_policy=value,
+                        )
+
+    def test_native_commit_exact_event_policy_rejects_invalid_value(self) -> None:
+        with wolvrix.Session() as session:
+            for value in ("", "targeted", "cold-layout"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, "commit_exact_event_policy"):
+                        native.session_emit_grhsim_cpp(
+                            session._capsule,
+                            design="missing.design",
+                            output="unused",
+                            commit_exact_event_policy=value,
+                        )
+
+    def test_native_commit_exact_event_policy_accepts_explicit_none(self) -> None:
+        with wolvrix.Session() as session:
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    session._capsule,
+                    design="missing.design",
+                    output="unused",
+                    commit_exact_event_policy=None,
+                )
 
     def test_native_same_batch_activation_cohort_policy_rejects_invalid_value(self) -> None:
         with wolvrix.Session() as session:
@@ -338,13 +400,24 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                     "probe",
                     "/tmp/cohort-fire.tsv",
                 )
+            with self.assertRaisesRegex(KeyError, "design key not found"):
+                native.session_emit_grhsim_cpp(
+                    *legacy_args,
+                    "targeted-direct",
+                    "probe",
+                    "/tmp/fire.tsv",
+                    "probe",
+                    "/tmp/cohort-fire.tsv",
+                    "targeted-cold-layout",
+                )
 
         self.assertIn(
             "direct_single_writer_state_reads=None, active_mask_gap_pack_policy=None, "
             "deferred_activation_forward_policy=None, "
             "deferred_activation_forward_profile_path=None, "
             "same_batch_activation_cohort_policy=None, "
-            "same_batch_activation_cohort_profile_path=None",
+            "same_batch_activation_cohort_profile_path=None, "
+            "commit_exact_event_policy=None",
             native.session_emit_grhsim_cpp.__doc__,
         )
 

@@ -321,7 +321,9 @@ namespace wolvrix::lib::emit
             kTargetedColdLayout,
         };
 
-        constexpr std::size_t kCommitExactEventColdGuardMinCount = 1024u;
+        constexpr std::size_t kCommitExactEventColdGuardMinCount = 256u;
+        constexpr std::size_t kCommitExactEventColdGuardMinWriteCount = 2048u;
+        constexpr std::size_t kCommitExactEventColdGuardMaxGroupSize = 2048u;
 
         struct CommitExactEventStats
         {
@@ -17729,6 +17731,44 @@ namespace wolvrix::lib::emit
             return joinStrings(parts, " || ");
         }
 
+        bool isNestableAssertionSideEffectPair(const Graph &graph,
+                                                 const EmitModel &model,
+                                                 OperationId systemTaskOpId,
+                                                 const Operation &systemTaskOp,
+                                                 OperationId dpicOpId,
+                                                 const Operation &dpicOp)
+        {
+            if (systemTaskOp.kind() != OperationKind::kSystemTask ||
+                dpicOp.kind() != OperationKind::kDpicCall)
+            {
+                return false;
+            }
+            const auto systemTaskOperands = systemTaskOp.operands();
+            const auto dpicOperands = dpicOp.operands();
+            if (systemTaskOperands.empty() || dpicOperands.empty() ||
+                systemTaskOperands.front() != dpicOperands.front())
+            {
+                return false;
+            }
+            const auto targetImport =
+                getAttribute<std::string>(dpicOp, "targetImportSymbol");
+            const auto outputNames =
+                getAttribute<std::vector<std::string>>(dpicOp, "outArgName");
+            if (!targetImport || *targetImport != "xs_assert_v2" ||
+                getAttribute<bool>(dpicOp, "hasReturn").value_or(false) ||
+                !dpicOp.results().empty() ||
+                (outputNames && !outputNames->empty()))
+            {
+                return false;
+            }
+            const auto systemTaskEventExpr =
+                exactEventExpr(graph, model, systemTaskOpId, systemTaskOp);
+            const auto dpicEventExpr =
+                exactEventExpr(graph, model, dpicOpId, dpicOp);
+            return systemTaskEventExpr && dpicEventExpr &&
+                   *systemTaskEventExpr == *dpicEventExpr;
+        }
+
         bool isWritePortKind(OperationKind kind) noexcept
         {
             switch (kind)
@@ -20832,6 +20872,7 @@ namespace wolvrix::lib::emit
                 }
                 std::size_t opIndex = 0;
                 std::size_t nextConcatPrefixDecl = 0;
+                OperationId nestedAssertionDpicOpId = OperationId::invalid();
                 const auto &supernodeOps = schedule.supernodeToOps[supernodeId];
                 DeferredActivationGroups deferredActivationGroups;
                 if (batch.phase == ScheduleBatch::Phase::kCompute && !fullpassVariant)
@@ -21046,11 +21087,71 @@ namespace wolvrix::lib::emit
                                     model,
                                     std::span<const OperationId>(supernodeOps.data() + opIndex, runEnd - opIndex),
                                     std::span<const CommitWriteGuardGroup>(guardGroups.data(), guardGroups.size()));
-                            const auto isColdSingletonRegisterGuard =
+                            const auto isKnownNonzeroConstantGuard =
+                                [&](const CommitWriteGuardGroup &group)
+                                {
+                                    if (group.runIndices.empty())
+                                    {
+                                        return false;
+                                    }
+                                    const std::size_t relativeRunIndex =
+                                        group.runIndices.front();
+                                    if (relativeRunIndex >= runEnd - opIndex)
+                                    {
+                                        return false;
+                                    }
+                                    const Operation guardOp = graph.getOperation(
+                                        supernodeOps[opIndex + relativeRunIndex]);
+                                    const auto operands = guardOp.operands();
+                                    if (operands.empty())
+                                    {
+                                        return false;
+                                    }
+                                    const ValueId condValue = operands.front();
+                                    const int32_t width = graph.valueWidth(condValue);
+                                    const auto constant =
+                                        constLogicValue(graph, condValue, width);
+                                    if (!constant)
+                                    {
+                                        return false;
+                                    }
+                                    const std::uint64_t *words = constant->getRawPtr();
+                                    return std::any_of(
+                                        words,
+                                        words + logicWordCount(width),
+                                        [](std::uint64_t word)
+                                        {
+                                            return word != UINT64_C(0);
+                                        });
+                                };
+                            const auto isColdRegisterWriteGuardGroup =
                                 [&](const CommitWriteGuardGroup &group)
                                 {
                                     if (group.condExpr == "true" ||
-                                        group.runIndices.size() != 1u)
+                                        group.runIndices.empty() ||
+                                        group.runIndices.size() >
+                                            kCommitExactEventColdGuardMaxGroupSize ||
+                                        isKnownNonzeroConstantGuard(group))
+                                    {
+                                        return false;
+                                    }
+                                    return std::all_of(
+                                        group.runIndices.begin(),
+                                        group.runIndices.end(),
+                                        [&](std::size_t relativeRunIndex)
+                                        {
+                                            return relativeRunIndex < runEnd - opIndex &&
+                                                   graph.getOperation(
+                                                       supernodeOps[opIndex + relativeRunIndex])
+                                                           .kind() == OperationKind::kRegisterWritePort;
+                                        });
+                                };
+                            const auto isColdSingletonMemoryWriteGuard =
+                                [&](const CommitWriteGuardGroup &group)
+                                {
+                                    if (group.condExpr == "true" ||
+                                        group.runIndices.size() != 1u ||
+                                        isKnownNonzeroConstantGuard(group))
                                     {
                                         return false;
                                     }
@@ -21059,18 +21160,36 @@ namespace wolvrix::lib::emit
                                     return relativeRunIndex < runEnd - opIndex &&
                                            graph.getOperation(
                                                supernodeOps[opIndex + relativeRunIndex])
-                                                   .kind() == OperationKind::kRegisterWritePort;
+                                                   .kind() == OperationKind::kMemoryWritePort;
                                 };
                             const std::size_t coldSingletonRegisterGuardCount =
                                 eventQualifiedBitmapContinuation
                                     ? static_cast<std::size_t>(
-                                          std::count_if(guardGroups.begin(),
-                                                        guardGroups.end(),
-                                                        isColdSingletonRegisterGuard))
+                                          std::count_if(
+                                              guardGroups.begin(),
+                                              guardGroups.end(),
+                                              [&](const CommitWriteGuardGroup &group)
+                                              {
+                                                  return group.runIndices.size() == 1u &&
+                                                         isColdRegisterWriteGuardGroup(group);
+                                              }))
                                     : 0u;
+                            std::size_t coldGuardedRegisterWriteCount = 0u;
+                            if (eventQualifiedBitmapContinuation)
+                            {
+                                for (const CommitWriteGuardGroup &group : guardGroups)
+                                {
+                                    if (isColdRegisterWriteGuardGroup(group))
+                                    {
+                                        coldGuardedRegisterWriteCount += group.runIndices.size();
+                                    }
+                                }
+                            }
                             const bool coldLargeCommitGuardRun =
                                 coldSingletonRegisterGuardCount >=
-                                kCommitExactEventColdGuardMinCount;
+                                    kCommitExactEventColdGuardMinCount ||
+                                coldGuardedRegisterWriteCount >=
+                                    kCommitExactEventColdGuardMinWriteCount;
                             if (coldLargeCommitGuardRun && commitExactEventStats != nullptr)
                             {
                                 commitExactEventStats->coldRuns.fetch_add(
@@ -21115,7 +21234,8 @@ namespace wolvrix::lib::emit
                                 {
                                     stream << "            if (";
                                     if (coldLargeCommitGuardRun &&
-                                        isColdSingletonRegisterGuard(guardGroup))
+                                        (isColdRegisterWriteGuardGroup(guardGroup) ||
+                                         isColdSingletonMemoryWriteGuard(guardGroup)))
                                     {
                                         stream << "unlikely(" << guardGroup.condExpr << ")";
                                     }
@@ -21956,12 +22076,38 @@ namespace wolvrix::lib::emit
                         {
                             procGuard = "(" + procGuard + ") && (!" + sampleIt->second.completedFieldName + ")";
                         }
-                        stream << "            if ((" << condExpr << ") && ";
+                        bool nestFollowingAssertionDpic = false;
+                        const bool nextOpStartsConcatPrefix =
+                            nextConcatPrefixDecl < concatPrefixCacheDecls.size() &&
+                            concatPrefixCacheDecls[nextConcatPrefixDecl].firstUseIndex ==
+                                opIndex + 1u;
+                        if (procGuard == "true" && !nextOpStartsConcatPrefix &&
+                            opIndex + 1u < supernodeOps.size())
+                        {
+                            const OperationId nextOpId = supernodeOps[opIndex + 1u];
+                            const Operation nextOp = graph.getOperation(nextOpId);
+                            nestFollowingAssertionDpic =
+                                isCommitPhaseOp(nextOp) == commitPhaseOp &&
+                                !isRegToMemIntentBypassOp(model, nextOpId) &&
+                                isNestableAssertionSideEffectPair(
+                                    graph, model, opId, op, nextOpId, nextOp);
+                        }
+                        stream << "            if (";
+                        if (nestFollowingAssertionDpic)
+                        {
+                            stream << "unlikely(";
+                        }
+                        stream << "(" << condExpr << ") && ";
                         if (!eventAlreadyHandled)
                         {
                             stream << "(" << *eventExpr << ") && ";
                         }
-                        stream << "(" << procGuard << ")) {\n";
+                        stream << "(" << procGuard << ")";
+                        if (nestFollowingAssertionDpic)
+                        {
+                            stream << ")";
+                        }
+                        stream << ") {\n";
                         const auto taskArgs =
                             argEnd <= 1
                                 ? std::span<const ValueId>()
@@ -22004,11 +22150,20 @@ namespace wolvrix::lib::emit
                         {
                             stream << "                " << sampleIt->second.completedFieldName << " = true;\n";
                         }
-                        stream << "            }\n";
+                        if (nestFollowingAssertionDpic)
+                        {
+                            nestedAssertionDpicOpId = supernodeOps[opIndex + 1u];
+                        }
+                        else
+                        {
+                            stream << "            }\n";
+                        }
                         break;
                     }
                     case OperationKind::kDpicCall:
                     {
+                        const bool closesNestedAssertionPair =
+                            nestedAssertionDpicOpId == opId;
                         const auto targetImport = getAttribute<std::string>(op, "targetImportSymbol");
                         const auto inArgName = getAttribute<std::vector<std::string>>(op, "inArgName").value_or(std::vector<std::string>{});
                         const auto outArgName = getAttribute<std::vector<std::string>>(op, "outArgName").value_or(std::vector<std::string>{});
@@ -22167,6 +22322,11 @@ namespace wolvrix::lib::emit
                             }
                         }
                         stream << "            }\n";
+                        if (closesNestedAssertionPair)
+                        {
+                            stream << "            }\n";
+                            nestedAssertionDpicOpId = OperationId::invalid();
+                        }
                         break;
                     }
                     case OperationKind::kRegister:

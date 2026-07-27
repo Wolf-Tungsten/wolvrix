@@ -1854,6 +1854,321 @@ namespace
         return design;
     }
 
+    struct CommitExactEventColdGuardOptions
+    {
+        std::size_t singletonRegisterWrites = 0u;
+        std::size_t sharedRegisterWrites = 0u;
+        std::size_t singletonMemoryWrites = 0u;
+        std::size_t sharedMemoryWrites = 0u;
+        bool knownNonzeroRegisterWrite = false;
+        bool knownNonzeroMemoryWrite = false;
+        bool memoryFill = false;
+    };
+
+    Design buildCommitExactEventColdGuardDesign(
+        const CommitExactEventColdGuardOptions &options)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId clk = makeLogicValue(graph, "cold_guard_clk", 1);
+        const ValueId data = makeLogicValue(graph, "cold_guard_data", 8);
+        const ValueId address = makeLogicValue(graph, "cold_guard_address", 2);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("address", address);
+
+        const ValueId mask =
+            addConstant(graph, "cold_guard_mask_op", "cold_guard_mask", 8, "8'hff");
+        const ValueId knownNonzero = addConstant(
+            graph, "cold_guard_known_nonzero_op", "cold_guard_known_nonzero", 8, "8'h02");
+
+        std::vector<std::pair<std::string, ValueId>> registerWrites;
+        registerWrites.reserve(options.singletonRegisterWrites +
+                               options.sharedRegisterWrites +
+                               (options.knownNonzeroRegisterWrite ? 1u : 0u));
+        const auto addRegister = [&](std::string name, ValueId guard)
+        {
+            const OperationId reg = graph.createOperation(
+                OperationKind::kRegister, graph.internSymbol(name));
+            graph.setAttr(reg, "width", static_cast<int64_t>(8));
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("8'h00"));
+            registerWrites.emplace_back(std::move(name), guard);
+        };
+
+        for (std::size_t index = 0; index < options.singletonRegisterWrites; ++index)
+        {
+            const std::string suffix = std::to_string(index);
+            const ValueId guard =
+                makeLogicValue(graph, "cold_guard_register_singleton_" + suffix, 1);
+            graph.bindInputPort("register_singleton_" + suffix, guard);
+            addRegister("cold_guard_register_singleton_state_" + suffix, guard);
+        }
+
+        ValueId sharedRegisterGuard;
+        if (options.sharedRegisterWrites != 0u)
+        {
+            sharedRegisterGuard =
+                makeLogicValue(graph, "cold_guard_register_shared", 1);
+            graph.bindInputPort("register_shared", sharedRegisterGuard);
+            for (std::size_t index = 0; index < options.sharedRegisterWrites; ++index)
+            {
+                addRegister("cold_guard_register_shared_state_" +
+                                std::to_string(index),
+                            sharedRegisterGuard);
+            }
+        }
+        if (options.knownNonzeroRegisterWrite)
+        {
+            addRegister("cold_guard_register_known_nonzero_state", knownNonzero);
+        }
+
+        for (std::size_t index = 0; index < registerWrites.size(); ++index)
+        {
+            const auto &[regName, guard] = registerWrites[index];
+            const OperationId write = graph.createOperation(
+                OperationKind::kRegisterWritePort,
+                graph.internSymbol("cold_guard_register_write_" +
+                                   std::to_string(index)));
+            graph.addOperand(write, guard);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", regName);
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        }
+
+        const bool needsMemory = options.singletonMemoryWrites != 0u ||
+                                 options.sharedMemoryWrites != 0u ||
+                                 options.knownNonzeroMemoryWrite || options.memoryFill;
+        if (needsMemory)
+        {
+            const OperationId memory = graph.createOperation(
+                OperationKind::kMemory, graph.internSymbol("cold_guard_memory"));
+            graph.setAttr(memory, "width", static_cast<int64_t>(8));
+            graph.setAttr(memory, "row", static_cast<int64_t>(4));
+            graph.setAttr(memory, "isSigned", false);
+            graph.setAttr(memory, "initKind", std::vector<std::string>{});
+            graph.setAttr(memory, "initFile", std::vector<std::string>{});
+            graph.setAttr(memory, "initValue", std::vector<std::string>{});
+            graph.setAttr(memory, "initStart", std::vector<int64_t>{});
+            graph.setAttr(memory, "initLen", std::vector<int64_t>{});
+
+            const auto addMemoryWrite = [&](std::string name, ValueId guard)
+            {
+                const OperationId write = graph.createOperation(
+                    OperationKind::kMemoryWritePort, graph.internSymbol(std::move(name)));
+                graph.addOperand(write, guard);
+                graph.addOperand(write, address);
+                graph.addOperand(write, data);
+                graph.addOperand(write, mask);
+                graph.addOperand(write, clk);
+                graph.setAttr(write, "memSymbol", std::string("cold_guard_memory"));
+                graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            };
+
+            for (std::size_t index = 0; index < options.singletonMemoryWrites; ++index)
+            {
+                const std::string suffix = std::to_string(index);
+                const ValueId guard =
+                    makeLogicValue(graph, "cold_guard_memory_singleton_" + suffix, 1);
+                graph.bindInputPort("memory_singleton_" + suffix, guard);
+                addMemoryWrite("cold_guard_memory_singleton_write_" + suffix, guard);
+            }
+
+            if (options.sharedMemoryWrites != 0u)
+            {
+                const ValueId sharedGuard =
+                    makeLogicValue(graph, "cold_guard_memory_shared", 1);
+                graph.bindInputPort("memory_shared", sharedGuard);
+                for (std::size_t index = 0; index < options.sharedMemoryWrites; ++index)
+                {
+                    addMemoryWrite("cold_guard_memory_shared_write_" +
+                                       std::to_string(index),
+                                   sharedGuard);
+                }
+            }
+            if (options.knownNonzeroMemoryWrite)
+            {
+                addMemoryWrite("cold_guard_memory_known_nonzero_write", knownNonzero);
+            }
+            if (options.memoryFill)
+            {
+                const ValueId fillGuard =
+                    makeLogicValue(graph, "cold_guard_memory_fill", 1);
+                graph.bindInputPort("memory_fill", fillGuard);
+                const OperationId fill = graph.createOperation(
+                    OperationKind::kMemoryFillPort,
+                    graph.internSymbol("cold_guard_memory_fill_write"));
+                graph.addOperand(fill, fillGuard);
+                graph.addOperand(fill, data);
+                graph.addOperand(fill, clk);
+                graph.setAttr(fill, "memSymbol", std::string("cold_guard_memory"));
+                graph.setAttr(fill, "eventEdge", std::vector<std::string>{"posedge"});
+            }
+        }
+
+        return design;
+    }
+
+    enum class AssertionOuterGuardFixtureMode
+    {
+        kEligible,
+        kDifferentCondition,
+        kDifferentEvent,
+        kWrongTarget,
+        kHasReturn,
+        kHasOutput,
+        kInitialProcGuard,
+        kNonAdjacent,
+        kConcatAssociatedInterveningOp,
+    };
+
+    Design buildAssertionOuterGuardDesign(AssertionOuterGuardFixtureMode mode)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId clk = makeLogicValue(graph, "assertion_outer_clk", 1);
+        const ValueId auxClk = makeLogicValue(graph, "assertion_outer_aux_clk", 1);
+        const ValueId condition =
+            makeLogicValue(graph, "assertion_outer_condition", 1);
+        const ValueId otherCondition =
+            makeLogicValue(graph, "assertion_outer_other_condition", 1);
+        const ValueId data = makeLogicValue(graph, "assertion_outer_data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("aux_clk", auxClk);
+        graph.bindInputPort("condition", condition);
+        graph.bindInputPort("other_condition", otherCondition);
+        graph.bindInputPort("data", data);
+        graph.bindOutputPort("data_out", data);
+
+        const ValueId format = addConstant(graph,
+                                           "assertion_outer_format_op",
+                                           "assertion_outer_format",
+                                           0,
+                                           "\"outer-guard-task=%0d\"",
+                                           ValueType::String);
+        const std::string importName =
+            mode == AssertionOuterGuardFixtureMode::kWrongTarget
+                ? "not_xs_assert_v2"
+                : "xs_assert_v2";
+        const OperationId import = graph.createOperation(
+            OperationKind::kDpicImport, graph.internSymbol(importName));
+        if (mode == AssertionOuterGuardFixtureMode::kHasOutput)
+        {
+            graph.setAttr(import, "argsDirection",
+                          std::vector<std::string>{"input", "output"});
+            graph.setAttr(import, "argsWidth", std::vector<int64_t>{8, 8});
+            graph.setAttr(import, "argsName",
+                          std::vector<std::string>{"value", "result"});
+            graph.setAttr(import, "argsSigned", std::vector<bool>{false, false});
+            graph.setAttr(import, "argsType",
+                          std::vector<std::string>{"logic", "logic"});
+        }
+        else
+        {
+            graph.setAttr(import, "argsDirection", std::vector<std::string>{"input"});
+            graph.setAttr(import, "argsWidth", std::vector<int64_t>{8});
+            graph.setAttr(import, "argsName", std::vector<std::string>{"value"});
+            graph.setAttr(import, "argsSigned", std::vector<bool>{false});
+            graph.setAttr(import, "argsType", std::vector<std::string>{"logic"});
+        }
+        const bool hasReturn = mode == AssertionOuterGuardFixtureMode::kHasReturn;
+        graph.setAttr(import, "hasReturn", hasReturn);
+        if (hasReturn)
+        {
+            graph.setAttr(import, "returnWidth", static_cast<int64_t>(8));
+            graph.setAttr(import, "returnSigned", false);
+            graph.setAttr(import, "returnType", std::string("logic"));
+        }
+
+        // Independent side-effect clusters are ordered by descending sink id by
+        // the focused activity schedule.  Create the DPIC sink first so the
+        // emitted order is SystemTask immediately followed by DPIC.
+        const OperationId call = graph.createOperation(
+            OperationKind::kDpicCall, graph.internSymbol("assertion_outer_dpic"));
+        graph.addOperand(
+            call,
+            mode == AssertionOuterGuardFixtureMode::kDifferentCondition
+                ? otherCondition
+                : condition);
+        graph.addOperand(call, data);
+        graph.addOperand(call,
+                         mode == AssertionOuterGuardFixtureMode::kDifferentEvent
+                             ? auxClk
+                             : clk);
+        graph.setAttr(call, "targetImportSymbol", importName);
+        graph.setAttr(call, "inArgName", std::vector<std::string>{"value"});
+        graph.setAttr(call,
+                      "outArgName",
+                      mode == AssertionOuterGuardFixtureMode::kHasOutput
+                          ? std::vector<std::string>{"result"}
+                          : std::vector<std::string>{});
+        graph.setAttr(call, "hasReturn", hasReturn);
+        graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+        if (hasReturn || mode == AssertionOuterGuardFixtureMode::kHasOutput)
+        {
+            const ValueId result = makeLogicValue(graph, "assertion_outer_result", 8);
+            graph.addResult(call, result);
+            graph.bindOutputPort("result", result);
+        }
+
+        if (mode == AssertionOuterGuardFixtureMode::kNonAdjacent ||
+            mode == AssertionOuterGuardFixtureMode::kConcatAssociatedInterveningOp)
+        {
+            ValueId barrierData = data;
+            if (mode ==
+                AssertionOuterGuardFixtureMode::kConcatAssociatedInterveningOp)
+            {
+                // Scalar concat prefix caching is currently disabled by
+                // scalarConcatPrefixCacheable().  Keep this as a distinct
+                // concat-associated intervening-op rejection; a focused
+                // nextConcatPrefixDecl barrier belongs here once caching is enabled.
+                barrierData = makeLogicValue(graph, "assertion_outer_concat", 16);
+                const OperationId concat = graph.createOperation(
+                    OperationKind::kConcat,
+                    graph.internSymbol("assertion_outer_concat_barrier"));
+                graph.addOperand(concat, data);
+                graph.addOperand(concat, data);
+                graph.addResult(concat, barrierData);
+            }
+            const OperationId barrier = graph.createOperation(
+                OperationKind::kSystemTask,
+                graph.internSymbol("assertion_outer_side_effect_barrier"));
+            graph.addOperand(barrier, otherCondition);
+            graph.addOperand(barrier, format);
+            graph.addOperand(barrier, barrierData);
+            graph.addOperand(barrier, clk);
+            graph.setAttr(barrier, "name", std::string("display"));
+            graph.setAttr(barrier, "procKind", std::string("always_ff"));
+            graph.setAttr(barrier, "hasTiming", false);
+            graph.setAttr(barrier, "hasSideEffects", true);
+            graph.setAttr(barrier, "eventEdge", std::vector<std::string>{"posedge"});
+        }
+
+        const OperationId task = graph.createOperation(
+            OperationKind::kSystemTask, graph.internSymbol("assertion_outer_task"));
+        graph.addOperand(task, condition);
+        graph.addOperand(task, format);
+        graph.addOperand(task, data);
+        graph.addOperand(task, clk);
+        graph.setAttr(task, "name", std::string("display"));
+        graph.setAttr(task,
+                      "procKind",
+                      std::string(mode == AssertionOuterGuardFixtureMode::kInitialProcGuard
+                                      ? "initial"
+                                      : "always_ff"));
+        graph.setAttr(task, "hasTiming", false);
+        graph.setAttr(task, "hasSideEffects", true);
+        graph.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+
+        return design;
+    }
+
     Design buildCommitLocalityPartitionDesign()
     {
         Design design;
@@ -5425,15 +5740,17 @@ namespace
             return fail("commit exact-event policy changed legacy targeted-direct output on an ineligible design");
         }
 
-        const auto runThresholdCase = [&](std::size_t guardCount,
+        const auto runColdGuardCase = [&](const CommitExactEventColdGuardOptions &options,
                                           std::string_view suffix,
-                                          std::size_t expectedAddedHints) -> int
+                                          std::size_t expectedAddedHints,
+                                          std::string_view requiredHint = {}) -> int
         {
-            Design design = buildCommitExactEventPolicyDesign(guardCount, false);
+            Design design = buildCommitExactEventColdGuardDesign(options);
             SessionStore session;
             if (!runActivitySchedule(design, session))
             {
-                return fail("commit exact-event cold-threshold activity-schedule pass failed");
+                return fail("commit exact-event cold-guard activity-schedule pass failed for " +
+                            std::string(suffix));
             }
             const ActiveMaskGapPackEmitRun offRun = runCommitExactEventEmit(
                 design,
@@ -5460,9 +5777,11 @@ namespace
             const std::size_t offHints = countSubstring(offSched, "if (unlikely(");
             const std::size_t targetedHints =
                 countSubstring(targetedSched, "if (unlikely(");
-            if (targetedHints != offHints + expectedAddedHints)
+            if (targetedHints != offHints + expectedAddedHints ||
+                (!requiredHint.empty() &&
+                 targetedSched.find(requiredHint) == std::string::npos))
             {
-                return fail("commit exact-event cold-hint threshold mismatch for " +
+                return fail("commit exact-event cold-hint boundary mismatch for " +
                             std::string(suffix) + ": off=" +
                             std::to_string(offHints) + " targeted=" +
                             std::to_string(targetedHints) + " expected_added=" +
@@ -5470,13 +5789,297 @@ namespace
             }
             return 0;
         };
-        if (const int result = runThresholdCase(1023u, "threshold_1023", 0u))
+        if (const int result = runColdGuardCase(
+                {.singletonRegisterWrites = 255u}, "singleton_255", 0u))
         {
             return result;
         }
-        if (const int result = runThresholdCase(1024u, "threshold_1024", 1024u))
+        if (const int result = runColdGuardCase(
+                {.singletonRegisterWrites = 256u}, "singleton_256", 256u))
         {
             return result;
+        }
+        if (const int result = runColdGuardCase(
+                {.sharedRegisterWrites = 2047u}, "total_writes_2047", 0u))
+        {
+            return result;
+        }
+        if (const int result = runColdGuardCase(
+                {.sharedRegisterWrites = 2048u}, "total_writes_2048", 1u))
+        {
+            return result;
+        }
+        if (const int result = runColdGuardCase(
+                {.sharedRegisterWrites = 2049u}, "group_cap_2049", 0u))
+        {
+            return result;
+        }
+        if (const int result = runColdGuardCase(
+                {.singletonMemoryWrites = 256u}, "memory_only", 0u))
+        {
+            return result;
+        }
+        if (const int result = runColdGuardCase(
+                {.singletonRegisterWrites = 255u,
+                 .knownNonzeroRegisterWrite = true},
+                "known_nonzero_admission",
+                0u))
+        {
+            return result;
+        }
+        if (const int result = runColdGuardCase(
+                {.singletonRegisterWrites = 256u,
+                 .singletonMemoryWrites = 1u,
+                 .sharedMemoryWrites = 2u,
+                 .knownNonzeroRegisterWrite = true,
+                 .knownNonzeroMemoryWrite = true,
+                 .memoryFill = true},
+                "admitted_memory",
+                257u,
+                "unlikely((memory_singleton_0) != 0)"))
+        {
+            return result;
+        }
+        return 0;
+    }
+
+    int runAssertionOuterGuardFocusedTests()
+    {
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            "grhsim_cpp_assertion_outer_guard";
+        const auto schedText = [](const ActiveMaskGapPackEmitRun &run)
+        {
+            std::string text;
+            for (const auto &[name, content] : run.artifacts)
+            {
+                if (name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp"))
+                {
+                    text += content;
+                }
+            }
+            return text;
+        };
+        const auto emitFixture = [&](AssertionOuterGuardFixtureMode mode,
+                                     std::string_view suffix,
+                                     std::size_t parallelism)
+        {
+            Design design = buildAssertionOuterGuardDesign(mode);
+            SessionStore session;
+            ActiveMaskGapPackEmitRun run;
+            if (!runActivitySchedule(design, session))
+            {
+                run.diagnostics = "assertion outer-guard activity-schedule failed for " +
+                                  std::string(suffix);
+                return run;
+            }
+            Graph *graph = design.findGraph("top");
+            if (graph == nullptr)
+            {
+                run.diagnostics = "assertion outer-guard graph lookup failed";
+                return run;
+            }
+            ActivityScheduleSupernodeToOps supernodeToOps(1u);
+            const auto addScheduledOp = [&](std::string_view symbol)
+            {
+                const OperationId op = graph->findOperation(symbol);
+                if (op.valid())
+                {
+                    supernodeToOps.front().push_back(op);
+                }
+                return op.valid();
+            };
+            bool validSchedule = addScheduledOp("assertion_outer_task");
+            if (mode ==
+                AssertionOuterGuardFixtureMode::kConcatAssociatedInterveningOp)
+            {
+                validSchedule &= addScheduledOp("assertion_outer_concat_barrier");
+            }
+            if (mode == AssertionOuterGuardFixtureMode::kNonAdjacent ||
+                mode ==
+                    AssertionOuterGuardFixtureMode::kConcatAssociatedInterveningOp)
+            {
+                validSchedule &=
+                    addScheduledOp("assertion_outer_side_effect_barrier");
+            }
+            validSchedule &= addScheduledOp("assertion_outer_dpic");
+            if (!validSchedule)
+            {
+                run.diagnostics = "assertion outer-guard focused schedule lookup failed";
+                return run;
+            }
+            // The emitter optimization consumes an already ordered schedule.
+            // Pin that order explicitly so this focused test does not depend on
+            // unrelated activity-schedule tie-breaking between side-effect sinks.
+            session.clear();
+            setActivityScheduleFixtureSlot(
+                session, "supernode_to_ops", std::move(supernodeToOps));
+            setActivityScheduleFixtureSlot(
+                session,
+                "value_fanout",
+                ActivityScheduleValueFanout(graph->values().size()));
+            setActivityScheduleFixtureSlot(
+                session, "topo_order", ActivityScheduleTopoOrder{0u});
+            setActivityScheduleFixtureSlot(
+                session,
+                "state_read_supernodes",
+                ActivityScheduleStateReadSupernodes{});
+            setActivityScheduleFixtureSlot(
+                session, "dag", ActivityScheduleDag(1u));
+            return runCommitExactEventEmit(design,
+                                           session,
+                                           baseDir / std::string(suffix),
+                                           "off",
+                                           "off",
+                                           parallelism);
+        };
+
+        const ActiveMaskGapPackEmitRun eligibleSerial = emitFixture(
+            AssertionOuterGuardFixtureMode::kEligible, "eligible_serial", 1u);
+        const ActiveMaskGapPackEmitRun eligibleParallel = emitFixture(
+            AssertionOuterGuardFixtureMode::kEligible, "eligible_parallel", 4u);
+        if (!eligibleSerial.success || eligibleSerial.diagnosticError ||
+            !eligibleParallel.success || eligibleParallel.diagnosticError)
+        {
+            return fail("assertion outer-guard eligible emission failed: " +
+                        eligibleSerial.diagnostics + eligibleParallel.diagnostics);
+        }
+        if (eligibleSerial.artifacts != eligibleParallel.artifacts)
+        {
+            return fail("assertion outer-guard emission is not parallel deterministic");
+        }
+
+        const std::string eligibleSched = schedText(eligibleSerial);
+        constexpr std::string_view kAssertionOuterGuard =
+            "if (unlikely(((condition) != 0)";
+        const std::size_t outerIf = eligibleSched.find(kAssertionOuterGuard);
+        const std::size_t outerOpen = eligibleSched.find('{', outerIf);
+        const std::size_t outerClose = findMatchingBrace(eligibleSched, outerOpen);
+        const std::size_t taskCall = eligibleSched.find("outer-guard-task", outerOpen);
+        const std::size_t dpicComment = eligibleSched.find(
+            "// DPIC calls may produce side effects", outerOpen);
+        const std::size_t innerIf = eligibleSched.find("            if ((", dpicComment);
+        const std::size_t innerOpen = eligibleSched.find('{', innerIf);
+        const std::size_t innerClose = findMatchingBrace(eligibleSched, innerOpen);
+        const std::size_t dpicCall = eligibleSched.find("xs_assert_v2(", innerOpen);
+        if (outerIf == std::string::npos ||
+            countSubstring(eligibleSched, kAssertionOuterGuard) != 1u ||
+            outerOpen == std::string::npos || outerClose == std::string::npos ||
+            taskCall == std::string::npos || taskCall >= outerClose ||
+            dpicComment == std::string::npos || dpicComment >= outerClose ||
+            innerIf == std::string::npos || innerIf >= outerClose ||
+            innerOpen == std::string::npos || innerClose == std::string::npos ||
+            innerClose >= outerClose || dpicCall == std::string::npos ||
+            dpicCall >= innerClose)
+        {
+            return fail("assertion outer-guard nesting or inner DPIC recheck is malformed");
+        }
+
+        const std::array<std::pair<AssertionOuterGuardFixtureMode, std::string_view>, 8>
+            rejectionCases = {{
+                {AssertionOuterGuardFixtureMode::kDifferentCondition,
+                 "different_condition"},
+                {AssertionOuterGuardFixtureMode::kDifferentEvent, "different_event"},
+                {AssertionOuterGuardFixtureMode::kWrongTarget, "wrong_target"},
+                {AssertionOuterGuardFixtureMode::kHasReturn, "has_return"},
+                {AssertionOuterGuardFixtureMode::kHasOutput, "has_output_result"},
+                {AssertionOuterGuardFixtureMode::kInitialProcGuard,
+                 "non_literal_true_proc_guard"},
+                {AssertionOuterGuardFixtureMode::kNonAdjacent, "non_adjacent"},
+                {AssertionOuterGuardFixtureMode::kConcatAssociatedInterveningOp,
+                 "concat_associated_intervening_op"},
+            }};
+        for (const auto &[mode, suffix] : rejectionCases)
+        {
+            const ActiveMaskGapPackEmitRun run = emitFixture(mode, suffix, 2u);
+            if (!run.success || run.diagnosticError)
+            {
+                return fail("assertion outer-guard rejection fixture emission failed for " +
+                            std::string(suffix) + ": " + run.diagnostics);
+            }
+            if (schedText(run).find(kAssertionOuterGuard) != std::string::npos)
+            {
+                return fail("assertion outer-guard accepted rejection fixture " +
+                            std::string(suffix));
+            }
+        }
+
+        const std::filesystem::path harnessDir = baseDir / "eligible_serial";
+        const std::vector<std::filesystem::path> stateFiles =
+            collectSchedFiles(harnessDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> schedFiles =
+            collectSchedFiles(harnessDir, "grhsim_top_sched_");
+        if (stateFiles.empty() || schedFiles.empty())
+        {
+            return fail("assertion outer-guard harness inputs are missing");
+        }
+        const std::filesystem::path harnessPath =
+            harnessDir / "grhsim_top_assertion_outer_guard_harness.cpp";
+        {
+            std::ofstream harness(harnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create assertion outer-guard harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n";
+            harness << "#include <cstdio>\n\n";
+            harness << "namespace { int dpi_calls = 0; std::uint8_t dpi_value = 0; }\n";
+            harness << "extern \"C\" void xs_assert_v2(std::uint8_t value)\n";
+            harness << "{ ++dpi_calls; dpi_value = value; }\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.aux_clk = false;\n";
+            harness << "    sim.condition = false;\n";
+            harness << "    sim.other_condition = false;\n";
+            harness << "    sim.data = static_cast<std::uint8_t>(17);\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (dpi_calls != 0) return 1;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.condition = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (dpi_calls != 1 || dpi_value != 17) return 2;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (dpi_calls != 1) return 3;\n";
+            harness << "    std::puts(\"assertion-harness-ok\");\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::filesystem::path harnessExe =
+            harnessDir / "grhsim_top_assertion_outer_guard_harness";
+        const std::filesystem::path harnessOutput =
+            harnessDir / "grhsim_top_assertion_outer_guard_harness.out";
+        std::string compileCommand =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + harnessDir.string();
+        for (const auto &stateFile : stateFiles)
+        {
+            compileCommand += " " + stateFile.string();
+        }
+        compileCommand += " " + (harnessDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedFile : schedFiles)
+        {
+            compileCommand += " " + schedFile.string();
+        }
+        compileCommand += " " + harnessPath.string() + " -o " + harnessExe.string();
+        const std::string runCommand =
+            harnessExe.string() + " > " + harnessOutput.string();
+        if (std::system(compileCommand.c_str()) != 0 ||
+            std::system(runCommand.c_str()) != 0)
+        {
+            return fail("assertion outer-guard behavior harness failed");
+        }
+        const std::string output = readFile(harnessOutput);
+        if (countSubstring(output, "outer-guard-task=17") != 1u ||
+            output.find("assertion-harness-ok") == std::string::npos)
+        {
+            return fail("assertion outer-guard true/false side-effect behavior mismatch");
         }
         return 0;
     }
@@ -6118,6 +6721,10 @@ int main()
     if (std::getenv("WOLVRIX_TEST_COMMIT_EXACT_EVENT") != nullptr)
     {
         return runCommitExactEventPolicyFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_ASSERTION_OUTER_GUARD") != nullptr)
+    {
+        return runAssertionOuterGuardFocusedTests();
     }
     if (std::getenv("WOLVRIX_TEST_DEFERRED_ACTIVATION_FORWARD") != nullptr)
     {

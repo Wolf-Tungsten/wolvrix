@@ -452,6 +452,12 @@ set_tests_properties(
     emit-grhsim-cpp-commit-exact-event
     PROPERTIES ENVIRONMENT "WOLVRIX_TEST_COMMIT_EXACT_EVENT=1"
 )
+add_test(NAME emit-grhsim-cpp-assertion-outer-guard
+         COMMAND emit-grhsim-cpp)
+set_tests_properties(
+    emit-grhsim-cpp-assertion-outer-guard
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_ASSERTION_OUTER_GUARD=1"
+)
 add_test(NAME emit-grhsim-cpp-deferred-activation-forward
          COMMAND emit-grhsim-cpp)
 set_tests_properties(

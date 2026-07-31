@@ -2306,7 +2306,7 @@ namespace wolvrix::lib::emit
                 return scalarTruncExpr("(" + scalarTruncExpr(valueExpr, width) + " << static_cast<unsigned>(" + shift + "))",
                                        width);
             }
-            return "((" + shift + " >= UINT64_C(64)) ? UINT64_C(0) : " +
+            return "(unlikely(" + shift + " >= UINT64_C(64)) ? UINT64_C(0) : " +
                    scalarTruncExpr("(" + scalarTruncExpr(valueExpr, width) + " << static_cast<unsigned>(" + shift + "))",
                                    width) +
                    ")";
@@ -2326,7 +2326,7 @@ namespace wolvrix::lib::emit
             {
                 return "(" + scalarTruncExpr(valueExpr, width) + " >> static_cast<unsigned>(" + shift + "))";
             }
-            return "((" + shift + " >= UINT64_C(64)) ? UINT64_C(0) : (" +
+            return "(unlikely(" + shift + " >= UINT64_C(64)) ? UINT64_C(0) : (" +
                    scalarTruncExpr(valueExpr, width) + " >> static_cast<unsigned>(" + shift + ")))";
         }
 
@@ -16854,6 +16854,15 @@ namespace wolvrix::lib::emit
                 return result;
             }
 
+            if (const auto constantRow = constLogicIndexValue(graph, addrValue, rowCount);
+                constantRow && *constantRow < rowCount)
+            {
+                result.rowExpr = std::to_string(*constantRow) + "u";
+                result.inRangeExpr = "true";
+                result.alwaysInRange = true;
+                return result;
+            }
+
             if (addrWidth > 0 && addrWidth < 64 &&
                 (UINT64_C(1) << static_cast<std::size_t>(addrWidth)) <= static_cast<std::uint64_t>(rowCount))
             {
@@ -21671,33 +21680,23 @@ namespace wolvrix::lib::emit
                             if (!rowAccess.alwaysInRange)
                             {
                                 stream << "                if (!" << rowAccess.inRangeExpr << ") {\n";
-                            }
-                            else
-                            {
-                                stream << "                {\n";
-                            }
-                            if (needChangeDetect)
-                            {
-                                stream << "                    if (" << lhs << " != "
-                                       << wordsArrayTypeForWidth(graph.valueWidth(op.results().front())) << "{}) {\n";
-                                emitChangedValuePropagation(stream, model, resultValue, "                    ", &activationContext);
-                                stream << "                        " << lhs << " = "
-                                       << wordsArrayTypeForWidth(graph.valueWidth(op.results().front())) << "{};\n";
-                                stream << "                    }\n";
-                            }
-                            else
-                            {
-                                stream << "                    " << lhs << " = "
-                                       << wordsArrayTypeForWidth(graph.valueWidth(op.results().front())) << "{};\n";
-                            }
-                            stream << "                }";
-                            if (!rowAccess.alwaysInRange)
-                            {
+                                if (needChangeDetect)
+                                {
+                                    stream << "                    if (" << lhs << " != "
+                                           << wordsArrayTypeForWidth(graph.valueWidth(op.results().front())) << "{}) {\n";
+                                    emitChangedValuePropagation(
+                                        stream, model, resultValue, "                    ", &activationContext);
+                                    stream << "                        " << lhs << " = "
+                                           << wordsArrayTypeForWidth(graph.valueWidth(op.results().front())) << "{};\n";
+                                    stream << "                    }\n";
+                                }
+                                else
+                                {
+                                    stream << "                    " << lhs << " = "
+                                           << wordsArrayTypeForWidth(graph.valueWidth(op.results().front())) << "{};\n";
+                                }
+                                stream << "                }";
                                 stream << " else ";
-                            }
-                            else
-                            {
-                                stream << "\n";
                             }
                             stream << "{\n";
                             stream << "                    const auto next_value = " << stateExpr << "[" << rowAccess.rowExpr
@@ -21720,40 +21719,32 @@ namespace wolvrix::lib::emit
                             if (!rowAccess.alwaysInRange)
                             {
                                 stream << "                if (!" << rowAccess.inRangeExpr << ") {\n";
-                            }
-                            else
-                            {
-                                stream << "                {\n";
-                            }
-                            if (needChangeDetect)
-                            {
-                                stream << "                    if (" << lhs << " != " << defaultInitExprForLogicWidth(graph.valueWidth(op.results().front()))
-                                       << ") {\n";
-                                emitChangedValueEffectsForCondition(
-                                    stream,
-                                    model,
-                                    resultValue,
-                                    lhs,
-                                    defaultInitExprForLogicWidth(graph.valueWidth(op.results().front())),
-                                    "true",
-                                    "                    ",
-                                    &activationContext,
-                                    &deferredActivationContext);
-                                stream << "                        " << lhs << " = " << defaultInitExprForLogicWidth(graph.valueWidth(op.results().front())) << ";\n";
-                                stream << "                    }\n";
-                            }
-                            else
-                            {
-                                stream << "                    " << lhs << " = " << defaultInitExprForLogicWidth(graph.valueWidth(op.results().front())) << ";\n";
-                            }
-                            stream << "                }";
-                            if (!rowAccess.alwaysInRange)
-                            {
+                                if (needChangeDetect)
+                                {
+                                    stream << "                    if (" << lhs << " != "
+                                           << defaultInitExprForLogicWidth(graph.valueWidth(op.results().front()))
+                                           << ") {\n";
+                                    emitChangedValueEffectsForCondition(
+                                        stream,
+                                        model,
+                                        resultValue,
+                                        lhs,
+                                        defaultInitExprForLogicWidth(graph.valueWidth(op.results().front())),
+                                        "true",
+                                        "                    ",
+                                        &activationContext,
+                                        &deferredActivationContext);
+                                    stream << "                        " << lhs << " = "
+                                           << defaultInitExprForLogicWidth(graph.valueWidth(op.results().front())) << ";\n";
+                                    stream << "                    }\n";
+                                }
+                                else
+                                {
+                                    stream << "                    " << lhs << " = "
+                                           << defaultInitExprForLogicWidth(graph.valueWidth(op.results().front())) << ";\n";
+                                }
+                                stream << "                }";
                                 stream << " else ";
-                            }
-                            else
-                            {
-                                stream << "\n";
                             }
                             stream << "{\n";
                             stream << "                    const auto next_value = " << stateExpr << "[" << rowAccess.rowExpr
@@ -22092,22 +22083,14 @@ namespace wolvrix::lib::emit
                                 isNestableAssertionSideEffectPair(
                                     graph, model, opId, op, nextOpId, nextOp);
                         }
-                        stream << "            if (";
-                        if (nestFollowingAssertionDpic)
-                        {
-                            stream << "unlikely(";
-                        }
+                        stream << "            if (unlikely(";
                         stream << "(" << condExpr << ") && ";
                         if (!eventAlreadyHandled)
                         {
                             stream << "(" << *eventExpr << ") && ";
                         }
                         stream << "(" << procGuard << ")";
-                        if (nestFollowingAssertionDpic)
-                        {
-                            stream << ")";
-                        }
-                        stream << ") {\n";
+                        stream << ")) {\n";
                         const auto taskArgs =
                             argEnd <= 1
                                 ? std::span<const ValueId>()
@@ -22189,10 +22172,22 @@ namespace wolvrix::lib::emit
                             batch.phase == ScheduleBatch::Phase::kCommit &&
                             (commitEventHandledByDispatch || outerCommitEventExpr.has_value());
                         stream << "            // DPIC calls may produce side effects and output values, so they stay as explicit schedule boundaries.\n";
-                        stream << "            if ((" << condExpr << ")";
+                        const bool coldAssertionSideEffect =
+                            !closesNestedAssertionPair && *targetImport == "xs_assert_v2" && !hasReturn &&
+                            op.results().empty() && outArgName.empty();
+                        stream << "            if (";
+                        if (coldAssertionSideEffect)
+                        {
+                            stream << "unlikely(";
+                        }
+                        stream << "(" << condExpr << ")";
                         if (!eventAlreadyHandled)
                         {
                             stream << " && (" << *eventExpr << ")";
+                        }
+                        if (coldAssertionSideEffect)
+                        {
+                            stream << ")";
                         }
                         stream << ") {\n";
                         std::vector<std::string> deferredArgs;
@@ -24359,8 +24354,15 @@ namespace wolvrix::lib::emit
             *stream << "inline std::uint64_t grhsim_random_u64(std::uint64_t &state, std::size_t width)\n{\n";
             *stream << "    return grhsim_trunc_u64(grhsim_splitmix64_next(state), width);\n";
             *stream << "}\n\n";
+            *stream << "#ifndef GRHSIM_ALWAYS_INLINE\n";
+            *stream << "#if defined(__GNUC__) || defined(__clang__)\n";
+            *stream << "#define GRHSIM_ALWAYS_INLINE inline __attribute__((always_inline))\n";
+            *stream << "#else\n";
+            *stream << "#define GRHSIM_ALWAYS_INLINE inline\n";
+            *stream << "#endif\n";
+            *stream << "#endif\n\n";
             *stream << "template <std::size_t N>\n";
-            *stream << "inline void grhsim_trunc_words(std::array<std::uint64_t, N> &value, std::size_t width)\n{\n";
+            *stream << "GRHSIM_ALWAYS_INLINE void grhsim_trunc_words(std::array<std::uint64_t, N> &value, std::size_t width)\n{\n";
             *stream << "    const std::size_t liveWords = (width + 63u) / 64u;\n";
             *stream << "    for (std::size_t i = liveWords; i < N; ++i) {\n";
             *stream << "        value[i] = 0;\n";
@@ -24408,7 +24410,7 @@ namespace wolvrix::lib::emit
             *stream << "    return lhs == rhs;\n";
             *stream << "}\n\n";
             *stream << "template <std::size_t N>\n";
-            *stream << "inline bool grhsim_assign_words(std::array<std::uint64_t, N> &dst,\n";
+            *stream << "GRHSIM_ALWAYS_INLINE bool grhsim_assign_words(std::array<std::uint64_t, N> &dst,\n";
             *stream << "                               const std::array<std::uint64_t, N> &src,\n";
             *stream << "                               std::size_t width)\n{\n";
             *stream << "    bool changed = false;\n";
@@ -25179,7 +25181,7 @@ inline void grhsim_put_bit_words(std::array<std::uint64_t, N> &value, std::size_
 }
 
 template <std::size_t N>
-inline void grhsim_clear_range_words(std::array<std::uint64_t, N> &value, std::size_t start, std::size_t width)
+GRHSIM_ALWAYS_INLINE void grhsim_clear_range_words(std::array<std::uint64_t, N> &value, std::size_t start, std::size_t width)
 {
     if (width == 0 || N == 0) {
         return;
@@ -25245,7 +25247,7 @@ inline void grhsim_fill_range_words(std::array<std::uint64_t, N> &value, std::si
 }
 
 template <std::size_t DestN, std::size_t SrcN>
-inline void grhsim_insert_words(std::array<std::uint64_t, DestN> &dest,
+GRHSIM_ALWAYS_INLINE void grhsim_insert_words(std::array<std::uint64_t, DestN> &dest,
                                 std::size_t destLsb,
                                 const std::array<std::uint64_t, SrcN> &src,
                                 std::size_t srcWidth)
@@ -25322,7 +25324,7 @@ inline void grhsim_insert_words_2_2(std::array<std::uint64_t, 2> &dest,
 }
 
 template <std::size_t DestN>
-inline void grhsim_insert_scalar_words(std::array<std::uint64_t, DestN> &dest,
+GRHSIM_ALWAYS_INLINE void grhsim_insert_scalar_words(std::array<std::uint64_t, DestN> &dest,
                                        std::size_t destLsb,
                                        std::uint64_t src,
                                        std::size_t srcWidth)
@@ -25344,7 +25346,7 @@ inline void grhsim_insert_scalar_words(std::array<std::uint64_t, DestN> &dest,
 }
 
 template <std::size_t DestN, std::size_t Count>
-inline std::array<std::uint64_t, DestN> grhsim_concat_scalars_words(const std::array<std::uint64_t, Count> &values,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, DestN> grhsim_concat_scalars_words(const std::array<std::uint64_t, Count> &values,
                                                                     const std::array<std::size_t, Count> &widths,
                                                                     std::size_t totalWidth)
 {
@@ -25367,7 +25369,7 @@ inline std::array<std::uint64_t, DestN> grhsim_concat_scalars_words(const std::a
 }
 
 template <std::size_t DestN, std::size_t Count>
-inline std::array<std::uint64_t, DestN> grhsim_concat_uniform_scalars_words(const std::array<std::uint64_t, Count> &values,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, DestN> grhsim_concat_uniform_scalars_words(const std::array<std::uint64_t, Count> &values,
                                                                             std::size_t elemWidth,
                                                                             std::size_t totalWidth)
 {
@@ -25436,7 +25438,7 @@ inline void grhsim_replicate_words_2_1_impl(std::array<std::uint64_t, 2> &out,
 }
 
 template <std::size_t DestN, std::size_t LhsN, std::size_t RhsN>
-inline std::array<std::uint64_t, DestN> grhsim_concat_words(const std::array<std::uint64_t, LhsN> &lhs,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, DestN> grhsim_concat_words(const std::array<std::uint64_t, LhsN> &lhs,
                                                             std::size_t lhsWidth,
                                                             const std::array<std::uint64_t, RhsN> &rhs,
                                                             std::size_t rhsWidth,
@@ -25510,7 +25512,7 @@ inline std::array<std::uint64_t, DestN> grhsim_replicate_words(const std::array<
 }
 
 template <std::size_t DestN, std::size_t SrcN>
-inline std::array<std::uint64_t, DestN> grhsim_slice_words(const std::array<std::uint64_t, SrcN> &src,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, DestN> grhsim_slice_words(const std::array<std::uint64_t, SrcN> &src,
                                                            std::size_t start,
                                                            std::size_t width)
 {
@@ -25539,7 +25541,7 @@ template <typename T>
 inline std::size_t grhsim_index_words(T value, std::size_t cap)
 {
     const std::uint64_t raw = static_cast<std::uint64_t>(value);
-    if (raw >= cap) {
+    if (unlikely(raw >= cap)) {
         return cap;
     }
     return static_cast<std::size_t>(raw);
@@ -25549,11 +25551,11 @@ template <std::size_t N>
 inline std::size_t grhsim_index_words(const std::array<std::uint64_t, N> &value, std::size_t cap)
 {
     for (std::size_t i = 1; i < N; ++i) {
-        if (value[i] != 0) {
+        if (unlikely(value[i] != 0)) {
             return cap;
         }
     }
-    if (value[0] >= cap) {
+    if (unlikely(value[0] >= cap)) {
         return cap;
     }
     return static_cast<std::size_t>(value[0]);
@@ -25603,7 +25605,7 @@ GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_not_words_full(const st
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_not_words(const std::array<std::uint64_t, N> &value, std::size_t width)
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_not_words(const std::array<std::uint64_t, N> &value, std::size_t width)
 {
     std::array<std::uint64_t, N> out{};
     for (std::size_t i = 0; i < N; ++i) {
@@ -25640,7 +25642,7 @@ GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_and_words_full(const st
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_and_words(const std::array<std::uint64_t, N> &lhs,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_and_words(const std::array<std::uint64_t, N> &lhs,
                                                      const std::array<std::uint64_t, N> &rhs,
                                                      std::size_t width)
 {
@@ -25664,7 +25666,7 @@ GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_or_words_full(const std
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_or_words(const std::array<std::uint64_t, N> &lhs,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_or_words(const std::array<std::uint64_t, N> &lhs,
                                                     const std::array<std::uint64_t, N> &rhs,
                                                     std::size_t width)
 {
@@ -25725,7 +25727,7 @@ inline bool grhsim_sign_bit_words(const std::array<std::uint64_t, N> &value, std
 }
 
 template <std::size_t N>
-inline int grhsim_compare_unsigned_words(const std::array<std::uint64_t, N> &lhs,
+GRHSIM_ALWAYS_INLINE int grhsim_compare_unsigned_words(const std::array<std::uint64_t, N> &lhs,
                                          const std::array<std::uint64_t, N> &rhs)
 {
     unsigned __int128 lhs128 = 0;
@@ -25868,7 +25870,7 @@ inline bool grhsim_reduce_nand_words(const std::array<std::uint64_t, N> &value, 
 }
 
 template <std::size_t N>
-inline bool grhsim_reduce_or_words(const std::array<std::uint64_t, N> &value, std::size_t width)
+GRHSIM_ALWAYS_INLINE bool grhsim_reduce_or_words(const std::array<std::uint64_t, N> &value, std::size_t width)
 {
     return grhsim_any_bits_words(value, width);
 }
@@ -25880,7 +25882,7 @@ inline bool grhsim_reduce_nor_words(const std::array<std::uint64_t, N> &value, s
 }
 
 template <std::size_t N>
-inline bool grhsim_reduce_xor_words(const std::array<std::uint64_t, N> &value, std::size_t width)
+GRHSIM_ALWAYS_INLINE bool grhsim_reduce_xor_words(const std::array<std::uint64_t, N> &value, std::size_t width)
 {
     unsigned parity = 0;
     const std::size_t liveWords = (width + 63u) / 64u;
@@ -25937,7 +25939,7 @@ inline std::array<std::uint64_t, 2> grhsim_add_words_2(const std::array<std::uin
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_sub_words(const std::array<std::uint64_t, N> &lhs,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_sub_words(const std::array<std::uint64_t, N> &lhs,
                                                      const std::array<std::uint64_t, N> &rhs,
                                                      std::size_t width)
 {
@@ -26228,7 +26230,7 @@ inline std::array<std::uint64_t, N> grhsim_smod_words(const std::array<std::uint
 }
 
 template <std::size_t N, typename ShiftT>
-inline std::array<std::uint64_t, N> grhsim_shl_words(const std::array<std::uint64_t, N> &value,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_shl_words(const std::array<std::uint64_t, N> &value,
                                                      const ShiftT &shift,
                                                      std::size_t width)
 {
@@ -26254,7 +26256,7 @@ inline std::array<std::uint64_t, N> grhsim_shl_words(const std::array<std::uint6
 }
 
 template <std::size_t N, typename ShiftT>
-inline std::array<std::uint64_t, N> grhsim_lshr_words(const std::array<std::uint64_t, N> &value,
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_lshr_words(const std::array<std::uint64_t, N> &value,
                                                       const ShiftT &shift,
                                                       std::size_t width)
 {

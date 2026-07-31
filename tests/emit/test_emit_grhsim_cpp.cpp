@@ -318,6 +318,7 @@ namespace
         ValueId comb = makeLogicValue(graph, "comb", 8);
         ValueId b = makeLogicValue(graph, "b", 8);
         ValueId sh = makeLogicValue(graph, "sh", 3);
+        ValueId shWide = makeLogicValue(graph, "sh_wide", 7);
         ValueId rep2 = makeLogicValue(graph, "rep2", 2);
         ValueId sa = makeLogicValue(graph, "sa", 8, true);
         ValueId ss4 = makeLogicValue(graph, "ss4", 4, true);
@@ -334,6 +335,7 @@ namespace
         graph.bindInputPort("comb", comb);
         graph.bindInputPort("b", b);
         graph.bindInputPort("sh", sh);
+        graph.bindInputPort("sh_wide", shWide);
         graph.bindInputPort("rep2", rep2);
         graph.bindInputPort("sa", sa);
         graph.bindInputPort("ss4", ss4);
@@ -470,6 +472,22 @@ namespace
         graph.addOperand(lshrOp, sh);
         graph.addResult(lshrOp, lshrY);
         graph.bindOutputPort("lshr_y", lshrY);
+
+        ValueId guardedShlY = makeLogicValue(graph, "guarded_shl_y", 8);
+        OperationId guardedShlOp =
+            graph.createOperation(OperationKind::kShl, graph.internSymbol("guarded_shl_op"));
+        graph.addOperand(guardedShlOp, comb);
+        graph.addOperand(guardedShlOp, shWide);
+        graph.addResult(guardedShlOp, guardedShlY);
+        graph.bindOutputPort("guarded_shl_y", guardedShlY);
+
+        ValueId guardedLshrY = makeLogicValue(graph, "guarded_lshr_y", 8);
+        OperationId guardedLshrOp =
+            graph.createOperation(OperationKind::kLShr, graph.internSymbol("guarded_lshr_op"));
+        graph.addOperand(guardedLshrOp, comb);
+        graph.addOperand(guardedLshrOp, shWide);
+        graph.addResult(guardedLshrOp, guardedLshrY);
+        graph.bindOutputPort("guarded_lshr_y", guardedLshrY);
 
         ValueId ashrY = makeLogicValue(graph, "ashr_y", 8, true);
         OperationId ashrOp = graph.createOperation(OperationKind::kAShr, graph.internSymbol("ashr_op"));
@@ -819,6 +837,16 @@ namespace
         graph.addResult(idxMemRead, idxMemQ);
         graph.setAttr(idxMemRead, "memSymbol", std::string("idx_mem"));
         graph.bindOutputPort("idx_mem_y", idxMemQ);
+
+        ValueId idxConstantRow =
+            addConstant(graph, "const_idx_row", "idx_constant_row", 2, "2'd1");
+        ValueId idxConstantMemQ = makeLogicValue(graph, "idx_constant_mem_q", 8);
+        OperationId idxConstantMemRead = graph.createOperation(
+            OperationKind::kMemoryReadPort, graph.internSymbol("idx_constant_mem_read"));
+        graph.addOperand(idxConstantMemRead, idxConstantRow);
+        graph.addResult(idxConstantMemRead, idxConstantMemQ);
+        graph.setAttr(idxConstantMemRead, "memSymbol", std::string("idx_mem"));
+        graph.bindOutputPort("idx_constant_mem_y", idxConstantMemQ);
 
         OperationId idxMemWrite = graph.createOperation(OperationKind::kMemoryWritePort,
                                                         graph.internSymbol("idx_mem_write"));
@@ -5997,10 +6025,31 @@ namespace
                 return fail("assertion outer-guard rejection fixture emission failed for " +
                             std::string(suffix) + ": " + run.diagnostics);
             }
-            if (schedText(run).find(kAssertionOuterGuard) != std::string::npos)
+            const std::string rejectionSched = schedText(run);
+            const std::size_t rejectionOuterIf = rejectionSched.find(kAssertionOuterGuard);
+            const std::size_t rejectionOuterOpen = rejectionSched.find('{', rejectionOuterIf);
+            const std::size_t rejectionOuterClose =
+                findMatchingBrace(rejectionSched, rejectionOuterOpen);
+            const std::size_t rejectionDpicComment = rejectionSched.find(
+                "// DPIC calls may produce side effects", rejectionOuterOpen);
+            if (rejectionOuterIf == std::string::npos ||
+                rejectionOuterOpen == std::string::npos ||
+                rejectionOuterClose == std::string::npos)
+            {
+                return fail("system-task cold outer guard is missing for rejection fixture " +
+                            std::string(suffix));
+            }
+            if (rejectionDpicComment != std::string::npos &&
+                rejectionDpicComment < rejectionOuterClose)
             {
                 return fail("assertion outer-guard accepted rejection fixture " +
                             std::string(suffix));
+            }
+            if (mode == AssertionOuterGuardFixtureMode::kDifferentCondition &&
+                rejectionSched.find("if (unlikely(((other_condition) != 0)") ==
+                    std::string::npos)
+            {
+                return fail("standalone xs_assert_v2 side effect should emit a cold condition");
             }
         }
 
@@ -6914,6 +6963,31 @@ int main()
     {
         return fail("commit state-change hint should cover scalar and wide register writes");
     }
+    const std::string_view guardedShl =
+        writeSnippet("// op guarded_shl_op [kShl]");
+    const std::string_view guardedLshr =
+        writeSnippet("// op guarded_lshr_op [kLShr]");
+    if (guardedShl.find("unlikely(") == std::string_view::npos ||
+        guardedShl.find("sh_wide") == std::string_view::npos ||
+        guardedLshr.find("unlikely(") == std::string_view::npos ||
+        guardedLshr.find("sh_wide") == std::string_view::npos)
+    {
+        return fail("dynamic scalar shift out-of-range guards should be cold by default");
+    }
+    const std::string_view constantMemoryRead =
+        writeSnippet("// op idx_constant_mem_read [kMemoryReadPort] mem=idx_mem");
+    if (constantMemoryRead.empty() ||
+        constantMemoryRead.find("[1u]") == std::string_view::npos ||
+        constantMemoryRead.find("if (!") != std::string_view::npos)
+    {
+        return fail("in-range constant memory reads should emit one direct row load");
+    }
+    const std::string_view displayTask =
+        writeSnippet("// op display_task [kSystemTask]");
+    if (displayTask.find("if (unlikely(") == std::string_view::npos)
+    {
+        return fail("system-task side-effect guards should be cold by default");
+    }
     {
         EmitOptions unhintedOptions = options;
         const std::filesystem::path unhintedOutDir =
@@ -6955,6 +7029,18 @@ int main()
     if (runtime.find("inline std::uint64_t grhsim_mask") == std::string::npos)
     {
         return fail("Missing runtime helper header");
+    }
+    if (runtime.find("#define GRHSIM_ALWAYS_INLINE inline __attribute__((always_inline))") ==
+            std::string::npos ||
+        runtime.find("GRHSIM_ALWAYS_INLINE void grhsim_trunc_words") ==
+            std::string::npos ||
+        runtime.find("GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_shl_words") ==
+            std::string::npos ||
+        runtime.find("if (unlikely(raw >= cap))") == std::string::npos ||
+        runtime.find("if (unlikely(value[i] != 0))") == std::string::npos ||
+        runtime.find("if (unlikely(value[0] >= cap))") == std::string::npos)
+    {
+        return fail("default runtime should inline hot word helpers and cold-mark index bounds");
     }
     if (runtime.find("inline std::uint64_t grhsim_mux_u64") == std::string::npos)
     {
@@ -8144,6 +8230,7 @@ int main()
         harness << "    sim.comb = static_cast<std::uint8_t>(0xB6);\n";
         harness << "    sim.b = static_cast<std::uint8_t>(3);\n";
         harness << "    sim.sh = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.sh_wide = static_cast<std::uint8_t>(65);\n";
         harness << "    sim.rep2 = static_cast<std::uint8_t>(2);\n";
         harness << "    sim.sa = static_cast<std::uint8_t>(0xF0);\n";
         harness << "    sim.ss4 = static_cast<std::uint8_t>(0xE);\n";
@@ -8167,6 +8254,8 @@ int main()
         harness << "    if (sim.mod_y != static_cast<std::uint8_t>(2)) return 13;\n";
         harness << "    if (sim.shl_y != static_cast<std::uint8_t>(0xD8)) return 14;\n";
         harness << "    if (sim.lshr_y != static_cast<std::uint8_t>(0x2D)) return 15;\n";
+        harness << "    if (sim.guarded_shl_y != static_cast<std::uint8_t>(0)) return 105;\n";
+        harness << "    if (sim.guarded_lshr_y != static_cast<std::uint8_t>(0)) return 106;\n";
         harness << "    if (sim.ashr_y != static_cast<std::uint8_t>(0xFC)) return 16;\n";
         harness << "    if (!sim.red_or_y) return 17;\n";
         harness << "    if (!sim.red_xor_y) return 18;\n";
@@ -8190,6 +8279,11 @@ int main()
         harness << "    if (!same_words(sim.wide_mem_y, wide_mem_init)) return 22;\n";
         harness << "    if (!same_words(sim.wide_masked_mem_y, wide_zero)) return 89;\n";
         harness << "    if (sim.idx_mem_y != static_cast<std::uint8_t>(0x33)) return 87;\n";
+        harness << "    if (sim.idx_constant_mem_y != static_cast<std::uint8_t>(0x22)) return 107;\n";
+        harness << "    sim.sh_wide = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.guarded_shl_y != static_cast<std::uint8_t>(0x6C)) return 108;\n";
+        harness << "    if (sim.guarded_lshr_y != static_cast<std::uint8_t>(0x5B)) return 109;\n";
         harness << "    if (!same_words(sim.wide_add_y, add_one(wide_value_a, 130))) return 31;\n";
         harness << "    if (!same_words(sim.wide_sub_y, sub_one(wide_value_a, 130))) return 32;\n";
         harness << "    if (!same_words(sim.wide_mul_y, shl_words(wide_value_a, 1, 132))) return 33;\n";
@@ -8274,6 +8368,7 @@ int main()
         harness << "    sim.comb = static_cast<std::uint8_t>(0xB6);\n";
         harness << "    sim.b = static_cast<std::uint8_t>(3);\n";
         harness << "    sim.sh = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.sh_wide = static_cast<std::uint8_t>(65);\n";
         harness << "    sim.rep2 = static_cast<std::uint8_t>(2);\n";
         harness << "    sim.sa = static_cast<std::uint8_t>(0xF0);\n";
         harness << "    sim.ss4 = static_cast<std::uint8_t>(0xE);\n";

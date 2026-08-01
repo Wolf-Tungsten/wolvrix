@@ -3843,6 +3843,104 @@ namespace
             std::make_unique<SessionSlotValue<T>>(std::move(value), "active-mask-gap-pack-test"));
     }
 
+    struct DirectHotInputEventFixtureConfig
+    {
+        std::size_t eventCount = 8;
+        std::size_t hotEventIndex = 5;
+        std::size_t hotPosedgeUses = 4;
+        std::optional<std::size_t> tiedEventIndex;
+        bool reversePortBindingOrder = false;
+        bool addHotResidualEdges = false;
+        std::string portPrefix = "opaque_phase_token";
+    };
+
+    ActiveMaskGapPackFixture buildDirectHotInputEventFixture(
+        const DirectHotInputEventFixtureConfig &config)
+    {
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+
+        std::vector<ValueId> events;
+        events.reserve(config.eventCount);
+        for (std::size_t index = 0; index < config.eventCount; ++index)
+        {
+            events.push_back(makeLogicValue(
+                graph,
+                config.portPrefix + "_" + std::to_string(index),
+                1));
+        }
+        if (config.reversePortBindingOrder)
+        {
+            for (std::size_t index = config.eventCount; index != 0; --index)
+            {
+                const std::size_t eventIndex = index - 1u;
+                graph.bindInputPort(
+                    config.portPrefix + "_" + std::to_string(eventIndex),
+                    events[eventIndex]);
+            }
+        }
+        else
+        {
+            for (std::size_t index = 0; index < config.eventCount; ++index)
+            {
+                graph.bindInputPort(
+                    config.portPrefix + "_" + std::to_string(index),
+                    events[index]);
+            }
+        }
+
+        const ValueId one = addConstant(
+            graph, "direct_hot_one_op", "direct_hot_one", 1, "1'b1");
+        const ValueId data = addConstant(
+            graph, "direct_hot_data_op", "direct_hot_data", 8, "8'd23");
+        const ValueId format = addConstant(
+            graph,
+            "direct_hot_format_op",
+            "direct_hot_format",
+            0,
+            "\"direct-hot=%0d\"",
+            ValueType::String);
+        std::size_t taskOrdinal = 0;
+        const auto addEventTask = [&](std::size_t eventIndex, std::string edge)
+        {
+            const OperationId task = graph.createOperation(
+                OperationKind::kSystemTask,
+                graph.internSymbol("direct_hot_task_" + std::to_string(taskOrdinal++)));
+            graph.addOperand(task, one);
+            graph.addOperand(task, format);
+            graph.addOperand(task, data);
+            graph.addOperand(task, events[eventIndex]);
+            graph.setAttr(task, "name", std::string("display"));
+            graph.setAttr(task, "procKind", std::string("always_ff"));
+            graph.setAttr(task, "hasTiming", false);
+            graph.setAttr(task, "hasSideEffects", true);
+            graph.setAttr(task, "eventEdge", std::vector<std::string>{std::move(edge)});
+        };
+
+        for (std::size_t index = 0; index < config.eventCount; ++index)
+        {
+            addEventTask(index, "posedge");
+        }
+        for (std::size_t use = 1; use < config.hotPosedgeUses; ++use)
+        {
+            addEventTask(config.hotEventIndex, "posedge");
+        }
+        if (config.tiedEventIndex)
+        {
+            for (std::size_t use = 1; use < config.hotPosedgeUses; ++use)
+            {
+                addEventTask(*config.tiedEventIndex, "posedge");
+            }
+        }
+        if (config.addHotResidualEdges)
+        {
+            addEventTask(config.hotEventIndex, "negedge");
+            addEventTask(config.hotEventIndex, "");
+        }
+        return fixture;
+    }
+
     ActiveMaskGapPackFixture buildActiveMaskGapPackFixture()
     {
         constexpr std::size_t kActiveFlagByteCount = 180u;
@@ -4613,6 +4711,251 @@ namespace
         {
             return std::nullopt;
         }
+    }
+
+    int runDirectHotInputEventFocusedTests()
+    {
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+            "grhsim_cpp_direct_hot_input_event";
+        std::filesystem::remove_all(baseDir);
+        std::filesystem::create_directories(baseDir);
+
+        const auto emitFixture = [&](const DirectHotInputEventFixtureConfig &config,
+                                     std::string_view suffix)
+        {
+            ActiveMaskGapPackFixture fixture = buildDirectHotInputEventFixture(config);
+            ActiveMaskGapPackEmitRun run;
+            if (!runActivitySchedule(fixture.design, fixture.session))
+            {
+                run.diagnostics = "activity-schedule failed";
+                return run;
+            }
+            return runCommitExactEventEmit(
+                fixture.design,
+                fixture.session,
+                baseDir / std::string(suffix),
+                std::nullopt,
+                std::nullopt,
+                1u);
+        };
+        const auto hasExpectedStats = [](const ActiveMaskGapPackEmitRun &run,
+                                         std::size_t applied,
+                                         std::size_t eventSlots,
+                                         std::size_t selectedInputIndex,
+                                         std::size_t posedgeUses,
+                                         std::size_t coveredBatches,
+                                         std::size_t reusableUses)
+        {
+            const std::string_view line = probeLogLine(
+                run.stderrText, "[GRHSIM_DIRECT_HOT_INPUT_EVENT] ");
+            return run.success && !run.diagnosticError && !line.empty() &&
+                   probeStatsUnsigned(line, "applied") == applied &&
+                   probeStatsUnsigned(line, "event_slots") == eventSlots &&
+                   probeStatsUnsigned(line, "selected_input_index") == selectedInputIndex &&
+                   probeStatsUnsigned(line, "posedge_uses") == posedgeUses &&
+                   probeStatsUnsigned(line, "covered_batches") == coveredBatches &&
+                   probeStatsUnsigned(line, "reusable_uses") == reusableUses &&
+                   probeStatsUnsigned(line, "fixed_cost") == 2u;
+        };
+        const auto scheduleText = [](const ActiveMaskGapPackEmitRun &run)
+        {
+            std::string text;
+            for (const auto &[name, content] : run.artifacts)
+            {
+                if (name.starts_with("grhsim_top_sched_") && name.ends_with(".cpp"))
+                {
+                    text += content;
+                }
+            }
+            return text;
+        };
+
+        DirectHotInputEventFixtureConfig mixedConfig;
+        mixedConfig.eventCount = 8u;
+        mixedConfig.hotEventIndex = 5u;
+        mixedConfig.hotPosedgeUses = 4u;
+        mixedConfig.addHotResidualEdges = true;
+        mixedConfig.portPrefix = "renamed_phase_marker";
+        const ActiveMaskGapPackEmitRun mixedRun = emitFixture(mixedConfig, "renamed_mixed");
+        if (!hasExpectedStats(mixedRun, 1u, 8u, 5u, 4u, 1u, 3u))
+        {
+            return fail("direct-hot renamed/mixed structural gate is wrong: " +
+                        mixedRun.diagnostics + "\n" + mixedRun.stderrText);
+        }
+        const auto mixedHeaderIt = mixedRun.artifacts.find("grhsim_top.hpp");
+        const auto mixedEvalIt = mixedRun.artifacts.find("grhsim_top_eval.cpp");
+        if (mixedHeaderIt == mixedRun.artifacts.end() ||
+            mixedEvalIt == mixedRun.artifacts.end())
+        {
+            return fail("direct-hot renamed/mixed fixture is missing generated artifacts");
+        }
+        const std::string &mixedHeader = mixedHeaderIt->second;
+        const std::string &mixedEval = mixedEvalIt->second;
+        const std::string mixedSched = scheduleText(mixedRun);
+        const std::string selectedClassify =
+            "event_edge_storage_[0] = event_baseline_initialized_ ? grhsim_classify_edge("
+            "prev_in_renamed_phase_marker_5, renamed_phase_marker_5)";
+        if (mixedHeader.find("bool hot_event_posedge_ = false;") == std::string::npos ||
+            mixedHeader.find("std::array<grhsim_event_edge_kind, 8> event_edge_storage_{};") ==
+                std::string::npos ||
+            mixedEval.find(selectedClassify) == std::string::npos ||
+            mixedEval.find(
+                "hot_event_posedge_ = event_edge_storage_[0] == "
+                "grhsim_event_edge_kind::posedge;") == std::string::npos ||
+            mixedSched.find(
+                "[[maybe_unused]] const bool hot_event_posedge_ = this->hot_event_posedge_;") ==
+                std::string::npos ||
+            mixedSched.find("hot_event_posedge_") == std::string::npos ||
+            mixedSched.find(
+                "event_edge_storage_[0] == grhsim_event_edge_kind::negedge") ==
+                std::string::npos ||
+            mixedSched.find(
+                "event_edge_storage_[0] != grhsim_event_edge_kind::none") ==
+                std::string::npos ||
+            mixedSched.find(
+                "event_edge_storage_[0] == grhsim_event_edge_kind::posedge") !=
+                std::string::npos)
+        {
+            return fail("direct-hot mixed-edge lowering did not specialize only exact posedge uses");
+        }
+
+        DirectHotInputEventFixtureConfig reorderedConfig = mixedConfig;
+        reorderedConfig.reversePortBindingOrder = true;
+        reorderedConfig.addHotResidualEdges = false;
+        const ActiveMaskGapPackEmitRun reorderedRun =
+            emitFixture(reorderedConfig, "reordered_ports");
+        const auto reorderedEvalIt = reorderedRun.artifacts.find("grhsim_top_eval.cpp");
+        if (!hasExpectedStats(reorderedRun, 1u, 8u, 5u, 4u, 1u, 3u) ||
+            reorderedEvalIt == reorderedRun.artifacts.end() ||
+            reorderedEvalIt->second.find(selectedClassify) == std::string::npos)
+        {
+            return fail("direct-hot selection changed after input-port reordering");
+        }
+
+        DirectHotInputEventFixtureConfig tieConfig;
+        tieConfig.eventCount = 8u;
+        tieConfig.hotEventIndex = 2u;
+        tieConfig.hotPosedgeUses = 4u;
+        tieConfig.tiedEventIndex = 6u;
+        tieConfig.portPrefix = "tie_phase_marker";
+        const ActiveMaskGapPackEmitRun tieRun = emitFixture(tieConfig, "stable_tie");
+        const auto tieEvalIt = tieRun.artifacts.find("grhsim_top_eval.cpp");
+        if (!hasExpectedStats(tieRun, 1u, 8u, 2u, 4u, 1u, 3u) ||
+            tieEvalIt == tieRun.artifacts.end() ||
+            tieEvalIt->second.find(
+                "event_edge_storage_[0] = event_baseline_initialized_ ? grhsim_classify_edge("
+                "prev_in_tie_phase_marker_2, tie_phase_marker_2)") == std::string::npos)
+        {
+            return fail("direct-hot equal-opportunity tie is not stable by registration order");
+        }
+
+        DirectHotInputEventFixtureConfig thresholdConfig;
+        thresholdConfig.eventCount = 8u;
+        thresholdConfig.hotEventIndex = 4u;
+        thresholdConfig.hotPosedgeUses = 3u;
+        thresholdConfig.portPrefix = "threshold_phase_marker";
+        const ActiveMaskGapPackEmitRun thresholdRun =
+            emitFixture(thresholdConfig, "fixed_cost_boundary");
+        const auto thresholdHeaderIt = thresholdRun.artifacts.find("grhsim_top.hpp");
+        if (!hasExpectedStats(thresholdRun, 0u, 8u, 4u, 3u, 1u, 2u) ||
+            thresholdHeaderIt == thresholdRun.artifacts.end() ||
+            thresholdHeaderIt->second.find("hot_event_posedge_") != std::string::npos ||
+            thresholdHeaderIt->second.find("std::array<std::byte, 8> event_edge_storage_{};") ==
+                std::string::npos)
+        {
+            return fail("direct-hot fixed-cost equality must fail closed");
+        }
+
+        for (const std::size_t eventCount : {255u, 256u, 257u})
+        {
+            DirectHotInputEventFixtureConfig boundaryConfig;
+            boundaryConfig.eventCount = eventCount;
+            boundaryConfig.hotEventIndex = eventCount / 2u;
+            boundaryConfig.hotPosedgeUses = 4u;
+            boundaryConfig.portPrefix = "slot_boundary_" + std::to_string(eventCount);
+            const ActiveMaskGapPackEmitRun boundaryRun = emitFixture(
+                boundaryConfig, "slot_boundary_" + std::to_string(eventCount));
+            if (!hasExpectedStats(boundaryRun,
+                                  1u,
+                                  eventCount,
+                                  boundaryConfig.hotEventIndex,
+                                  4u,
+                                  1u,
+                                  3u))
+            {
+                return fail("direct-hot structural gate depends on the old 255/256/257 slot boundary");
+            }
+        }
+
+        const std::filesystem::path mixedDir = baseDir / "renamed_mixed";
+        const std::vector<std::filesystem::path> mixedStateFiles =
+            collectSchedFiles(mixedDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> mixedSchedFiles =
+            collectSchedFiles(mixedDir, "grhsim_top_sched_");
+        if (mixedSchedFiles.empty())
+        {
+            return fail("direct-hot behavior harness schedule sources are missing");
+        }
+        const std::filesystem::path harnessPath =
+            mixedDir / "grhsim_top_direct_hot_harness.cpp";
+        {
+            std::ofstream harness(harnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create direct-hot behavior harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdio>\n\n";
+            harness << "int main()\n{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            for (std::size_t index = 0; index < mixedConfig.eventCount; ++index)
+            {
+                harness << "    sim." << mixedConfig.portPrefix << "_" << index
+                        << " = false;\n";
+            }
+            harness << "    sim.eval();\n";
+            harness << "    sim." << mixedConfig.portPrefix << "_"
+                    << mixedConfig.hotEventIndex << " = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim." << mixedConfig.portPrefix << "_"
+                    << mixedConfig.hotEventIndex << " = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    std::puts(\"direct-hot-harness-ok\");\n";
+            harness << "    return 0;\n}\n";
+        }
+        const std::filesystem::path harnessExe =
+            mixedDir / "grhsim_top_direct_hot_harness";
+        const std::filesystem::path harnessOutput =
+            mixedDir / "grhsim_top_direct_hot_harness.out";
+        std::string compileCommand =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + mixedDir.string();
+        for (const auto &stateFile : mixedStateFiles)
+        {
+            compileCommand += " " + stateFile.string();
+        }
+        compileCommand += " " + (mixedDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedFile : mixedSchedFiles)
+        {
+            compileCommand += " " + schedFile.string();
+        }
+        compileCommand += " " + harnessPath.string() + " -o " + harnessExe.string();
+        const std::string runCommand =
+            harnessExe.string() + " > " + harnessOutput.string();
+        if (std::system(compileCommand.c_str()) != 0 ||
+            std::system(runCommand.c_str()) != 0)
+        {
+            return fail("direct-hot generated behavior harness failed");
+        }
+        const std::string harnessText = readFile(harnessOutput);
+        if (countSubstring(harnessText, "direct-hot=23") != 7u ||
+            harnessText.find("direct-hot-harness-ok") == std::string::npos)
+        {
+            return fail("direct-hot mixed posedge/negedge/general behavior changed");
+        }
+        return 0;
     }
 
     int runDeferredActivationForwardFocusedTests()
@@ -5389,9 +5732,10 @@ namespace
                        std::string::npos &&
                    runtime->second.find("grhsim_any_event_edges(") !=
                        std::string::npos &&
-                   eval->second.find(
-                       "grhsim_any_event_edges(event_edge_slots_, "
-                       "kEventEdgeStorageBytes)") != std::string::npos;
+                   eval->second.find("grhsim_any_event_edges(") !=
+                       std::string::npos &&
+                   eval->second.find("kEventEdgeStorageBytes)") !=
+                       std::string::npos;
         };
         const auto hasAnySelectedMarker = [&](const ActiveMaskGapPackEmitRun &run)
         {
@@ -5407,9 +5751,10 @@ namespace
                     runtime->second.find("grhsim_any_event_edges(") !=
                         std::string::npos) ||
                    (eval != run.artifacts.end() &&
-                    eval->second.find(
-                        "grhsim_any_event_edges(event_edge_slots_, "
-                        "kEventEdgeStorageBytes)") != std::string::npos) ||
+                    eval->second.find("grhsim_any_event_edges(") !=
+                        std::string::npos &&
+                    eval->second.find("kEventEdgeStorageBytes)") !=
+                        std::string::npos) ||
                    schedText(run).find(
                        "Lockstep scalar register writes share one change predicate.") !=
                        std::string::npos;
@@ -6767,6 +7112,10 @@ namespace
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_DIRECT_HOT_INPUT_EVENT") != nullptr)
+    {
+        return runDirectHotInputEventFocusedTests();
+    }
     if (std::getenv("WOLVRIX_TEST_COMMIT_EXACT_EVENT") != nullptr)
     {
         return runCommitExactEventPolicyFocusedTests();
@@ -7196,7 +7545,8 @@ int main()
         eval.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
         eval.find("this->eval_compute_batch_0();") == std::string::npos ||
         eval.find("this->eval_commit_batch_") == std::string::npos ||
-        eval.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos)
+        (eval.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos &&
+         eval.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_storage_.data(), kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos))
     {
         return fail("Missing compute/commit fixed-point eval loop");
     }
@@ -7314,7 +7664,10 @@ int main()
     {
         return fail("Missing random seed plumbing in state init");
     }
-    if (state.find("std::fill_n(event_edge_slots_, ") == std::string::npos ||
+    if ((state.find("std::fill_n(event_edge_slots_, ") == std::string::npos &&
+         (state.find("event_edge_storage_.fill(grhsim_event_edge_kind::none);") ==
+              std::string::npos ||
+          state.find("hot_event_posedge_ = false;") == std::string::npos)) ||
         state.find("state_shadow_touched_slots_ = {};") != std::string::npos ||
         state.find("memory_write_touched_slots_ = {};") != std::string::npos ||
         state.find("state_mem_wide_mem_") == std::string::npos ||
@@ -9118,7 +9471,10 @@ int main()
         if (commitBatchHeader.find("std::uint32_t condIndex = 0;") != std::string::npos ||
             commitBatchHeader.find("std::uint32_t condBase = 0;") != std::string::npos ||
             commitBatchRuntime.find("struct grhsim_active_mask_entry") == std::string::npos ||
-            countSubstring(commitBatchSched, "if (event_edge_slots_[0] == grhsim_event_edge_kind::posedge)") != 1)
+            countSubstring(commitBatchSched,
+                           "if (event_edge_slots_[0] == grhsim_event_edge_kind::posedge)") +
+                    countSubstring(commitBatchSched, "if (hot_event_posedge_)") !=
+                1u)
         {
             return fail("commit-cond-batch should share one exact-event guard without legacy cond descriptors");
         }
@@ -9663,7 +10019,8 @@ int main()
         {
             return fail("gated-clock emit should not use vector assign for fixed storage");
         }
-        if (gatedSchedText.find("grhsim_event_edge_kind::posedge") == std::string::npos)
+        if (gatedSchedText.find("grhsim_event_edge_kind::posedge") == std::string::npos &&
+            gatedSchedText.find("hot_event_posedge_") == std::string::npos)
         {
             return fail("gated-clock exact event logic should consume shared event-edge enums");
         }
@@ -9676,12 +10033,14 @@ int main()
             gatedEvalText.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
             gatedEvalText.find("this->eval_compute_batch_0();") == std::string::npos ||
             gatedEvalText.find("this->eval_commit_batch_") == std::string::npos ||
-            gatedEvalText.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos)
+            (gatedEvalText.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos &&
+             gatedEvalText.find("pending_eval_round = commit_activated_readers_ || (grhsim_any_event_edges(event_edge_storage_.data(), kEventEdgeStorageBytes) && grhsim_any_active_flags(supernode_active_curr_));") == std::string::npos))
         {
             return fail("gated-clock eval should iterate until compute/commit reaches a fixed point");
         }
         if (gatedEvalText.find("grhsim_classify_edge(") == std::string::npos ||
-            gatedEvalText.find("event_edge_slots_") == std::string::npos)
+            (gatedEvalText.find("event_edge_slots_") == std::string::npos &&
+             gatedEvalText.find("event_edge_storage_") == std::string::npos))
         {
             return fail("gated-clock eval should seed and clear event-edge state");
         }
@@ -11246,7 +11605,8 @@ int main()
         const std::string_view pureEventFirstWrapper =
             std::string_view(pureEventEnabledSched).substr(pureEventWrapperIfPos,
                                                            pureEventWrapperClose - pureEventWrapperIfPos + 1u);
-        if (countSubstring(pureEventFirstWrapper, "event_edge_slots_[") < 1u)
+        if (countSubstring(pureEventFirstWrapper, "event_edge_slots_[") < 1u &&
+            countSubstring(pureEventFirstWrapper, "hot_event_posedge_") < 1u)
         {
             return fail("pure-event compute-word wrapper should retain inner exact-event guards");
         }
@@ -11266,13 +11626,17 @@ int main()
             "const volatile bool grhsim_pure_event_word_hit_";
         constexpr std::string_view pureEventDirectOuter =
             "if (event_edge_slots_[0] == grhsim_event_edge_kind::posedge) {";
+        constexpr std::string_view pureEventBoolOuter =
+            "if (hot_event_posedge_) {";
         if (countSubstring(pureEventSparseOneSched, pureEventMarker) != 1u ||
             countSubstring(pureEventSparseOneSched, pureEventVolatileHit) != 1u ||
             countSubstring(pureEventSparseTwoSched, pureEventMarker) != 2u ||
             countSubstring(pureEventSparseTwoSched, pureEventVolatileHit) != 2u ||
             countSubstring(pureEventDenseThreeSched, pureEventMarker) != 3u ||
             countSubstring(pureEventDenseThreeSched, pureEventVolatileHit) != 0u ||
-            countSubstring(pureEventDenseThreeSched, pureEventDirectOuter) != 3u)
+            countSubstring(pureEventDenseThreeSched, pureEventDirectOuter) +
+                    countSubstring(pureEventDenseThreeSched, pureEventBoolOuter) !=
+                3u)
         {
             return fail("pure-event sparse predicate should switch at the two-word batch boundary");
         }

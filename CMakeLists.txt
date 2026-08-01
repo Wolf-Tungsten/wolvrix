@@ -446,6 +446,12 @@ target_compile_definitions(emit-grhsim-cpp
 )
 
 register_test_exe(emit-grhsim-cpp)
+add_test(NAME emit-grhsim-cpp-direct-hot-input-event
+         COMMAND emit-grhsim-cpp)
+set_tests_properties(
+    emit-grhsim-cpp-direct-hot-input-event
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_DIRECT_HOT_INPUT_EVENT=1"
+)
 add_test(NAME emit-grhsim-cpp-commit-exact-event
          COMMAND emit-grhsim-cpp)
 set_tests_properties(

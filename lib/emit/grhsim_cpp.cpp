@@ -64,6 +64,10 @@ namespace wolvrix::lib::emit
         constexpr std::size_t kInlineSystemTaskArgLimit = 16;
         constexpr std::size_t kRegToMemIntentIndexInlineOpLimit = 32;
         constexpr std::size_t kOrderedMemoryWriteAffineMinWrites = 16;
+        // The opportunity model counts exact-posedge comparisons avoided beyond
+        // one batch-local snapshot. Charge one unit for materializing the bool
+        // and one for clearing it before accepting a candidate.
+        constexpr std::size_t kDirectHotInputEventFixedCost = 2;
         constexpr std::size_t kPureEventVolatileBatchMaxEligibleWords = 2;
 
         template <typename T>
@@ -4361,6 +4365,11 @@ namespace wolvrix::lib::emit
             std::vector<DpiImportDecl> dpiImports;
             std::vector<ValueId> allEventValues;
             std::vector<ValueId> inputEventValues;
+            std::optional<ValueId> directHotInputEventValue;
+            std::size_t directHotInputEventInputIndex = 0;
+            std::size_t directHotInputEventPosedgeUseCount = 0;
+            std::size_t directHotInputEventCoveredBatchCount = 0;
+            std::size_t directHotInputEventReusableUseCount = 0;
             std::vector<std::string> eventFieldDecls;
             std::vector<WaveformSignalDecl> waveformSignals;
             std::vector<std::string> stateOrder;
@@ -4453,6 +4462,118 @@ namespace wolvrix::lib::emit
             std::size_t directStateReadRemovedSourceHeadCount = 0;
             std::size_t directStateReadConsumerHeadCount = 0;
         };
+
+        bool useDirectHotInputEventEdge(const EmitModel &model) noexcept
+        {
+            return model.directHotInputEventValue.has_value();
+        }
+
+        void selectDirectHotInputEventEdge(const ScheduleRefs &schedule,
+                                           const std::vector<ScheduleBatch> &scheduleBatches,
+                                           EmitModel &model)
+        {
+            model.directHotInputEventValue.reset();
+            model.directHotInputEventInputIndex = 0;
+            model.directHotInputEventPosedgeUseCount = 0;
+            model.directHotInputEventCoveredBatchCount = 0;
+            model.directHotInputEventReusableUseCount = 0;
+
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> inputIndexByValue;
+            inputIndexByValue.reserve(model.inputEventValues.size());
+            for (std::size_t inputIndex = 0; inputIndex < model.inputEventValues.size(); ++inputIndex)
+            {
+                inputIndexByValue.emplace(model.inputEventValues[inputIndex], inputIndex);
+            }
+
+            std::vector<std::size_t> posedgeUses(model.inputEventValues.size(), 0);
+            std::vector<std::size_t> coveredBatches(model.inputEventValues.size(), 0);
+            std::vector<std::size_t> lastCoveredBatch(model.inputEventValues.size(), kInvalidIndex);
+            for (std::size_t batchOrdinal = 0; batchOrdinal < scheduleBatches.size(); ++batchOrdinal)
+            {
+                for (uint32_t supernodeId : scheduleBatches[batchOrdinal].supernodeIds)
+                {
+                    if (supernodeId >= schedule.supernodeToOps.size())
+                    {
+                        continue;
+                    }
+                    for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                    {
+                        const auto sampleIt = model.eventSamplesByOp.find(opId);
+                        if (sampleIt == model.eventSamplesByOp.end())
+                        {
+                            continue;
+                        }
+                        const EventSampleDecl &samples = sampleIt->second;
+                        for (std::size_t sampleIndex = 0;
+                             sampleIndex < samples.values.size() && sampleIndex < samples.edges.size();
+                             ++sampleIndex)
+                        {
+                            if (samples.edges[sampleIndex] != "posedge")
+                            {
+                                continue;
+                            }
+                            const auto inputIt = inputIndexByValue.find(samples.values[sampleIndex]);
+                            if (inputIt == inputIndexByValue.end())
+                            {
+                                continue;
+                            }
+                            const std::size_t inputIndex = inputIt->second;
+                            ++posedgeUses[inputIndex];
+                            if (lastCoveredBatch[inputIndex] != batchOrdinal)
+                            {
+                                lastCoveredBatch[inputIndex] = batchOrdinal;
+                                ++coveredBatches[inputIndex];
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (std::size_t inputIndex = 0; inputIndex < model.inputEventValues.size(); ++inputIndex)
+            {
+                const std::size_t reusableUses =
+                    posedgeUses[inputIndex] - coveredBatches[inputIndex];
+                if (reusableUses > model.directHotInputEventReusableUseCount ||
+                    (reusableUses == model.directHotInputEventReusableUseCount &&
+                     posedgeUses[inputIndex] > model.directHotInputEventPosedgeUseCount))
+                {
+                    model.directHotInputEventInputIndex = inputIndex;
+                    model.directHotInputEventPosedgeUseCount = posedgeUses[inputIndex];
+                    model.directHotInputEventCoveredBatchCount = coveredBatches[inputIndex];
+                    model.directHotInputEventReusableUseCount = reusableUses;
+                }
+            }
+
+            if (!model.inputEventValues.empty() &&
+                model.directHotInputEventReusableUseCount > kDirectHotInputEventFixedCost)
+            {
+                const ValueId hotEvent =
+                    model.inputEventValues[model.directHotInputEventInputIndex];
+                model.directHotInputEventValue = hotEvent;
+                model.eventEdgeFieldByValue.at(hotEvent) = "event_edge_storage_[0]";
+                std::size_t storageIndex = 1;
+                for (ValueId value : model.allEventValues)
+                {
+                    if (value == hotEvent)
+                    {
+                        continue;
+                    }
+                    model.eventEdgeFieldByValue.at(value) =
+                        "event_edge_storage_[" + std::to_string(storageIndex++) + "]";
+                }
+            }
+
+            std::fprintf(stderr,
+                         "[GRHSIM_DIRECT_HOT_INPUT_EVENT] applied=%u input_events=%zu event_slots=%zu selected_input_index=%zu posedge_uses=%zu covered_batches=%zu reusable_uses=%zu fixed_cost=%zu\n",
+                         useDirectHotInputEventEdge(model) ? 1u : 0u,
+                         model.inputEventValues.size(),
+                         model.eventEdgeSlotCount,
+                         model.directHotInputEventInputIndex,
+                         model.directHotInputEventPosedgeUseCount,
+                         model.directHotInputEventCoveredBatchCount,
+                         model.directHotInputEventReusableUseCount,
+                         kDirectHotInputEventFixedCost);
+        }
 
         std::size_t sameBatchActivationCohortMemberCount(
             const EmitModel &model) noexcept
@@ -11764,6 +11885,11 @@ namespace wolvrix::lib::emit
             model.eventEdgeFieldByValue.clear();
             model.allEventValues.clear();
             model.inputEventValues.clear();
+            model.directHotInputEventValue.reset();
+            model.directHotInputEventInputIndex = 0;
+            model.directHotInputEventPosedgeUseCount = 0;
+            model.directHotInputEventCoveredBatchCount = 0;
+            model.directHotInputEventReusableUseCount = 0;
             std::size_t stateLogicStorageOffset = 0;
             auto registerInputEndpoint = [&](ValueId valueId, const std::string &fieldStem, const std::string &apiStem) {
                 if (model.inputFieldByValue.find(valueId) != model.inputFieldByValue.end())
@@ -17716,7 +17842,13 @@ namespace wolvrix::lib::emit
                 const ValueId value = samples.values[i];
                 const std::string &edgeField = model.eventEdgeFieldByValue.at(value);
                 const std::string &edge = samples.edges[i];
-                if (edge.empty())
+                if (edge == "posedge" &&
+                    model.directHotInputEventValue.has_value() &&
+                    value == *model.directHotInputEventValue)
+                {
+                    parts.emplace_back("hot_event_posedge_");
+                }
+                else if (edge.empty())
                 {
                     parts.push_back(edgeField + " != grhsim_event_edge_kind::none");
                 }
@@ -20427,6 +20559,10 @@ namespace wolvrix::lib::emit
             {
                 stream << indent << model.eventEdgeFieldByValue.at(value) << " = grhsim_event_edge_kind::none;\n";
             }
+            if (model.directHotInputEventValue.has_value())
+            {
+                stream << indent << "hot_event_posedge_ = false;\n";
+            }
         }
 
         std::optional<std::string> emitSchedBatchFile(const std::filesystem::path &schedPath,
@@ -22663,6 +22799,10 @@ namespace wolvrix::lib::emit
             };
 
                  stream << "void " << className << "::" << scheduleBatchMethodName(batch) << "()\n{\n";
+                if (useDirectHotInputEventEdge(model))
+                {
+                    stream << "        [[maybe_unused]] const bool hot_event_posedge_ = this->hot_event_posedge_;\n";
+                }
                 if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
                     stream << "        // commit batch " << batch.index
@@ -22693,6 +22833,10 @@ namespace wolvrix::lib::emit
                 batch.phase == ScheduleBatch::Phase::kCompute)
             {
                 stream << "\nvoid " << className << "::" << scheduleBatchFullpassMethodName(batch) << "()\n{\n";
+                if (useDirectHotInputEventEdge(model))
+                {
+                    stream << "        [[maybe_unused]] const bool hot_event_posedge_ = this->hot_event_posedge_;\n";
+                }
                 stream << "        // compute batch " << batch.index
                        << " full-pass specialization: evaluate all supernodes and suppress compute propagation.\n";
                 for (const auto &word : batch.words)
@@ -23247,6 +23391,7 @@ namespace wolvrix::lib::emit
                          pureEventWordPackStats.frozenBatchRebuiltEstimatedLines,
                          pureEventWordPackStats.frozenBatchMaxAbsEstimatedLineDelta);
         }
+        selectDirectHotInputEventEdge(schedule, scheduleBatches, model);
         std::unique_ptr<ActiveMaskGapPackProbe> activeMaskGapPackProbe;
         const bool activeMaskTableRuntimeProfileCompiled =
             model.emitRuntimeProfile && *activeMaskGapPackPolicy == ActiveMaskGapPackPolicy::kProbe;
@@ -23555,9 +23700,13 @@ namespace wolvrix::lib::emit
         CommitExactEventStats commitExactEventStats;
         const std::string_view pendingEvalRoundExpr =
             eventQualifiedBitmapContinuation
-                ? "commit_activated_readers_ || "
-                  "(grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && "
-                  "grhsim_any_active_flags(supernode_active_curr_))"
+                ? (useDirectHotInputEventEdge(model)
+                       ? "commit_activated_readers_ || "
+                         "(grhsim_any_event_edges(event_edge_storage_.data(), kEventEdgeStorageBytes) && "
+                         "grhsim_any_active_flags(supernode_active_curr_))"
+                       : "commit_activated_readers_ || "
+                         "(grhsim_any_event_edges(event_edge_slots_, kEventEdgeStorageBytes) && "
+                         "grhsim_any_active_flags(supernode_active_curr_))")
                 : "commit_activated_readers_ || "
                   "grhsim_any_active_flags(supernode_active_curr_)";
 
@@ -27555,6 +27704,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::array<std::uint64_t, kBatchCount> pure_event_word_active_miss_by_batch_{};\n";
             }
             *stream << "    bool register_write_conflict_ = false;\n";
+            if (useDirectHotInputEventEdge(model))
+            {
+                *stream << "    bool hot_event_posedge_ = false;\n";
+            }
             *stream << "    std::uint64_t random_seed_ = UINT64_C(0);\n";
             *stream << "    std::uint64_t random_state_ = UINT64_C(0);\n";
             if (model.emitWaveform)
@@ -27592,10 +27745,14 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             if (model.eventEdgeSlotCount != 0)
             {
+                const std::string_view eventEdgeStorageType =
+                    useDirectHotInputEventEdge(model)
+                        ? "grhsim_event_edge_kind"
+                        : "std::byte";
                 *stream << "    static constexpr std::size_t kEventEdgeStorageBytes = "
                         << (model.eventEdgeSlotCount * sizeof(std::uint8_t)) << ";\n";
                 *stream << "    alignas(std::uint8_t) "
-                        << fixedArrayType("std::byte", model.eventEdgeSlotCount * sizeof(std::uint8_t))
+                        << fixedArrayType(eventEdgeStorageType, model.eventEdgeSlotCount * sizeof(std::uint8_t))
                         << " event_edge_storage_{};\n";
                 *stream << "    grhsim_event_edge_kind *event_edge_slots_ = nullptr;\n";
             }
@@ -28075,7 +28232,14 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             if (model.eventEdgeSlotCount != 0)
             {
-                *stream << "    event_edge_slots_ = reinterpret_cast<grhsim_event_edge_kind *>(event_edge_storage_.data());\n";
+                if (useDirectHotInputEventEdge(model))
+                {
+                    *stream << "    event_edge_slots_ = event_edge_storage_.data();\n";
+                }
+                else
+                {
+                    *stream << "    event_edge_slots_ = reinterpret_cast<grhsim_event_edge_kind *>(event_edge_storage_.data());\n";
+                }
             }
             if (model.stateShadowStorageBytes != 0)
             {
@@ -30196,8 +30360,16 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    // Clear shared event-edge slots.\n";
                 if (model.eventEdgeSlotCount != 0)
                 {
-                    *stream << "    std::fill_n(event_edge_slots_, " << model.eventEdgeSlotCount
-                            << "u, grhsim_event_edge_kind::none);\n";
+                    if (useDirectHotInputEventEdge(model))
+                    {
+                        *stream << "    event_edge_storage_.fill(grhsim_event_edge_kind::none);\n";
+                        *stream << "    hot_event_posedge_ = false;\n";
+                    }
+                    else
+                    {
+                        *stream << "    std::fill_n(event_edge_slots_, " << model.eventEdgeSlotCount
+                                << "u, grhsim_event_edge_kind::none);\n";
+                    }
                 }
                 break;
             case InitChunkSpec::Kind::kEvalState:
@@ -30639,10 +30811,16 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    // Update shared event edges for direct input event values.\n";
                 for (ValueId value : model.inputEventValues)
                 {
-                    *stream << "    " << model.eventEdgeFieldByValue.at(value) << " = "
+                    const std::string &eventEdgeField = model.eventEdgeFieldByValue.at(value);
+                    *stream << "    " << eventEdgeField << " = "
                             << eventClassifyExpr(model.prevInputFieldByValue.at(value),
                                                  model.inputFieldByValue.at(value))
                             << ";\n";
+                    if (model.directHotInputEventValue == value)
+                    {
+                        *stream << "    hot_event_posedge_ = " << eventEdgeField
+                                << " == grhsim_event_edge_kind::posedge;\n";
+                    }
                 }
             }
             if (model.inputFullpassSpecialization && !model.inputEventValues.empty())

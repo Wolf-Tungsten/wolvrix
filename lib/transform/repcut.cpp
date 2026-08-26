@@ -249,35 +249,29 @@ namespace wolvrix::lib::transform
             return edges && !edges->empty();
         }
 
-        bool opHasReturnedEffectValue(const wolvrix::lib::grh::Operation &op)
+        bool isEffectOpKind(wolvrix::lib::grh::OperationKind kind)
         {
-            if (!getAttrBool(op, "hasReturn").value_or(false))
+            return kind == wolvrix::lib::grh::OperationKind::kDpicCall ||
+                   kind == wolvrix::lib::grh::OperationKind::kSystemTask;
+        }
+
+        bool opProducesEffectResult(const wolvrix::lib::grh::Operation &op)
+        {
+            if (!isEffectOpKind(op.kind()))
             {
                 return false;
             }
-            return op.kind() == wolvrix::lib::grh::OperationKind::kDpicCall ||
-                   op.kind() == wolvrix::lib::grh::OperationKind::kSystemTask;
+
+            const auto outArgNames = getAttrStrings(op, "outArgName");
+            const auto inoutArgNames = getAttrStrings(op, "inoutArgName");
+            return getAttrBool(op, "hasReturn").value_or(false) ||
+                   (outArgNames && !outArgNames->empty()) ||
+                   (inoutArgNames && !inoutArgNames->empty());
         }
 
-        bool isEffectSinkOpKind(wolvrix::lib::grh::OperationKind kind)
+        bool isEffectExecutionAnchorOp(const wolvrix::lib::grh::Operation &op)
         {
-            switch (kind)
-            {
-            case wolvrix::lib::grh::OperationKind::kSystemTask:
-                return true;
-            default:
-                return false;
-            }
-        }
-
-        bool isEffectSinkOp(const wolvrix::lib::grh::Operation &op)
-        {
-            if (isEffectSinkOpKind(op.kind()))
-            {
-                return !opHasReturnedEffectValue(op);
-            }
-            return op.kind() == wolvrix::lib::grh::OperationKind::kDpicCall &&
-                   !opHasReturnedEffectValue(op);
+            return isEffectOpKind(op.kind());
         }
 
         bool isSinkOpKind(wolvrix::lib::grh::OperationKind kind)
@@ -289,18 +283,13 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
                 return true;
             default:
-                return isEffectSinkOpKind(kind);
+                return false;
             }
         }
 
         bool isSinkOp(const wolvrix::lib::grh::Operation &op)
         {
-            if (op.kind() == wolvrix::lib::grh::OperationKind::kDpicCall ||
-                op.kind() == wolvrix::lib::grh::OperationKind::kSystemTask)
-            {
-                return !opHasReturnedEffectValue(op);
-            }
-            return isSinkOpKind(op.kind()) || isEffectSinkOp(op);
+            return isSinkOpKind(op.kind()) || isEffectExecutionAnchorOp(op);
         }
 
         bool isHierOpKind(wolvrix::lib::grh::OperationKind kind)
@@ -391,7 +380,7 @@ namespace wolvrix::lib::transform
 
         bool isAscConeTraversalOp(const wolvrix::lib::grh::Operation &op)
         {
-            return isCombOp(op) || opHasReturnedEffectValue(op);
+            return isCombOp(op) || opProducesEffectResult(op);
         }
 
         bool isSourceValue(const wolvrix::lib::grh::Graph &graph,
@@ -1156,29 +1145,29 @@ namespace wolvrix::lib::transform
             }
         }
 
-        struct ReturnedEffectCollectStats
+        struct EffectResultCollectStats
         {
             uint64_t visitedNodes = 0;
-            uint64_t returnedEffectHits = 0;
+            uint64_t effectResultHits = 0;
         };
 
-        struct ReturnedEffectMemo
+        struct EffectResultMemo
         {
-            std::vector<std::vector<wolvrix::lib::grh::OperationId>> nodeToReturnedEffectOps;
+            std::vector<std::vector<wolvrix::lib::grh::OperationId>> nodeToEffectResultOps;
             std::vector<uint8_t> nodeState;
         };
 
         const std::vector<wolvrix::lib::grh::OperationId> &
-        collectNodeReturnedEffectOps(
+        collectNodeEffectResultOps(
             const wolvrix::lib::grh::Graph &graph,
             const PhaseAData &phaseA,
             NodeId node,
             const std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> &inoutInputValues,
-            ReturnedEffectMemo &memo,
-            ReturnedEffectCollectStats &stats)
+            EffectResultMemo &memo,
+            EffectResultCollectStats &stats)
         {
             static const std::vector<wolvrix::lib::grh::OperationId> kEmpty;
-            if (node >= memo.nodeToReturnedEffectOps.size() || node >= memo.nodeState.size())
+            if (node >= memo.nodeToEffectResultOps.size() || node >= memo.nodeState.size())
             {
                 return kEmpty;
             }
@@ -1186,7 +1175,7 @@ namespace wolvrix::lib::transform
             uint8_t &state = memo.nodeState[node];
             if (state == 2)
             {
-                return memo.nodeToReturnedEffectOps[node];
+                return memo.nodeToEffectResultOps[node];
             }
             if (state == 1)
             {
@@ -1195,14 +1184,14 @@ namespace wolvrix::lib::transform
 
             state = 1;
             ++stats.visitedNodes;
-            std::vector<wolvrix::lib::grh::OperationId> &result = memo.nodeToReturnedEffectOps[node];
+            std::vector<wolvrix::lib::grh::OperationId> &result = memo.nodeToEffectResultOps[node];
             result.clear();
 
             const wolvrix::lib::grh::OperationId opId = phaseA.nodeToOp[node];
             const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-            if (opHasReturnedEffectValue(op))
+            if (opProducesEffectResult(op))
             {
-                ++stats.returnedEffectHits;
+                ++stats.effectResultHits;
                 result.push_back(opId);
             }
 
@@ -1225,7 +1214,7 @@ namespace wolvrix::lib::transform
                         continue;
                     }
                     const auto &childOps =
-                        collectNodeReturnedEffectOps(graph, phaseA, it->second, inoutInputValues, memo, stats);
+                        collectNodeEffectResultOps(graph, phaseA, it->second, inoutInputValues, memo, stats);
                     result.insert(result.end(), childOps.begin(), childOps.end());
                 }
             }
@@ -1248,14 +1237,14 @@ namespace wolvrix::lib::transform
             return result;
         }
 
-        void collectConeReturnedEffectOps(
+        void collectConeEffectResultOps(
             const wolvrix::lib::grh::Graph &graph,
             const PhaseAData &phaseA,
             const SinkRef &sink,
             const std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> &inoutInputValues,
-            ReturnedEffectMemo &memo,
-            std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash> &returnedEffectOps,
-            ReturnedEffectCollectStats &stats)
+            EffectResultMemo &memo,
+            std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash> &effectResultOps,
+            EffectResultCollectStats &stats)
         {
             auto collectFromValue = [&](wolvrix::lib::grh::ValueId value) {
                 if (isSourceValue(graph, value, inoutInputValues))
@@ -1275,13 +1264,17 @@ namespace wolvrix::lib::transform
                 }
 
                 const auto &ops =
-                    collectNodeReturnedEffectOps(graph, phaseA, it->second, inoutInputValues, memo, stats);
-                returnedEffectOps.insert(ops.begin(), ops.end());
+                    collectNodeEffectResultOps(graph, phaseA, it->second, inoutInputValues, memo, stats);
+                effectResultOps.insert(ops.begin(), ops.end());
             };
 
             if (sink.kind == SinkRef::Kind::Operation)
             {
                 const wolvrix::lib::grh::Operation op = graph.getOperation(sink.op);
+                if (opProducesEffectResult(op))
+                {
+                    effectResultOps.insert(sink.op);
+                }
                 for (const auto operand : op.operands())
                 {
                     collectFromValue(operand);
@@ -1573,40 +1566,40 @@ namespace wolvrix::lib::transform
 
             const auto effectConeStart = std::chrono::steady_clock::now();
             const size_t effectProgressEvery = sinkCount < 20000 ? 5000 : 20000;
-            ReturnedEffectMemo effectMemo;
-            effectMemo.nodeToReturnedEffectOps.resize(phaseA.nodeToOp.size());
+            EffectResultMemo effectMemo;
+            effectMemo.nodeToEffectResultOps.resize(phaseA.nodeToOp.size());
             effectMemo.nodeState.resize(phaseA.nodeToOp.size(), 0);
             std::unordered_map<wolvrix::lib::grh::OperationId, size_t, wolvrix::lib::grh::OperationIdHash>
-                firstSinkByReturnedEffect;
+                firstSinkByEffectResult;
             if (progressLogger)
             {
-                progressLogger("repcut phase-b/ascs: collect_returned_effect_begin");
+                progressLogger("repcut phase-b/ascs: collect_effect_result_begin");
             }
             batchStartIndex = 0;
             batchStart = effectConeStart;
-            uint64_t batchReturnedVisitedNodes = 0;
-            uint64_t batchReturnedEffectHits = 0;
-            uint64_t batchReturnedDsuUnions = 0;
+            uint64_t batchEffectVisitedNodes = 0;
+            uint64_t batchEffectResultHits = 0;
+            uint64_t batchEffectDsuUnions = 0;
             std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>
-                batchUniqueReturnedEffects;
+                batchUniqueEffectResults;
             for (size_t i = 0; i < data.sinks.size(); ++i)
             {
-                ReturnedEffectCollectStats sinkStats;
+                EffectResultCollectStats sinkStats;
                 std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>
-                    sinkReturnedEffects;
-                collectConeReturnedEffectOps(graph,
-                                             phaseA,
-                                             data.sinks[i],
-                                             inoutInputValues,
-                                             effectMemo,
-                                             sinkReturnedEffects,
-                                             sinkStats);
-                batchReturnedVisitedNodes += sinkStats.visitedNodes;
-                batchReturnedEffectHits += sinkStats.returnedEffectHits;
-                for (const auto returnedEffectOp : sinkReturnedEffects)
+                    sinkEffectResults;
+                collectConeEffectResultOps(graph,
+                                           phaseA,
+                                           data.sinks[i],
+                                           inoutInputValues,
+                                           effectMemo,
+                                           sinkEffectResults,
+                                           sinkStats);
+                batchEffectVisitedNodes += sinkStats.visitedNodes;
+                batchEffectResultHits += sinkStats.effectResultHits;
+                for (const auto effectResultOp : sinkEffectResults)
                 {
-                    batchUniqueReturnedEffects.insert(returnedEffectOp);
-                    const auto [it, inserted] = firstSinkByReturnedEffect.emplace(returnedEffectOp, i);
+                    batchUniqueEffectResults.insert(effectResultOp);
+                    const auto [it, inserted] = firstSinkByEffectResult.emplace(effectResultOp, i);
                     if (inserted)
                     {
                         continue;
@@ -1615,7 +1608,7 @@ namespace wolvrix::lib::transform
                     const size_t firstRoot = dsu.find(it->second);
                     if (sinkRoot != firstRoot)
                     {
-                        ++batchReturnedDsuUnions;
+                        ++batchEffectDsuUnions;
                         dsu.unite(sinkRoot, firstRoot);
                     }
                 }
@@ -1623,36 +1616,36 @@ namespace wolvrix::lib::transform
                 if (progressLogger && ((i + 1) % effectProgressEvery) == 0)
                 {
                     const size_t processed = i + 1;
-                    progressLogger("repcut phase-b/ascs: collect_returned_effect_progress=" +
+                    progressLogger("repcut phase-b/ascs: collect_effect_result_progress=" +
                                    std::to_string(processed) + "/" + std::to_string(sinkCount) +
                                    " elapsed_ms=" + std::to_string(msSince(effectConeStart)) +
                                    " batch_elapsed_ms=" + std::to_string(msSince(batchStart)) +
-                                   " visited_nodes=" + std::to_string(batchReturnedVisitedNodes) +
-                                   " returned_effect_hits=" + std::to_string(batchReturnedEffectHits) +
-                                   " unique_returned_effects=" + std::to_string(batchUniqueReturnedEffects.size()) +
-                                   " dsu_unions=" + std::to_string(batchReturnedDsuUnions));
+                                   " visited_nodes=" + std::to_string(batchEffectVisitedNodes) +
+                                   " effect_result_hits=" + std::to_string(batchEffectResultHits) +
+                                   " unique_effect_results=" + std::to_string(batchUniqueEffectResults.size()) +
+                                   " dsu_unions=" + std::to_string(batchEffectDsuUnions));
                     batchStartIndex = processed;
                     batchStart = std::chrono::steady_clock::now();
-                    batchReturnedVisitedNodes = 0;
-                    batchReturnedEffectHits = 0;
-                    batchReturnedDsuUnions = 0;
-                    batchUniqueReturnedEffects.clear();
+                    batchEffectVisitedNodes = 0;
+                    batchEffectResultHits = 0;
+                    batchEffectDsuUnions = 0;
+                    batchUniqueEffectResults.clear();
                 }
             }
             if (progressLogger && batchStartIndex < sinkCount)
             {
-                progressLogger("repcut phase-b/ascs: collect_returned_effect_progress=" +
+                progressLogger("repcut phase-b/ascs: collect_effect_result_progress=" +
                                std::to_string(sinkCount) + "/" + std::to_string(sinkCount) +
                                " elapsed_ms=" + std::to_string(msSince(effectConeStart)) +
                                " batch_elapsed_ms=" + std::to_string(msSince(batchStart)) +
-                               " visited_nodes=" + std::to_string(batchReturnedVisitedNodes) +
-                               " returned_effect_hits=" + std::to_string(batchReturnedEffectHits) +
-                               " unique_returned_effects=" + std::to_string(batchUniqueReturnedEffects.size()) +
-                               " dsu_unions=" + std::to_string(batchReturnedDsuUnions));
+                               " visited_nodes=" + std::to_string(batchEffectVisitedNodes) +
+                               " effect_result_hits=" + std::to_string(batchEffectResultHits) +
+                               " unique_effect_results=" + std::to_string(batchUniqueEffectResults.size()) +
+                               " dsu_unions=" + std::to_string(batchEffectDsuUnions));
             }
             if (progressLogger)
             {
-                progressLogger("repcut phase-b/ascs: collect_returned_effect_done elapsed_ms=" +
+                progressLogger("repcut phase-b/ascs: collect_effect_result_done elapsed_ms=" +
                                std::to_string(msSince(effectConeStart)));
             }
 
@@ -2196,7 +2189,7 @@ namespace wolvrix::lib::transform
                                      " sink_pos=" + std::to_string(sinkPos) +
                                      " sink_index=" + std::to_string(sinkIndex) +
                                      " op=" + formatOperationRef(graph, sink.op) +
-                                     " expected_sink_kind={kRegisterWritePort|kLatchWritePort|kMemoryWritePort|kDpicCall(no-return)|kSystemTask(no-return)}");
+                                     " expected_sink_kind={kRegisterWritePort|kLatchWritePort|kMemoryWritePort|effect-op}");
                         }
                     }
                     else
@@ -4515,12 +4508,12 @@ namespace wolvrix::lib::transform
             const wolvrix::lib::grh::OperationId defOpId = val.definingOp();
             wolvrix::lib::grh::OperationKind defKind = wolvrix::lib::grh::OperationKind::kConstant;
             bool defKindKnown = false;
-            bool defIsAllowedEffectSink = false;
+            bool defIsResultProducingEffect = false;
             if (defOpId.valid())
             {
                 const wolvrix::lib::grh::Operation defOp = graph->getOperation(defOpId);
                 defKind = defOp.kind();
-                defIsAllowedEffectSink = isEffectSinkOp(defOp);
+                defIsResultProducingEffect = opProducesEffectResult(defOp);
                 defKindKnown = true;
             }
 
@@ -4557,7 +4550,7 @@ namespace wolvrix::lib::transform
                             allowCross = true;
                             requiresPort = false;
                         }
-                        else if (defIsAllowedEffectSink)
+                        else if (defIsResultProducingEffect)
                         {
                             allowCross = true;
                             requiresPort = true;

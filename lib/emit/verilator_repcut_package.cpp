@@ -153,11 +153,18 @@ namespace wolvrix::lib::emit
 
         struct ManifestUnit
         {
+            enum class Phase
+            {
+                Early,
+                Normal
+            };
+
             std::string instanceName;
             std::string moduleGraphName;
             std::string moduleName;
             std::string sourceSv;
             std::vector<ManifestPort> ports;
+            Phase phase = Phase::Normal;
         };
 
         struct UnitShimInfo
@@ -184,6 +191,8 @@ namespace wolvrix::lib::emit
             std::string instanceName;
             std::string portName;
             std::string constValue;
+            bool effectDerived = false;
+            bool stateDerived = false;
         };
 
         struct SinkDesc
@@ -201,12 +210,19 @@ namespace wolvrix::lib::emit
 
         struct ManifestEdge
         {
+            enum class PublishPhase
+            {
+                EarlyEffect,
+                Final
+            };
+
             std::string signal;
             int64_t width = 1;
             bool isSigned = false;
             std::string kind;
             DriverDesc driver;
             std::vector<SinkDesc> sinks;
+            PublishPhase publishPhase = PublishPhase::Final;
         };
 
         struct EdgeKey
@@ -226,6 +242,27 @@ namespace wolvrix::lib::emit
             {
                 std::size_t seed = std::hash<std::string>{}(key.kind);
                 seed ^= wolvrix::lib::grh::ValueIdHash{}(key.valueId) + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
+                return seed;
+            }
+        };
+
+        struct UnitDriverKey
+        {
+            std::string instanceName;
+            std::string portName;
+
+            bool operator==(const UnitDriverKey &other) const noexcept
+            {
+                return instanceName == other.instanceName && portName == other.portName;
+            }
+        };
+
+        struct UnitDriverKeyHash
+        {
+            std::size_t operator()(const UnitDriverKey &key) const noexcept
+            {
+                std::size_t seed = std::hash<std::string>{}(key.instanceName);
+                seed ^= std::hash<std::string>{}(key.portName) + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
                 return seed;
             }
         };
@@ -697,6 +734,128 @@ namespace wolvrix::lib::emit
             return getAttribute<std::string>(graph.getOperation(def), "constValue");
         }
 
+        struct OutputProvenance
+        {
+            bool effect = false;
+            bool state = false;
+        };
+
+        bool isEffectTransparentCombOp(wolvrix::lib::grh::OperationKind kind)
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kAdd:
+            case wolvrix::lib::grh::OperationKind::kSub:
+            case wolvrix::lib::grh::OperationKind::kMul:
+            case wolvrix::lib::grh::OperationKind::kDiv:
+            case wolvrix::lib::grh::OperationKind::kMod:
+            case wolvrix::lib::grh::OperationKind::kEq:
+            case wolvrix::lib::grh::OperationKind::kNe:
+            case wolvrix::lib::grh::OperationKind::kCaseEq:
+            case wolvrix::lib::grh::OperationKind::kCaseNe:
+            case wolvrix::lib::grh::OperationKind::kWildcardEq:
+            case wolvrix::lib::grh::OperationKind::kWildcardNe:
+            case wolvrix::lib::grh::OperationKind::kLt:
+            case wolvrix::lib::grh::OperationKind::kLe:
+            case wolvrix::lib::grh::OperationKind::kGt:
+            case wolvrix::lib::grh::OperationKind::kGe:
+            case wolvrix::lib::grh::OperationKind::kAnd:
+            case wolvrix::lib::grh::OperationKind::kOr:
+            case wolvrix::lib::grh::OperationKind::kXor:
+            case wolvrix::lib::grh::OperationKind::kXnor:
+            case wolvrix::lib::grh::OperationKind::kNot:
+            case wolvrix::lib::grh::OperationKind::kLogicAnd:
+            case wolvrix::lib::grh::OperationKind::kLogicOr:
+            case wolvrix::lib::grh::OperationKind::kLogicNot:
+            case wolvrix::lib::grh::OperationKind::kReduceAnd:
+            case wolvrix::lib::grh::OperationKind::kReduceOr:
+            case wolvrix::lib::grh::OperationKind::kReduceXor:
+            case wolvrix::lib::grh::OperationKind::kReduceNor:
+            case wolvrix::lib::grh::OperationKind::kReduceNand:
+            case wolvrix::lib::grh::OperationKind::kReduceXnor:
+            case wolvrix::lib::grh::OperationKind::kShl:
+            case wolvrix::lib::grh::OperationKind::kLShr:
+            case wolvrix::lib::grh::OperationKind::kAShr:
+            case wolvrix::lib::grh::OperationKind::kMux:
+            case wolvrix::lib::grh::OperationKind::kAssign:
+            case wolvrix::lib::grh::OperationKind::kConcat:
+            case wolvrix::lib::grh::OperationKind::kReplicate:
+            case wolvrix::lib::grh::OperationKind::kSliceStatic:
+            case wolvrix::lib::grh::OperationKind::kSliceDynamic:
+            case wolvrix::lib::grh::OperationKind::kSliceArray:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        using OutputProvenanceMemo = std::unordered_map<wolvrix::lib::grh::ValueId,
+                                                        OutputProvenance,
+                                                        wolvrix::lib::grh::ValueIdHash>;
+
+        OutputProvenance outputProvenance(const wolvrix::lib::grh::Graph &graph,
+                                          wolvrix::lib::grh::ValueId output,
+                                          OutputProvenanceMemo &memo)
+        {
+            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> visiting;
+            auto visit = [&](auto &&self, wolvrix::lib::grh::ValueId value) -> OutputProvenance {
+                if (!value.valid() || value.graph != graph.id())
+                {
+                    return {};
+                }
+                if (const auto memoIt = memo.find(value); memoIt != memo.end())
+                {
+                    return memoIt->second;
+                }
+                if (!visiting.insert(value).second)
+                {
+                    return {false, true};
+                }
+
+                OutputProvenance provenance;
+                const auto def = graph.valueDef(value);
+                if (def.valid())
+                {
+                    const auto kind = graph.opKind(def);
+                    if (kind == wolvrix::lib::grh::OperationKind::kDpicCall ||
+                        kind == wolvrix::lib::grh::OperationKind::kSystemTask)
+                    {
+                        provenance.effect = true;
+                    }
+                    else if (kind == wolvrix::lib::grh::OperationKind::kConstant)
+                    {
+                        provenance = {};
+                    }
+                    else if (isEffectTransparentCombOp(kind) ||
+                             (kind == wolvrix::lib::grh::OperationKind::kSystemFunction &&
+                              !getAttribute<bool>(graph.getOperation(def), "hasSideEffects").value_or(false)))
+                    {
+                        for (const auto operand : graph.opOperands(def))
+                        {
+                            const auto operandProvenance = self(self, operand);
+                            provenance.effect = provenance.effect || operandProvenance.effect;
+                            provenance.state = provenance.state || operandProvenance.state;
+                        }
+                    }
+                    else
+                    {
+                        provenance.state = true;
+                        for (const auto operand : graph.opOperands(def))
+                        {
+                            const auto operandProvenance = self(self, operand);
+                            provenance.effect = provenance.effect || operandProvenance.effect;
+                            provenance.state = provenance.state || operandProvenance.state;
+                        }
+                    }
+                }
+
+                visiting.erase(value);
+                memo.emplace(value, provenance);
+                return provenance;
+            };
+            return visit(visit, output);
+        }
+
         struct WrapperCode
         {
             std::string header;
@@ -764,6 +923,7 @@ namespace wolvrix::lib::emit
                 std::string methodName;
                 std::vector<std::string> modelTypes;
                 std::string definition;
+                ManifestUnit::Phase phase = ManifestUnit::Phase::Normal;
             };
 
             constexpr std::size_t kLoadChunkTargetBytes = 4u * 1024u * 1024u;
@@ -806,8 +966,8 @@ namespace wolvrix::lib::emit
                 }
             }
 
-            std::vector<std::string> normalEvalOrder;
-            normalEvalOrder.reserve(manifest.serialEvalOrder.size());
+            std::vector<std::string> evalOrder;
+            evalOrder.reserve(manifest.serialEvalOrder.size());
             for (const auto &instanceName : manifest.serialEvalOrder)
             {
                 const auto unitIt = std::find_if(
@@ -822,7 +982,7 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                normalEvalOrder.push_back(instanceName);
+                evalOrder.push_back(instanceName);
             }
 
             std::unordered_set<std::string> usedTopInputIdentifiers;
@@ -993,7 +1153,10 @@ namespace wolvrix::lib::emit
                 return wroteAny;
             };
 
-            auto emitUnitUpdatesForUnit = [&](std::ostream &out, const std::string &instanceName, int indentLevel)
+            auto emitUnitUpdatesForUnit = [&](std::ostream &out,
+                                              const std::string &instanceName,
+                                              ManifestEdge::PublishPhase publishPhase,
+                                              int indentLevel)
             {
                 const auto unitIt = unitInfoByInstance.find(instanceName);
                 if (unitIt == unitInfoByInstance.end())
@@ -1006,6 +1169,10 @@ namespace wolvrix::lib::emit
                 for (const auto &edge : manifest.connections)
                 {
                     if (edge.driver.kind != DriverDesc::Kind::Unit || edge.driver.instanceName != instanceName)
+                    {
+                        continue;
+                    }
+                    if (edge.publishPhase != publishPhase)
                     {
                         continue;
                     }
@@ -1076,10 +1243,10 @@ namespace wolvrix::lib::emit
             std::vector<PhaseMethodDef> loadMethods;
             std::vector<PhaseMethodDef> evalMethods;
             std::vector<PhaseMethodDef> updateMethods;
-            loadMethods.reserve(normalEvalOrder.size());
-            evalMethods.reserve(normalEvalOrder.size());
-            updateMethods.reserve(normalEvalOrder.size());
-            for (const auto &instanceName : normalEvalOrder)
+            loadMethods.reserve(evalOrder.size());
+            evalMethods.reserve(evalOrder.size());
+            updateMethods.reserve(evalOrder.size());
+            for (const auto &instanceName : evalOrder)
             {
                 const auto unitIt = unitInfoByInstance.find(instanceName);
                 if (unitIt == unitInfoByInstance.end())
@@ -1092,6 +1259,15 @@ namespace wolvrix::lib::emit
                     throw std::runtime_error("Missing timing index for unit " + instanceName);
                 }
                 const auto &unitInfo = unitIt->second;
+                const auto manifestUnitIt = std::find_if(
+                    manifest.units.begin(),
+                    manifest.units.end(),
+                    [&](const ManifestUnit &unit) { return unit.instanceName == instanceName; });
+                if (manifestUnitIt == manifest.units.end())
+                {
+                    throw std::runtime_error("Missing manifest unit " + instanceName);
+                }
+                const ManifestUnit::Phase unitPhase = manifestUnitIt->phase;
 
                 {
                     std::ostringstream body;
@@ -1115,6 +1291,7 @@ namespace wolvrix::lib::emit
                             methodName,
                             {unitInfo.modelType},
                             method.str(),
+                            unitPhase,
                         });
                     }
                 }
@@ -1143,12 +1320,16 @@ namespace wolvrix::lib::emit
                         methodName,
                         {unitInfo.modelType},
                         method.str(),
+                        unitPhase,
                     });
                 }
 
+                auto appendUpdateMethod = [&](ManifestEdge::PublishPhase publishPhase,
+                                              ManifestUnit::Phase schedulePhase,
+                                              std::string_view methodTag)
                 {
                     std::ostringstream body;
-                    if (emitUnitUpdatesForUnit(body, instanceName, 1))
+                    if (emitUnitUpdatesForUnit(body, instanceName, publishPhase, 1))
                     {
                         std::unordered_set<std::string> seenMethodModels;
                         std::vector<std::string> methodModels;
@@ -1157,6 +1338,10 @@ namespace wolvrix::lib::emit
                         for (const auto &edge : manifest.connections)
                         {
                             if (edge.driver.kind != DriverDesc::Kind::Unit || edge.driver.instanceName != instanceName)
+                            {
+                                continue;
+                            }
+                            if (edge.publishPhase != publishPhase)
                             {
                                 continue;
                             }
@@ -1180,7 +1365,9 @@ namespace wolvrix::lib::emit
                         }
 
                         const std::string methodName =
-                            makeUniqueIdentifier("run_update_" + instanceName, usedMethodIdentifiers) + "_";
+                            makeUniqueIdentifier("run_update_" + std::string(methodTag) + "_" + instanceName,
+                                                 usedMethodIdentifiers) +
+                            "_";
                         std::ostringstream method;
                         method << "void WolviRepCutVerilatorSim::" << methodName << "(std::size_t workerIndex) {\n";
                         method << "  PartTimingStats* partTimingStats = &part_timing_stats_["
@@ -1201,9 +1388,19 @@ namespace wolvrix::lib::emit
                             methodName,
                             std::move(methodModels),
                             method.str(),
+                            schedulePhase,
                         });
                     }
+                };
+                if (unitPhase == ManifestUnit::Phase::Early)
+                {
+                    appendUpdateMethod(ManifestEdge::PublishPhase::EarlyEffect,
+                                       ManifestUnit::Phase::Early,
+                                       "early");
                 }
+                appendUpdateMethod(ManifestEdge::PublishPhase::Final,
+                                   ManifestUnit::Phase::Normal,
+                                   "final");
             }
 
             auto loadChunks = chunkEntriesByEstimatedSize(
@@ -1377,8 +1574,10 @@ namespace wolvrix::lib::emit
                 header << "\n";
             }
             header << "  std::vector<StepFn> load_step_fns_;\n";
-            header << "  std::vector<StepFn> eval_step_fns_;\n";
-            header << "  std::vector<StepFn> update_step_fns_;\n";
+            header << "  std::vector<StepFn> early_eval_step_fns_;\n";
+            header << "  std::vector<StepFn> early_update_step_fns_;\n";
+            header << "  std::vector<StepFn> normal_eval_step_fns_;\n";
+            header << "  std::vector<StepFn> normal_update_step_fns_;\n";
             header << "  const std::vector<StepFn>* active_phase_fns_{};\n";
             header << "  std::unique_ptr<PhaseWorker[]> phase_workers_;\n";
             header << "  std::vector<int> phase_cpu_ids_;\n";
@@ -1406,8 +1605,10 @@ namespace wolvrix::lib::emit
             emitSourcePreamble(commonSource, modelTypesInOrder);
             commonSource << "#include <algorithm>\n";
             commonSource << "#include <cassert>\n";
+            commonSource << "#include <cerrno>\n";
             commonSource << "#include <cstdio>\n";
             commonSource << "#include <cstdlib>\n";
+            commonSource << "#include <limits>\n";
             commonSource << "#include <utility>\n";
             commonSource << "#if defined(__linux__)\n";
             commonSource << "#include <pthread.h>\n";
@@ -1446,16 +1647,27 @@ namespace wolvrix::lib::emit
             commonSource << "  return false;\n";
             commonSource << "#endif\n";
             commonSource << "}\n\n";
+            commonSource << "[[noreturn]] inline void wolvi_repcut_thread_config_error(const char* message) {\n";
+            commonSource << "  std::fprintf(stderr, \"[WOLVI][thread-config] error=%s\\n\", message);\n";
+            commonSource << "  std::fflush(stderr);\n";
+            commonSource << "  std::abort();\n";
+            commonSource << "}\n\n";
             commonSource << "inline std::size_t wolvi_repcut_requested_workers() {\n";
             commonSource << "  const char* env = std::getenv(\"XS_EMU_THREADS\");\n";
             commonSource << "  if (env == nullptr || *env == '\\0') {\n";
             commonSource << "    return 0;\n";
             commonSource << "  }\n";
+            commonSource << "  for (const char* cursor = env; *cursor != '\\0'; ++cursor) {\n";
+            commonSource << "    if (*cursor < '0' || *cursor > '9') {\n";
+            commonSource << "      wolvi_repcut_thread_config_error(\"XS_EMU_THREADS must be an unsigned integer\");\n";
+            commonSource << "    }\n";
+            commonSource << "  }\n";
+            commonSource << "  errno = 0;\n";
             commonSource << "  char* end = nullptr;\n";
             commonSource << "  const unsigned long long value = std::strtoull(env, &end, 10);\n";
-            commonSource << "  if (end == env || (end != nullptr && *end != '\\0')) {\n";
-            commonSource << "    assert(false && \"XS_EMU_THREADS must be an unsigned integer\");\n";
-            commonSource << "    return 0;\n";
+            commonSource << "  if (errno == ERANGE || end == env || (end != nullptr && *end != '\\0') ||\n";
+            commonSource << "      value > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {\n";
+            commonSource << "    wolvi_repcut_thread_config_error(\"XS_EMU_THREADS is out of range\");\n";
             commonSource << "  }\n";
             commonSource << "  return static_cast<std::size_t>(value);\n";
             commonSource << "}\n";
@@ -1490,7 +1702,7 @@ namespace wolvrix::lib::emit
                 }
             }
             commonSource << " {\n";
-            for (const auto &instanceName : normalEvalOrder)
+            for (const auto &instanceName : evalOrder)
             {
                 emitConstLoadsForUnit(commonSource, instanceName, 1);
             }
@@ -1510,50 +1722,89 @@ namespace wolvrix::lib::emit
                 commonSource << "  load_step_fns_.push_back(&WolviRepCutVerilatorSim::" << method.methodName
                              << ");\n";
             }
-            commonSource << "  eval_step_fns_.reserve(" << evalMethods.size() << ");\n";
+            const std::size_t earlyEvalMethodCount = static_cast<std::size_t>(std::count_if(
+                evalMethods.begin(), evalMethods.end(), [](const PhaseMethodDef &method) {
+                    return method.phase == ManifestUnit::Phase::Early;
+                }));
+            const std::size_t normalEvalMethodCount = evalMethods.size() - earlyEvalMethodCount;
+            const std::size_t earlyUpdateMethodCount = static_cast<std::size_t>(std::count_if(
+                updateMethods.begin(), updateMethods.end(), [](const PhaseMethodDef &method) {
+                    return method.phase == ManifestUnit::Phase::Early;
+                }));
+            const std::size_t normalUpdateMethodCount = updateMethods.size() - earlyUpdateMethodCount;
+            commonSource << "  early_eval_step_fns_.reserve(" << earlyEvalMethodCount << ");\n";
+            commonSource << "  normal_eval_step_fns_.reserve(" << normalEvalMethodCount << ");\n";
             for (const auto &method : evalMethods)
             {
-                commonSource << "  eval_step_fns_.push_back(&WolviRepCutVerilatorSim::" << method.methodName
+                commonSource << "  "
+                             << (method.phase == ManifestUnit::Phase::Early ? "early_eval_step_fns_"
+                                                                           : "normal_eval_step_fns_")
+                             << ".push_back(&WolviRepCutVerilatorSim::" << method.methodName
                              << ");\n";
             }
-            commonSource << "  update_step_fns_.reserve(" << updateMethods.size() << ");\n";
+            commonSource << "  early_update_step_fns_.reserve(" << earlyUpdateMethodCount << ");\n";
+            commonSource << "  normal_update_step_fns_.reserve(" << normalUpdateMethodCount << ");\n";
             for (const auto &method : updateMethods)
             {
-                commonSource << "  update_step_fns_.push_back(&WolviRepCutVerilatorSim::" << method.methodName
+                commonSource << "  "
+                             << (method.phase == ManifestUnit::Phase::Early ? "early_update_step_fns_"
+                                                                           : "normal_update_step_fns_")
+                             << ".push_back(&WolviRepCutVerilatorSim::" << method.methodName
                              << ");\n";
             }
             commonSource << "}\n\n";
             commonSource << "void WolviRepCutVerilatorSim::initialize_phase_workers_() {\n";
             commonSource << "  const std::size_t requestedWorkers = wolvi_repcut_requested_workers();\n";
-            commonSource << "  const std::size_t maxParallelFns = std::max(eval_step_fns_.size(), update_step_fns_.size());\n";
-            commonSource << "  assert(requestedWorkers <= maxParallelFns && \"XS_EMU_THREADS must not exceed repcut partition count\");\n";
-            commonSource << "  if (maxParallelFns < 2 || requestedWorkers < 2) {\n";
-            commonSource << "    return;\n";
+            commonSource << "  const std::size_t maxParallelFns = std::max({early_eval_step_fns_.size(), early_update_step_fns_.size(), normal_eval_step_fns_.size(), normal_update_step_fns_.size()});\n";
+            commonSource << "  if (requestedWorkers > " << manifest.units.size() << ") {\n";
+            commonSource << "    wolvi_repcut_thread_config_error(\"XS_EMU_THREADS must not exceed repcut partition count\");\n";
+            commonSource << "  }\n";
+            commonSource << "  if (requestedWorkers != 0 && requestedWorkers > maxParallelFns) {\n";
+            commonSource << "    wolvi_repcut_thread_config_error(\"XS_EMU_THREADS must not exceed largest phase task count\");\n";
             commonSource << "  }\n";
             commonSource << "  phase_cpu_ids_ = wolvi_repcut_available_cpus();\n";
-            commonSource << "  if (phase_cpu_ids_.size() < 2) {\n";
+            commonSource << "  const std::size_t availableCpuCount = phase_cpu_ids_.size();\n";
+            commonSource << "  if (requestedWorkers < 2) {\n";
+            commonSource << "    std::fprintf(stderr, \"[WOLVI][thread-config] requested=%zu effective=1 max_parallel=%zu available_cpus=%zu\\n\", requestedWorkers, maxParallelFns, availableCpuCount);\n";
             commonSource << "    phase_cpu_ids_.clear();\n";
             commonSource << "    return;\n";
             commonSource << "  }\n";
-            commonSource << "  phase_worker_count_ = std::min(maxParallelFns, requestedWorkers);\n";
-            commonSource << "  phase_worker_count_ = std::min(phase_worker_count_, phase_cpu_ids_.size());\n";
-            commonSource << "  if (phase_worker_count_ < 2) {\n";
-            commonSource << "    phase_worker_count_ = 0;\n";
-            commonSource << "    phase_cpu_ids_.clear();\n";
-            commonSource << "    return;\n";
+            commonSource << "  if (requestedWorkers > availableCpuCount) {\n";
+            commonSource << "    wolvi_repcut_thread_config_error(\"XS_EMU_THREADS must not exceed available CPU count\");\n";
             commonSource << "  }\n";
+            commonSource << "  phase_worker_count_ = requestedWorkers;\n";
             commonSource << "  if (!phase_cpu_ids_.empty()) {\n";
             commonSource << "    phase_cpu_ids_.resize(phase_worker_count_);\n";
             commonSource << "  }\n";
+            commonSource << "  std::fprintf(stderr, \"[WOLVI][thread-config] requested=%zu effective=%zu max_parallel=%zu available_cpus=%zu\\n\", requestedWorkers, phase_worker_count_, maxParallelFns, availableCpuCount);\n";
             commonSource << "  part_timing_worker_stats_.assign(phase_worker_count_, {});\n";
             commonSource << "  phase_workers_ = std::make_unique<PhaseWorker[]>(phase_worker_count_);\n";
-            commonSource << "  for (std::size_t workerIndex = 0; workerIndex < phase_worker_count_; ++workerIndex) {\n";
-            commonSource << "    phase_workers_[workerIndex].thread = std::thread([this, workerIndex]() {\n";
-            commonSource << "      if (workerIndex < phase_cpu_ids_.size()) {\n";
-            commonSource << "        wolvi_repcut_pin_current_thread(phase_cpu_ids_[workerIndex]);\n";
+            commonSource << "  std::size_t startedWorkerCount = 0;\n";
+            commonSource << "  try {\n";
+            commonSource << "    for (std::size_t workerIndex = 0; workerIndex < phase_worker_count_; ++workerIndex) {\n";
+            commonSource << "      phase_workers_[workerIndex].thread = std::thread([this, workerIndex]() {\n";
+            commonSource << "        if (workerIndex < phase_cpu_ids_.size()) {\n";
+            commonSource << "          wolvi_repcut_pin_current_thread(phase_cpu_ids_[workerIndex]);\n";
+            commonSource << "        }\n";
+            commonSource << "        phase_worker_loop_(workerIndex);\n";
+            commonSource << "      });\n";
+            commonSource << "      ++startedWorkerCount;\n";
+            commonSource << "    }\n";
+            commonSource << "  } catch (...) {\n";
+            commonSource << "    for (std::size_t workerIndex = 0; workerIndex < startedWorkerCount; ++workerIndex) {\n";
+            commonSource << "      PhaseWorker& worker = phase_workers_[workerIndex];\n";
+            commonSource << "      {\n";
+            commonSource << "        std::lock_guard<std::mutex> lock(worker.mutex);\n";
+            commonSource << "        worker.stop = true;\n";
             commonSource << "      }\n";
-            commonSource << "      phase_worker_loop_(workerIndex);\n";
-            commonSource << "    });\n";
+            commonSource << "      worker.cv.notify_one();\n";
+            commonSource << "    }\n";
+            commonSource << "    for (std::size_t workerIndex = 0; workerIndex < startedWorkerCount; ++workerIndex) {\n";
+            commonSource << "      if (phase_workers_[workerIndex].thread.joinable()) {\n";
+            commonSource << "        phase_workers_[workerIndex].thread.join();\n";
+            commonSource << "      }\n";
+            commonSource << "    }\n";
+            commonSource << "    wolvi_repcut_thread_config_error(\"failed to create phase worker thread\");\n";
             commonSource << "  }\n";
             commonSource << "  phase_parallel_ = true;\n";
             commonSource << "}\n\n";
@@ -1586,7 +1837,7 @@ namespace wolvrix::lib::emit
             commonSource << "  auto &worker = phase_workers_[workerIndex];\n";
             commonSource << "  while (true) {\n";
             commonSource << "    std::unique_lock<std::mutex> lock(worker.mutex);\n";
-            commonSource << "    worker.cv.wait(lock, [&worker]() { return worker.hasWork; });\n";
+            commonSource << "    worker.cv.wait(lock, [&worker]() { return worker.stop || worker.hasWork; });\n";
             commonSource << "    if (worker.stop) {\n";
             commonSource << "      return;\n";
             commonSource << "    }\n";
@@ -1801,15 +2052,23 @@ namespace wolvrix::lib::emit
             commonSource << "  run_host_phase_(load_step_fns_);\n";
             commonSource << "  const auto inputLoadEnd = WolviClock::now();\n";
             commonSource << "  step_timing_.input_load_ns += elapsed_ns_(inputLoadBegin, inputLoadEnd);\n";
-            commonSource << "  const auto partEvalBegin = inputLoadEnd;\n";
-            commonSource << "  run_phase_workers_(eval_step_fns_);\n";
-            commonSource << "  const auto partEvalEnd = WolviClock::now();\n";
-            commonSource << "  step_timing_.part_eval_ns += elapsed_ns_(partEvalBegin, partEvalEnd);\n";
-            commonSource << "  const auto globalUpdateBegin = partEvalEnd;\n";
-            commonSource << "  run_phase_workers_(update_step_fns_);\n";
-            commonSource << "  const auto globalUpdateEnd = WolviClock::now();\n";
-            commonSource << "  step_timing_.global_update_ns += elapsed_ns_(globalUpdateBegin, globalUpdateEnd);\n";
-            commonSource << "  step_timing_.total_ns += elapsed_ns_(stepBegin, globalUpdateEnd);\n";
+            commonSource << "  const auto earlyEvalBegin = inputLoadEnd;\n";
+            commonSource << "  run_phase_workers_(early_eval_step_fns_);\n";
+            commonSource << "  const auto earlyEvalEnd = WolviClock::now();\n";
+            commonSource << "  step_timing_.part_eval_ns += elapsed_ns_(earlyEvalBegin, earlyEvalEnd);\n";
+            commonSource << "  const auto earlyUpdateBegin = earlyEvalEnd;\n";
+            commonSource << "  run_phase_workers_(early_update_step_fns_);\n";
+            commonSource << "  const auto earlyUpdateEnd = WolviClock::now();\n";
+            commonSource << "  step_timing_.global_update_ns += elapsed_ns_(earlyUpdateBegin, earlyUpdateEnd);\n";
+            commonSource << "  const auto normalEvalBegin = earlyUpdateEnd;\n";
+            commonSource << "  run_phase_workers_(normal_eval_step_fns_);\n";
+            commonSource << "  const auto normalEvalEnd = WolviClock::now();\n";
+            commonSource << "  step_timing_.part_eval_ns += elapsed_ns_(normalEvalBegin, normalEvalEnd);\n";
+            commonSource << "  const auto finalUpdateBegin = normalEvalEnd;\n";
+            commonSource << "  run_phase_workers_(normal_update_step_fns_);\n";
+            commonSource << "  const auto finalUpdateEnd = WolviClock::now();\n";
+            commonSource << "  step_timing_.global_update_ns += elapsed_ns_(finalUpdateBegin, finalUpdateEnd);\n";
+            commonSource << "  step_timing_.total_ns += elapsed_ns_(stepBegin, finalUpdateEnd);\n";
             commonSource << "}\n";
             sources.push_back(WrapperCode::SourceFile{
                 "wolvi_repcut_verilator_sim_common.cpp",
@@ -2169,6 +2428,7 @@ namespace wolvrix::lib::emit
         std::unordered_set<std::string> usedWrapperModuleNames;
         std::unordered_map<std::string, UnitShimInfo> unitShimByInstance;
         unitShimByInstance.reserve(topGraph.operations().size());
+        std::unordered_map<const wolvrix::lib::grh::Graph *, OutputProvenanceMemo> provenanceMemoByGraph;
 
         std::vector<PendingUnitInputs> pendingUnitInputs;
         std::vector<AliasAssign> aliasAssigns;
@@ -2267,6 +2527,7 @@ namespace wolvrix::lib::emit
                 storedShim.wrapperModuleName,
                 storedShim.wrapperSourceSv,
                 storedShim.wrapperPorts,
+                ManifestUnit::Phase::Normal,
             });
 
             const auto operands = topGraph.opOperands(opId);
@@ -2280,6 +2541,16 @@ namespace wolvrix::lib::emit
 
             for (std::size_t i = 0; i < outputNames->size(); ++i)
             {
+                const auto graphOutput = unitGraph->outputPortValue((*outputNames)[i]);
+                if (!graphOutput.valid())
+                {
+                    reportError("Failed to find instance output in unit graph",
+                                instanceName + "." + (*outputNames)[i]);
+                    result.success = false;
+                    return result;
+                }
+                auto &provenanceMemo = provenanceMemoByGraph[unitGraph];
+                const OutputProvenance provenance = outputProvenance(*unitGraph, graphOutput, provenanceMemo);
                 const auto mappedOutputIt = storedShim.outputPortByGraphName.find((*outputNames)[i]);
                 if (mappedOutputIt == storedShim.outputPortByGraphName.end())
                 {
@@ -2293,6 +2564,8 @@ namespace wolvrix::lib::emit
                     instanceName,
                     mappedOutputIt->second,
                     {},
+                    provenance.effect,
+                    provenance.state,
                 };
             }
 
@@ -2412,6 +2685,70 @@ namespace wolvrix::lib::emit
                 return result;
             }
             appendSink("unit_to_top", port.value, driver, SinkDesc{SinkDesc::Kind::Top, {}, port.name});
+        }
+
+        std::unordered_set<UnitDriverKey, UnitDriverKeyHash> earlyDriverKeys;
+        for (const auto &edge : manifest.connections)
+        {
+            if (edge.kind == "unit_to_unit" && edge.driver.effectDerived)
+            {
+                if (edge.driver.stateDerived)
+                {
+                    reportError("Cross-unit output mixes result-producing effect and state provenance",
+                                edge.driver.instanceName + "." + edge.driver.portName);
+                    result.success = false;
+                    return result;
+                }
+                earlyDriverKeys.insert(UnitDriverKey{edge.driver.instanceName, edge.driver.portName});
+            }
+        }
+        std::unordered_set<std::string> earlyInstances;
+        for (const auto &driverKey : earlyDriverKeys)
+        {
+            earlyInstances.insert(driverKey.instanceName);
+        }
+        for (auto &unit : manifest.units)
+        {
+            unit.phase = earlyInstances.contains(unit.instanceName) ? ManifestUnit::Phase::Early
+                                                                   : ManifestUnit::Phase::Normal;
+        }
+        for (const auto &edge : manifest.connections)
+        {
+            if (edge.kind != "unit_to_unit" || earlyInstances.contains(edge.driver.instanceName))
+            {
+                continue;
+            }
+            for (const auto &sink : edge.sinks)
+            {
+                if (sink.kind == SinkDesc::Kind::Unit && earlyInstances.contains(sink.instanceName))
+                {
+                    reportError("Normal unit output feeds an early unit",
+                                edge.driver.instanceName + "." + edge.driver.portName + " -> " +
+                                    sink.instanceName + "." + sink.portName);
+                    result.success = false;
+                    return result;
+                }
+            }
+        }
+        for (auto &edge : manifest.connections)
+        {
+            if (edge.driver.kind != DriverDesc::Kind::Unit ||
+                !earlyDriverKeys.contains(UnitDriverKey{edge.driver.instanceName, edge.driver.portName}))
+            {
+                continue;
+            }
+            for (const auto &sink : edge.sinks)
+            {
+                if (sink.kind == SinkDesc::Kind::Unit && earlyInstances.contains(sink.instanceName))
+                {
+                    reportError("Early effect edge targets another early unit",
+                                edge.driver.instanceName + "." + edge.driver.portName + " -> " +
+                                    sink.instanceName + "." + sink.portName);
+                    result.success = false;
+                    return result;
+                }
+            }
+            edge.publishPhase = ManifestEdge::PublishPhase::EarlyEffect;
         }
 
         for (const auto &unit : manifest.units)

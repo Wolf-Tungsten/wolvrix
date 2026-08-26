@@ -6,6 +6,7 @@
 #include <exception>
 #include <functional>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <system_error>
 #include <unordered_set>
@@ -1648,6 +1649,11 @@ namespace wolvrix::lib::emit
             std::vector<std::pair<std::string, wolvrix::lib::grh::OperationId>> latchBlocks;
             std::vector<SimpleBlock> simpleBlocks;
             std::vector<SeqBlock> seqBlocks;
+            std::unordered_map<wolvrix::lib::grh::OperationId,
+                               std::unordered_set<wolvrix::lib::grh::OperationId,
+                                                  wolvrix::lib::grh::OperationIdHash>,
+                               wolvrix::lib::grh::OperationIdHash>
+                sequentialStmtPredecessors;
             std::unordered_set<std::string> instanceNamesUsed;
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> dpiTempNames;
             int concatTempIndex = 0;
@@ -1898,6 +1904,113 @@ namespace wolvrix::lib::emit
                         ordered[slots[index]] = std::move(entries[index].stmt);
                     }
                 }
+
+                std::unordered_map<wolvrix::lib::grh::OperationId,
+                                   std::vector<std::size_t>,
+                                   wolvrix::lib::grh::OperationIdHash>
+                    slotsByOp;
+                for (std::size_t slot = 0; slot < ordered.size(); ++slot)
+                {
+                    if (ordered[slot].op.valid())
+                    {
+                        slotsByOp[ordered[slot].op].push_back(slot);
+                    }
+                }
+                std::vector<std::vector<std::size_t>> successors(ordered.size());
+                std::vector<std::size_t> predecessorCount(ordered.size(), 0);
+                auto addOrderingEdge = [&](std::size_t predecessor, std::size_t successor)
+                {
+                    if (predecessor == successor)
+                    {
+                        return;
+                    }
+                    auto &targets = successors[predecessor];
+                    if (std::find(targets.begin(), targets.end(), successor) != targets.end())
+                    {
+                        return;
+                    }
+                    targets.push_back(successor);
+                    ++predecessorCount[successor];
+                };
+
+                std::unordered_map<std::string, std::size_t> previousMemoryPrioritySlot;
+                for (std::size_t slot = 0; slot < ordered.size(); ++slot)
+                {
+                    if (!ordered[slot].op.valid())
+                    {
+                        continue;
+                    }
+                    const auto op = graph->getOperation(ordered[slot].op);
+                    const auto group = getAttribute<std::string>(
+                        *graph, op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+                    const auto priority = getAttribute<int64_t>(
+                        *graph, op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
+                    if (!group || !priority)
+                    {
+                        continue;
+                    }
+                    if (auto previous = previousMemoryPrioritySlot.find(*group);
+                        previous != previousMemoryPrioritySlot.end())
+                    {
+                        addOrderingEdge(previous->second, slot);
+                    }
+                    previousMemoryPrioritySlot[*group] = slot;
+                }
+                for (const auto &[sinkOp, predecessorOps] : sequentialStmtPredecessors)
+                {
+                    auto sinkIt = slotsByOp.find(sinkOp);
+                    if (sinkIt == slotsByOp.end())
+                    {
+                        continue;
+                    }
+                    for (const auto predecessorOp : predecessorOps)
+                    {
+                        auto predecessorIt = slotsByOp.find(predecessorOp);
+                        if (predecessorIt == slotsByOp.end())
+                        {
+                            continue;
+                        }
+                        for (const std::size_t predecessorSlot : predecessorIt->second)
+                        {
+                            for (const std::size_t sinkSlot : sinkIt->second)
+                            {
+                                addOrderingEdge(predecessorSlot, sinkSlot);
+                            }
+                        }
+                    }
+                }
+                std::priority_queue<std::size_t,
+                                    std::vector<std::size_t>,
+                                    std::greater<std::size_t>>
+                    ready;
+                for (std::size_t slot = 0; slot < ordered.size(); ++slot)
+                {
+                    if (predecessorCount[slot] == 0)
+                    {
+                        ready.push(slot);
+                    }
+                }
+                std::vector<SeqStmt> dependencyOrdered;
+                dependencyOrdered.reserve(ordered.size());
+                while (!ready.empty())
+                {
+                    const std::size_t slot = ready.top();
+                    ready.pop();
+                    dependencyOrdered.push_back(ordered[slot]);
+                    for (const std::size_t successor : successors[slot])
+                    {
+                        if (--predecessorCount[successor] == 0)
+                        {
+                            ready.push(successor);
+                        }
+                    }
+                }
+                if (dependencyOrdered.size() == ordered.size())
+                {
+                    return dependencyOrdered;
+                }
+                reportError("sequential statement ordering constraints contain a cycle",
+                            graph->symbol());
                 return ordered;
             };
 
@@ -1914,14 +2027,63 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kLatchWritePort:
                 case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
                 case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+                case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
                     return true;
                 default:
                     return false;
                 }
             };
 
-            std::unordered_map<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>
-                dpiInlineReturnSink;
+            auto isDpiProcedurallyInlineableKind = [](wolvrix::lib::grh::OperationKind kind) -> bool
+            {
+                switch (kind)
+                {
+                case wolvrix::lib::grh::OperationKind::kConstant:
+                case wolvrix::lib::grh::OperationKind::kEq:
+                case wolvrix::lib::grh::OperationKind::kNe:
+                case wolvrix::lib::grh::OperationKind::kCaseEq:
+                case wolvrix::lib::grh::OperationKind::kCaseNe:
+                case wolvrix::lib::grh::OperationKind::kWildcardEq:
+                case wolvrix::lib::grh::OperationKind::kWildcardNe:
+                case wolvrix::lib::grh::OperationKind::kLt:
+                case wolvrix::lib::grh::OperationKind::kLe:
+                case wolvrix::lib::grh::OperationKind::kGt:
+                case wolvrix::lib::grh::OperationKind::kGe:
+                case wolvrix::lib::grh::OperationKind::kAnd:
+                case wolvrix::lib::grh::OperationKind::kOr:
+                case wolvrix::lib::grh::OperationKind::kXor:
+                case wolvrix::lib::grh::OperationKind::kXnor:
+                case wolvrix::lib::grh::OperationKind::kShl:
+                case wolvrix::lib::grh::OperationKind::kLShr:
+                case wolvrix::lib::grh::OperationKind::kAShr:
+                case wolvrix::lib::grh::OperationKind::kAdd:
+                case wolvrix::lib::grh::OperationKind::kSub:
+                case wolvrix::lib::grh::OperationKind::kMul:
+                case wolvrix::lib::grh::OperationKind::kDiv:
+                case wolvrix::lib::grh::OperationKind::kMod:
+                case wolvrix::lib::grh::OperationKind::kLogicAnd:
+                case wolvrix::lib::grh::OperationKind::kLogicOr:
+                case wolvrix::lib::grh::OperationKind::kNot:
+                case wolvrix::lib::grh::OperationKind::kReduceAnd:
+                case wolvrix::lib::grh::OperationKind::kReduceOr:
+                case wolvrix::lib::grh::OperationKind::kReduceXor:
+                case wolvrix::lib::grh::OperationKind::kReduceNor:
+                case wolvrix::lib::grh::OperationKind::kReduceNand:
+                case wolvrix::lib::grh::OperationKind::kReduceXnor:
+                case wolvrix::lib::grh::OperationKind::kLogicNot:
+                case wolvrix::lib::grh::OperationKind::kMux:
+                case wolvrix::lib::grh::OperationKind::kAssign:
+                case wolvrix::lib::grh::OperationKind::kConcat:
+                case wolvrix::lib::grh::OperationKind::kReplicate:
+                case wolvrix::lib::grh::OperationKind::kSliceStatic:
+                case wolvrix::lib::grh::OperationKind::kSliceDynamic:
+                case wolvrix::lib::grh::OperationKind::kSliceArray:
+                    return true;
+                default:
+                    return false;
+                }
+            };
+
             std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash> dpiDrivenStateOps;
             std::unordered_map<wolvrix::lib::grh::ValueId,
                                std::vector<wolvrix::lib::grh::OperationId>,
@@ -2019,22 +2181,37 @@ namespace wolvrix::lib::emit
             auto collectStateSinks =
                 [&](auto &&self,
                     wolvrix::lib::grh::ValueId valueId,
-                    std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> &visited,
-                    std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash> &sinks) -> void
+                    std::unordered_map<wolvrix::lib::grh::ValueId, bool,
+                                       wolvrix::lib::grh::ValueIdHash> &reachesStateMemo,
+                    std::unordered_set<wolvrix::lib::grh::ValueId,
+                                       wolvrix::lib::grh::ValueIdHash> &visiting,
+                    std::unordered_set<wolvrix::lib::grh::OperationId,
+                                       wolvrix::lib::grh::OperationIdHash> &sinks,
+                    std::unordered_set<wolvrix::lib::grh::OperationId,
+                                       wolvrix::lib::grh::OperationIdHash> &unsupportedOps,
+                    std::unordered_set<wolvrix::lib::grh::OperationId,
+                                       wolvrix::lib::grh::OperationIdHash> &effectConsumers) -> bool
             {
                 if (!valueId.valid() || valueId.graph != graph->id())
                 {
-                    return;
+                    return false;
                 }
-                if (!visited.insert(valueId).second)
+                if (auto memo = reachesStateMemo.find(valueId); memo != reachesStateMemo.end())
                 {
-                    return;
+                    return memo->second;
+                }
+                if (!visiting.insert(valueId).second)
+                {
+                    return false;
                 }
                 auto itUses = valueUseMap.find(valueId);
                 if (itUses == valueUseMap.end())
                 {
-                    return;
+                    visiting.erase(valueId);
+                    reachesStateMemo.emplace(valueId, false);
+                    return false;
                 }
+                bool reachesState = false;
                 for (const auto userOpId : itUses->second)
                 {
                     if (!userOpId.valid())
@@ -2042,16 +2219,42 @@ namespace wolvrix::lib::emit
                         continue;
                     }
                     const wolvrix::lib::grh::Operation userOp = graph->getOperation(userOpId);
+                    const bool isEffectConsumer =
+                        userOp.kind() == wolvrix::lib::grh::OperationKind::kSystemTask ||
+                        userOp.kind() == wolvrix::lib::grh::OperationKind::kDpicCall ||
+                        (userOp.kind() == wolvrix::lib::grh::OperationKind::kSystemFunction &&
+                         getAttribute<bool>(*graph, userOp, "hasSideEffects").value_or(false));
+                    if (isEffectConsumer)
+                    {
+                        effectConsumers.insert(userOpId);
+                        continue;
+                    }
                     if (isStateSinkKind(userOp.kind()))
                     {
                         sinks.insert(userOpId);
+                        reachesState = true;
                         continue;
                     }
+                    bool userReachesState = false;
                     for (const auto result : userOp.results())
                     {
-                        self(self, result, visited, sinks);
+                        userReachesState |= self(self,
+                                                 result,
+                                                 reachesStateMemo,
+                                                 visiting,
+                                                 sinks,
+                                                 unsupportedOps,
+                                                 effectConsumers);
                     }
+                    if (userReachesState && !isDpiProcedurallyInlineableKind(userOp.kind()))
+                    {
+                        unsupportedOps.insert(userOpId);
+                    }
+                    reachesState |= userReachesState;
                 }
+                visiting.erase(valueId);
+                reachesStateMemo.emplace(valueId, reachesState);
+                return reachesState;
             };
             auto formatSinkName = [&](wolvrix::lib::grh::OperationId sinkOpId) -> std::string
             {
@@ -2101,56 +2304,77 @@ namespace wolvrix::lib::emit
                 label << "kDpicCall#" << dpiOp.id().index;
                 return label.str();
             };
-            auto canInlineDpiCall = [&](const wolvrix::lib::grh::Operation &dpiOp) -> bool
+            auto dpiStateSequenceMatches =
+                [&](const wolvrix::lib::grh::Operation &dpiOp,
+                    const wolvrix::lib::grh::Operation &sinkOp) -> bool
             {
-                auto targetImport = getAttribute<std::string>(*graph, dpiOp, "targetImportSymbol");
-                auto inArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "inArgName");
-                auto outArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "outArgName");
-                auto inoutArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "inoutArgName");
-                const auto hasReturn = getAttribute<bool>(*graph, dpiOp, "hasReturn").value_or(false);
-                if (!targetImport || !inArgName || !outArgName)
-                {
-                    return false;
-                }
-                if (!hasReturn)
-                {
-                    return false;
-                }
-                if ((outArgName && !outArgName->empty()) ||
-                    (inoutArgName && !inoutArgName->empty()))
-                {
-                    return false;
-                }
+                const std::string opContext = std::string(dpiOp.symbolText());
                 const auto &operands = dpiOp.operands();
                 if (operands.empty())
                 {
+                    reportError("kDpicCall missing updateCond operand", opContext);
                     return false;
                 }
-                auto itImport = dpicImports.find(*targetImport);
-                if (itImport == dpicImports.end() || itImport->second.graph == nullptr)
+
+                const wolvrix::lib::grh::ValueId dpiUpdateCond = operands[0];
+                if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort)
                 {
-                    return false;
-                }
-                const DpiImportRef &importRef = itImport->second;
-                const wolvrix::lib::grh::Operation importOp = importRef.graph->getOperation(importRef.op);
-                auto importArgs = getAttribute<std::vector<std::string>>(*importRef.graph, importOp, "argsName");
-                auto importDirs =
-                    getAttribute<std::vector<std::string>>(*importRef.graph, importOp, "argsDirection");
-                if (!importArgs || !importDirs || importArgs->size() != importDirs->size())
-                {
-                    return false;
-                }
-                for (std::size_t i = 0; i < importArgs->size(); ++i)
-                {
-                    const std::string &formal = (*importArgs)[i];
-                    const std::string &dir = (*importDirs)[i];
-                    if (dir != "input")
+                    const auto &sinkOperands = sinkOp.operands();
+                    if (sinkOperands.empty())
                     {
+                        reportError("DPI sink missing updateCond operand", opContext);
                         return false;
                     }
-                    int idx = findNameIndex(*inArgName, formal);
-                    if (idx < 0 || static_cast<std::size_t>(idx + 1) >= operands.size())
+                    // DPI results retain their last value while the call guard is false. A
+                    // merged write port may therefore have a broader guard and select the
+                    // current DPI result only on the call branch.
+                }
+                else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                {
+                    if (!isConstOneValue(dpiUpdateCond))
                     {
+                        reportError("kDpicCall updateCond must be constant 1 for memory read port inline",
+                                    opContext);
+                        return false;
+                    }
+                }
+
+                if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort)
+                {
+                    auto eventEdges = getAttribute<std::vector<std::string>>(*graph, dpiOp, "eventEdge");
+                    if (!eventEdges)
+                    {
+                        reportError("kDpicCall missing eventEdge", opContext);
+                        return false;
+                    }
+                    if (operands.size() < eventEdges->size())
+                    {
+                        reportError("kDpicCall operand count does not match eventEdge", opContext);
+                        return false;
+                    }
+                    const std::size_t eventStart = operands.size() - eventEdges->size();
+                    auto dpiKey = computeEventKey(dpiOp, eventStart, opContext);
+                    auto sinkKey = computeEventKey(
+                        sinkOp,
+                        sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ? 3U : 4U,
+                        std::string(sinkOp.symbolText()));
+                    if (!dpiKey || !sinkKey || !sameSeqKey(*dpiKey, *sinkKey))
+                    {
+                        reportError("kDpicCall eventEdge does not match sink eventEdge for atomic state update",
+                                    opContext);
+                        return false;
+                    }
+                }
+                else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort ||
+                         sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                {
+                    auto eventEdges = getAttribute<std::vector<std::string>>(*graph, dpiOp, "eventEdge");
+                    if (eventEdges && !eventEdges->empty())
+                    {
+                        reportError("kDpicCall eventEdge must be empty for comb/latch inline", opContext);
                         return false;
                     }
                 }
@@ -2167,9 +2391,10 @@ namespace wolvrix::lib::emit
                 const std::string opContext = std::string(op.symbolText());
                 const std::string dpiName = formatDpiName(op);
                 const auto hasReturn = getAttribute<bool>(*graph, op, "hasReturn").value_or(false);
-                wolvrix::lib::grh::OperationId returnSinkOpId = wolvrix::lib::grh::OperationId::invalid();
                 bool resultsOk = true;
                 const auto &results = op.results();
+                std::vector<wolvrix::lib::grh::OperationId> resultSinkOps(
+                    results.size(), wolvrix::lib::grh::OperationId::invalid());
                 for (std::size_t resIdx = 0; resIdx < results.size(); ++resIdx)
                 {
                     const auto res = results[resIdx];
@@ -2178,8 +2403,69 @@ namespace wolvrix::lib::emit
                         continue;
                     }
                     std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash> sinks;
-                    std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> visited;
-                    collectStateSinks(collectStateSinks, res, visited, sinks);
+                    std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>
+                        unsupportedOps;
+                    std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>
+                        effectConsumers;
+                    std::unordered_map<wolvrix::lib::grh::ValueId, bool,
+                                       wolvrix::lib::grh::ValueIdHash> reachesStateMemo;
+                    std::unordered_set<wolvrix::lib::grh::ValueId,
+                                       wolvrix::lib::grh::ValueIdHash> visiting;
+                    collectStateSinks(collectStateSinks,
+                                      res,
+                                      reachesStateMemo,
+                                      visiting,
+                                      sinks,
+                                      unsupportedOps,
+                                      effectConsumers);
+                    if (!effectConsumers.empty())
+                    {
+                        std::ostringstream details;
+                        bool firstOp = true;
+                        for (const auto effectOpId : effectConsumers)
+                        {
+                            if (!firstOp)
+                            {
+                                details << ", ";
+                            }
+                            firstOp = false;
+                            const auto effectOp = graph->getOperation(effectOpId);
+                            details << wolvrix::lib::grh::toString(effectOp.kind());
+                            if (!effectOp.symbolText().empty())
+                            {
+                                details << "(" << effectOp.symbolText() << ")";
+                            }
+                        }
+                        reportError("kDpicCall result is consumed by effect operations that cannot be "
+                                        "ordered atomically: " + details.str(),
+                                    opContext);
+                        resultsOk = false;
+                        continue;
+                    }
+                    if (!unsupportedOps.empty())
+                    {
+                        std::ostringstream details;
+                        bool firstOp = true;
+                        for (const auto unsupportedOpId : unsupportedOps)
+                        {
+                            if (!firstOp)
+                            {
+                                details << ", ";
+                            }
+                            firstOp = false;
+                            const auto unsupportedOp = graph->getOperation(unsupportedOpId);
+                            details << wolvrix::lib::grh::toString(unsupportedOp.kind());
+                            if (!unsupportedOp.symbolText().empty())
+                            {
+                                details << "(" << unsupportedOp.symbolText() << ")";
+                            }
+                        }
+                        reportError("kDpicCall result reaches state through operations that cannot be "
+                                        "inlined atomically: " + details.str(),
+                                    opContext);
+                        resultsOk = false;
+                        continue;
+                    }
                     if (sinks.size() > 1)
                     {
                         std::ostringstream details;
@@ -2202,122 +2488,63 @@ namespace wolvrix::lib::emit
                         resultsOk = false;
                         continue;
                     }
-                    if (hasReturn && resIdx == 0 && sinks.size() == 1)
+                    if (sinks.size() == 1)
                     {
-                        returnSinkOpId = *sinks.begin();
+                        resultSinkOps[resIdx] = *sinks.begin();
                     }
                 }
                 if (!resultsOk)
                 {
                     continue;
                 }
-                if (!hasReturn || !returnSinkOpId.valid())
-                {
-                    continue;
-                }
-                const wolvrix::lib::grh::Operation sinkOp = graph->getOperation(returnSinkOpId);
 
                 auto outArgName = getAttribute<std::vector<std::string>>(*graph, op, "outArgName");
                 auto inoutArgName = getAttribute<std::vector<std::string>>(*graph, op, "inoutArgName");
-                if ((outArgName && !outArgName->empty()) ||
-                    (inoutArgName && !inoutArgName->empty()))
-                {
-                    continue;
-                }
-                if (op.results().size() != 1)
+                const std::size_t expectedResultCount =
+                    (hasReturn ? 1U : 0U) +
+                    (outArgName ? outArgName->size() : 0U) +
+                    (inoutArgName ? inoutArgName->size() : 0U);
+                if (results.size() < expectedResultCount)
                 {
                     continue;
                 }
 
-                const auto &operands = op.operands();
-                if (operands.empty())
+                std::unordered_set<wolvrix::lib::grh::OperationId,
+                                   wolvrix::lib::grh::OperationIdHash>
+                    atomicSinks;
+                for (std::size_t resIdx = 0; resIdx < expectedResultCount; ++resIdx)
                 {
-                    reportError("kDpicCall missing updateCond operand", opContext);
-                    continue;
-                }
-                const wolvrix::lib::grh::ValueId dpiUpdateCond = operands[0];
-                bool updateCondOk = true;
-                if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
-                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort ||
-                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort)
-                {
-                    const auto &sinkOperands = sinkOp.operands();
-                    if (sinkOperands.empty())
+                    if (resultSinkOps[resIdx].valid())
                     {
-                        reportError("DPI sink missing updateCond operand", opContext);
-                        updateCondOk = false;
-                    }
-                    else
-                    {
-                        const wolvrix::lib::grh::ValueId sinkUpdateCond = sinkOperands[0];
-                        const bool bothConstOne =
-                            isConstOneValue(dpiUpdateCond) && isConstOneValue(sinkUpdateCond);
-                        if (!bothConstOne && dpiUpdateCond != sinkUpdateCond)
-                        {
-                            reportError("kDpicCall updateCond must match sink updateCond for inline",
-                                        opContext);
-                            updateCondOk = false;
-                        }
+                        atomicSinks.insert(resultSinkOps[resIdx]);
                     }
                 }
-                else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                bool atomicSinksOk = true;
+                for (const auto sinkOpId : atomicSinks)
                 {
-                    if (!isConstOneValue(dpiUpdateCond))
+                    const wolvrix::lib::grh::Operation sinkOp = graph->getOperation(sinkOpId);
+                    if (sinkOp.kind() != wolvrix::lib::grh::OperationKind::kRegisterWritePort &&
+                        sinkOp.kind() != wolvrix::lib::grh::OperationKind::kMemoryWritePort)
                     {
-                        reportError("kDpicCall updateCond must be constant 1 for memory read port inline",
+                        reportError("kDpicCall output/inout result requires a supported atomic state sink",
                                     opContext);
-                        updateCondOk = false;
-                    }
-                }
-                if (!updateCondOk)
-                {
-                    continue;
-                }
-
-                bool eventOk = true;
-                if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
-                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort)
-                {
-                    auto eventEdges = getAttribute<std::vector<std::string>>(*graph, op, "eventEdge");
-                    if (!eventEdges)
-                    {
-                        reportError("kDpicCall missing eventEdge", opContext);
+                        atomicSinksOk = false;
                         continue;
                     }
-                    const std::size_t eventStart = operands.size() - eventEdges->size();
-                    auto dpiKey = computeEventKey(op, eventStart, opContext);
-                    auto sinkKey = computeEventKey(
-                        sinkOp,
-                        sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ? 3U : 4U,
-                        std::string(sinkOp.symbolText()));
-                    if (!dpiKey || !sinkKey || !sameSeqKey(*dpiKey, *sinkKey))
+                    if (!dpiStateSequenceMatches(op, sinkOp))
                     {
-                        reportError("kDpicCall eventEdge does not match sink eventEdge for inline",
-                                    opContext);
-                        eventOk = false;
+                        atomicSinksOk = false;
                     }
                 }
-                else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort ||
-                         sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
-                {
-                    auto eventEdges = getAttribute<std::vector<std::string>>(*graph, op, "eventEdge");
-                    if (eventEdges && !eventEdges->empty())
-                    {
-                        reportError("kDpicCall eventEdge must be empty for comb/latch inline", opContext);
-                        eventOk = false;
-                    }
-                }
-                if (!eventOk)
+                if (!atomicSinksOk)
                 {
                     continue;
                 }
-                if (!canInlineDpiCall(op))
+                for (const auto sinkOpId : atomicSinks)
                 {
-                    continue;
+                    dpiDrivenStateOps.insert(sinkOpId);
+                    sequentialStmtPredecessors[sinkOpId].insert(opId);
                 }
-
-                dpiInlineReturnSink.emplace(opId, returnSinkOpId);
-                dpiDrivenStateOps.insert(returnSinkOpId);
             }
             const uint32_t dpiMaxValueIndex = maxValueIndex;
             std::vector<int8_t> dpiDependsDense(dpiMaxValueIndex + 1, -1);
@@ -2378,55 +2605,8 @@ namespace wolvrix::lib::emit
                     }
                     return false;
                 };
-                bool depends = false;
-                switch (graph->opKind(defOpId))
-                {
-                case wolvrix::lib::grh::OperationKind::kConstant:
-                case wolvrix::lib::grh::OperationKind::kEq:
-                case wolvrix::lib::grh::OperationKind::kNe:
-                case wolvrix::lib::grh::OperationKind::kCaseEq:
-                case wolvrix::lib::grh::OperationKind::kCaseNe:
-                case wolvrix::lib::grh::OperationKind::kWildcardEq:
-                case wolvrix::lib::grh::OperationKind::kWildcardNe:
-                case wolvrix::lib::grh::OperationKind::kLt:
-                case wolvrix::lib::grh::OperationKind::kLe:
-                case wolvrix::lib::grh::OperationKind::kGt:
-                case wolvrix::lib::grh::OperationKind::kGe:
-                case wolvrix::lib::grh::OperationKind::kAnd:
-                case wolvrix::lib::grh::OperationKind::kOr:
-                case wolvrix::lib::grh::OperationKind::kXor:
-                case wolvrix::lib::grh::OperationKind::kXnor:
-                case wolvrix::lib::grh::OperationKind::kShl:
-                case wolvrix::lib::grh::OperationKind::kLShr:
-                case wolvrix::lib::grh::OperationKind::kAShr:
-                case wolvrix::lib::grh::OperationKind::kAdd:
-                case wolvrix::lib::grh::OperationKind::kSub:
-                case wolvrix::lib::grh::OperationKind::kMul:
-                case wolvrix::lib::grh::OperationKind::kDiv:
-                case wolvrix::lib::grh::OperationKind::kMod:
-                case wolvrix::lib::grh::OperationKind::kLogicAnd:
-                case wolvrix::lib::grh::OperationKind::kLogicOr:
-                case wolvrix::lib::grh::OperationKind::kNot:
-                case wolvrix::lib::grh::OperationKind::kReduceAnd:
-                case wolvrix::lib::grh::OperationKind::kReduceOr:
-                case wolvrix::lib::grh::OperationKind::kReduceXor:
-                case wolvrix::lib::grh::OperationKind::kReduceNor:
-                case wolvrix::lib::grh::OperationKind::kReduceNand:
-                case wolvrix::lib::grh::OperationKind::kReduceXnor:
-                case wolvrix::lib::grh::OperationKind::kLogicNot:
-                case wolvrix::lib::grh::OperationKind::kMux:
-                case wolvrix::lib::grh::OperationKind::kAssign:
-                case wolvrix::lib::grh::OperationKind::kConcat:
-                case wolvrix::lib::grh::OperationKind::kReplicate:
-                case wolvrix::lib::grh::OperationKind::kSliceStatic:
-                case wolvrix::lib::grh::OperationKind::kSliceDynamic:
-                case wolvrix::lib::grh::OperationKind::kSliceArray:
-                    depends = dependsForOperands();
-                    break;
-                default:
-                    depends = false;
-                    break;
-                }
+                const bool depends = isDpiProcedurallyInlineableKind(graph->opKind(defOpId)) &&
+                                     dependsForOperands();
                 dpiDependsVisiting[idx] = 0;
                 dpiDependsDense[idx] = depends ? 1 : 0;
                 return depends;
@@ -2451,81 +2631,6 @@ namespace wolvrix::lib::emit
                     return false;
                 }
                 return dpiDependsDense[idx] > 0;
-            };
-
-            auto buildDpiCallExpr = [&](const wolvrix::lib::grh::Operation &dpiOp) -> std::optional<std::string>
-            {
-                const std::string opContext = std::string(dpiOp.symbolText());
-                const auto &operands = dpiOp.operands();
-                auto targetImport = getAttribute<std::string>(*graph, dpiOp, "targetImportSymbol");
-                auto inArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "inArgName");
-                auto outArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "outArgName");
-                auto inoutArgName = getAttribute<std::vector<std::string>>(*graph, dpiOp, "inoutArgName");
-                auto hasReturn = getAttribute<bool>(*graph, dpiOp, "hasReturn").value_or(false);
-                if (!targetImport || !inArgName || !outArgName)
-                {
-                    reportError("kDpicCall missing metadata for inline", opContext);
-                    return std::nullopt;
-                }
-                if (!hasReturn)
-                {
-                    reportError("kDpicCall without return cannot be inlined", opContext);
-                    return std::nullopt;
-                }
-                if ((outArgName && !outArgName->empty()) ||
-                    (inoutArgName && !inoutArgName->empty()))
-                {
-                    reportError("kDpicCall inline supports return-only results", opContext);
-                    return std::nullopt;
-                }
-                if (operands.empty())
-                {
-                    reportError("kDpicCall missing operands for inline", opContext);
-                    return std::nullopt;
-                }
-                auto itImport = dpicImports.find(*targetImport);
-                if (itImport == dpicImports.end() || itImport->second.graph == nullptr)
-                {
-                    reportError("kDpicCall cannot resolve import symbol for inline", opContext);
-                    return std::nullopt;
-                }
-                const DpiImportRef &importRef = itImport->second;
-                const wolvrix::lib::grh::Operation importOp = importRef.graph->getOperation(importRef.op);
-                auto importArgs = getAttribute<std::vector<std::string>>(*importRef.graph, importOp, "argsName");
-                auto importDirs =
-                    getAttribute<std::vector<std::string>>(*importRef.graph, importOp, "argsDirection");
-                if (!importArgs || !importDirs || importArgs->size() != importDirs->size())
-                {
-                    reportError("kDpicCall found malformed import signature for inline", opContext);
-                    return std::nullopt;
-                }
-                std::ostringstream expr;
-                expr << *targetImport << "(";
-                bool firstArg = true;
-                for (std::size_t i = 0; i < importArgs->size(); ++i)
-                {
-                    if (!firstArg)
-                    {
-                        expr << ", ";
-                    }
-                    firstArg = false;
-                    const std::string &formal = (*importArgs)[i];
-                    const std::string &dir = (*importDirs)[i];
-                    if (dir != "input")
-                    {
-                        reportError("kDpicCall inline supports only input args", opContext);
-                        return std::nullopt;
-                    }
-                    int idx = findNameIndex(*inArgName, formal);
-                    if (idx < 0 || static_cast<std::size_t>(idx + 1) >= operands.size())
-                    {
-                        reportError("kDpicCall missing matching input arg " + formal, opContext);
-                        return std::nullopt;
-                    }
-                    expr << valueExpr(operands[static_cast<std::size_t>(idx + 1)]);
-                }
-                expr << ")";
-                return expr.str();
             };
 
             wolvrix::lib::grh::OperationId dpiInlineSink = wolvrix::lib::grh::OperationId::invalid();
@@ -2555,22 +2660,6 @@ namespace wolvrix::lib::emit
                     return cached->second;
                 }
                 const wolvrix::lib::grh::OperationId defOpId = graph->valueDef(valueId);
-                if (defOpId.valid())
-                {
-                    if (graph->opKind(defOpId) == wolvrix::lib::grh::OperationKind::kDpicCall && dpiInlineSink.valid())
-                    {
-                        auto itSink = dpiInlineReturnSink.find(defOpId);
-                        if (itSink != dpiInlineReturnSink.end() && itSink->second == dpiInlineSink)
-                        {
-                            const wolvrix::lib::grh::Operation defOp = graph->getOperation(defOpId);
-                            if (auto inlineExpr = buildDpiCallExpr(defOp))
-                            {
-                                dpiInlineCache.emplace(valueId, *inlineExpr);
-                                return *inlineExpr;
-                            }
-                        }
-                    }
-                }
                 if (auto it = dpiTempNames.find(valueId); it != dpiTempNames.end())
                 {
                     return it->second;
@@ -2738,6 +2827,24 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kConcat:
                     if (!ops.empty())
                     {
+                        int64_t concatWidth = 0;
+                        bool concatWidthKnown = true;
+                        for (const auto operand : ops)
+                        {
+                            if (!operand.valid() ||
+                                graph->valueType(operand) != wolvrix::lib::grh::ValueType::Logic)
+                            {
+                                concatWidthKnown = false;
+                                break;
+                            }
+                            const int64_t operandWidth = graph->valueWidth(operand);
+                            if (operandWidth <= 0)
+                            {
+                                concatWidthKnown = false;
+                                break;
+                            }
+                            concatWidth += operandWidth;
+                        }
                         if (ops.size() == 1)
                         {
                             expr = inlineExpr.valueExpr(ops[0]);
@@ -2775,6 +2882,11 @@ namespace wolvrix::lib::emit
                             exprStream << "  }";
                             expr = exprStream.str();
                         }
+                        const int64_t resultWidth = graph->valueWidth(valueId);
+                        if (concatWidthKnown && resultWidth > 0 && concatWidth > resultWidth)
+                        {
+                            expr = std::to_string(resultWidth) + "'(" + expr + ")";
+                        }
                     }
                     break;
                 case wolvrix::lib::grh::OperationKind::kReplicate:
@@ -2787,6 +2899,14 @@ namespace wolvrix::lib::emit
                             std::ostringstream exprStream;
                             exprStream << "{" << *rep << "{" << inlineExpr.concatOperandExpr(ops[0]) << "}}";
                             expr = exprStream.str();
+                            const int64_t resultWidth = graph->valueWidth(valueId);
+                            const int64_t operandWidth = graph->valueWidth(ops[0]);
+                            if (resultWidth > 0 && operandWidth > 0 &&
+                                graph->valueType(ops[0]) == wolvrix::lib::grh::ValueType::Logic &&
+                                operandWidth * (*rep) > resultWidth)
+                            {
+                                expr = std::to_string(resultWidth) + "'(" + expr + ")";
+                            }
                         }
                     }
                     break;
@@ -2831,6 +2951,14 @@ namespace wolvrix::lib::emit
                         if (width)
                         {
                             const int64_t operandWidth = graph->valueWidth(ops[0]);
+                            auto indexExpr = [&](wolvrix::lib::grh::ValueId indexId) -> std::string
+                            {
+                                if (auto literal = inlineConstExprFor(indexId))
+                                {
+                                    return *literal;
+                                }
+                                return inlineExpr.clampIndexExpr(indexId, operandWidth);
+                            };
                             std::ostringstream exprStream;
                             if (operandWidth == 1)
                             {
@@ -2839,12 +2967,12 @@ namespace wolvrix::lib::emit
                             else if (*width == 1)
                             {
                                 exprStream << parenIfNeeded(inlineExpr.valueExpr(ops[0])) << "[" <<
-                                    parenIfNeeded(inlineExpr.valueExpr(ops[1])) << "]";
+                                    indexExpr(ops[1]) << "]";
                             }
                             else
                             {
                                 exprStream << parenIfNeeded(inlineExpr.valueExpr(ops[0])) << "[" <<
-                                    parenIfNeeded(inlineExpr.valueExpr(ops[1])) << " +: " << *width << "]";
+                                    indexExpr(ops[1]) << " +: " << *width << "]";
                             }
                             expr = exprStream.str();
                         }
@@ -2884,6 +3012,12 @@ namespace wolvrix::lib::emit
                 }
                 default:
                     break;
+                }
+                if (graph->valueType(valueId) == wolvrix::lib::grh::ValueType::Logic &&
+                    !expr.empty())
+                {
+                    expr = std::string(graph->valueSigned(valueId) ? "$signed(" : "$unsigned(") +
+                           expr + ")";
                 }
                 dpiInlineResolving.erase(valueId);
                 dpiInlineCache.emplace(valueId, expr);
@@ -5499,13 +5633,6 @@ namespace wolvrix::lib::emit
                     if (!importArgs || !importDirs || importArgs->size() != importDirs->size())
                     {
                         reportError("kDpicCall found malformed import signature", *targetImport);
-                        break;
-                    }
-
-                    const bool inlineReturn =
-                        hasReturn && (dpiInlineReturnSink.find(opId) != dpiInlineReturnSink.end());
-                    if (inlineReturn)
-                    {
                         break;
                     }
 

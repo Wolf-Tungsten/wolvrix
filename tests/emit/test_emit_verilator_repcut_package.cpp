@@ -2,6 +2,7 @@
 #include "core/grh.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -36,6 +37,18 @@ namespace
     bool contains(std::string_view text, std::string_view needle)
     {
         return text.find(needle) != std::string_view::npos;
+    }
+
+    std::size_t countOccurrences(std::string_view text, std::string_view needle)
+    {
+        std::size_t count = 0;
+        std::size_t position = 0;
+        while ((position = text.find(needle, position)) != std::string_view::npos)
+        {
+            ++count;
+            position += needle.size();
+        }
+        return count;
     }
 
     std::string diagnosticsSummary(const EmitDiagnostics &diagnostics)
@@ -109,38 +122,42 @@ namespace
         const auto effectReset = effect.createValue(effect.internSymbol("reset"), 1, false);
         const auto effectInput = effect.createValue(effect.internSymbol("in__data"), 8, false);
         const auto effectOutput = effect.createValue(effect.internSymbol("effect__out"), 8, false);
+        const auto effectDpiResult = effect.createValue(effect.internSymbol("effect_dpi_result"), 8, false);
+        const auto stateOutput = effect.createValue(effect.internSymbol("state__out"), 8, false);
         const auto effectCond = effect.createValue(effect.internSymbol("effect_cond"), 1, false);
         effect.bindInputPort("clock", effectClock);
         effect.bindInputPort("reset", effectReset);
         effect.bindInputPort("in__data", effectInput);
         effect.bindOutputPort("effect__out", effectOutput);
+        effect.bindOutputPort("state__out", stateOutput);
         const auto condConst =
             effect.createOperation(OperationKind::kConstant, effect.internSymbol("const_true"));
         effect.setAttr(condConst, "constValue", std::string("1'b1"));
         effect.addResult(condConst, effectCond);
         const auto dpiImport =
             effect.createOperation(OperationKind::kDpicImport, effect.internSymbol("dpi_func"));
-        effect.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
-        effect.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8});
-        effect.setAttr(dpiImport, "argsName", std::vector<std::string>{"in_val"});
-        effect.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
-        effect.setAttr(dpiImport, "argsType", std::vector<std::string>{"logic"});
-        effect.setAttr(dpiImport, "hasReturn", true);
-        effect.setAttr(dpiImport, "returnWidth", static_cast<int64_t>(8));
-        effect.setAttr(dpiImport, "returnSigned", false);
-        effect.setAttr(dpiImport, "returnType", std::string("logic"));
+        effect.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input", "output"});
+        effect.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8, 8});
+        effect.setAttr(dpiImport, "argsName", std::vector<std::string>{"in_val", "out_val"});
+        effect.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, false});
+        effect.setAttr(dpiImport, "argsType", std::vector<std::string>{"logic", "logic"});
+        effect.setAttr(dpiImport, "hasReturn", false);
         (void)dpiImport;
         const auto dpiCall =
             effect.createOperation(OperationKind::kDpicCall, effect.internSymbol("dpi_call"));
         effect.addOperand(dpiCall, effectCond);
         effect.addOperand(dpiCall, effectInput);
         effect.addOperand(dpiCall, effectClock);
-        effect.addResult(dpiCall, effectOutput);
+        effect.addResult(dpiCall, effectDpiResult);
         effect.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_func"));
         effect.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
         effect.setAttr(dpiCall, "inArgName", std::vector<std::string>{"in_val"});
-        effect.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
-        effect.setAttr(dpiCall, "hasReturn", true);
+        effect.setAttr(dpiCall, "outArgName", std::vector<std::string>{"out_val"});
+        effect.setAttr(dpiCall, "hasReturn", false);
+        const auto effectAssign = effect.createOperation(OperationKind::kAssign,
+                                                         effect.internSymbol("effect_result_assign"));
+        effect.addOperand(effectAssign, effectDpiResult);
+        effect.addResult(effectAssign, effectOutput);
 
         const auto dpiImportVoid =
             effect.createOperation(OperationKind::kDpicImport, effect.internSymbol("dpi_void_func"));
@@ -160,10 +177,42 @@ namespace
         effect.setAttr(dpiCallVoid, "inArgName", std::vector<std::string>{"in_val"});
         effect.setAttr(dpiCallVoid, "outArgName", std::vector<std::string>{});
         effect.setAttr(dpiCallVoid, "hasReturn", false);
-        buildUnitGraph(design,
-                       "SimTop_logic_part_repcut_part0",
-                       {{"clock", 1}, {"reset", 1}, {"effect__out", 8}},
-                       {{"mid__val", 8}});
+
+        const auto stateReg = effect.createOperation(OperationKind::kRegister,
+                                                     effect.internSymbol("state_reg"));
+        effect.setAttr(stateReg, "width", static_cast<int64_t>(8));
+        effect.setAttr(stateReg, "isSigned", false);
+        const auto stateRead = effect.createOperation(OperationKind::kRegisterReadPort,
+                                                      effect.internSymbol("state_read"));
+        effect.addResult(stateRead, stateOutput);
+        effect.setAttr(stateRead, "regSymbol", std::string("state_reg"));
+        Graph &part0 = buildUnitGraph(design,
+                                      "SimTop_logic_part_repcut_part0",
+                                      {{"clock", 1}, {"reset", 1}, {"effect__out", 8}, {"state__out", 8}},
+                                      {{"mid__val", 8}});
+        const auto part0Cond = part0.createValue(part0.internSymbol("part0_cond"), 1, false);
+        const auto part0CondConst =
+            part0.createOperation(OperationKind::kConstant, part0.internSymbol("part0_const_true"));
+        part0.setAttr(part0CondConst, "constValue", std::string("1'b1"));
+        part0.addResult(part0CondConst, part0Cond);
+        const auto part0DpiImport =
+            part0.createOperation(OperationKind::kDpicImport, part0.internSymbol("part0_dpi_void_func"));
+        part0.setAttr(part0DpiImport, "argsDirection", std::vector<std::string>{"input"});
+        part0.setAttr(part0DpiImport, "argsWidth", std::vector<int64_t>{8});
+        part0.setAttr(part0DpiImport, "argsName", std::vector<std::string>{"in_val"});
+        part0.setAttr(part0DpiImport, "argsSigned", std::vector<bool>{false});
+        part0.setAttr(part0DpiImport, "argsType", std::vector<std::string>{"logic"});
+        part0.setAttr(part0DpiImport, "hasReturn", false);
+        const auto part0DpiCall =
+            part0.createOperation(OperationKind::kDpicCall, part0.internSymbol("part0_dpi_call_void"));
+        part0.addOperand(part0DpiCall, part0Cond);
+        part0.addOperand(part0DpiCall, part0.inputPorts()[2].value);
+        part0.addOperand(part0DpiCall, part0.inputPorts()[0].value);
+        part0.setAttr(part0DpiCall, "targetImportSymbol", std::string("part0_dpi_void_func"));
+        part0.setAttr(part0DpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+        part0.setAttr(part0DpiCall, "inArgName", std::vector<std::string>{"in_val"});
+        part0.setAttr(part0DpiCall, "outArgName", std::vector<std::string>{});
+        part0.setAttr(part0DpiCall, "hasReturn", false);
         buildUnitGraph(design,
                        "SimTop_logic_part_repcut_part1",
                        {{"clock", 1}, {"reset", 1}, {"mid__val", 8}, {"sel", 1}},
@@ -175,6 +224,7 @@ namespace
         const auto reset = top.createValue(top.internSymbol("reset"), 1, false);
         const auto inData = top.createValue(top.internSymbol("in_data"), 8, false);
         const auto effectOut = top.createValue(top.internSymbol("effect__out"), 8, false);
+        const auto stateOut = top.createValue(top.internSymbol("state__out"), 8, false);
         const auto mid = top.createValue(top.internSymbol("mid"), 8, false);
         const auto outData = top.createValue(top.internSymbol("out_data"), 8, false);
         const auto outAlias = top.createValue(top.internSymbol("out_alias"), 8, false);
@@ -184,6 +234,7 @@ namespace
         top.bindInputPort("reset", reset);
         top.bindInputPort("in_data", inData);
         top.bindOutputPort("out", outAlias);
+        top.bindOutputPort("effect_tap", effectOut);
 
         const auto clockAssign = top.createOperation(OperationKind::kAssign, top.internSymbol("assign_clock_alias"));
         top.addOperand(clockAssign, clock);
@@ -201,15 +252,15 @@ namespace
                     "effect_part",
                     "SimTop_effect_part",
                     {linkClock, reset, inData},
-                    {effectOut},
+                    {effectOut, stateOut},
                     {"clock", "reset", "in__data"},
-                    {"effect__out"});
+                    {"effect__out", "state__out"});
         addInstance(top,
                     "part_0",
                     "SimTop_logic_part_repcut_part0",
-                    {linkClock, reset, effectOut},
+                    {linkClock, reset, effectOut, stateOut},
                     {mid},
-                    {"clock", "reset", "effect__out"},
+                    {"clock", "reset", "effect__out", "state__out"},
                     {"mid__val"});
         addInstance(top,
                     "part_1",
@@ -220,6 +271,278 @@ namespace
                     {"out__data"});
 
         design.markAsTop("SimTop");
+        return design;
+    }
+
+    struct DpiResult
+    {
+        ValueId condition;
+        ValueId result;
+    };
+
+    DpiResult addDpiResult(Graph &graph,
+                           ValueId clock,
+                           ValueId input,
+                           std::string_view prefix)
+    {
+        const std::string stem(prefix);
+        const auto condition = graph.createValue(graph.internSymbol(stem + "_condition"), 1, false);
+        const auto result = graph.createValue(graph.internSymbol(stem + "_result"), 8, false);
+        const auto conditionOp = graph.createOperation(OperationKind::kConstant,
+                                                       graph.internSymbol(stem + "_condition_op"));
+        graph.setAttr(conditionOp, "constValue", std::string("1'b1"));
+        graph.addResult(conditionOp, condition);
+
+        const auto dpiImport = graph.createOperation(OperationKind::kDpicImport,
+                                                     graph.internSymbol(stem + "_import"));
+        graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input", "output"});
+        graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8, 8});
+        graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"in_val", "out_val"});
+        graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, false});
+        graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"logic", "logic"});
+        graph.setAttr(dpiImport, "hasReturn", false);
+
+        const auto dpiCall = graph.createOperation(OperationKind::kDpicCall,
+                                                   graph.internSymbol(stem + "_call"));
+        graph.addOperand(dpiCall, condition);
+        graph.addOperand(dpiCall, input);
+        graph.addOperand(dpiCall, clock);
+        graph.addResult(dpiCall, result);
+        graph.setAttr(dpiCall, "targetImportSymbol", stem + "_import");
+        graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"in_val"});
+        graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{"out_val"});
+        graph.setAttr(dpiCall, "hasReturn", false);
+        return {condition, result};
+    }
+
+    ValueId addRegisterRead(Graph &graph, std::string_view prefix)
+    {
+        const std::string stem(prefix);
+        const auto reg = graph.createOperation(OperationKind::kRegister,
+                                               graph.internSymbol(stem + "_reg"));
+        graph.setAttr(reg, "width", static_cast<int64_t>(8));
+        graph.setAttr(reg, "isSigned", false);
+        const auto value = graph.createValue(graph.internSymbol(stem + "_value"), 8, false);
+        const auto read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                graph.internSymbol(stem + "_read"));
+        graph.addResult(read, value);
+        graph.setAttr(read, "regSymbol", stem + "_reg");
+        return value;
+    }
+
+    Design buildNoEarlyEffectDesign()
+    {
+        Design design;
+        Graph &topOnly = design.createGraph("TopOnlyEffectUnit");
+        const auto topOnlyClock = topOnly.createValue(topOnly.internSymbol("clock"), 1, false);
+        const auto topOnlyInput = topOnly.createValue(topOnly.internSymbol("input"), 8, false);
+        topOnly.bindInputPort("clock", topOnlyClock);
+        topOnly.bindInputPort("input", topOnlyInput);
+        const auto topOnlyEffect = addDpiResult(topOnly, topOnlyClock, topOnlyInput, "top_only");
+        topOnly.bindOutputPort("effect", topOnlyEffect.result);
+
+        Graph &local = design.createGraph("LocalEffectUnit");
+        const auto localClock = local.createValue(local.internSymbol("clock"), 1, false);
+        const auto localInput = local.createValue(local.internSymbol("input"), 8, false);
+        local.bindInputPort("clock", localClock);
+        local.bindInputPort("input", localInput);
+        const auto localEffect = addDpiResult(local, localClock, localInput, "local");
+        const auto localState = addRegisterRead(local, "local_state");
+        local.bindOutputPort("state", localState);
+        const auto mask = local.createValue(local.internSymbol("local_mask"), 8, false);
+        const auto maskOp = local.createOperation(OperationKind::kConstant,
+                                                  local.internSymbol("local_mask_op"));
+        local.setAttr(maskOp, "constValue", std::string("8'hff"));
+        local.addResult(maskOp, mask);
+        const auto write = local.createOperation(OperationKind::kRegisterWritePort,
+                                                 local.internSymbol("local_state_write"));
+        local.addOperand(write, localEffect.condition);
+        local.addOperand(write, localEffect.result);
+        local.addOperand(write, mask);
+        local.addOperand(write, localClock);
+        local.setAttr(write, "regSymbol", std::string("local_state_reg"));
+        local.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
+        Graph &top = design.createGraph("NoEarlyTop");
+        const auto clock = top.createValue(top.internSymbol("clock"), 1, false);
+        const auto input = top.createValue(top.internSymbol("input"), 8, false);
+        const auto effect = top.createValue(top.internSymbol("effect"), 8, false);
+        const auto state = top.createValue(top.internSymbol("state"), 8, false);
+        top.bindInputPort("clock", clock);
+        top.bindInputPort("input", input);
+        top.bindOutputPort("effect", effect);
+        top.bindOutputPort("state", state);
+        addInstance(top, "top_only", "TopOnlyEffectUnit", {clock, input}, {effect},
+                    {"clock", "input"}, {"effect"});
+        addInstance(top, "local", "LocalEffectUnit", {clock, input}, {state},
+                    {"clock", "input"}, {"state"});
+        design.markAsTop("NoEarlyTop");
+        return design;
+    }
+
+    Design buildMixedCrossUnitDesign()
+    {
+        Design design;
+        Graph &mixed = design.createGraph("MixedUnit");
+        const auto clock = mixed.createValue(mixed.internSymbol("clock"), 1, false);
+        const auto input = mixed.createValue(mixed.internSymbol("input"), 8, false);
+        mixed.bindInputPort("clock", clock);
+        mixed.bindInputPort("input", input);
+        const auto effect = addDpiResult(mixed, clock, input, "mixed");
+        const auto state = addRegisterRead(mixed, "mixed_state");
+        const auto output = mixed.createValue(mixed.internSymbol("mixed_output"), 16, false);
+        const auto concat = mixed.createOperation(OperationKind::kConcat,
+                                                  mixed.internSymbol("mixed_concat"));
+        mixed.addOperand(concat, effect.result);
+        mixed.addOperand(concat, state);
+        mixed.addResult(concat, output);
+        mixed.bindOutputPort("mixed", output);
+
+        Graph &sink = buildUnitGraph(design, "MixedSink", {{"input", 16}}, {{"output", 16}});
+        const auto sinkAssign = sink.createOperation(OperationKind::kAssign,
+                                                     sink.internSymbol("sink_assign"));
+        sink.addOperand(sinkAssign, sink.inputPorts()[0].value);
+        sink.addResult(sinkAssign, sink.outputPorts()[0].value);
+
+        Graph &top = design.createGraph("MixedTop");
+        const auto topClock = top.createValue(top.internSymbol("clock"), 1, false);
+        const auto topInput = top.createValue(top.internSymbol("input"), 8, false);
+        const auto mixedValue = top.createValue(top.internSymbol("mixed"), 16, false);
+        const auto outputValue = top.createValue(top.internSymbol("output"), 16, false);
+        top.bindInputPort("clock", topClock);
+        top.bindInputPort("input", topInput);
+        top.bindOutputPort("output", outputValue);
+        addInstance(top, "mixed_unit", "MixedUnit", {topClock, topInput}, {mixedValue},
+                    {"clock", "input"}, {"mixed"});
+        addInstance(top, "sink_unit", "MixedSink", {mixedValue}, {outputValue}, {"input"}, {"output"});
+        design.markAsTop("MixedTop");
+        return design;
+    }
+
+    Design buildEarlyChainDesign()
+    {
+        Design design;
+        auto buildEffectUnit = [&](std::string_view name, std::string_view prefix) -> Graph & {
+            Graph &graph = design.createGraph(std::string(name));
+            const auto clock = graph.createValue(graph.internSymbol("clock"), 1, false);
+            const auto input = graph.createValue(graph.internSymbol("input"), 8, false);
+            graph.bindInputPort("clock", clock);
+            graph.bindInputPort("input", input);
+            const auto effect = addDpiResult(graph, clock, input, prefix);
+            graph.bindOutputPort("output", effect.result);
+            return graph;
+        };
+        buildEffectUnit("EarlyA", "early_a");
+        buildEffectUnit("EarlyB", "early_b");
+        Graph &sink = buildUnitGraph(design, "EarlySink", {{"input", 8}}, {{"output", 8}});
+        const auto sinkAssign = sink.createOperation(OperationKind::kAssign,
+                                                     sink.internSymbol("sink_assign"));
+        sink.addOperand(sinkAssign, sink.inputPorts()[0].value);
+        sink.addResult(sinkAssign, sink.outputPorts()[0].value);
+
+        Graph &top = design.createGraph("EarlyChainTop");
+        const auto clock = top.createValue(top.internSymbol("clock"), 1, false);
+        const auto input = top.createValue(top.internSymbol("input"), 8, false);
+        const auto a = top.createValue(top.internSymbol("a"), 8, false);
+        const auto b = top.createValue(top.internSymbol("b"), 8, false);
+        const auto output = top.createValue(top.internSymbol("output"), 8, false);
+        top.bindInputPort("clock", clock);
+        top.bindInputPort("input", input);
+        top.bindOutputPort("output", output);
+        addInstance(top, "early_a", "EarlyA", {clock, input}, {a},
+                    {"clock", "input"}, {"output"});
+        addInstance(top, "early_b", "EarlyB", {clock, a}, {b},
+                    {"clock", "input"}, {"output"});
+        addInstance(top, "sink", "EarlySink", {b}, {output}, {"input"}, {"output"});
+        design.markAsTop("EarlyChainTop");
+        return design;
+    }
+
+    Design buildNormalToEarlyDesign()
+    {
+        Design design;
+        Graph &normal = buildUnitGraph(design,
+                                       "NormalProducer",
+                                       {{"clock", 1}, {"input", 8}},
+                                       {{"output", 8}});
+        const auto normalAssign = normal.createOperation(OperationKind::kAssign,
+                                                         normal.internSymbol("normal_assign"));
+        normal.addOperand(normalAssign, normal.inputPorts()[1].value);
+        normal.addResult(normalAssign, normal.outputPorts()[0].value);
+
+        Graph &early = design.createGraph("EarlyConsumer");
+        const auto earlyClock = early.createValue(early.internSymbol("clock"), 1, false);
+        const auto normalInput = early.createValue(early.internSymbol("normal_input"), 8, false);
+        early.bindInputPort("clock", earlyClock);
+        early.bindInputPort("normal_input", normalInput);
+        const auto effect = addDpiResult(early, earlyClock, normalInput, "normal_to_early");
+        early.bindOutputPort("output", effect.result);
+
+        Graph &sink = buildUnitGraph(design, "EarlySinkNormal", {{"input", 8}}, {{"output", 8}});
+        const auto sinkAssign = sink.createOperation(OperationKind::kAssign,
+                                                     sink.internSymbol("sink_assign"));
+        sink.addOperand(sinkAssign, sink.inputPorts()[0].value);
+        sink.addResult(sinkAssign, sink.outputPorts()[0].value);
+
+        Graph &top = design.createGraph("NormalToEarlyTop");
+        const auto clock = top.createValue(top.internSymbol("clock"), 1, false);
+        const auto input = top.createValue(top.internSymbol("input"), 8, false);
+        const auto normalValue = top.createValue(top.internSymbol("normal_value"), 8, false);
+        const auto earlyValue = top.createValue(top.internSymbol("early_value"), 8, false);
+        const auto output = top.createValue(top.internSymbol("output"), 8, false);
+        top.bindInputPort("clock", clock);
+        top.bindInputPort("input", input);
+        top.bindOutputPort("output", output);
+        addInstance(top, "normal", "NormalProducer", {clock, input}, {normalValue},
+                    {"clock", "input"}, {"output"});
+        addInstance(top, "early", "EarlyConsumer", {clock, normalValue}, {earlyValue},
+                    {"clock", "normal_input"}, {"output"});
+        addInstance(top, "sink", "EarlySinkNormal", {earlyValue}, {output}, {"input"}, {"output"});
+        design.markAsTop("NormalToEarlyTop");
+        return design;
+    }
+
+    Design buildSystemFunctionEffectPathDesign(bool hasSideEffects)
+    {
+        Design design;
+        const std::string namePrefix = hasSideEffects ? "Unsupported" : "Pure";
+        Graph &producer = design.createGraph(namePrefix + "Producer");
+        const auto clock = producer.createValue(producer.internSymbol("clock"), 1, false);
+        const auto input = producer.createValue(producer.internSymbol("input"), 8, false);
+        producer.bindInputPort("clock", clock);
+        producer.bindInputPort("input", input);
+        const auto effect = addDpiResult(producer, clock, input, "unsupported");
+        const auto output = producer.createValue(producer.internSymbol("output"), 8, false);
+        const auto unknown = producer.createOperation(OperationKind::kSystemFunction,
+                                                      producer.internSymbol("unsupported_function"));
+        producer.addOperand(unknown, effect.result);
+        producer.addResult(unknown, output);
+        producer.setAttr(unknown, "name", std::string("unsigned"));
+        if (hasSideEffects)
+        {
+            producer.setAttr(unknown, "hasSideEffects", true);
+        }
+        producer.bindOutputPort("output", output);
+
+        Graph &sink = buildUnitGraph(design, namePrefix + "Sink", {{"input", 8}}, {{"output", 8}});
+        const auto sinkAssign = sink.createOperation(OperationKind::kAssign,
+                                                     sink.internSymbol("sink_assign"));
+        sink.addOperand(sinkAssign, sink.inputPorts()[0].value);
+        sink.addResult(sinkAssign, sink.outputPorts()[0].value);
+
+        Graph &top = design.createGraph(namePrefix + "Top");
+        const auto topClock = top.createValue(top.internSymbol("clock"), 1, false);
+        const auto topInput = top.createValue(top.internSymbol("input"), 8, false);
+        const auto intermediate = top.createValue(top.internSymbol("intermediate"), 8, false);
+        const auto topOutput = top.createValue(top.internSymbol("output"), 8, false);
+        top.bindInputPort("clock", topClock);
+        top.bindInputPort("input", topInput);
+        top.bindOutputPort("output", topOutput);
+        addInstance(top, "producer", namePrefix + "Producer", {topClock, topInput}, {intermediate},
+                    {"clock", "input"}, {"output"});
+        addInstance(top, "sink", namePrefix + "Sink", {intermediate}, {topOutput}, {"input"}, {"output"});
+        design.markAsTop(namePrefix + "Top");
         return design;
     }
 
@@ -343,8 +666,10 @@ int main()
     }
     if (!contains(wrapperHeader, "using StepFn = void (WolviRepCutVerilatorSim::*)(std::size_t);") ||
         !contains(wrapperHeader, "std::vector<StepFn> load_step_fns_;") ||
-        !contains(wrapperHeader, "std::vector<StepFn> eval_step_fns_;") ||
-        !contains(wrapperHeader, "std::vector<StepFn> update_step_fns_;") ||
+        !contains(wrapperHeader, "std::vector<StepFn> early_eval_step_fns_;") ||
+        !contains(wrapperHeader, "std::vector<StepFn> early_update_step_fns_;") ||
+        !contains(wrapperHeader, "std::vector<StepFn> normal_eval_step_fns_;") ||
+        !contains(wrapperHeader, "std::vector<StepFn> normal_update_step_fns_;") ||
         !contains(wrapperHeader, "void run_host_phase_(const std::vector<StepFn>& phaseFns);") ||
         !contains(wrapperHeader, "void run_phase_workers_(const std::vector<StepFn>& phaseFns);"))
     {
@@ -387,6 +712,8 @@ int main()
     }
     if (!contains(wrapperSource, "unit_effect_part_->in_2 = top_in_in_data_;") ||
         !contains(wrapperSource, "unit_part_0_->in_2 = unit_effect_part_->out_0;") ||
+        !contains(wrapperSource, "unit_part_0_->in_3 = unit_effect_part_->out_1;") ||
+        !contains(wrapperSource, "top_out_effect_tap_ = unit_effect_part_->out_0;") ||
         !contains(wrapperSource, "unit_part_1_->in_2 = unit_part_0_->out_0;") ||
         !contains(wrapperSource, "unit_part_1_->in_3 = const_sel_const_;") ||
         !contains(wrapperSource, "top_out_out_ = unit_part_1_->out_0;"))
@@ -394,15 +721,23 @@ int main()
         return fail("wrapper source missing expected load/update wiring");
     }
     if (!contains(wrapperSource, "load_step_fns_.push_back(&WolviRepCutVerilatorSim::") ||
-        !contains(wrapperSource, "eval_step_fns_.push_back(&WolviRepCutVerilatorSim::") ||
-        !contains(wrapperSource, "update_step_fns_.push_back(&WolviRepCutVerilatorSim::"))
+        !contains(wrapperSource, "early_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_effect_part_);") ||
+        !contains(wrapperSource, "early_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_early_effect_part_);") ||
+        !contains(wrapperSource, "normal_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_part_0_);") ||
+        !contains(wrapperSource, "normal_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_part_1_);") ||
+        !contains(wrapperSource, "normal_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_final_effect_part_);") ||
+        !contains(wrapperSource, "normal_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_final_part_0_);") ||
+        !contains(wrapperSource, "normal_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_final_part_1_);") ||
+        contains(wrapperSource, "normal_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_effect_part_);") ||
+        contains(wrapperSource, "early_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_final_effect_part_);"))
     {
-        return fail("wrapper source missing expected phase task registration");
+        return fail("wrapper source missing expected early/normal task registration");
     }
     if (!contains(wrapperSource, "unit_effect_part_->eval();") ||
         !contains(wrapperSource, "// eval part_0") ||
         !contains(wrapperSource, "// eval part_1") ||
-        !contains(wrapperSource, "run_phase_workers_(eval_step_fns_);"))
+        !contains(wrapperSource, "run_phase_workers_(early_eval_step_fns_);") ||
+        !contains(wrapperSource, "run_phase_workers_(normal_eval_step_fns_);"))
     {
         return fail("wrapper source missing expected eval calls");
     }
@@ -412,8 +747,25 @@ int main()
         return fail("wrapper source should not contain snapshot/writeback publish paths");
     }
     if (!contains(wrapperSource, "std::getenv(\"XS_EMU_THREADS\")") ||
-        !contains(wrapperSource, "const std::size_t maxParallelFns = std::max(eval_step_fns_.size(), update_step_fns_.size());") ||
-        !contains(wrapperSource, "assert(requestedWorkers <= maxParallelFns && \"XS_EMU_THREADS must not exceed repcut partition count\")") ||
+        !contains(wrapperSource, "const std::size_t maxParallelFns = std::max({early_eval_step_fns_.size(), early_update_step_fns_.size(), normal_eval_step_fns_.size(), normal_update_step_fns_.size()});") ||
+        !contains(wrapperSource, "[[noreturn]] inline void wolvi_repcut_thread_config_error") ||
+        !contains(wrapperSource, "[WOLVI][thread-config] error=%s") ||
+        !contains(wrapperSource, "std::abort();") ||
+        !contains(wrapperSource, "if (*cursor < '0' || *cursor > '9')") ||
+        !contains(wrapperSource, "errno == ERANGE") ||
+        !contains(wrapperSource, "std::numeric_limits<std::size_t>::max()") ||
+        !contains(wrapperSource, "if (requestedWorkers > 3)") ||
+        !contains(wrapperSource, "if (requestedWorkers != 0 && requestedWorkers > maxParallelFns)") ||
+        !contains(wrapperSource, "if (requestedWorkers > availableCpuCount)") ||
+        !contains(wrapperSource, "std::size_t startedWorkerCount = 0;") ||
+        !contains(wrapperSource, "} catch (...) {") ||
+        !contains(wrapperSource, "worker.stop = true;") ||
+        !contains(wrapperSource, "worker.cv.notify_one();") ||
+        !contains(wrapperSource, "return worker.stop || worker.hasWork;") ||
+        !contains(wrapperSource, "phase_workers_[workerIndex].thread.join();") ||
+        !contains(wrapperSource, "failed to create phase worker thread") ||
+        !contains(wrapperSource, "phase_worker_count_ = requestedWorkers;") ||
+        !contains(wrapperSource, "[WOLVI][thread-config] requested=%zu effective=%zu max_parallel=%zu available_cpus=%zu") ||
         !contains(wrapperSource, "#if defined(__linux__)"))
     {
         return fail("wrapper source missing expected runtime thread-pool guards");
@@ -457,19 +809,12 @@ int main()
     {
         return fail("wrapper source missing expected timing instrumentation");
     }
-    if (contains(wrapperHeader, "void run_early_phase_();") ||
-        contains(wrapperHeader, "early_scatter_ns") ||
-        contains(wrapperHeader, "early_eval_ns") ||
-        contains(wrapperHeader, "early_publish_ns") ||
-        contains(wrapperSource, "run_early_phase_();") ||
-        contains(wrapperSource, "printPhase(\"early_scatter\"") ||
-        contains(wrapperSource, "printPhase(\"early_eval\"") ||
-        contains(wrapperSource, "printPhase(\"early_publish\"") ||
-        contains(wrapperSource, "dumpPhase(\"early_scatter\"") ||
-        contains(wrapperSource, "dumpPhase(\"early_eval\"") ||
-        contains(wrapperSource, "dumpPhase(\"early_publish\""))
+    if (!contains(wrapperSource, "run_phase_workers_(early_eval_step_fns_);") ||
+        !contains(wrapperSource, "run_phase_workers_(early_update_step_fns_);") ||
+        !contains(wrapperSource, "run_phase_workers_(normal_eval_step_fns_);") ||
+        !contains(wrapperSource, "run_phase_workers_(normal_update_step_fns_);"))
     {
-        return fail("wrapper source should not contain early-phase scheduling artifacts");
+        return fail("wrapper source missing early/normal scheduling phases");
     }
     if (contains(wrapperSource, "XS_REPCUT_STEP_TIMING") ||
         contains(wrapperSource, "step_timing_enabled_") ||
@@ -517,20 +862,52 @@ int main()
         return fail("wrapper source missing expected load/eval/update chunks");
     }
     const std::size_t commonLoadPos = commonSource.find("run_host_phase_(load_step_fns_);");
-    const std::size_t commonPartEvalPos = commonSource.find("run_phase_workers_(eval_step_fns_);");
-    const std::size_t commonUpdatePos = commonSource.find("run_phase_workers_(update_step_fns_);");
+    const std::size_t commonEarlyEvalPos = commonSource.find("run_phase_workers_(early_eval_step_fns_);");
+    const std::size_t commonEarlyUpdatePos = commonSource.find("run_phase_workers_(early_update_step_fns_);");
+    const std::size_t commonNormalEvalPos = commonSource.find("run_phase_workers_(normal_eval_step_fns_);");
+    const std::size_t commonFinalUpdatePos = commonSource.find("run_phase_workers_(normal_update_step_fns_);");
     const std::size_t loadInputPos = loadChunkSource.find("unit_effect_part_->in_2 = top_in_in_data_;");
     const std::size_t evalEvalPos = evalChunkSource.find("unit_effect_part_->eval();");
     const std::size_t updatePushPos = updateChunkSource.find("unit_part_0_->in_2 = unit_effect_part_->out_0;");
-    if (commonLoadPos == std::string::npos || commonPartEvalPos == std::string::npos ||
-        commonUpdatePos == std::string::npos || loadInputPos == std::string::npos ||
+    if (commonLoadPos == std::string::npos || commonEarlyEvalPos == std::string::npos ||
+        commonEarlyUpdatePos == std::string::npos || commonNormalEvalPos == std::string::npos ||
+        commonFinalUpdatePos == std::string::npos || loadInputPos == std::string::npos ||
         evalEvalPos == std::string::npos || updatePushPos == std::string::npos)
     {
         return fail("wrapper source missing phase-order markers");
     }
-    if (!(commonLoadPos < commonPartEvalPos && commonPartEvalPos < commonUpdatePos))
+    if (!(commonLoadPos < commonEarlyEvalPos &&
+          commonEarlyEvalPos < commonEarlyUpdatePos &&
+          commonEarlyUpdatePos < commonNormalEvalPos &&
+          commonNormalEvalPos < commonFinalUpdatePos))
     {
-        return fail("wrapper source should run load before eval and eval before update");
+        return fail("wrapper source should run load, early eval/update, then normal eval/final update");
+    }
+    if (countOccurrences(commonSource, "run_phase_workers_(early_update_step_fns_);") != 1 ||
+        countOccurrences(commonSource, "run_phase_workers_(normal_update_step_fns_);") != 1)
+    {
+        return fail("wrapper source should publish each phase exactly once per step");
+    }
+    const std::size_t earlyEffectMethodPos = wrapperSource.find(
+        "void WolviRepCutVerilatorSim::run_update_early_effect_part_");
+    const std::size_t finalEffectMethodPos = wrapperSource.find(
+        "void WolviRepCutVerilatorSim::run_update_final_effect_part_");
+    const std::size_t earlyEffectEdgePos = wrapperSource.find(
+        "unit_part_0_->in_2 = unit_effect_part_->out_0;");
+    const std::size_t earlyEffectTopPos = wrapperSource.find(
+        "top_out_effect_tap_ = unit_effect_part_->out_0;");
+    const std::size_t finalStateEdgePos = wrapperSource.find(
+        "unit_part_0_->in_3 = unit_effect_part_->out_1;");
+    if (earlyEffectMethodPos == std::string::npos || finalEffectMethodPos == std::string::npos ||
+        earlyEffectEdgePos == std::string::npos || earlyEffectTopPos == std::string::npos ||
+        finalStateEdgePos == std::string::npos ||
+        !(earlyEffectMethodPos < earlyEffectEdgePos && earlyEffectMethodPos < earlyEffectTopPos &&
+          finalEffectMethodPos < finalStateEdgePos) ||
+        countOccurrences(wrapperSource, "unit_part_0_->in_2 = unit_effect_part_->out_0;") != 1 ||
+        countOccurrences(wrapperSource, "top_out_effect_tap_ = unit_effect_part_->out_0;") != 1 ||
+        countOccurrences(wrapperSource, "unit_part_0_->in_3 = unit_effect_part_->out_1;") != 1)
+    {
+        return fail("effect and state edges should be published by their respective update methods exactly once");
     }
     if (!contains(wrapperSource, "const CData WolviRepCutVerilatorSim::const_sel_const_ = static_cast<CData>(0x1ULL);"))
     {
@@ -569,6 +946,142 @@ int main()
         !contains(makefile, "run: $(TARGET)"))
     {
         return fail("Makefile missing expected top-level build rules");
+    }
+
+    {
+        const std::filesystem::path noEarlyRoot = artifactRoot / "no_early_effect";
+        EmitDiagnostics noEarlyDiagnostics;
+        EmitVerilatorRepCutPackage noEarlyEmitter(&noEarlyDiagnostics);
+        EmitOptions noEarlyOptions;
+        noEarlyOptions.outputDir = noEarlyRoot.string();
+        noEarlyOptions.topOverrides = {"NoEarlyTop"};
+        const EmitResult noEarlyResult = noEarlyEmitter.emit(buildNoEarlyEffectDesign(), noEarlyOptions);
+        if (!noEarlyResult.success || noEarlyDiagnostics.hasError())
+        {
+            return fail("top-only/local effect package emit failed: " + diagnosticsSummary(noEarlyDiagnostics));
+        }
+        std::string noEarlySource;
+        for (const auto &entry : std::filesystem::directory_iterator(noEarlyRoot))
+        {
+            if (entry.is_regular_file() && entry.path().extension() == ".cpp" &&
+                entry.path().filename().string().rfind("wolvi_repcut_verilator_sim", 0) == 0)
+            {
+                noEarlySource += readFile(entry.path());
+            }
+        }
+        if (!contains(noEarlySource,
+                      "normal_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_top_only_);") ||
+            !contains(noEarlySource,
+                      "normal_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_local_);") ||
+            !contains(noEarlySource,
+                      "normal_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_final_top_only_);") ||
+            !contains(noEarlySource,
+                      "normal_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_final_local_);") ||
+            contains(noEarlySource,
+                     "early_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_top_only_);") ||
+            contains(noEarlySource,
+                     "early_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_local_);"))
+        {
+            return fail("top-only and locally consumed effects should remain in the normal/final phases");
+        }
+    }
+
+    {
+        const std::filesystem::path mixedRoot = artifactRoot / "mixed_cross_unit";
+        EmitDiagnostics mixedDiagnostics;
+        EmitVerilatorRepCutPackage mixedEmitter(&mixedDiagnostics);
+        EmitOptions mixedOptions;
+        mixedOptions.outputDir = mixedRoot.string();
+        mixedOptions.topOverrides = {"MixedTop"};
+        const EmitResult mixedResult = mixedEmitter.emit(buildMixedCrossUnitDesign(), mixedOptions);
+        if (mixedResult.success ||
+            !contains(diagnosticsSummary(mixedDiagnostics),
+                      "Cross-unit output mixes result-producing effect and state provenance"))
+        {
+            return fail("mixed effect/state cross-unit output should fail fast");
+        }
+    }
+
+    {
+        const std::filesystem::path earlyChainRoot = artifactRoot / "early_chain";
+        EmitDiagnostics earlyChainDiagnostics;
+        EmitVerilatorRepCutPackage earlyChainEmitter(&earlyChainDiagnostics);
+        EmitOptions earlyChainOptions;
+        earlyChainOptions.outputDir = earlyChainRoot.string();
+        earlyChainOptions.topOverrides = {"EarlyChainTop"};
+        const EmitResult earlyChainResult = earlyChainEmitter.emit(buildEarlyChainDesign(), earlyChainOptions);
+        if (earlyChainResult.success ||
+            !contains(diagnosticsSummary(earlyChainDiagnostics),
+                      "Early effect edge targets another early unit"))
+        {
+            return fail("early effect edge targeting another early unit should fail fast");
+        }
+
+        const std::filesystem::path normalToEarlyRoot = artifactRoot / "normal_to_early";
+        EmitDiagnostics normalToEarlyDiagnostics;
+        EmitVerilatorRepCutPackage normalToEarlyEmitter(&normalToEarlyDiagnostics);
+        EmitOptions normalToEarlyOptions;
+        normalToEarlyOptions.outputDir = normalToEarlyRoot.string();
+        normalToEarlyOptions.topOverrides = {"NormalToEarlyTop"};
+        const EmitResult normalToEarlyResult =
+            normalToEarlyEmitter.emit(buildNormalToEarlyDesign(), normalToEarlyOptions);
+        if (normalToEarlyResult.success ||
+            !contains(diagnosticsSummary(normalToEarlyDiagnostics),
+                      "Normal unit output feeds an early unit"))
+        {
+            return fail("normal-to-early dependency should fail fast");
+        }
+    }
+
+    {
+        const std::filesystem::path pureRoot = artifactRoot / "pure_system_function_effect_path";
+        EmitDiagnostics pureDiagnostics;
+        EmitVerilatorRepCutPackage pureEmitter(&pureDiagnostics);
+        EmitOptions pureOptions;
+        pureOptions.outputDir = pureRoot.string();
+        pureOptions.topOverrides = {"PureTop"};
+        const EmitResult pureResult =
+            pureEmitter.emit(buildSystemFunctionEffectPathDesign(false), pureOptions);
+        if (!pureResult.success || pureDiagnostics.hasError())
+        {
+            return fail("pure system function should propagate effect provenance: " +
+                        diagnosticsSummary(pureDiagnostics));
+        }
+        std::string pureSource;
+        for (const auto &entry : std::filesystem::directory_iterator(pureRoot))
+        {
+            if (entry.is_regular_file() && entry.path().extension() == ".cpp" &&
+                entry.path().filename().string().rfind("wolvi_repcut_verilator_sim", 0) == 0)
+            {
+                pureSource += readFile(entry.path());
+            }
+        }
+        if (!contains(pureSource,
+                      "early_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_producer_);") ||
+            !contains(pureSource,
+                      "early_update_step_fns_.push_back(&WolviRepCutVerilatorSim::run_update_early_producer_);") ||
+            contains(pureSource,
+                     "normal_eval_step_fns_.push_back(&WolviRepCutVerilatorSim::run_eval_producer_);"))
+        {
+            return fail("pure system function effect path was not scheduled in the early phase");
+        }
+    }
+
+    {
+        const std::filesystem::path unsupportedRoot = artifactRoot / "unsupported_effect_path";
+        EmitDiagnostics unsupportedDiagnostics;
+        EmitVerilatorRepCutPackage unsupportedEmitter(&unsupportedDiagnostics);
+        EmitOptions unsupportedOptions;
+        unsupportedOptions.outputDir = unsupportedRoot.string();
+        unsupportedOptions.topOverrides = {"UnsupportedTop"};
+        const EmitResult unsupportedResult =
+            unsupportedEmitter.emit(buildSystemFunctionEffectPathDesign(true), unsupportedOptions);
+        if (unsupportedResult.success ||
+            !contains(diagnosticsSummary(unsupportedDiagnostics),
+                      "effect operations that cannot be ordered atomically"))
+        {
+            return fail("side-effecting system function consuming a DPI result should fail fast");
+        }
     }
 
     return 0;

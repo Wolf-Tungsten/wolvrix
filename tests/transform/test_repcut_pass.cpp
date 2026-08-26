@@ -258,6 +258,33 @@ namespace
         return nullptr;
     }
 
+    std::size_t countOpSymbolInGraphsWithPrefix(wolvrix::lib::grh::Design &design,
+                                                 std::string_view prefix,
+                                                 std::string_view symbol)
+    {
+        std::size_t count = 0;
+        for (const auto &graphName : design.graphOrder())
+        {
+            if (graphName.rfind(prefix, 0) != 0)
+            {
+                continue;
+            }
+            auto *graph = design.findGraph(graphName);
+            if (graph == nullptr)
+            {
+                continue;
+            }
+            for (const auto opId : graph->operations())
+            {
+                if (opId.valid() && graph->getOperation(opId).symbolText() == symbol)
+                {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    }
+
 } // namespace
 
 int main()
@@ -399,21 +426,6 @@ int main()
     {
         return fail("expected native mt-kahypar partition output file");
     }
-    const std::filesystem::path featurePath = outDir / "top_repcut_k2.partition_features.jsonl";
-    if (!std::filesystem::exists(featurePath))
-    {
-        return fail("expected repcut partition static feature export");
-    }
-    const std::string featureText = readFile(featurePath);
-    if (featureText.find("\"record_type\":\"partition_static_feature_summary\"") == std::string::npos ||
-        featureText.find("\"record_type\":\"partition_static_features\"") == std::string::npos ||
-        featureText.find("\"part_name\":\"part_0\"") == std::string::npos ||
-        featureText.find("\"op_kind_counts\":{") == std::string::npos ||
-        featureText.find("\"width_bucket_counts\":{") == std::string::npos)
-    {
-        return fail("unexpected repcut partition static feature export content");
-    }
-
     if (!result.success || diags.hasError())
     {
         bool hasExpectedDiagnostic = false;
@@ -436,6 +448,16 @@ int main()
     if (!result.changed)
     {
         return fail("expected repcut pass to report graph changes");
+    }
+
+    const std::string *stats = findRepcutStatsDiagnostic(diags);
+    if (stats == nullptr ||
+        stats->find("\"partition_static_features\":[") == std::string::npos ||
+        stats->find("\"part_name\":\"part_0\"") == std::string::npos ||
+        stats->find("\"op_kind_counts\":{") == std::string::npos ||
+        stats->find("\"width_bucket_counts\":{") == std::string::npos)
+    {
+        return fail("repcut stats missing canonical partition static feature fields");
     }
 
     wolvrix::lib::grh::Graph *newTop = design.findGraph("top");
@@ -632,6 +654,46 @@ int main()
     effectGraph.setAttr(dpiImportVoid, "argsType", std::vector<std::string>{"logic"});
     effectGraph.setAttr(dpiImportVoid, "hasReturn", false);
 
+    const auto dpiImportVoidOutput =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport,
+                                    effectGraph.internSymbol("dpi_func_void_output"));
+    effectGraph.setAttr(dpiImportVoidOutput, "argsDirection", std::vector<std::string>{"input", "output"});
+    effectGraph.setAttr(dpiImportVoidOutput, "argsWidth", std::vector<int64_t>{32, 32});
+    effectGraph.setAttr(dpiImportVoidOutput, "argsName", std::vector<std::string>{"lhs", "data"});
+    effectGraph.setAttr(dpiImportVoidOutput, "argsSigned", std::vector<bool>{false, false});
+    effectGraph.setAttr(dpiImportVoidOutput, "argsType", std::vector<std::string>{"logic", "logic"});
+    effectGraph.setAttr(dpiImportVoidOutput, "hasReturn", false);
+
+    const auto dpiImportVoidInout =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport,
+                                    effectGraph.internSymbol("dpi_func_void_inout"));
+    effectGraph.setAttr(dpiImportVoidInout, "argsDirection", std::vector<std::string>{"inout"});
+    effectGraph.setAttr(dpiImportVoidInout, "argsWidth", std::vector<int64_t>{32});
+    effectGraph.setAttr(dpiImportVoidInout, "argsName", std::vector<std::string>{"state"});
+    effectGraph.setAttr(dpiImportVoidInout, "argsSigned", std::vector<bool>{false});
+    effectGraph.setAttr(dpiImportVoidInout, "argsType", std::vector<std::string>{"logic"});
+    effectGraph.setAttr(dpiImportVoidInout, "hasReturn", false);
+
+    const auto dpiImportVoidOutputUnused =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport,
+                                    effectGraph.internSymbol("dpi_func_void_output_unused"));
+    effectGraph.setAttr(dpiImportVoidOutputUnused, "argsDirection", std::vector<std::string>{"input", "output"});
+    effectGraph.setAttr(dpiImportVoidOutputUnused, "argsWidth", std::vector<int64_t>{32, 32});
+    effectGraph.setAttr(dpiImportVoidOutputUnused, "argsName", std::vector<std::string>{"lhs", "data"});
+    effectGraph.setAttr(dpiImportVoidOutputUnused, "argsSigned", std::vector<bool>{false, false});
+    effectGraph.setAttr(dpiImportVoidOutputUnused, "argsType", std::vector<std::string>{"logic", "logic"});
+    effectGraph.setAttr(dpiImportVoidOutputUnused, "hasReturn", false);
+
+    const auto dpiImportVoidInoutUnused =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport,
+                                    effectGraph.internSymbol("dpi_func_void_inout_unused"));
+    effectGraph.setAttr(dpiImportVoidInoutUnused, "argsDirection", std::vector<std::string>{"inout"});
+    effectGraph.setAttr(dpiImportVoidInoutUnused, "argsWidth", std::vector<int64_t>{32});
+    effectGraph.setAttr(dpiImportVoidInoutUnused, "argsName", std::vector<std::string>{"state"});
+    effectGraph.setAttr(dpiImportVoidInoutUnused, "argsSigned", std::vector<bool>{false});
+    effectGraph.setAttr(dpiImportVoidInoutUnused, "argsType", std::vector<std::string>{"logic"});
+    effectGraph.setAttr(dpiImportVoidInoutUnused, "hasReturn", false);
+
     const auto dpiCall =
         effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
                                     effectGraph.internSymbol("dpi_call"));
@@ -657,6 +719,68 @@ int main()
     effectGraph.setAttr(dpiCallVoid, "inArgName", std::vector<std::string>{"rhs"});
     effectGraph.setAttr(dpiCallVoid, "outArgName", std::vector<std::string>{});
     effectGraph.setAttr(dpiCallVoid, "hasReturn", false);
+
+    const auto dpiCallVoidOutput =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                    effectGraph.internSymbol("dpi_call_void_output"));
+    effectGraph.addOperand(dpiCallVoidOutput, effEn);
+    effectGraph.addOperand(dpiCallVoidOutput, effA);
+    effectGraph.addOperand(dpiCallVoidOutput, effEn);
+    effectGraph.setAttr(dpiCallVoidOutput, "targetImportSymbol", std::string("dpi_func_void_output"));
+    effectGraph.setAttr(dpiCallVoidOutput, "eventEdge", std::vector<std::string>{"posedge"});
+    effectGraph.setAttr(dpiCallVoidOutput, "inArgName", std::vector<std::string>{"lhs"});
+    effectGraph.setAttr(dpiCallVoidOutput, "outArgName", std::vector<std::string>{"data"});
+    effectGraph.setAttr(dpiCallVoidOutput, "hasReturn", false);
+    const auto dpiVoidOutputRes = makeValue(effectGraph, "dpi_void_output_res", 32, false);
+    effectGraph.addResult(dpiCallVoidOutput, dpiVoidOutputRes);
+
+    const auto dpiCallVoidInout =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                    effectGraph.internSymbol("dpi_call_void_inout"));
+    effectGraph.addOperand(dpiCallVoidInout, effEn);
+    effectGraph.addOperand(dpiCallVoidInout, effB);
+    effectGraph.addOperand(dpiCallVoidInout, effEn);
+    effectGraph.setAttr(dpiCallVoidInout, "targetImportSymbol", std::string("dpi_func_void_inout"));
+    effectGraph.setAttr(dpiCallVoidInout, "eventEdge", std::vector<std::string>{"posedge"});
+    effectGraph.setAttr(dpiCallVoidInout, "inArgName", std::vector<std::string>{});
+    effectGraph.setAttr(dpiCallVoidInout, "outArgName", std::vector<std::string>{});
+    effectGraph.setAttr(dpiCallVoidInout, "inoutArgName", std::vector<std::string>{"state"});
+    effectGraph.setAttr(dpiCallVoidInout, "hasReturn", false);
+    const auto dpiVoidInoutRes = makeValue(effectGraph, "dpi_void_inout_res", 32, false);
+    effectGraph.addResult(dpiCallVoidInout, dpiVoidInoutRes);
+
+    const auto dpiCallVoidOutputUnused =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                    effectGraph.internSymbol("dpi_call_void_output_unused"));
+    effectGraph.addOperand(dpiCallVoidOutputUnused, effEn);
+    effectGraph.addOperand(dpiCallVoidOutputUnused, effA);
+    effectGraph.addOperand(dpiCallVoidOutputUnused, effEn);
+    effectGraph.setAttr(dpiCallVoidOutputUnused,
+                        "targetImportSymbol",
+                        std::string("dpi_func_void_output_unused"));
+    effectGraph.setAttr(dpiCallVoidOutputUnused, "eventEdge", std::vector<std::string>{"posedge"});
+    effectGraph.setAttr(dpiCallVoidOutputUnused, "inArgName", std::vector<std::string>{"lhs"});
+    effectGraph.setAttr(dpiCallVoidOutputUnused, "outArgName", std::vector<std::string>{"data"});
+    effectGraph.setAttr(dpiCallVoidOutputUnused, "hasReturn", false);
+    const auto dpiVoidOutputUnusedRes = makeValue(effectGraph, "dpi_void_output_unused_res", 32, false);
+    effectGraph.addResult(dpiCallVoidOutputUnused, dpiVoidOutputUnusedRes);
+
+    const auto dpiCallVoidInoutUnused =
+        effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                    effectGraph.internSymbol("dpi_call_void_inout_unused"));
+    effectGraph.addOperand(dpiCallVoidInoutUnused, effEn);
+    effectGraph.addOperand(dpiCallVoidInoutUnused, effB);
+    effectGraph.addOperand(dpiCallVoidInoutUnused, effEn);
+    effectGraph.setAttr(dpiCallVoidInoutUnused,
+                        "targetImportSymbol",
+                        std::string("dpi_func_void_inout_unused"));
+    effectGraph.setAttr(dpiCallVoidInoutUnused, "eventEdge", std::vector<std::string>{"posedge"});
+    effectGraph.setAttr(dpiCallVoidInoutUnused, "inArgName", std::vector<std::string>{});
+    effectGraph.setAttr(dpiCallVoidInoutUnused, "outArgName", std::vector<std::string>{});
+    effectGraph.setAttr(dpiCallVoidInoutUnused, "inoutArgName", std::vector<std::string>{"state"});
+    effectGraph.setAttr(dpiCallVoidInoutUnused, "hasReturn", false);
+    const auto dpiVoidInoutUnusedRes = makeValue(effectGraph, "dpi_void_inout_unused_res", 32, false);
+    effectGraph.addResult(dpiCallVoidInoutUnused, dpiVoidInoutUnusedRes);
 
     const auto sysTask =
         effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kSystemTask,
@@ -743,6 +867,32 @@ int main()
     effectGraph.addOperand(effLatchWr3, effData3);
     effectGraph.setAttr(effLatchWr3, "latchSymbol", std::string("lat3"));
 
+    auto addEffectLatchSink = [&](int index,
+                                  wolvrix::lib::grh::OperationKind kind,
+                                  wolvrix::lib::grh::ValueId lhs,
+                                  wolvrix::lib::grh::ValueId rhs) {
+        const std::string suffix = std::to_string(index);
+        const auto data = makeValue(effectGraph, "lat_data" + suffix, 32, false);
+        makeBinaryOp(effectGraph, kind, "lat_data_op" + suffix, lhs, rhs, data);
+
+        const std::string latchSymbol = "lat" + suffix;
+        const auto latch = effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kLatch,
+                                                       effectGraph.internSymbol(latchSymbol));
+        effectGraph.setAttr(latch, "width", static_cast<int64_t>(32));
+        effectGraph.setAttr(latch, "isSigned", false);
+
+        const auto write = effectGraph.createOperation(wolvrix::lib::grh::OperationKind::kLatchWritePort,
+                                                       effectGraph.internSymbol(latchSymbol + "_wr"));
+        effectGraph.addOperand(write, effEn);
+        effectGraph.addOperand(write, data);
+        effectGraph.setAttr(write, "latchSymbol", latchSymbol);
+    };
+
+    addEffectLatchSink(4, wolvrix::lib::grh::OperationKind::kAdd, dpiVoidOutputRes, effA);
+    addEffectLatchSink(5, wolvrix::lib::grh::OperationKind::kSub, dpiVoidOutputRes, effB);
+    addEffectLatchSink(6, wolvrix::lib::grh::OperationKind::kAdd, dpiVoidInoutRes, effA);
+    addEffectLatchSink(7, wolvrix::lib::grh::OperationKind::kSub, dpiVoidInoutRes, effB);
+
     const std::filesystem::path effectOutDir =
         std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) / "repcut_test_effect_sink";
     std::filesystem::create_directories(effectOutDir, ec);
@@ -825,6 +975,71 @@ int main()
     {
         return fail("no-return kDpicCall partition missing matching kDpicImport after repcut");
     }
+
+    auto *voidOutputCallPart =
+        findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "dpi_call_void_output");
+    auto *lat4Part = findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "lat4_wr");
+    auto *lat5Part = findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "lat5_wr");
+    if (voidOutputCallPart == nullptr || lat4Part == nullptr || lat5Part == nullptr)
+    {
+        return fail("expected void DPI output call and dependent latch sinks after effect-sink repcut");
+    }
+    if (voidOutputCallPart != lat4Part || voidOutputCallPart != lat5Part)
+    {
+        return fail("void DPI output call and its dependent sinks should be merged into one ASC/partition");
+    }
+    if (!graphHasOpSymbol(*voidOutputCallPart, "dpi_func_void_output"))
+    {
+        return fail("void DPI output call partition missing matching kDpicImport after repcut");
+    }
+
+    auto *voidInoutCallPart =
+        findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "dpi_call_void_inout");
+    auto *lat6Part = findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "lat6_wr");
+    auto *lat7Part = findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "lat7_wr");
+    if (voidInoutCallPart == nullptr || lat6Part == nullptr || lat7Part == nullptr)
+    {
+        return fail("expected void DPI inout call and dependent latch sinks after effect-sink repcut");
+    }
+    if (voidInoutCallPart != lat6Part || voidInoutCallPart != lat7Part)
+    {
+        return fail("void DPI inout call and its dependent sinks should be merged into one ASC/partition");
+    }
+    if (!graphHasOpSymbol(*voidInoutCallPart, "dpi_func_void_inout"))
+    {
+        return fail("void DPI inout call partition missing matching kDpicImport after repcut");
+    }
+    if (countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_call_void_output") != 1 ||
+        countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_func_void_output") != 1 ||
+        countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_call_void_inout") != 1 ||
+        countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_func_void_inout") != 1)
+    {
+        return fail("consumed void DPI result producer/import should each be kept exactly once after repcut");
+    }
+    if (countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_call_void_output_unused") != 1 ||
+        countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_func_void_output_unused") != 1 ||
+        countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_call_void_inout_unused") != 1 ||
+        countOpSymbolInGraphsWithPrefix(effectDesign,
+                                        "top_effect_sink_repcut_part",
+                                        "dpi_func_void_inout_unused") != 1)
+    {
+        return fail("unused void DPI result producer/import should each be kept exactly once after repcut");
+    }
+
     auto *returnedSysTaskPart =
         findGraphWithPrefixAndOpSymbol(effectDesign, "top_effect_sink_repcut_part", "sys_task_ret");
     if (returnedSysTaskPart == nullptr)

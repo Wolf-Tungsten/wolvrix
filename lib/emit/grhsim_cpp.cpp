@@ -3968,6 +3968,14 @@ namespace wolvrix::lib::emit
             std::size_t wordCount = 0;
         };
 
+        struct StateLogicPhysicalField
+        {
+            bool wide = false;
+            ValueSlotScalarKind scalarKind = ValueSlotScalarKind::kBool;
+            std::size_t wordCount = 0;
+            std::size_t slotIndex = 0;
+        };
+
         struct DpiImportDecl
         {
             std::string symbol;
@@ -4403,6 +4411,7 @@ namespace wolvrix::lib::emit
             std::array<std::size_t, static_cast<std::size_t>(ValueSlotScalarKind::kCount)> stateLogicScalarSlotCounts{};
             std::array<std::size_t, static_cast<std::size_t>(ValueSlotScalarKind::kCount)> stateLogicScalarBaseOffsets{};
             std::map<std::size_t, std::size_t> stateLogicWideSlotCountsByWords;
+            std::vector<StateLogicPhysicalField> stateLogicPhysicalFieldOrder;
             std::map<std::size_t, std::size_t> stateLogicWideBaseOffsetsByWords;
             std::size_t stateLogicStorageBytes = 0;
             std::array<std::size_t, static_cast<std::size_t>(ValueSlotScalarKind::kCount)> stateMemoryScalarSlotCounts{};
@@ -5628,6 +5637,258 @@ namespace wolvrix::lib::emit
                           return lhs.order.graphOrder < rhs.order.graphOrder;
                       });
             return orderedEntries;
+        }
+
+        using StateLogicReferenceUnit =
+            std::pair<ScheduleBatch::Phase, std::size_t>;
+
+        struct StateLogicReferenceDemand
+        {
+            std::string symbol;
+            std::vector<StateLogicReferenceUnit> units;
+            std::size_t demand = 0;
+            std::size_t graphOrder = 0;
+        };
+
+        std::size_t stateLogicReferenceDemandClass(std::size_t demand) noexcept
+        {
+            std::size_t demandClass = 0;
+            while (demand != 0)
+            {
+                ++demandClass;
+                demand >>= 1u;
+            }
+            return demandClass;
+        }
+
+        void orderStateLogicStorageByReferenceDemand(
+            const Graph &graph,
+            std::span<const ScheduleBatch> scheduleBatches,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            EmitModel &model)
+        {
+            std::vector<StateLogicReferenceDemand> signatures;
+            signatures.reserve(model.stateOrder.size());
+            std::unordered_map<std::string, std::size_t> signatureBySymbol;
+            signatureBySymbol.reserve(model.stateOrder.size());
+
+            std::size_t graphOrder = 0;
+            for (const std::string &stateSymbol : model.stateOrder)
+            {
+                const auto stateIt = model.stateBySymbol.find(stateSymbol);
+                if (stateIt != model.stateBySymbol.end() &&
+                    stateIt->second.kind != StateDecl::Kind::Memory &&
+                    !stateIt->second.regToMemIntentStorage)
+                {
+                    signatureBySymbol.emplace(stateSymbol, signatures.size());
+                    signatures.push_back(StateLogicReferenceDemand{
+                        .symbol = stateSymbol,
+                        .units = {},
+                        .demand = 0,
+                        .graphOrder = graphOrder,
+                    });
+                }
+                ++graphOrder;
+            }
+
+            const auto noteReference = [&](const std::string &stateSymbol,
+                                           const ScheduleBatch &batch,
+                                           uint32_t supernodeId,
+                                           std::size_t demand)
+            {
+                const auto signatureIt = signatureBySymbol.find(stateSymbol);
+                if (signatureIt == signatureBySymbol.end())
+                {
+                    return;
+                }
+                StateLogicReferenceDemand &signature =
+                    signatures[signatureIt->second];
+                const StateLogicReferenceUnit unit = {
+                    batch.phase,
+                    batch.phase == ScheduleBatch::Phase::kCompute
+                        ? static_cast<std::size_t>(supernodeId)
+                        : batch.index,
+                };
+                if (signature.units.empty() || signature.units.back() != unit)
+                {
+                    signature.units.push_back(unit);
+                }
+                signature.demand += demand;
+            };
+
+            for (const ScheduleBatch &batch : scheduleBatches)
+            {
+                for (uint32_t supernodeId : batch.supernodeIds)
+                {
+                    if (supernodeId >= supernodeToOps.size())
+                    {
+                        continue;
+                    }
+                    for (OperationId opId : supernodeToOps[supernodeId])
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        const bool commitPhaseOp = isCommitPhaseOp(op);
+                        if ((batch.phase == ScheduleBatch::Phase::kCompute &&
+                             commitPhaseOp) ||
+                            (batch.phase == ScheduleBatch::Phase::kCommit &&
+                             !commitPhaseOp))
+                        {
+                            continue;
+                        }
+
+                        for (ValueId operand : op.operands())
+                        {
+                            const auto directIt =
+                                model.directStateReadSymbolByValue.find(operand);
+                            if (directIt !=
+                                model.directStateReadSymbolByValue.end())
+                            {
+                                noteReference(directIt->second,
+                                              batch,
+                                              supernodeId,
+                                              1u);
+                            }
+                        }
+
+                        if (op.kind() == OperationKind::kRegisterReadPort ||
+                            op.kind() == OperationKind::kLatchReadPort)
+                        {
+                            if (op.results().size() != 1u)
+                            {
+                                continue;
+                            }
+                            const ValueId resultValue = op.results().front();
+                            if (model.directStateReadSymbolByValue.contains(
+                                    resultValue) ||
+                                model.materializedValueAliasByValue.contains(
+                                    resultValue))
+                            {
+                                continue;
+                            }
+                            const char *symbolAttr =
+                                op.kind() == OperationKind::kRegisterReadPort
+                                    ? "regSymbol"
+                                    : "latchSymbol";
+                            if (const auto stateSymbol =
+                                    getAttribute<std::string>(op, symbolAttr))
+                            {
+                                noteReference(*stateSymbol,
+                                              batch,
+                                              supernodeId,
+                                              1u);
+                            }
+                            continue;
+                        }
+
+                        if (isWritePortKind(op.kind()))
+                        {
+                            if (const auto writeIt = model.writeByOp.find(opId);
+                                writeIt != model.writeByOp.end())
+                            {
+                                noteReference(writeIt->second.symbol,
+                                              batch,
+                                              supernodeId,
+                                              2u);
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::sort(
+                signatures.begin(),
+                signatures.end(),
+                [](const StateLogicReferenceDemand &lhs,
+                   const StateLogicReferenceDemand &rhs)
+                {
+                    if (lhs.units.empty() != rhs.units.empty())
+                    {
+                        return !lhs.units.empty();
+                    }
+                    const std::size_t lhsClass =
+                        stateLogicReferenceDemandClass(lhs.demand);
+                    const std::size_t rhsClass =
+                        stateLogicReferenceDemandClass(rhs.demand);
+                    if (lhsClass != rhsClass)
+                    {
+                        return lhsClass > rhsClass;
+                    }
+                    if (lhs.units != rhs.units)
+                    {
+                        return std::lexicographical_compare(lhs.units.begin(),
+                                                            lhs.units.end(),
+                                                            rhs.units.begin(),
+                                                            rhs.units.end());
+                    }
+                    if (lhs.demand != rhs.demand)
+                    {
+                        return lhs.demand > rhs.demand;
+                    }
+                    return lhs.graphOrder < rhs.graphOrder;
+                });
+
+            const auto physicalGroup =
+                [&](const StateLogicReferenceDemand &signature)
+            {
+                const StateDecl &state =
+                    model.stateBySymbol.at(signature.symbol);
+                if (isWideLogicWidth(state.width) ||
+                    state.scalarKind == ValueSlotScalarKind::kU64)
+                {
+                    return 0u;
+                }
+                if (state.scalarKind == ValueSlotScalarKind::kU32)
+                {
+                    return 1u;
+                }
+                if (state.scalarKind == ValueSlotScalarKind::kU16)
+                {
+                    return 2u;
+                }
+                return 3u;
+            };
+
+            model.stateLogicPhysicalFieldOrder.clear();
+            model.stateLogicPhysicalFieldOrder.reserve(signatures.size());
+            std::size_t tierBegin = 0;
+            while (tierBegin < signatures.size())
+            {
+                const std::size_t demandClass =
+                    stateLogicReferenceDemandClass(
+                        signatures[tierBegin].demand);
+                std::size_t tierEnd = tierBegin + 1u;
+                while (tierEnd < signatures.size() &&
+                       stateLogicReferenceDemandClass(
+                           signatures[tierEnd].demand) == demandClass)
+                {
+                    ++tierEnd;
+                }
+
+                for (unsigned group = 0; group < 4u; ++group)
+                {
+                    for (std::size_t index = tierBegin;
+                         index < tierEnd;
+                         ++index)
+                    {
+                        const StateLogicReferenceDemand &signature =
+                            signatures[index];
+                        if (physicalGroup(signature) != group)
+                        {
+                            continue;
+                        }
+                        const StateDecl &state =
+                            model.stateBySymbol.at(signature.symbol);
+                        model.stateLogicPhysicalFieldOrder.push_back(
+                            StateLogicPhysicalField{
+                                .wide = isWideLogicWidth(state.width),
+                                .scalarKind = state.scalarKind,
+                                .wordCount = state.wordCount,
+                                .slotIndex = state.logicSlotIndex,
+                            });
+                    }
+                }
+                tierBegin = tierEnd;
+            }
         }
 
         void rebuildMixedLogicStorage(const Graph &graph,
@@ -23430,6 +23691,10 @@ namespace wolvrix::lib::emit
             model.activeMaskGapPackProbe = activeMaskGapPackProbe.get();
         }
         markRepeatedPatternScheduleBatches(graph, model, schedule, scheduleBatches);
+        orderStateLogicStorageByReferenceDemand(graph,
+                                                scheduleBatches,
+                                                schedule.supernodeToOps,
+                                                model);
         std::vector<ValueId> batchReadLocalityValueOrder =
             buildStateAnchoredValueOrder(graph,
                                          model,
@@ -27824,26 +28089,27 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             if (model.stateLogicStorageBytes != 0)
             {
                 *stream << "    struct state_logic_storage_t {\n";
-                for (std::size_t kindIndex = 0;
-                     kindIndex < static_cast<std::size_t>(ValueSlotScalarKind::kCount);
-                     ++kindIndex)
+                for (const StateLogicPhysicalField &field :
+                     model.stateLogicPhysicalFieldOrder)
                 {
-                    const auto kind = static_cast<ValueSlotScalarKind>(kindIndex);
-                    const std::size_t slotCount = model.stateLogicScalarSlotCounts[kindIndex];
-                    for (std::size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex)
-                    {
-                        *stream << "        " << scalarLogicObjectCppType(kind) << " "
-                                << stateScalarStorageFieldName(kind, std::to_string(slotIndex))
-                                << ";\n";
-                    }
-                }
-                for (const auto &[wordCount, slotCount] : model.stateLogicWideSlotCountsByWords)
-                {
-                    for (std::size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex)
+                    if (field.wide)
                     {
                         *stream << "        "
-                                << fixedArrayType("std::uint64_t", wordCount) << " "
-                                << stateWideStorageFieldName(wordCount, std::to_string(slotIndex))
+                                << fixedArrayType("std::uint64_t", field.wordCount)
+                                << " "
+                                << stateWideStorageFieldName(
+                                       field.wordCount,
+                                       std::to_string(field.slotIndex))
+                                << ";\n";
+                    }
+                    else
+                    {
+                        *stream << "        "
+                                << scalarLogicObjectCppType(field.scalarKind)
+                                << " "
+                                << stateScalarStorageFieldName(
+                                       field.scalarKind,
+                                       std::to_string(field.slotIndex))
                                 << ";\n";
                     }
                 }

@@ -2647,6 +2647,20 @@ namespace wolvrix::lib::transform
         if (normalized == "repcut")
         {
             RepcutOptions options;
+            auto parseWeightMode = [&](std::string_view value) -> bool {
+                if (value == "baseline")
+                {
+                    options.weightMode = RepcutWeightMode::kBaseline;
+                    return true;
+                }
+                if (value == "closure-aware")
+                {
+                    options.weightMode = RepcutWeightMode::kClosureAware;
+                    return true;
+                }
+                error = "invalid -weight-mode value; expected baseline or closure-aware";
+                return false;
+            };
             for (std::size_t i = 0; i < args.size(); ++i)
             {
                 const std::string_view arg = args[i];
@@ -2795,6 +2809,25 @@ namespace wolvrix::lib::transform
                     catch (const std::exception &)
                     {
                         error = "invalid -mtkahypar-threads value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-weight-mode")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-weight-mode expects a value";
+                        return nullptr;
+                    }
+                    if (!parseWeightMode(args[++i]))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-weight-mode="))
+                {
+                    if (!parseWeightMode(arg.substr(std::string_view("-weight-mode=").size())))
+                    {
                         return nullptr;
                     }
                 }

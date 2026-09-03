@@ -21,6 +21,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -187,6 +188,18 @@ namespace wolvrix::lib::transform
         constexpr std::size_t kMaxPartitionCount = 4096;
 
         using PartitionSet = wolvrix::lib::transform::detail::PartitionSet;
+
+        std::string_view repcutWeightModeName(RepcutWeightMode mode)
+        {
+            switch (mode)
+            {
+            case RepcutWeightMode::kBaseline:
+                return "baseline";
+            case RepcutWeightMode::kClosureAware:
+                return "closure-aware";
+            }
+            return "unknown";
+        }
 
         template <typename T>
         std::optional<T> getAttr(const wolvrix::lib::grh::Operation &op, std::string_view key)
@@ -448,11 +461,648 @@ namespace wolvrix::lib::transform
             {
                 std::vector<AscId> nodes;
                 uint32_t weight = 1;
+                PieceId pieceId = kInvalidPiece;
             };
 
             std::vector<uint32_t> nodeWeights;
             std::vector<HyperEdge> edges;
         };
+
+        struct ClosureWeightModel
+        {
+            std::vector<uint64_t> exclusiveWeights;
+            std::vector<uint64_t> sharedIncidentWeights;
+            std::vector<uint64_t> fullClosureWeights;
+            std::vector<uint64_t> fairShareWeights;
+            uint64_t referencedUniqueWeight = 0;
+            uint64_t unreferencedPieceWeight = 0;
+            uint64_t exclusiveUniqueWeight = 0;
+            uint64_t sharedUniqueWeight = 0;
+            uint64_t fairShareAllocatedWeight = 0;
+            uint64_t fairSharePaddingWeight = 0;
+            AscId maxFullClosureAscId = 0;
+            uint64_t maxFullClosureWeight = 0;
+        };
+
+        struct ClosureAssignmentMetrics
+        {
+            std::vector<uint64_t> partitionLoads;
+            uint64_t loadSum = 0;
+            uint64_t loadMax = 0;
+            uint64_t computeKm1 = 0;
+            uint64_t communicationProxyKm1 = 0;
+        };
+
+        struct ClosureRefineStats
+        {
+            bool enabled = false;
+            bool applied = false;
+            std::string skipReason;
+            std::size_t roundCount = 0;
+            std::size_t moveCount = 0;
+            ClosureAssignmentMetrics before;
+            ClosureAssignmentMetrics after;
+        };
+
+        bool checkedAdd(uint64_t &value, uint64_t increment)
+        {
+            if (increment > std::numeric_limits<uint64_t>::max() - value)
+            {
+                return false;
+            }
+            value += increment;
+            return true;
+        }
+
+        bool buildClosureWeightModel(const PhaseBData &phaseB,
+                                     const std::vector<uint32_t> &pieceWeights,
+                                     ClosureWeightModel &model,
+                                     std::string &errorMessage)
+        {
+            if (pieceWeights.size() != phaseB.pieces.size() ||
+                phaseB.pieceToAscs.size() != phaseB.pieces.size())
+            {
+                errorMessage = "repcut closure model: piece arrays have inconsistent sizes";
+                return false;
+            }
+
+            model = {};
+            model.exclusiveWeights.assign(phaseB.ascs.size(), 0);
+            model.sharedIncidentWeights.assign(phaseB.ascs.size(), 0);
+            model.fullClosureWeights.assign(phaseB.ascs.size(), 0);
+            model.fairShareWeights.assign(phaseB.ascs.size(), 0);
+
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+            {
+                if (phaseB.pieces[pid].empty())
+                {
+                    continue;
+                }
+
+                const uint64_t weight = pieceWeights[pid];
+                const auto &ascs = phaseB.pieceToAscs[pid];
+                if (ascs.empty())
+                {
+                    if (!checkedAdd(model.unreferencedPieceWeight, weight))
+                    {
+                        errorMessage = "repcut closure model: unreferenced weight overflow";
+                        return false;
+                    }
+                    continue;
+                }
+                if (!checkedAdd(model.referencedUniqueWeight, weight))
+                {
+                    errorMessage = "repcut closure model: referenced weight overflow";
+                    return false;
+                }
+
+                const bool shared = ascs.size() > 1;
+                uint64_t &uniqueClassWeight =
+                    shared ? model.sharedUniqueWeight : model.exclusiveUniqueWeight;
+                if (!checkedAdd(uniqueClassWeight, weight))
+                {
+                    errorMessage = "repcut closure model: unique class weight overflow";
+                    return false;
+                }
+
+                const uint64_t quotient = weight / ascs.size();
+                const uint64_t remainder = weight % ascs.size();
+                const std::size_t start = pid % ascs.size();
+                for (std::size_t index = 0; index < ascs.size(); ++index)
+                {
+                    const AscId aid = ascs[index];
+                    if (aid >= phaseB.ascs.size())
+                    {
+                        errorMessage = "repcut closure model: piece references invalid asc id";
+                        return false;
+                    }
+                    if (!checkedAdd(model.fullClosureWeights[aid], weight))
+                    {
+                        errorMessage = "repcut closure model: full closure weight overflow";
+                        return false;
+                    }
+                    uint64_t &classWeight =
+                        shared ? model.sharedIncidentWeights[aid] : model.exclusiveWeights[aid];
+                    if (!checkedAdd(classWeight, weight))
+                    {
+                        errorMessage = "repcut closure model: per-asc class weight overflow";
+                        return false;
+                    }
+
+                    const std::size_t fairPosition = (start + index) % ascs.size();
+                    const AscId fairAid = ascs[fairPosition];
+                    const uint64_t fairWeight = quotient + (index < remainder ? 1u : 0u);
+                    if (!checkedAdd(model.fairShareWeights[fairAid], fairWeight))
+                    {
+                        errorMessage = "repcut closure model: fair-share weight overflow";
+                        return false;
+                    }
+                }
+            }
+
+            for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+            {
+                if (!checkedAdd(model.fairShareAllocatedWeight, model.fairShareWeights[aid]))
+                {
+                    errorMessage = "repcut closure model: fair-share total overflow";
+                    return false;
+                }
+                if (model.fairShareWeights[aid] == 0)
+                {
+                    ++model.fairSharePaddingWeight;
+                }
+                if (model.fullClosureWeights[aid] > model.maxFullClosureWeight)
+                {
+                    model.maxFullClosureWeight = model.fullClosureWeights[aid];
+                    model.maxFullClosureAscId = aid;
+                }
+            }
+
+            if (model.exclusiveUniqueWeight + model.sharedUniqueWeight != model.referencedUniqueWeight ||
+                model.fairShareAllocatedWeight != model.referencedUniqueWeight)
+            {
+                errorMessage = "repcut closure model: unique/fair-share conservation check failed";
+                return false;
+            }
+            return true;
+        }
+
+        bool evaluateClosureAssignment(const PhaseBData &phaseB,
+                                       const std::vector<uint32_t> &pieceWeights,
+                                       const std::vector<uint32_t> &edgeProxyWeights,
+                                       const std::vector<uint32_t> &ascPartition,
+                                       std::size_t partitionCount,
+                                       ClosureAssignmentMetrics &metrics,
+                                       std::string &errorMessage)
+        {
+            if (ascPartition.size() != phaseB.ascs.size() ||
+                pieceWeights.size() != phaseB.pieces.size() ||
+                edgeProxyWeights.size() != phaseB.pieces.size() ||
+                partitionCount == 0)
+            {
+                errorMessage = "repcut closure assignment: inconsistent input sizes";
+                return false;
+            }
+
+            metrics = {};
+            metrics.partitionLoads.assign(partitionCount, 0);
+            std::vector<uint32_t> partStamps(partitionCount, 0);
+            uint32_t stamp = 0;
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+            {
+                if (phaseB.pieces[pid].empty() || phaseB.pieceToAscs[pid].empty())
+                {
+                    continue;
+                }
+                if (stamp == std::numeric_limits<uint32_t>::max())
+                {
+                    std::fill(partStamps.begin(), partStamps.end(), 0);
+                    stamp = 1;
+                }
+                else
+                {
+                    ++stamp;
+                }
+
+                std::size_t connectivity = 0;
+                for (const AscId aid : phaseB.pieceToAscs[pid])
+                {
+                    if (aid >= ascPartition.size() || ascPartition[aid] >= partitionCount)
+                    {
+                        errorMessage = "repcut closure assignment: partition id out of range";
+                        return false;
+                    }
+                    const uint32_t part = ascPartition[aid];
+                    if (partStamps[part] == stamp)
+                    {
+                        continue;
+                    }
+                    partStamps[part] = stamp;
+                    ++connectivity;
+                    if (!checkedAdd(metrics.partitionLoads[part], pieceWeights[pid]))
+                    {
+                        errorMessage = "repcut closure assignment: partition load overflow";
+                        return false;
+                    }
+                }
+
+                if (connectivity > 1)
+                {
+                    const uint64_t multiplier = connectivity - 1;
+                    if (!checkedAdd(metrics.computeKm1, multiplier * pieceWeights[pid]) ||
+                        !checkedAdd(metrics.communicationProxyKm1, multiplier * edgeProxyWeights[pid]))
+                    {
+                        errorMessage = "repcut closure assignment: km1 overflow";
+                        return false;
+                    }
+                }
+            }
+
+            for (const uint64_t load : metrics.partitionLoads)
+            {
+                if (!checkedAdd(metrics.loadSum, load))
+                {
+                    errorMessage = "repcut closure assignment: load sum overflow";
+                    return false;
+                }
+                metrics.loadMax = std::max(metrics.loadMax, load);
+            }
+            return true;
+        }
+
+        bool withinOnePercent(uint64_t value, uint64_t baseline)
+        {
+            return static_cast<unsigned __int128>(value) * 100u <=
+                   static_cast<unsigned __int128>(baseline) * 101u;
+        }
+
+        bool refineClosureAssignment(const PhaseBData &phaseB,
+                                     const std::vector<uint32_t> &pieceWeights,
+                                     const std::vector<uint32_t> &edgeProxyWeights,
+                                     const ClosureWeightModel &model,
+                                     std::size_t partitionCount,
+                                     std::vector<uint32_t> &ascPartition,
+                                     ClosureRefineStats &stats,
+                                     std::string &errorMessage)
+        {
+            stats = {};
+            stats.enabled = true;
+            if (!evaluateClosureAssignment(
+                    phaseB, pieceWeights, edgeProxyWeights, ascPartition, partitionCount, stats.before, errorMessage))
+            {
+                return false;
+            }
+            stats.after = stats.before;
+
+            if (partitionCount > 64)
+            {
+                stats.skipReason = "partition_count_exceeds_dense_refiner_limit";
+                return true;
+            }
+            for (const uint32_t part : ascPartition)
+            {
+                if (part >= partitionCount)
+                {
+                    errorMessage = "repcut closure refiner: partition id out of range";
+                    return false;
+                }
+            }
+            if (phaseB.pieces.size() > std::numeric_limits<std::size_t>::max() / partitionCount)
+            {
+                stats.skipReason = "occupancy_size_overflow";
+                return true;
+            }
+
+            const std::size_t occupancySize = phaseB.pieces.size() * partitionCount;
+            std::size_t incidenceCount = 0;
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+            {
+                if (phaseB.pieces[pid].empty())
+                {
+                    continue;
+                }
+                if (phaseB.pieceToAscs[pid].size() >
+                    std::numeric_limits<std::size_t>::max() - incidenceCount)
+                {
+                    stats.skipReason = "incidence_size_overflow";
+                    return true;
+                }
+                incidenceCount += phaseB.pieceToAscs[pid].size();
+            }
+            constexpr uint64_t kDenseRefinerWorkingSetLimitBytes = 512ull * 1024ull * 1024ull;
+            const unsigned __int128 estimatedWorkingSetBytes =
+                static_cast<unsigned __int128>(occupancySize) * sizeof(uint32_t) +
+                static_cast<unsigned __int128>(incidenceCount) * sizeof(PieceId) +
+                (static_cast<unsigned __int128>(phaseB.ascs.size()) + 1u) * sizeof(uint64_t) * 2u;
+            if (estimatedWorkingSetBytes > kDenseRefinerWorkingSetLimitBytes)
+            {
+                stats.skipReason = "dense_refiner_working_set_exceeds_512mib";
+                return true;
+            }
+
+            std::vector<uint32_t> occupancy(occupancySize, 0);
+            std::vector<uint64_t> ascPieceOffsets(phaseB.ascs.size() + 1, 0);
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+            {
+                if (phaseB.pieces[pid].empty())
+                {
+                    continue;
+                }
+                for (const AscId aid : phaseB.pieceToAscs[pid])
+                {
+                    if (aid >= phaseB.ascs.size())
+                    {
+                        errorMessage = "repcut closure refiner: invalid asc incidence";
+                        return false;
+                    }
+                    ++ascPieceOffsets[aid + 1];
+                    ++occupancy[static_cast<std::size_t>(pid) * partitionCount + ascPartition[aid]];
+                }
+            }
+            for (std::size_t aid = 1; aid < ascPieceOffsets.size(); ++aid)
+            {
+                ascPieceOffsets[aid] += ascPieceOffsets[aid - 1];
+            }
+            if (ascPieceOffsets.back() > std::numeric_limits<std::size_t>::max())
+            {
+                errorMessage = "repcut closure refiner: incidence array too large";
+                return false;
+            }
+            std::vector<PieceId> ascPieces(static_cast<std::size_t>(ascPieceOffsets.back()));
+            std::vector<uint64_t> cursors = ascPieceOffsets;
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+            {
+                if (phaseB.pieces[pid].empty())
+                {
+                    continue;
+                }
+                for (const AscId aid : phaseB.pieceToAscs[pid])
+                {
+                    ascPieces[static_cast<std::size_t>(cursors[aid]++)] = pid;
+                }
+            }
+
+            std::vector<std::size_t> partAscCounts(partitionCount, 0);
+            for (const uint32_t part : ascPartition)
+            {
+                if (part >= partitionCount)
+                {
+                    errorMessage = "repcut closure refiner: partition id out of range";
+                    return false;
+                }
+                ++partAscCounts[part];
+            }
+
+            const uint64_t nominalTarget =
+                (model.referencedUniqueWeight + partitionCount - 1) / partitionCount;
+            std::vector<bool> overweightAsc(phaseB.ascs.size(), false);
+            std::vector<bool> reservedPart(partitionCount, false);
+            for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+            {
+                if (model.fullClosureWeights[aid] > nominalTarget)
+                {
+                    overweightAsc[aid] = true;
+                    reservedPart[ascPartition[aid]] = true;
+                }
+            }
+
+            struct MoveCandidate
+            {
+                bool valid = false;
+                AscId aid = 0;
+                uint32_t source = 0;
+                uint32_t destination = 0;
+                uint64_t sourceLoss = 0;
+                uint64_t destinationGain = 0;
+                std::vector<uint64_t> descendingLoads;
+                uint64_t loadSum = 0;
+                uint64_t communicationProxyKm1 = 0;
+            };
+
+            auto candidateIsBetter = [](const MoveCandidate &lhs, const MoveCandidate &rhs) {
+                if (!rhs.valid)
+                {
+                    return true;
+                }
+                if (lhs.descendingLoads != rhs.descendingLoads)
+                {
+                    return lhs.descendingLoads < rhs.descendingLoads;
+                }
+                if (lhs.loadSum != rhs.loadSum)
+                {
+                    return lhs.loadSum < rhs.loadSum;
+                }
+                if (lhs.communicationProxyKm1 != rhs.communicationProxyKm1)
+                {
+                    return lhs.communicationProxyKm1 < rhs.communicationProxyKm1;
+                }
+                return std::tie(lhs.aid, lhs.destination) < std::tie(rhs.aid, rhs.destination);
+            };
+
+            std::vector<uint64_t> currentLoads = stats.before.partitionLoads;
+            uint64_t currentLoadSum = stats.before.loadSum;
+            uint64_t currentCommunicationKm1 = stats.before.communicationProxyKm1;
+            constexpr std::size_t kMaxRounds = 4;
+            constexpr std::size_t kMaxMoves = 64;
+            constexpr std::size_t kDrainCandidateLimit = 128;
+            for (std::size_t round = 0; round < kMaxRounds && stats.moveCount < kMaxMoves; ++round)
+            {
+                std::vector<bool> movedThisRound(phaseB.ascs.size(), false);
+                std::vector<bool> blockedSources(partitionCount, false);
+                bool acceptedInRound = false;
+                while (stats.moveCount < kMaxMoves)
+                {
+                    std::optional<uint32_t> sourceCandidate;
+                    for (uint32_t part = 0; part < partitionCount; ++part)
+                    {
+                        if (blockedSources[part] || partAscCounts[part] <= 1)
+                        {
+                            continue;
+                        }
+                        if (!sourceCandidate || currentLoads[part] > currentLoads[*sourceCandidate] ||
+                            (currentLoads[part] == currentLoads[*sourceCandidate] && part < *sourceCandidate))
+                        {
+                            sourceCandidate = part;
+                        }
+                    }
+                    if (!sourceCandidate)
+                    {
+                        break;
+                    }
+                    const uint32_t source = *sourceCandidate;
+                    std::vector<uint64_t> currentDescendingLoads = currentLoads;
+                    std::sort(currentDescendingLoads.begin(), currentDescendingLoads.end(), std::greater<>());
+
+                    MoveCandidate best;
+                    std::vector<std::pair<uint64_t, AscId>> sourceCandidates;
+                    for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+                    {
+                        if (ascPartition[aid] != source || movedThisRound[aid] || overweightAsc[aid])
+                        {
+                            continue;
+                        }
+
+                        const uint64_t begin = ascPieceOffsets[aid];
+                        const uint64_t end = ascPieceOffsets[aid + 1];
+                        uint64_t sourceLoss = 0;
+                        for (uint64_t index = begin; index < end; ++index)
+                        {
+                            const PieceId pid = ascPieces[static_cast<std::size_t>(index)];
+                            if (occupancy[static_cast<std::size_t>(pid) * partitionCount + source] == 1)
+                            {
+                                if (!checkedAdd(sourceLoss, pieceWeights[pid]))
+                                {
+                                    errorMessage = "repcut closure refiner: source loss overflow";
+                                    return false;
+                                }
+                            }
+                        }
+                        if (sourceLoss == 0)
+                        {
+                            continue;
+                        }
+                        sourceCandidates.emplace_back(sourceLoss, aid);
+                    }
+                    std::sort(sourceCandidates.begin(), sourceCandidates.end(), [](const auto &lhs, const auto &rhs) {
+                        if (lhs.first != rhs.first)
+                        {
+                            return lhs.first > rhs.first;
+                        }
+                        return lhs.second < rhs.second;
+                    });
+                    if (sourceCandidates.size() > kDrainCandidateLimit)
+                    {
+                        sourceCandidates.resize(kDrainCandidateLimit);
+                    }
+
+                    for (const auto &[sourceLoss, aid] : sourceCandidates)
+                    {
+                        const uint64_t begin = ascPieceOffsets[aid];
+                        const uint64_t end = ascPieceOffsets[aid + 1];
+                        for (uint32_t destination = 0; destination < partitionCount; ++destination)
+                        {
+                            if (destination == source)
+                            {
+                                continue;
+                            }
+                            uint64_t destinationGain = 0;
+                            __int128 communicationDelta = 0;
+                            for (uint64_t index = begin; index < end; ++index)
+                            {
+                                const PieceId pid = ascPieces[static_cast<std::size_t>(index)];
+                                const std::size_t base = static_cast<std::size_t>(pid) * partitionCount;
+                                if (occupancy[base + destination] == 0)
+                                {
+                                    if (!checkedAdd(destinationGain, pieceWeights[pid]))
+                                    {
+                                        errorMessage = "repcut closure refiner: destination gain overflow";
+                                        return false;
+                                    }
+                                    communicationDelta += static_cast<__int128>(edgeProxyWeights[pid]);
+                                }
+                                if (occupancy[base + source] == 1)
+                                {
+                                    communicationDelta -= static_cast<__int128>(edgeProxyWeights[pid]);
+                                }
+                            }
+                            if (reservedPart[destination] && destinationGain > 0)
+                            {
+                                continue;
+                            }
+
+                            MoveCandidate candidate;
+                            candidate.valid = true;
+                            candidate.aid = aid;
+                            candidate.source = source;
+                            candidate.destination = destination;
+                            candidate.sourceLoss = sourceLoss;
+                            candidate.destinationGain = destinationGain;
+                            std::vector<uint64_t> loads = currentLoads;
+                            if (sourceLoss > loads[source] ||
+                                !checkedAdd(loads[destination], destinationGain))
+                            {
+                                errorMessage = "repcut closure refiner: partition load update overflow";
+                                return false;
+                            }
+                            loads[source] -= sourceLoss;
+                            candidate.descendingLoads = loads;
+                            std::sort(
+                                candidate.descendingLoads.begin(), candidate.descendingLoads.end(), std::greater<>());
+                            if (sourceLoss > currentLoadSum)
+                            {
+                                errorMessage = "repcut closure refiner: load sum underflow";
+                                return false;
+                            }
+                            candidate.loadSum = currentLoadSum - sourceLoss;
+                            if (!checkedAdd(candidate.loadSum, destinationGain))
+                            {
+                                errorMessage = "repcut closure refiner: load sum overflow";
+                                return false;
+                            }
+                            const __int128 updatedCommunicationKm1 =
+                                static_cast<__int128>(currentCommunicationKm1) + communicationDelta;
+                            if (updatedCommunicationKm1 < 0 ||
+                                static_cast<unsigned __int128>(updatedCommunicationKm1) >
+                                    std::numeric_limits<uint64_t>::max())
+                            {
+                                errorMessage = "repcut closure refiner: communication km1 update overflow";
+                                return false;
+                            }
+                            candidate.communicationProxyKm1 = static_cast<uint64_t>(updatedCommunicationKm1);
+                            if (!withinOnePercent(candidate.loadSum, stats.before.loadSum) ||
+                                !withinOnePercent(
+                                    candidate.communicationProxyKm1, stats.before.communicationProxyKm1))
+                            {
+                                continue;
+                            }
+                            if (candidate.descendingLoads > currentDescendingLoads ||
+                                (candidate.descendingLoads == currentDescendingLoads &&
+                                 std::tie(candidate.loadSum, candidate.communicationProxyKm1) >=
+                                     std::tie(currentLoadSum, currentCommunicationKm1)))
+                            {
+                                continue;
+                            }
+                            if (candidateIsBetter(candidate, best))
+                            {
+                                best = std::move(candidate);
+                            }
+                        }
+                    }
+
+                    if (!best.valid)
+                    {
+                        blockedSources[source] = true;
+                        continue;
+                    }
+                    const uint64_t begin = ascPieceOffsets[best.aid];
+                    const uint64_t end = ascPieceOffsets[best.aid + 1];
+                    for (uint64_t index = begin; index < end; ++index)
+                    {
+                        const PieceId pid = ascPieces[static_cast<std::size_t>(index)];
+                        const std::size_t base = static_cast<std::size_t>(pid) * partitionCount;
+                        --occupancy[base + best.source];
+                        ++occupancy[base + best.destination];
+                    }
+                    currentLoads[best.source] -= best.sourceLoss;
+                    currentLoads[best.destination] += best.destinationGain;
+                    currentLoadSum = best.loadSum;
+                    currentCommunicationKm1 = best.communicationProxyKm1;
+                    --partAscCounts[best.source];
+                    ++partAscCounts[best.destination];
+                    ascPartition[best.aid] = best.destination;
+                    movedThisRound[best.aid] = true;
+                    std::fill(blockedSources.begin(), blockedSources.end(), false);
+                    ++stats.moveCount;
+                    acceptedInRound = true;
+                }
+                ++stats.roundCount;
+                if (!acceptedInRound)
+                {
+                    break;
+                }
+            }
+
+            ClosureAssignmentMetrics recomputed;
+            if (!evaluateClosureAssignment(
+                    phaseB, pieceWeights, edgeProxyWeights, ascPartition, partitionCount, recomputed, errorMessage))
+            {
+                return false;
+            }
+            if (recomputed.partitionLoads != currentLoads ||
+                recomputed.loadSum != currentLoadSum ||
+                recomputed.communicationProxyKm1 != currentCommunicationKm1)
+            {
+                errorMessage = "repcut closure refiner: incremental occupancy differs from full recomputation";
+                return false;
+            }
+            stats.after = std::move(recomputed);
+            stats.applied = stats.moveCount > 0;
+            if (!stats.applied)
+            {
+                stats.skipReason = "no_budgeted_lexicographic_improvement";
+            }
+            return true;
+        }
 
         struct StorageInfo
         {
@@ -2820,6 +3470,7 @@ namespace wolvrix::lib::transform
             std::size_t fanoutCount = 0;
             std::size_t estimatedNodeWeightSum = 0;
             std::size_t hyperNodeWeight = 0;
+            uint64_t exactReferencedClosureWeight = 0;
             std::size_t crossInValueCount = 0;
             std::size_t crossOutValueCount = 0;
             std::size_t crossInWordCount = 0;
@@ -2844,7 +3495,8 @@ namespace wolvrix::lib::transform
             const PhaseAData &phaseA,
             const std::vector<std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>> &partitionOps,
             const std::vector<CrossPartitionValue> &crossValues,
-            const std::vector<std::size_t> &partitionWeights)
+            const std::vector<std::size_t> &partitionWeights,
+            const std::vector<uint64_t> &exactReferencedClosureWeights)
         {
             std::vector<PartitionStaticFeatureRecord> records(partitionOps.size());
             std::vector<uint32_t> nodeWeights(phaseA.nodeToOp.size(), std::numeric_limits<uint32_t>::max());
@@ -2855,6 +3507,10 @@ namespace wolvrix::lib::transform
                 if (partId < partitionWeights.size())
                 {
                     record.hyperNodeWeight = partitionWeights[partId];
+                }
+                if (partId < exactReferencedClosureWeights.size())
+                {
+                    record.exactReferencedClosureWeight = exactReferencedClosureWeights[partId];
                 }
                 for (const auto opId : partitionOps[partId])
                 {
@@ -2947,11 +3603,15 @@ namespace wolvrix::lib::transform
         HyperGraph buildHyperGraph(const wolvrix::lib::grh::Graph &graph,
                                    const PhaseAData &phaseA,
                                    const PhaseBData &phaseB,
+                                   RepcutWeightMode weightMode,
                                    std::vector<uint32_t> &nodeWeights,
                                    std::vector<uint32_t> &pieceWeights,
-                                   std::vector<uint32_t> &edgeCutWeights)
+                                   std::vector<uint32_t> &edgeProxyWeights,
+                                   std::vector<uint32_t> &edgeHypergraphWeights,
+                                   std::size_t &mtWeightClampCount)
         {
             HyperGraph hg;
+            mtWeightClampCount = 0;
 
             nodeWeights.assign(phaseA.nodeToOp.size(), std::numeric_limits<uint32_t>::max());
             pieceWeights.assign(phaseB.pieces.size(), std::numeric_limits<uint32_t>::max());
@@ -2970,9 +3630,14 @@ namespace wolvrix::lib::transform
             std::vector<std::size_t> edgeSignalCounts;
             std::vector<std::size_t> edgeFanoutExcesses;
             std::vector<std::size_t> edgeWide64Words;
-            for (PieceId pid = static_cast<PieceId>(phaseB.ascs.size()); pid < phaseB.pieces.size(); ++pid)
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
             {
-                if (phaseB.pieceToAscs[pid].empty())
+                const bool baselineEdge =
+                    pid >= phaseB.ascs.size() && !phaseB.pieceToAscs[pid].empty();
+                const bool closureAwareEdge =
+                    !phaseB.pieces[pid].empty() && phaseB.pieceToAscs[pid].size() > 1;
+                if ((weightMode == RepcutWeightMode::kBaseline && !baselineEdge) ||
+                    (weightMode == RepcutWeightMode::kClosureAware && !closureAwareEdge))
                 {
                     continue;
                 }
@@ -2987,7 +3652,7 @@ namespace wolvrix::lib::transform
             constexpr std::size_t kMaxCutEdgeWeight = 65535;
 
             std::vector<uint32_t> balanceWeights(phaseB.pieces.size(), 1u);
-            edgeCutWeights.assign(phaseB.pieces.size(), 1u);
+            edgeProxyWeights.assign(phaseB.pieces.size(), 1u);
             for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
             {
                 const PieceCommStats &stats = pieceCommStats[pid];
@@ -3012,27 +3677,89 @@ namespace wolvrix::lib::transform
                 const std::size_t edgeWeight =
                     1u + outWordScore + 2u * wide64Score + 4u * wide256Score + 2u * fanoutScore +
                     3u * stateBoundaryScore + (hubBonus ? 32u : 0u);
-                edgeCutWeights[pid] = std::max<uint32_t>(
+                edgeProxyWeights[pid] = std::max<uint32_t>(
                     1u,
                     clampToUint32(std::min<std::size_t>(kMaxCutEdgeWeight, edgeWeight)));
             }
 
-            hg.nodeWeights.reserve(phaseB.ascs.size());
-            for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+            edgeHypergraphWeights = edgeProxyWeights;
+            if (weightMode == RepcutWeightMode::kBaseline)
             {
-                const uint32_t weight = (aid < balanceWeights.size()) ? balanceWeights[aid] : 1u;
-                hg.nodeWeights.push_back(std::max(1u, weight));
+                hg.nodeWeights.reserve(phaseB.ascs.size());
+                for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+                {
+                    const uint32_t weight = (aid < balanceWeights.size()) ? balanceWeights[aid] : 1u;
+                    hg.nodeWeights.push_back(std::max(1u, weight));
+                }
+            }
+            else
+            {
+                std::vector<uint64_t> allocatedWeights(phaseB.ascs.size(), 0);
+                for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+                {
+                    if (phaseB.pieces[pid].empty() || phaseB.pieceToAscs[pid].empty())
+                    {
+                        continue;
+                    }
+                    const auto &ascs = phaseB.pieceToAscs[pid];
+                    const uint64_t pieceWeight = pieceWeights[pid];
+                    const uint64_t quotient = pieceWeight / ascs.size();
+                    const uint64_t remainder = pieceWeight % ascs.size();
+                    const std::size_t start = pid % ascs.size();
+                    for (std::size_t i = 0; i < ascs.size(); ++i)
+                    {
+                        const std::size_t position = (start + i) % ascs.size();
+                        allocatedWeights[ascs[position]] += quotient + (i < remainder ? 1u : 0u);
+                    }
+                }
+
+                constexpr uint64_t kMaxMtKaHyParWeight =
+                    static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+                hg.nodeWeights.reserve(phaseB.ascs.size());
+                for (const uint64_t weight : allocatedWeights)
+                {
+                    if (weight > kMaxMtKaHyParWeight)
+                    {
+                        ++mtWeightClampCount;
+                    }
+                    hg.nodeWeights.push_back(static_cast<uint32_t>(
+                        std::max<uint64_t>(1u, std::min(weight, kMaxMtKaHyParWeight))));
+                }
+
+                for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
+                {
+                    if (phaseB.pieces[pid].empty() || phaseB.pieceToAscs[pid].size() <= 1)
+                    {
+                        continue;
+                    }
+                    const uint64_t combinedWeight =
+                        static_cast<uint64_t>(pieceWeights[pid]) + edgeProxyWeights[pid];
+                    if (combinedWeight > kMaxMtKaHyParWeight)
+                    {
+                        ++mtWeightClampCount;
+                    }
+                    edgeHypergraphWeights[pid] = static_cast<uint32_t>(
+                        std::min(combinedWeight, kMaxMtKaHyParWeight));
+                }
             }
 
-            for (PieceId pid = static_cast<PieceId>(phaseB.ascs.size()); pid < phaseB.pieces.size(); ++pid)
+            const PieceId firstPiece =
+                weightMode == RepcutWeightMode::kBaseline ? static_cast<PieceId>(phaseB.ascs.size()) : 0u;
+            for (PieceId pid = firstPiece; pid < phaseB.pieces.size(); ++pid)
             {
-                HyperGraph::HyperEdge edge;
-                edge.weight = (pid < edgeCutWeights.size()) ? std::max(1u, edgeCutWeights[pid]) : 1u;
-                edge.nodes = phaseB.pieceToAscs[pid];
-                if (!edge.nodes.empty())
+                const bool include =
+                    weightMode == RepcutWeightMode::kBaseline
+                        ? !phaseB.pieceToAscs[pid].empty()
+                        : (!phaseB.pieces[pid].empty() && phaseB.pieceToAscs[pid].size() > 1);
+                if (!include)
                 {
-                    hg.edges.push_back(std::move(edge));
+                    continue;
                 }
+                HyperGraph::HyperEdge edge;
+                edge.weight = std::max(1u, edgeHypergraphWeights[pid]);
+                edge.nodes = phaseB.pieceToAscs[pid];
+                edge.pieceId = pid;
+                hg.edges.push_back(std::move(edge));
             }
 
             return hg;
@@ -3084,7 +3811,8 @@ namespace wolvrix::lib::transform
 
         bool validateHyperEdgeContentGuard(const PhaseBData &phaseB,
                                            const HyperGraph &hg,
-                                           const std::vector<uint32_t> &edgeProxyWeights,
+                                           RepcutWeightMode weightMode,
+                                           const std::vector<uint32_t> &expectedEdgeWeights,
                                            std::string &errorMessage)
         {
             constexpr std::size_t kGuardDiagLimit = 24;
@@ -3101,10 +3829,22 @@ namespace wolvrix::lib::transform
             };
 
             const std::size_t ascCount = phaseB.ascs.size();
+            auto pieceHasEdge = [&](PieceId pid) {
+                if (pid >= phaseB.pieces.size() || phaseB.pieceToAscs[pid].empty())
+                {
+                    return false;
+                }
+                if (weightMode == RepcutWeightMode::kBaseline)
+                {
+                    return pid >= ascCount;
+                }
+                return !phaseB.pieces[pid].empty() && phaseB.pieceToAscs[pid].size() > 1;
+            };
+
             std::size_t expectedEdgeCount = 0;
-            for (PieceId pid = static_cast<PieceId>(ascCount); pid < phaseB.pieces.size(); ++pid)
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
             {
-                if (!phaseB.pieceToAscs[pid].empty())
+                if (pieceHasEdge(pid))
                 {
                     ++expectedEdgeCount;
                 }
@@ -3117,10 +3857,10 @@ namespace wolvrix::lib::transform
             }
 
             std::size_t edgeIndex = 0;
-            for (PieceId pid = static_cast<PieceId>(ascCount); pid < phaseB.pieces.size(); ++pid)
+            for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
             {
                 const auto &expectedNodesRaw = phaseB.pieceToAscs[pid];
-                if (expectedNodesRaw.empty())
+                if (!pieceHasEdge(pid))
                 {
                     continue;
                 }
@@ -3133,6 +3873,12 @@ namespace wolvrix::lib::transform
                 }
 
                 const HyperGraph::HyperEdge &edge = hg.edges[edgeIndex];
+                if (edge.pieceId != pid)
+                {
+                    addIssue("hyperedge piece id mismatch: edge_index=" + std::to_string(edgeIndex) +
+                             " expected_piece=" + std::to_string(pid) +
+                             " actual_piece=" + std::to_string(edge.pieceId));
+                }
                 if (edge.weight == 0)
                 {
                     addIssue("hyperedge weight is zero: edge_index=" + std::to_string(edgeIndex) +
@@ -3140,7 +3886,7 @@ namespace wolvrix::lib::transform
                 }
 
                 const uint32_t expectedWeight =
-                    (pid < edgeProxyWeights.size()) ? std::max<uint32_t>(1u, edgeProxyWeights[pid]) : 1u;
+                    (pid < expectedEdgeWeights.size()) ? std::max<uint32_t>(1u, expectedEdgeWeights[pid]) : 1u;
                 if (edge.weight != expectedWeight)
                 {
                     addIssue("hyperedge weight mismatch: edge_index=" + std::to_string(edgeIndex) +
@@ -3155,11 +3901,8 @@ namespace wolvrix::lib::transform
                              " piece=" + std::to_string(pid));
                 }
 
-                std::vector<AscId> actualNodes = edge.nodes;
-                std::sort(actualNodes.begin(), actualNodes.end());
-                const auto actualUniqueEnd = std::unique(actualNodes.begin(), actualNodes.end());
-                const bool hasDuplicateAsc = actualUniqueEnd != actualNodes.end();
-                actualNodes.erase(actualUniqueEnd, actualNodes.end());
+                const bool hasDuplicateAsc =
+                    std::adjacent_find(edge.nodes.begin(), edge.nodes.end()) != edge.nodes.end();
                 if (hasDuplicateAsc)
                 {
                     addIssue("hyperedge contains duplicate asc ids: edge_index=" + std::to_string(edgeIndex) +
@@ -3168,7 +3911,7 @@ namespace wolvrix::lib::transform
 
                 bool hasOutOfRangeAsc = false;
                 AscId firstOutOfRangeAsc = 0;
-                for (const AscId aid : actualNodes)
+                for (const AscId aid : edge.nodes)
                 {
                     if (aid >= ascCount)
                     {
@@ -3185,22 +3928,19 @@ namespace wolvrix::lib::transform
                              " asc_count=" + std::to_string(ascCount));
                 }
 
-                std::vector<AscId> expectedNodes = expectedNodesRaw;
-                std::sort(expectedNodes.begin(), expectedNodes.end());
-                const auto expectedUniqueEnd = std::unique(expectedNodes.begin(), expectedNodes.end());
-                const bool pieceHasDuplicateAsc = expectedUniqueEnd != expectedNodes.end();
-                expectedNodes.erase(expectedUniqueEnd, expectedNodes.end());
+                const bool pieceHasDuplicateAsc =
+                    std::adjacent_find(expectedNodesRaw.begin(), expectedNodesRaw.end()) != expectedNodesRaw.end();
                 if (pieceHasDuplicateAsc)
                 {
                     addIssue("pieceToAscs contains duplicate asc ids: piece=" + std::to_string(pid));
                 }
 
-                if (actualNodes != expectedNodes)
+                if (edge.nodes != expectedNodesRaw)
                 {
                     addIssue("hyperedge nodes mismatch pieceToAscs: edge_index=" + std::to_string(edgeIndex) +
                              " piece=" + std::to_string(pid) +
-                             " expected_nodes=" + std::to_string(expectedNodes.size()) +
-                             " actual_nodes=" + std::to_string(actualNodes.size()));
+                             " expected_nodes=" + std::to_string(expectedNodesRaw.size()) +
+                             " actual_nodes=" + std::to_string(edge.nodes.size()));
                 }
 
                 ++edgeIndex;
@@ -3960,6 +4700,7 @@ namespace wolvrix::lib::transform
                  << " partitioner=" << options_.partitioner
                  << " mtkahypar_preset=" << options_.mtKaHyParPreset
                  << " mtkahypar_threads=" << options_.mtKaHyParThreads
+                 << " weight_mode=" << repcutWeightModeName(options_.weightMode)
                  << " mem_cone_union=true"
                  << " keep_intermediate=" << (options_.keepIntermediateFiles ? "true" : "false");
             logInfo(boot.str());
@@ -4153,13 +4894,59 @@ namespace wolvrix::lib::transform
         std::vector<uint32_t> nodeWeights;
         std::vector<uint32_t> pieceWeights;
         std::vector<uint32_t> edgeProxyWeights;
+        std::vector<uint32_t> edgeHypergraphWeights;
+        std::size_t mtWeightClampCount = 0;
                 const auto hyperBuildStart = std::chrono::steady_clock::now();
-        const HyperGraph hg = buildHyperGraph(*graph, data, phaseB, nodeWeights, pieceWeights, edgeProxyWeights);
+        const HyperGraph hg = buildHyperGraph(
+            *graph,
+            data,
+            phaseB,
+            options_.weightMode,
+            nodeWeights,
+            pieceWeights,
+            edgeProxyWeights,
+            edgeHypergraphWeights,
+            mtWeightClampCount);
                 const uint64_t hyperBuildMs = msSince(hyperBuildStart);
+
+        ClosureWeightModel closureModel;
+        std::string closureModelError;
+        if (!buildClosureWeightModel(phaseB, pieceWeights, closureModel, closureModelError))
+        {
+            error(closureModelError);
+            result.failed = true;
+            return result;
+        }
+
+        if (mtWeightClampCount > 0)
+        {
+            error("repcut phase-c: closure-aware weights exceed mt-kahypar int32 range; clamped_count=" +
+                  std::to_string(mtWeightClampCount));
+            result.failed = true;
+            return result;
+        }
+        if (options_.weightMode == RepcutWeightMode::kClosureAware)
+        {
+            constexpr uint64_t kMaxMtKaHyParWeight =
+                static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+            for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+            {
+                const uint32_t expected = static_cast<uint32_t>(std::max<uint64_t>(
+                    1u, std::min(closureModel.fairShareWeights[aid], kMaxMtKaHyParWeight)));
+                if (hg.nodeWeights[aid] != expected)
+                {
+                    error("repcut phase-c: closure-aware fair-share HGR guard failed for asc=" +
+                          std::to_string(aid));
+                    result.failed = true;
+                    return result;
+                }
+            }
+        }
 
         const auto phaseCGuardStart = std::chrono::steady_clock::now();
         std::string phaseCGuardError;
-        if (!validateHyperEdgeContentGuard(phaseB, hg, edgeProxyWeights, phaseCGuardError))
+        if (!validateHyperEdgeContentGuard(
+                phaseB, hg, options_.weightMode, edgeHypergraphWeights, phaseCGuardError))
         {
             error(phaseCGuardError);
             result.failed = true;
@@ -4208,9 +4995,20 @@ namespace wolvrix::lib::transform
         {
             maxHyperEdgeWeight = std::max(maxHyperEdgeWeight, static_cast<std::size_t>(edge.weight));
         }
+        const uint64_t nominalUniqueTargetWeight =
+            (closureModel.referencedUniqueWeight + options_.partitionCount - 1) / options_.partitionCount;
+        std::size_t overweightFullClosureAscCount = 0;
+        for (const uint64_t weight : closureModel.fullClosureWeights)
+        {
+            if (weight > nominalUniqueTargetWeight)
+            {
+                ++overweightFullClosureAscCount;
+            }
+        }
 
         std::ostringstream phaseCSummary;
         phaseCSummary << "repcut phase-c: graph=" << graph->symbol()
+                      << " weight_mode=" << repcutWeightModeName(options_.weightMode)
                       << " weighted_nodes=" << weightedNodeCount
                       << " total_node_weight=" << totalNodeWeight
                       << " max_node_weight=" << maxNodeWeight
@@ -4218,6 +5016,15 @@ namespace wolvrix::lib::transform
                       << " max_piece_weight=" << maxPieceWeight
                       << " hyper_nodes=" << hg.nodeWeights.size()
                       << " hyper_edges=" << hg.edges.size()
+                      << " mt_weight_clamp_count=" << mtWeightClampCount
+                      << " referenced_unique_weight=" << closureModel.referencedUniqueWeight
+                      << " unreferenced_piece_weight=" << closureModel.unreferencedPieceWeight
+                      << " fair_share_allocated_weight=" << closureModel.fairShareAllocatedWeight
+                      << " fair_share_padding_weight=" << closureModel.fairSharePaddingWeight
+                      << " nominal_unique_target_weight=" << nominalUniqueTargetWeight
+                      << " overweight_full_closure_ascs=" << overweightFullClosureAscCount
+                      << " max_full_closure_asc_id=" << closureModel.maxFullClosureAscId
+                      << " max_full_closure_weight=" << closureModel.maxFullClosureWeight
                       << " max_hyper_node_weight=" << maxHyperNodeWeight
                       << " max_hyper_edge_weight=" << maxHyperEdgeWeight;
         const uint64_t phaseCMs = msSince(phaseCStart);
@@ -4322,7 +5129,8 @@ namespace wolvrix::lib::transform
         const uint64_t partitionRunMs = backendResponse.solverRunMs;
         const uint64_t parsePartMs = backendResponse.parsePartitionMs;
         const std::filesystem::path &partitionOutPath = backendResponse.partitionPath;
-        const std::vector<uint32_t> &ascPartition = backendResponse.partition;
+        const std::vector<uint32_t> &rawAscPartition = backendResponse.partition;
+        std::vector<uint32_t> ascPartition = rawAscPartition;
         const bool partitionComplete = backendResponse.partitionComplete;
         const std::string &partitionWarning = backendResponse.partitionWarning;
 
@@ -4339,6 +5147,96 @@ namespace wolvrix::lib::transform
             warning("repcut phase-d: " + partitionWarning);
         }
 
+        ClosureRefineStats closureRefineStats;
+        std::string refineError;
+        if (options_.weightMode == RepcutWeightMode::kClosureAware)
+        {
+            if (!refineClosureAssignment(
+                    phaseB,
+                    pieceWeights,
+                    edgeProxyWeights,
+                    closureModel,
+                    options_.partitionCount,
+                    ascPartition,
+                    closureRefineStats,
+                    refineError))
+            {
+                error(refineError);
+                result.failed = true;
+                return result;
+            }
+        }
+        else
+        {
+            closureRefineStats.enabled = false;
+            closureRefineStats.skipReason = "weight_mode_baseline";
+            if (!evaluateClosureAssignment(
+                    phaseB,
+                    pieceWeights,
+                    edgeProxyWeights,
+                    ascPartition,
+                    options_.partitionCount,
+                    closureRefineStats.before,
+                    refineError))
+            {
+                error(refineError);
+                result.failed = true;
+                return result;
+            }
+            closureRefineStats.after = closureRefineStats.before;
+        }
+        auto validateClosureMetricIdentity = [&](const ClosureAssignmentMetrics &metrics,
+                                                 std::string_view label) -> bool {
+            if (metrics.computeKm1 > std::numeric_limits<uint64_t>::max() -
+                                         closureModel.referencedUniqueWeight ||
+                metrics.loadSum != closureModel.referencedUniqueWeight + metrics.computeKm1)
+            {
+                error("repcut phase-d: exact closure load identity failed for " + std::string(label));
+                return false;
+            }
+            return true;
+        };
+        if (!validateClosureMetricIdentity(closureRefineStats.before, "before") ||
+            !validateClosureMetricIdentity(closureRefineStats.after, "after"))
+        {
+            result.failed = true;
+            return result;
+        }
+
+        const std::string rawPartitionPath = partitionOutPath.string();
+        std::string effectivePartitionPath = rawPartitionPath;
+        if (options_.weightMode == RepcutWeightMode::kClosureAware)
+        {
+            const std::filesystem::path refinedPath =
+                std::filesystem::path(hmetisPath.string() + ".closure-aware.part" +
+                                      std::to_string(options_.partitionCount));
+            std::ostringstream refinedContent;
+            for (const uint32_t part : ascPartition)
+            {
+                refinedContent << part << "\n";
+            }
+            if (!writeTextFile(refinedPath, refinedContent.str(), ioError))
+            {
+                error("repcut phase-d: " + ioError);
+                result.failed = true;
+                return result;
+            }
+            effectivePartitionPath = refinedPath.string();
+            result.artifacts.push_back(effectivePartitionPath);
+        }
+
+        logInfo("repcut phase-d closure-refine: enabled=" +
+                std::string(closureRefineStats.enabled ? "true" : "false") +
+                " applied=" + std::string(closureRefineStats.applied ? "true" : "false") +
+                " rounds=" + std::to_string(closureRefineStats.roundCount) +
+                " moves=" + std::to_string(closureRefineStats.moveCount) +
+                " before_max=" + std::to_string(closureRefineStats.before.loadMax) +
+                " after_max=" + std::to_string(closureRefineStats.after.loadMax) +
+                " before_sum=" + std::to_string(closureRefineStats.before.loadSum) +
+                " after_sum=" + std::to_string(closureRefineStats.after.loadSum) +
+                " skip_reason=" +
+                (closureRefineStats.skipReason.empty() ? std::string("<none>") : closureRefineStats.skipReason));
+
         uint32_t maxPartId = 0;
         std::unordered_map<uint32_t, size_t> partSizes;
         for (const uint32_t part : ascPartition)
@@ -4352,6 +5250,8 @@ namespace wolvrix::lib::transform
                       << " backend=" << partitionBackend->name()
                       << " hmetis=" << hmetisPath.string()
                       << " partition_file=" << (partitionOutPath.empty() ? "<none>" : partitionOutPath.string())
+                      << " effective_partition_file=" <<
+                             (effectivePartitionPath.empty() ? "<none>" : effectivePartitionPath)
                       << " asc_count=" << ascPartition.size()
                       << " part_count_observed=" << (partSizes.empty() ? 0 : (maxPartId + 1))
                       << " partition_complete=" << (partitionComplete ? "true" : "false");
@@ -4768,7 +5668,13 @@ namespace wolvrix::lib::transform
             partitionWeights[partId] += static_cast<std::size_t>(hg.nodeWeights[aid]);
         }
         const std::vector<PartitionStaticFeatureRecord> partitionFeatureRecords =
-            buildPartitionStaticFeatureRecords(*graph, data, partitionOps, crossValues, partitionWeights);
+            buildPartitionStaticFeatureRecords(
+                *graph,
+                data,
+                partitionOps,
+                crossValues,
+                partitionWeights,
+                closureRefineStats.after.partitionLoads);
 
         const auto phaseERebuildStart = std::chrono::steady_clock::now();
         logInfo("repcut phase-e rebuild: begin graph=" + graph->symbol() +
@@ -6336,6 +7242,11 @@ namespace wolvrix::lib::transform
             std::filesystem::remove(hmetisPath, cleanupError);
             cleanupError.clear();
             std::filesystem::remove(partitionPath, cleanupError);
+            if (!effectivePartitionPath.empty() && effectivePartitionPath != partitionPath.string())
+            {
+                cleanupError.clear();
+                std::filesystem::remove(effectivePartitionPath, cleanupError);
+            }
         }
 
         std::size_t partitionWeightSum = 0;
@@ -6382,6 +7293,29 @@ namespace wolvrix::lib::transform
             (partitionOpsMax == 0) ? 0.0 : static_cast<double>(origTopOpsCount) / static_cast<double>(partitionOpsMax);
         const double origOverAvgOpsRatio =
             (partitionOpsAvg <= 0.0) ? 0.0 : static_cast<double>(origTopOpsCount) / partitionOpsAvg;
+        const double exactPartitionLoadAvg =
+            closureRefineStats.after.partitionLoads.empty()
+                ? 0.0
+                : static_cast<double>(closureRefineStats.after.loadSum) /
+                      static_cast<double>(closureRefineStats.after.partitionLoads.size());
+        std::vector<AscId> topFullClosureAscs;
+        topFullClosureAscs.reserve(phaseB.ascs.size());
+        for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
+        {
+            topFullClosureAscs.push_back(aid);
+        }
+        std::sort(topFullClosureAscs.begin(), topFullClosureAscs.end(), [&](AscId lhs, AscId rhs) {
+            if (closureModel.fullClosureWeights[lhs] != closureModel.fullClosureWeights[rhs])
+            {
+                return closureModel.fullClosureWeights[lhs] > closureModel.fullClosureWeights[rhs];
+            }
+            return lhs < rhs;
+        });
+        constexpr std::size_t kTopFullClosureAscLimit = 16;
+        if (topFullClosureAscs.size() > kTopFullClosureAscLimit)
+        {
+            topFullClosureAscs.resize(kTopFullClosureAscLimit);
+        }
 
         const auto appendGraphStatsJson = [&](std::ostringstream &oss,
                                               std::string_view key,
@@ -6401,11 +7335,13 @@ namespace wolvrix::lib::transform
         stats << "{"
               << "\"pass\":\"repcut\""
               << ",\"graph\":\"" << escapeJson(topName) << "\""
+              << ",\"weight_mode\":\"" << repcutWeightModeName(options_.weightMode) << "\""
               << ",\"partition_count_requested\":" << options_.partitionCount
               << ",\"partition_count_observed\":" << partInfos.size()
               << ",\"asc_count\":" << phaseB.ascs.size()
               << ",\"piece_count\":" << phaseB.pieces.size()
               << ",\"hyper_edge_count\":" << hg.edges.size()
+              << ",\"mt_weight_clamp_count\":" << mtWeightClampCount
               << ",\"cross_values_total\":" << crossValues.size()
               << ",\"cross_values_need_ports\":" << crossNeedsPortCount
               << ",\"cross_links\":" << linkValues.size()
@@ -6436,6 +7372,72 @@ namespace wolvrix::lib::transform
               << ",\"max_partition_weight_fraction_of_original\":" << toFixedString(maxWeightFractionOfOriginal, 6)
               << ",\"avg_partition_weight_fraction_of_original\":" << toFixedString(avgWeightFractionOfOriginal, 6)
               << "}";
+        stats << ",\"closure_weight_stats\":{"
+              << "\"referenced_unique_weight\":" << closureModel.referencedUniqueWeight
+              << ",\"unreferenced_piece_weight\":" << closureModel.unreferencedPieceWeight
+              << ",\"exclusive_unique_weight\":" << closureModel.exclusiveUniqueWeight
+              << ",\"shared_unique_weight\":" << closureModel.sharedUniqueWeight
+              << ",\"fair_share_allocated_weight\":" << closureModel.fairShareAllocatedWeight
+              << ",\"fair_share_padding_weight\":" << closureModel.fairSharePaddingWeight
+              << ",\"nominal_unique_target_weight\":" << nominalUniqueTargetWeight
+              << ",\"max_full_closure_asc_id\":" << closureModel.maxFullClosureAscId
+              << ",\"max_full_closure_weight\":" << closureModel.maxFullClosureWeight
+              << ",\"overweight_full_closure_asc_count\":" << overweightFullClosureAscCount
+              << ",\"exact_partition_load_sum\":" << closureRefineStats.after.loadSum
+              << ",\"exact_partition_load_max\":" << closureRefineStats.after.loadMax
+              << ",\"exact_partition_load_avg\":" << toFixedString(exactPartitionLoadAvg, 9)
+              << ",\"compute_km1\":" << closureRefineStats.after.computeKm1
+              << ",\"communication_proxy_km1\":" << closureRefineStats.after.communicationProxyKm1
+              << ",\"top_full_closure_ascs\":[";
+        for (std::size_t index = 0; index < topFullClosureAscs.size(); ++index)
+        {
+            const AscId aid = topFullClosureAscs[index];
+            if (index > 0)
+            {
+                stats << ",";
+            }
+            stats << "{"
+                  << "\"asc_id\":" << aid
+                  << ",\"partition_id\":" << (aid < ascPartition.size() ? ascPartition[aid] : 0u)
+                  << ",\"exclusive_weight\":" << closureModel.exclusiveWeights[aid]
+                  << ",\"shared_incident_weight\":" << closureModel.sharedIncidentWeights[aid]
+                  << ",\"full_closure_weight\":" << closureModel.fullClosureWeights[aid]
+                  << ",\"fair_share_weight\":" << closureModel.fairShareWeights[aid]
+                  << ",\"overweight\":"
+                  << (closureModel.fullClosureWeights[aid] > nominalUniqueTargetWeight ? "true" : "false")
+                  << "}";
+        }
+        stats << "]}";
+        auto appendRefineMetricsJson = [&](const ClosureAssignmentMetrics &metrics) {
+            stats << "{"
+                  << "\"load_sum\":" << metrics.loadSum
+                  << ",\"load_max\":" << metrics.loadMax
+                  << ",\"compute_km1\":" << metrics.computeKm1
+                  << ",\"communication_proxy_km1\":" << metrics.communicationProxyKm1
+                  << ",\"partition_loads\":[";
+            for (std::size_t part = 0; part < metrics.partitionLoads.size(); ++part)
+            {
+                if (part > 0)
+                {
+                    stats << ",";
+                }
+                stats << metrics.partitionLoads[part];
+            }
+            stats << "]}";
+        };
+        stats << ",\"partition_refine_stats\":{"
+              << "\"enabled\":" << (closureRefineStats.enabled ? "true" : "false")
+              << ",\"applied\":" << (closureRefineStats.applied ? "true" : "false")
+              << ",\"skip_reason\":\"" << escapeJson(closureRefineStats.skipReason) << "\""
+              << ",\"round_count\":" << closureRefineStats.roundCount
+              << ",\"move_count\":" << closureRefineStats.moveCount
+              << ",\"raw_partition_path\":\"" << escapeJson(rawPartitionPath) << "\""
+              << ",\"effective_partition_path\":\"" << escapeJson(effectivePartitionPath) << "\""
+              << ",\"before\":";
+        appendRefineMetricsJson(closureRefineStats.before);
+        stats << ",\"after\":";
+        appendRefineMetricsJson(closureRefineStats.after);
+        stats << "}";
         appendGraphStatsJson(
             stats,
             "original_top_graph_stats",
@@ -6500,6 +7502,7 @@ namespace wolvrix::lib::transform
                   << ",\"fanout_count\":" << record.fanoutCount
                   << ",\"estimated_node_weight_sum\":" << record.estimatedNodeWeightSum
                   << ",\"hyper_partition_weight\":" << record.hyperNodeWeight
+                  << ",\"exact_referenced_closure_weight\":" << record.exactReferencedClosureWeight
                   << ",\"cross_in_value_count\":" << record.crossInValueCount
                   << ",\"cross_out_value_count\":" << record.crossOutValueCount
                   << ",\"cross_in_word_count\":" << record.crossInWordCount

@@ -68,7 +68,32 @@
 | `-partitioner` | `mt-kahypar` | 分区后端 |
 | `-mtkahypar-preset` | `deterministic-quality` | mt-kahypar 预设；`repcut` 会强制使用确定性 preset |
 | `-mtkahypar-threads` | `0` | 线程数，`0` 表示后端默认 |
+| `-weight-mode` | `baseline` | 求解器 vertex weight 模式；严格支持 `baseline` 或 `closure-aware` |
 | `-keep-intermediate-files` | false | 是否保留中间文件 |
+
+`baseline` 保留原有 RepCut vertex weight 口径。`closure-aware` 包含三步：
+
+1. singleton piece 的计算权重全额计入其 ASC，shared piece 在关联 ASC 间做守恒、确定性分摊；
+2. shared piece 的计算权重加入 KM1 edge，显式计入跨分区重复物化成本；
+3. Mt-KaHyPar 返回后，按 exact ASC-piece occupancy 对最大 closure-load 分区做有界、确定性的 whole-ASC
+   refine。refine 不移动 full closure 超过 nominal target 的 overweight ASC，也不允许向其 owner 分区增加正边际负载；
+   总 closure load 和 communication proxy KM1 的回退预算均为 1%。
+
+refine 的接受顺序是：先比较按降序排列的完整 per-part exact load vector，再比较总 closure load，
+最后比较 communication proxy KM1。搜索最多执行 4 轮、接受 64 次移动，并在每个 source 分区中只枚举
+`sourceLoss` 最大的 128 个 ASC；因此它是有界的确定性启发式，不是全局最优证明。
+
+overweight owner 的规则是 post-refine guard，不是求解器级的独占约束：raw partition 中已经落在该 owner
+上的普通 ASC 可能保留。stats 中的 before/after 精确负载用于审计实际结果，不能仅凭 `overweight=true`
+声称该分区只含一个 ASC。
+
+该模式不会拆分 ASC，也不会改变 storage 归属或 graph 重建语义。所谓 exact load 仅覆盖 ASC 引用的
+piece closure；Phase E 另行归属的 storage/source 和重建 adapter 继续通过 `estimated_node_weight_sum`、
+最终 graph ops 等指标观测。
+
+启用 `-keep-intermediate-files` 时，solver 原始分区保存在常规 `.hgr.partK` 文件，refine 后实际用于
+重建的分区另存为 `.hgr.closure-aware.partK`。最终 info stats 会记录 `closure_weight_stats`、
+`partition_refine_stats`，以及每个 part 的 `exact_referenced_closure_weight`。
 
 ## 示例
 
@@ -88,6 +113,32 @@ wolvrix --pass=repcut:-path=SimTop.logic_part:-partition-count=32 input.json
 
 这是按实例路径选择目标 graph 的形式。
 
+### 示例 3：比较两种权重模式
+
+```bash
+wolvrix --pass=repcut:-path=SimTop:-partition-count=32:-weight-mode=closure-aware input.json
+```
+
+Python binding 使用对应的 `weight_mode` 命名参数：
+
+```python
+session.run_pass(
+    "repcut",
+    design="design.main",
+    path="SimTop",
+    partition_count=32,
+    weight_mode="closure-aware",
+)
+```
+
+XiangShan Make 流程通过同名实验变量选择模式：
+
+```bash
+make build_xs_repcut_verilator XS_REPCUT_WEIGHT_MODE=closure-aware
+```
+
+未设置 `XS_REPCUT_WEIGHT_MODE` 时使用 `baseline`。
+
 ## 前置条件
 
 - 推荐在 `xmr-resolve` 之后运行
@@ -96,8 +147,13 @@ wolvrix --pass=repcut:-path=SimTop.logic_part:-partition-count=32 input.json
 ## 注意事项
 
 - 多段路径按实例名解析，不按模块名解析
+- `-weight-mode` token 区分大小写，不接受 `candidate`、`closure_aware` 等别名
 - `-mtkahypar-preset=quality` / `highest-quality` 会映射到 `deterministic-quality`，`default` 会映射到 `deterministic`；`large-k` 不再适用于 `repcut`
 - 该 pass 只分区目标 graph 一层，不会继续递归分区其内部实例
 - 若目标 graph 原来是 top graph，重建后会重新标记为 top；否则不会改变 top 集合
 - 分区数上限当前为 `4096`
+- `closure-aware` 的 exact post-refine 当前只在 `partition-count <= 64` 时启用；更大的 K 仍使用
+  closure-aware HGR 权重，但 stats 会记录 refiner 的 skip reason
+- dense post-refine 还受 512 MiB 估算工作集上限保护；超过上限时保留 solver raw partition，并在 stats
+  中记录 skip reason
 - 重建后的 wrapper graph 会保留原 graph 名，因此从父层进入该 graph 的既有实例路径不需要改写

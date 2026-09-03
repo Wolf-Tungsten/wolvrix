@@ -9,6 +9,12 @@
 namespace wolvrix::lib::transform
 {
 
+    enum class RepcutWeightMode
+    {
+        kBaseline,
+        kClosureAware,
+    };
+
     struct RepcutOptions
     {
         std::string path;
@@ -18,6 +24,7 @@ namespace wolvrix::lib::transform
         std::string partitioner = "mt-kahypar";
         std::string mtKaHyParPreset = "deterministic-quality";
         std::size_t mtKaHyParThreads = 0;
+        RepcutWeightMode weightMode = RepcutWeightMode::kBaseline;
         bool keepIntermediateFiles = false;
     };
 

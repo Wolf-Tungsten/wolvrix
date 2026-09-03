@@ -410,6 +410,55 @@ int main()
         return fail("expected repeated repcut runs to emit identical mt-kahypar partition files");
     }
 
+    wolvrix::lib::grh::Design closureAwareDesign;
+    populateBasicRepcutDesign(closureAwareDesign, "top_closure_aware");
+    const std::filesystem::path closureAwareOutDir = outDir / "closure_aware";
+    std::filesystem::create_directories(closureAwareOutDir, ec);
+    if (ec)
+    {
+        return fail("failed to create closure-aware output directory");
+    }
+
+    PassManager closureAwareManager;
+    closureAwareManager.options().verbosity = PassVerbosity::Info;
+    RepcutOptions closureAwareOptions = deterministicOptions;
+    closureAwareOptions.path = "top_closure_aware";
+    closureAwareOptions.workDir = closureAwareOutDir.string();
+    closureAwareOptions.weightMode = RepcutWeightMode::kClosureAware;
+    closureAwareManager.addPass(std::make_unique<RepcutPass>(closureAwareOptions));
+
+    PassDiagnostics closureAwareDiags;
+    PassManagerResult closureAwareResult{};
+    try
+    {
+        closureAwareResult = closureAwareManager.run(closureAwareDesign, closureAwareDiags);
+    }
+    catch (const std::exception &ex)
+    {
+        return fail(std::string("closure-aware repcut exception: ") + ex.what());
+    }
+    if (!closureAwareResult.success || closureAwareDiags.hasError() || !closureAwareResult.changed)
+    {
+        return fail("closure-aware repcut failed unexpectedly");
+    }
+    const std::string *closureAwareStats = findRepcutStatsDiagnostic(closureAwareDiags);
+    if (closureAwareStats == nullptr ||
+        closureAwareStats->find("\"weight_mode\":\"closure-aware\"") == std::string::npos ||
+        closureAwareStats->find("\"closure_weight_stats\":{") == std::string::npos ||
+        closureAwareStats->find("\"partition_refine_stats\":{") == std::string::npos ||
+        closureAwareStats->find("\"round_count\":") == std::string::npos ||
+        closureAwareStats->find("\"partition_loads\":[") == std::string::npos ||
+        closureAwareStats->find("\"exact_referenced_closure_weight\":") == std::string::npos)
+    {
+        return fail("closure-aware repcut stats schema is incomplete");
+    }
+    const std::filesystem::path closureAwarePartition =
+        closureAwareOutDir / "top_closure_aware_repcut_k2.hgr.closure-aware.part2";
+    if (!std::filesystem::is_regular_file(closureAwarePartition))
+    {
+        return fail("closure-aware repcut missing effective partition file");
+    }
+
     PassDiagnostics diags;
     PassManagerResult result{};
     try

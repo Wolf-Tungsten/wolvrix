@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 #include "transform/demo_stats.hpp"
+#include "transform/repcut.hpp"
 
 #include <iostream>
 #include <string>
@@ -427,6 +428,57 @@ int main()
                 std::string::npos)
         {
             return fail("Stats pass did not report expected max symbol for combinational result users");
+        }
+    }
+
+    // Case 8: repcut weight mode parsing is discrete and strict
+    {
+        if (RepcutOptions{}.weightMode != RepcutWeightMode::kBaseline)
+        {
+            return fail("Expected repcut weight mode to default to baseline");
+        }
+
+        const auto expectAccepted = [&](std::vector<std::string_view> args,
+                                        std::string_view description) -> bool {
+            std::string parseError;
+            if (makePass("repcut", args, parseError) == nullptr)
+            {
+                std::cerr << "[transform-tests] Expected " << description
+                          << " to be accepted, error: " << parseError << '\n';
+                return false;
+            }
+            return true;
+        };
+        if (!expectAccepted({}, "omitted repcut weight mode") ||
+            !expectAccepted({"-weight-mode", "baseline"}, "separated baseline weight mode") ||
+            !expectAccepted({"-weight-mode=closure-aware"}, "equals closure-aware weight mode"))
+        {
+            return 1;
+        }
+
+        for (const std::string_view invalid : {
+                 std::string_view("candidate"),
+                 std::string_view("closure_aware"),
+                 std::string_view("BASELINE"),
+                 std::string_view(""),
+             })
+        {
+            std::string parseError;
+            const std::vector<std::string_view> args = {"-weight-mode", invalid};
+            if (makePass("repcut", args, parseError) != nullptr ||
+                parseError.find("expected baseline or closure-aware") == std::string::npos)
+            {
+                return fail("Expected invalid repcut weight mode to be rejected: " +
+                            std::string(invalid));
+            }
+        }
+
+        std::string parseError;
+        const std::vector<std::string_view> missingValueArgs = {"-weight-mode"};
+        if (makePass("repcut", missingValueArgs, parseError) != nullptr ||
+            parseError != "-weight-mode expects a value")
+        {
+            return fail("Expected missing repcut weight mode value to be rejected");
         }
     }
 

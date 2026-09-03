@@ -657,6 +657,16 @@ def _compile_repcut_kwargs(named: dict[str, Any]) -> list[str]:
     threads = _pop_named(local, "mtkahypar_threads", None)
     if threads is not None:
         out.extend(["-mtkahypar-threads", str(threads)])
+    weight_mode = _pop_named(local, "weight_mode", None)
+    if weight_mode is not None:
+        if not isinstance(weight_mode, str) or weight_mode not in {
+            "baseline",
+            "closure-aware",
+        }:
+            raise ValueError(
+                "weight_mode must be one of: baseline, closure-aware"
+            )
+        out.extend(["-weight-mode", weight_mode])
     keep_intermediate_files = _pop_named(local, "keep_intermediate_files", None)
     if keep_intermediate_files:
         out.append("-keep-intermediate-files")

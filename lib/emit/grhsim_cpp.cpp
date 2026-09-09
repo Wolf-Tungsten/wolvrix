@@ -20915,6 +20915,30 @@ namespace wolvrix::lib::emit
             {
                 const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
                 const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
+                std::uint8_t selectedInputDispatchMask = UINT8_C(0);
+                if (!fullpassVariant &&
+                    batch.phase == ScheduleBatch::Phase::kCompute &&
+                    clearMask == dispatchMask &&
+                    model.directHotInputEventValue.has_value())
+                {
+                    const auto inputIt = model.inputHeadSupernodesByValue.find(
+                        *model.directHotInputEventValue);
+                    if (inputIt != model.inputHeadSupernodesByValue.end())
+                    {
+                        std::uint8_t inputMask = UINT8_C(0);
+                        for (uint32_t activeId : inputIt->second)
+                        {
+                            if (activeId / kActiveFlagBitsPerWord == word.activeFlagWordIndex)
+                            {
+                                inputMask = static_cast<std::uint8_t>(
+                                    inputMask |
+                                    (UINT8_C(1) << (activeId % kActiveFlagBitsPerWord)));
+                            }
+                        }
+                        selectedInputDispatchMask =
+                            static_cast<std::uint8_t>(inputMask & dispatchMask);
+                    }
+                }
                 const bool consumeFullActiveWord =
                     model.fullActiveWordConsume &&
                     batch.phase == ScheduleBatch::Phase::kCompute &&
@@ -21181,7 +21205,11 @@ namespace wolvrix::lib::emit
                     {
                         stream << "    \n";
                         stream << "        // Supernode " << supernodeId << ": run when its activity flag is set.\n";
-                        stream << "        if (unlikely(activeWordFlags & UINT8_C(" << static_cast<unsigned>(supernodeMask) << "))) {\n";
+                        stream << "        if ("
+                               << ((selectedInputDispatchMask & supernodeMask) != UINT8_C(0)
+                                       ? "GRHSIM_LIKELY"
+                                       : "unlikely")
+                               << "(activeWordFlags & UINT8_C(" << static_cast<unsigned>(supernodeMask) << "))) {\n";
                         if (strictCohortLeader)
                         {
                             stream << "        // Strict same-batch cohort leader "
@@ -27523,6 +27551,9 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "#pragma once\n\n";
             *stream << "#ifndef unlikely\n";
             *stream << "#define unlikely(x) __builtin_expect(!!(x), 0)\n";
+            *stream << "#endif\n\n";
+            *stream << "#ifndef GRHSIM_LIKELY\n";
+            *stream << "#define GRHSIM_LIKELY(x) __builtin_expect(!!(x), 1)\n";
             *stream << "#endif\n\n";
             *stream << "#include <algorithm>\n";
             *stream << "#include <array>\n";

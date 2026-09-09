@@ -3851,6 +3851,7 @@ namespace
         std::optional<std::size_t> tiedEventIndex;
         bool reversePortBindingOrder = false;
         bool addHotResidualEdges = false;
+        bool addInputComputeOutputs = false;
         std::string portPrefix = "opaque_phase_token";
     };
 
@@ -3937,6 +3938,20 @@ namespace
         {
             addEventTask(config.hotEventIndex, "negedge");
             addEventTask(config.hotEventIndex, "");
+        }
+        if (config.addInputComputeOutputs)
+        {
+            for (std::size_t index = 0; index < config.eventCount; ++index)
+            {
+                const std::string suffix = std::to_string(index);
+                const ValueId output = makeLogicValue(graph, "inverted_input_" + suffix, 1);
+                const OperationId invert = graph.createOperation(
+                    OperationKind::kNot,
+                    graph.internSymbol("invert_input_op_" + suffix));
+                graph.addOperand(invert, events[index]);
+                graph.addResult(invert, output);
+                graph.bindOutputPort("inverted_input_" + suffix, output);
+            }
         }
         return fixture;
     }
@@ -4726,7 +4741,12 @@ namespace
         {
             ActiveMaskGapPackFixture fixture = buildDirectHotInputEventFixture(config);
             ActiveMaskGapPackEmitRun run;
-            if (!runActivitySchedule(fixture.design, fixture.session))
+            ActivityScheduleOptions scheduleOptions;
+            if (config.addInputComputeOutputs)
+            {
+                scheduleOptions.maxOpInComputeSupernode = 1u;
+            }
+            if (!runActivitySchedule(fixture.design, fixture.session, scheduleOptions))
             {
                 run.diagnostics = "activity-schedule failed";
                 return run;
@@ -4770,12 +4790,38 @@ namespace
             }
             return text;
         };
+        const auto hasExpectedInputDispatchHints = [&](const ActiveMaskGapPackEmitRun &run,
+                                                       const DirectHotInputEventFixtureConfig &config,
+                                                       bool selected)
+        {
+            const std::string text = scheduleText(run);
+            for (std::size_t index = 0; index < config.eventCount; ++index)
+            {
+                const std::size_t op = text.find(
+                    "// op invert_input_op_" + std::to_string(index) + " [kNot]");
+                if (op == std::string::npos)
+                {
+                    return false;
+                }
+                const std::size_t supernode = text.rfind("// Supernode ", op);
+                const std::string_view guard =
+                    selected && index == config.hotEventIndex
+                        ? "if (GRHSIM_LIKELY(activeWordFlags & UINT8_C("
+                        : "if (unlikely(activeWordFlags & UINT8_C(";
+                if (supernode == std::string::npos || text.find(guard, supernode) >= op)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
 
         DirectHotInputEventFixtureConfig mixedConfig;
         mixedConfig.eventCount = 8u;
         mixedConfig.hotEventIndex = 5u;
         mixedConfig.hotPosedgeUses = 4u;
         mixedConfig.addHotResidualEdges = true;
+        mixedConfig.addInputComputeOutputs = true;
         mixedConfig.portPrefix = "renamed_phase_marker";
         const ActiveMaskGapPackEmitRun mixedRun = emitFixture(mixedConfig, "renamed_mixed");
         if (!hasExpectedStats(mixedRun, 1u, 8u, 5u, 4u, 1u, 3u))
@@ -4793,6 +4839,12 @@ namespace
         const std::string &mixedHeader = mixedHeaderIt->second;
         const std::string &mixedEval = mixedEvalIt->second;
         const std::string mixedSched = scheduleText(mixedRun);
+        if (!hasExpectedInputDispatchHints(mixedRun, mixedConfig, true) ||
+            mixedHeader.find("#define GRHSIM_LIKELY(x) __builtin_expect(!!(x), 1)") ==
+                std::string::npos)
+        {
+            return fail("hot-input dispatch hints must select only the chosen input's compute guards");
+        }
         const std::string selectedClassify =
             "event_edge_storage_[0] = event_baseline_initialized_ ? grhsim_classify_edge("
             "prev_in_renamed_phase_marker_5, renamed_phase_marker_5)";
@@ -4832,6 +4884,10 @@ namespace
         {
             return fail("direct-hot selection changed after input-port reordering");
         }
+        if (!hasExpectedInputDispatchHints(reorderedRun, reorderedConfig, true))
+        {
+            return fail("hot-input dispatch hint selection changed after input-port reordering");
+        }
 
         DirectHotInputEventFixtureConfig tieConfig;
         tieConfig.eventCount = 8u;
@@ -4854,6 +4910,7 @@ namespace
         thresholdConfig.eventCount = 8u;
         thresholdConfig.hotEventIndex = 4u;
         thresholdConfig.hotPosedgeUses = 3u;
+        thresholdConfig.addInputComputeOutputs = true;
         thresholdConfig.portPrefix = "threshold_phase_marker";
         const ActiveMaskGapPackEmitRun thresholdRun =
             emitFixture(thresholdConfig, "fixed_cost_boundary");
@@ -4865,6 +4922,11 @@ namespace
                 std::string::npos)
         {
             return fail("direct-hot fixed-cost equality must fail closed");
+        }
+        if (!hasExpectedInputDispatchHints(thresholdRun, thresholdConfig, false) ||
+            scheduleText(thresholdRun).find("GRHSIM_LIKELY(") != std::string::npos)
+        {
+            return fail("hot-input dispatch hints must stay disabled below the structural threshold");
         }
 
         for (const std::size_t eventCount : {255u, 256u, 257u})
@@ -4910,19 +4972,38 @@ namespace
             harness << "int main()\n{\n";
             harness << "    GrhSIM_top sim;\n";
             harness << "    sim.init();\n";
+            harness << "    const auto outputs_match = [&]() {\n";
+            for (std::size_t index = 0; index < mixedConfig.eventCount; ++index)
+            {
+                harness << "        if (sim.inverted_input_" << index << " == sim."
+                        << mixedConfig.portPrefix << "_" << index << ") return false;\n";
+            }
+            harness << "        return true;\n    };\n";
             for (std::size_t index = 0; index < mixedConfig.eventCount; ++index)
             {
                 harness << "    sim." << mixedConfig.portPrefix << "_" << index
                         << " = false;\n";
             }
             harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 1;\n";
             harness << "    sim." << mixedConfig.portPrefix << "_"
                     << mixedConfig.hotEventIndex << " = true;\n";
             harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 2;\n";
             harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 3;\n";
             harness << "    sim." << mixedConfig.portPrefix << "_"
                     << mixedConfig.hotEventIndex << " = false;\n";
             harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 4;\n";
+            harness << "    sim." << mixedConfig.portPrefix << "_0 = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 5;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 6;\n";
+            harness << "    sim." << mixedConfig.portPrefix << "_0 = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!outputs_match()) return 7;\n";
             harness << "    std::puts(\"direct-hot-harness-ok\");\n";
             harness << "    return 0;\n}\n";
         }
@@ -4950,7 +5031,7 @@ namespace
             return fail("direct-hot generated behavior harness failed");
         }
         const std::string harnessText = readFile(harnessOutput);
-        if (countSubstring(harnessText, "direct-hot=23") != 7u ||
+        if (countSubstring(harnessText, "direct-hot=23") != 8u ||
             harnessText.find("direct-hot-harness-ok") == std::string::npos)
         {
             return fail("direct-hot mixed posedge/negedge/general behavior changed");

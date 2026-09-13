@@ -209,7 +209,7 @@ namespace wolvrix::lib::grhsim
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
-                    "cpu_stage_cell", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
+                    "cpu_stage_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
                 for (std::size_t i = 0; i < initChunkCount(); ++i) names.insert("cpu_init_" + std::to_string(i));
@@ -584,7 +584,7 @@ namespace wolvrix::lib::grhsim
                 for (const auto &term : terms)
                 {
                     if (!check.empty()) check += " || ";
-                    check += '(' + state(term.history) + "!=" + value(term.event) + ')';
+                    check += '(' + state(term.history) + "!=" + eventValue(term.event) + ')';
                 }
                 return check;
             }
@@ -890,8 +890,10 @@ namespace wolvrix::lib::grhsim
             void sampleHistoryBatch(std::ostream &out, const HistoryBatch &batch) const
             {
                 const auto range = stateRanges_[batch.first.index];
+                // The batch fills every byte in the contiguous range, so avoid copying
+                // the visible history into the shadow before the overwrite.
                 out << "{ // cpu_history_batch states=" << batch.count << "\n"
-                    << "auto *cpu_history=cpu_stage_bytes(" << batch.first.index << ',' << batch.offset << ',' << batch.count
+                    << "auto *cpu_history=cpu_stage_bytes_overwrite(" << batch.first.index << ',' << batch.offset << ',' << batch.count
                     << ',' << range.offset << ',' << range.count << ",true);\n";
                 if (batch.pattern.size() == 1)
                     out << "std::memset(cpu_history,static_cast<unsigned char>(" << value(batch.pattern.front()) << ")," << batch.count << ");\n";
@@ -1422,6 +1424,46 @@ namespace wolvrix::lib::grhsim
                 return result + ");";
             }
 
+            std::string eventValue(ValueId event) const
+            {
+                if (activeEventCache_)
+                {
+                    const auto found = activeEventCache_->find(event.index);
+                    if (found != activeEventCache_->end()) return found->second;
+                }
+                return value(event);
+            }
+
+            std::map<uint32_t, std::string> taskEventCache(const CpuScheduledTask &task) const
+            {
+                std::map<uint32_t, unsigned> counts;
+                // Commit tasks are emitted as one function body. Compute tasks may
+                // split operations into helper functions, whose event values are
+                // deliberately left in their original form.
+                if (task.execution == CpuExecution::ActivityDrivenCompute) return {};
+                const auto &tree = mapping_.partitionTree;
+                const auto taskPartition = tree.partitions[task.partition.index - 1];
+                const auto countOp = [&](OpId opId) {
+                    const auto &op = model_.operations()[opId.index - 1];
+                    const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                    if (!edges) return;
+                    for (auto event : model_.operands(op).last(edges->size()))
+                    {
+                        if (event.index == 0 || type(event).kind != TypeKind::Logic || type(event).width != 1 ||
+                            layout_.values[event.index - 1].kind != CpuStorageKind::Boundary)
+                            continue;
+                        ++counts[event.index];
+                    }
+                };
+                for (auto unit : taskPartition.children)
+                    for (auto opId : tree.partitions[unit.index - 1].ops) countOp(opId);
+                std::map<uint32_t, std::string> cache;
+                std::size_t index = 0;
+                for (const auto &[event, count] : counts)
+                    if (count >= 2) cache.emplace(event, "cpu_event_snapshot_" + std::to_string(index++));
+                return cache;
+            }
+
             std::string eventGuard(const SimOp &op, std::size_t historyBase) const
             {
                 const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
@@ -1432,7 +1474,7 @@ namespace wolvrix::lib::grhsim
                 for (std::size_t i = 0; i < edges->size(); ++i)
                     guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") +
                         state({refs[historyBase + i].index, 0}) + " && " +
-                        ((*edges)[i] == "negedge" ? "!" : "") + value(events[i]) + ")";
+                        ((*edges)[i] == "negedge" ? "!" : "") + eventValue(events[i]) + ")";
                 return guard;
             }
 
@@ -1493,7 +1535,7 @@ namespace wolvrix::lib::grhsim
                 const auto events = model_.operands(op).last(edges->size());
                 const auto refs = model_.objectRefs(op);
                 for (std::size_t i = 0; i < edges->size(); ++i)
-                    stage(out, {refs[historyBase + i].index, 0}, value(events[i]));
+                    stage(out, {refs[historyBase + i].index, 0}, eventValue(events[i]));
             }
 
             void publishDpiResult(std::ostream &out, ValueId result, const std::string &temporary, PartitionId activeUnit) const
@@ -1850,7 +1892,7 @@ namespace wolvrix::lib::grhsim
                 if (edges)
                     for (std::size_t i = 0; i < edges->size(); ++i)
                     {
-                        const auto event = value(operands[operands.size() - edges->size() + i]);
+                        const auto event = eventValue(operands[operands.size() - edges->size() + i]);
                         const StateId history{refs[i + 1].index, 0};
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
@@ -1892,7 +1934,7 @@ namespace wolvrix::lib::grhsim
                     std::string guard = "false";
                     if (edges) for (std::size_t i = 0; i < eventCount; ++i)
                     {
-                        const auto event = value(operands[operands.size() - eventCount + i]);
+                        const auto event = eventValue(operands[operands.size() - eventCount + i]);
                         const StateId history{refs[i + 1].index, 0};
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
@@ -1902,7 +1944,7 @@ namespace wolvrix::lib::grhsim
                         << "cpu_at<" << cppType(element) << ">(" << stageCell(target, "i") << ",0)="
                         << normalize(value(operands[1]), element) << "; }\n";
                     if (edges) for (std::size_t i = 0; i < eventCount; ++i)
-                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - eventCount + i]));
+                        stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - eventCount + i]));
                     return;
                 }
                 if (opName == "core.state.memAssign")
@@ -1917,7 +1959,7 @@ namespace wolvrix::lib::grhsim
                     const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
                     if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
                     {
-                        const auto event = value(operands[operands.size() - edges->size() + i]);
+                        const auto event = eventValue(operands[operands.size() - edges->size() + i]);
                         const StateId history{refs[i + 1].index, 0};
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
@@ -1933,7 +1975,7 @@ namespace wolvrix::lib::grhsim
                         out << "cpu_cell=" << normalize("(static_cast<std::uint64_t>(cpu_cell)&~static_cast<std::uint64_t>(" + value(operands[3]) +
                             "))|(static_cast<std::uint64_t>(" + value(operands[2]) + ")&static_cast<std::uint64_t>(" + value(operands[3]) + "))", element) << ";}\n";
                     if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
-                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - edges->size() + i]));
+                        stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
                     return;
                 }
                 if (opName == "core.state.memWriteSeq")
@@ -1949,7 +1991,7 @@ namespace wolvrix::lib::grhsim
                     std::string guard = "false";
                     if (edges) for (std::size_t i = 0; i < eventCount; ++i)
                     {
-                        const auto event = value(operands[operands.size() - eventCount + i]);
+                        const auto event = eventValue(operands[operands.size() - eventCount + i]);
                         const StateId history{refs[i + 1].index, 0};
                         guard += " || (" + std::string((*edges)[i] == "posedge" ? "!" : "") + state(history) + " && " +
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
@@ -1962,7 +2004,7 @@ namespace wolvrix::lib::grhsim
                             << ",0)=" << normalize(value(operands[i + 2]), element) << "; }\n";
                     out << "}\n";
                     if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
-                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - edges->size() + i]));
+                        stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
                     return;
                 }
                 const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
@@ -1998,7 +2040,7 @@ namespace wolvrix::lib::grhsim
                 }
                 if (edges)
                     for (std::size_t i = 0; i < edges->size(); ++i)
-                        stage(out, {refs[i + 1].index, 0}, value(operands[operands.size() - edges->size() + i]));
+                        stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
             }
 
             void header(std::ostream &out) const
@@ -2138,6 +2180,9 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     << "cpu_at<T>(cpu_shadow.get(),offset)=next;}\n"
                     << "std::byte *cpu_stage_bytes(std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
+                    << "return cpu_shadow.get()+offset;}\n"
+                    << "std::byte *cpu_stage_bytes_overwrite(std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
                     << "return cpu_shadow.get()+offset;}\nbool cpu_publish();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "void cpu_init_" << i << "();\n";
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks) out << "void cpu_task_" << task.id.index << "();\n";
@@ -2420,11 +2465,11 @@ if(terminal){
                     offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
                     // Every byte is a distinct private history; no task can have staged it earlier.
                     if (offsets.back() - offsets.front() + 1 == offsets.size())
-                        out << "if(std::memchr(cpu_objects.get()+" << offsets.front() << ",!bool(" << value(group.value) << "),"
+                        out << "if(std::memchr(cpu_objects.get()+" << offsets.front() << ",!bool(" << eventValue(group.value) << "),"
                             << offsets.size() << "))return false;";
                     else
                     {
-                        out << "{const auto cpu_current=std::byte{static_cast<unsigned char>(bool(" << value(group.value)
+                        out << "{const auto cpu_current=std::byte{static_cast<unsigned char>(bool(" << eventValue(group.value)
                             << "))};static constexpr std::size_t cpu_histories[]={";
                         for (std::size_t i = 0; i < offsets.size(); ++i) out << (i ? "," : "") << offsets[i];
                         out << "};for(auto cpu_offset:cpu_histories)if(cpu_objects[cpu_offset]!=cpu_current)return false;}";
@@ -2497,7 +2542,7 @@ if(terminal){
                 for (auto &term : terms)
                 {
                     const bool negative = term.event.edge == CpuEventEdge::Negedge;
-                    const auto level = std::string(negative ? "!" : "") + value(term.event.value);
+                    const auto level = std::string(negative ? "!" : "") + eventValue(term.event.value);
                     // Inspect every current history, never a representative or a pending shadow.
                     const auto history = term.byteHistories ? historyEdgePossibility(std::move(term.offsets), negative ? 1 : 0) : std::string{};
                     result += " || " + (history.empty() ? level : "(" + level + " && (" + history + "))");
@@ -2579,6 +2624,10 @@ if(terminal){
                 if (task.execution == CpuExecution::ActivityDrivenCompute)
                     for (const auto &function : model_.functions()) out << dpiDeclaration(function) << '\n';
                 out << "void " << class_ << "::cpu_task_" << task.id.index << "(){\n";
+                const auto eventCache = taskEventCache(task);
+                activeEventCache_ = &eventCache;
+                for (const auto &[event, name] : eventCache)
+                    out << "const bool " << name << "=" << value(ValueId{event, 0}) << ";\n";
                 const auto &tree = mapping_.partitionTree;
                 if (task.execution != CpuExecution::ActivityDrivenCompute)
                 {
@@ -2717,6 +2766,7 @@ if(terminal){
                         out << "cpu_flags[" << offset << "]|=cpu_active_word;}}\n";
                     }
                 out << "}\n";
+                activeEventCache_ = nullptr;
                 if (task.execution == CpuExecution::ActivityDrivenCompute)
                     for (auto word : tree.partitions[task.partition.index - 1].children)
                         for (auto unit : tree.partitions[word.index - 1].children)
@@ -2750,6 +2800,7 @@ if(terminal){
             std::vector<std::vector<uint64_t>> localStrings_;
             std::vector<std::pair<std::string_view, uint64_t>> persistentStrings_;
             std::map<uint32_t, std::string> staticStrings_;
+            mutable const std::map<uint32_t, std::string> *activeEventCache_ = nullptr;
             bool hasSystemTasks_ = false;
             std::map<uint32_t, std::size_t> onceTasks_;
             std::vector<uint32_t> activeOffsets_, activeMasks_;

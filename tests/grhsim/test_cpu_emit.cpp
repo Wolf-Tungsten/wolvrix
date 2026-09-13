@@ -1115,13 +1115,18 @@ namespace
         require(fallbackDomains == 2, "cross-domain history fixture missed fallback coverage");
         require(emitCpuCpp(*restored, directory, diagnostics).success, "history batch emit failed");
         require(checkSamplingTasks(*restored, directory) == 0, "conflicting-history fallback used sampling fast path");
+        bool overwriteBatch = false, eventSnapshot = false;
         for (const auto &file : std::filesystem::directory_iterator(directory))
             if (file.path().extension() == ".cpp")
             {
                 std::ifstream stream(file.path());
                 const std::string source{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
                 require(source.find("cpu_stable_history_skip") == std::string::npos, "shared/written history used whole-task skip");
+                overwriteBatch |= source.find("cpu_stage_bytes_overwrite(") != std::string::npos;
+                eventSnapshot |= source.find("cpu_event_snapshot_") != std::string::npos;
             }
+        require(overwriteBatch, "history batch did not use overwrite staging helper");
+        require(eventSnapshot, "repeated boundary event was not cached at task entry");
         bool coverage = false;
         for (const auto &message : diagnostics.messages())
         {

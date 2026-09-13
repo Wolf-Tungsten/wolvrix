@@ -666,6 +666,11 @@ CPU emitter 可以在同一边沿事件域的 commit 函数内部批量暂存私
 memset，多值用至多八字节 pattern 的原地 memcpy；复用既有 pending ABI。
 emitter 的 history_batch 诊断给出实际覆盖和回退数量，不能仅凭该数量判断性能收益。
 
+批次的 `[offset, offset + count)` 范围由 pattern 完整覆盖，因此生成代码使用
+`cpu_stage_bytes_overwrite` 登记 dirty/pending 后直接取得 shadow 指针，省略 visible
+范围的预复制；普通 `cpu_stage_bytes` 仍保留预复制语义。publish 继续对最终 shadow
+与 visible 做 memcmp，所以批次与同轮其他写入产生相同的最终值时不会虚假激活读者。
+
 `DomainGatedCommit` 函数可从实际 op/event operands 合成一个有限的必要条件：
 所有 posedge 当前值及所有 negedge 当前值取反的 OR。条件为假时，payload 的全部
 edge guard 必为假，函数只按原 op/event 顺序采样 history，并执行同样的私有批次。

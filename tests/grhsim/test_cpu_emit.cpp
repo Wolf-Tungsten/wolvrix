@@ -1285,6 +1285,89 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testIdentityAssigns(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_identity_assign"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto input = [&](const std::string &name, TypeId type) {
+            const auto id = model.addInput(name, type); const auto value = model.addValue(type);
+            const std::array results{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto state = [&](TypeId type) {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), type);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto compute = [&](const char *op, TypeId type, std::initializer_list<ValueId> args) {
+            const auto value = model.addValue(type); const std::array results{value};
+            model.addOperation(op, {args.begin(), args.size()}, results); return value;
+        };
+        const auto output = [&](const std::string &name, TypeId type, ValueId value) {
+            const auto id = model.addOutput(name, type); const std::array refs{ObjectRef::output(id)};
+            const std::array operands{value}; model.addOperation("core.output.write", operands, {}, refs);
+        };
+        const auto identity = [&](ValueId value) {
+            const auto type = model.values()[value.index - 1].type;
+            for (unsigned i = 0; i < 3; ++i) value = compute("core.compute.assign", type, {value});
+            return value;
+        };
+        const auto clock = identity(input("clock", bit)), enable = identity(input("enable", bit));
+        const std::array types{bit, model.logicType(5, true, LogicDomain::TwoState),
+            model.logicType(64, false, LogicDomain::TwoState)};
+        for (std::size_t i = 0; i < types.size(); ++i)
+        {
+            const auto type = types[i]; const auto suffix = std::to_string(i);
+            const auto a = input("a" + suffix, type), b = input("b" + suffix, type);
+            const auto sum = identity(compute("core.compute.add", type, {identity(a), b}));
+            const auto mix = identity(compute("core.compute.xor", type, {sum, b}));
+            const auto sumCopy = compute("core.compute.add", type, {a, identity(b)});
+            const auto mixCopy = compute("core.compute.xor", type, {sumCopy, b});
+            const auto combined = compute("core.compute.add", type, {sumCopy, mixCopy});
+            output("sum" + suffix, type, sum); output("mix" + suffix, type, mix);
+            output("combined" + suffix, type, combined);
+            // Removing aliases must preserve pre-commit snapshots, including a
+            // state read whose only commit consumer is behind an identity chain.
+            ValueId previous = sum;
+            for (unsigned stage = 0; stage < 2; ++stage)
+            {
+                const auto reg = state(type), history = state(bit);
+                const auto mask = model.addValue(type); const std::array maskResult{mask};
+                const std::array params{Parameter{model.intern("value"), std::string("-1")}};
+                model.addOperation("core.compute.constant", {}, maskResult, {}, params);
+                const std::array operands{enable, previous, mask, clock};
+                const std::array refs{ObjectRef::state(reg), ObjectRef::state(history)};
+                const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+                model.addOperation("core.state.regWrite", operands, {}, refs, edges);
+                const auto read = model.addValue(type); const std::array result{read};
+                const std::array readRefs{ObjectRef::state(reg)};
+                model.addOperation("core.state.read", {}, result, readRefs);
+                output("q" + std::to_string(stage) + "_" + suffix, type, read); previous = identity(read);
+            }
+        }
+        PassManager manager(defaultDialectRegistry()); std::string error;
+        auto pass = defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error);
+        require(bool(pass), "identity assignment pass lookup failed"); manager.addPass(std::move(pass));
+        diag::Diagnostics rewrite;
+        const auto result = manager.run(model, rewrite);
+        require(result.success && result.changed, "identity assignment pass did not rewrite fixture");
+        unsigned adds = 0, xors = 0;
+        for (const auto &op : model.operations())
+        {
+            require(model.text(op.opType) != "core.compute.assign", "identity assignment chain remains");
+            adds += model.text(op.opType) == "core.compute.add";
+            xors += model.text(op.opType) == "core.compute.xor";
+        }
+        require(adds == 6 && xors == 3, "common expressions were not shared through assignment chains");
+        map(model, "128", helpers ? "1" : "10000"); diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "identity assignment emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_identity_assign.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testScalarStaging(const std::filesystem::path &directory)
     {
         GrhSimModel model("cpu_scalar_stage"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1676,6 +1759,8 @@ int main(int argc, char **argv)
         testSharedCommitEdges(directory / "notifications", "128", "10000");
         testSharedCommitEdges(directory / "notifications_split", "2", "1");
         testScalarStaging(directory / "scalar_staging");
+        testIdentityAssigns(directory / "identity_assign", false);
+        testIdentityAssigns(directory / "identity_assign_helpers", true);
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");
@@ -1687,21 +1772,29 @@ int main(int argc, char **argv)
         }
         if (!std::filesystem::is_regular_file(WOLVRIX_TEST_VERILATOR)) { std::cerr << "Verilator unavailable\n"; return 77; }
         compileAndCompare(directory, "cpu_chain");
-        auto scalar = scalarFixture(); map(scalar);
+        const auto canonicalize = [](GrhSimModel &model) {
+            PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+            auto pass = defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error);
+            require(bool(pass), "compute canonicalization factory missing");
+            manager.addPass(std::move(pass));
+            require(manager.run(model, diagnostics).success, "compute canonicalization before differential test failed");
+        };
+        auto scalar = scalarFixture(); canonicalize(scalar); map(scalar);
         diag::Diagnostics scalarDiagnostics;
         require(emitCpuCpp(scalar, directory / "scalar", scalarDiagnostics).success, "scalar emit failed");
         compileAndCompare(directory / "scalar", "cpu_scalar");
-        auto wide = wideFixture(); map(wide);
+        auto wide = wideFixture(); canonicalize(wide); map(wide);
         diag::Diagnostics wideDiagnostics;
         require(emitCpuCpp(wide, directory / "wide", wideDiagnostics).success, "wide emit failed");
         compileAndCompare(directory / "wide", "cpu_wide");
-        auto states = stateFixture(); map(states);
+        auto states = stateFixture(); canonicalize(states); map(states);
         diag::Diagnostics stateDiagnostics;
         require(emitCpuCpp(states, directory / "wide_state", stateDiagnostics).success, "wide state emit failed");
         compileAndCompare(directory / "wide_state", "cpu_wide_state");
         for (auto fixture : {cdcFixture, dualRamFixture})
         {
             auto multiclock = fixture();
+            canonicalize(multiclock);
             map(multiclock); diag::Diagnostics multiclockDiagnostics;
             const auto top = std::string(multiclock.text(multiclock.name()));
             std::size_t domains = 0;

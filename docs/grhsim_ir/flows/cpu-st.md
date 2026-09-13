@@ -35,8 +35,36 @@ logic value，lower 显式生成同位宽、同有符号属性的 `core.compute.
 外部 input 和 inout 输入侧由 `core.input.read` 提供 producer，不补零；没有引用的 detached
 value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认为二态零。
 
-XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`，再进入下表的
-CPU mapping；这不依赖 GRH 侧 reg-to-mem。
+XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem` 和
+`grhsim.canonicalize-compute`，再进入下表的 CPU mapping；这不依赖 GRH 侧
+reg-to-mem，也不修改 GRH。
+
+`grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有
+消费者。`core.compute.assign` 唯一 operand 是源值，唯一 result 是赋值结果；
+op 不得带 objectRefs 或 parameters。例如：
+
+```text
+x:u8 -> assign y:u8 -> assign z:u8 -> regWrite(enable, z, mask, clk)
+                                 => regWrite(enable, x, mask, clk)
+```
+
+`regWrite` 的 operands 依次为 enable、写入数据、位掩码和事件值。重写只将数据
+从 z 接回 x；原 history 对象、初始化和事件边沿参数不变。若赋值连接不同位宽、
+signedness 或 logic domain，则保留转换；string、real、四态值也不消除。同类型
+宽 logic 可消除，因为不存在截断或扩展。赋值环保持，不为环构造常量或任意根。
+链解析不依赖 operation 的存储顺序，留下的操作顺序、名称、origin、对象和参数
+保持，删除后重建 dense ID。该 pass 为 SemanticTransform，修改会使既有 mapping
+失效；重新建立的依赖与状态 alias 证明仍保证 commit 读取提交前快照。再次运行
+无变化时保持 revision 不变。
+
+该 pass 还按拓扑次序共享精确相同的两态 logic `core.compute.*` 纯计算，键包含
+op、结果 TypeId、归一化后的有序 operands 及完整 parameters。例如两条
+`add(a,b) → xor(result,b)` 链可共用一条；`sub(a,b)` 与 `sub(b,a)` 保持独立，
+不同 sliceStart/sliceEnd 的切片保持独立。只编码整数、bool、string 参数，其他
+参数类型保留原 op；string 参数按长度分隔，不能因文本包含分隔符发生误合并。
+input/state/memory read、DPI、system、output 和 commit 均不共享。赋值环、其他
+计算环及依赖计算环的纯 op 不进入 CSE；不推断循环不变量。诊断包括
+`identity_assigns_removed`、`common_expressions_removed` 和 `rewritten_uses`。
 
 按下表顺序执行。前八步只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
 最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。

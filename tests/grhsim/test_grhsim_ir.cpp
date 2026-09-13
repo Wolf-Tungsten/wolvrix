@@ -7,10 +7,12 @@
 
 #include "slang/numeric/SVInt.h"
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -302,6 +304,81 @@ namespace
         if (model || !diagnostics.hasError()) return fail("hierarchical GRH was not rejected");
         return 0;
     }
+
+    int runIdentityAssignTest()
+    {
+        using namespace grhsim;
+        GrhSimModel model("identity_assign"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto u5 = model.logicType(5, false, LogicDomain::TwoState);
+        const auto s5 = model.logicType(5, true, LogicDomain::TwoState);
+        const auto u8 = model.logicType(8, false, LogicDomain::TwoState);
+        const auto four = model.logicType(5, false, LogicDomain::FourState);
+        const auto wide = model.logicType(129, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type); const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto a = input("a", u5), b = input("b", four);
+        const auto w = input("w", wide);
+        const auto wideAlias = model.addValue(wide);
+        model.addOperation("core.compute.assign", std::array{w}, std::array{wideAlias});
+        const auto first = model.addValue(u5), second = model.addValue(u5);
+        // Deliberately emit the use before its producer, and retain conversions.
+        model.addOperation("core.compute.assign", std::array{first}, std::array{second});
+        model.addOperation("core.compute.assign", std::array{a}, std::array{first});
+        for (auto target : {s5, u8})
+        {
+            const auto converted = model.addValue(target);
+            model.addOperation("core.compute.assign", std::array{second}, std::array{converted});
+        }
+        const auto fourResult = model.addValue(four);
+        model.addOperation("core.compute.assign", std::array{b}, std::array{fourResult});
+        const auto cycleA = model.addValue(u5), cycleB = model.addValue(u5);
+        model.addOperation("core.compute.assign", std::array{cycleB}, std::array{cycleA});
+        model.addOperation("core.compute.assign", std::array{cycleA}, std::array{cycleB});
+        const auto expression = [&](std::string_view op, std::initializer_list<ValueId> operands) {
+            const auto value = model.addValue(u5);
+            model.addOperation(op, {operands.begin(), operands.size()}, std::array{value});
+            return value;
+        };
+        const auto sum0 = expression("core.compute.add", {a, second});
+        const auto sum1 = expression("core.compute.add", {first, a});
+        expression("core.compute.xor", {sum0, a});
+        expression("core.compute.xor", {sum1, second});
+        expression("core.compute.sub", {sum0, a});
+        expression("core.compute.sub", {a, sum0});
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        for (int64_t start : {0, 1, 0})
+        {
+            const auto value = model.addValue(bit);
+            const std::array params{Parameter{model.intern("sliceStart"), start},
+                Parameter{model.intern("sliceEnd"), start}};
+            model.addOperation("core.compute.sliceStatic", std::array{a}, std::array{value}, {}, params);
+        }
+        const auto port = model.addOutput("y", u5);
+        model.addOperation("core.output.write", std::array{second}, {}, std::array{ObjectRef::output(port)});
+        const auto before = model.operations().size();
+        const auto revision = model.semanticRevision();
+        PassManager manager(defaultDialectRegistry()); std::string error;
+        auto pass = defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error);
+        if (!pass) return fail("identity pass factory: " + error);
+        manager.addPass(std::move(pass));
+        diag::Diagnostics diagnostics; const auto result = manager.run(model, diagnostics);
+        if (!result.success || !result.changed || model.operations().size() != before - 6 ||
+            model.semanticRevision() != revision + 1)
+            return fail("identity pass did not remove exactly the type-preserving chain");
+        for (const auto &op : model.operations())
+            if (model.text(op.opType) == "core.output.write" && model.operands(op)[0] != a)
+                return fail("identity pass did not reconnect output to original producer");
+        const auto again = manager.run(model, diagnostics);
+        if (!again.success || again.changed) return fail("identity pass is not idempotent on cycles/conversions");
+        std::stringstream serialized;
+        if (!writeGrhSimJson(model, serialized, defaultDialectRegistry(), diagnostics) ||
+            !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics))
+            return fail("identity pass output does not round-trip");
+        return 0;
+    }
 }
 
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
@@ -316,6 +393,7 @@ int main()
             return status;
         if (const int status = runDetachedValueTest(); status != 0) return status;
         if (const int status = runUndrivenTwoStateTest(); status != 0) return status;
+        if (const int status = runIdentityAssignTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }
     catch (const std::exception &ex)

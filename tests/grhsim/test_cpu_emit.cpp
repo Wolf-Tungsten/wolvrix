@@ -872,7 +872,16 @@ namespace
             model.addOperation(writeKind, operands, {}, refs, params);
             output("q" + std::to_string(i), registers[i], byte);
         }
-        if (observe) { output("history_a", historiesA.back(), bit); output("history_b", historiesB.front(), bit); }
+        if (observe)
+        {
+            output("history_a", historiesA.back(), bit); output("history_b", historiesB.front(), bit);
+            // Observe every history to preserve the independent range scans.
+            for (unsigned i = 0; i < count; ++i)
+            {
+                output("history_a_" + std::to_string(i), historiesA[i], bit);
+                output("history_b_" + std::to_string(i), historiesB[i], bit);
+            }
+        }
         return model;
     }
 
@@ -977,6 +986,20 @@ namespace
         for (const auto &message : diagnostics.messages())
             excluded |= message.message.find("history_shared_states=0 history_shared_tasks=0 ") != std::string::npos;
         require(excluded, "random histories were merged despite independent initialization");
+        bool overwritten = false;
+        for (const auto &file : std::filesystem::directory_iterator(directory))
+            if (file.path().extension() == ".cpp")
+            {
+                std::ifstream stream(file.path());
+                const std::string source{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+                overwritten |= source.find("cpu_stage_bytes_overwrite(") != std::string::npos;
+            }
+        require(overwritten, "independent random histories lost batch overwrite coverage");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_history_scan.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O0 -g -DCPU_HISTORY_SCAN_PRIVATE=1 -fsanitize=address,undefined -fno-sanitize-recover=all'"
+                " CPU_HISTORY_SCAN_ARGS=--random");
     }
 
     void testComputeHistorySharing(const std::filesystem::path &directory)
@@ -1042,7 +1065,7 @@ namespace
         require(count("(false ||") == 6, "repeated event guard expressions were not collapsed");
     }
 
-    void testHistoryBatches(const std::filesystem::path &directory)
+    void testHistoryCohorts(const std::filesystem::path &directory)
     {
         GrhSimModel model("cpu_history_batch"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState), byte = model.logicType(8, false, LogicDomain::TwoState);
@@ -1115,7 +1138,7 @@ namespace
         require(fallbackDomains == 2, "cross-domain history fixture missed fallback coverage");
         require(emitCpuCpp(*restored, directory, diagnostics).success, "history batch emit failed");
         require(checkSamplingTasks(*restored, directory) == 0, "conflicting-history fallback used sampling fast path");
-        bool overwriteBatch = false, eventSnapshot = false;
+        bool overwriteBatch = false, eventSnapshot = false, edgeSnapshot = false;
         for (const auto &file : std::filesystem::directory_iterator(directory))
             if (file.path().extension() == ".cpp")
             {
@@ -1124,14 +1147,16 @@ namespace
                 require(source.find("cpu_stable_history_skip") == std::string::npos, "shared/written history used whole-task skip");
                 overwriteBatch |= source.find("cpu_stage_bytes_overwrite(") != std::string::npos;
                 eventSnapshot |= source.find("cpu_event_snapshot_") != std::string::npos;
+                edgeSnapshot |= source.find("cpu_edge_snapshot uses=") != std::string::npos;
             }
-        require(overwriteBatch, "history batch did not use overwrite staging helper");
+        require(!overwriteBatch, "equivalent history cohorts were still batch copied");
         require(eventSnapshot, "repeated boundary event was not cached at task entry");
+        require(edgeSnapshot, "mixed-task private history guards were not shared");
         bool coverage = false;
         for (const auto &message : diagnostics.messages())
         {
             std::cout << message.message << '\n';
-            coverage |= message.message.find("history_candidates=18 history_private_rejected=6 history_layout_rejected=0 history_batch_states=12 history_batches=2 ") != std::string::npos;
+            coverage |= message.message.find("history_shared_states=11 history_shared_tasks=1 ") != std::string::npos;
         }
         require(coverage, "history batching missed eligible histories or accepted shared/observed/written histories");
         std::set<uint32_t> direct;
@@ -1581,7 +1606,7 @@ int main(int argc, char **argv)
         testStableHistorySkip(directory / "stable_history");
         testRandomHistorySharingFallback(directory / "random_history");
         testComputeHistorySharing(directory / "compute_history");
-        testHistoryBatches(directory / "history_batches");
+        testHistoryCohorts(directory / "history_cohorts");
         testPrivateCommits(directory / "private_commits");
         testScalarStaging(directory / "scalar_staging");
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);

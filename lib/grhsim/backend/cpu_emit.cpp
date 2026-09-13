@@ -54,7 +54,7 @@ namespace wolvrix::lib::grhsim
                   activeOffsets_(wordOffsets_.size()), activeMasks_(wordOffsets_.size()), stateRanges_(model.states().size() + 1),
                   projected_(stateRanges_.size()), fanout_(model.values().size() + 1), batchedHistories_(stateRanges_.size()),
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
-                  historyAliases_(stateRanges_.size())
+                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size())
             {
                 for (const auto &frame : layout_.localFrames) frameSizes_[frame.owner.index] = frame.size;
                 for (const auto &op : model_.operations())
@@ -609,12 +609,14 @@ namespace wolvrix::lib::grhsim
                 const auto &tree = mapping_.partitionTree;
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
                 {
-                    if (task.execution != CpuExecution::DomainGatedCommit) continue;
+                    if (task.execution == CpuExecution::ActivityDrivenCompute) continue;
                     const auto &function = tree.partitions[task.partition.index - 1];
+                    if (!tree.partitions[function.parent.index - 1].attrs.eventGate) continue;
                     const auto arm = armOffsets_[function.parent.index];
+                    struct Sample { ValueId event; uint32_t references = 0; bool consistent = true; };
+                    std::map<uint32_t, Sample> samples;
                     std::map<std::tuple<uint32_t, uint32_t, std::string>, StateId> representatives;
                     std::vector<std::pair<StateId, StateId>> aliases;
-                    bool eligible = true;
                     for (auto unit : function.children)
                         for (auto id : tree.partitions[unit.index - 1].ops)
                         {
@@ -622,28 +624,44 @@ namespace wolvrix::lib::grhsim
                             const auto name = model_.text(op.opType);
                             if (name != "core.state.regWrite" && name != "core.state.memWrite" &&
                                 name != "core.state.memFill" && name != "core.state.memWriteSeq")
-                            { eligible = false; continue; }
+                                continue;
                             const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
-                            if (!edges || edges->empty()) { eligible = false; continue; }
+                            if (!edges || edges->empty()) continue;
                             const auto events = model_.operands(op).last(edges->size());
                             const auto histories = model_.objectRefs(op).last(edges->size());
                             for (std::size_t i = 0; i < edges->size(); ++i)
                             {
                                 const StateId history{histories[i].index, histories[i].generation};
-                                const auto range = stateRanges_[history.index];
-                                if (references[history.index] != 1 || initializers[history.index] != 1 ||
-                                    constants[history.index].empty() || !projected_[history.index] || range.count != 1 ||
-                                    !stateTargets_[range.offset].arm || stateTargets_[range.offset].offset != arm ||
-                                    ((*edges)[i] != "posedge" && (*edges)[i] != "negedge"))
-                                { eligible = false; continue; }
-                                const auto key = std::make_tuple(events[i].index,
-                                    model_.states()[history.index - 1].type.index, constants[history.index]);
-                                const auto [it, inserted] = representatives.emplace(key, history);
-                                if (!inserted) aliases.emplace_back(history, it->second);
+                                auto &sample = samples.try_emplace(history.index, Sample{events[i]}).first->second;
+                                ++sample.references;
+                                sample.consistent &= sample.event == events[i] &&
+                                    ((*edges)[i] == "posedge" || (*edges)[i] == "negedge");
                             }
                         }
-                    if (!eligible || aliases.empty()) continue;
-                    // All guards read visible history; every member samples the same snapshot on every task call.
+                    for (const auto &[index, sample] : samples)
+                    {
+                        const StateId history{index, 0};
+                        const auto range = stateRanges_[index];
+                        // Every use must be an unconditional sample of the same
+                        // invariant event in this task. Other histories in the
+                        // task may be observed, written, or shared across tasks.
+                        if (!sample.consistent || references[index] != sample.references || initializers[index] != 1 ||
+                            constants[index].empty() || !projected_[index] || range.count != 1 ||
+                            !stateTargets_[range.offset].arm || stateTargets_[range.offset].offset != arm ||
+                            readAliases_[sample.event.index] ||
+                            layout_.values[sample.event.index - 1].kind != CpuStorageKind::Boundary ||
+                            model_.states()[index - 1].type != model_.values()[sample.event.index - 1].type)
+                            continue;
+                        sharedHistoryEligible_[index] = true;
+                        const auto key = std::make_tuple(sample.event.index,
+                            model_.states()[index - 1].type.index, constants[index]);
+                        const auto [it, inserted] = representatives.emplace(key, history);
+                        if (!inserted) aliases.emplace_back(history, it->second);
+                    }
+                    if (aliases.empty()) continue;
+                    // Equal initial values and identical sampling sequences
+                    // preserve visible/shadow equality by induction. Repeated
+                    // samples of a representative remain in program order.
                     for (auto [history, representative] : aliases) historyAliases_[history.index] = representative;
                     sharedHistoryCount_ += aliases.size();
                     ++sharedHistoryTasks_;
@@ -2561,9 +2579,14 @@ if(terminal){
                     for (auto id : tree.partitions[unit.index - 1].ops)
                     {
                         const auto &op = model_.operations()[id.index - 1];
-                        const auto &edges = *parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                        const auto *edgeParameter = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                        if (!edgeParameter || edgeParameter->empty()) continue;
+                        const auto &edges = *edgeParameter;
                         const auto events = model_.operands(op).last(edges.size());
                         const auto histories = model_.objectRefs(op).last(edges.size());
+                        if (std::any_of(histories.begin(), histories.end(), [&](ObjectRef history) {
+                            return history.kind != ObjectKind::State || !sharedHistoryEligible_[history.index];
+                        })) continue;
                         Key key;
                         for (std::size_t i = 0; i < edges.size(); ++i)
                         {
@@ -2820,6 +2843,7 @@ if(terminal){
             std::vector<bool> directCommitStates_;
             std::vector<bool> privateByteHistories_;
             std::vector<StateId> historyAliases_;
+            std::vector<bool> sharedHistoryEligible_;
             uint64_t sharedHistoryCount_ = 0, sharedHistoryTasks_ = 0;
             std::set<uint32_t> sharedHistoryTaskIds_;
             uint64_t computeSharedHistoryCount_ = 0, computeSharedHistoryUnits_ = 0;

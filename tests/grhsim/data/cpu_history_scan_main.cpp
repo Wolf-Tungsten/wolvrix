@@ -5,11 +5,13 @@
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 
-int main(int argc, char **)
+int main(int argc, char **argv)
 {
     GrhSIM_cpu_history_scan model;
-    const bool derived = argc > 1;
+    const bool derived = argc > 1 && std::string_view(argv[1]) == "--derived";
+    const bool randomHistory = argc > 1 && std::string_view(argv[1]) == "--random";
     std::mt19937 random(20260907);
     unsigned samples = 0;
     for (unsigned reset = 0; reset < 4; ++reset) {
@@ -36,8 +38,11 @@ int main(int argc, char **)
                 throw std::runtime_error("observed history mismatch at " + std::to_string(samples));
 #endif
         };
+        // Sample both events with writes disabled before checking random
+        // histories; their independent initial bits need not be predicted.
+        if (randomHistory) step(false, true, false, 0);
         step(true, !derived, true, 42);
-        if (model.q0 != 0 || model.q30 != 0 || model.q31 != 42)
+        if (!randomHistory && (model.q0 != 0 || model.q30 != 0 || model.q31 != 42))
             throw std::runtime_error("history scan missed the final byte or discarded distinct initial histories");
         step(true, !derived, true, 77);
         step(false, !derived, true, 19);

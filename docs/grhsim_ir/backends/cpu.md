@@ -628,11 +628,14 @@ bit1 留在全局等待后续扫描。域 arm、DPI guard/history 和 commit 发
 
 ### CPU C++ 多时钟回归
 
-发射器先尝试在同一个 `DomainGatedCommit` task 内共享等价的私有事件历史。
-整个 task 必须只含 `regWrite/memWrite/memFill/memWriteSeq`，所有事件为
-posedge/negedge；每个 history 只有一个 object ref、unsigned two-state 1-bit 类型、
-唯一常量初始化记录，且 publication 目标恰为本域 arm。任一条件不满足则整个 task
-保留原历史布局。随机初始化、被观察或额外写入的历史、不同 task 均不共享。
+发射器在同一个边沿域 commit task 内按采样等价类共享私有事件历史，适用于
+`DomainGatedCommit` 和 `AlwaysScanCommit`。每个 history 单独检查：全模型的
+object ref 必须全部是本 task 中 `regWrite/memWrite/memFill/memWriteSeq` 的
+posedge/negedge 采样，且每次采样使用同一个、不经 state-read alias 的 boundary
+ValueId。history 与 event 类型相同，均为 unsigned two-state 1-bit；history 具有
+唯一常量初始化记录，publication 目标恰为本域 arm。同一 history 可以被本 task
+重复采样；被观察、被其他操作写入、跨 task 采样、采样不同事件或随机初始化的
+history 保留独立存储，不妨碍同 task 内其他 history 共享。
 
 共享键为 `(event ValueId, history TypeId, 规范化初始常量)`。例如同一 task 的三个
 posedge 操作引用历史 `[h0=0,h1=0,h2=1]` 且采样同一 `clk`，发射后前两个守卫
@@ -643,6 +646,11 @@ schedule 本身不变，发射器重定向私有存储访问并省略冗余 stag
 保持不变。重复 init 只向代表写入相同常量，不改变随机数序列。诊断
 `history_shared_states/tasks` 给出省略的状态数和受影响 task 数。
 
+混合示例：同 task 中 `h0=0` 被两个写端口采样 `clk`、`h1=0` 被一个写端口采样
+`clk`、`h2=0` 还被输出读取。前两者可共享 h0（代表元的两次原始采样仍保留），
+h2 保持独立。若 h0 的两次采样分别使用 `clk_a` 和 `clk_b`，则 h0 也保持独立；
+不能对 `h0←clk_a; h0←clk_b; h0←clk_a` 跨越中间写入去重。
+
 For tasks with shared private histories, repeated edge predicates are evaluated
 once into task-local `const bool cpu_edge_snapshot_N` values before payload
 writes. The key is the ordered list of `(event ValueId, resolved history StateId,
@@ -652,8 +660,9 @@ predicates remain inline. All commit operands retain pre-commit boundary values,
 and private histories change only at publication, so the snapshot stays valid
 through intervening payload writes. It is recomputed on every task invocation.
 Write order, unconditional history sampling, stable-history and inactive-edge
-exits, and publication remain unchanged. Observed, signed, random-initialized,
-or otherwise ineligible tasks retain the existing path.
+exits, and publication remain unchanged. Only predicates whose every history
+passes the sampling proof can be cached; other predicates in the same task
+retain the existing path.
 
 CPU emitter 可以在同一边沿事件域的 commit 函数内部批量暂存私有 event history，
 包括因其他 history 冲突而使用 `AlwaysScanCommit` 的边沿域。

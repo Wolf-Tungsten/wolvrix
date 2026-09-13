@@ -520,6 +520,25 @@ emitter 可将 value 解析为 state 引用并省去读取复制。state 发布�
 每个结果比较并写回，块尾一次性以 mask 发布变化；宽位原地 helper 的返回标志也合并到该组，
 不引入额外数组快照。分组不会越过 supernode/chunk 边界；DPI 调用与其结果发布保持原语义。
 
+### CPU C++ 标量内存写入
+
+标量 memory cell（two-state logic 1–64 bit）先比较 masked next，再决定是否
+进入 shadow/pending。`memWrite` operands 依次是 enable、index、data、mask、
+event values；`memFill` 的 enable/data 更新每行，`memWriteSeq` 的各组
+enable/index/data 按原顺序做全量更新。`cpu_write_cell<T,Width>` 使用
+`key=memory_base+row` 和 `offset=array_offset+row*sizeof(T)`，从 dirty cell 的
+shadow 或干净 cell 的 visible 取 current，按元素宽度及 signedness 规范化
+`(current & ~mask) | (data & mask)`。next 等于 current 时无需拷贝、入队或写回；
+首次变化只加入一个带 memory 标记的 Pending，直接写 next，无需复制旧 cell。
+
+例如 visible 为 `8'ha0`，同一轮先按 `8'h0f` 写 `8'h05`，再全量写 `8'ha0`：
+第一口留下 shadow `a5`，第二口必须基于已有 shadow 恢复 `a0`；pending 保留到
+publication，由最终 visible/shadow 比较消去通知。干净 cell 的零 mask 或同值
+写入不创建 pending；已 dirty cell 保留原 pending。两个不同 row 分别跟踪，
+读者仍按最后读取的 row offset 精确激活。
+该路径沿用 scalar state 的写入顺序和分配策略。宽 cell 继续使用既有
+`cpu_stage_cell` 和就地宽值掩码 helper，helper ABI 不变。
+
 ### CPU C++ 标量直接提交
 
 唯一写者的 1..64-bit、2-state 标量可使用 direct commit，但完整 object-ref pool

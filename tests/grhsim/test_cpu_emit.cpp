@@ -529,7 +529,7 @@ namespace
                     std::ifstream file(entry.path()); source.append(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
                 }
             require(source.find("cpu_stage_bytes(" + std::to_string(mem.index) + ",") == std::string::npos &&
-                    source.find("cpu_stage_cell(") != std::string::npos,
+                    source.find("cpu_write_cell<") != std::string::npos,
                     "memory writes still stage an entire array");
             require(source.find("cpu_changed_") != std::string::npos && source.find("cpu_read_offsets[i]==p.offset") != std::string::npos,
                     "grouped changes or addressed-reader activation missing");
@@ -1519,6 +1519,80 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testMemoryStaging(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_memory_stage"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const std::string &name, TypeId type) {
+            const auto id = model.addInput(name, type); const auto value = model.addValue(type);
+            const std::array results{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto state = [&](TypeId type) {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), type);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern(model.types()[type.index - 1].kind == TypeKind::Array ?
+                "core.init.fill" : "core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto clock = input("clock", bit), enable = input("enable", bit);
+        const auto a = input("address_a", byte), b = input("address_b", byte), read = input("read_address", byte);
+        const std::array<std::pair<unsigned, bool>, 10> cases{{
+            {1, false}, {5, false}, {5, true}, {8, false}, {13, false},
+            {13, true}, {32, false}, {32, true}, {64, false}, {64, true}}};
+        std::vector<StateId> memories;
+        for (std::size_t i = 0; i < cases.size(); ++i)
+        {
+            const auto [width, isSigned] = cases[i];
+            const auto type = model.logicType(width, isSigned, LogicDomain::TwoState);
+            const auto memory = state(model.arrayType(type, 4)); memories.push_back(memory);
+            const auto value = model.addValue(type); const std::array results{value};
+            const std::array operands{read}; const std::array refs{ObjectRef::state(memory)};
+            model.addOperation("core.state.memRead", operands, results, refs);
+            const auto output = model.addOutput("q" + std::to_string(i), type);
+            const std::array outputRefs{ObjectRef::output(output)};
+            model.addOperation("core.output.write", results, {}, outputRefs);
+            for (unsigned writer = 0; writer < 2; ++writer)
+            {
+                const auto suffix = std::to_string(i) + "_" + std::to_string(writer);
+                const auto data = input("data" + suffix, type), mask = input("mask" + suffix, type);
+                const std::array writeOperands{enable, writer ? b : a, data, mask, clock};
+                const std::array writeRefs{ObjectRef::state(memory), ObjectRef::state(state(bit))};
+                const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+                model.addOperation("core.state.memWrite", writeOperands, {}, writeRefs, params);
+            }
+        }
+        map(model);
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "memory staging emit failed");
+        const auto headerPath = directory / "grhsim_cpu_memory_stage.hpp";
+        std::ifstream inputHeader(headerPath);
+        std::string header{std::istreambuf_iterator<char>(inputHeader), std::istreambuf_iterator<char>()};
+        inputHeader.close();
+        const auto privatePos = header.find("private:\n");
+        require(privatePos != std::string::npos, "memory fixture header has no private section");
+        header.replace(privatePos, std::string("private:").size(), "public:");
+        std::ofstream(headerPath) << header;
+        std::ofstream slots(directory / "memory_stage_slots.hpp");
+        slots << "struct MemoryStageSlot{std::size_t key,offset;};\ninline constexpr MemoryStageSlot memory_stage_slots[]={\n";
+        std::size_t key = model.states().size() + 1;
+        for (auto memory : memories)
+        {
+            bool found = false;
+            for (const auto &entry : model.cpuMapping()->dataLayout->objects)
+                if (entry.object == ObjectRef::state(memory))
+                { slots << '{' << key << ',' << entry.slot.offset << "},\n"; found = true; break; }
+            require(found, "memory fixture has no object slot");
+            key += 4;
+        }
+        slots << "};\n"; slots.close();
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_memory_stage.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     using InitDescription = std::pair<std::string, std::vector<std::pair<std::string, ParameterValue>>>;
 
     void initializedOutput(GrhSimModel &model, const char *name, TypeId type, ValueId address,
@@ -1839,6 +1913,7 @@ int main(int argc, char **argv)
         testIdentityAssigns(directory / "identity_assign_helpers", true);
         testScalarConstants(directory / "constants", false);
         testScalarConstants(directory / "constants_helpers", true);
+        testMemoryStaging(directory / "memory_stage");
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");

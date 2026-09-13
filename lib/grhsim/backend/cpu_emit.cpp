@@ -212,7 +212,7 @@ namespace wolvrix::lib::grhsim
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
-                    "cpu_stage_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
+                    "cpu_stage_cell", "cpu_write_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
                 for (std::size_t i = 0; i < initChunkCount(); ++i) names.insert("cpu_init_" + std::to_string(i));
@@ -1912,6 +1912,16 @@ namespace wolvrix::lib::grhsim
                     (projected_[target.index] ? "true" : "false") + ")";
             }
 
+            void writeCell(std::ostream &out, StateId target, const std::string &row,
+                           const std::string &data, const std::string &mask = "UINT64_MAX") const
+            {
+                const auto &element = model_.types()[stateType(target).elementType.index - 1];
+                const auto range = memoryRanges_[target.index];
+                out << "cpu_write_cell<" << cppType(element) << ',' << element.width << ">(" << memoryDirtyBases_[target.index]
+                    << ',' << object(ObjectRef::state(target)).offset << ',' << row << ',' << range.offset << ',' << range.count
+                    << ',' << (projected_[target.index] ? "true" : "false") << ',' << data << ',' << mask << ");\n";
+            }
+
             std::string commitEdgeGuard(const SimOp &op, const std::string &cachedGuard = {}) const
             {
                 const auto operands = model_.operands(op);
@@ -1969,9 +1979,11 @@ namespace wolvrix::lib::grhsim
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
                     }
                     if (!cachedGuard.empty()) guard = cachedGuard;
-                    out << "if((" << guard << ") && " << value(operands[0]) << "){ for(std::size_t i=0;i<" << array.count << ";++i) "
-                        << "cpu_at<" << cppType(element) << ">(" << stageCell(target, "i") << ",0)="
-                        << normalize(value(operands[1]), element) << "; }\n";
+                    out << "if((" << guard << ") && " << value(operands[0]) << "){ for(std::size_t i=0;i<" << array.count << ";++i) ";
+                    if (isScalarLogic(element)) writeCell(out, target, "i", value(operands[1]));
+                    else out << "cpu_at<" << cppType(element) << ">(" << stageCell(target, "i") << ",0)="
+                             << normalize(value(operands[1]), element) << ";\n";
+                    out << "}\n";
                     if (edges) for (std::size_t i = 0; i < eventCount; ++i)
                         stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - eventCount + i]));
                     return;
@@ -1996,13 +2008,18 @@ namespace wolvrix::lib::grhsim
                     if (!cachedGuard.empty()) guard = cachedGuard;
                     out << "if((" << guard << ") && " << value(operands[0]) << " && static_cast<std::size_t>("
                         << value(operands[1]) << ")<" << array.count << "){\n";
-                    out << "auto &cpu_cell=cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[1])) << ",0);\n";
-                    if (element.kind == TypeKind::Logic && element.width > 64)
-                        out << "grhsim_apply_masked_words_inplace(cpu_cell," << value(operands[2]) << ','
-                            << value(operands[3]) << ',' << element.width << ");}\n";
+                    if (isScalarLogic(element))
+                        writeCell(out, target, value(operands[1]), value(operands[2]), value(operands[3]));
                     else
-                        out << "cpu_cell=" << normalize("(static_cast<std::uint64_t>(cpu_cell)&~static_cast<std::uint64_t>(" + value(operands[3]) +
-                            "))|(static_cast<std::uint64_t>(" + value(operands[2]) + ")&static_cast<std::uint64_t>(" + value(operands[3]) + "))", element) << ";}\n";
+                    {
+                        out << "auto &cpu_cell=cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[1])) << ",0);\n";
+                        if (element.kind == TypeKind::Logic && element.width > 64)
+                            out << "grhsim_apply_masked_words_inplace(cpu_cell," << value(operands[2]) << ','
+                                << value(operands[3]) << ',' << element.width << ");\n";
+                        else out << "cpu_cell=" << normalize("(static_cast<std::uint64_t>(cpu_cell)&~static_cast<std::uint64_t>(" + value(operands[3]) +
+                            "))|(static_cast<std::uint64_t>(" + value(operands[2]) + ")&static_cast<std::uint64_t>(" + value(operands[3]) + "))", element) << ";\n";
+                    }
+                    out << "}\n";
                     if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
                         stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
                     return;
@@ -2028,9 +2045,14 @@ namespace wolvrix::lib::grhsim
                     if (!cachedGuard.empty()) guard = cachedGuard;
                     out << "if(" << guard << "){\n";
                     for (std::size_t i = 0; i < operands.size() - eventCount; i += 3)
+                    {
                         out << "if(" << value(operands[i]) << " && static_cast<std::size_t>(" << value(operands[i + 1]) << ")<"
-                            << array.count << "){ cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[i + 1]))
-                            << ",0)=" << normalize(value(operands[i + 2]), element) << "; }\n";
+                            << array.count << "){\n";
+                        if (isScalarLogic(element)) writeCell(out, target, value(operands[i + 1]), value(operands[i + 2]));
+                        else out << "cpu_at<" << cppType(element) << ">(" << stageCell(target, value(operands[i + 1]))
+                                 << ",0)=" << normalize(value(operands[i + 2]), element) << ";\n";
+                        out << "}\n";
+                    }
                     out << "}\n";
                     if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
                         stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
@@ -2200,6 +2222,11 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
                     << "bool cpu_direct_again=false;\nvoid cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection);\n"
                     << "std::byte *cpu_stage_cell(std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "key+=row;offset+=row*size;if(!cpu_dirty[key]){cpu_dirty[key]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({key,offset,size,begin,count,projection,true});}return cpu_shadow.get()+offset;}\n"
+                    << "template<class T,unsigned Width> void cpu_write_cell(std::size_t key,std::size_t offset,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection,std::uint64_t data,std::uint64_t mask){\n"
+                    << "key+=row;offset+=row*sizeof(T);const T current=cpu_at<T>(cpu_dirty[key]?cpu_shadow.get():cpu_objects.get(),offset);\n"
+                    << "const auto merged=(static_cast<std::uint64_t>(current)&~mask)|(data&mask);\n"
+                    << "const T next=static_cast<T>(std::is_signed_v<T>?grhsim_sign_extend_i64(merged,Width):grhsim_trunc_u64(merged,Width));if(current==next)return;\n"
+                    << "if(!cpu_dirty[key]){cpu_pending.push_back({key,offset,sizeof(T),begin,count,projection,true});cpu_dirty[key]=1;}cpu_at<T>(cpu_shadow.get(),offset)=next;}\n"
                     << "template<class T> T &cpu_stage(std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,sizeof(T));cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});}\n"
                     << "return cpu_at<T>(cpu_shadow.get(),offset);}\n"

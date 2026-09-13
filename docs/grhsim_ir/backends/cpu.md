@@ -557,6 +557,24 @@ state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`c
 武装位持续直到被消费，跨 round、跨 eval 有效；同一 eval 内 compute 的新变化在
 下一轮重新武装。发射器诊断给出 `port_arm_ports/tasks/values/words`。
 
+### CPU C++ 共享边沿端口块的一次消费
+
+提交端口仍以持久 `cpu_pflags` 记录 enable/data/mask 变化。现有最多八字节扫描
+块内，若所有端口使用同一个非空缓存边沿快照，则先检查该快照一次。如果全部
+armable 端口在整个 task 内也共享该快照，则检查进一步提到所有扫描块的入口。
+无法按整个 task 共享时仍逐块判断，混合块保留原路径。边沿为假
+时不读取/消费端口位，边沿为真时按原次序检查武装位、enable 和实际值变化。
+本块端口的边沿已经相同，无需逐端口再次检查或累积 consumed。字节中八个位
+都有端口时消费后直接置 0；不足八个时仅清除实际端口掩码，保留其他位。
+
+例如某字节的五个端口都使用 `posedge(clk)`，有效掩码为 `0x1f`。下降沿时全部
+武装位保留；上升沿时按原序评估已武装端口，末尾执行 `pflags &= ~0x1f`。
+enable 为 false 的端口也消费该武装位，后续 enable 变化仍会重新武装。不同事件
+或不能缓存的 guard 继续逐端口消费，不合并。事件快照在原 history 采样之前计算，
+而 pflags 只由 compute 写入，因此边沿成立时清除这些位与逐位消费等价。
+history 采样、状态写入、通知、padding 位和跨 eval 的持久规则保持。
+诊断 `shared_edge_blocks/ports` 表示共享检查的块数和端口数。
+
 ### CPU C++ 活动扫描字打包
 
 逐轮稠密扫描统一加字粒度空测试预过滤：调度循环中共享同一 8 字节 `cpu_flags`

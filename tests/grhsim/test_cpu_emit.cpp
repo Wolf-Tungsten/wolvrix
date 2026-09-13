@@ -1220,6 +1220,71 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testSharedCommitEdges(const std::filesystem::path &directory, std::string_view superOps,
+                                 std::string_view helperLines)
+    {
+        GrhSimModel model("cpu_notifications"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState), byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const std::string &name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            const std::array results{value}; const std::array refs{ObjectRef::input(port)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto clock = input("clock", bit), mask = input("mask", byte);
+        std::array<ValueId, 8> enables, data;
+        for (unsigned i = 0; i < enables.size(); ++i)
+        {
+            enables[i] = input("en" + std::to_string(i), bit);
+            data[i] = input("d" + std::to_string(i), byte);
+        }
+        ValueId sum;
+        for (unsigned i = 0; i < 41; ++i)
+        {
+            const auto suffix = std::to_string(i);
+            const auto state = model.addState("s" + suffix, byte), history = model.addState("h" + suffix, bit);
+            const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(state, steps, initParams); model.addInit(history, steps, initParams);
+            const std::array operands{enables[i % enables.size()], data[i % data.size()], mask, clock};
+            const std::array refs{ObjectRef::state(state), ObjectRef::state(history)};
+            const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.state.regWrite", operands, {}, refs, params);
+            const auto read = model.addValue(byte); const std::array result{read};
+            const std::array readRefs{ObjectRef::state(state)};
+            model.addOperation("core.state.read", {}, result, readRefs);
+            const auto adjusted = model.addValue(byte); const std::array adjustedResult{adjusted};
+            const std::array adjustedOperands{read, mask};
+            model.addOperation("core.compute.add", adjustedOperands, adjustedResult);
+            if (!sum) sum = adjusted;
+            else
+            {
+                const auto next = model.addValue(byte); const std::array addResult{next};
+                const std::array addOperands{sum, adjusted};
+                model.addOperation("core.compute.add", addOperands, addResult); sum = next;
+            }
+        }
+        const auto output = model.addOutput("sum", byte); const std::array outRefs{ObjectRef::output(output)};
+        const std::array outOperands{sum}; model.addOperation("core.output.write", outOperands, {}, outRefs);
+        map(model, superOps, helperLines); diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "notification fixture emit failed");
+        bool sharedEdge = false, partialByte = false;
+        for (const auto &file : std::filesystem::directory_iterator(directory))
+            if (file.path().extension() == ".cpp")
+            {
+                std::ifstream stream(file.path());
+                const std::string source{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+                sharedEdge |= source.find("cpu_shared_task_edge") != std::string::npos ||
+                    source.find("cpu_shared_port_edge") != std::string::npos;
+                partialByte |= source.find("cpu_pflags[5]&=~1;") != std::string::npos;
+            }
+        require(sharedEdge && partialByte, "shared commit edge fixture missed block guard or partial byte consumption");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_notifications.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testScalarStaging(const std::filesystem::path &directory)
     {
         GrhSimModel model("cpu_scalar_stage"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1608,6 +1673,8 @@ int main(int argc, char **argv)
         testComputeHistorySharing(directory / "compute_history");
         testHistoryCohorts(directory / "history_cohorts");
         testPrivateCommits(directory / "private_commits");
+        testSharedCommitEdges(directory / "notifications", "128", "10000");
+        testSharedCommitEdges(directory / "notifications_split", "2", "1");
         testScalarStaging(directory / "scalar_staging");
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";

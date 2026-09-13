@@ -303,7 +303,9 @@ namespace wolvrix::lib::grhsim
             {
                 return "dispatch_packed_checks=" + std::to_string(dispatchPackedBytes_) +
                     " handoff_packed_slots=" + std::to_string(handoffPackedSlots_) +
-                    " port_arm_walk_packed_words=" + std::to_string(pflagPackedWords_);
+                    " port_arm_walk_packed_words=" + std::to_string(pflagPackedWords_) +
+                    " shared_edge_blocks=" + std::to_string(sharedEdgeBlocks_) +
+                    " shared_edge_ports=" + std::to_string(sharedEdgePorts_);
             }
 
             PassResult write(const std::filesystem::path &directory)
@@ -2705,12 +2707,27 @@ if(terminal){
                                 if (word == ~std::uint32_t(0)) continue;
                                 wordOps[word].push_back(op);
                             }
+                        std::string taskGuard = findGuard(wordOps.begin()->second.front());
+                        for (const auto &[word, ops] : wordOps)
+                            for (auto op : ops)
+                                if (findGuard(op) != taskGuard) taskGuard.clear();
+                        if (!taskGuard.empty()) out << "if(" << taskGuard << "){ // cpu_shared_task_edge\n";
                         for (auto it = wordOps.cbegin(); it != wordOps.cend();)
                         {
                             const std::uint32_t base = it->first;
                             std::vector<std::map<std::uint32_t, std::vector<OpId>>::const_iterator> group;
                             for (auto next = it; next != wordOps.end() && next->first < base + 8; ++next) group.push_back(next);
                             it = group.empty() ? std::next(it) : std::next(group.back());
+                            std::string sharedGuard = findGuard(group.front()->second.front());
+                            for (auto entry : group)
+                                for (auto op : entry->second)
+                                    if (findGuard(op) != sharedGuard) sharedGuard.clear();
+                            if (!sharedGuard.empty())
+                            {
+                                if (taskGuard.empty()) out << "if(" << sharedGuard << "){ // cpu_shared_port_edge\n";
+                                ++sharedEdgeBlocks_;
+                                for (auto entry : group) sharedEdgePorts_ += entry->second.size();
+                            }
                             const bool packed = group.size() >= 2;
                             if (packed)
                             {
@@ -2719,20 +2736,32 @@ if(terminal){
                             }
                             for (auto entry : group)
                             {
-                                out << "{const std::uint8_t cpu_armed=cpu_pflags[" << entry->first << "];if(cpu_armed){std::uint8_t cpu_consumed=0;\n";
+                                out << "{const std::uint8_t cpu_armed=cpu_pflags[" << entry->first << "];if(cpu_armed){";
+                                if (sharedGuard.empty()) out << "std::uint8_t cpu_consumed=0;";
+                                out << '\n';
+                                std::uint32_t portMask = 0;
                                 for (auto op : entry->second)
                                 {
                                     const auto &operation = model_.operations()[op.index - 1];
                                     const auto bit = 1u << portArmBits_[op.index];
-                                    out << "if(cpu_armed&" << bit << "){if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|="
-                                        << bit << ";if(" << value(model_.operands(operation)[0]) << "){\n";
+                                    portMask |= bit;
+                                    out << "if(cpu_armed&" << bit << "){";
+                                    if (sharedGuard.empty())
+                                        out << "if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|=" << bit << ';';
+                                    out << "if(" << value(model_.operands(operation)[0]) << "){\n";
                                     directCommitBody(out, operation);
-                                    out << "}}}\n";
+                                    out << (sharedGuard.empty() ? "}}}\n" : "}}\n");
                                 }
-                                out << "cpu_pflags[" << entry->first << "]&=~cpu_consumed;}}\n";
+                                out << "cpu_pflags[" << entry->first << ']';
+                                if (sharedGuard.empty()) out << "&=~cpu_consumed";
+                                else if (portMask == 255) out << "=0";
+                                else out << "&=~" << portMask;
+                                out << ";}}\n";
                             }
                             if (packed) out << "}\n";
+                            if (!sharedGuard.empty() && taskGuard.empty()) out << "}\n";
                         }
+                        if (!taskGuard.empty()) out << "}\n";
                     }
                     // Private shadow writes commute; guards keep reading individual visible histories.
                     if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
@@ -2861,6 +2890,7 @@ if(terminal){
             std::uint32_t portArmWordCount_ = 0;
             std::uint64_t portArmPortCount_ = 0, portArmTaskCount_ = 0, portArmValueCount_ = 0;
             mutable std::uint64_t dispatchPackedBytes_ = 0, handoffPackedSlots_ = 0, pflagPackedWords_ = 0;
+            mutable std::uint64_t sharedEdgeBlocks_ = 0, sharedEdgePorts_ = 0;
         };
 
         class EmitCppPass final : public Pass

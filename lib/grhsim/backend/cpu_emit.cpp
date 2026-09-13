@@ -62,6 +62,9 @@ namespace wolvrix::lib::grhsim
                     if (model_.text(op.opType) == "core.compute.constant" && model_.results(op).size() == 1 &&
                         type(model_.results(op)[0]).kind == TypeKind::String)
                         staticStrings_.emplace(model_.results(op)[0].index, expression(op));
+                    if (model_.text(op.opType) == "core.compute.constant" && model_.results(op).size() == 1 &&
+                        isScalarLogic(type(model_.results(op)[0])))
+                        staticScalars_.emplace(model_.results(op)[0].index, expression(op));
                     if (model_.text(op.opType) == "core.system.task")
                     {
                         hasSystemTasks_ = true;
@@ -296,6 +299,7 @@ namespace wolvrix::lib::grhsim
                     " port_arm_values=" + std::to_string(portArmValueCount_) +
                     " port_arm_words=" + std::to_string(portArmWordCount_) +
                     " state_read_aliases=" + std::to_string(std::count_if(readAliases_.begin(), readAliases_.end(), [](auto id) { return bool(id); })) +
+                    " scalar_constants=" + std::to_string(staticScalars_.size()) +
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
             }
 
@@ -984,6 +988,7 @@ namespace wolvrix::lib::grhsim
             std::string value(ValueId value) const
             {
                 if (!readAliases_.empty() && readAliases_[value.index]) return state(readAliases_[value.index]);
+                if (const auto it = staticScalars_.find(value.index); it != staticScalars_.end()) return it->second;
                 if (type(value).kind == TypeKind::String)
                     if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
                 const auto &slot = layout_.values[value.index - 1];
@@ -1690,6 +1695,7 @@ namespace wolvrix::lib::grhsim
                     const auto results = model_.results(op);
                     if (results.size() != 1 || model_.text(op.opType) == "core.dpi.call") continue;
                     const auto result = results[0];
+                    if (staticScalars_.contains(result.index)) continue;
                     if (readAliases_[result.index] || type(result).kind != TypeKind::Logic) continue;
                     const auto *targets = fanout_[result.index];
                     const auto *ports = portArmTargets(result);
@@ -1744,6 +1750,9 @@ namespace wolvrix::lib::grhsim
                 }
                 const auto result = model_.results(op)[0];
                 const auto &resultType = type(result);
+                // All units and commit ports start active. Immutable operands
+                // are available at every use, with no later change to publish.
+                if (staticScalars_.contains(result.index)) return;
                 if (readAliases_[result.index]) return;
                 if (const auto read = memoryReadIds_[op.id.index])
                     out << "cpu_read_offsets[" << read - 1 << "]=" << object(model_.objectRefs(op)[0]).offset
@@ -2852,6 +2861,7 @@ if(terminal){
             std::vector<std::vector<uint64_t>> localStrings_;
             std::vector<std::pair<std::string_view, uint64_t>> persistentStrings_;
             std::map<uint32_t, std::string> staticStrings_;
+            std::map<uint32_t, std::string> staticScalars_;
             mutable const std::map<uint32_t, std::string> *activeEventCache_ = nullptr;
             bool hasSystemTasks_ = false;
             std::map<uint32_t, std::size_t> onceTasks_;

@@ -1368,6 +1368,82 @@ namespace
                 " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testScalarConstants(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_constants"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto signedFive = model.logicType(5, true, LogicDomain::TwoState);
+        const auto word = model.logicType(64, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            const std::array results{value}; const std::array refs{ObjectRef::input(port)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto output = [&](const char *name, ValueId value) {
+            const auto port = model.addOutput(name, model.values()[value.index - 1].type);
+            const std::array operands{value}; const std::array refs{ObjectRef::output(port)};
+            model.addOperation("core.output.write", operands, {}, refs);
+        };
+        const auto constant = [&](TypeId type, const char *literal) {
+            const auto value = model.addValue(type); const std::array results{value};
+            const std::array params{Parameter{model.intern("value"), std::string(literal)}};
+            model.addOperation("core.compute.constant", {}, results, {}, params); return value;
+        };
+        const auto state = [&](TypeId type, const char *initial) {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), type);
+            const std::array params{Parameter{model.intern("value"), std::string(initial)}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto clock = input("clock", bit), data = input("data", byte);
+        const auto unsignedData = input("unsigned_data", word), signedData = input("signed_data", signedFive);
+        const auto one = constant(bit, "1'b1"), minusThree = constant(signedFive, "5'h1d");
+        const auto allOnes = constant(word, "64'hffffffffffffffff"), unknown = constant(byte, "8'hxz");
+        const auto inoutInitial = constant(byte, "8'hx5");
+        output("u1", one); output("s1", constant(model.logicType(1, true, LogicDomain::TwoState), "1'b1"));
+        output("u5", constant(model.logicType(5, false, LogicDomain::TwoState), "8'hff"));
+        output("s5", minusThree); output("u64", allOnes);
+        output("s64", constant(model.logicType(64, true, LogicDomain::TwoState), "64'h8000000000000000"));
+        output("xz", unknown); output("inout_initial", inoutInitial);
+        for (const auto &[name, lhs, rhs, type] : std::array{
+                 std::tuple{"unsigned_sum", unsignedData, allOnes, word},
+                 std::tuple{"signed_sum", signedData, minusThree, signedFive}})
+        {
+            const auto value = model.addValue(type); const std::array results{value};
+            const std::array operands{lhs, rhs};
+            model.addOperation("core.compute.add", operands, results); output(name, value);
+        }
+        const auto write = [&](const char *name, ValueId event, const char *mask) {
+            const auto reg = state(byte, "8'ha0"), history = state(bit, "0");
+            const std::array operands{one, data, constant(byte, mask), event};
+            const std::array refs{ObjectRef::state(reg), ObjectRef::state(history)};
+            const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.state.regWrite", operands, {}, refs, params);
+            const auto value = model.addValue(byte); const std::array results{value};
+            const std::array readRefs{ObjectRef::state(reg)};
+            model.addOperation("core.state.read", {}, results, readRefs); output(name, value);
+        };
+        write("masked", clock, "8'h0f"); write("constant_event", one, "8'hff");
+        const std::array arguments{DpiArgument{model.intern("value"), DpiDirection::Inout, byte}};
+        const auto function = model.addExternFunction("cpu_constant_inout", "core.dpi", "cpu_constant_inout", arguments);
+        const auto returned = model.addValue(byte); const std::array results{returned};
+        const std::array operands{one, inoutInitial, clock};
+        const std::array refs{ObjectRef::function(function), ObjectRef::state(state(bit, "0"))};
+        const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        model.addOperation("core.dpi.call", operands, results, refs, params); output("inout_result", returned);
+        map(model, helpers ? "2" : "128", helpers ? "1" : "10000");
+        diag::Diagnostics diagnostics;
+        const auto revision = model.semanticRevision();
+        require(emitCpuCpp(model, directory, diagnostics).success && model.semanticRevision() == revision,
+                "scalar constant emit failed or mutated semantic IR");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_constants.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testScalarStaging(const std::filesystem::path &directory)
     {
         GrhSimModel model("cpu_scalar_stage"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1761,6 +1837,8 @@ int main(int argc, char **argv)
         testScalarStaging(directory / "scalar_staging");
         testIdentityAssigns(directory / "identity_assign", false);
         testIdentityAssigns(directory / "identity_assign_helpers", true);
+        testScalarConstants(directory / "constants", false);
+        testScalarConstants(directory / "constants_helpers", true);
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");

@@ -57,6 +57,17 @@ shadow 的字符串由模型持有；partition-local 字符串由 supernode 调�
 C++ RAII 完成。字符串 state 的初始化/提交与字符串数组尚未实现，emit 明确拒绝，不能走
 字节 memcpy 或把句柄数组解释为 `std::array<std::string, N>`。
 
+单结果 `core.compute.constant` 的两态 logic<1..64> 操作数在使用点直接发射为
+按原类型截断/符号扩展的 C++ literal，不物化到 local/boundary arena，也不发出
+常量变化通知。例如 `%one = constant logic<1,false> 1`、`%mask = constant
+logic<8,false> 255` 作为 `regWrite` 的 enable 和 mask 时，消费者直接使用 true 和
+255，编译器可消去恒定的 enable 分支与全位掩码运算。`logic<5,true>` 的 `5'h1d`
+仍为 -3，`logic<1,false>` 仍按最低位截断，X/Z 沿用 two-state 投影为零的规则。
+所有 compute unit、commit domain 和端口活动位在 `init()` 时已激活，首次求值
+及重新初始化无需依赖常量生产者通知；常量后续不会变化。IR、mapping、任务顺序
+和布局中的槽保持不变。宽常量仍走原存储路径，DPI inout 从 literal 初始化独立
+可写临时值，再单独发布 result，不修改常量本身。
+
 不可变 `core.compute.constant` 字符串例外：emitter 在使用点直接引用已转义的
 `std::string` 常量表达式，不生成独立赋值或 local/boundary 字符串对象绑定；布局中的
 槽仍保留，mapping 不变。例如 guarded DPI 的字符串构造位于原有 `if (enable &&

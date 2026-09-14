@@ -1368,6 +1368,113 @@ namespace
                 " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testStateSharing(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_state_share"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto input = [&](const std::string &name, TypeId type) {
+            const auto id = model.addInput(name, type); const auto value = model.addValue(type);
+            const std::array result{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, result, refs); return value;
+        };
+        const auto state = [&](const std::string &name, TypeId type, const char *value = "0", bool random = false) {
+            const auto id = model.addState(name, type);
+            const std::vector<Parameter> params = random ? std::vector<Parameter>{} :
+                std::vector<Parameter>{{model.intern("value"), std::string(value)}};
+            const std::array steps{InitStep{model.intern(random ? "core.init.random" : "core.init.const"),
+                {0, static_cast<uint32_t>(params.size())}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto read = [&](StateId state, TypeId type) {
+            const auto value = model.addValue(type); const std::array result{value};
+            const std::array refs{ObjectRef::state(state)};
+            model.addOperation("core.state.read", {}, result, refs); return value;
+        };
+        const auto output = [&](const std::string &name, ValueId value) {
+            const auto id = model.addOutput(name, model.values()[value.index - 1].type);
+            const std::array operands{value}; const std::array refs{ObjectRef::output(id)};
+            model.addOperation("core.output.write", operands, {}, refs);
+        };
+        const auto clock = input("clock", bit), aux = input("aux", bit), enable = input("enable", bit);
+        const auto write = [&](StateId target, ValueId en, ValueId data, ValueId mask,
+                               std::vector<ValueId> events, std::vector<StateId> histories, const char *edge) {
+            std::vector<ValueId> args{en, data, mask}; args.insert(args.end(), events.begin(), events.end());
+            std::vector<ObjectRef> refs{ObjectRef::state(target)};
+            for (auto history : histories) refs.push_back(ObjectRef::state(history));
+            const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>(events.size(), edge)}};
+            model.addOperation("core.state.regWrite", args, {}, refs, params);
+        };
+        const std::array types{bit, model.logicType(5, true, LogicDomain::TwoState),
+            model.logicType(64, false, LogicDomain::TwoState), model.logicType(129, false, LogicDomain::TwoState)};
+        for (unsigned lane = 0; lane < types.size(); ++lane)
+        {
+            const auto type = types[lane];
+            const auto data = input("data" + std::to_string(lane), type), mask = input("mask" + std::to_string(lane), type);
+            for (unsigned copy = 0; copy < 2; ++copy)
+            {
+                auto previous = data;
+                for (unsigned stage = 0; stage < 2; ++stage)
+                {
+                    const auto name = "q" + std::to_string(lane) + '_' + std::to_string(stage) + '_' + std::to_string(copy);
+                    const auto q = state(name, type), history = state(name + "_hist", bit);
+                    if (stage == 0) write(q, enable, previous, mask, {clock, aux}, {history, state(name + "_aux", bit)}, "posedge");
+                    else write(q, enable, previous, mask, {clock}, {history}, "negedge");
+                    const auto value = read(q, type); output(name, value);
+                    const auto next = model.addValue(type); const std::array args{value, data}; const std::array result{next};
+                    model.addOperation("core.compute.xor", args, result); previous = next;
+                }
+            }
+        }
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto data = input("negative_data", byte), mask = input("negative_mask", byte);
+        for (unsigned test = 0; test < 8; ++test)
+        {
+            const auto en = input("negative_enable" + std::to_string(test), bit);
+            StateId sharedHistory;
+            for (unsigned copy = 0; copy < 2; ++copy)
+            {
+                const auto name = "negative" + std::to_string(test) + '_' + std::to_string(copy);
+                const auto q = state(name, byte, test == 0 && copy ? "1" : "0", test == 2);
+                const auto value = read(q, byte); output(name, value);
+                const auto history = test == 5 && copy ? sharedHistory :
+                    state(name + "_hist", bit, test == 1 && copy ? "1" : "0");
+                sharedHistory = history;
+                if (test == 4 && copy == 0) output("observed_history", read(history, bit));
+                write(q, en, test == 6 ? value : data, mask, {test == 7 && copy ? aux : clock}, {history}, "posedge");
+                if (test == 3 && copy == 0)
+                    write(q, en, mask, data, {clock}, {state(name + "_second", bit)}, "posedge");
+            }
+        }
+        auto reference = model.clone();
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error));
+        const auto stateCount = model.states().size();
+        const auto result = manager.run(model, diagnostics);
+        require(result.success && result.changed && model.states().size() == stateCount - 20,
+                "equivalent state cascade or private-history exclusions differ");
+        const auto stable = manager.run(model, diagnostics);
+        require(stable.success && !stable.changed, "state sharing did not reach a fixed point");
+        for (unsigned test = 0; test < 8; ++test)
+            for (unsigned copy = 0; copy < 2; ++copy)
+            {
+                const auto name = "negative" + std::to_string(test) + '_' + std::to_string(copy);
+                require(std::any_of(model.states().begin(), model.states().end(), [&](const auto &state) {
+                    return model.text(state.name) == name;
+                }), "state sharing removed an excluded state");
+            }
+        std::stringstream json;
+        require(writeGrhSimJson(model, json, defaultDialectRegistry(), diagnostics) &&
+                bool(readGrhSimJson(json, defaultDialectRegistry(), diagnostics)), "shared state model failed round-trip");
+        map(model, "128", helpers ? "1" : "10000");
+        map(reference, "128", helpers ? "1" : "10000");
+        require(emitCpuCpp(model, directory, diagnostics).success &&
+                emitCpuCpp(reference, directory / "reference", diagnostics).success, "state sharing emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_state_share.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testScalarConstants(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_constants"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1914,6 +2021,8 @@ int main(int argc, char **argv)
         testScalarConstants(directory / "constants", false);
         testScalarConstants(directory / "constants_helpers", true);
         testMemoryStaging(directory / "memory_stage");
+        testStateSharing(directory / "state_share", false);
+        testStateSharing(directory / "state_share_helpers", true);
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");

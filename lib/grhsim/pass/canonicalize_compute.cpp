@@ -7,12 +7,147 @@ namespace wolvrix::lib::grhsim
 {
     namespace
     {
+        bool parameterKey(std::span<const Parameter> parameters, std::string &key)
+        {
+            for (const auto &parameter : parameters)
+            {
+                key += std::to_string(parameter.name.index) + ':' + std::to_string(parameter.value.index()) + ':';
+                if (const auto *integer = std::get_if<int64_t>(&parameter.value)) key += std::to_string(*integer) + ';';
+                else if (const auto *boolean = std::get_if<bool>(&parameter.value)) key += *boolean ? "1;" : "0;";
+                else if (const auto *text = std::get_if<std::string>(&parameter.value))
+                    key += std::to_string(text->size()) + ':' + *text + ';';
+                else if (const auto *strings = std::get_if<std::vector<std::string>>(&parameter.value))
+                {
+                    key += std::to_string(strings->size()) + '[';
+                    for (const auto &text : *strings) key += std::to_string(text.size()) + ':' + text + ';';
+                    key += ']';
+                }
+                else return false;
+            }
+            return true;
+        }
+
+        bool shareEquivalentStates(GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            std::vector<uint32_t> references(model.states().size() + 1), allowed(references.size()), writers(references.size());
+            std::vector<std::string> initial(references.size());
+            for (auto ref : model.objectRefPool())
+                if (ref.kind == ObjectKind::State) ++references[ref.index];
+            for (const auto &record : model.initRecords())
+            {
+                const auto steps = model.steps(record);
+                if (steps.size() != 1 || model.text(steps[0].kind) != "core.init.const") continue;
+                auto key = std::to_string(model.states()[record.state.index - 1].type.index) + ':';
+                if (parameterKey(model.parameters(steps[0]), key)) initial[record.state.index] = std::move(key);
+            }
+            for (const auto &op : model.operations())
+            {
+                const auto name = model.text(op.opType);
+                const auto refs = model.objectRefs(op);
+                if (name == "core.state.read") ++allowed[refs[0].index];
+                else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                { ++allowed[refs[0].index]; ++writers[refs[0].index]; }
+            }
+            std::vector<StateId> canonical(references.size());
+            std::vector<uint8_t> sharedTargets(references.size());
+            for (const auto &state : model.states()) canonical[state.id.index] = state.id;
+            std::vector<uint8_t> removeOps(model.operations().size() + 1), removeStates(references.size());
+            std::unordered_map<std::string, StateId> groups;
+            std::size_t shared = 0, histories = 0;
+            for (const auto &op : model.operations())
+            {
+                const auto name = model.text(op.opType);
+                if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
+                const auto refs = model.objectRefs(op);
+                const StateId state{refs[0].index, 0};
+                const auto &type = model.types()[model.states()[state.index - 1].type.index - 1];
+                if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
+                    writers[state.index] != 1 || references[state.index] != allowed[state.index] || initial[state.index].empty()) continue;
+                std::string key = std::to_string(op.opType.index) + ':' + initial[state.index] + ':';
+                for (auto operand : model.operands(op)) key += std::to_string(operand.index) + ',';
+                key += ';';
+                if (!parameterKey(model.parameters(op), key)) continue;
+                bool privateHistory = true;
+                for (auto ref : refs.subspan(1))
+                {
+                    if (ref.kind != ObjectKind::State || references[ref.index] != 1 || initial[ref.index].empty())
+                    { privateHistory = false; break; }
+                    key += '/' + initial[ref.index];
+                }
+                if (!privateHistory) continue;
+                const auto [entry, inserted] = groups.emplace(std::move(key), state);
+                if (inserted) continue;
+                canonical[state.index] = entry->second;
+                sharedTargets[entry->second.index] = 1;
+                removeStates[state.index] = removeOps[op.id.index] = 1;
+                ++shared;
+                for (auto ref : refs.subspan(1)) { removeStates[ref.index] = 1; ++histories; }
+            }
+            if (!shared) return false;
+            std::vector<ValueId> values(model.values().size() + 1);
+            for (const auto &value : model.values()) values[value.id.index] = value.id;
+            std::unordered_map<uint64_t, ValueId> reads;
+            std::size_t sharedReads = 0;
+            for (const auto &op : model.operations())
+            {
+                if (model.text(op.opType) != "core.state.read" || model.results(op).size() != 1 ||
+                    !model.operands(op).empty() || !model.parameters(op).empty()) continue;
+                const auto result = model.results(op)[0];
+                const auto state = canonical[model.objectRefs(op)[0].index];
+                if (!sharedTargets[state.index]) continue;
+                const auto type = model.values()[result.index - 1].type;
+                const uint64_t key = (uint64_t(state.index) << 32) | type.index;
+                const auto [entry, inserted] = reads.emplace(key, result);
+                if (inserted) continue;
+                values[result.index] = entry->second;
+                removeOps[op.id.index] = 1;
+                ++sharedReads;
+            }
+            for (const auto &op : model.operations())
+            {
+                if (removeOps[op.id.index]) continue;
+                const auto args = model.operands(op), results = model.results(op);
+                const auto refSpan = model.objectRefs(op);
+                const auto paramSpan = model.parameters(op);
+                std::vector<ValueId> operands(args.begin(), args.end());
+                std::vector<ObjectRef> refs(refSpan.begin(), refSpan.end());
+                bool changed = false;
+                for (auto &operand : operands)
+                    if (values[operand.index] != operand) { operand = values[operand.index]; changed = true; }
+                for (auto &ref : refs)
+                    if (ref.kind == ObjectKind::State && canonical[ref.index].index != ref.index)
+                    { ref = ObjectRef::state(canonical[ref.index]); changed = true; }
+                if (!changed) continue;
+                const std::vector<ValueId> out(results.begin(), results.end());
+                const std::vector<Parameter> params(paramSpan.begin(), paramSpan.end());
+                model.replaceOperation(op.id, model.text(op.opType), operands, out, refs, params);
+            }
+            model.compact(removeOps, removeStates);
+            diagnostics.info("equivalent_states_removed=" + std::to_string(shared) +
+                " private_histories_removed=" + std::to_string(histories) + " state_reads_shared=" + std::to_string(sharedReads),
+                "grhsim.canonicalize-compute");
+            return true;
+        }
+
         class CanonicalizeComputePass final : public Pass
         {
         public:
             CanonicalizeComputePass() : Pass("grhsim.canonicalize-compute", PassKind::SemanticTransform) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
+            {
+                bool changed = false;
+                while (true)
+                {
+                    changed = canonicalize(model, diagnostics).changed || changed;
+                    if (!shareEquivalentStates(model, diagnostics)) break;
+                    changed = true;
+                }
+                return {true, changed, {}};
+            }
+
+        private:
+            PassResult canonicalize(GrhSimModel &model, diag::Diagnostics &diagnostics)
             {
                 std::vector<ValueId> sources(model.values().size() + 1), canonical(sources.size());
                 for (const auto &op : model.operations())

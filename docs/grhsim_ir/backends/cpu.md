@@ -557,6 +557,24 @@ direct commit 不改变 phase/task/domain/event 策略，也不影响 DPI 真实
 覆盖 signed 5-bit、unsigned 64-bit、bool、零/部分/全 mask、重复 eval 和 init。
 生成标记还检查多写者及普通写口写 history 的回退，防止提前记录中间变化。
 
+### GrhSIM 等价普通状态共享
+
+`grhsim.canonicalize-compute` 在纯计算 CSE 后共享确定性等价的普通状态，再重复
+纯计算 CSE，直到没有新的状态合并。每轮继续的前提是至少删除一个状态；不同
+反馈 value 的循环不推测等价。只处理 two-state logic 的唯一 regWrite/latchWrite，
+完整对象引用必须仅为目标写口和 state.read；随机/文件/多步初始化及额外引用回退。
+状态类型、单条 `core.init.const` 的完整参数、写口种类、全部操作数及参数必须相同。
+每个事件 history 必须仅由本写口引用，且两边对应 history 的类型和确定性初值相同；
+共享或被读取的 history 回退。
+
+regWrite 的操作数为 enable、data、mask，随后为各 event value；object refs 为
+目标状态，随后为各 event history，`event_edges` 指定对应边沿。latchWrite 使用
+前三个操作数。相同初值和逐轮相同输入保证状态与历史始终等价，所以保留组内一个
+状态/写口，把同一类型的 state.read 合并为一个 value，并删除副本及其私有 history。
+例如 `q0=0; q1=0; q0<=d; q1<=d` 在相同 enable/mask/事件下可共享，消费者中
+`q0 xor a` 与 `q1 xor a` 随之可被 CSE；初值不同、事件不同或 `q0<=q0; q1<=q1`
+均不按此规则合并。接口与 DPI/system 调用保留，写入仍使用 compute 阶段的快照。
+
 ### CPU C++ 提交端口变化武装
 
 满足以下条件的 direct-commit 写口（regWrite/latchWrite）按变化武装（change-armed）：

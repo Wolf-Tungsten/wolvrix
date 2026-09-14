@@ -1329,9 +1329,25 @@ namespace
         {
             const auto type = types[i]; const auto suffix = std::to_string(i);
             const auto a = input("a" + suffix, type), b = input("b" + suffix, type);
-            const auto sum = identity(compute("core.compute.add", type, {identity(a), b}));
+            const auto constant = [&](const char *literal) {
+                const auto value = model.addValue(type);
+                const std::array params{Parameter{model.intern("value"), std::string(literal)}};
+                model.addOperation("core.compute.constant", {}, std::array{value}, {}, params);
+                return identity(value);
+            };
+            const auto zero = constant("0"), one = constant("1"), mask = constant("-1");
+            const auto algebraicIdentity = [&](ValueId value) {
+                value = compute("core.compute.and", type, {mask, value});
+                value = compute("core.compute.add", type, {value, zero});
+                value = compute("core.compute.mul", type, {one, value});
+                value = compute("core.compute.div", type, {value, one});
+                value = compute("core.compute.xor", type, {zero, value});
+                const auto absorbed = compute("core.compute.and", type, {value, zero});
+                return compute("core.compute.add", type, {value, absorbed});
+            };
+            const auto sum = algebraicIdentity(identity(compute("core.compute.add", type, {identity(a), b})));
             const auto mix = identity(compute("core.compute.xor", type, {sum, b}));
-            const auto sumCopy = compute("core.compute.add", type, {a, identity(b)});
+            const auto sumCopy = compute("core.compute.add", type, {identity(b), a});
             const auto mixCopy = compute("core.compute.xor", type, {sumCopy, b});
             const auto combined = compute("core.compute.add", type, {sumCopy, mixCopy});
             output("sum" + suffix, type, sum); output("mix" + suffix, type, mix);
@@ -1352,7 +1368,7 @@ namespace
                 const auto read = model.addValue(type); const std::array result{read};
                 const std::array readRefs{ObjectRef::state(reg)};
                 model.addOperation("core.state.read", {}, result, readRefs);
-                output("q" + std::to_string(stage) + "_" + suffix, type, read); previous = identity(read);
+                output("q" + std::to_string(stage) + "_" + suffix, type, read); previous = algebraicIdentity(identity(read));
             }
         }
         PassManager manager(defaultDialectRegistry()); std::string error;

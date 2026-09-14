@@ -379,6 +379,148 @@ namespace
             return fail("identity pass output does not round-trip");
         return 0;
     }
+
+    int runAlgebraicComputeTest()
+    {
+        using namespace grhsim;
+        for (const uint32_t width : {1, 5, 64})
+        for (const bool isSigned : {false, true})
+        {
+            GrhSimModel model("algebra"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto type = model.logicType(width, isSigned, LogicDomain::TwoState);
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto x = model.addValue(type), y = model.addValue(type);
+            const auto xPort = model.addInput("x", type), yPort = model.addInput("y", type);
+            const auto constant = [&](TypeId t, ParameterValue literal) {
+                const auto value = model.addValue(t);
+                const std::array parameters{Parameter{model.intern("value"), std::move(literal)}};
+                model.addOperation("core.compute.constant", {}, std::array{value}, {}, parameters);
+                return value;
+            };
+            const auto zero = constant(type, int64_t{0}), one = constant(type, true);
+            const auto mask = constant(type, std::string("-1"));
+            const auto condition = constant(bit, std::string("1'bx"));
+            std::vector<std::pair<OutputId, OutputId>> expected;
+            const auto check = [&](std::string_view name, std::initializer_list<ValueId> args, ValueId equivalent) {
+                const auto result = model.addValue(type);
+                model.addOperation(std::string("core.compute.") + std::string(name), {args.begin(), args.size()}, std::array{result});
+                const auto output = model.addOutput("o" + std::to_string(expected.size()), type);
+                model.addOperation("core.output.write", std::array{result}, {}, std::array{ObjectRef::output(output)});
+                const auto reference = model.addOutput("ref" + std::to_string(expected.size()), type);
+                model.addOperation("core.output.write", std::array{equivalent ? equivalent : result}, {}, std::array{ObjectRef::output(reference)});
+                expected.emplace_back(output, reference);
+                return result;
+            };
+            for (const auto op : {"add", "xor", "or"})
+            { check(op, {x, zero}, x); check(op, {zero, x}, x); }
+            check("sub", {x, zero}, x);
+            check("mul", {x, one}, x); check("mul", {one, x}, x);
+            check("mul", {x, zero}, zero); check("mul", {zero, x}, zero);
+            check("and", {x, zero}, zero); check("and", {zero, x}, zero);
+            check("and", {x, mask}, x); check("and", {mask, x}, x);
+            check("or", {x, mask}, mask); check("or", {mask, x}, mask);
+            check("and", {x, x}, x); check("or", {x, x}, x);
+            check("mux", {condition, x, y}, y); check("mux", {condition, x, x}, x);
+            if (!(width == 1 && isSigned)) check("div", {x, one}, x);
+            if (width == 1)
+            {
+                check("logicAnd", {x, zero}, zero); check("logicAnd", {zero, x}, zero);
+                check("logicAnd", {x, one}, x); check("logicAnd", {one, x}, x);
+                check("logicOr", {x, zero}, x); check("logicOr", {zero, x}, x);
+                check("logicOr", {x, one}, one); check("logicOr", {one, x}, one);
+            }
+            // Consumers and constant aliases deliberately precede their producers.
+            const auto alias = model.addValue(type), folded = model.addValue(type);
+            check("add", {x, folded}, x);
+            model.addOperation("core.compute.mul", std::array{alias, x}, std::array{folded});
+            model.addOperation("core.compute.assign", std::array{zero}, std::array{alias});
+            model.addOperation("core.input.read", {}, std::array{x}, std::array{ObjectRef::input(xPort)});
+            model.addOperation("core.input.read", {}, std::array{y}, std::array{ObjectRef::input(yPort)});
+            const auto sum = check("add", {x, y}, {});
+            check("add", {y, x}, sum);
+            check("sub", {x, y}, {});
+            check("sub", {y, x}, {});
+            // These are deliberate non-identities and must survive.
+            check("mod", {x, one}, {});
+            check("div", {x, zero}, {});
+            const auto opsBefore = model.operations().size();
+            PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+            manager.addPass(defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error));
+            const auto result = manager.run(model, diagnostics);
+            if (!result.success || !result.changed || model.operations().size() >= opsBefore)
+                return fail("algebraic pass failed to simplify");
+            std::vector<ValueId> outputs(model.outputs().size() + 1);
+            unsigned subs = 0, mods = 0, divs = 0;
+            for (const auto &op : model.operations())
+            {
+                if (model.text(op.opType) == "core.output.write")
+                    outputs[model.objectRefs(op)[0].index] = model.operands(op)[0];
+                subs += model.text(op.opType) == "core.compute.sub";
+                mods += model.text(op.opType) == "core.compute.mod";
+                divs += model.text(op.opType) == "core.compute.div";
+            }
+            for (const auto &[port, reference] : expected)
+                if (outputs[port.index] != outputs[reference.index])
+                    return fail("algebraic rewrite chose a wrong producer at width " + std::to_string(width) +
+                        " signed=" + std::to_string(isSigned) + " output=" + std::to_string(port.index));
+            if (subs != 2 || mods != 1 || divs != 1) return fail("non-identity or noncommutative op was removed");
+            const auto again = manager.run(model, diagnostics);
+            if (!again.success || again.changed) return fail("algebraic pass is not idempotent");
+            std::stringstream serialized;
+            if (!writeGrhSimJson(model, serialized, defaultDialectRegistry(), diagnostics) ||
+                !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics))
+                return fail("algebraic pass output does not round-trip");
+        }
+        GrhSimModel guards("algebra_guards"); guards.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto u5 = guards.logicType(5, false, LogicDomain::TwoState);
+        const auto s5 = guards.logicType(5, true, LogicDomain::TwoState);
+        const auto four = guards.logicType(5, false, LogicDomain::FourState);
+        const auto input = [&](TypeId type) {
+            const auto port = guards.addInput("i" + std::to_string(guards.inputs().size()), type);
+            const auto value = guards.addValue(type);
+            guards.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto constant = [&](TypeId type, const char *literal) {
+            const auto value = guards.addValue(type);
+            const std::array params{Parameter{guards.intern("value"), std::string(literal)}};
+            guards.addOperation("core.compute.constant", {}, std::array{value}, {}, params);
+            return value;
+        };
+        const auto x = input(u5), f = input(four);
+        const auto zero = constant(u5, "0"), one = constant(u5, "1"), fourZero = constant(four, "0");
+        const auto preserve = [&](std::string_view name, TypeId type, std::initializer_list<ValueId> args,
+                                  std::span<const Parameter> parameters = {}) {
+            const auto result = guards.addValue(type);
+            guards.addOperation(name, {args.begin(), args.size()}, std::array{result}, {}, parameters);
+        };
+        preserve("core.compute.logicAnd", u5, {x, one});
+        preserve("core.compute.logicOr", u5, {x, zero});
+        preserve("core.compute.add", s5, {x, zero});
+        preserve("core.compute.and", four, {f, fourZero});
+        preserve("core.compute.mux", u5, {f, x, x});
+        const std::array params{Parameter{guards.intern("future_semantics"), true}};
+        preserve("core.compute.add", u5, {x, zero}, params);
+        // Do not choose between legacy and canonical parameter spellings when
+        // both occur on a constant; their order must not affect simplification.
+        for (const bool reverse : {false, true})
+        {
+            const auto ambiguous = guards.addValue(u5);
+            std::array constants{Parameter{guards.intern("constValue"), std::string("0")},
+                Parameter{guards.intern("value"), std::string("1")}};
+            if (reverse) std::swap(constants[0], constants[1]);
+            guards.addOperation("core.compute.constant", {}, std::array{ambiguous}, {}, constants);
+            preserve("core.compute.add", u5, {x, ambiguous});
+        }
+        const auto cycleA = guards.addValue(u5), cycleB = guards.addValue(u5);
+        guards.addOperation("core.compute.add", std::array{cycleB, zero}, std::array{cycleA});
+        guards.addOperation("core.compute.add", std::array{cycleA, zero}, std::array{cycleB});
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error));
+        const auto result = manager.run(guards, diagnostics);
+        if (!result.success || result.changed) return fail("algebraic pass ignored a type, parameter, or cycle guard");
+        return 0;
+    }
 }
 
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
@@ -394,6 +536,7 @@ int main()
         if (const int status = runDetachedValueTest(); status != 0) return status;
         if (const int status = runUndrivenTwoStateTest(); status != 0) return status;
         if (const int status = runIdentityAssignTest(); status != 0) return status;
+        if (const int status = runAlgebraicComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }
     catch (const std::exception &ex)

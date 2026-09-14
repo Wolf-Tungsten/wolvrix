@@ -58,13 +58,36 @@ signedness 或 logic domain，则保留转换；string、real、四态值也不�
 无变化时保持 revision 不变。
 
 该 pass 还按拓扑次序共享精确相同的两态 logic `core.compute.*` 纯计算，键包含
-op、结果 TypeId、归一化后的有序 operands 及完整 parameters。例如两条
+op、结果 TypeId、归一化后的 operands 及完整 parameters。例如两条
 `add(a,b) → xor(result,b)` 链可共用一条；`sub(a,b)` 与 `sub(b,a)` 保持独立，
 不同 sliceStart/sliceEnd 的切片保持独立。只编码整数、bool、string 参数，其他
 参数类型保留原 op；string 参数按长度分隔，不能因文本包含分隔符发生误合并。
 input/state/memory read、DPI、system、output 和 commit 均不共享。赋值环、其他
 计算环及依赖计算环的纯 op 不进入 CSE；不推断循环不变量。诊断包括
-`identity_assigns_removed`、`common_expressions_removed` 和 `rewritten_uses`。
+`identity_assigns_removed`、`algebraic_identities_removed`、
+`common_expressions_removed` 和 `rewritten_uses`。
+
+归一化也在这个 GrhSIM IR pass 中执行代数恒等式，不由 emitter 改写计算语义。
+对无 parameters、同完整 TypeId 的两态 1–64 位 operands/result，二元操作的
+operands 依次是左值 `a`、右值 `b`：`add(a,0)`、`sub(a,0)`、`mul(a,1)`、
+`div(a,1)`、`and(a,all-ones)`、`or(a,0)`、`xor(a,0)` 接回 `a`；可交换操作
+也识别另一侧的常量。`mul/and` 遇零接回零，`or` 遇全 1 接回全 1。
+有符号 1 位除法保守保留；模除及除零不套用恒等式。逻辑 `logicAnd/logicOr`
+只在同类型 1 位条件下套用布尔恒等式，不能将宽整数的布尔结果接回宽整数。
+例如 `u5 x && u5(1)` 的结果仍须经过布尔化，而 `u1 x && u1(1)` 可接回 `x`。
+
+`mux` 的三个 operands 是条件、真分支、假分支。两分支和 result 同完整 TypeId、
+条件为两态 logic 时，常量条件选定分支，或两个相同分支接回该分支；分支可以是
+宽 logic。常量条件识别限 1–64 位。`and(a,a)`、`or(a,a)` 也支持同类型宽 logic。
+常量要求只有一个 `value` 或 `constValue` 参数；两者并存或附带其他参数时保守
+保留。先按字面量自身符号扩展/截断到结果位宽，再按两态语义将 X/Z 投影为零。
+
+恒等式在已有赋值链解析后的拓扑遍历中处理，后继看到的是替换后的 ValueId，
+因此 `assign(0) -> mul(x,alias) -> add(y,product)` 可一次接回 `y`。已知可交换的
+`add/mul/and/or/xor/xnor/eq/ne/caseEq/caseNe/logicAnd/logicOr` 在两输入同类型时
+按 ValueId 排序构造 CSE 键，`add(a,b)` 与 `add(b,a)` 可共享，非交换运算保持顺序。
+删除与重接发生于 IR，后续依赖分析和 mapping 使用化简后的图；语义 revision
+使旧 mapping 失效。状态共享若再暴露相同表达式，重复现有归一化过程。
 
 按下表顺序执行。前八步只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
 最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。

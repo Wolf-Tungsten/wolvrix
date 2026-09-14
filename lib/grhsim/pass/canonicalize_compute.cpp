@@ -1,12 +1,111 @@
 #include "grhsim/pass/canonicalize_compute.hpp"
 #include "grhsim/ir/model.hpp"
+#include "slang/numeric/SVInt.h"
 
+#include <optional>
 #include <unordered_map>
 
 namespace wolvrix::lib::grhsim
 {
     namespace
     {
+        std::optional<uint64_t> scalarConstant(const GrhSimModel &model, const SimOp &op)
+        {
+            const auto results = model.results(op);
+            if (model.text(op.opType) != "core.compute.constant" || results.size() != 1 ||
+                !model.operands(op).empty() || !model.objectRefs(op).empty() || model.parameters(op).size() != 1) return {};
+            const auto &type = model.types()[model.values()[results[0].index - 1].type.index - 1];
+            if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
+                type.width == 0 || type.width > 64) return {};
+            for (const auto &parameter : model.parameters(op))
+            {
+                if (model.text(parameter.name) != "constValue" && model.text(parameter.name) != "value") continue;
+                std::string literal;
+                if (const auto *text = std::get_if<std::string>(&parameter.value)) literal = *text;
+                else if (const auto *integer = std::get_if<int64_t>(&parameter.value)) literal = std::to_string(*integer);
+                else if (const auto *boolean = std::get_if<bool>(&parameter.value)) literal = *boolean ? "1" : "0";
+                else return {};
+                try
+                {
+                    // Match two-state constant semantics: resize with the literal's
+                    // signedness, then project X/Z to zero before reading raw bits.
+                    auto bits = slang::SVInt::fromString(literal).resize(type.width);
+                    bits.flattenUnknowns();
+                    return bits.getRawPtr()[0];
+                }
+                catch (const std::exception &) { return {}; }
+            }
+            return {};
+        }
+
+        ValueId simplify(const GrhSimModel &model, const SimOp &op, std::span<const ValueId> operands,
+                         const std::vector<std::optional<uint64_t>> &constants)
+        {
+            if (!model.parameters(op).empty()) return {};
+            const auto result = model.results(op)[0];
+            const auto typeId = model.values()[result.index - 1].type;
+            const auto &type = model.types()[typeId.index - 1];
+            const auto sameType = [&](ValueId value) { return model.values()[value.index - 1].type == typeId; };
+            const auto name = model.text(op.opType);
+            if (name == "core.compute.mux" && operands.size() == 3 && sameType(operands[1]) && sameType(operands[2]))
+            {
+                const auto &conditionType = model.types()[model.values()[operands[0].index - 1].type.index - 1];
+                if (conditionType.kind != TypeKind::Logic || conditionType.domain != LogicDomain::TwoState) return {};
+                if (operands[1] == operands[2]) return operands[1];
+                if (const auto condition = constants[operands[0].index]) return *condition ? operands[1] : operands[2];
+                return {};
+            }
+            if (operands.size() != 2 || !sameType(operands[0]) || !sameType(operands[1])) return {};
+            if ((name == "core.compute.and" || name == "core.compute.or") && operands[0] == operands[1])
+                return operands[0];
+            if (type.width == 0 || type.width > 64) return {};
+            const auto a = operands[0], b = operands[1];
+            const auto lhs = constants[a.index], rhs = constants[b.index];
+            const uint64_t mask = type.width == 64 ? UINT64_MAX : (UINT64_C(1) << type.width) - 1;
+            if (name == "core.compute.add" || name == "core.compute.sub" || name == "core.compute.xor")
+            {
+                if (rhs == 0) return a;
+                if (name != "core.compute.sub" && lhs == 0) return b;
+            }
+            else if (name == "core.compute.mul")
+            {
+                if (lhs == 0 || rhs == 1) return a;
+                if (rhs == 0 || lhs == 1) return b;
+            }
+            else if (name == "core.compute.div")
+            {
+                if (rhs == 1 && !(type.isSigned && type.width == 1)) return a;
+            }
+            else if (name == "core.compute.and")
+            {
+                if (lhs == 0 || rhs == mask) return a;
+                if (rhs == 0 || lhs == mask) return b;
+            }
+            else if (name == "core.compute.or")
+            {
+                if (lhs == mask || rhs == 0) return a;
+                if (rhs == mask || lhs == 0) return b;
+            }
+            else if (type.width == 1 && (name == "core.compute.logicAnd" || name == "core.compute.logicOr"))
+            {
+                // Logical results are Boolean; wider integer operands cannot be
+                // substituted without an explicit Boolean conversion.
+                const uint64_t absorbing = name == "core.compute.logicAnd" ? 0 : 1;
+                if (lhs == absorbing || rhs == 1 - absorbing) return a;
+                if (rhs == absorbing || lhs == 1 - absorbing) return b;
+            }
+            return {};
+        }
+
+        bool commutative(std::string_view name)
+        {
+            return name == "core.compute.add" || name == "core.compute.mul" ||
+                name == "core.compute.and" || name == "core.compute.or" || name == "core.compute.xor" ||
+                name == "core.compute.xnor" || name == "core.compute.eq" || name == "core.compute.ne" ||
+                name == "core.compute.caseEq" || name == "core.compute.caseNe" ||
+                name == "core.compute.logicAnd" || name == "core.compute.logicOr";
+        }
+
         bool parameterKey(std::span<const Parameter> parameters, std::string &key)
         {
             for (const auto &parameter : parameters)
@@ -221,8 +320,9 @@ namespace wolvrix::lib::grhsim
                     }
                     return current;
                 };
+                std::vector<std::optional<uint64_t>> constants(sources.size());
                 std::unordered_map<std::string, ValueId> expressions;
-                std::size_t common = 0;
+                std::size_t common = 0, algebraic = 0;
                 for (std::size_t i = 0; i < ready.size(); ++i)
                 {
                     const auto &op = model.operations()[ready[i] - 1];
@@ -234,8 +334,25 @@ namespace wolvrix::lib::grhsim
                         const auto type = model.values()[results[0].index - 1].type;
                         const auto &resultType = model.types()[type.index - 1];
                         pure = resultType.kind == TypeKind::Logic && resultType.domain == LogicDomain::TwoState;
+                        std::vector<ValueId> operands;
+                        for (auto operand : model.operands(op)) operands.push_back(root(operand));
+                        if (pure)
+                        {
+                            constants[results[0].index] = scalarConstant(model, op);
+                            if (const auto replacement = simplify(model, op, operands, constants))
+                            {
+                                canonical[results[0].index] = replacement;
+                                removed[op.id.index] = 1;
+                                ++algebraic;
+                                pure = false;
+                            }
+                        }
+                        if (pure && operands.size() == 2 && commutative(model.text(op.opType)) &&
+                            model.values()[operands[0].index - 1].type == model.values()[operands[1].index - 1].type &&
+                            operands[1].index < operands[0].index)
+                            std::swap(operands[0], operands[1]);
                         std::string key = std::to_string(op.opType.index) + ":" + std::to_string(type.index) + ":";
-                        for (auto operand : model.operands(op)) key += std::to_string(root(operand).index) + ',';
+                        for (auto operand : operands) key += std::to_string(operand.index) + ',';
                         key += ';';
                         for (const auto &parameter : model.parameters(op))
                         {
@@ -261,7 +378,8 @@ namespace wolvrix::lib::grhsim
                         if (--pending[user] == 0) ready.push_back(user);
                 }
                 for (const auto &value : model.values()) canonical[value.id.index] = root(value.id);
-                count += common;
+                const auto assigns = count;
+                count += common + algebraic;
                 if (count)
                 {
                     for (const auto &op : model.operations())
@@ -288,7 +406,8 @@ namespace wolvrix::lib::grhsim
                     }
                     model.compact(removed, std::vector<uint8_t>(model.states().size() + 1));
                 }
-                diagnostics.info("identity_assigns_removed=" + std::to_string(count - common) +
+                diagnostics.info("identity_assigns_removed=" + std::to_string(assigns) +
+                                 " algebraic_identities_removed=" + std::to_string(algebraic) +
                                  " common_expressions_removed=" + std::to_string(common) +
                                  " rewritten_uses=" + std::to_string(uses), name());
                 return {true, count != 0, {}};

@@ -23,6 +23,13 @@ int main()
     const std::array<std::uint64_t, 2> padded{1, ~UINT64_C(1)}, clean{1, 0};
     if (grhsim_compare_extended_words(padded.data(), 2, 65, clean.data(), 2, 65, false) != 0)
         throw std::runtime_error("comparison included padding bits");
+    const std::array<std::uint64_t, 1> replicateSource{{1}};
+    std::array<std::uint64_t, 3> replicateResult{};
+    if (!cpu_replicate_words_changed<3>(replicateSource, 1, 137, 137, replicateResult) ||
+        replicateResult != std::array<std::uint64_t, 3>{UINT64_MAX, UINT64_MAX, 0x1ff})
+        throw std::runtime_error("caller-owned replication produced the wrong first result");
+    if (cpu_replicate_words_changed<3>(replicateSource, 1, 137, 137, replicateResult))
+        throw std::runtime_error("caller-owned replication reported a stable result as changed");
     std::mt19937_64 random(197);
     const std::array<std::uint64_t, 12> shifts{0, 1, 27, 28, 63, 64, 65, 127, 447, 448, 449, UINT64_MAX};
     for (unsigned sample = 0; sample < 256; ++sample)

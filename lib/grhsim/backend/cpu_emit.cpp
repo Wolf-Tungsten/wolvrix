@@ -209,7 +209,7 @@ namespace wolvrix::lib::grhsim
                     "cpu_objects", "cpu_shadow", "cpu_boundary", "cpu_inputs", "cpu_strings", "cpu_bind_strings",
                     "cpu_rng", "cpu_flags", "cpu_next_arms", "cpu_dirty", "Pending", "Target", "cpu_targets",
                     "cpu_pending", "cpu_stage", "cpu_write_scalar", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed",
-                    "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_active_word",
+                    "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_replicate_words_changed", "cpu_active_word",
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
                     "cpu_stage_cell", "cpu_write_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
@@ -1793,6 +1793,28 @@ namespace wolvrix::lib::grhsim
                         out << "}\n";
                         return;
                     }
+                    if (name == "core.compute.replicate")
+                    {
+                        const auto operand = operands[0];
+                        const auto sourceWords = (type(operand).width + 63u) / 64u;
+                        const auto *rep = parameter<int64_t>(model_, model_.parameters(op), "rep");
+                        if (!rep || *rep < 0) throw std::runtime_error("missing or negative CPU replication parameter");
+                        const auto call = (type(operand).width > 64 ?
+                            "cpu_replicate_words_changed<" + std::to_string(words) + "," + std::to_string(sourceWords) + ">( " :
+                            "cpu_replicate_words_changed<" + std::to_string(words) + ">( ") + value(operand) + "," +
+                            std::to_string(type(operand).width) + "," + std::to_string(*rep) + "," +
+                            std::to_string(resultType.width) + "," + value(result) + ")";
+                        if (!changed.empty())
+                            out << changed << "|=" << call << ";\n";
+                        else if (const auto *targets = fanout_[result.index])
+                        {
+                            out << "if(" << call << "){\n";
+                            activate(out, *targets, false, activeUnit); out << "}\n";
+                        }
+                        else
+                            out << "(void)" << call << ";\n";
+                        return;
+                    }
                     const auto ptr = [&](ValueId valueId, const std::string &expr) {
                         return type(valueId).width > 64 ? "(" + expr + ").data()" : "&cpu_operand_" + std::to_string(valueId.index);
                     };
@@ -2183,6 +2205,59 @@ inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valu
         out[i]=word;
     }
     return changed;
+}
+)CPP";
+                out << R"CPP(template<std::size_t DestN,std::size_t SrcN>
+inline bool cpu_replicate_words_changed(const std::array<std::uint64_t,SrcN> &source,
+    std::size_t elemWidth,std::size_t rep,std::size_t totalWidth,
+    std::array<std::uint64_t,DestN> &out)
+{
+    bool changed=false;
+    for(std::size_t repeat=0;repeat<rep;++repeat){
+        const std::size_t destLsb=repeat*elemWidth;
+        if(destLsb>=totalWidth) break;
+        const std::size_t width=std::min(elemWidth,totalWidth-destLsb);
+        const std::size_t sourceWords=(width+63u)/64u;
+        for(std::size_t i=0;i<sourceWords && i<SrcN;++i){
+            const std::size_t wordWidth=(i+1u==sourceWords)?width-i*64u:64u;
+            const std::uint64_t sourceWord=source[i]&grhsim_mask(wordWidth);
+            const std::size_t bit=destLsb+i*64u;
+            const std::size_t word=bit/64u;
+            const std::size_t shift=bit&63u;
+            if(word<DestN){
+                const std::size_t first=std::min(wordWidth,64u-shift);
+                const std::uint64_t mask=grhsim_mask(first)<<shift;
+                const std::uint64_t value=(sourceWord&grhsim_mask(first))<<shift;
+                const std::uint64_t next=(out[word]&~mask)|value;
+                changed|=out[word]!=next;out[word]=next;
+                if(first<wordWidth && word+1u<DestN){
+                    const std::size_t second=wordWidth-first;
+                    const std::uint64_t nextWord=(out[word+1u]&~grhsim_mask(second))|(sourceWord>>first&grhsim_mask(second));
+                    changed|=out[word+1u]!=nextWord;out[word+1u]=nextWord;
+                }
+            }
+        }
+    }
+    const std::size_t liveWidth=elemWidth==0||rep==0?0:rep>totalWidth/elemWidth?totalWidth:rep*elemWidth;
+    const std::size_t firstDead=liveWidth/64u;
+    if(liveWidth&63u){
+        if(firstDead<DestN){
+            const std::uint64_t next=out[firstDead]&grhsim_mask(liveWidth&63u);
+            changed|=out[firstDead]!=next;out[firstDead]=next;
+            for(std::size_t i=firstDead+1u;i<DestN;++i){changed|=out[i]!=UINT64_C(0);out[i]=UINT64_C(0);}
+        }
+    }
+    else if(firstDead<DestN){
+        for(std::size_t i=firstDead;i<DestN;++i){changed|=out[i]!=UINT64_C(0);out[i]=UINT64_C(0);}
+    }
+    return changed;
+}
+template<std::size_t DestN,class Scalar>
+inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std::size_t rep,
+    std::size_t totalWidth,std::array<std::uint64_t,DestN> &out)
+{
+    const std::array<std::uint64_t,1> words{{static_cast<std::uint64_t>(source)}};
+    return cpu_replicate_words_changed<DestN,1>(words,elemWidth,rep,totalWidth,out);
 }
 )CPP";
                 out << "static_assert(sizeof(std::string*)==" << layout_.pointerBytes << ");\n"

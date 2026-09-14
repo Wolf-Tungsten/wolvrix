@@ -1214,6 +1214,15 @@ namespace
         require(bool(restored), "private commit fresh load failed");
         require(emitCpuCpp(*restored, directory, diagnostics).success, "private commit emit failed");
         require(emittedDirectStates(directory) == direct, "nonprojected private states did not use direct commit");
+        bool specialized = false;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp")
+            {
+                std::ifstream stream(entry.path());
+                const std::string source{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+                specialized |= source.find("cpu_direct_state_changed_one(") != std::string::npos;
+            }
+        require(specialized, "single-target direct commits did not use the specialized notification");
         const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_private_commit.mk";
         command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
                 " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
@@ -2026,7 +2035,7 @@ int main(int argc, char **argv)
         auto unsupported = fixture(); unsupported.addInput("four_state", unsupported.logicType(4, false, LogicDomain::FourState)); map(unsupported);
         diag::Diagnostics rejected; const auto rejectedPath = directory / "unsupported";
         require(!emitCpuCpp(unsupported, rejectedPath, rejected).success && !std::filesystem::exists(rejectedPath), "unsupported type produced artifacts");
-        for (const char *name : {"cpu_flags", "cpu_task_1", "cpu_init_0", "cpu_at", "init", "cpu_bind_strings", "cpu_direct_again", "cpu_direct_state_changed", "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_replicate_words_changed", "cpu_active_word", "cpu_write_scalar", "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_tick"})
+        for (const char *name : {"cpu_flags", "cpu_task_1", "cpu_init_0", "cpu_at", "init", "cpu_bind_strings", "cpu_direct_again", "cpu_direct_state_changed", "cpu_direct_state_changed_one", "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_replicate_words_changed", "cpu_active_word", "cpu_write_scalar", "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_tick"})
         {
             auto collision = fixture(); collision.addInput(name, collision.logicType(1, false, LogicDomain::TwoState)); map(collision);
             diag::Diagnostics invalidName; const auto path = directory / (std::string("reserved_") + name);

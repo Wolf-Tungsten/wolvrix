@@ -208,7 +208,7 @@ namespace wolvrix::lib::grhsim
                     class_, "init", "eval", "set_runtime_profile_enabled", "dump_runtime_profile", "cpu_at",
                     "cpu_objects", "cpu_shadow", "cpu_boundary", "cpu_inputs", "cpu_strings", "cpu_bind_strings",
                     "cpu_rng", "cpu_flags", "cpu_next_arms", "cpu_dirty", "Pending", "Target", "cpu_targets",
-                    "cpu_pending", "cpu_stage", "cpu_write_scalar", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed",
+                    "cpu_pending", "cpu_stage", "cpu_write_scalar", "cpu_stage_bytes", "cpu_publish", "cpu_direct_again", "cpu_direct_state_changed", "cpu_direct_state_changed_one",
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_replicate_words_changed", "cpu_active_word",
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
@@ -1974,8 +1974,18 @@ namespace wolvrix::lib::grhsim
                         "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))",
                         stateType(target)) << ";\nif(cpu_current!=cpu_value){cpu_current=cpu_value;\n";
                 if (projected_[target.index] || range.count)
-                    out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
-                        << (projected_[target.index] ? "true" : "false") << ");\n";
+                {
+                    if (range.count == 1)
+                    {
+                        const auto &notification = stateTargets_[range.offset];
+                        out << "cpu_direct_state_changed_one(" << notification.offset << ',' << notification.mask << ','
+                            << (notification.arm ? "true" : "false") << ','
+                            << (projected_[target.index] ? "true" : "false") << ");\n";
+                    }
+                    else
+                        out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
+                            << (projected_[target.index] ? "true" : "false") << ");\n";
+                }
                 out << "}\n";
             }
 
@@ -2295,6 +2305,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "static const std::array<Target," << memoryReaders_.size() << "> cpu_memory_readers;\n"
                     << "std::array<std::size_t," << memoryReaders_.size() << "> cpu_read_offsets{};\n"
                     << "bool cpu_direct_again=false;\nvoid cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection);\n"
+                    << "void cpu_direct_state_changed_one(std::uint32_t offset,std::uint8_t mask,bool arm,bool projection){cpu_direct_again=cpu_direct_again||projection;if(arm)cpu_next_arms[offset]=1;else cpu_flags[offset]|=mask;}\n"
                     << "std::byte *cpu_stage_cell(std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "key+=row;offset+=row*size;if(!cpu_dirty[key]){cpu_dirty[key]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({key,offset,size,begin,count,projection,true});}return cpu_shadow.get()+offset;}\n"
                     << "template<class T,unsigned Width> void cpu_write_cell(std::size_t key,std::size_t offset,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection,std::uint64_t data,std::uint64_t mask){\n"

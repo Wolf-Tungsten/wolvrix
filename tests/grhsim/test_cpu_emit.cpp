@@ -1393,6 +1393,207 @@ namespace
                 " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testBitPackingDomains()
+    {
+        for (unsigned test = 0; test < 7; ++test)
+        {
+            GrhSimModel model("packing_domains"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto four = model.logicType(1, false, LogicDomain::FourState);
+            const auto signedBit = model.logicType(1, true, LogicDomain::TwoState);
+            const auto targetType = test == 0 ? four : test == 6 ? model.logicType(2, false, LogicDomain::TwoState) : bit;
+            const auto input = [&](const char *name, TypeId type) {
+                const auto port = model.addInput(name, type); const auto value = model.addValue(type);
+                model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+                return value;
+            };
+            const auto clock = input("clock", test == 2 ? four : bit);
+            const auto enable = input("enable", test == 3 ? signedBit : bit);
+            const auto mask = input("mask", test == 4 ? four : targetType), data = input("data", targetType);
+            for (unsigned copy = 0; copy < 2; ++copy)
+            {
+                const auto q = model.addState("q" + std::to_string(copy), targetType);
+                const auto h = model.addState("h" + std::to_string(copy), test == 1 ? four : bit);
+                const std::array init{Parameter{model.intern("value"), std::string("0")}};
+                const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+                model.addInit(q, steps, init); model.addInit(h, steps, init);
+                const auto value = model.addValue(targetType);
+                const std::vector<Parameter> readParams = test == 5 ?
+                    std::vector<Parameter>{{model.intern("extra"), true}} : std::vector<Parameter>{};
+                model.addOperation("core.state.read", {}, std::array{value}, std::array{ObjectRef::state(q)}, readParams);
+                const auto port = model.addOutput("q" + std::to_string(copy), targetType);
+                model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+                const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+                model.addOperation("core.state.regWrite", std::array{enable, data, mask, clock}, {},
+                                   std::array{ObjectRef::state(q), ObjectRef::state(h)}, edges);
+            }
+            map(model);
+            PassManager manager(defaultDialectRegistry()); diag::Diagnostics diagnostics; std::string error;
+            manager.addPass(defaultPassRegistry().create("grhsim.pack-bit-registers", {}, error));
+            const auto result = manager.run(model, diagnostics);
+            require(result.success && !result.changed && model.cpuMapping() && model.states().size() == 4,
+                    "bit packing accepted an unsupported type or parameterized read");
+        }
+    }
+
+    void testPackedBitRegisters(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_packed_bits"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto state = [&](const std::string &name, TypeId type, const std::string &literal) {
+            const auto id = model.addState(name, type);
+            const std::array params{Parameter{model.intern("value"), literal}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto read = [&](StateId id, TypeId type) {
+            const auto value = model.addValue(type);
+            model.addOperation("core.state.read", {}, std::array{value}, std::array{ObjectRef::state(id)});
+            return value;
+        };
+        const auto clock = input("clock", bit), aux = input("aux", bit), enable = input("enable", bit);
+        const auto enable2 = input("enable2", bit), mask = input("mask", bit);
+        const auto data = input("data", model.logicType(64, false, LogicDomain::TwoState));
+        std::array<ValueId, 64> dataBits;
+        for (unsigned i = 0; i < dataBits.size(); ++i)
+        {
+            dataBits[i] = model.addValue(bit);
+            const std::array params{Parameter{model.intern("sliceStart"), int64_t(i)},
+                                    Parameter{model.intern("sliceEnd"), int64_t(i)}};
+            model.addOperation("core.compute.sliceStatic", std::array{data}, std::array{dataBits[i]}, {}, params);
+        }
+        const std::array counts{2u, 64u, 130u, 3u, 3u, 2u};
+        std::vector<StateId> privateStates;
+        for (unsigned group = 0; group < counts.size(); ++group)
+        {
+            std::vector<StateId> states;
+            std::vector<ValueId> values;
+            for (unsigned i = 0; i < counts[group]; ++i)
+            {
+                const auto q = state("q" + std::to_string(group) + "_" + std::to_string(i), bit,
+                                     i % 2 ? "1'b1" : "1'b0");
+                states.push_back(q); values.push_back(read(q, bit));
+            }
+            for (unsigned i = 0; i < counts[group]; ++i)
+            {
+                auto next = dataBits[i % 64];
+                if (group == 2)
+                {
+                    next = model.addValue(bit);
+                    model.addOperation("core.compute.xor", std::array{values[(i + 1) % counts[group]], dataBits[i % 64]},
+                                       std::array{next});
+                }
+                const auto history = state("h" + std::to_string(group) + "_" + std::to_string(i), bit, group == 3 ? "1" : "0");
+                std::vector<ValueId> operands{group == 4 ? enable2 : enable, next, mask, clock};
+                std::vector<ObjectRef> refs{ObjectRef::state(states[i]), ObjectRef::state(history)};
+                std::vector<std::string> edges{group == 1 ? "negedge" : "posedge"};
+                if (group == 2)
+                {
+                    operands.push_back(aux); edges.push_back("negedge");
+                    refs.push_back(ObjectRef::state(state("ha" + std::to_string(i), bit, "1")));
+                }
+                const std::array params{Parameter{model.intern("event_edges"), edges}};
+                model.addOperation("core.state.regWrite", operands, {}, refs, params);
+            }
+            if (group == 5)
+            {
+                privateStates = states;
+                const std::array args{DpiArgument{model.intern("a"), DpiDirection::Input, bit},
+                                      DpiArgument{model.intern("b"), DpiDirection::Input, bit}};
+                const auto function = model.addExternFunction("packed_private", "core.dpi", "packed_private", args, {});
+                const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{}}};
+                model.addOperation("core.dpi.call", std::array{enable, values[0], values[1]}, {},
+                                   std::array{ObjectRef::function(function)}, params);
+            }
+            else
+            {
+                std::reverse(values.begin(), values.end());
+                const auto type = model.logicType(counts[group], false, LogicDomain::TwoState);
+                const auto value = model.addValue(type);
+                model.addOperation("core.compute.concat", values, std::array{value});
+                const auto output = model.addOutput("out" + std::to_string(group), type);
+                model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(output)});
+            }
+        }
+        // Exclude uncertain initialization, observable/shared histories and
+        // multiple writers even when all visible controls are identical.
+        std::vector<std::string> excluded;
+        for (unsigned test = 0; test < 8; ++test)
+        {
+            StateId shared;
+            const auto type = test == 0 ? model.logicType(1, true, LogicDomain::TwoState) : bit;
+            const auto next = model.addValue(type), writeMask = model.addValue(type);
+            model.addOperation("core.compute.assign", std::array{dataBits[test]}, std::array{next});
+            model.addOperation("core.compute.assign", std::array{mask}, std::array{writeMask});
+            for (unsigned copy = 0; copy < 2; ++copy)
+            {
+                const auto name = "excluded" + std::to_string(test) + "_" + std::to_string(copy);
+                excluded.push_back(name);
+                StateId q;
+                if (test == 1)
+                {
+                    q = model.addState(name, type);
+                    const std::array steps{InitStep{model.intern("core.init.random"), {0, 0}}};
+                    model.addInit(q, steps, {});
+                }
+                else q = state(name, type, test == 2 ? "1'bx" : "0");
+                const auto history = test == 4 && copy ? shared : state(name + "_hist", bit, test == 3 ? "1'bx" : "0");
+                shared = history;
+                const auto value = read(q, type);
+                const auto output = model.addOutput(name, type);
+                model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(output)});
+                if (test == 5)
+                {
+                    const auto historyOut = model.addOutput(name + "_hist", bit);
+                    model.addOperation("core.output.write", std::array{read(history, bit)}, {}, std::array{ObjectRef::output(historyOut)});
+                }
+                const std::array params{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+                const auto write = [&](StateId target, StateId hist) {
+                    model.addOperation("core.state.regWrite", std::array{enable, next, writeMask, clock}, {},
+                                       std::array{ObjectRef::state(target), ObjectRef::state(hist)}, params);
+                };
+                write(q, history);
+                if (test == 6) write(q, state(name + "_second", bit, "0"));
+                if (test == 7) write(history, state(name + "_third", bit, "0"));
+            }
+        }
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        for (auto id : privateStates)
+            require(!model.cpuMapping()->schedule->quiescenceProjection[id.index], "packing fixture private state is projected");
+        auto reference = model.clone();
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.pack-bit-registers", {}, error));
+        const auto result = manager.run(model, diagnostics);
+        for (const auto &message : diagnostics.messages()) std::cout << message.message << '\n';
+        require(result.success && result.changed && !model.cpuMapping(), "bit packing failed or kept stale mapping");
+        unsigned writes = 0;
+        for (const auto &op : model.operations()) writes += model.text(op.opType) == "core.state.regWrite";
+        require(writes == 28, "packing did not preserve control, history initial value, chunk, or projection boundaries");
+        for (const auto &name : excluded)
+            require(std::any_of(model.states().begin(), model.states().end(), [&](const auto &state) {
+                return model.text(state.name) == name;
+            }), "bit packing removed an excluded state");
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        const auto stable = manager.run(model, diagnostics);
+        require(stable.success && !stable.changed, "bit packing is not idempotent after remapping");
+        std::stringstream json;
+        require(writeGrhSimJson(model, json, defaultDialectRegistry(), diagnostics), "packed bit JSON write failed");
+        auto restored = readGrhSimJson(json, defaultDialectRegistry(), diagnostics);
+        require(bool(restored), "packed bit JSON reload failed");
+        require(emitCpuCpp(*restored, directory, diagnostics).success &&
+                emitCpuCpp(reference, directory / "reference", diagnostics).success, "packed bit emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_packed_bits.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testBitwisePredicates(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_predicates"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2194,6 +2395,9 @@ int main(int argc, char **argv)
         testSharedComputeClones(directory / "clones_helpers", true);
         testBitwisePredicates(directory / "predicates", false);
         testBitwisePredicates(directory / "predicates_helpers", true);
+        testPackedBitRegisters(directory / "packed_bits", false);
+        testPackedBitRegisters(directory / "packed_bits_helpers", true);
+        testBitPackingDomains();
         testScalarConstants(directory / "constants", false);
         testScalarConstants(directory / "constants_helpers", true);
         testMemoryStaging(directory / "memory_stage");

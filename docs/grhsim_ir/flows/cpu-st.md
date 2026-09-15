@@ -41,6 +41,13 @@ XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`、
 [`grhsim.bitwise-predicates`](../passes/bitwise-predicates.md)，再进入下表的 CPU mapping；这不依赖 GRH 侧
 reg-to-mem，也不修改 GRH。
 
+完成首次mapping后，XiangShan入口执行
+[`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)，依据同enable/mask、
+event/history初值和quiescence投影类别把普通单写口bit寄存器打包为至多64位word。
+该语义变换会使mapping失效，随后完整重跑八个CPU mapping pass。集成开关为
+`XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1`。读slice继续提供commit旧快照，
+CPU emitter使用现有标量concat/read/slice/write路径；打包收益须由性能实测判断。
+
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有
 消费者。`core.compute.assign` 唯一 operand 是源值，唯一 result 是赋值结果；
 op 不得带 objectRefs 或 parameters。例如：

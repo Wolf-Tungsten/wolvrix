@@ -74,6 +74,14 @@ bool 操作数的 `a & b` / `a | b`，省去通用 scalar cast 包装。
 同类型 logical AND/OR 规范化到这些 op；两输入已求值且值域为 {0,1}，无需
 C++ 短路控制依赖。宽度、符号或 domain 不满足条件时沿用原规则。
 
+[grhsim.pack-bit-registers](../passes/pack-bit-registers.md) 使同控制bit寄存器共用
+至多64位的状态和提交操作。变换后重新mapping；emitter仍用已有scalar concat、
+slice和masked write路径。例如两个写口`q0<=d0; q1<=d1`成为一次
+`packed<={d1,d0}`，读者通过固定slice取得相应bit。packed的compute-only读取
+可沿用安全别名，直接用于commit的slice结果仍物化旧值快照。通知变为packed
+状态的读者并集，减少提交粒度的同时可能扩大唤醒范围；不以静态写口数量代替
+性能验证，也不改变quiescence投影的语义。
+
 不可变 `core.compute.constant` 字符串例外：emitter 在使用点直接引用已转义的
 `std::string` 常量表达式，不生成独立赋值或 local/boundary 字符串对象绑定；布局中的
 槽仍保留，mapping 不变。例如 guarded DPI 的字符串构造位于原有 `if (enable &&

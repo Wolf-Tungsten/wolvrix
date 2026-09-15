@@ -52,13 +52,16 @@ namespace wolvrix::lib::grhsim
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
                   activeOffsets_(wordOffsets_.size()), activeMasks_(wordOffsets_.size()), stateRanges_(model.states().size() + 1),
-                  projected_(stateRanges_.size()), fanout_(model.values().size() + 1), batchedHistories_(stateRanges_.size()),
+                  projected_(stateRanges_.size()), fanout_(model.values().size() + 1), producers_(model.values().size() + 1),
+                  batchedHistories_(stateRanges_.size()),
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
                   historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size())
             {
                 for (const auto &frame : layout_.localFrames) frameSizes_[frame.owner.index] = frame.size;
                 for (const auto &op : model_.operations())
                 {
+                    for (const auto result : model_.results(op))
+                        producers_[result.index] = op.id;
                     if (model_.text(op.opType) == "core.compute.constant" && model_.results(op).size() == 1 &&
                         type(model_.results(op)[0]).kind == TypeKind::String)
                         staticStrings_.emplace(model_.results(op)[0].index, expression(op));
@@ -994,6 +997,32 @@ namespace wolvrix::lib::grhsim
                 const auto &slot = layout_.values[value.index - 1];
                 return at(type(value), slot.kind == CpuStorageKind::Boundary ? "cpu_boundary.get()" : "cpu_local", slot.offset);
             }
+            std::optional<StateId> stateReadSource(ValueId value) const
+            {
+                if (!value || value.index >= producers_.size()) return {};
+                if (!readAliases_.empty() && readAliases_[value.index]) return readAliases_[value.index];
+                const auto producer = producers_[value.index];
+                if (!producer) return {};
+                const auto &op = model_.operations()[producer.index - 1];
+                const auto name = model_.text(op.opType);
+                if (name == "core.state.read")
+                {
+                    const auto refs = model_.objectRefs(op);
+                    if (refs.size() == 1 && refs[0].kind == ObjectKind::State)
+                        return StateId{refs[0].index, 0};
+                    return {};
+                }
+                // A slice/assignment preserves the immutable compute-phase
+                // snapshot of its source state. Follow only these transparent
+                // forms; arbitrary expressions may combine multiple states.
+                if (name == "core.compute.sliceStatic" || name == "core.compute.sliceDynamic" ||
+                    name == "core.compute.sliceArray" || name == "core.compute.assign")
+                {
+                    const auto operands = model_.operands(op);
+                    if (!operands.empty()) return stateReadSource(operands.front());
+                }
+                return {};
+            }
             const CpuDataSlot &object(ObjectRef ref) const
             {
                 if (ref.kind == ObjectKind::State && historyAliases_[ref.index])
@@ -1003,7 +1032,12 @@ namespace wolvrix::lib::grhsim
                 return layout_.objects[index].slot;
             }
             std::string state(StateId state) const
-            { return at(stateType(state), "cpu_objects.get()", object(ObjectRef::state(state)).offset); }
+            {
+                if (activeStateCache_)
+                    if (const auto found = activeStateCache_->find(state.index); found != activeStateCache_->end())
+                        return found->second;
+                return at(stateType(state), "cpu_objects.get()", object(ObjectRef::state(state)).offset);
+            }
             std::string literal(std::string_view text, const Type &type) const
             {
                 auto parsed = [&]() {
@@ -1686,6 +1720,27 @@ namespace wolvrix::lib::grhsim
             void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit,
                               const std::map<uint32_t, std::string> &guards = {}) const
             {
+                // A compute helper observes a stable pre-commit snapshot. Cache
+                // repeated scalar state reads (including transparent slices) once
+                // per helper invocation so packed and unpacked readers do not
+                // reload the same object slot for every derived value.
+                std::map<uint32_t, uint32_t> stateUseCounts;
+                for (auto id : ops)
+                    for (auto operand : model_.operands(model_.operations()[id.index - 1]))
+                        if (const auto source = stateReadSource(operand)) ++stateUseCounts[source->index];
+                std::map<uint32_t, std::string> stateCaches;
+                for (const auto &[index, count] : stateUseCounts)
+                    if (count > 1)
+                    {
+                        const StateId source{index, 0};
+                        const auto &sourceType = stateType(source);
+                        if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState ||
+                            sourceType.width == 0 || sourceType.width > 64) continue;
+                        const auto name = "cpu_cached_state_" + std::to_string(index);
+                        out << "const auto " << name << '=' << state(source) << ";\n";
+                        stateCaches.emplace(index, name);
+                    }
+                activeStateCache_ = &stateCaches;
                 struct ChangedGroup
                 {
                     const CpuActivationTargets *targets = nullptr;
@@ -1738,6 +1793,7 @@ namespace wolvrix::lib::grhsim
                     if (groups[i].targets) activate(out, *groups[i].targets, false, unit, "cpu_changed_" + std::to_string(i));
                     if (groups[i].ports) armPorts(out, *groups[i].ports, "cpu_changed_" + std::to_string(i));
                 }
+                activeStateCache_ = nullptr;
             }
 
             void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {},
@@ -2981,6 +3037,8 @@ if(terminal){
             std::map<uint32_t, std::string> staticStrings_;
             std::map<uint32_t, std::string> staticScalars_;
             mutable const std::map<uint32_t, std::string> *activeEventCache_ = nullptr;
+            mutable const std::map<uint32_t, std::string> *activeStateCache_ = nullptr;
+            std::vector<OpId> producers_;
             bool hasSystemTasks_ = false;
             std::map<uint32_t, std::size_t> onceTasks_;
             std::vector<uint32_t> activeOffsets_, activeMasks_;

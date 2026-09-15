@@ -1393,6 +1393,58 @@ namespace
                 " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testBitwisePredicates(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_predicates"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto signedBit = model.logicType(1, true, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type); const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto compute = [&](const char *name, ValueId a, ValueId b) {
+            const auto value = model.addValue(bit);
+            model.addOperation(name, std::array{a, b}, std::array{value}); return value;
+        };
+        const auto output = [&](const char *name, ValueId value) {
+            const auto port = model.addOutput(name, bit);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto a = input("a", bit), b = input("b", bit), c = input("c", bit);
+        const auto x = input("x", byte), y = input("y", byte), s = input("s", signedBit);
+        const auto land = compute("core.compute.logicAnd", a, b), lor = compute("core.compute.logicOr", a, b);
+        output("land", land); output("lor", lor);
+        output("chain", compute("core.compute.logicOr", compute("core.compute.logicAnd", lor, c), land));
+        output("wide_and", compute("core.compute.logicAnd", x, y));
+        output("wide_or", compute("core.compute.logicOr", x, y));
+        output("signed_and", compute("core.compute.logicAnd", s, a));
+        const auto q = model.addState("q", bit), history = model.addState("history", bit);
+        const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+        const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
+        model.addInit(q, initSteps, initParams); model.addInit(history, initSteps, initParams);
+        const auto old = model.addValue(bit), one = model.addValue(bit);
+        model.addOperation("core.state.read", {}, std::array{old}, std::array{ObjectRef::state(q)});
+        const std::array literal{Parameter{model.intern("value"), std::string("1")}};
+        model.addOperation("core.compute.constant", {}, std::array{one}, {}, literal);
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        model.addOperation("core.state.regWrite", std::array{lor, land, one, c}, {},
+                           std::array{ObjectRef::state(q), ObjectRef::state(history)}, edges);
+        output("q", old);
+        output("state_and", compute("core.compute.logicAnd", old, a));
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.bitwise-predicates", {}, error));
+        require(manager.run(model, diagnostics).success && !model.cpuMapping(), "predicate pass retained stale mapping");
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        require(emitCpuCpp(model, directory, diagnostics).success, "predicate model emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_predicates.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testSharedComputeClones(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_clones"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2140,6 +2192,8 @@ int main(int argc, char **argv)
         testIdentityAssigns(directory / "identity_assign_helpers", true);
         testSharedComputeClones(directory / "clones", false);
         testSharedComputeClones(directory / "clones_helpers", true);
+        testBitwisePredicates(directory / "predicates", false);
+        testBitwisePredicates(directory / "predicates_helpers", true);
         testScalarConstants(directory / "constants", false);
         testScalarConstants(directory / "constants_helpers", true);
         testMemoryStaging(directory / "memory_stage");

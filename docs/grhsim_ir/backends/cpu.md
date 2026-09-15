@@ -68,6 +68,12 @@ logic<8,false> 255` 作为 `regWrite` 的 enable 和 mask 时，消费者直接�
 和布局中的槽保持不变。宽常量仍走原存储路径，DPI inout 从 literal 初始化独立
 可写临时值，再单独发布 result，不修改常量本身。
 
+输入和结果均为 unsigned two-state logic<1> 的 `core.compute.and/or` 直接发射
+bool 操作数的 `a & b` / `a | b`，省去通用 scalar cast 包装。
+[grhsim.bitwise-predicates](../passes/bitwise-predicates.md) 可在 mapping 之前将
+同类型 logical AND/OR 规范化到这些 op；两输入已求值且值域为 {0,1}，无需
+C++ 短路控制依赖。宽度、符号或 domain 不满足条件时沿用原规则。
+
 不可变 `core.compute.constant` 字符串例外：emitter 在使用点直接引用已转义的
 `std::string` 常量表达式，不生成独立赋值或 local/boundary 字符串对象绑定；布局中的
 槽仍保留，mapping 不变。例如 guarded DPI 的字符串构造位于原有 `if (enable &&

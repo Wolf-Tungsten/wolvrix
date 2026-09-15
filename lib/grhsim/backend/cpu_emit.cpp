@@ -1308,6 +1308,11 @@ namespace wolvrix::lib::grhsim
                     throw std::runtime_error("CPU C++ emit unsupported wide operation: " + std::string(kind) + " width=" + std::to_string(width));
                 }
                 if (kind == "assign") return cast(0, width);
+                if ((kind == "and" || kind == "or") && operands.size() == 2 &&
+                    width == 1 && !result.isSigned &&
+                    type(operands[0]).width == 1 && !type(operands[0]).isSigned &&
+                    type(operands[1]).width == 1 && !type(operands[1]).isSigned)
+                    return "(" + raw(0) + (kind == "and" ? "&" : "|") + raw(1) + ")";
                 static const std::map<std::string_view, std::string_view> binary{
                     {"add", "+"}, {"sub", "-"}, {"mul", "*"}, {"and", "&"}, {"or", "|"}, {"xor", "^"},
                     {"logicAnd", "&&"}, {"logicOr", "||"}};

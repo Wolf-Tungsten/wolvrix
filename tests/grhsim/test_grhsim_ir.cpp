@@ -381,6 +381,54 @@ namespace
         return 0;
     }
 
+    int runBitwisePredicatesTest()
+    {
+        using namespace grhsim;
+        GrhSimModel model("predicates"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto signedBit = model.logicType(1, true, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto four = model.logicType(1, false, LogicDomain::FourState);
+        std::vector<OpId> rewritten, unchanged;
+        for (auto type : {bit, signedBit, byte, four})
+        {
+            const auto input = model.addInput("x" + std::to_string(type.index), type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(input)});
+            for (auto name : {"core.compute.logicAnd", "core.compute.logicOr"})
+            for (bool tagged : {false, true})
+            {
+                const auto result = model.addValue(bit);
+                std::vector<Parameter> parameters;
+                if (tagged) parameters.push_back({model.intern("keep"), true});
+                const auto op = model.addOperation(name, std::array{value, value}, std::array{result}, {}, parameters);
+                (type == bit && !tagged ? rewritten : unchanged).push_back(op);
+            }
+        }
+        const auto beforeOps = model.operations().size(), beforeValues = model.values().size();
+        const auto revision = model.semanticRevision();
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.bitwise-predicates", {}, error));
+        const auto result = manager.run(model, diagnostics);
+        if (!result.success || !result.changed || model.semanticRevision() != revision + 1 ||
+            model.operations().size() != beforeOps || model.values().size() != beforeValues)
+            return fail("bitwise predicates changed entity coverage or failed");
+        for (auto id : rewritten)
+        {
+            const auto name = model.text(model.operations()[id.index - 1].opType);
+            if (name != "core.compute.and" && name != "core.compute.or") return fail("predicate not normalized");
+        }
+        for (auto id : unchanged)
+            if (!model.text(model.operations()[id.index - 1].opType).starts_with("core.compute.logic"))
+                return fail("predicate type/parameter guard ignored");
+        const auto again = manager.run(model, diagnostics);
+        if (!again.success || again.changed) return fail("predicate normalization is not idempotent");
+        std::stringstream serialized;
+        if (!writeGrhSimJson(model, serialized, defaultDialectRegistry(), diagnostics) ||
+            !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics)) return fail("predicate roundtrip failed");
+        return 0;
+    }
+
     int runAlgebraicComputeTest()
     {
         using namespace grhsim;
@@ -718,6 +766,7 @@ int main()
         if (const int status = runUndrivenTwoStateTest(); status != 0) return status;
         if (const int status = runIdentityAssignTest(); status != 0) return status;
         if (const int status = runAlgebraicComputeTest(); status != 0) return status;
+        if (const int status = runBitwisePredicatesTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }

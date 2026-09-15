@@ -37,7 +37,8 @@ value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认
 
 XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`、
 `grhsim.canonicalize-compute` 和
-[`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)，再进入下表的 CPU mapping；这不依赖 GRH 侧
+[`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)、
+[`grhsim.bitwise-predicates`](../passes/bitwise-predicates.md)，再进入下表的 CPU mapping；这不依赖 GRH 侧
 reg-to-mem，也不修改 GRH。
 
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有

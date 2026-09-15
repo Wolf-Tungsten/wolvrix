@@ -7,6 +7,7 @@
 
 #include "slang/numeric/SVInt.h"
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -521,6 +522,186 @@ namespace
         if (!result.success || result.changed) return fail("algebraic pass ignored a type, parameter, or cycle guard");
         return 0;
     }
+
+    int runCloneSharedComputeTest()
+    {
+        using namespace grhsim;
+        GrhSimModel model("clone_shared_compute");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto inputValue = [&](std::string_view name) {
+            const auto input = model.addInput(name, bit);
+            const auto value = model.addValue(bit, name);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(input)});
+            return value;
+        };
+        const auto source = inputValue("source");
+        const auto left = inputValue("left");
+        const auto right = inputValue("right");
+        const auto shared = model.addValue(bit, "shared");
+        model.addOperation("core.compute.not", std::array{source}, std::array{shared}, {}, {}, "shared.not");
+        const auto leftResult = model.addValue(bit, "left_result");
+        model.addOperation("core.compute.and", std::array{shared, shared}, std::array{leftResult}, {}, {}, "left.and");
+        const auto rightResult = model.addValue(bit, "right_result");
+        model.addOperation("core.compute.or", std::array{shared, source}, std::array{rightResult}, {}, {}, "right.or");
+        const auto leftOutput = model.addOutput("left_output", bit);
+        model.addOperation("core.output.write", std::array{leftResult}, {}, std::array{ObjectRef::output(leftOutput)});
+        const auto rightOutput = model.addOutput("right_output", bit);
+        model.addOperation("core.output.write", std::array{rightResult}, {}, std::array{ObjectRef::output(rightOutput)});
+
+        PassManager manager(defaultDialectRegistry());
+        std::string error;
+        manager.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute", {}, error));
+        diag::Diagnostics diagnostics;
+        const auto result = manager.run(model, diagnostics);
+        if (!result.success || !result.changed || diagnostics.hasError())
+        {
+            for (const auto &message : diagnostics.messages())
+                std::cerr << "[grhsim-ir] clone diagnostic: " << message.context << ": " << message.message << '\n';
+            return fail("shared compute localization pass failed");
+        }
+        unsigned localNots = 0;
+        for (const auto &op : model.operations())
+        {
+            const auto name = model.text(op.name);
+            if (name.find(".local") != std::string_view::npos && model.text(op.opType) == "core.compute.not") ++localNots;
+        }
+        if (localNots != 2)
+            return fail("shared compute localization did not clone the scalar producer per consumer");
+        for (const auto &op : model.operations())
+            if (model.text(op.opType) == "core.compute.and" || model.text(op.opType) == "core.compute.or")
+                if (model.text(model.values()[model.operands(op)[0].index - 1].name).find(".local") == std::string_view::npos)
+                    return fail("shared compute consumer still uses the original boundary candidate");
+        for (const auto &op : model.operations())
+            if (model.text(op.opType) == "core.compute.and" && model.operands(op)[0] != model.operands(op)[1])
+                return fail("repeated consumer operand did not reuse its clone");
+        if (model.inputs().size() != 3 || model.operations().size() != 9)
+            return fail("localization removed an unrelated read or retained a dead root");
+        diag::Diagnostics verifyDiagnostics;
+        if (!verifyGrhSimModel(model, defaultDialectRegistry(), verifyDiagnostics))
+            return fail("shared compute localization produced an invalid IR");
+        PassManager second(defaultDialectRegistry());
+        second.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute", {}, error));
+        const auto again = second.run(model, diagnostics);
+        if (!again.success || again.changed)
+            return fail("shared compute localization is not idempotent");
+        std::stringstream serialized;
+        if (!writeGrhSimJson(model, serialized, defaultDialectRegistry(), diagnostics) ||
+            !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics))
+            return fail("localized model does not round-trip");
+
+        for (unsigned scenario = 0; scenario < 4; ++scenario)
+        {
+            GrhSimModel chain("clone_chain"); chain.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = chain.logicType(8, false, LogicDomain::TwoState);
+            const auto port = chain.addInput("x", byte);
+            const auto x = chain.addValue(byte), five = chain.addValue(byte);
+            const auto t = chain.addValue(byte), u = chain.addValue(byte);
+            chain.addOperation("core.input.read", {}, std::array{x}, std::array{ObjectRef::input(port)});
+            const std::array literal{Parameter{chain.intern("value"), std::string("5")}};
+            chain.addOperation("core.compute.constant", {}, std::array{five}, {}, literal);
+            const auto addNot = [&] {
+                chain.addOperation("core.compute.not", std::array{x}, std::array{t}, {}, {}, "shared.not");
+            };
+            if (scenario != 1) addNot();
+            chain.addOperation("core.compute.add", std::array{t, five}, std::array{u}, {}, {}, "shared.add");
+            if (scenario == 1) addNot();
+            for (unsigned i = 0; i < 3; ++i)
+            {
+                const auto y = chain.addValue(byte);
+                chain.addOperation(i == 2 ? "core.compute.xor" : "core.compute.and",
+                    std::array{i == 0 ? t : u, x}, std::array{y});
+                const auto output = chain.addOutput("y" + std::to_string(i), byte);
+                chain.addOperation("core.output.write", std::array{y}, {}, std::array{ObjectRef::output(output)});
+            }
+            const std::array<std::string_view, 2> budget{"--max-clones", "4"}, fanout{"--max-fanout", "2"};
+            PassManager chains(defaultDialectRegistry());
+            chains.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute",
+                scenario == 2 ? std::span<const std::string_view>(budget) :
+                scenario == 3 ? std::span<const std::string_view>(fanout) : std::span<const std::string_view>{}, error));
+            const auto result = chains.run(chain, diagnostics);
+            if (!result.success || !result.changed) return fail("shared bijection chain was not localized");
+            unsigned clones = 0, roots = 0;
+            for (const auto &op : chain.operations())
+            {
+                const auto name = chain.text(op.name);
+                roots += name == "shared.not" || name == "shared.add";
+                if (name.find(".local") == std::string_view::npos) continue;
+                ++clones;
+                const auto value = chain.results(op)[0];
+                unsigned uses = 0;
+                for (const auto &user : chain.operations())
+                {
+                    const auto operands = chain.operands(user);
+                    uses += std::find(operands.begin(), operands.end(), value) != operands.end();
+                }
+                if (uses != 1) return fail("adjacent roots left a dead or shared clone");
+            }
+            if (clones != (scenario < 2 ? 5 : 2) || roots != (scenario < 2 ? 0 : 1))
+                return fail("chain localization depends on insertion order or partially consumed a root budget");
+            if (scenario < 2)
+            {
+                const auto again = chains.run(chain, diagnostics);
+                if (!again.success || again.changed) return fail("localized chain is not idempotent");
+            }
+            std::stringstream serialized;
+            if (!writeGrhSimJson(chain, serialized, defaultDialectRegistry(), diagnostics) ||
+                !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics))
+                return fail("localized chain does not round-trip");
+        }
+
+        GrhSimModel cycle("clone_cycle"); cycle.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto cycleBit = cycle.logicType(1, false, LogicDomain::TwoState);
+        const auto cycleA = cycle.addValue(cycleBit), cycleB = cycle.addValue(cycleBit);
+        cycle.addOperation("core.compute.not", std::array{cycleB}, std::array{cycleA});
+        cycle.addOperation("core.compute.not", std::array{cycleA}, std::array{cycleB});
+        for (const auto value : {cycleA, cycleB})
+        {
+            const auto output = cycle.addOutput("y" + std::to_string(value.index), cycleBit);
+            cycle.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(output)});
+        }
+        const auto cycleResult = second.run(cycle, diagnostics);
+        if (!cycleResult.success || cycleResult.changed) return fail("localization did not preserve a candidate cycle");
+
+        for (unsigned scenario = 0; scenario < 9; ++scenario)
+        {
+            GrhSimModel guards("clone_guards"); guards.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto type = guards.logicType(scenario == 0 ? 65 : scenario >= 5 ? 8 : 1, false,
+                scenario == 1 ? LogicDomain::FourState : LogicDomain::TwoState);
+            const auto resultType = scenario == 5 ? guards.logicType(1, false, LogicDomain::TwoState) :
+                scenario == 8 ? guards.logicType(4, false, LogicDomain::TwoState) : type;
+            const auto port = guards.addInput("x", type);
+            const auto x = guards.addValue(type), root = guards.addValue(resultType);
+            guards.addOperation("core.input.read", {}, std::array{x}, std::array{ObjectRef::input(port)});
+            if (scenario != 7)
+            {
+                const auto output = guards.addOutput("source", type);
+                guards.addOperation("core.output.write", std::array{x}, {}, std::array{ObjectRef::output(output)});
+            }
+            const std::array params{Parameter{guards.intern("extension"), true}};
+            if (scenario == 6)
+                guards.addOperation("core.compute.xor", std::array{x, x}, std::array{root});
+            else
+                guards.addOperation(scenario == 5 ? "core.compute.logicNot" : "core.compute.not",
+                    std::array{x}, std::array{root}, {},
+                    scenario == 2 ? std::span<const Parameter>(params) : std::span<const Parameter>{});
+            for (unsigned i = 0; i < 3; ++i)
+            {
+                const auto y = guards.addValue(resultType);
+                guards.addOperation("core.compute.and", std::array{root, root}, std::array{y});
+            }
+            const std::array<std::string_view, 2> fanout{"--max-fanout", "2"}, budget{"--max-clones", "2"};
+            PassManager guarded(defaultDialectRegistry());
+            guarded.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute",
+                scenario == 3 ? std::span<const std::string_view>(fanout) :
+                scenario == 4 ? std::span<const std::string_view>(budget) : std::span<const std::string_view>{}, error));
+            diag::Diagnostics messages;
+            const auto result = guarded.run(guards, messages);
+            if (!result.success || result.changed)
+                return fail("localization ignored a type, parameter, bijection, source-sharing, or budget guard");
+        }
+        return 0;
+    }
 }
 
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
@@ -537,6 +718,7 @@ int main()
         if (const int status = runUndrivenTwoStateTest(); status != 0) return status;
         if (const int status = runIdentityAssignTest(); status != 0) return status;
         if (const int status = runAlgebraicComputeTest(); status != 0) return status;
+        if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }
     catch (const std::exception &ex)

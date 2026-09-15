@@ -1393,6 +1393,101 @@ namespace
                 " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testSharedComputeClones(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_clones"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto compute = [&](const char *name, TypeId type, std::initializer_list<ValueId> args) {
+            const auto result = model.addValue(type);
+            model.addOperation(name, {args.begin(), args.size()}, std::array{result}); return result;
+        };
+        const auto output = [&](const char *name, TypeId type, ValueId value) {
+            const auto port = model.addOutput(name, type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto state = [&](TypeId type) {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), type);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto read = [&](StateId state) {
+            const auto value = model.addValue(byte);
+            model.addOperation("core.state.read", {}, std::array{value}, std::array{ObjectRef::state(state)});
+            return value;
+        };
+        const auto clock = input("clock", bit), inhibit = input("inhibit", bit);
+        const auto a = input("a", byte), b = input("b", byte);
+        const auto enable = compute("core.compute.logicNot", bit, {inhibit});
+        const auto q0 = state(byte), q1 = state(byte);
+        const auto current = read(q0), previous = read(q1);
+        const auto inverted = compute("core.compute.not", byte, {current});
+        const auto mask = model.addValue(byte);
+        const std::array literal{Parameter{model.intern("value"), std::string("255")}};
+        model.addOperation("core.compute.constant", {}, std::array{mask}, {}, literal);
+        const auto write = [&](StateId target, ValueId value) {
+            const auto history = state(bit);
+            const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.state.regWrite", std::array{enable, value, mask, clock}, {},
+                std::array{ObjectRef::state(target), ObjectRef::state(history)}, edges);
+        };
+        write(q0, a); write(q1, inverted);
+        output("q0", byte, current); output("q1", byte, previous);
+        output("left", byte, compute("core.compute.and", byte, {inverted, a}));
+        output("right", byte, compute("core.compute.or", byte, {inverted, b}));
+        output("duplicate", byte, compute("core.compute.xor", byte, {inverted, inverted}));
+        output("enabled_clock", bit, compute("core.compute.and", bit, {enable, clock}));
+        output("enabled_or_clock", bit, compute("core.compute.or", bit, {enable, clock}));
+        output("raw_inhibit", bit, inhibit);
+        const auto word = model.logicType(64, false, LogicDomain::TwoState);
+        const auto wordValue = input("word", word), five = model.addValue(word);
+        const std::array fiveParams{Parameter{model.intern("value"), std::string("5")}};
+        model.addOperation("core.compute.constant", {}, std::array{five}, {}, fiveParams);
+        const std::array roots{
+            compute("core.compute.not", word, {wordValue}),
+            compute("core.compute.xor", word, {wordValue, five}),
+            compute("core.compute.add", word, {five, wordValue}),
+            compute("core.compute.sub", word, {wordValue, five}),
+            compute("core.compute.sub", word, {five, wordValue})};
+        for (std::size_t i = 0; i < roots.size(); ++i)
+        {
+            output(("and" + std::to_string(i)).c_str(), word, compute("core.compute.and", word, {roots[i], wordValue}));
+            output(("xor" + std::to_string(i)).c_str(), word, compute("core.compute.xor", word, {roots[i], wordValue}));
+        }
+        const auto chained = compute("core.compute.add", word, {roots[0], five});
+        output("and_chain", word, compute("core.compute.and", word, {chained, wordValue}));
+        output("xor_chain", word, compute("core.compute.xor", word, {chained, wordValue}));
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute", {}, error));
+        require(manager.run(model, diagnostics).success, "cloning failed");
+        unsigned reads = 0, clones = 0;
+        for (const auto &op : model.operations())
+        {
+            reads += model.text(op.opType) == "core.state.read";
+            clones += model.text(op.name).find(".local") != std::string_view::npos;
+        }
+        require(reads == 2 && clones == 19, "clones missed scalar bijections/chains or duplicated state reads/operand uses");
+        map(model, helpers ? "2" : "128", helpers ? "1" : "10000");
+        std::stringstream serialized;
+        require(writeGrhSimJson(model, serialized, defaultDialectRegistry(), diagnostics), "clone JSON write failed");
+        auto restored = readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics);
+        if (!restored)
+            for (const auto &message : diagnostics.messages()) std::cerr << message.context << ": " << message.message << '\n';
+        require(bool(restored), "clone JSON reload failed");
+        require(emitCpuCpp(*restored, directory, diagnostics).success, "clone emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_clones.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testStateSharing(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_state_share"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2043,6 +2138,8 @@ int main(int argc, char **argv)
         testScalarStaging(directory / "scalar_staging");
         testIdentityAssigns(directory / "identity_assign", false);
         testIdentityAssigns(directory / "identity_assign_helpers", true);
+        testSharedComputeClones(directory / "clones", false);
+        testSharedComputeClones(directory / "clones_helpers", true);
         testScalarConstants(directory / "constants", false);
         testScalarConstants(directory / "constants_helpers", true);
         testMemoryStaging(directory / "memory_stage");

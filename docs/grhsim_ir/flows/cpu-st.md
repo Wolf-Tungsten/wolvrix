@@ -35,8 +35,9 @@ logic value，lower 显式生成同位宽、同有符号属性的 `core.compute.
 外部 input 和 inout 输入侧由 `core.input.read` 提供 producer，不补零；没有引用的 detached
 value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认为二态零。
 
-XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem` 和
-`grhsim.canonicalize-compute`，再进入下表的 CPU mapping；这不依赖 GRH 侧
+XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`、
+`grhsim.canonicalize-compute` 和
+[`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)，再进入下表的 CPU mapping；这不依赖 GRH 侧
 reg-to-mem，也不修改 GRH。
 
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有

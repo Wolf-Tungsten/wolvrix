@@ -1,6 +1,7 @@
 #include "grhsim/pass/pass.hpp"
 #include "grhsim/pass/reg_to_mem.hpp"
 #include "grhsim/pass/canonicalize_compute.hpp"
+#include "grhsim/pass/clone_shared_compute.hpp"
 #include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
@@ -158,6 +159,7 @@ namespace wolvrix::lib::grhsim
         registerCpuPasses(registry);
         registerRegToMemPass(registry);
         registerCanonicalizeComputePass(registry);
+        registerCloneSharedComputePass(registry);
         std::string error;
         registry.registerPass(
             "grhsim.verify", PassKind::Analysis,

@@ -1722,6 +1722,131 @@ namespace
                 " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testReplicateBroadcast(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_replicate_broadcast"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto output = [&](const char *name, TypeId type, ValueId value) {
+            const auto port = model.addOutput(name, type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto b = input("b", bit), clock = input("clock", bit), w8 = input("w8", byte);
+        const auto replicate = [&](const char *name, ValueId source, unsigned width, int64_t rep) {
+            const auto type = model.logicType(width, false, LogicDomain::TwoState);
+            const auto value = model.addValue(type);
+            const std::array params{Parameter{model.intern("rep"), rep}};
+            model.addOperation("core.compute.replicate", std::array{source}, std::array{value}, {}, params);
+            output(name, type, value);
+            return value;
+        };
+        replicate("r1", b, 1, 1);
+        replicate("r3", b, 3, 3);
+        replicate("r32", b, 32, 32);
+        replicate("r64", b, 64, 64);
+        replicate("r66", b, 66, 66);
+        replicate("r130", b, 130, 130);
+        replicate("wide9", w8, 72, 9);
+        const auto state = [&](const char *name) {
+            const auto id = model.addState(name, bit);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto q = state("q"), hq = state("hq");
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        const auto one = model.addValue(bit);
+        const std::array literal{Parameter{model.intern("value"), std::string("1")}};
+        model.addOperation("core.compute.constant", {}, std::array{one}, {}, literal);
+        model.addOperation("core.state.regWrite", std::array{one, b, one, clock}, {},
+                           std::array{ObjectRef::state(q), ObjectRef::state(hq)}, edges);
+        const auto oldQ = model.addValue(bit);
+        model.addOperation("core.state.read", {}, std::array{oldQ}, std::array{ObjectRef::state(q)});
+        output("q", bit, oldQ);
+        replicate("q32", oldQ, 32, 32);
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "replicate broadcast emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_replicate_broadcast.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
+    void testDynamicStats(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_dynamic_stats"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto compute = [&](const char *name, TypeId type, std::initializer_list<ValueId> args) {
+            const auto value = model.addValue(type);
+            model.addOperation(name, {args.begin(), args.size()}, std::array{value}); return value;
+        };
+        const auto output = [&](const char *name, TypeId type, ValueId value) {
+            const auto port = model.addOutput(name, type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto a = input("a", byte), b = input("b", byte);
+        const auto clock = input("clock", bit), enable = input("enable", bit);
+        const auto sum = compute("core.compute.add", byte, {a, b});
+        const auto sel = compute("core.compute.mux", byte, {enable, sum, a});
+        const auto dat = compute("core.compute.xor", byte, {sel, a});
+        const auto msk = compute("core.compute.or", byte, {a, b});
+        const auto en = compute("core.compute.and", bit, {enable, compute("core.compute.reduceOr", byte, {b})});
+        output("out_sum", byte, sum); output("out_sel", byte, sel); output("out_dat", byte, dat);
+        const auto state = [&](const char *name, TypeId type) {
+            const auto id = model.addState(name, type);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto q = state("q", byte), hq = state("hq", bit);
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        model.addOperation("core.state.regWrite", std::array{en, dat, msk, clock}, {},
+                           std::array{ObjectRef::state(q), ObjectRef::state(hq)}, edges);
+        const auto oldQ = model.addValue(byte);
+        model.addOperation("core.state.read", {}, std::array{oldQ}, std::array{ObjectRef::state(q)});
+        output("out_q", byte, oldQ);
+        map(model);
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics, true).success, "dynamic stats emit failed");
+        {
+            std::ifstream stream(directory / "grhsim_cpu_dynamic_stats.hpp");
+            const std::string header((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+            require(header.find("cpu_dyn_wr") != std::string::npos && header.find("cpu_dyn_sn_act") != std::string::npos,
+                    "dynamic stats counters were not declared");
+        }
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_dynamic_stats.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+        {
+            GrhSimModel collision("cpu_dyn_collision"); collision.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = collision.logicType(1, false, LogicDomain::TwoState);
+            const auto port = collision.addInput("cpu_dyn_wr", bit);
+            const auto value = collision.addValue(bit);
+            collision.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            const auto out = collision.addOutput("o", bit);
+            collision.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(out)});
+            map(collision);
+            diag::Diagnostics invalid;
+            require(!emitCpuCpp(collision, directory / "collision", invalid, true).success &&
+                    !std::filesystem::exists(directory / "collision"), "dynamic stats reserved name was accepted");
+        }
+    }
+
     void testHelperReadCaches(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_helper_read_cache"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2577,6 +2702,9 @@ int main(int argc, char **argv)
         testBitwisePredicates(directory / "predicates_helpers", true);
         testBitwiseMuxes(directory / "bit_select", false);
         testBitwiseMuxes(directory / "bit_select_helpers", true);
+        testDynamicStats(directory / "dynamic_stats");
+        testReplicateBroadcast(directory / "replicate_broadcast", false);
+        testReplicateBroadcast(directory / "replicate_broadcast_helpers", true);
         testPackedBitRegisters(directory / "packed_bits", false);
         testPackedBitRegisters(directory / "packed_bits_helpers", true);
         testBitPackingDomains();
@@ -2618,8 +2746,40 @@ int main(int argc, char **argv)
                     std::ifstream stream(entry.path());
                     generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
                 }
+            require(generated.find("cpu_replicate_words_changed<") == std::string::npos &&
+                    generated.find("cpu_rword=0-static_cast") != std::string::npos,
+                    "wide 1-bit replication did not use the broadcast emission");
+        }
+        {
+            // The caller-owned word helper keeps covering multi-bit sources directly.
+            GrhSimModel model("cpu_replicate_wide_source"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto wide72 = model.logicType(72, false, LogicDomain::TwoState);
+            const auto wide144 = model.logicType(144, false, LogicDomain::TwoState);
+            const auto port = model.addInput("b", bit);
+            const auto bv = model.addValue(bit);
+            model.addOperation("core.input.read", {}, std::array{bv}, std::array{ObjectRef::input(port)});
+            const auto in = model.addInput("w", wide72);
+            const auto wv = model.addValue(wide72);
+            model.addOperation("core.input.read", {}, std::array{wv}, std::array{ObjectRef::input(in)});
+            const auto result = model.addValue(wide144);
+            const std::array rep{Parameter{model.intern("rep"), int64_t(2)}};
+            model.addOperation("core.compute.replicate", std::array{wv}, std::array{result}, {}, rep);
+            const auto out = model.addOutput("o", wide144);
+            model.addOperation("core.output.write", std::array{result}, {}, std::array{ObjectRef::output(out)});
+            map(model);
+            diag::Diagnostics helperDiagnostics;
+            const auto helperPath = directory / "wide_replicate_helper";
+            require(emitCpuCpp(model, helperPath, helperDiagnostics).success, "wide-source replicate emit failed");
+            std::string generated;
+            for (const auto &entry : std::filesystem::directory_iterator(helperPath))
+                if (entry.path().extension() == ".cpp")
+                {
+                    std::ifstream stream(entry.path());
+                    generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+                }
             require(generated.find("cpu_replicate_words_changed<") != std::string::npos,
-                    "wide replication did not use the caller-owned result helper");
+                    "wide replication of a multi-bit source lost the caller-owned result helper");
         }
         compileAndCompare(directory / "wide", "cpu_wide");
         auto states = stateFixture(); canonicalize(states); map(states);

@@ -47,7 +47,7 @@ namespace wolvrix::lib::grhsim
         class Emitter
         {
         public:
-            explicit Emitter(const GrhSimModel &model)
+            explicit Emitter(const GrhSimModel &model, bool dynamicStats = false)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -55,8 +55,16 @@ namespace wolvrix::lib::grhsim
                   projected_(stateRanges_.size()), fanout_(model.values().size() + 1), producers_(model.values().size() + 1),
                   batchedHistories_(stateRanges_.size()),
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
-                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size())
+                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()), dynamicStats_(dynamicStats)
             {
+                if (dynamicStats_)
+                {
+                    std::set<std::string> kinds;
+                    for (const auto &op : model_.operations()) kinds.emplace(model_.text(op.opType));
+                    for (const auto &kind : kinds) dynKinds_.emplace(kind, dynKinds_.size());
+                    for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                        dynTaskSpan_ = std::max(dynTaskSpan_, task.id.index + 1);
+                }
                 for (const auto &frame : layout_.localFrames) frameSizes_[frame.owner.index] = frame.size;
                 if (layout_.helperReadCaches)
                     for (const auto &cache : *layout_.helperReadCaches)
@@ -221,7 +229,14 @@ namespace wolvrix::lib::grhsim
                     "cpu_bitwise_words_changed", "cpu_arithmetic_words_changed", "cpu_shift_words_changed", "cpu_replicate_words_changed", "cpu_active_word",
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
-                    "cpu_stage_cell", "cpu_write_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed"};
+                    "cpu_stage_cell", "cpu_write_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed",
+                    "cpu_rword", "cpu_rchanged", "cpu_rnext"};
+                if (dynamicStats_)
+                    for (const auto *name : {"cpu_dyn_wr", "cpu_dyn_ch", "cpu_dyn_silent", "cpu_dyn_sn_act", "cpu_dyn_sn_body",
+                                             "cpu_dyn_sn_grp", "cpu_dyn_sn_chg", "cpu_dyn_cm_ent", "cpu_dyn_grp_pub", "cpu_dyn_grp_fire",
+                                             "cpu_dyn_port_eval", "cpu_dyn_port_fire", "cpu_dyn_in_chk", "cpu_dyn_in_chg", "cpu_dyn_pub_calls",
+                                             "cpu_dyn_pub_pending", "cpu_dyn_pub_changes", "cpu_dyn_cm_stable", "cpu_dyn_cm_inactive"})
+                        names.insert(name);
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
                 for (std::size_t i = 0; i < initChunkCount(); ++i) names.insert("cpu_init_" + std::to_string(i));
@@ -1435,6 +1450,14 @@ namespace wolvrix::lib::grhsim
                 }
                 if (kind == "concat" || kind == "replicate")
                 {
+                    const auto &sourceType = type(operands[0]);
+                    if (kind == "replicate" && sourceType.kind == TypeKind::Logic && sourceType.width == 1 &&
+                        !sourceType.isSigned && sourceType.domain == LogicDomain::TwoState)
+                    {
+                        // {rep{bit}} broadcasts the bit: 0/-bit fills every lane in one
+                        // subtract; normalize() applies the result width truncation.
+                        return "(0-static_cast<std::uint64_t>(" + raw(0) + "))";
+                    }
                     std::string expr = "UINT64_C(0)"; uint64_t total = 0;
                     const auto count = kind == "replicate" ? number("rep") : operands.size();
                     if (!count || count > 64) throw std::runtime_error("invalid CPU scalar concatenation/replication count");
@@ -1736,6 +1759,7 @@ namespace wolvrix::lib::grhsim
             void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit,
                               const std::map<uint32_t, std::string> &guards = {}) const
             {
+                if (dynamicStats_) out << "++cpu_dyn_sn_grp[" << unit.index << "];\n";
                 // A compute helper observes a stable pre-commit snapshot. Cache
                 // repeated scalar state reads (including transparent slices) once
                 // per helper invocation so packed and unpacked readers do not
@@ -1819,6 +1843,12 @@ namespace wolvrix::lib::grhsim
                     if (groups[i].targets) activate(out, *groups[i].targets, false, unit, "cpu_changed_" + std::to_string(i));
                     if (groups[i].ports) armPorts(out, *groups[i].ports, "cpu_changed_" + std::to_string(i));
                 }
+                if (dynamicStats_ && !groups.empty())
+                {
+                    out << "{const bool cpu_dyn_any=cpu_changed_0";
+                    for (std::size_t i = 1; i < groups.size(); ++i) out << "|cpu_changed_" << i;
+                    out << ";cpu_dyn_sn_chg[" << unit.index << "]+=cpu_dyn_any;++cpu_dyn_grp_pub;cpu_dyn_grp_fire+=cpu_dyn_any;}\n";
+                }
                 activeStateCache_ = nullptr;
                 activeValueCache_ = nullptr;
             }
@@ -1871,34 +1901,99 @@ namespace wolvrix::lib::grhsim
                         if (targets)
                         {
                             if (!changed.empty())
-                                out << changed << "|=(" << value(result) << "!=cpu_concat);" << value(result) << "=cpu_concat;\n";
+                            {
+                                if (dynamicStats_)
+                                {
+                                    const auto kind = dynKind(op);
+                                    out << "{const bool cpu_dyn_c=(" << value(result) << "!=cpu_concat);++cpu_dyn_wr[" << kind
+                                        << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;" << changed << "|=cpu_dyn_c;"
+                                        << value(result) << "=cpu_concat;}\n";
+                                }
+                                else out << changed << "|=(" << value(result) << "!=cpu_concat);" << value(result) << "=cpu_concat;\n";
+                            }
+                            else if (dynamicStats_)
+                            {
+                                const auto kind = dynKind(op);
+                                out << "++cpu_dyn_wr[" << kind << "];if(" << value(result) << "!=cpu_concat){++cpu_dyn_ch[" << kind
+                                    << "];" << value(result) << "=cpu_concat;\n";
+                                activate(out, *targets, false, activeUnit); out << "}\n";
+                            }
                             else
                             {
                                 out << "if(" << value(result) << "!=cpu_concat){" << value(result) << "=cpu_concat;\n";
                                 activate(out, *targets, false, activeUnit); out << "}\n";
                             }
                         }
+                        else if (dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
                         out << "}\n";
                         return;
                     }
                     if (name == "core.compute.replicate")
                     {
                         const auto operand = operands[0];
-                        const auto sourceWords = (type(operand).width + 63u) / 64u;
+                        const auto &sourceType = type(operand);
+                        const auto sourceWords = (sourceType.width + 63u) / 64u;
                         const auto *rep = parameter<int64_t>(model_, model_.parameters(op), "rep");
                         if (!rep || *rep < 0) throw std::runtime_error("missing or negative CPU replication parameter");
-                        const auto call = (type(operand).width > 64 ?
+                        if (sourceType.width == 1 && !sourceType.isSigned && sourceType.domain == LogicDomain::TwoState)
+                        {
+                            // {rep{bit}} broadcast: every live lane equals the bit, so each
+                            // result word is 0 or all-ones under the live-bit mask; dead
+                            // padding lanes stay zero exactly like the word helper.
+                            const auto kind = dynamicStats_ ? dynKind(op) : 0;
+                            out << "{\nconst std::uint64_t cpu_rword=0-static_cast<std::uint64_t>(" << value(operand) << ");\n";
+                            if (dynamicStats_) out << "++cpu_dyn_wr[" << kind << "];\n";
+                            out << "bool cpu_rchanged=false;\n";
+                            const std::uint64_t live = std::min<std::uint64_t>(static_cast<std::uint64_t>(*rep), resultType.width);
+                            for (std::uint64_t word = 0; word < words; ++word)
+                            {
+                                const std::uint64_t liveBits = live > word * 64 ? std::min<std::uint64_t>(live - word * 64, 64) : 0;
+                                out << "{const std::uint64_t cpu_rnext=cpu_rword&"
+                                    << (liveBits == 64 ? "UINT64_MAX" : "((UINT64_C(1)<<" + std::to_string(liveBits) + ")-1)")
+                                    << ";cpu_rchanged|=(" << value(result) << '[' << word << "]!=cpu_rnext);" << value(result) << '['
+                                    << word << "]=cpu_rnext;}\n";
+                            }
+                            if (dynamicStats_) out << "cpu_dyn_ch[" << kind << "]+=cpu_rchanged;\n";
+                            if (!changed.empty()) out << changed << "|=cpu_rchanged;\n";
+                            else if (const auto *targets = fanout_[result.index])
+                            {
+                                out << "if(cpu_rchanged){\n";
+                                activate(out, *targets, false, activeUnit); out << "}\n";
+                            }
+                            out << "}\n";
+                            return;
+                        }
+                        const auto call = (sourceType.width > 64 ?
                             "cpu_replicate_words_changed<" + std::to_string(words) + "," + std::to_string(sourceWords) + ">( " :
                             "cpu_replicate_words_changed<" + std::to_string(words) + ">( ") + value(operand) + "," +
-                            std::to_string(type(operand).width) + "," + std::to_string(*rep) + "," +
+                            std::to_string(sourceType.width) + "," + std::to_string(*rep) + "," +
                             std::to_string(resultType.width) + "," + value(result) + ")";
                         if (!changed.empty())
-                            out << changed << "|=" << call << ";\n";
+                        {
+                            if (dynamicStats_)
+                            {
+                                const auto kind = dynKind(op);
+                                out << "{const bool cpu_dyn_c=" << call << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind
+                                    << "]+=cpu_dyn_c;" << changed << "|=cpu_dyn_c;}\n";
+                            }
+                            else out << changed << "|=" << call << ";\n";
+                        }
                         else if (const auto *targets = fanout_[result.index])
                         {
-                            out << "if(" << call << "){\n";
-                            activate(out, *targets, false, activeUnit); out << "}\n";
+                            if (dynamicStats_)
+                            {
+                                const auto kind = dynKind(op);
+                                out << "{const bool cpu_dyn_c=" << call << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind
+                                    << "]+=cpu_dyn_c;if(cpu_dyn_c){\n";
+                                activate(out, *targets, false, activeUnit); out << "}}\n";
+                            }
+                            else
+                            {
+                                out << "if(" << call << "){\n";
+                                activate(out, *targets, false, activeUnit); out << "}\n";
+                            }
                         }
+                        else if (dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];(void)" << call << ";\n";
                         else
                             out << "(void)" << call << ";\n";
                         return;
@@ -1929,18 +2024,34 @@ namespace wolvrix::lib::grhsim
                     {
                         const bool unary = name == "core.compute.not";
                         const char operation = unary ? '~' : name == "core.compute.and" ? '&' : name == "core.compute.or" ? '|' : '^';
-                        out << (changed.empty() ? "if(" : changed + "|=") << "cpu_bitwise_words_changed<'" << operation << "'>(" << ptr(operands[0], value(operands[0])) << ','
-                            << ((type(operands[0]).width + 63u) / 64u) << ',';
-                        if (unary) out << "nullptr,0,";
-                        else out << ptr(operands[1], value(operands[1])) << ',' << ((type(operands[1]).width + 63u) / 64u) << ',';
-                        out << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ')';
-                        if (changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
-                        else out << ";\n";
+                        const auto call = [&](std::ostream &stream)
+                        {
+                            stream << "cpu_bitwise_words_changed<'" << operation << "'>(" << ptr(operands[0], value(operands[0])) << ','
+                                << ((type(operands[0]).width + 63u) / 64u) << ',';
+                            if (unary) stream << "nullptr,0,";
+                            else stream << ptr(operands[1], value(operands[1])) << ',' << ((type(operands[1]).width + 63u) / 64u) << ',';
+                            stream << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ')';
+                        };
+                        if (dynamicStats_)
+                        {
+                            const auto kind = dynKind(op);
+                            out << "{const bool cpu_dyn_c="; call(out);
+                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
+                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activate(out, *targets, false, activeUnit); out << "}}\n"; }
+                            else out << changed << "|=cpu_dyn_c;}\n";
+                        }
+                        else
+                        {
+                            out << (changed.empty() ? "if(" : changed + "|="); call(out);
+                            if (changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                            else out << ";\n";
+                        }
                         out << "}\n";
                         return;
                     }
                     if (name == "core.compute.and" || name == "core.compute.or" || name == "core.compute.xor")
                     {
+                        if (dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
                         out << "grhsim_" << name.substr(std::string_view("core.compute.").size()) << "_words(" << ptr(operands[0], value(operands[0])) << ','
                             << ((type(operands[0]).width + 63u) / 64u) << ',' << ptr(operands[1], value(operands[1])) << ','
                             << ((type(operands[1]).width + 63u) / 64u) << ',' << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ");\n";
@@ -1949,6 +2060,7 @@ namespace wolvrix::lib::grhsim
                     }
                     if (name == "core.compute.not")
                     {
+                        if (dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
                         out << "grhsim_not_words(" << ptr(operands[0], value(operands[0])) << ',' << ((type(operands[0]).width + 63u) / 64u) << ','
                             << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ");\n";
                         out << "}\n";
@@ -1957,41 +2069,96 @@ namespace wolvrix::lib::grhsim
                     if (name == "core.compute.shl" || name == "core.compute.lshr" || name == "core.compute.ashr")
                     {
                         const auto *targets = fanout_[result.index];
-                        if (targets)
-                            out << (changed.empty() ? "if(" : changed + "|=") << "cpu_shift_words_changed<'" << (name == "core.compute.shl" ? 'L' : name == "core.compute.lshr" ? 'R' : 'A') << "'>(";
-                        else out << "grhsim_" << name.substr(std::string_view("core.compute.").size()) << "_words(";
-                        out << ptr(operands[0], value(operands[0])) << ','
-                            << ((type(operands[0]).width + 63u) / 64u) << ",grhsim_index_words(" << value(operands[1]) << ',' << resultType.width << ")," << resultType.width << ','
-                            << ptr(result, value(result)) << ',' << words << ')';
-                        if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
-                        else out << ";\n";
+                        const auto call = [&](std::ostream &stream)
+                        {
+                            stream << (targets ? "cpu_shift_words_changed<'" : "grhsim_")
+                                << (targets ? (name == "core.compute.shl" ? "L" : name == "core.compute.lshr" ? "R" : "A")
+                                    : name == "core.compute.shl" ? "shl" : name == "core.compute.lshr" ? "lshr" : "ashr")
+                                << (targets ? "'>(" : "_words(")
+                                << ptr(operands[0], value(operands[0])) << ','
+                                << ((type(operands[0]).width + 63u) / 64u) << ",grhsim_index_words(" << value(operands[1]) << ',' << resultType.width << ")," << resultType.width << ','
+                                << ptr(result, value(result)) << ',' << words << ')';
+                        };
+                        if (dynamicStats_ && targets)
+                        {
+                            const auto kind = dynKind(op);
+                            out << "{const bool cpu_dyn_c="; call(out);
+                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
+                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activate(out, *targets, false, activeUnit); out << "}}\n"; }
+                            else out << changed << "|=cpu_dyn_c;}\n";
+                        }
+                        else
+                        {
+                            if (!targets && dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
+                            out << (targets ? (changed.empty() ? "if(" : changed + "|=") : ""); call(out);
+                            if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                            else out << ";\n";
+                        }
                         out << "}\n";
                         return;
                     }
                     if (name == "core.compute.add" || name == "core.compute.sub")
                     {
                         const auto *targets = fanout_[result.index];
-                        if (targets) out << (changed.empty() ? "if(" : changed + "|=") << "cpu_arithmetic_words_changed<'" << (name == "core.compute.add" ? '+' : '-') << "'>(";
-                        else out << "grhsim_" << name.substr(std::string_view("core.compute.").size()) << "_words(";
-                        out << ptr(operands[0], value(operands[0])) << ','
-                            << ((type(operands[0]).width + 63u) / 64u) << ',' << ptr(operands[1], value(operands[1])) << ','
-                            << ((type(operands[1]).width + 63u) / 64u) << ',' << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ')';
-                        if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
-                        else out << ";\n";
+                        const auto call = [&](std::ostream &stream)
+                        {
+                            stream << (targets ? (name == "core.compute.add" ? "cpu_arithmetic_words_changed<'+'>(" : "cpu_arithmetic_words_changed<'-'>(")
+                                    : (name == "core.compute.add" ? "grhsim_add_words(" : "grhsim_sub_words("))
+                                << ptr(operands[0], value(operands[0])) << ','
+                                << ((type(operands[0]).width + 63u) / 64u) << ',' << ptr(operands[1], value(operands[1])) << ','
+                                << ((type(operands[1]).width + 63u) / 64u) << ',' << resultType.width << ',' << ptr(result, value(result)) << ',' << words << ')';
+                        };
+                        if (dynamicStats_ && targets)
+                        {
+                            const auto kind = dynKind(op);
+                            out << "{const bool cpu_dyn_c="; call(out);
+                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
+                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activate(out, *targets, false, activeUnit); out << "}}\n"; }
+                            else out << changed << "|=cpu_dyn_c;}\n";
+                        }
+                        else
+                        {
+                            if (!targets && dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
+                            out << (targets ? (changed.empty() ? "if(" : changed + "|=") : ""); call(out);
+                            if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                            else out << ";\n";
+                        }
                         out << "}\n";
                         return;
                     }
                 }
                 const auto expr = normalize(expression(op), resultType);
                 if (!changed.empty())
-                    out << "{const auto cpu_value=" << expr << ';' << changed << "|=(" << value(result) << "!=cpu_value);"
-                        << value(result) << "=cpu_value;}\n";
+                {
+                    if (dynamicStats_)
+                    {
+                        const auto kind = dynKind(op);
+                        out << "{const auto cpu_value=" << expr << ";const bool cpu_dyn_c=(" << value(result)
+                            << "!=cpu_value);++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;"
+                            << changed << "|=cpu_dyn_c;" << value(result) << "=cpu_value;}\n";
+                    }
+                    else
+                        out << "{const auto cpu_value=" << expr << ';' << changed << "|=(" << value(result) << "!=cpu_value);"
+                            << value(result) << "=cpu_value;}\n";
+                }
                 else if (const auto *targets = fanout_[result.index])
                 {
-                    out << "{ const auto cpu_value=" << expr << "; if(" << value(result) << "!=cpu_value){\n"
-                        << value(result) << "=cpu_value;\n";
-                    activate(out, *targets, false, activeUnit); out << "}}\n";
+                    if (dynamicStats_)
+                    {
+                        const auto kind = dynKind(op);
+                        out << "{ const auto cpu_value=" << expr << ";++cpu_dyn_wr[" << kind << "];if(" << value(result)
+                            << "!=cpu_value){++cpu_dyn_ch[" << kind << "];\n" << value(result) << "=cpu_value;\n";
+                        activate(out, *targets, false, activeUnit); out << "}}\n";
+                    }
+                    else
+                    {
+                        out << "{ const auto cpu_value=" << expr << "; if(" << value(result) << "!=cpu_value){\n"
+                            << value(result) << "=cpu_value;\n";
+                        activate(out, *targets, false, activeUnit); out << "}}\n";
+                    }
                 }
+                else if (dynBoundary(result))
+                    out << "++cpu_dyn_silent[" << dynKind(op) << "];" << value(result) << '=' << expr << ";\n";
                 else out << value(result) << '=' << expr << ";\n";
             }
 
@@ -2385,8 +2552,15 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "void cpu_bind_strings();\n"
                     << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n"
                     << "std::array<std::uint8_t," << layout_.runtimeBytes << "> cpu_flags{},cpu_next_arms{};\n"
-                    << "std::array<std::uint8_t," << std::max<std::uint32_t>(portArmWordCount_, 1) << "> cpu_pflags{};\n"
-                    << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
+                    << "std::array<std::uint8_t," << std::max<std::uint32_t>(portArmWordCount_, 1) << "> cpu_pflags{};\n";
+                if (dynamicStats_)
+                    out << "std::array<std::uint64_t," << dynKinds_.size() << "> cpu_dyn_wr{},cpu_dyn_ch{},cpu_dyn_silent{};\n"
+                        << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_act{},cpu_dyn_sn_body{},cpu_dyn_sn_grp{},cpu_dyn_sn_chg{};\n"
+                        << "std::array<std::uint64_t," << dynTaskSpan_ << "> cpu_dyn_cm_ent{};\n"
+                        << "std::uint64_t cpu_dyn_grp_pub=0,cpu_dyn_grp_fire=0,cpu_dyn_port_eval=0,cpu_dyn_port_fire=0;\n"
+                        << "std::uint64_t cpu_dyn_in_chk=0,cpu_dyn_in_chg=0,cpu_dyn_pub_calls=0,cpu_dyn_pub_pending=0,cpu_dyn_pub_changes=0;\n"
+                        << "std::uint64_t cpu_dyn_cm_stable=0,cpu_dyn_cm_inactive=0;\n";
+                out << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
                     << "struct Pending{std::size_t state,offset,size; std::uint32_t begin,count; bool projection;bool memory=false;};\n"
                     << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n"
                     << "static const std::array<Target," << stateTargets_.size() << "> cpu_targets;\nstd::vector<Pending> cpu_pending;\n"
@@ -2475,6 +2649,10 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "cpu_inputs.fill(std::byte{});cpu_flags.fill(0);cpu_next_arms.fill(0);cpu_pflags.fill(255);std::fill(cpu_dirty.begin(),cpu_dirty.end(),0);cpu_pending.clear();cpu_direct_again=false;cpu_read_offsets.fill(0);\n";
                 out << "for(std::size_t i=0;i<" << persistentStrings_.size() << ";++i)cpu_strings[i].clear();\ncpu_bind_strings();\n";
                 out << "cpu_profile_data={};\n";
+                if (dynamicStats_)
+                    out << "cpu_dyn_wr.fill(0);cpu_dyn_ch.fill(0);cpu_dyn_silent.fill(0);cpu_dyn_sn_act.fill(0);cpu_dyn_sn_body.fill(0);cpu_dyn_sn_grp.fill(0);cpu_dyn_sn_chg.fill(0);cpu_dyn_cm_ent.fill(0);\n"
+                        << "cpu_dyn_grp_pub=0;cpu_dyn_grp_fire=0;cpu_dyn_port_eval=0;cpu_dyn_port_fire=0;cpu_dyn_in_chk=0;cpu_dyn_in_chg=0;\n"
+                        << "cpu_dyn_pub_calls=0;cpu_dyn_pub_pending=0;cpu_dyn_pub_changes=0;cpu_dyn_cm_stable=0;cpu_dyn_cm_inactive=0;\n";
                 out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
                 if (hasSystemTasks_) out << "cpu_first_eval=true;cpu_system_done.fill(false);cpu_strobes.clear();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "cpu_init_" << i << "();\n";
@@ -2483,8 +2661,12 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 out << "}\nvoid " << class_ << "::cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "cpu_direct_again=cpu_direct_again||projection;\n"
                     << "for(std::uint32_t i=begin;i<begin+count;++i){const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}\n";
-                out << "bool " << class_ << "::cpu_publish(){bool again=cpu_direct_again;cpu_direct_again=false;for(const auto &p:cpu_pending){\n"
-                    << "if(std::memcmp(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size)!=0){std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n"
+                out << "bool " << class_ << "::cpu_publish(){";
+                if (dynamicStats_) out << "++cpu_dyn_pub_calls;cpu_dyn_pub_pending+=cpu_pending.size();";
+                out << "bool again=cpu_direct_again;cpu_direct_again=false;for(const auto &p:cpu_pending){\n"
+                    << "if(std::memcmp(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size)!=0){";
+                if (dynamicStats_) out << "++cpu_dyn_pub_changes;";
+                out << "std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n"
                     << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
                 out << "void " << class_ << "::eval(){\n";
                 out << "using cpu_profile_clock=std::chrono::steady_clock;\n"
@@ -2503,7 +2685,10 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     const auto &row = schedule_.inputFanout[i]; const auto &shadow = schedule_.inputShadows[i];
                     const auto current = at(type(row.source), "cpu_objects.get()", object(ObjectRef::input(inputByValue[row.source.index])).offset);
                     const auto previous = at(type(row.source), "cpu_inputs.data()", shadow.offset);
-                    out << "if(" << previous << "!=" << current << "){" << previous << '=' << current << ";\n";
+                    if (dynamicStats_) out << "++cpu_dyn_in_chk;";
+                    out << "if(" << previous << "!=" << current << "){";
+                    if (dynamicStats_) out << "++cpu_dyn_in_chg;";
+                    out << previous << '=' << current << ";\n";
                     activate(out, row.targets, false); out << "}\n";
                 }
                 out << "for(std::uint32_t cpu_round=0;cpu_round<100000;++cpu_round){\n";
@@ -2618,7 +2803,33 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "std::fprintf(stderr,\"[grhsim-cpu-phase] evals=%llu rounds=%llu eval_ns=%llu compute_ns=%llu commit_ns=%llu publish_ns=%llu\\n\",\n"
                     << "static_cast<unsigned long long>(p.evals),static_cast<unsigned long long>(p.rounds),\n"
                     << "static_cast<unsigned long long>(p.eval_ns),static_cast<unsigned long long>(p.compute_ns),\n"
-                    << "static_cast<unsigned long long>(p.commit_ns),static_cast<unsigned long long>(p.publish_ns));}\n";
+                    << "static_cast<unsigned long long>(p.commit_ns),static_cast<unsigned long long>(p.publish_ns));";
+                if (dynamicStats_)
+                {
+                    std::vector<std::string> names(dynKinds_.size());
+                    for (const auto &[name, index] : dynKinds_) names[index] = name;
+                    out << "\nstatic const char *cpu_dyn_names[" << names.size() << "]={";
+                    for (std::size_t i = 0; i < names.size(); ++i) out << (i ? ",\"" : "\"") << names[i] << "\"";
+                    out << "};\n"
+                        << "for(std::size_t i=0;i<" << names.size() << ";++i)if(cpu_dyn_wr[i]||cpu_dyn_ch[i]||cpu_dyn_silent[i])"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] kind %s wr=%llu ch=%llu silent=%llu\\n\",cpu_dyn_names[i],"
+                        << "static_cast<unsigned long long>(cpu_dyn_wr[i]),static_cast<unsigned long long>(cpu_dyn_ch[i]),static_cast<unsigned long long>(cpu_dyn_silent[i]));\n"
+                        << "for(std::size_t i=0;i<" << mapping_.partitionTree.partitions.size() + 1 << ";++i)if(cpu_dyn_sn_act[i])"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] sn %zu act=%llu body=%llu grp=%llu chg=%llu\\n\",i,"
+                        << "static_cast<unsigned long long>(cpu_dyn_sn_act[i]),static_cast<unsigned long long>(cpu_dyn_sn_body[i]),"
+                        << "static_cast<unsigned long long>(cpu_dyn_sn_grp[i]),static_cast<unsigned long long>(cpu_dyn_sn_chg[i]));\n"
+                        << "for(std::size_t i=0;i<" << dynTaskSpan_ << ";++i)if(cpu_dyn_cm_ent[i])"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] commit %zu ent=%llu\\n\",i,static_cast<unsigned long long>(cpu_dyn_cm_ent[i]));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] totals grp_pub=%llu grp_fire=%llu port_eval=%llu port_fire=%llu "
+                        << "in_chk=%llu in_chg=%llu pub_calls=%llu pub_pending=%llu pub_changes=%llu cm_stable=%llu cm_inactive=%llu\\n\",\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_grp_pub),static_cast<unsigned long long>(cpu_dyn_grp_fire),\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_port_eval),static_cast<unsigned long long>(cpu_dyn_port_fire),\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_in_chk),static_cast<unsigned long long>(cpu_dyn_in_chg),\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_pub_calls),static_cast<unsigned long long>(cpu_dyn_pub_pending),\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_pub_changes),static_cast<unsigned long long>(cpu_dyn_cm_stable),\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_cm_inactive));\n";
+                }
+                out << "}\n";
                 if (hasSystemTasks_) systemTaskDriver(out);
             }
 
@@ -2866,12 +3077,19 @@ if(terminal){
                 const auto &tree = mapping_.partitionTree;
                 if (task.execution != CpuExecution::ActivityDrivenCompute)
                 {
+                    if (dynamicStats_) out << "++cpu_dyn_cm_ent[" << task.id.index << "];\n";
                     if (const auto stable = stableCommitHistories(task); !stable.empty())
-                        out << "if(" << stable << ")return; // cpu_stable_history_skip task=" << task.id.index << '\n';
+                    {
+                        if (dynamicStats_)
+                            out << "if(" << stable << "){++cpu_dyn_cm_stable;return;} // cpu_stable_history_skip task=" << task.id.index << '\n';
+                        else
+                            out << "if(" << stable << ")return; // cpu_stable_history_skip task=" << task.id.index << '\n';
+                    }
                     const auto possibility = commitEdgePossibility(task);
                     if (!possibility.empty())
                     {
                         out << "if(!(" << possibility << ")){ // cpu_inactive_edge_sample task=" << task.id.index << '\n';
+                        if (dynamicStats_) out << "++cpu_dyn_cm_inactive;\n";
                         // A false edge still samples history, including writes that overwrite pending values.
                         for (auto unit : tree.partitions[task.partition.index - 1].children)
                             for (auto op : tree.partitions[unit.index - 1].ops) sampleEvents(out, model_.operations()[op.index - 1], 1);
@@ -2956,9 +3174,11 @@ if(terminal){
                                     const auto bit = 1u << portArmBits_[op.index];
                                     portMask |= bit;
                                     out << "if(cpu_armed&" << bit << "){";
+                                    if (dynamicStats_) out << "++cpu_dyn_port_eval;";
                                     if (sharedGuard.empty())
                                         out << "if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|=" << bit << ';';
                                     out << "if(" << value(model_.operands(operation)[0]) << "){\n";
+                                    if (dynamicStats_) out << "++cpu_dyn_port_fire;\n";
                                     directCommitBody(out, operation);
                                     out << (sharedGuard.empty() ? "}}}\n" : "}}\n");
                                 }
@@ -2986,6 +3206,7 @@ if(terminal){
                         {
                             const auto &partition = tree.partitions[unit.index - 1];
                             out << "if(cpu_active_word&" << activeMasks_[unit.index] << "){cpu_active_word&=~" << activeMasks_[unit.index] << ";\n";
+                            if (dynamicStats_) out << "++cpu_dyn_sn_act[" << unit.index << "];\n";
                             // Quiescent units (hist == event on every guard term) are inert: all
                             // edge guards are false and every embedded history sample is a
                             // current==next no-op, so the whole body is skipped.
@@ -2993,6 +3214,7 @@ if(terminal){
                             const bool quiescent = quiescence != computeQuiescence_.end() && !quiescence->second.empty();
                             if (quiescent)
                                 out << "if(" << quiescenceCheck(quiescence->second) << "){ // cpu_quiescence_skip unit=" << unit.index << '\n';
+                            if (dynamicStats_) out << "++cpu_dyn_sn_body[" << unit.index << "];\n";
                             out << "alignas(8) std::byte cpu_local[" << std::max<uint64_t>(frameSizes_[unit.index], 1) << "]{};\n";
                             // Strings outlive all helper calls for this supernode invocation.
                             for (auto stringOffset : localStrings_[unit.index])
@@ -3107,26 +3329,38 @@ if(terminal){
             std::uint64_t portArmPortCount_ = 0, portArmTaskCount_ = 0, portArmValueCount_ = 0;
             mutable std::uint64_t dispatchPackedBytes_ = 0, handoffPackedSlots_ = 0, pflagPackedWords_ = 0;
             mutable std::uint64_t sharedEdgeBlocks_ = 0, sharedEdgePorts_ = 0;
+            bool dynamicStats_ = false;
+            std::map<std::string, std::uint32_t> dynKinds_;
+            std::uint32_t dynTaskSpan_ = 1;
+            std::uint32_t dynKind(const SimOp &op) const { return dynKinds_.at(std::string(model_.text(op.opType))); }
+            bool dynBoundary(ValueId result) const
+            {
+                return dynamicStats_ && layout_.values[result.index - 1].kind == CpuStorageKind::Boundary;
+            }
         };
 
         class EmitCppPass final : public Pass
         {
         public:
-            explicit EmitCppPass(std::filesystem::path path) : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)) {}
-            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override { return emitCpuCpp(model, path_, diagnostics); }
+            explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false)
+                : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats) {}
+            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_); }
         private:
             std::filesystem::path path_;
+            bool dynamicStats_ = false;
         };
     }
 
-    PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics)
+    PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
+                          bool dynamicStats)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
         { diagnostics.error("CPU C++ emit requires a complete schedule", "cpu.st.emit-cpp"); return {false, false, {}}; }
         try
         {
-            Emitter emitter(model); emitter.validate();
+            Emitter emitter(model, dynamicStats); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
@@ -3141,9 +3375,21 @@ if(terminal){
         std::string error;
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
-                if (args.size() != 2 || args[0] != "--output" || args[1].empty())
-                { error = "expected --output <empty-directory>"; return {}; }
-                return std::make_unique<EmitCppPass>(std::filesystem::path(args[1]));
+                if (args.empty() || args.size() % 2)
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>]"; return {}; }
+                std::filesystem::path output;
+                bool dynamicStats = false;
+                for (std::size_t i = 0; i < args.size(); i += 2)
+                {
+                    if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
+                    else if (args[i] == "--dynamic-stats" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        dynamicStats = args[i + 1] == "true";
+                    else
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>]"; return {}; }
+                }
+                if (output.empty())
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats);
             }, error)) throw std::logic_error(error);
     }
 }

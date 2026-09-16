@@ -942,7 +942,7 @@ namespace wolvrix::lib::grhsim
                 // The batch fills every byte in the contiguous range, so avoid copying
                 // the visible history into the shadow before the overwrite.
                 out << "{ // cpu_history_batch states=" << batch.count << "\n"
-                    << "auto *cpu_history=cpu_stage_bytes_overwrite(" << batch.first.index << ',' << batch.offset << ',' << batch.count
+                    << "auto *cpu_history=cpu_stage_bytes_overwrite(cpu_obj_,cpu_shadow_," << batch.first.index << ',' << batch.offset << ',' << batch.count
                     << ',' << range.offset << ',' << range.count << ",true);\n";
                 if (batch.pattern.size() == 1)
                     out << "std::memset(cpu_history,static_cast<unsigned char>(" << value(batch.pattern.front()) << ")," << batch.count << ");\n";
@@ -1010,6 +1010,19 @@ namespace wolvrix::lib::grhsim
             }
             std::string at(const Type &type, std::string_view arena, uint64_t offset) const
             { return "cpu_at<" + cppType(type) + ">(" + std::string(arena) + "," + std::to_string(offset) + ")"; }
+            // Task/helper bodies operate on restrict-qualified local copies of the
+            // three buffer bases: the compiler otherwise reloads the unique_ptr
+            // members after every store and cannot hoist buffer loads across
+            // stores, which serializes the per-state commit inner loops.
+            std::string_view arenaObjects() const { return localizeBuffers_ ? "cpu_obj_" : "cpu_objects.get()"; }
+            std::string_view arenaBoundary() const { return localizeBuffers_ ? "cpu_bnd_" : "cpu_boundary.get()"; }
+            std::string_view arenaShadow() const { return localizeBuffers_ ? "cpu_shadow_" : "cpu_shadow.get()"; }
+            void emitBufferLocals(std::ostream &out) const
+            {
+                out << "[[maybe_unused]] std::byte *__restrict const cpu_obj_=cpu_objects.get();\n"
+                    << "[[maybe_unused]] std::byte *__restrict const cpu_bnd_=cpu_boundary.get();\n"
+                    << "[[maybe_unused]] std::byte *__restrict const cpu_shadow_=cpu_shadow.get();\n";
+            }
             std::string value(ValueId value) const
             {
                 if (activeValueCache_)
@@ -1020,7 +1033,7 @@ namespace wolvrix::lib::grhsim
                 if (type(value).kind == TypeKind::String)
                     if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
                 const auto &slot = layout_.values[value.index - 1];
-                return at(type(value), slot.kind == CpuStorageKind::Boundary ? "cpu_boundary.get()" : "cpu_local", slot.offset);
+                return at(type(value), slot.kind == CpuStorageKind::Boundary ? arenaBoundary() : "cpu_local", slot.offset);
             }
             std::optional<StateId> stateReadSource(ValueId value) const
             {
@@ -1061,7 +1074,7 @@ namespace wolvrix::lib::grhsim
                 if (activeStateCache_)
                     if (const auto found = activeStateCache_->find(state.index); found != activeStateCache_->end())
                         return found->second;
-                return at(stateType(state), "cpu_objects.get()", object(ObjectRef::state(state)).offset);
+                return at(stateType(state), arenaObjects(), object(ObjectRef::state(state)).offset);
             }
             std::string literal(std::string_view text, const Type &type) const
             {
@@ -1257,7 +1270,7 @@ namespace wolvrix::lib::grhsim
                     if (!n || *n < 0) throw std::runtime_error("missing or negative CPU slice/replication parameter");
                     return static_cast<uint64_t>(*n);
                 };
-                if (name == "core.input.read") return at(result, "cpu_objects.get()", object(model_.objectRefs(op)[0]).offset);
+                if (name == "core.input.read") return at(result, arenaObjects(), object(model_.objectRefs(op)[0]).offset);
                 if (name == "core.state.read") return state({model_.objectRefs(op)[0].index, 0});
                 if (name == "core.state.memRead")
                 {
@@ -1270,7 +1283,7 @@ namespace wolvrix::lib::grhsim
                     const auto &element = model_.types()[array.elementType.index - 1];
                     if (operands.size() != 1)
                         throw std::runtime_error("CPU memory read requires one index operand");
-                    return "cpu_at<" + cppType(element) + ">(cpu_objects.get()," +
+                    return "cpu_at<" + cppType(element) + ">(" + std::string(arenaObjects()) + "," +
                            std::to_string(object(refs[0]).offset) + "+(" + raw(0) + ")*" +
                            std::to_string(storageBytes(element)) + ")";
                 }
@@ -1875,7 +1888,7 @@ namespace wolvrix::lib::grhsim
                 if (model_.text(op.opType) == "core.output.write")
                 {
                     const auto operand = model_.operands(op)[0]; const auto ref = model_.objectRefs(op)[0];
-                    out << at(type(operand), "cpu_objects.get()", object(ref).offset) << '=' << value(operand) << ";\n";
+                    out << at(type(operand), arenaObjects(), object(ref).offset) << '=' << value(operand) << ";\n";
                     return;
                 }
                 const auto result = model_.results(op)[0];
@@ -2185,7 +2198,7 @@ namespace wolvrix::lib::grhsim
                 if (batchedHistories_[target.index] || historyAliases_[target.index]) return;
                 const auto range = stateRanges_[target.index]; const auto &type = stateType(target);
                 const bool scalar = isScalarLogic(type);
-                out << (scalar ? "cpu_write_scalar<" : "cpu_stage<") << cppType(type) << ">(" << target.index << ',' << object(ObjectRef::state(target)).offset
+                out << (scalar ? "cpu_write_scalar<" : "cpu_stage<") << cppType(type) << ">(cpu_obj_,cpu_shadow_," << target.index << ',' << object(ObjectRef::state(target)).offset
                     << ',' << range.offset << ',' << range.count << ',' << (projected_[target.index] ? "true" : "false")
                     << (scalar ? "," : ")=") << normalize(std::move(expression), type) << (scalar ? ");\n" : ";\n");
             }
@@ -2195,7 +2208,7 @@ namespace wolvrix::lib::grhsim
                 const auto &array = stateType(target);
                 const auto &element = model_.types()[array.elementType.index - 1];
                 const auto range = memoryRanges_[target.index];
-                return "cpu_stage_cell(" + std::to_string(memoryDirtyBases_[target.index]) + "," +
+                return "cpu_stage_cell(cpu_obj_,cpu_shadow_," + std::to_string(memoryDirtyBases_[target.index]) + "," +
                     std::to_string(object(ObjectRef::state(target)).offset) + "," + std::to_string(storageBytes(element)) +
                     "," + row + "," + std::to_string(range.offset) + "," + std::to_string(range.count) + "," +
                     (projected_[target.index] ? "true" : "false") + ")";
@@ -2206,7 +2219,7 @@ namespace wolvrix::lib::grhsim
             {
                 const auto &element = model_.types()[stateType(target).elementType.index - 1];
                 const auto range = memoryRanges_[target.index];
-                out << "cpu_write_cell<" << cppType(element) << ',' << element.width << ">(" << memoryDirtyBases_[target.index]
+                out << "cpu_write_cell<" << cppType(element) << ',' << element.width << ">(cpu_obj_,cpu_shadow_," << memoryDirtyBases_[target.index]
                     << ',' << object(ObjectRef::state(target)).offset << ',' << row << ',' << range.offset << ',' << range.count
                     << ',' << (projected_[target.index] ? "true" : "false") << ',' << data << ',' << mask << ");\n";
             }
@@ -2370,7 +2383,8 @@ namespace wolvrix::lib::grhsim
                 {
                     // Merge against the latest shadow so repeated writes retain program order.
                     out << "const auto cpu_next=" << at(stateType(target),
-                        "(cpu_dirty[" + std::to_string(target.index) + "]?cpu_shadow.get():cpu_objects.get())",
+                        "(cpu_dirty[" + std::to_string(target.index) + "]?" + std::string(arenaShadow()) + ":" +
+                            std::string(arenaObjects()) + ")",
                         object(refs[0]).offset) << ";\n";
                     stage(out, target, "(static_cast<std::uint64_t>(cpu_next)&~static_cast<std::uint64_t>(" + value(operands[2]) +
                         "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))");
@@ -2378,7 +2392,7 @@ namespace wolvrix::lib::grhsim
                 }
                 else
                 {
-                    out << "auto &cpu_next=cpu_stage<" << cppType(stateType(target)) << ">(" << target.index << ','
+                    out << "auto &cpu_next=cpu_stage<" << cppType(stateType(target)) << ">(cpu_obj_,cpu_shadow_," << target.index << ','
                         << object(refs[0]).offset << ',' << range.offset << ',' << range.count << ','
                         << (projected_[target.index] ? "true" : "false") << ");\n";
                     if (stateType(target).kind == TypeKind::Logic && stateType(target).width > 64)
@@ -2580,26 +2594,26 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "std::array<std::size_t," << memoryReaders_.size() << "> cpu_read_offsets{};\n"
                     << "bool cpu_direct_again=false;\nvoid cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection);\n"
                     << "void cpu_direct_state_changed_one(std::uint32_t offset,std::uint8_t mask,bool arm,bool projection){cpu_direct_again=cpu_direct_again||projection;if(arm)cpu_next_arms[offset]=1;else cpu_flags[offset]|=mask;}\n"
-                    << "std::byte *cpu_stage_cell(std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
-                    << "key+=row;offset+=row*size;if(!cpu_dirty[key]){cpu_dirty[key]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({key,offset,size,begin,count,projection,true});}return cpu_shadow.get()+offset;}\n"
-                    << "template<class T,unsigned Width> void cpu_write_cell(std::size_t key,std::size_t offset,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection,std::uint64_t data,std::uint64_t mask){\n"
-                    << "key+=row;offset+=row*sizeof(T);const T current=cpu_at<T>(cpu_dirty[key]?cpu_shadow.get():cpu_objects.get(),offset);\n"
+                    << "std::byte *cpu_stage_cell(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "key+=row;offset+=row*size;if(!cpu_dirty[key]){cpu_dirty[key]=1;std::memcpy(cpu_shadow_+offset,cpu_obj_+offset,size);cpu_pending.push_back({key,offset,size,begin,count,projection,true});}return cpu_shadow_+offset;}\n"
+                    << "template<class T,unsigned Width> void cpu_write_cell(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::size_t key,std::size_t offset,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection,std::uint64_t data,std::uint64_t mask){\n"
+                    << "key+=row;offset+=row*sizeof(T);const T current=cpu_at<T>(cpu_dirty[key]?cpu_shadow_:cpu_obj_,offset);\n"
                     << "const auto merged=(static_cast<std::uint64_t>(current)&~mask)|(data&mask);\n"
                     << "const T next=static_cast<T>(std::is_signed_v<T>?grhsim_sign_extend_i64(merged,Width):grhsim_trunc_u64(merged,Width));if(current==next)return;\n"
-                    << "if(!cpu_dirty[key]){cpu_pending.push_back({key,offset,sizeof(T),begin,count,projection,true});cpu_dirty[key]=1;}cpu_at<T>(cpu_shadow.get(),offset)=next;}\n"
-                    << "template<class T> T &cpu_stage(std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection){\n"
-                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,sizeof(T));cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});}\n"
-                    << "return cpu_at<T>(cpu_shadow.get(),offset);}\n"
-                    << "template<class T> void cpu_write_scalar(std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection,T next){\n"
-                    << "const T current=cpu_at<T>(cpu_dirty[state]?cpu_shadow.get():cpu_objects.get(),offset);if(current==next)return;\n"
+                    << "if(!cpu_dirty[key]){cpu_pending.push_back({key,offset,sizeof(T),begin,count,projection,true});cpu_dirty[key]=1;}cpu_at<T>(cpu_shadow_,offset)=next;}\n"
+                    << "template<class T> T &cpu_stage(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow_+offset,cpu_obj_+offset,sizeof(T));cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});}\n"
+                    << "return cpu_at<T>(cpu_shadow_,offset);}\n"
+                    << "template<class T> void cpu_write_scalar(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::uint32_t state,std::size_t offset,std::uint32_t begin,std::uint32_t count,bool projection,T next){\n"
+                    << "const T current=cpu_at<T>(cpu_dirty[state]?cpu_shadow_:cpu_obj_,offset);if(current==next)return;\n"
                     << "if(!cpu_dirty[state]){cpu_pending.push_back({state,offset,sizeof(T),begin,count,projection});cpu_dirty[state]=1;}\n"
-                    << "cpu_at<T>(cpu_shadow.get(),offset)=next;}\n"
-                    << "std::byte *cpu_stage_bytes(std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
-                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow.get()+offset,cpu_objects.get()+offset,size);cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
-                    << "return cpu_shadow.get()+offset;}\n"
-                    << "std::byte *cpu_stage_bytes_overwrite(std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "cpu_at<T>(cpu_shadow_,offset)=next;}\n"
+                    << "std::byte *cpu_stage_bytes(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "if(!cpu_dirty[state]){cpu_dirty[state]=1;std::memcpy(cpu_shadow_+offset,cpu_obj_+offset,size);cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
+                    << "return cpu_shadow_+offset;}\n"
+                    << "std::byte *cpu_stage_bytes_overwrite(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::uint32_t state,std::size_t offset,std::size_t size,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "if(!cpu_dirty[state]){cpu_dirty[state]=1;cpu_pending.push_back({state,offset,size,begin,count,projection});}\n"
-                    << "return cpu_shadow.get()+offset;}\nbool cpu_publish();\n";
+                    << "return cpu_shadow_+offset;}\nbool cpu_publish();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "void cpu_init_" << i << "();\n";
                 for (const auto &task : schedule_.numaNodes[0].cores[0].tasks) out << "void cpu_task_" << task.id.index << "();\n";
                 for (const auto &partition : mapping_.partitionTree.partitions)
@@ -2918,14 +2932,14 @@ if(terminal){
                     offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
                     // Every byte is a distinct private history; no task can have staged it earlier.
                     if (offsets.back() - offsets.front() + 1 == offsets.size())
-                        out << "if(std::memchr(cpu_objects.get()+" << offsets.front() << ",!bool(" << eventValue(group.value) << "),"
+                        out << "if(std::memchr(" << arenaObjects() << "+" << offsets.front() << ",!bool(" << eventValue(group.value) << "),"
                             << offsets.size() << "))return false;";
                     else
                     {
                         out << "{const auto cpu_current=std::byte{static_cast<unsigned char>(bool(" << eventValue(group.value)
                             << "))};static constexpr std::size_t cpu_histories[]={";
                         for (std::size_t i = 0; i < offsets.size(); ++i) out << (i ? "," : "") << offsets[i];
-                        out << "};for(auto cpu_offset:cpu_histories)if(cpu_objects[cpu_offset]!=cpu_current)return false;}";
+                        out << "};for(auto cpu_offset:cpu_histories)if(" << arenaObjects() << "[cpu_offset]!=cpu_current)return false;}";
                     }
                 }
                 out << "return true;}())";
@@ -2945,14 +2959,14 @@ if(terminal){
                 std::ostringstream out;
                 out << "/* cpu_history_edge_scan histories=" << offsets.size() << " ranges=" << ranges.size() << " */ ";
                 if (ranges.size() == 1)
-                    out << "std::memchr(cpu_objects.get()+" << ranges[0].first << ',' << previous << ',' << ranges[0].second << ")!=nullptr";
+                    out << "std::memchr(" << arenaObjects() << "+" << ranges[0].first << ',' << previous << ',' << ranges[0].second << ")!=nullptr";
                 else
                 {
                     out << "([&](){static constexpr std::size_t cpu_history_ranges[][2]={";
                     for (std::size_t i = 0; i < ranges.size(); ++i)
                         out << (i ? "," : "") << '{' << ranges[i].first << ',' << ranges[i].second << '}';
                     out << "};for(const auto &cpu_range:cpu_history_ranges)"
-                        << "if(std::memchr(cpu_objects.get()+cpu_range[0]," << previous << ",cpu_range[1]))return true;return false;}())";
+                        << "if(std::memchr(" << arenaObjects() << "+cpu_range[0]," << previous << ",cpu_range[1]))return true;return false;}())";
                 }
                 return out.str();
             }
@@ -3082,6 +3096,8 @@ if(terminal){
                 if (task.execution == CpuExecution::ActivityDrivenCompute)
                     for (const auto &function : model_.functions()) out << dpiDeclaration(function) << '\n';
                 out << "void " << class_ << "::cpu_task_" << task.id.index << "(){\n";
+                localizeBuffers_ = true;
+                emitBufferLocals(out);
                 const auto eventCache = taskEventCache(task);
                 activeEventCache_ = &eventCache;
                 for (const auto &[event, name] : eventCache)
@@ -3278,11 +3294,13 @@ if(terminal){
                                 out << "void " << class_ << "::cpu_helper_" << unit.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word";
                                 for (const auto &param : computeGuardParams(unit, chunk)) out << ",bool " << param;
                                 out << "){\n";
+                                emitBufferLocals(out);
                                 const auto guards = computeGuardMap(unit);
                                 computeGroup(out, chunk, unit, guards);
                                 out << "}\n";
                             }
                         }
+                localizeBuffers_ = false;
             }
 
             struct Target { uint32_t offset, mask; bool arm; };
@@ -3327,6 +3345,7 @@ if(terminal){
             std::map<uint32_t, const std::vector<ValueId> *> helperReadCaches_;
             uint64_t helperReadCacheValues_ = 0;
             mutable const std::map<uint32_t, std::string> *activeValueCache_ = nullptr;
+            mutable bool localizeBuffers_ = false;
             std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
             std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
             uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0;

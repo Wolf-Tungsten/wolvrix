@@ -105,6 +105,23 @@ namespace
         return count;
     }
 
+    void checkBufferLocals(const std::filesystem::path &directory)
+    {
+        std::string source;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp" && entry.path().filename().string().find("_task_") != std::string::npos)
+            {
+                std::ifstream stream(entry.path());
+                source.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        require(source.find("std::byte *__restrict const cpu_obj_=cpu_objects.get();") != std::string::npos,
+                "task body missed the restrict-qualified objects buffer local");
+        require(source.find("std::byte *__restrict const cpu_bnd_=cpu_boundary.get();") != std::string::npos,
+                "task body missed the restrict-qualified boundary buffer local");
+        require(source.find("(cpu_obj_,") != std::string::npos, "state accesses were not routed through the objects local");
+        require(source.find("(cpu_bnd_,") != std::string::npos, "boundary accesses were not routed through the boundary local");
+    }
+
     GrhSimModel fixture()
     {
         GrhSimModel model("cpu_chain"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1054,7 +1071,7 @@ namespace
         };
         require(count("cpu_system_task(\"display\"") == 12, "compute history sharing dropped a guarded system task");
         require(count("cpu_write_scalar<bool>(") == 7, "compute history samples were not collapsed to unit representatives");
-        require(count("cpu_write_scalar<bool>(" + std::to_string(observed.index) + ",") == 2,
+        require(count("cpu_write_scalar<bool>(cpu_obj_,cpu_shadow_," + std::to_string(observed.index) + ",") == 2,
                 "history referenced by two calls lost an unconditional sample");
         // Every unit holds a same-key call pair, so each pair's repeated event guard collapses to one local.
         bool hoisted = false;
@@ -2674,6 +2691,7 @@ int main(int argc, char **argv)
         require(emittedDirectStates(directory) == std::set<uint32_t>{1, 2, 3, 4, 5}, "private commit accepted multiple writers or missed a private register/latch");
         require(checkSamplingTasks(model, directory) == 3, "input/derived/mixed-edge sampling path coverage differs");
         require(checkActivityGuards(model, directory) != 0, "activity-driven task guard coverage differs");
+        checkBufferLocals(directory);
         diag::Diagnostics repeated;
         require(!emitCpuCpp(model, directory, repeated).success, "emit overwrote nonempty directory");
         testStartup(directory / "startup");

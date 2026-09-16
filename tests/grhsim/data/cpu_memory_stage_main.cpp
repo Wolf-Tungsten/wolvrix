@@ -16,7 +16,7 @@ void testLane(GrhSIM_cpu_memory_stage &model, unsigned lane,
     model.init();
     const auto [key, offset] = memory_stage_slots[lane];
     const auto write = [&](unsigned row, std::uint64_t data, std::uint64_t mask = UINT64_MAX) {
-        model.cpu_write_cell<T, Width>(key, offset, row, 0, 0, true, data, mask);
+        model.cpu_write_cell<T, Width>(model.cpu_objects.get(), model.cpu_shadow.get(), key, offset, row, 0, 0, true, data, mask);
     };
     const auto visible = [&](unsigned row) { return cpu_at<T>(model.cpu_objects.get(), offset + row * sizeof(T)); };
     write(0, 0); write(1, UINT64_MAX, 0);
@@ -30,7 +30,7 @@ void testLane(GrhSIM_cpu_memory_stage &model, unsigned lane,
             "memory cancellation ignored the current shadow");
     require(model.cpu_pending.empty() && !model.cpu_dirty[key] && !model.cpu_dirty[key + 1],
             "memory publication retained pending/dirty rows");
-    cpu_at<T>(model.cpu_stage_cell(key, offset, sizeof(T), 2, 0, 0, true), 0) = T{1};
+    cpu_at<T>(model.cpu_stage_cell(model.cpu_objects.get(), model.cpu_shadow.get(), key, offset, sizeof(T), 2, 0, 0, true), 0) = T{1};
     write(2, 0);
     require(!model.cpu_publish() && visible(2) == 0, "cell write ignored a legacy staged value");
     write(3, 1);

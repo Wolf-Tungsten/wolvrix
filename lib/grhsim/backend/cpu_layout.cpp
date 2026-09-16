@@ -158,7 +158,41 @@ namespace wolvrix::lib::grhsim
             layout.objects.reserve(model.inputs().size() + model.outputs().size() + model.states().size());
             for (const auto &object : model.inputs()) addObject(ObjectRef::input(object.id), object.type);
             for (const auto &object : model.outputs()) addObject(ObjectRef::output(object.id), object.type);
-            for (const auto &object : model.states()) addObject(ObjectRef::state(object.id), object.type);
+            // State entries stay in id order for positional lookup; only the byte
+            // offsets are assigned in tiers.  Edge-committed scalar states are
+            // touched every cycle while array states sit in multi-megabyte
+            // regions, so their offsets form one small front tier that keeps the
+            // per-cycle commit working set cache-resident instead of scattered
+            // across the full object arena.
+            std::vector<uint32_t> stateRefs(model.states().size() + 1), stateAllowed(model.states().size() + 1),
+                stateWriters(model.states().size() + 1);
+            for (auto ref : model.objectRefPool())
+                if (ref.kind == ObjectKind::State) ++stateRefs[ref.index];
+            for (const auto &op : model.operations())
+            {
+                const auto name = model.text(op.opType);
+                const auto refs = model.objectRefs(op);
+                if (name == "core.state.read") ++stateAllowed[refs[0].index];
+                else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                { ++stateAllowed[refs[0].index]; ++stateWriters[refs[0].index]; }
+            }
+            const auto hotCommitScalar = [&](const StateObject &state) {
+                const auto &type = model.types()[state.type.index - 1];
+                return type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 0 &&
+                    type.width <= 64 && stateWriters[state.id.index] == 1 && stateRefs[state.id.index] == stateAllowed[state.id.index];
+            };
+            const auto stateBase = layout.objects.size();
+            for (const auto &object : model.states())
+                layout.objects.push_back({ObjectRef::state(object.id), {types[object.type.index], CpuStorageKind::Object, {}, 0}});
+            for (unsigned tier = 0; tier < 3; ++tier)
+                for (const auto &state : model.states())
+                {
+                    const bool isArray = model.types()[state.type.index - 1].kind == TypeKind::Array;
+                    const unsigned stateTier = hotCommitScalar(state) ? 0 : isArray ? 2 : 1;
+                    if (stateTier != tier) continue;
+                    auto &slot = layout.objects[stateBase + state.id.index - 1].slot;
+                    slot.offset = allocate(layout.objectBytes, layout.types[slot.type.index - 1]);
+                }
 
             std::vector<PartitionId> opOwners(model.operations().size() + 1);
             std::vector<uint32_t> frames(tree.partitions.size() + 1);
@@ -207,20 +241,36 @@ namespace wolvrix::lib::grhsim
                     }
                 }
             }
+            // Boundary operands of edge-commit ports are read every cycle by the
+            // commit tasks; assign them the front tier of the boundary arena.
+            std::vector<uint8_t> commitOperands(model.values().size() + 1);
+            for (const auto &op : model.operations())
+            {
+                const auto name = model.text(op.opType);
+                if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
+                const auto refs = model.objectRefs(op);
+                if (refs.empty() || refs[0].kind != ObjectKind::State ||
+                    !hotCommitScalar(model.states()[refs[0].index - 1])) continue;
+                for (auto operand : model.operands(op)) commitOperands[operand.index] = 1;
+            }
             for (const auto &value : model.values())
             {
                 auto &slot = layout.values[value.id.index - 1];
                 slot.type = types[value.type.index];
                 if (!slot.owner) throw std::runtime_error("CPU layout value has no producer");
-                const auto &type = layout.types[slot.type.index - 1];
-                if (slot.kind == CpuStorageKind::Boundary) slot.offset = allocate(layout.boundaryBytes, type);
-                else
-                {
-                    auto &frame = layout.localFrames.at(frames[slot.owner.index]);
-                    slot.offset = allocate(frame.size, type);
-                    frame.alignment = std::max(frame.alignment, type.alignment);
-                }
+                if (slot.kind == CpuStorageKind::Boundary) continue;
+                auto &frame = layout.localFrames.at(frames[slot.owner.index]);
+                slot.offset = allocate(frame.size, layout.types[slot.type.index - 1]);
+                frame.alignment = std::max(frame.alignment, layout.types[slot.type.index - 1].alignment);
             }
+            for (unsigned tier = 0; tier < 2; ++tier)
+                for (const auto &value : model.values())
+                {
+                    auto &slot = layout.values[value.id.index - 1];
+                    if (slot.kind != CpuStorageKind::Boundary ||
+                        (tier == 0) != (commitOperands[value.id.index] != 0)) continue;
+                    slot.offset = allocate(layout.boundaryBytes, layout.types[slot.type.index - 1]);
+                }
             for (auto &frame : layout.localFrames) frame.size = alignUp(frame.size, frame.alignment);
             layout.objectBytes = alignUp(layout.objectBytes, 8);
             layout.boundaryBytes = alignUp(layout.boundaryBytes, 8);

@@ -17,7 +17,7 @@ void testLane(GrhSIM_cpu_scalar_stage &model, unsigned lane, unsigned width,
 {
     model.init();
     const auto [state, offset] = scalar_stage_slots[lane];
-    const auto write = [&](T value) { model.cpu_write_scalar<T>(state, offset, 0, 0, true, value); };
+    const auto write = [&](T value) { model.cpu_write_scalar<T>(model.cpu_objects.get(), model.cpu_shadow.get(), state, offset, 0, 0, true, value); };
     const auto visible = [&] { return cpu_at<T>(model.cpu_objects.get(), offset); };
     write(T{0});
     require(model.cpu_pending.empty() && !model.cpu_dirty[state], "clean no-op created a pending write");
@@ -29,7 +29,7 @@ void testLane(GrhSIM_cpu_scalar_stage &model, unsigned lane, unsigned width,
             "write back to visible value lost cancellation semantics");
     require(model.cpu_pending.empty() && !model.cpu_dirty[state], "publication left dirty state");
     // Interoperate with a previously staged value, as required for shared shadow storage.
-    model.cpu_stage<T>(state, offset, 0, 0, true) = T{1}; write(T{0});
+    model.cpu_stage<T>(model.cpu_objects.get(), model.cpu_shadow.get(), state, offset, 0, 0, true) = T{1}; write(T{0});
     require(!model.cpu_publish() && visible() == T{0}, "full write ignored an existing shadow");
     write(T{1});
     require(model.cpu_publish() && visible() == T{1}, "changed scalar failed to publish projection");

@@ -1380,7 +1380,19 @@ namespace wolvrix::lib::grhsim
                            (kind.starts_with("logic") ? raw(1) : cast(1, width)) + ")";
                 if (kind == "not" || kind == "logicNot") return "(" + std::string(kind == "not" ? "~" : "!") + raw(0) + ")";
                 if (kind == "xnor") return "~(" + cast(0, width) + "^" + cast(1, width) + ")";
-                if (kind == "mux") return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
+                if (kind == "mux")
+                {
+                    // A two-state scalar mux is a pure bit-select.  Use the
+                    // branchless mask form so the hot compute path does not
+                    // expose a data-dependent conditional branch for every
+                    // mux result.  grhsim_mux_u64 preserves the SV condition
+                    // rule (any non-zero condition selects the true arm),
+                    // while the surrounding normalize() applies the result
+                    // width and signedness exactly as before.
+                    if (result.domain == LogicDomain::TwoState && width <= 64 && operands.size() == 3)
+                        return "grhsim_mux_u64(" + raw(0) + "," + cast(1, width) + "," + cast(2, width) + ")";
+                    return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
+                }
                 if (kind == "bitSelect") {
                     if (width == 1 && !result.isSigned)
                         return "((" + raw(0) + "&" + raw(1) + ")|((" + raw(0) + "^1)&" + raw(2) + "))";

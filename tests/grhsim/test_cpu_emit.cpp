@@ -2734,6 +2734,17 @@ int main(int argc, char **argv)
         auto scalar = scalarFixture(); canonicalize(scalar); map(scalar);
         diag::Diagnostics scalarDiagnostics;
         require(emitCpuCpp(scalar, directory / "scalar", scalarDiagnostics).success, "scalar emit failed");
+        {
+            std::string generated;
+            for (const auto &entry : std::filesystem::directory_iterator(directory / "scalar"))
+                if (entry.path().extension() == ".cpp")
+                {
+                    std::ifstream stream(entry.path());
+                    generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+                }
+            require(generated.find("grhsim_mux_u64(") != std::string::npos,
+                    "two-state scalar mux did not use the branchless mask helper");
+        }
         compileAndCompare(directory / "scalar", "cpu_scalar");
         auto wide = wideFixture(); canonicalize(wide); map(wide);
         diag::Diagnostics wideDiagnostics;

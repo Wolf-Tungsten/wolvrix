@@ -374,6 +374,23 @@ namespace wolvrix::lib::grhsim
                 {
                     error("core.dpi.call must reference its function first", context());
                 }
+                else if (opName == "core.compute.bitSelect") {
+                    bool valid = operands.size() == 3 && results.size() == 1 &&
+                                 refs.empty() && parameters.empty();
+                    TypeId typeId;
+                    const auto scalar = [&](ValueId value) {
+                        if (!validId(value, model.values().size())) return false;
+                        const auto id = model.values()[value.index - 1].type;
+                        if (!validId(id, model.types().size())) return false;
+                        const auto &type = model.types()[id.index - 1];
+                        if (!typeId) typeId = id;
+                        return id == typeId && type.kind == TypeKind::Logic &&
+                               type.domain == LogicDomain::TwoState && type.width > 0 && type.width <= 64;
+                    };
+                    for (const auto value : operands) valid &= scalar(value);
+                    for (const auto value : results) valid &= scalar(value);
+                    if (!valid) error("bitSelect requires three operands and one result of the same scalar two-state type", context());
+                }
 
                 const Parameter *edges = findParameter(model, parameters, "event_edges");
                 if (edges && !std::holds_alternative<std::vector<std::string>>(edges->value))

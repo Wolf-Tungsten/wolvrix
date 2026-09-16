@@ -122,6 +122,18 @@ operands、results 或运算语义。当前直接承接以下关键结构：
 [GRH IR 定义](../../grh/grh-ir.md)相同。其他 GRH op 只有在 core 方言中补充明确定义后才能转换，
 不能被静默展开或改写为另一种图形。
 
+### 4.1 变换产生的逐位选择
+
+`core.compute.bitSelect` 的 operands 为 `mask, whenSet, whenClear`，唯一 result
+逐位满足 `result[i] = mask[i] ? whenSet[i] : whenClear[i]`。所有 operand/result
+的完整 TypeId 相同，当前支持 1–64 位 two-state logic，无 parameters/object refs。
+signed 类型也按比特选择，最终按 result signedness 解释。例如
+`bitSelect(4'b1010, 4'b1100, 4'b0011) = 4'b1001`。
+
+这与普通 mux 的“condition 非零时选择整个 true value”语义不同。
+[bitwise-muxes](../passes/bitwise-muxes.md) 仅将全部值为 unsigned 1-bit 的
+mux 转为此 op，保留原 producer 求值与依赖。GRH lowering 不直接生成它。
+
 ## 5. 状态端口 op
 
 | op | operands | object refs | parameters | results |

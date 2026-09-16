@@ -3,6 +3,7 @@
 #include "grhsim/pass/canonicalize_compute.hpp"
 #include "grhsim/pass/clone_shared_compute.hpp"
 #include "grhsim/pass/bitwise_predicates.hpp"
+#include "grhsim/pass/bitwise_muxes.hpp"
 #include "grhsim/pass/pack_bit_registers.hpp"
 #include "grhsim/backend/cpu.hpp"
 
@@ -163,6 +164,7 @@ namespace wolvrix::lib::grhsim
         registerCanonicalizeComputePass(registry);
         registerCloneSharedComputePass(registry);
         registerBitwisePredicatesPass(registry);
+        registerBitwiseMuxesPass(registry);
         registerPackBitRegistersPass(registry);
         std::string error;
         registry.registerPass(

@@ -48,6 +48,12 @@ event/history初值和quiescence投影类别把普通单写口bit寄存器打包
 `XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1`。读slice继续提供commit旧快照，
 CPU emitter使用现有标量concat/read/slice/write路径；打包收益须由性能实测判断。
 
+最终 mapping 前运行 [`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)，
+将全部 operand/result 为 unsigned two-state bit 的 mux 转为按位选择 op，
+让 emitter 使用按位算术表达已经求值的数据选择。禁用 bit 寄存器打包时，
+此 pass 在 semantic pipeline 末尾执行。它保留 producers、依赖与共享关系，
+不改变 state/commit/DPI 的执行条件。
+
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有
 消费者。`core.compute.assign` 唯一 operand 是源值，唯一 result 是赋值结果；
 op 不得带 objectRefs 或 parameters。例如：

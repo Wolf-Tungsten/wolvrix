@@ -752,6 +752,62 @@ namespace
     }
 }
 
+namespace {
+    int runBitwiseMuxGuardsTest() {
+        using namespace grhsim;
+        for (unsigned scenario = 0; scenario < 8; ++scenario) {
+            GrhSimModel model("bitwise_mux_guards"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto type = model.logicType(scenario == 0 ? 8 : 1, scenario == 1,
+                scenario == 2 ? LogicDomain::FourState : LogicDomain::TwoState);
+            const auto input = [&](TypeId inputType) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), inputType);
+                const auto value = model.addValue(inputType);
+                model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+                return value;
+            };
+            const auto condition = input(scenario == 3 ? model.logicType(8, false, LogicDomain::TwoState) : type);
+            const auto a = input(type), b = input(scenario == 4 ? model.logicType(1, true, LogicDomain::TwoState) : type);
+            const auto result = model.addValue(type);
+            std::vector<ValueId> args{condition, a, b};
+            if (scenario == 7) args.pop_back();
+            const std::array params{Parameter{model.intern("extension"), true}};
+            const std::array refs{ObjectRef::input({1, 0})};
+            model.addOperation("core.compute.mux", args, std::array{result},
+                scenario == 6 ? std::span<const ObjectRef>(refs) : std::span<const ObjectRef>{},
+                scenario == 5 ? std::span<const Parameter>(params) : std::span<const Parameter>{});
+            PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+            manager.addPass(defaultPassRegistry().create("grhsim.bitwise-muxes", {}, error));
+            const auto outcome = manager.run(model, diagnostics);
+            if (!outcome.success || outcome.changed) return fail("bitwise mux ignored a type, shape or metadata guard");
+        }
+        for (unsigned defect = 0; defect < 7; ++defect) {
+            GrhSimModel model("invalid_bit_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto type = model.logicType(defect == 4 ? 65 : 8, false,
+                defect == 3 ? LogicDomain::FourState : LogicDomain::TwoState);
+            const auto input = [&](TypeId inputType) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), inputType);
+                const auto value = model.addValue(inputType);
+                model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+                return value;
+            };
+            const auto mask = input(type), a = input(type), b = input(type);
+            std::vector<ValueId> args{mask, a, b};
+            if (defect == 0) args.pop_back();
+            if (defect == 1) args.back() = input(model.logicType(8, true, LogicDomain::TwoState));
+            const auto result = model.addValue(defect == 2 ? model.logicType(4, false, LogicDomain::TwoState) : type);
+            const std::array params{Parameter{model.intern("extension"), true}};
+            const std::array refs{ObjectRef::input({1, 0})};
+            model.addOperation("core.compute.bitSelect", args, std::array{result},
+                defect == 5 ? std::span<const ObjectRef>(refs) : std::span<const ObjectRef>{},
+                defect == 6 ? std::span<const Parameter>(params) : std::span<const Parameter>{});
+            diag::Diagnostics diagnostics;
+            if (verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+                return fail("malformed bitSelect passed verification");
+        }
+        return 0;
+    }
+}
+
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
 #error "WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR must be defined"
 #endif
@@ -767,6 +823,7 @@ int main()
         if (const int status = runIdentityAssignTest(); status != 0) return status;
         if (const int status = runAlgebraicComputeTest(); status != 0) return status;
         if (const int status = runBitwisePredicatesTest(); status != 0) return status;
+        if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }

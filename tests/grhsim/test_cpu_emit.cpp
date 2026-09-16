@@ -1647,6 +1647,81 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testBitwiseMuxes(const std::filesystem::path &directory, bool helpers) {
+        GrhSimModel model("cpu_bit_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto signed5 = model.logicType(5, true, LogicDomain::TwoState);
+        const auto word = model.logicType(64, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto compute = [&](const char *name, TypeId type, ValueId mask, ValueId a, ValueId b) {
+            const auto value = model.addValue(type);
+            model.addOperation(name, std::array{mask, a, b}, std::array{value}); return value;
+        };
+        const auto output = [&](const char *name, ValueId value) {
+            const auto port = model.addOutput(name, model.values()[value.index - 1].type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto a = input("a", bit), b = input("b", bit), c = input("c", bit);
+        const auto clock = input("clock", bit), condition = input("condition", byte);
+        const auto y = compute("core.compute.mux", bit, c, a, b);
+        const auto nested = compute("core.compute.mux", bit, y, b, c);
+        output("selected", y); output("nested", nested);
+        output("nonbool", compute("core.compute.mux", bit, condition, a, b));
+        const auto mask5 = input("mask5", signed5), a5 = input("a5", signed5), b5 = input("b5", signed5);
+        output("selected5", compute("core.compute.bitSelect", signed5, mask5, a5, b5));
+        const auto mask64 = input("mask64", word), a64 = input("a64", word), b64 = input("b64", word);
+        output("selected64", compute("core.compute.bitSelect", word, mask64, a64, b64));
+        const auto state = [&](const char *name) {
+            const auto id = model.addState(name, bit);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto q = state("q"), r = state("r"), hq = state("hq"), hr = state("hr");
+        const auto read = [&](StateId id) {
+            const auto value = model.addValue(bit);
+            model.addOperation("core.state.read", {}, std::array{value}, std::array{ObjectRef::state(id)});
+            return value;
+        };
+        const auto oldQ = read(q), oldR = read(r), one = model.addValue(bit);
+        const std::array literal{Parameter{model.intern("value"), std::string("1")}};
+        model.addOperation("core.compute.constant", {}, std::array{one}, {}, literal);
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        model.addOperation("core.state.regWrite", std::array{one, nested, one, clock}, {},
+                           std::array{ObjectRef::state(q), ObjectRef::state(hq)}, edges);
+        model.addOperation("core.state.regWrite", std::array{one, oldQ, one, clock}, {},
+                           std::array{ObjectRef::state(r), ObjectRef::state(hr)}, edges);
+        output("registered", oldQ); output("delayed", oldR);
+        map(model);
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.bitwise-muxes", {}, error));
+        const auto first = manager.run(model, diagnostics);
+        require(first.success && first.changed && !model.cpuMapping(), "bitwise mux pass retained stale mapping");
+        const auto second = manager.run(model, diagnostics);
+        require(second.success && !second.changed, "bitwise mux pass is not idempotent");
+        unsigned converted = 0, remaining = 0;
+        for (const auto &op : model.operations()) {
+            converted += model.text(op.opType) == "core.compute.bitSelect";
+            remaining += model.text(op.opType) == "core.compute.mux";
+        }
+        require(converted == 4 && remaining == 1, "bitwise mux changed a nonboolean condition");
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        std::stringstream json;
+        require(writeGrhSimJson(model, json, defaultDialectRegistry(), diagnostics), "bitSelect JSON write failed");
+        auto restored = readGrhSimJson(json, defaultDialectRegistry(), diagnostics);
+        require(restored && emitCpuCpp(*restored, directory, diagnostics).success, "bitSelect roundtrip or emit failed");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_bit_select.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testHelperReadCaches(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_helper_read_cache"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2500,6 +2575,8 @@ int main(int argc, char **argv)
         testHelperReadCaches(directory / "read_cache_helpers", true);
         testBitwisePredicates(directory / "predicates", false);
         testBitwisePredicates(directory / "predicates_helpers", true);
+        testBitwiseMuxes(directory / "bit_select", false);
+        testBitwiseMuxes(directory / "bit_select_helpers", true);
         testPackedBitRegisters(directory / "packed_bits", false);
         testPackedBitRegisters(directory / "packed_bits_helpers", true);
         testBitPackingDomains();

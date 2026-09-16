@@ -1366,6 +1366,12 @@ namespace wolvrix::lib::grhsim
                 if (kind == "not" || kind == "logicNot") return "(" + std::string(kind == "not" ? "~" : "!") + raw(0) + ")";
                 if (kind == "xnor") return "~(" + cast(0, width) + "^" + cast(1, width) + ")";
                 if (kind == "mux") return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
+                if (kind == "bitSelect") {
+                    if (width == 1 && !result.isSigned)
+                        return "((" + raw(0) + "&" + raw(1) + ")|((" + raw(0) + "^1)&" + raw(2) + "))";
+                    return "((" + cast(0, width) + "&" + cast(1, width) + ")|(~" + cast(0, width) +
+                           "&" + cast(2, width) + "))";
+                }
                 if (kind == "shl" || kind == "lshr" || kind == "ashr")
                     return "grhsim_" + std::string(kind) + "_u64(" + cast(0, width) + ",grhsim_index_words(" + raw(1) + "," + std::to_string(width) + ")," + std::to_string(width) + ")";
                 if (kind == "div" || kind == "mod")

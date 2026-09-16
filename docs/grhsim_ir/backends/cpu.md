@@ -154,6 +154,8 @@ random 使用 legacy SplitMix64 算法，每个宽值按低字到高字写入目
 - `runtime`：active word、edge-domain arm 和 `(domain,event value,edge)` slot 各占一字节，
   owner 分别为 word 或 domain；general 域无 arm。事件历史仍使用原有语义 state 存储。
 - `objectBytes/boundaryBytes/runtimeBytes`：三个独立长期 arena 的字节数；前两者按 8 字节向上对齐。
+- `helperReadCaches`：可选的稳定输入缓存表；每项 `{firstOp, values}` 保存一个
+  最终 helper 的首个 OpId，以及需要缓存的 ValueId（升序）。表缺失时使用普通读取。
 
 所有 object slot 的 owner 为空，offset 相对于 object arena。value 的 owner 是生产者
 supernode，`partition_local` offset 相对于该 supernode frame，`boundary` offset 相对于
@@ -170,17 +172,36 @@ v1 使用 canonical layout；verifier 重新推导并逐项比较类型、覆盖
 frame 和 runtime slots，而不只是检查已有条目的 ID。所有大小计算检查 UInt64 溢出。
 输入差分影子集合仍由后续 schedule 的 input fanout 确定，本阶段不声称完成调度运行态。
 
+缓存表按最终 helper ranges 独立构建；未拆分 supernode 的整个 body 视为一个 helper。
+候选必须为非 constant、1–64 位 two-state logic 的 boundary value，在该 helper
+operand 列表中出现至少两次，且不是该 helper 内任何 op 的结果。最后一条保证缓存
+加载时值已经可用，在单线程 helper 调用期间不会被其 producer 修改。宽值、局部
+frame value、单次读取和 helper 内生产的结果均不缓存；该表不改变语义图、slot
+分配、分区、调度或任何通知。
+
+例如外部 helper 已产生 `%a`，本 helper 内有 `%b = and %a,%x`、`%c = or %a,%y`，
+则表项为 `{firstOp=producer(%b), values=[%a]}`（假定 `%b` 为第一条 op）。emitter
+在 helper 开始发射 `const auto cpu_cached_value_a = boundary[a]`，两处表达式使用
+该局部变量，`%b/%c` 的写回和激活逻辑照常执行。若本 helper 自己生产 `%a`，它不会
+进入该缓存表，以免提前读到旧值。每次 helper 调用重新创建缓存；先前调用的结果
+不会跨调用复用。state-read cache 仍按其独立的状态快照规则工作。
+
+verifier 从语义图和 helper ranges 重建并逐项比较完整缓存表，拒绝错误 firstOp、
+遗漏、重复及不稳定来源。旧 checkpoint 不含表时可以加载和原样重存，重新运行
+layout pass 后才创建缓存计划。JSON 只增加可选末尾数组，不改变先前字段的位置。
+
 JSON 的 CPU payload 从 `[stage,root,partitions]` 扩展为
 `[stage,root,partitions,layout]`，旧 stage 不输出 layout，旧 checkpoint 字节形态不变。
 `layout` 为以下固定顺序数组，所有 ID 从 1 开始，空 owner/element/event value 编码为 0：
 
 ```text
-[pointer_bytes, types, objects, values, frames, runtime, object_bytes, boundary_bytes, runtime_bytes]
+[pointer_bytes, types, objects, values, frames, runtime, object_bytes, boundary_bytes, runtime_bytes, helper_read_caches?]
 type    = [id, kind, width, element_type, count, size, alignment]
 slot    = [cpu_type, storage_kind, owner, offset]
 object  = [object_kind, object_index, slot]
 frame   = [owner, size, alignment]
 runtime = [runtime_kind, owner, event_value, edge, offset]
+helper_read_caches = [[first_op, [value, ...]], ...]
 ```
 
 枚举顺序见 C++ model 定义；未知枚举、缺失 layout 和 stage/payload 不一致均被拒绝。

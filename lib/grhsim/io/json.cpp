@@ -144,6 +144,7 @@ namespace wolvrix::lib::grhsim
             void endObject() { expect('}'); }
             void startArray() { expect('['); }
             void endArray() { expect(']'); }
+            bool comma() { return consume(','); }
             bool nextArray(bool &first)
             {
                 skipWhitespace();
@@ -571,7 +572,18 @@ namespace wolvrix::lib::grhsim
                 writer.value(slot.offset); writer.endArray();
             }
             writer.endArray(); writer.value(layout.objectBytes); writer.value(layout.boundaryBytes);
-            writer.value(layout.runtimeBytes); writer.endArray();
+            writer.value(layout.runtimeBytes);
+            if (layout.helperReadCaches)
+            {
+                writer.startArray();
+                for (const auto &cache : *layout.helperReadCaches)
+                {
+                    writer.startArray(); writeId(writer, cache.firstOp);
+                    writeIdArray<ValueId>(writer, cache.values); writer.endArray();
+                }
+                writer.endArray();
+            }
+            writer.endArray();
         }
 
         template <typename SourceId>
@@ -744,7 +756,19 @@ namespace wolvrix::lib::grhsim
             }
             expectComma(reader); layout.objectBytes = reader.unsignedInteger();
             expectComma(reader); layout.boundaryBytes = reader.unsignedInteger();
-            expectComma(reader); layout.runtimeBytes = reader.unsignedInteger(); reader.endArray();
+            expectComma(reader); layout.runtimeBytes = reader.unsignedInteger();
+            if (reader.comma())
+            {
+                layout.helperReadCaches.emplace(); reader.startArray(); first = true;
+                while (reader.nextArray(first))
+                {
+                    reader.startArray(); const auto op = readId<OpId>(reader, "cached helper first op");
+                    expectComma(reader); auto values = readIdArray<ValueId>(reader, "cached helper value");
+                    reader.endArray(); layout.helperReadCaches->push_back({op, std::move(values)});
+                }
+                reader.endArray();
+            }
+            else reader.endArray();
             return layout;
         }
 

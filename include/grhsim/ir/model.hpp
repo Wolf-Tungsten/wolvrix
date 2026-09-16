@@ -377,6 +377,13 @@ namespace wolvrix::lib::grhsim
         friend bool operator==(const CpuRuntimeSlot &, const CpuRuntimeSlot &) = default;
     };
 
+    struct CpuHelperReadCache
+    {
+        OpId firstOp;
+        std::vector<ValueId> values;
+        friend bool operator==(const CpuHelperReadCache &, const CpuHelperReadCache &) = default;
+    };
+
     struct CpuDataLayout
     {
         uint32_t pointerBytes = 8;
@@ -389,6 +396,9 @@ namespace wolvrix::lib::grhsim
         uint64_t objectBytes = 0;
         uint64_t boundaryBytes = 0;
         uint64_t runtimeBytes = 0;
+        // Optional for old checkpoints. Cache stable scalar boundary inputs
+        // referenced more than once in the helper beginning at firstOp.
+        std::optional<std::vector<CpuHelperReadCache>> helperReadCaches;
         friend bool operator==(const CpuDataLayout &, const CpuDataLayout &) = default;
     };
 

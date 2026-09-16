@@ -58,6 +58,12 @@ namespace wolvrix::lib::grhsim
                   historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size())
             {
                 for (const auto &frame : layout_.localFrames) frameSizes_[frame.owner.index] = frame.size;
+                if (layout_.helperReadCaches)
+                    for (const auto &cache : *layout_.helperReadCaches)
+                    {
+                        helperReadCaches_.emplace(cache.firstOp.index, &cache.values);
+                        helperReadCacheValues_ += cache.values.size();
+                    }
                 for (const auto &op : model_.operations())
                 {
                     for (const auto result : model_.results(op))
@@ -294,6 +300,7 @@ namespace wolvrix::lib::grhsim
                     " compute_history_alias_units=" + std::to_string(computeSharedHistoryUnits_) +
                     " compute_guard_snapshots=" + std::to_string(computeGuardSnapshots_) +
                     " compute_guard_snapshot_uses=" + std::to_string(computeGuardUses_) +
+                    " helper_read_cache_values=" + std::to_string(helperReadCacheValues_) +
                     " compute_quiescence_units=" + std::to_string(computeQuiescenceUnits_) +
                     " compute_quiescence_terms=" + std::to_string(computeQuiescenceTerms_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
@@ -990,6 +997,9 @@ namespace wolvrix::lib::grhsim
             { return "cpu_at<" + cppType(type) + ">(" + std::string(arena) + "," + std::to_string(offset) + ")"; }
             std::string value(ValueId value) const
             {
+                if (activeValueCache_)
+                    if (const auto found = activeValueCache_->find(value.index); found != activeValueCache_->end())
+                        return found->second;
                 if (!readAliases_.empty() && readAliases_[value.index]) return state(readAliases_[value.index]);
                 if (const auto it = staticScalars_.find(value.index); it != staticScalars_.end()) return it->second;
                 if (type(value).kind == TypeKind::String)
@@ -1741,6 +1751,16 @@ namespace wolvrix::lib::grhsim
                         stateCaches.emplace(index, name);
                     }
                 activeStateCache_ = &stateCaches;
+                std::map<uint32_t, std::string> valueCaches;
+                if (!ops.empty())
+                    if (const auto cache = helperReadCaches_.find(ops.front().index); cache != helperReadCaches_.end())
+                        for (const auto source : *cache->second)
+                        {
+                            const auto name = "cpu_cached_value_" + std::to_string(source.index);
+                            out << "const auto " << name << '=' << value(source) << ";\n";
+                            valueCaches.emplace(source.index, name);
+                        }
+                activeValueCache_ = &valueCaches;
                 struct ChangedGroup
                 {
                     const CpuActivationTargets *targets = nullptr;
@@ -1794,6 +1814,7 @@ namespace wolvrix::lib::grhsim
                     if (groups[i].ports) armPorts(out, *groups[i].ports, "cpu_changed_" + std::to_string(i));
                 }
                 activeStateCache_ = nullptr;
+                activeValueCache_ = nullptr;
             }
 
             void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {},
@@ -3063,6 +3084,9 @@ if(terminal){
             std::set<uint32_t> sharedHistoryTaskIds_;
             uint64_t computeSharedHistoryCount_ = 0, computeSharedHistoryUnits_ = 0;
             uint64_t computeGuardSnapshots_ = 0, computeGuardUses_ = 0;
+            std::map<uint32_t, const std::vector<ValueId> *> helperReadCaches_;
+            uint64_t helperReadCacheValues_ = 0;
+            mutable const std::map<uint32_t, std::string> *activeValueCache_ = nullptr;
             std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
             std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
             uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0;

@@ -3,6 +3,7 @@
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/io/json.hpp"
 #include "grhsim/ir/model.hpp"
+#include "grhsim/ir/verifier.hpp"
 
 #include <array>
 #include <chrono>
@@ -1646,6 +1647,108 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testHelperReadCaches(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_helper_read_cache"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto nibble = model.logicType(4, false, LogicDomain::TwoState);
+        const auto signedByte = model.logicType(8, true, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto compute = [&](const char *name, TypeId type, std::initializer_list<ValueId> args) {
+            const auto value = model.addValue(type);
+            model.addOperation(name, {args.begin(), args.size()}, std::array{value}); return value;
+        };
+        const auto output = [&](const char *name, TypeId type, ValueId value) {
+            const auto port = model.addOutput(name, type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto a = input("a", byte), b = input("b", byte);
+        const auto clock = input("clock", bit), enable = input("enable", bit);
+        const auto sum0 = compute("core.compute.add", byte, {a, b});
+        const auto sum1 = compute("core.compute.add", byte, {a, b});
+        // This boundary value has both external commit users and local users;
+        // combining its producer with those local users must disable caching.
+        const auto not0 = compute("core.compute.logicNot", bit, {enable});
+        const auto not1 = compute("core.compute.logicNot", bit, {enable});
+        output("sum", byte, sum0);
+        output("equal", byte, compute("core.compute.xor", byte, {sum0, sum0}));
+        output("not_equal", bit, compute("core.compute.xor", bit, {not0, not1}));
+        output("ab", byte, compute("core.compute.sub", byte, {a, b}));
+        output("ba", byte, compute("core.compute.sub", byte, {b, a}));
+        output("small", nibble, compute("core.compute.add", nibble, {a, b}));
+        output("signed_sum", signedByte, compute("core.compute.add", signedByte, {a, b}));
+        for (unsigned start = 0; start < 2; ++start)
+        {
+            const auto value = model.addValue(nibble);
+            const std::array params{Parameter{model.intern("sliceStart"), int64_t(start)}};
+            model.addOperation("core.compute.sliceStatic", std::array{a}, std::array{value}, {}, params);
+            output(start ? "slice1" : "slice0", nibble, value);
+        }
+        const auto state = [&](const char *name, TypeId type) {
+            const auto id = model.addState(name, type);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto mask = model.addValue(byte);
+        const std::array literal{Parameter{model.intern("value"), std::string("255")}};
+        model.addOperation("core.compute.constant", {}, std::array{mask}, {}, literal);
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            const auto q = state(i ? "reg1" : "reg0", byte), history = state(i ? "hist1" : "hist0", bit);
+            const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.state.regWrite", std::array{i ? not1 : enable, i ? sum1 : sum0, mask, clock}, {},
+                               std::array{ObjectRef::state(q), ObjectRef::state(history)}, edges);
+            const auto value = model.addValue(byte);
+            model.addOperation("core.state.read", {}, std::array{value}, std::array{ObjectRef::state(q)});
+            output(i ? "q1" : "q0", byte, value);
+        }
+        map(model, "2", helpers ? "1" : "10000");
+        const auto &layout = *model.cpuMapping()->dataLayout;
+        require(layout.helperReadCaches && !layout.helperReadCaches->empty(), "fixture missed helper read cache plan");
+        bool cachedSum = false;
+        for (const auto &cache : *layout.helperReadCaches)
+            for (const auto value : cache.values)
+                cachedSum |= value == sum0;
+        require(cachedSum, "repeated stable boundary value was not cached");
+        auto combined = model.clone(); map(combined, "128", "10000");
+        for (const auto &cache : *combined.cpuMapping()->dataLayout->helperReadCaches)
+            for (const auto value : cache.values)
+                require(value != sum0, "helper-produced boundary value was read before its definition");
+        for (unsigned defect = 0; defect < 3; ++defect)
+        {
+            auto broken = model.clone(); auto mapping = *broken.cpuMapping();
+            auto &plan = *mapping.dataLayout->helperReadCaches;
+            if (defect == 0) plan[0].firstOp = {};
+            if (defect == 1) plan[0].values.push_back(plan[0].values.front());
+            if (defect == 2) plan.pop_back();
+            broken.setCpuMapping(std::move(mapping)); diag::Diagnostics diagnostics;
+            require(!verifyGrhSimModel(broken, defaultDialectRegistry(), diagnostics), "invalid read cache plan passed verification");
+        }
+        diag::Diagnostics diagnostics; std::stringstream json;
+        require(writeGrhSimJson(model, json, defaultDialectRegistry(), diagnostics), "read cache JSON write failed");
+        auto restored = readGrhSimJson(json, defaultDialectRegistry(), diagnostics);
+        require(restored && restored->cpuMapping()->dataLayout == model.cpuMapping()->dataLayout,
+                "read cache plan did not survive JSON round-trip");
+        require(emitCpuCpp(*restored, directory, diagnostics).success, "read cache emit failed");
+        auto legacy = model.clone(); auto mapping = *legacy.cpuMapping();
+        mapping.dataLayout->helperReadCaches.reset();
+        legacy.setCpuMapping(std::move(mapping)); std::stringstream oldJson;
+        require(writeGrhSimJson(legacy, oldJson, defaultDialectRegistry(), diagnostics), "legacy layout JSON write failed");
+        auto old = readGrhSimJson(oldJson, defaultDialectRegistry(), diagnostics);
+        require(old && !old->cpuMapping()->dataLayout->helperReadCaches, "legacy layout gained a fabricated read cache plan");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_helper_read_cache.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testSharedComputeClones(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_clones"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2393,6 +2496,8 @@ int main(int argc, char **argv)
         testIdentityAssigns(directory / "identity_assign_helpers", true);
         testSharedComputeClones(directory / "clones", false);
         testSharedComputeClones(directory / "clones_helpers", true);
+        testHelperReadCaches(directory / "read_cache", false);
+        testHelperReadCaches(directory / "read_cache_helpers", true);
         testBitwisePredicates(directory / "predicates", false);
         testBitwisePredicates(directory / "predicates_helpers", true);
         testPackedBitRegisters(directory / "packed_bits", false);

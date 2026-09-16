@@ -73,7 +73,55 @@ namespace wolvrix::lib::grhsim
             std::map<std::tuple<CpuTypeKind, uint32_t, uint32_t, uint64_t>, CpuTypeId> types_;
         };
 
-        CpuDataLayout buildLayout(const GrhSimModel &model, const CpuPartitionTree &tree)
+        std::vector<CpuHelperReadCache> planHelperReadCaches(const GrhSimModel &model, const CpuPartitionTree &tree,
+                                                          const CpuDataLayout &layout)
+        {
+            std::vector<bool> constants(model.values().size() + 1);
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.compute.constant")
+                    for (const auto result : model.results(op)) constants[result.index] = true;
+            std::vector<CpuHelperReadCache> caches;
+            for (const auto &partition : tree.partitions)
+            {
+                if (partition.attrs.kind != CpuPartitionKind::Supernode || partition.children.empty()) continue;
+                std::vector<OpId> ops;
+                for (const auto child : partition.children)
+                {
+                    const auto &node = tree.partitions[child.index - 1];
+                    ops.insert(ops.end(), node.ops.begin(), node.ops.end());
+                }
+                auto chunks = partition.attrs.helperChunks;
+                if (chunks.empty()) chunks.push_back({0, static_cast<uint32_t>(ops.size())});
+                for (const auto chunk : chunks)
+                {
+                    const auto group = std::span<const OpId>(ops).subspan(chunk.offset, chunk.count);
+                    if (group.empty()) continue;
+                    std::map<uint32_t, uint32_t> uses;
+                    for (const auto id : group)
+                        for (const auto operand : model.operands(model.operations()[id.index - 1]))
+                            ++uses[operand.index];
+                    // Values produced in this helper can change during its body;
+                    // only already-available boundary inputs may be snapshotted.
+                    for (const auto id : group)
+                        for (const auto result : model.results(model.operations()[id.index - 1]))
+                            uses.erase(result.index);
+                    CpuHelperReadCache cache{group.front(), {}};
+                    for (const auto &[index, count] : uses)
+                    {
+                        const auto &type = model.types()[model.values()[index - 1].type.index - 1];
+                        if (count > 1 && !constants[index] &&
+                            layout.values[index - 1].kind == CpuStorageKind::Boundary &&
+                            type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
+                            type.width > 0 && type.width <= 64)
+                            cache.values.push_back({index, 0});
+                    }
+                    if (!cache.values.empty()) caches.push_back(std::move(cache));
+                }
+            }
+            return caches;
+        }
+
+        CpuDataLayout buildLayout(const GrhSimModel &model, const CpuPartitionTree &tree, bool readCaches = true)
         {
             CpuDataLayout layout;
             TypeMapper mapper(layout);
@@ -176,6 +224,7 @@ namespace wolvrix::lib::grhsim
             for (auto &frame : layout.localFrames) frame.size = alignUp(frame.size, frame.alignment);
             layout.objectBytes = alignUp(layout.objectBytes, 8);
             layout.boundaryBytes = alignUp(layout.boundaryBytes, 8);
+            if (readCaches) layout.helperReadCaches = planHelperReadCaches(model, tree, layout);
             return layout;
         }
 
@@ -196,7 +245,8 @@ namespace wolvrix::lib::grhsim
                 diagnostics.info("cpu_types=" + std::to_string(layout.types.size()) +
                                  " object_bytes=" + std::to_string(layout.objectBytes) +
                                  " boundary_bytes=" + std::to_string(layout.boundaryBytes) +
-                                 " runtime_bytes=" + std::to_string(layout.runtimeBytes), name());
+                                 " runtime_bytes=" + std::to_string(layout.runtimeBytes) +
+                                 " helper_read_caches=" + std::to_string(layout.helperReadCaches->size()), name());
                 auto mapping = *previous;
                 mapping.dataLayout = std::move(layout);
                 mapping.stage = CpuMappingStage::DataLayout;
@@ -216,7 +266,7 @@ namespace wolvrix::lib::grhsim
             return false;
         }
         // v1 uses a canonical layout, checking both coverage and every required lifetime boundary.
-        if (*mapping.dataLayout != buildLayout(model, mapping.partitionTree))
+        if (*mapping.dataLayout != buildLayout(model, mapping.partitionTree, mapping.dataLayout->helperReadCaches.has_value()))
         {
             diagnostics.error("CPU data layout differs from canonical types, storage or runtime slots", "cpu.layout");
             return false;

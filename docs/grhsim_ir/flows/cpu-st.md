@@ -186,6 +186,20 @@ word 只存在于 compute 枝，active ID 连续分配。helper ranges 覆盖一
 DataLayout 在最终分区后生成。跨 supernode、compute 到 commit、事件值和需保持的 DPI 结果
 使用持久存储；其余可用 partition-local 槽。布局完整性不能代替 emitter 的类型支持检查。
 
+boundary 偏移按三层分配。最前层是事件门控端点输入的致密段：compute（非 EventDomain
+子树的 EmitFunction）中，凡 unit 含带非空 `event_edges` 参数的 `core.system.task` /
+`core.dpi.call`（判据只看 op 名与参数，不看 task 编号或模块名），该 unit 直接引用的
+两态、宽度 ≤8 位的 boundary 值按消费 task 聚成一组，组间按组大小降序（同大小按 task
+分区 id 升序）、组内按 value id 升序从偏移 0 起致密分配；致密段预算 16 KiB，超预算的组
+整组回落到旧层（不拆组）。第二层是每周期被 commit task 读取的 edge-commit 写口 boundary
+操作数，第三层是其余 boundary 值（value id 顺序）。致密化只重排偏移，每个值偏移唯一、
+boundaryBytes 按对齐规则照常累计；生产者写回与消费者读取都经
+`layout.values[v].offset` 取址，天然一致。该集合是模型与分区树的确定函数，是 canonical
+布局的一部分；`verifyCpuDataLayout` 同时接受致密化前的旧 canonical 形式，使旧 checkpoint
+经重跑 `cpu.st.layout-data`（reemit remap 路径）升级，完整 SV 流程产物则始终为致密形式。
+`cpu.st.layout-data` 诊断输出 `densified_boundary_values` / `densified_bytes` /
+`densified_groups` 三个计数。
+
 SchedulePlan 的单核 task 序列先 compute 后 commit，每个函数对应一个 task，`waitsFor` 为空。
 执行条件与激活关系分开表示：
 

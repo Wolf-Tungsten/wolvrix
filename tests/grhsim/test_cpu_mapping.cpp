@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -437,6 +438,145 @@ namespace
         require(!model.cpuMapping()->dataLayout, "upstream rerun retained stale layout");
     }
 
+    void densifyBoundaryTests()
+    {
+        const auto offsetsOf = [](const GrhSimModel &model) {
+            std::vector<uint64_t> offsets;
+            for (const auto &slot : model.cpuMapping()->dataLayout->values) offsets.push_back(slot.offset);
+            return offsets;
+        };
+        const auto build = [&](bool gated, std::vector<ValueId> &narrow, std::vector<ValueId> &excluded) {
+            GrhSimModel model("densify");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto wide = model.logicType(64, false, LogicDomain::TwoState);
+            const auto quad = model.logicType(1, false, LogicDomain::FourState);
+            const auto clk = model.addInput("clk", bit);
+            const auto data = model.addInput("data", bit);
+            const auto wideIn = model.addInput("wide", wide);
+            const auto quadIn = model.addInput("quad", quad);
+            const auto read = [&](ObjectRef ref, TypeId type) {
+                const auto value = model.addValue(type);
+                const std::array results{value};
+                const std::array refs{ref};
+                model.addOperation("core.input.read", {}, results, refs);
+                return value;
+            };
+            const auto clkV = read(ObjectRef::input(clk), bit);
+            const auto dataV = read(ObjectRef::input(data), bit);
+            const auto wideV = read(ObjectRef::input(wideIn), wide);
+            const auto quadV = read(ObjectRef::input(quadIn), quad);
+            const auto join = [&](ValueId a, ValueId b, TypeId type) {
+                const auto value = model.addValue(type);
+                const std::array operands{a, b};
+                const std::array results{value};
+                model.addOperation("core.compute.and", operands, results);
+                return value;
+            };
+            const auto n0 = join(clkV, dataV, bit);
+            const auto n1 = join(n0, dataV, bit);
+            const auto n2 = join(n1, dataV, bit);
+            const auto w0 = join(wideV, wideV, wide);
+            const auto ev = join(clkV, n2, bit);
+            const std::array operands{n0, n1, n2, w0, quadV, ev};
+            const std::array refs{ObjectRef::state(state(model, bit))};
+            std::vector<Parameter> params{Parameter{model.intern("name"), std::string("$endpoint")}};
+            if (gated) params.push_back(Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}});
+            model.addOperation("core.system.task", operands, {}, refs, params);
+            prepareLayout(model, true);
+            runPass(model, "cpu.st.layout-data");
+            narrow = {n0, n1, n2, ev};
+            excluded = {w0, quadV};
+            return model;
+        };
+        std::vector<ValueId> narrow, excluded;
+        auto gated = build(true, narrow, excluded);
+        const auto &layout = *gated.cpuMapping()->dataLayout;
+        for (auto value : narrow)
+        {
+            require(layout.values[value.index - 1].kind == CpuStorageKind::Boundary,
+                    "test endpoint input is not a boundary value");
+            require(layout.values[value.index - 1].offset < narrow.size(),
+                    "event-gated endpoint boundary input was not front-packed");
+        }
+        for (auto value : excluded)
+        {
+            require(layout.values[value.index - 1].kind == CpuStorageKind::Boundary,
+                    "test excluded endpoint input is not a boundary value");
+            require(layout.values[value.index - 1].offset >= narrow.size(),
+                    "wide or four-state endpoint input entered the dense tier");
+        }
+        std::set<uint64_t> seen;
+        for (const auto &slot : layout.values)
+            if (slot.kind == CpuStorageKind::Boundary)
+                require(seen.insert(slot.offset).second, "densified layout lost offset uniqueness");
+        auto control = build(false, narrow, excluded);
+        const auto &controlLayout = *control.cpuMapping()->dataLayout;
+        bool allFront = true;
+        for (auto value : narrow)
+            allFront = allFront && controlLayout.values[value.index - 1].offset < narrow.size();
+        require(!allFront, "ungated endpoint inputs must keep the legacy tiers");
+        auto again = build(true, narrow, excluded);
+        require(offsetsOf(gated) == offsetsOf(again), "densified layout is not deterministic");
+        roundTrip(gated);
+
+        const uint32_t groupSize = 9000;  // two groups exceed the 16 KiB budget together
+        GrhSimModel budget("densify_budget");
+        budget.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = budget.logicType(1, false, LogicDomain::TwoState);
+        const auto clk = budget.addInput("clk", bit);
+        const auto data = budget.addInput("data", bit);
+        const auto read = [&](ObjectRef ref) {
+            const auto value = budget.addValue(bit);
+            const std::array results{value};
+            const std::array refs{ref};
+            budget.addOperation("core.input.read", {}, results, refs);
+            return value;
+        };
+        const auto clkV = read(ObjectRef::input(clk));
+        const auto dataV = read(ObjectRef::input(data));
+        std::vector<std::vector<ValueId>> groups(2);
+        for (auto &group : groups)
+        {
+            std::vector<ValueId> operands;
+            for (uint32_t i = 0; i + 1 < groupSize; ++i)
+            {
+                const auto value = budget.addValue(bit);
+                const std::array ops{clkV, dataV};
+                const std::array results{value};
+                budget.addOperation("core.compute.and", ops, results);
+                operands.push_back(value);
+                group.push_back(value);
+            }
+            const auto ev = budget.addValue(bit);
+            const std::array ops{clkV, dataV};
+            const std::array results{ev};
+            budget.addOperation("core.compute.and", ops, results);
+            operands.push_back(ev);
+            group.push_back(ev);
+            const std::array refs{ObjectRef::state(state(budget, bit))};
+            const std::array params{Parameter{budget.intern("name"), std::string("$endpoint")},
+                                    Parameter{budget.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            budget.addOperation("core.system.task", operands, {}, refs, params);
+        }
+        prepareLayout(budget, true);
+        runPass(budget, "cpu.st.layout-data");
+        const auto &budgetLayout = *budget.cpuMapping()->dataLayout;
+        const auto frontCount = [&](const std::vector<ValueId> &group) {
+            uint64_t count = 0;
+            for (auto value : group)
+                if (budgetLayout.values[value.index - 1].offset < groupSize) ++count;
+            return count;
+        };
+        const auto packedA = frontCount(groups[0]) == groupSize, packedB = frontCount(groups[1]) == groupSize;
+        require(packedA != packedB, "budget must select exactly one whole group");
+        require(frontCount(packedA ? groups[1] : groups[0]) == 0, "over-budget group was partially densified");
+        uint64_t frontTotal = 0;
+        for (const auto &slot : budgetLayout.values)
+            if (slot.kind == CpuStorageKind::Boundary && slot.offset < groupSize) ++frontTotal;
+        require(frontTotal == groupSize, "dense tier carries non-group values");
+    }
+
     void layoutCheckpoint(const std::filesystem::path &input, const std::filesystem::path &output)
     {
         diag::Diagnostics diagnostics;
@@ -585,6 +725,7 @@ int main(int argc, char **argv)
         unitTests();
         partitionTests();
         layoutTests();
+        densifyBoundaryTests();
         if (argc == 4 && std::string_view(argv[1]) == "--layout")
         { layoutCheckpoint(argv[2], argv[3]); return 0; }
         if (argc == 3) checkpointTest(argv[1], argv[2]);

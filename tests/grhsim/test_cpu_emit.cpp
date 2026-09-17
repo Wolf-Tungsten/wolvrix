@@ -1070,9 +1070,12 @@ namespace
             return found;
         };
         require(count("cpu_system_task(\"display\"") == 12, "compute history sharing dropped a guarded system task");
-        require(count("cpu_write_scalar<bool>(") == 7, "compute history samples were not collapsed to unit representatives");
-        require(count("cpu_write_scalar<bool>(cpu_obj_,cpu_shadow_," + std::to_string(observed.index) + ",") == 2,
-                "history referenced by two calls lost an unconditional sample");
+        require(count("cpu_write_scalar<bool>(") == 0,
+                "unit-private history samples still pay the staged write path");
+        require(count("cpu_dsample=") == 6,
+                "unit-private history representatives were not deferred-sampled once per unit block");
+        require(count("cpu_dsample=") != 0 && count("cpu_write_scalar<bool>(cpu_obj_,cpu_shadow_," + std::to_string(observed.index) + ",") == 0,
+                "history referenced by two calls lost its sample");
         // Every unit holds a same-key call pair, so each pair's repeated event guard collapses to one local.
         bool hoisted = false;
         for (const auto &message : diagnostics.messages())

@@ -298,6 +298,7 @@ namespace wolvrix::lib::grhsim
                 planHistoryBatches();
                 planPortArms();
                 planComputeQuiescence();
+                planDirectSampling();
             }
 
             std::string historyBatchSummary() const
@@ -318,6 +319,8 @@ namespace wolvrix::lib::grhsim
                     " helper_read_cache_values=" + std::to_string(helperReadCacheValues_) +
                     " compute_quiescence_units=" + std::to_string(computeQuiescenceUnits_) +
                     " compute_quiescence_terms=" + std::to_string(computeQuiescenceTerms_) +
+                    " direct_sample_states=" + std::to_string(directSampleStateCount_) +
+                    " direct_sample_units=" + std::to_string(directSampleUnitCount_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
                     " port_arm_ports=" + std::to_string(portArmPortCount_) +
                     " port_arm_tasks=" + std::to_string(portArmTaskCount_) +
@@ -607,6 +610,110 @@ namespace wolvrix::lib::grhsim
                         computeQuiescence_[unit.index] = std::move(terms);
                     }
                 }
+            }
+
+            // Direct in-place sampling for unit-private event histories. A history
+            // state referenced only by one compute unit's own edge-history positions
+            // has no state reader or activation fanout that could observe the
+            // shadow/pending/publish round trip: every in-body read (edge guards,
+            // quiescence check) sees the round-start value, and the deferred store
+            // at the unit block end becomes visible at the same time publish would
+            // have made it visible (the unit runs at most once per round and nothing
+            // else reads the state). Certified conservatively from objectRef
+            // reachability; anything doubtful keeps the staged write path.
+            void planDirectSampling()
+            {
+                directSampleStates_.assign(model_.states().size() + 1, 0);
+                const auto &tree = mapping_.partitionTree;
+                std::vector<std::uint32_t> opUnit(model_.operations().size() + 1, 0);
+                std::map<std::uint32_t, std::set<uint32_t>> unitProduced;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    {
+                        const auto &partition = tree.partitions[unit.index - 1];
+                        for (auto node : partition.children)
+                            for (auto opId : tree.partitions[node.index - 1].ops)
+                            {
+                                opUnit[opId.index] = unit.index;
+                                for (auto result : model_.results(model_.operations()[opId.index - 1]))
+                                    unitProduced[unit.index].insert(result.index);
+                            }
+                    }
+                }
+                std::vector<std::uint32_t> references(model_.states().size() + 1, 0);
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++references[ref.index];
+                std::vector<std::vector<uint32_t>> preimage(model_.states().size() + 1);
+                for (std::size_t index = 1; index < historyAliases_.size(); ++index)
+                    if (historyAliases_[index]) preimage[historyAliases_[index].index].push_back(index);
+
+                struct SampleSite { uint32_t unit; ValueId event; bool direct; };
+                std::vector<std::vector<SampleSite>> sites(model_.states().size() + 1);
+                for (const auto &op : model_.operations())
+                {
+                    const std::uint32_t unit = opUnit[op.id.index];
+                    if (!unit) continue;
+                    const auto name = model_.text(op.opType);
+                    const bool system = name == "core.system.task", dpi = name == "core.dpi.call";
+                    if (!system && !dpi) continue;
+                    const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                    if (!edges || edges->empty()) continue;
+                    const auto refs = model_.objectRefs(op);
+                    const std::size_t historyBase = dpi ? 1 : 0;
+                    if (refs.size() < historyBase + edges->size()) continue;
+                    const auto events = model_.operands(op).last(edges->size());
+                    for (std::size_t i = 0; i < edges->size(); ++i)
+                    {
+                        if (refs[historyBase + i].kind != ObjectKind::State) continue;
+                        const auto raw = refs[historyBase + i].index;
+                        const auto alias = historyAliases_[raw];
+                        const std::uint32_t resolved = alias ? alias.index : raw;
+                        sites[resolved].push_back({unit, events[i], resolved == raw});
+                    }
+                }
+                for (std::size_t index = 1; index < sites.size(); ++index)
+                {
+                    const auto &list = sites[index];
+                    if (list.empty() || historyAliases_[index] || batchedHistories_[index]) continue;
+                    std::uint32_t total = references[index];
+                    for (auto alias : preimage[index]) total += references[alias];
+                    if (total != list.size()) continue;
+                    const auto directIt = std::find_if(list.begin(), list.end(), [](const SampleSite &site) { return site.direct; });
+                    const bool oneUnit = directIt != list.end() && std::all_of(list.begin(), list.end(),
+                                                       [&](const SampleSite &site) { return site.unit == directIt->unit; });
+                    // Repeated direct samples of one state inside the unit are idempotent
+                    // when they share the event value; keep a single deferred entry.
+                    const bool sameEvent = directIt != list.end() && std::all_of(list.begin(), list.end(),
+                                                       [&](const SampleSite &site) { return site.event.index == directIt->event.index; });
+                    if (!oneUnit || !sameEvent) continue;
+                    const auto &type = stateType(StateId{static_cast<uint32_t>(index), 0});
+                    if (!isScalarLogic(type) || type.width != 1) continue;
+                    // The scheduler gives every event history a commit-fanout entry so a
+                    // resampled value re-activates its readers. Certification already
+                    // restricts readers to the sampling unit itself, which is seeded every
+                    // round (roundSeeds), so a pure self-activation entry is unobservable.
+                    const auto range = stateRanges_[index];
+                    bool selfOnly = true;
+                    for (std::uint32_t t = 0; t < range.count && selfOnly; ++t)
+                    {
+                        const auto &target = stateTargets_[range.offset + t];
+                        if (target.arm || target.offset != activeOffsets_[directIt->unit] ||
+                            target.mask != activeMasks_[directIt->unit])
+                            selfOnly = false;
+                    }
+                    if (!selfOnly) continue;
+                    const auto event = directIt->event;
+                    if (unitProduced[directIt->unit].contains(event.index) ||
+                        (!readAliases_[event.index] && layout_.values[event.index - 1].kind != CpuStorageKind::Boundary))
+                        continue;
+                    directSampleStates_[index] = 1;
+                    directSampleUnits_[directIt->unit].push_back({StateId{static_cast<uint32_t>(index), 0}, event, projected_[index]});
+                    ++directSampleStateCount_;
+                }
+                directSampleUnitCount_ = directSampleUnits_.size();
             }
 
             std::string quiescenceCheck(const std::vector<QuiescenceTerm> &terms) const
@@ -2196,6 +2303,8 @@ namespace wolvrix::lib::grhsim
             void stage(std::ostream &out, StateId target, std::string expression) const
             {
                 if (batchedHistories_[target.index] || historyAliases_[target.index]) return;
+                // Unit-private histories are sampled directly at the unit block end.
+                if (directSampleStates_[target.index]) return;
                 const auto range = stateRanges_[target.index]; const auto &type = stateType(target);
                 const bool scalar = isScalarLogic(type);
                 out << (scalar ? "cpu_write_scalar<" : "cpu_stage<") << cppType(type) << ">(cpu_obj_,cpu_shadow_," << target.index << ',' << object(ObjectRef::state(target)).offset
@@ -3272,6 +3381,11 @@ if(terminal){
                                 const auto guards = computeGuardMap(unit);
                                 computeGroup(out, ops, unit, guards);
                             }
+                            if (const auto samples = directSampleUnits_.find(unit.index); samples != directSampleUnits_.end())
+                                for (const auto &sample : samples->second)
+                                    out << "{const bool cpu_dsample=" << eventValue(sample.event) << ";if(" << state(sample.state)
+                                        << "!=cpu_dsample){" << state(sample.state) << "=cpu_dsample;"
+                                        << (sample.projection ? "cpu_direct_again=true;" : "") << "}}\n";
                             if (quiescent) out << "}\n";
                             out << "}\n";
                         }
@@ -3349,6 +3463,10 @@ if(terminal){
             std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
             std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
             uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0;
+            struct DirectSample { StateId state; ValueId event; bool projection; };
+            std::vector<char> directSampleStates_;
+            std::map<std::uint32_t, std::vector<DirectSample>> directSampleUnits_;
+            uint64_t directSampleStateCount_ = 0, directSampleUnitCount_ = 0;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;

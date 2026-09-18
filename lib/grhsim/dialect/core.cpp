@@ -47,9 +47,10 @@ namespace wolvrix::lib::grhsim
         {
             if (!registry.registerOp("core", name, error)) return false;
         }
-        constexpr std::array<std::string_view, 5> remainingOps = {
+        constexpr std::array<std::string_view, 6> remainingOps = {
             "core.compute.replicate", "core.compute.sliceStatic",
-            "core.compute.sliceDynamic", "core.compute.sliceArray", "core.compute.bitSelect"};
+            "core.compute.sliceDynamic", "core.compute.sliceArray", "core.compute.bitSelect",
+            "core.compute.prioritySelect"};
         for (std::string_view name : remainingOps)
         {
             if (!registry.registerOp("core", name, error)) return false;

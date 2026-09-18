@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -808,6 +809,170 @@ namespace {
     }
 }
 
+namespace {
+    int runMuxChainFoldTest() {
+        using namespace grhsim;
+        const auto buildChain = [](GrhSimModel &model, unsigned links, TypeId resultType,
+                                   const auto &input, ValueId dflt,
+                                   std::vector<ValueId> *conds = nullptr, std::vector<ValueId> *arms = nullptr) {
+            std::vector<ValueId> cs, as;
+            for (unsigned i = 0; i < links; ++i) {
+                cs.push_back(input(model.logicType(1, false, LogicDomain::TwoState)));
+                as.push_back(input(resultType));
+            }
+            ValueId link = dflt;
+            for (unsigned i = links; i-- > 0;) {
+                const auto value = model.addValue(resultType);
+                model.addOperation("core.compute.mux", std::array{cs[i], as[i], link}, std::array{value});
+                link = value;
+            }
+            if (conds) *conds = cs;
+            if (arms) *arms = as;
+            return link;
+        };
+        // Positive: a four-link priority chain folds into one prioritySelect and
+        // the pass is idempotent.
+        {
+            GrhSimModel model("mux_chain_fold"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto input = [&](TypeId type) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+                const auto value = model.addValue(type);
+                model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+                return value;
+            };
+            std::vector<ValueId> conds, arms;
+            const auto dflt = input(byte);
+            const auto root = buildChain(model, 4, byte, input, dflt, &conds, &arms);
+            (void)root;
+            const auto output = model.addOutput("o", byte);
+            model.addOperation("core.output.write", std::array{root}, {}, std::array{ObjectRef::output(output)});
+            PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+            manager.addPass(defaultPassRegistry().create("grhsim.mux-chain-fold", {}, error));
+            const auto first = manager.run(model, diagnostics);
+            if (!first.success || !first.changed) return fail("mux chain fold missed a four-link chain");
+            // compact() renumbers values; re-resolve the input reads by port.
+            std::map<uint32_t, ValueId> byPort;
+            unsigned selects = 0, muxes = 0;
+            const SimOp *select = nullptr;
+            for (const auto &op : model.operations()) {
+                if (model.text(op.opType) == "core.input.read")
+                    byPort.emplace(model.objectRefs(op)[0].index, model.results(op)[0]);
+                else if (model.text(op.opType) == "core.compute.prioritySelect") { ++selects; select = &op; }
+                else muxes += model.text(op.opType) == "core.compute.mux";
+            }
+            if (selects != 1 || muxes != 0 || byPort.size() != 9) return fail("mux chain fold left residual links");
+            const auto operands = model.operands(*select);
+            if (operands.size() != 9 || model.results(*select).size() != 1)
+                return fail("prioritySelect arity mismatch");
+            for (unsigned i = 0; i < 4; ++i)
+                if (operands[i] != byPort[2 * i + 2] || operands[4 + i] != byPort[2 * i + 3] || operands[8] != byPort[1])
+                    return fail("prioritySelect operand order changed");
+            bool feedsOutput = false;
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.output.write" &&
+                    model.operands(op)[0] == model.results(*select)[0]) feedsOutput = true;
+            if (!feedsOutput) return fail("prioritySelect result lost its consumer");
+            const auto second = manager.run(model, diagnostics);
+            if (!second.success || second.changed) return fail("mux chain fold is not idempotent");
+        }
+        // Guards: a two-link chain never folds; a tapped middle link stops the
+        // chain (only a long enough suffix folds); wide conditions and mismatched
+        // link result types block the fold.
+        for (unsigned scenario = 0; scenario < 3; ++scenario) {
+            GrhSimModel model("mux_chain_guards"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto word = model.logicType(16, false, LogicDomain::TwoState);
+            const auto input = [&](TypeId type) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+                const auto value = model.addValue(type);
+                model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+                return value;
+            };
+            const auto dflt = input(byte);
+            const auto muxInto = [&](ValueId c, ValueId a, ValueId b, TypeId type) {
+                const auto value = model.addValue(type);
+                model.addOperation("core.compute.mux", std::array{c, a, b}, std::array{value});
+                return value;
+            };
+            unsigned expectedSelects = 0, expectedMuxes = 0;
+            if (scenario == 0) {
+                const auto root = buildChain(model, 2, byte, input, dflt);
+                const auto output = model.addOutput("o", byte);
+                model.addOperation("core.output.write", std::array{root}, {}, std::array{ObjectRef::output(output)});
+                expectedMuxes = 2;
+            } else if (scenario == 1) {
+                // Four links, but the middle link's value is also observed: only
+                // the three-link suffix below the tap may fold.
+                const auto m4 = muxInto(input(bit), input(byte), muxInto(input(bit), input(byte), dflt, byte), byte);
+                const auto m2 = muxInto(input(bit), input(byte), m4, byte);
+                const auto m1 = muxInto(input(bit), input(byte), m2, byte);
+                const auto m0 = muxInto(input(bit), input(byte), m1, byte);
+                const auto tap = model.addOutput("tap", byte);
+                model.addOperation("core.output.write", std::array{m2}, {}, std::array{ObjectRef::output(tap)});
+                const auto output = model.addOutput("o", byte);
+                model.addOperation("core.output.write", std::array{m0}, {}, std::array{ObjectRef::output(output)});
+                expectedSelects = 1; expectedMuxes = 2;
+            } else {
+                // The deep link's condition is two bits wide and its result type
+                // differs from the root's: no fold anywhere.
+                const auto wide = model.logicType(2, false, LogicDomain::TwoState);
+                const auto m2 = muxInto(input(wide), input(word), input(word), word);
+                const auto m1 = muxInto(input(bit), input(byte), input(byte), byte);
+                const auto m0 = muxInto(input(bit), input(byte), m1, byte);
+                const auto output = model.addOutput("o", byte);
+                model.addOperation("core.output.write", std::array{m0}, {}, std::array{ObjectRef::output(output)});
+                (void)m2;
+                expectedMuxes = 3;
+            }
+            PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+            manager.addPass(defaultPassRegistry().create("grhsim.mux-chain-fold", {}, error));
+            const auto result = manager.run(model, diagnostics);
+            if (!result.success) return fail("mux chain fold rejected a guard model");
+            if (scenario == 0 && result.changed) return fail("mux chain fold rewrote a two-link chain");
+            unsigned selects = 0, muxes = 0;
+            for (const auto &op : model.operations()) {
+                selects += model.text(op.opType) == "core.compute.prioritySelect";
+                muxes += model.text(op.opType) == "core.compute.mux";
+            }
+            if (selects != expectedSelects || muxes != expectedMuxes)
+                return fail("mux chain fold ignored a multi-use, length, condition-width or type guard");
+        }
+        // The verifier rejects malformed prioritySelect shapes.
+        for (unsigned defect = 0; defect < 7; ++defect) {
+            GrhSimModel model("invalid_priority_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto input = [&](TypeId type) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+                const auto value = model.addValue(type);
+                model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+                return value;
+            };
+            std::vector<ValueId> args;
+            for (unsigned i = 0; i < 4; ++i)
+                args.push_back(input(defect == 2 && i == 1 ? model.logicType(2, false, LogicDomain::TwoState) : bit));
+            for (unsigned i = 0; i < 4; ++i)
+                args.push_back(input(defect == 3 && i == 1 ? model.logicType(8, false, LogicDomain::FourState) :
+                                     defect == 4 && i == 1 ? model.logicType(65, false, LogicDomain::TwoState) : byte));
+            args.push_back(input(byte));
+            if (defect == 0) args.pop_back();
+            if (defect == 1) { args.erase(args.begin(), args.begin() + 2); args.erase(args.begin() + 2, args.begin() + 4); }
+            const auto result = model.addValue(byte);
+            const std::array params{Parameter{model.intern("extension"), true}};
+            const std::array refs{ObjectRef::input({1, 0})};
+            model.addOperation("core.compute.prioritySelect", args, std::array{result},
+                defect == 5 ? std::span<const ObjectRef>(refs) : std::span<const ObjectRef>{},
+                defect == 6 ? std::span<const Parameter>(params) : std::span<const Parameter>{});
+            diag::Diagnostics diagnostics;
+            if (verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+                return fail("malformed prioritySelect passed verification");
+        }
+        return 0;
+    }
+}
+
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
 #error "WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR must be defined"
 #endif
@@ -824,6 +989,7 @@ int main()
         if (const int status = runAlgebraicComputeTest(); status != 0) return status;
         if (const int status = runBitwisePredicatesTest(); status != 0) return status;
         if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
+        if (const int status = runMuxChainFoldTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }

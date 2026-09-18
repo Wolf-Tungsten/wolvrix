@@ -1811,6 +1811,106 @@ namespace
                 " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testMuxChainFold(const std::filesystem::path &directory, bool helpers)
+    {
+        GrhSimModel model("cpu_mux_chain"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto output = [&](const char *name, ValueId value) {
+            const auto port = model.addOutput(name, byte);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto mux = [&](ValueId condition, ValueId onTrue, ValueId onFalse) {
+            const auto value = model.addValue(byte);
+            model.addOperation("core.compute.mux", std::array{condition, onTrue, onFalse}, std::array{value});
+            return value;
+        };
+        std::vector<ValueId> conditions;
+        for (const char *name : {"c0", "c1", "c2", "c3", "e0", "e1", "e2", "e3", "e4", "f0", "f1"})
+            conditions.push_back(input(name, bit));
+        const auto c = conditions.begin();
+        std::vector<ValueId> arms;
+        for (const char *name : {"a0", "a1", "a2", "a3", "a4"}) arms.push_back(input(name, byte));
+        const auto d = input("d", byte);
+        const auto clock = input("clock", bit);
+        // A four-link priority chain folds into one prioritySelect.
+        const auto selected = mux(c[0], arms[0], mux(c[1], arms[1], mux(c[2], arms[2], mux(c[3], arms[3], d))));
+        output("sel", selected);
+        // Two links stay plain muxes.
+        output("pair", mux(c[9], arms[0], mux(c[10], arms[1], d)));
+        // A tapped middle link blocks the head; only the three-link suffix folds.
+        const auto suffix = mux(c[6], arms[2], mux(c[7], arms[3], mux(c[8], arms[4], d)));
+        output("tapped", suffix);
+        mux(c[4], arms[0], mux(c[5], arms[1], suffix));
+        const auto state = [&](const char *name, TypeId type) {
+            const auto id = model.addState(name, type);
+            const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+            const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, initSteps, initParams); return id;
+        };
+        const auto q = state("q", byte), hq = state("hq", bit);
+        const auto qd = state("qd", byte), hqd = state("hqd", bit);
+        const auto oldQ = model.addValue(byte), oldQd = model.addValue(byte);
+        model.addOperation("core.state.read", {}, std::array{oldQ}, std::array{ObjectRef::state(q)});
+        model.addOperation("core.state.read", {}, std::array{oldQd}, std::array{ObjectRef::state(qd)});
+        const auto one = model.addValue(bit), full = model.addValue(byte);
+        const std::array oneParam{Parameter{model.intern("value"), std::string("1")}};
+        const std::array fullParam{Parameter{model.intern("value"), std::string("255")}};
+        model.addOperation("core.compute.constant", {}, std::array{one}, {}, oneParam);
+        model.addOperation("core.compute.constant", {}, std::array{full}, {}, fullParam);
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        model.addOperation("core.state.regWrite", std::array{one, selected, full, clock}, {},
+                           std::array{ObjectRef::state(q), ObjectRef::state(hq)}, edges);
+        model.addOperation("core.state.regWrite", std::array{one, oldQ, full, clock}, {},
+                           std::array{ObjectRef::state(qd), ObjectRef::state(hqd)}, edges);
+        output("qt", oldQ); output("qd", oldQd);
+        map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.mux-chain-fold", {}, error));
+        const auto folded = manager.run(model, diagnostics);
+        require(folded.success && folded.changed && !model.cpuMapping(), "mux chain fold retained stale mapping");
+        unsigned selects = 0, muxes = 0;
+        for (const auto &op : model.operations())
+        {
+            selects += model.text(op.opType) == "core.compute.prioritySelect";
+            muxes += model.text(op.opType) == "core.compute.mux";
+        }
+        require(selects == 2 && muxes == 4, "mux chain fold coverage differs");
+        std::stringstream json;
+        require(writeGrhSimJson(model, json, defaultDialectRegistry(), diagnostics), "prioritySelect JSON write failed");
+        auto restored = readGrhSimJson(json, defaultDialectRegistry(), diagnostics);
+        require(bool(restored), "prioritySelect JSON fresh load failed");
+        map(*restored, helpers ? "1" : "128", helpers ? "1" : "10000");
+        require(emitCpuCpp(*restored, directory, diagnostics).success, "mux chain model emit failed");
+        std::string generated;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp")
+            {
+                std::ifstream stream(entry.path());
+                generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        unsigned nested = 0;
+        std::istringstream lines(generated);
+        for (std::string line; std::getline(lines, line);)
+        {
+            unsigned calls = 0;
+            for (std::size_t at = 0; (at = line.find("grhsim_mux_u64(", at)) != std::string::npos; at += 15)
+                ++calls;
+            nested += calls >= 4;
+        }
+        require(nested >= 1, "prioritySelect lost the nested branchless select form");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_mux_chain.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testReplicateBroadcast(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_replicate_broadcast"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2793,6 +2893,8 @@ int main(int argc, char **argv)
         testBitwisePredicates(directory / "predicates_helpers", true);
         testBitwiseMuxes(directory / "bit_select", false);
         testBitwiseMuxes(directory / "bit_select_helpers", true);
+        testMuxChainFold(directory / "mux_chain", false);
+        testMuxChainFold(directory / "mux_chain_helpers", true);
         testDynamicStats(directory / "dynamic_stats");
         testReplicateBroadcast(directory / "replicate_broadcast", false);
         testReplicateBroadcast(directory / "replicate_broadcast_helpers", true);

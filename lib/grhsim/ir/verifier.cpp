@@ -391,6 +391,38 @@ namespace wolvrix::lib::grhsim
                     for (const auto value : results) valid &= scalar(value);
                     if (!valid) error("bitSelect requires three operands and one result of the same scalar two-state type", context());
                 }
+                else if (opName == "core.compute.prioritySelect") {
+                    // [c0..cN-1, a0..aN-1, default]: the first true condition wins.
+                    bool valid = results.size() == 1 && refs.empty() && parameters.empty() &&
+                                 operands.size() >= 7 && operands.size() % 2 == 1;
+                    if (valid) {
+                        const std::size_t count = (operands.size() - 1) / 2;
+                        valid = count <= 64;
+                        const auto valueType = [&](ValueId value) -> const Type * {
+                            if (!validId(value, model.values().size())) return nullptr;
+                            const auto id = model.values()[value.index - 1].type;
+                            if (!validId(id, model.types().size())) return nullptr;
+                            return &model.types()[id.index - 1];
+                        };
+                        const auto *resultType = valueType(results[0]);
+                        valid &= resultType && resultType->kind == TypeKind::Logic &&
+                                 resultType->domain == LogicDomain::TwoState &&
+                                 resultType->width > 0 && resultType->width <= 64;
+                        for (std::size_t i = 0; i < count && valid; ++i) {
+                            const auto *condType = valueType(operands[i]);
+                            valid &= condType && condType->kind == TypeKind::Logic &&
+                                     condType->domain == LogicDomain::TwoState &&
+                                     condType->width == 1 && !condType->isSigned;
+                        }
+                        for (std::size_t i = count; i < operands.size() && valid; ++i) {
+                            const auto *armType = valueType(operands[i]);
+                            valid &= armType && armType->kind == TypeKind::Logic &&
+                                     armType->domain == LogicDomain::TwoState &&
+                                     armType->width > 0 && armType->width <= 64;
+                        }
+                    }
+                    if (!valid) error("prioritySelect requires 2N+1 operands (3<=N<=64): N one-bit unsigned two-state conditions, N arms and one default of scalar two-state types, and one result", context());
+                }
 
                 const Parameter *edges = findParameter(model, parameters, "event_edges");
                 if (edges && !std::holds_alternative<std::vector<std::string>>(edges->value))

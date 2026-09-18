@@ -1538,6 +1538,21 @@ namespace wolvrix::lib::grhsim
                         return "grhsim_mux_u64(" + raw(0) + "," + cast(1, width) + "," + cast(2, width) + ")";
                     return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
                 }
+                if (kind == "prioritySelect")
+                {
+                    // [c0..cN-1, a0..aN-1, default]: the first true condition wins,
+                    // exactly the folded mux chain.  Emit as one right-nested
+                    // branchless select expression: the intermediate slot stores
+                    // and reloads of the link chain disappear while the per-link
+                    // mask select and casts stay bit-identical.
+                    const std::size_t count = (operands.size() - 1) / 2;
+                    if (count < 3 || count > 64)
+                        throw std::runtime_error("CPU C++ emit prioritySelect condition count is out of range");
+                    std::string expr = cast(2 * count, width);
+                    for (std::size_t i = count; i-- > 0;)
+                        expr = "grhsim_mux_u64(" + raw(i) + "," + cast(count + i, width) + "," + expr + ")";
+                    return expr;
+                }
                 if (kind == "bitSelect") {
                     if (width == 1 && !result.isSigned)
                         return "((" + raw(0) + "&" + raw(1) + ")|((" + raw(0) + "^1)&" + raw(2) + "))";

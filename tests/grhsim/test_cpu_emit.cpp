@@ -1152,6 +1152,7 @@ namespace
         require(count("cpu_gate_merge ops=2") == 1, "same-condition call pair was not merged");
         require(count("__builtin_expect") == 1, "constant-body gates did not get exactly one cold hint each");
         require(count("cpu_cold_gate") == 0, "run members must not use the singleton cold-gate form");
+        require(count("){ // cpu_edge_direction") == 3, "single-event posedge units did not get the edge-direction fast path");
     }
 
     void testHistoryCohorts(const std::filesystem::path &directory)

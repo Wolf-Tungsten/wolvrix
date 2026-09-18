@@ -319,6 +319,7 @@ namespace wolvrix::lib::grhsim
                     " helper_read_cache_values=" + std::to_string(helperReadCacheValues_) +
                     " compute_quiescence_units=" + std::to_string(computeQuiescenceUnits_) +
                     " compute_quiescence_terms=" + std::to_string(computeQuiescenceTerms_) +
+                    " edge_direction_units=" + std::to_string(edgeDirectionUnits_) +
                     " direct_sample_states=" + std::to_string(directSampleStateCount_) +
                     " direct_sample_units=" + std::to_string(directSampleUnitCount_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
@@ -554,6 +555,9 @@ namespace wolvrix::lib::grhsim
                         std::vector<QuiescenceTerm> terms;
                         std::map<uint32_t, uint32_t> termRefs;
                         bool eligible = true;
+                        uint32_t edgeEvent = 0;
+                        int edgeDirection = 0;
+                        bool edgeUniform = true;
                         for (auto id : ops)
                         {
                             if (!eligible) break;
@@ -573,6 +577,18 @@ namespace wolvrix::lib::grhsim
                                 {
                                     if (refs[historyBase + i].kind != ObjectKind::State) { eligible = false; break; }
                                     const auto event = events[i];
+                                    // The edge-direction fast path needs one shared
+                                    // (event, direction) across every guarded op.
+                                    {
+                                        const int direction = (*edges)[i] == "posedge" ? 1 : (*edges)[i] == "negedge" ? -1 : 0;
+                                        if (direction == 0) edgeUniform = false;
+                                        else if (edgeDirection == 0)
+                                        {
+                                            edgeEvent = event.index;
+                                            edgeDirection = direction;
+                                        }
+                                        else if (edgeEvent != event.index || edgeDirection != direction) edgeUniform = false;
+                                    }
                                     // Same in-unit invariance test as planComputeEdgeGuards.
                                     if (produced.contains(event.index) ||
                                         (!readAliases_[event.index] && layout_.values[event.index - 1].kind != CpuStorageKind::Boundary))
@@ -611,6 +627,11 @@ namespace wolvrix::lib::grhsim
                         if (!eligible) continue;
                         computeQuiescenceTerms_ += terms.size();
                         ++computeQuiescenceUnits_;
+                        if (edgeUniform && edgeDirection != 0)
+                        {
+                            computeEdgeDirection_[unit.index] = edgeDirection;
+                            ++edgeDirectionUnits_;
+                        }
                         computeQuiescence_[unit.index] = std::move(terms);
                     }
                 }
@@ -3532,6 +3553,21 @@ if(terminal){
                             const bool quiescent = quiescence != computeQuiescence_.end() && !quiescence->second.empty();
                             if (quiescent)
                                 out << "if(" << quiescenceCheck(quiescence->second) << "){ // cpu_quiescence_skip unit=" << unit.index << '\n';
+                            // Single-(event, direction) units are also inert while the
+                            // event sits at the inactive level: every edge guard is
+                            // false regardless of the histories. Skipping the body
+                            // there halves the activations of always-woken endpoint
+                            // units (both clock edges wake them); history sampling
+                            // below stays outside the wrapper so edge tracking is
+                            // unchanged.
+                            int edgeDirection = 0;
+                            if (quiescent)
+                                if (const auto found = computeEdgeDirection_.find(unit.index);
+                                    found != computeEdgeDirection_.end())
+                                    edgeDirection = found->second;
+                            if (edgeDirection != 0)
+                                out << "if(" << (edgeDirection < 0 ? "!" : "") << eventValue(quiescence->second.front().event)
+                                    << "){ // cpu_edge_direction\n";
                             if (dynamicStats_) out << "++cpu_dyn_sn_body[" << unit.index << "];\n";
                             out << "alignas(8) std::byte cpu_local[" << std::max<uint64_t>(frameSizes_[unit.index], 1) << "]{};\n";
                             // Strings outlive all helper calls for this supernode invocation.
@@ -3562,6 +3598,7 @@ if(terminal){
                                 const auto guards = computeGuardMap(unit);
                                 computeGroup(out, ops, unit, guards);
                             }
+                            if (edgeDirection != 0) out << "}\n";
                             if (const auto samples = directSampleUnits_.find(unit.index); samples != directSampleUnits_.end())
                                 for (const auto &sample : samples->second)
                                     out << "{const bool cpu_dsample=" << eventValue(sample.event) << ";if(" << state(sample.state)
@@ -3643,7 +3680,8 @@ if(terminal){
             mutable bool localizeBuffers_ = false;
             std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
             std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
-            uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0;
+            std::map<std::uint32_t, int> computeEdgeDirection_;
+            uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0, edgeDirectionUnits_ = 0;
             mutable uint64_t gateHoistedRuns_ = 0, gateHoistedGates_ = 0, gateMergedGates_ = 0, gateColdHints_ = 0;
             struct DirectSample { StateId state; ValueId event; bool projection; };
             std::vector<char> directSampleStates_;

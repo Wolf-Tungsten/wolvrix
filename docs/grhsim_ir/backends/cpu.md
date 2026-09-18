@@ -700,6 +700,26 @@ pending 值，外部采样者会让被跳过的采样变得可观察。检查项
 `(state(hist))!=(value(event))`，发射在 frame 清零之前。发射器诊断报告
 `compute_quiescence_units`/`compute_quiescence_terms`。
 
+### CPU C++ 端点门控链致密化
+
+event-gated 端点 supernode（assert/DPI 端点族）的体是几百个
+`if (cevent && pred) { body }` 门：事件守卫共享同一 `cpu_cevent_*` 局部量，
+`pred` 几乎总为假，门体（assert/fwrite 诊断）几乎从不执行。逐个发射时门体
+inline 在门链中，每次激活要跨过全部冷体取指。发射器在 computeGroup 内对
+**同一 guard 的连续门**做三个保持语义的结构变换：run ≥2 时外提
+`if (guard) { ... }`（G2，`guard && cond` 短路等价于嵌套）；run 内相邻且条件
+文本相同的门合并为单 `if` 多块体（G1，门体均为外部 void 调用、两调用间无仿真
+状态写，顺序与次数不变）；门体全部实参为 `core.compute.constant` 产出时条件包
+`__builtin_expect(!!(...),0)`（G3，编译器据此把从不执行的诊断体移出顺序取指
+路径；带运行时参数的事件流调用不加提示，避免惩罚频繁触发的体）。
+
+资格按 op 静态判定：须为 `core.system.task` 或空 results 的 `core.dpi.call`
+（空 results 保证无 output/inout 回写），带 computeGuardGroup 的 cachedGuard，
+且每条事件历史的 `stage()` 均为空操作（batched/aliased/direct-sampled）——
+仍有体内采样的门留在原路径，采样写位置逐字不动。常量、别名读与静态字符串等
+无发射 op 不打断 run。不同条件的门永不重排，副作用顺序保持。发射器诊断报告
+`gate_hoisted_runs`/`gate_hoisted_gates`/`gate_merged_gates`/`gate_cold_hints`。
+
 ### CPU C++ 宽位运算活动度
 
 compute word 调度沿用 legacy 局部活动字节结构：读取 `cpu_flags[wordOffset]` 到

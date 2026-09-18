@@ -337,7 +337,11 @@ namespace wolvrix::lib::grhsim
                     " handoff_packed_slots=" + std::to_string(handoffPackedSlots_) +
                     " port_arm_walk_packed_words=" + std::to_string(pflagPackedWords_) +
                     " shared_edge_blocks=" + std::to_string(sharedEdgeBlocks_) +
-                    " shared_edge_ports=" + std::to_string(sharedEdgePorts_);
+                    " shared_edge_ports=" + std::to_string(sharedEdgePorts_) +
+                    " gate_hoisted_runs=" + std::to_string(gateHoistedRuns_) +
+                    " gate_hoisted_gates=" + std::to_string(gateHoistedGates_) +
+                    " gate_merged_gates=" + std::to_string(gateMergedGates_) +
+                    " gate_cold_hints=" + std::to_string(gateColdHints_);
             }
 
             PassResult write(const std::filesystem::path &directory)
@@ -1791,6 +1795,26 @@ namespace wolvrix::lib::grhsim
                 out << "}}\n";
             }
 
+            // Call string for a resultless DPI call: validateDpiCall guarantees
+            // that a call without results has no return value and no output or
+            // inout arguments, so every formal is an input passed by value.
+            std::string dpiCallExpression(const SimOp &op) const
+            {
+                const auto &function = model_.functions()[model_.objectRefs(op)[0].index - 1];
+                const auto arguments = model_.arguments(function);
+                const auto operands = model_.operands(op);
+                std::string call = "::" + identifier(model_.text(function.symbol)) + "(";
+                std::size_t input = 1;
+                for (std::size_t i = 0; i < arguments.size(); ++i)
+                {
+                    if (i) call += ',';
+                    const auto &arg = arguments[i]; const auto &target = model_.types()[arg.type.index - 1];
+                    const auto source = value(operands[input++]);
+                    call += target.kind == TypeKind::String ? "(" + source + ").c_str()" : normalize(source, target);
+                }
+                return call + ')';
+            }
+
             void dpiCall(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &cachedGuard = {}) const
             {
                 const auto &function = model_.functions()[model_.objectRefs(op)[0].index - 1];
@@ -1858,20 +1882,25 @@ namespace wolvrix::lib::grhsim
                         throw std::runtime_error("CPU system task array arguments are not implemented");
             }
 
-            void systemTask(std::ostream &out, const SimOp &op, const std::string &cachedGuard = {}) const
+            // Extra per-op gate conjuncts (initial/first-eval and once flags).
+            std::string sideCallExtras(const SimOp &op) const
+            {
+                const auto params = model_.parameters(op);
+                const auto *proc = parameter<std::string>(model_, params, "proc_kind");
+                const auto *timed = parameter<bool>(model_, params, "has_timing");
+                std::string extras;
+                if (proc && *proc == "initial" && (!timed || !*timed)) extras += " && cpu_first_eval";
+                if (const auto once = onceTasks_.find(op.id.index); once != onceTasks_.end())
+                    extras += " && !cpu_system_done[" + std::to_string(once->second) + ']';
+                return extras;
+            }
+
+            void systemTaskBody(std::ostream &out, const SimOp &op) const
             {
                 const auto params = model_.parameters(op);
                 const auto &name = *parameter<std::string>(model_, params, "name");
-                const auto *proc = parameter<std::string>(model_, params, "proc_kind");
-                const auto *timed = parameter<bool>(model_, params, "has_timing");
                 const auto *edges = parameter<std::vector<std::string>>(model_, params, "event_edges");
                 const auto operands = model_.operands(op);
-                if (cachedGuard.empty()) out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 0) << ")";
-                else out << "if(" << cachedGuard << " && " << callCondition(operands[0]);
-                if (proc && *proc == "initial" && (!timed || !*timed)) out << " && cpu_first_eval";
-                const auto once = onceTasks_.find(op.id.index);
-                if (once != onceTasks_.end()) out << " && !cpu_system_done[" << once->second << ']';
-                out << "){\n";
                 const auto args = operands.subspan(1, operands.size() - 1 - (edges ? edges->size() : 0));
                 out << "const std::array<grhsim_task_arg," << args.size() << "> cpu_args{{";
                 for (std::size_t i = 0; i < args.size(); ++i)
@@ -1883,9 +1912,79 @@ namespace wolvrix::lib::grhsim
                     out << ')';
                 }
                 out << "}};cpu_system_task(\"" << name << "\",cpu_args);\n";
-                if (once != onceTasks_.end()) out << "cpu_system_done[" << once->second << "]=true;\n";
+                if (const auto once = onceTasks_.find(op.id.index); once != onceTasks_.end())
+                    out << "cpu_system_done[" << once->second << "]=true;\n";
+            }
+
+            void systemTask(std::ostream &out, const SimOp &op, const std::string &cachedGuard = {}) const
+            {
+                const auto operands = model_.operands(op);
+                if (cachedGuard.empty()) out << "if(" << callCondition(operands[0]) << " && (" << eventGuard(op, 0) << ")";
+                else out << "if(" << cachedGuard << " && " << callCondition(operands[0]);
+                out << sideCallExtras(op) << "){\n";
+                systemTaskBody(out, op);
                 out << "}\n";
                 sampleEvents(out, op, 0);
+            }
+
+            // Event-gated side-effect calls (system tasks and resultless DPI
+            // calls) share per-unit edge-guard locals. A maximal run of such
+            // gates on the same guard is restructured into
+            // `if (guard) { if (cond_i) { body_i } ... }`: the shared edge test
+            // is evaluated once per run instead of once per gate, and adjacent
+            // gates with textually identical conditions merge into one block.
+            // Only consecutive ops with no in-body history sampling are
+            // eligible, so side-effect order and sampling placement are
+            // preserved exactly. Gates whose arguments are all compile-time
+            // constants are emitted as unlikely so the compiler sinks the
+            // never-executed diagnostic bodies out of the sequential fetch
+            // path; calls with runtime arguments (event streams that fire
+            // often) keep the default layout.
+            struct SideGateInfo
+            {
+                std::string guard;
+                std::string condition;
+                bool constantBody = false;
+            };
+
+            std::optional<SideGateInfo> sideCallGate(const SimOp &op, const std::map<uint32_t, std::string> &guards) const
+            {
+                const auto name = model_.text(op.opType);
+                const bool system = name == "core.system.task", dpi = name == "core.dpi.call";
+                if ((!system && !dpi) || !model_.results(op).empty()) return std::nullopt;
+                const auto found = guards.find(op.id.index);
+                if (found == guards.end() || found->second.empty()) return std::nullopt;
+                const auto params = model_.parameters(op);
+                const auto *edges = parameter<std::vector<std::string>>(model_, params, "event_edges");
+                if (!edges || edges->empty()) return std::nullopt;
+                const auto refs = model_.objectRefs(op);
+                const std::size_t historyBase = dpi ? 1 : 0;
+                if (refs.size() < historyBase + edges->size()) return std::nullopt;
+                for (std::size_t i = 0; i < edges->size(); ++i)
+                {
+                    if (refs[historyBase + i].kind != ObjectKind::State) return std::nullopt;
+                    const auto index = refs[historyBase + i].index;
+                    if (!batchedHistories_[index] && !historyAliases_[index] && !directSampleStates_[index])
+                        return std::nullopt;
+                }
+                const auto operands = model_.operands(op);
+                bool constantBody = true;
+                for (const auto arg : operands.subspan(1, operands.size() - 1 - edges->size()))
+                {
+                    const auto producer = producers_[arg.index];
+                    if (!producer || model_.text(model_.operations()[producer.index - 1].opType) != "core.compute.constant")
+                    {
+                        constantBody = false;
+                        break;
+                    }
+                }
+                return SideGateInfo{found->second, callCondition(operands[0]) + sideCallExtras(op), constantBody};
+            }
+
+            void sideCallBody(std::ostream &out, const SimOp &op) const
+            {
+                if (model_.text(op.opType) == "core.system.task") { systemTaskBody(out, op); return; }
+                out << dpiCallExpression(op) << ";\n";
             }
 
             void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit,
@@ -1961,14 +2060,96 @@ namespace wolvrix::lib::grhsim
                     groupByValue.emplace(result.index, it->second);
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i) out << "bool cpu_changed_" << i << "=false;\n";
-                for (auto id : ops)
-                {
+                const auto emitOne = [&](OpId id) {
                     const auto &op = model_.operations()[id.index - 1];
                     const auto results = model_.results(op);
                     const auto found = results.size() == 1 ? groupByValue.find(results[0].index) : groupByValue.end();
                     const auto guard = guards.find(id.index);
                     compute(out, op, unit, found == groupByValue.end() ? std::string{} : "cpu_changed_" + std::to_string(found->second),
                         guard == guards.end() ? std::string{} : guard->second);
+                };
+                // Constants, aliased reads and static strings emit nothing, so they
+                // must not split a gate run (they sit between the endpoint calls in
+                // program order). compute() is a pure no-op for them.
+                const auto emitsNothing = [&](OpId id) {
+                    const auto &op = model_.operations()[id.index - 1];
+                    const auto results = model_.results(op);
+                    if (results.size() != 1) return false;
+                    const auto result = results[0];
+                    return staticScalars_.contains(result.index) || readAliases_[result.index] ||
+                        (type(result).kind == TypeKind::String && staticStrings_.contains(result.index));
+                };
+                for (std::size_t pos = 0; pos < ops.size();)
+                {
+                    if (emitsNothing(ops[pos]))
+                    {
+                        ++pos;
+                        continue;
+                    }
+                    const auto first = sideCallGate(model_.operations()[ops[pos].index - 1], guards);
+                    if (!first)
+                    {
+                        emitOne(ops[pos]);
+                        ++pos;
+                        continue;
+                    }
+                    std::vector<std::pair<OpId, SideGateInfo>> run;
+                    std::size_t end = pos;
+                    while (end < ops.size())
+                    {
+                        if (emitsNothing(ops[end]))
+                        {
+                            ++end;
+                            continue;
+                        }
+                        auto info = sideCallGate(model_.operations()[ops[end].index - 1], guards);
+                        if (!info || info->guard != first->guard) break;
+                        run.emplace_back(ops[end], std::move(*info));
+                        ++end;
+                    }
+                    if (run.size() < 2)
+                    {
+                        const auto &only = run.front();
+                        if (!only.second.constantBody) emitOne(only.first);
+                        else
+                        {
+                            ++gateColdHints_;
+                            out << "if(__builtin_expect(!!(" << only.second.guard << " && " << only.second.condition
+                                << "),0)){ // cpu_cold_gate\n{\n";
+                            sideCallBody(out, model_.operations()[only.first.index - 1]);
+                            out << "}}\n";
+                        }
+                        pos = end;
+                        continue;
+                    }
+                    ++gateHoistedRuns_;
+                    gateHoistedGates_ += run.size();
+                    out << "if(" << first->guard << "){ // cpu_gate_hoist gates=" << run.size() << "\n";
+                    for (std::size_t k = 0; k < run.size();)
+                    {
+                        std::size_t merged = k + 1;
+                        while (merged < run.size() && run[merged].second.condition == run[k].second.condition) ++merged;
+                        const bool unlikely = std::all_of(run.begin() + k, run.begin() + merged,
+                            [](const auto &entry) { return entry.second.constantBody; });
+                        if (unlikely) gateColdHints_ += merged - k;
+                        gateMergedGates_ += merged - k - 1;
+                        out << "if(";
+                        if (unlikely) out << "__builtin_expect(!!(" << run[k].second.condition << "),0)";
+                        else out << run[k].second.condition;
+                        if (merged - k > 1) out << "){ // cpu_gate_merge ops=" << merged - k << "\n";
+                        else out << "){\n";
+                        for (std::size_t j = k; j < merged; ++j)
+                        {
+                            // One scope per body: system-task bodies declare cpu_args.
+                            out << "{\n";
+                            sideCallBody(out, model_.operations()[run[j].first.index - 1]);
+                            out << "}\n";
+                        }
+                        out << "}\n";
+                        k = merged;
+                    }
+                    out << "}\n";
+                    pos = end;
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i)
                 {
@@ -3463,6 +3644,7 @@ if(terminal){
             std::map<std::uint32_t, std::vector<ComputeGuardGroup>> computeGuardGroups_;
             std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
             uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0;
+            mutable uint64_t gateHoistedRuns_ = 0, gateHoistedGates_ = 0, gateMergedGates_ = 0, gateColdHints_ = 0;
             struct DirectSample { StateId state; ValueId event; bool projection; };
             std::vector<char> directSampleStates_;
             std::map<std::uint32_t, std::vector<DirectSample>> directSampleUnits_;

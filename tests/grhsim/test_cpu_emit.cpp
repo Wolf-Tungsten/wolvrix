@@ -1082,8 +1082,76 @@ namespace
             hoisted |= message.message.find("compute_guard_snapshots=6 compute_guard_snapshot_uses=12 ") != std::string::npos;
         require(hoisted, "compute guard hoisting missed same-unit repeated event guards");
         require(count("const bool cpu_cevent_") == 6, "compute guard locals were not emitted once per unit key");
-        require(count("if(cpu_cevent_") == 12, "guarded system tasks did not consume the hoisted event guard");
+        require(count("cpu_cold_gate") == 12, "constant-body guarded calls did not get the cold-body hint");
         require(count("(false ||") == 6, "repeated event guard expressions were not collapsed");
+    }
+
+    void testGateCompaction(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_gate_compaction"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name) {
+            const auto id = model.addInput(name, bit); const auto value = model.addValue(bit);
+            const std::array results{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto clock = input("clock"), enableA = input("enableA"), enableB = input("enableB");
+        const auto dataId = model.addInput("data", byte); const auto data = model.addValue(byte);
+        {   const std::array results{data}; const std::array refs{ObjectRef::input(dataId)};
+            model.addOperation("core.input.read", {}, results, refs); }
+        const auto history = [&] {
+            const auto id = model.addState("h" + std::to_string(model.states().size()), bit);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, params); return id;
+        };
+        const auto display = [&](ValueId condition) {
+            const std::array operands{condition, clock};
+            const std::array refs{ObjectRef::state(history())};
+            const std::array params{Parameter{model.intern("name"), std::string("display")},
+                Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.system.task", operands, {}, refs, params);
+        };
+        // Same-condition constant-body pair: must merge under one hoisted guard.
+        display(enableA); display(enableA);
+        // Distinct constant-body condition: hoisted, hinted, not merged.
+        display(enableB);
+        // Runtime-argument gate: hoisted but never hinted.
+        {
+            const std::array operands{enableB, data, clock};
+            const std::array refs{ObjectRef::state(history())};
+            const std::array params{Parameter{model.intern("name"), std::string("display")},
+                Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.system.task", operands, {}, refs, params);
+        }
+        map(model, "2", "1000000");
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "gate compaction emit failed");
+        bool stats = false;
+        for (const auto &message : diagnostics.messages())
+        {
+            if (message.message.find("gate_hoisted_runs=") != std::string::npos) std::cout << message.message << '\n';
+            stats |= message.message.find("gate_hoisted_runs=1 gate_hoisted_gates=2 gate_merged_gates=1 gate_cold_hints=2") != std::string::npos;
+        }
+        require(stats, "gate compaction statistics did not match the fixture shape");
+        std::string source;
+        for (const auto &file : std::filesystem::directory_iterator(directory))
+            if (file.path().extension() == ".cpp")
+            {
+                std::ifstream stream(file.path());
+                source.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        const auto count = [&](const std::string &needle) {
+            std::size_t found = 0, at = 0;
+            while ((at = source.find(needle, at)) != std::string::npos) { ++found; at += needle.size(); }
+            return found;
+        };
+        require(count("cpu_system_task(\"display\"") == 4, "gate compaction dropped a guarded system task");
+        require(count("if(cpu_cevent_") == 1, "same-guard calls were not grouped under one hoisted guard per unit");
+        require(count("cpu_gate_merge ops=2") == 1, "same-condition call pair was not merged");
+        require(count("__builtin_expect") == 1, "constant-body gates did not get exactly one cold hint each");
+        require(count("cpu_cold_gate") == 0, "run members must not use the singleton cold-gate form");
     }
 
     void testHistoryCohorts(const std::filesystem::path &directory)
@@ -2708,6 +2776,7 @@ int main(int argc, char **argv)
         testStableHistorySkip(directory / "stable_history");
         testRandomHistorySharingFallback(directory / "random_history");
         testComputeHistorySharing(directory / "compute_history");
+        testGateCompaction(directory / "gate_compaction");
         testHistoryCohorts(directory / "history_cohorts");
         testPrivateCommits(directory / "private_commits");
         testSharedCommitEdges(directory / "notifications", "128", "10000");

@@ -1911,6 +1911,110 @@ namespace
                 " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    void testCommitCompactWalk(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_commit_batch"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto word = model.logicType(64, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto state = [&](const char *name, TypeId type) {
+            const auto id = model.addState(name, type);
+            const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+            const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, initSteps, initParams); return id;
+        };
+        const auto compute = [&](const char *op, TypeId type, std::initializer_list<ValueId> args) {
+            const auto value = model.addValue(type);
+            model.addOperation(op, {args.begin(), args.size()}, std::array{value}); return value;
+        };
+        const auto constant = [&](const char *text) {
+            const auto value = model.addValue(word);
+            const std::array params{Parameter{model.intern("value"), std::string(text)}};
+            model.addOperation("core.compute.constant", {}, std::array{value}, {}, params); return value;
+        };
+        const auto clock = input("clock", bit), enw = input("enw", word), dw = input("dw", word);
+        const auto fullMask = constant("64'hffffffffffffffff");
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        ValueId folded;
+        // 64 uniform u64 full-mask ports form one full compact-walk group.
+        for (unsigned i = 0; i < 64; ++i)
+        {
+            const auto enBit = model.addValue(bit);
+            {
+                const std::array ops{enw};
+                const std::array params{Parameter{model.intern("sliceStart"), static_cast<long long>(i)},
+                                        Parameter{model.intern("sliceEnd"), static_cast<long long>(i)}};
+                model.addOperation("core.compute.sliceStatic", ops, std::array{enBit}, {}, params);
+            }
+            const auto step = constant(std::to_string(i).c_str());
+            const auto data = compute("core.compute.add", word, {dw, step});
+            const auto suffix = std::to_string(i);
+            const auto q = state(("q" + suffix).c_str(), word), hq = state(("hq" + suffix).c_str(), bit);
+            model.addOperation("core.state.regWrite", std::array{enBit, data, fullMask, clock}, {},
+                               std::array{ObjectRef::state(q), ObjectRef::state(hq)}, edges);
+            const auto read = model.addValue(word);
+            model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(q)});
+            if (!folded) folded = read;
+            else
+            {
+                const auto next = model.addValue(word);
+                model.addOperation("core.compute.xor", std::array{folded, read}, std::array{next});
+                folded = next;
+            }
+        }
+        // One variable-mask port and one constant-enable port share the edge but must
+        // stay in the per-bit walk (the latter has no boundary-resident enable byte).
+        const auto enm = input("enm", bit), dm = input("dm", word), mm = input("mm", word);
+        const auto qm = state("qm", word), hqm = state("hqm", bit);
+        model.addOperation("core.state.regWrite", std::array{enm, dm, mm, clock}, {},
+                           std::array{ObjectRef::state(qm), ObjectRef::state(hqm)}, edges);
+        const auto constEnable = model.addValue(bit);
+        {
+            const std::array params{Parameter{model.intern("value"), std::string("1")}};
+            model.addOperation("core.compute.constant", {}, std::array{constEnable}, {}, params);
+        }
+        const auto dc = input("dc", word);
+        const auto qc = state("qc", word), hqc = state("hqc", bit);
+        model.addOperation("core.state.regWrite", std::array{constEnable, dc, fullMask, clock}, {},
+                           std::array{ObjectRef::state(qc), ObjectRef::state(hqc)}, edges);
+        const auto readM = model.addValue(word);
+        model.addOperation("core.state.read", {}, std::array{readM}, std::array{ObjectRef::state(qm)});
+        const auto readC = model.addValue(word);
+        model.addOperation("core.state.read", {}, std::array{readC}, std::array{ObjectRef::state(qc)});
+        const auto mix1 = model.addValue(word);
+        model.addOperation("core.compute.xor", std::array{folded, readM}, std::array{mix1});
+        const auto mixed = model.addValue(word);
+        model.addOperation("core.compute.xor", std::array{mix1, readC}, std::array{mixed});
+        const auto out = model.addOutput("x", word);
+        model.addOperation("core.output.write", std::array{mixed}, {}, std::array{ObjectRef::output(out)});
+        map(model);
+        diag::Diagnostics diagnostics;
+        const auto emitted = emitCpuCpp(model, directory, diagnostics, false, true);
+        require(emitted.success, "commit compact walk emit failed");
+        std::string generated;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp")
+            {
+                std::ifstream stream(entry.path());
+                generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        require(generated.find("// cpu_compact_walk") != std::string::npos, "uniform u64 group was not compact-walked");
+        require(generated.find("__builtin_ctzll(cpu_todo)") != std::string::npos, "compact walk lost the ctz iteration");
+        require(generated.find("if(cpu_armed&1){") != std::string::npos,
+                "variable-mask port left the per-bit walk");
+        require(generated.find("grhsim_trunc_u64(UINT64_C(18446744073709551615),1))") != std::string::npos,
+                "constant-enable port left the per-bit walk");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_commit_batch.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testReplicateBroadcast(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_replicate_broadcast"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2895,6 +2999,7 @@ int main(int argc, char **argv)
         testBitwiseMuxes(directory / "bit_select_helpers", true);
         testMuxChainFold(directory / "mux_chain", false);
         testMuxChainFold(directory / "mux_chain_helpers", true);
+        testCommitCompactWalk(directory / "commit_batch");
         testDynamicStats(directory / "dynamic_stats");
         testReplicateBroadcast(directory / "replicate_broadcast", false);
         testReplicateBroadcast(directory / "replicate_broadcast_helpers", true);

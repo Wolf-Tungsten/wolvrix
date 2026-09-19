@@ -47,7 +47,7 @@ namespace wolvrix::lib::grhsim
         class Emitter
         {
         public:
-            explicit Emitter(const GrhSimModel &model, bool dynamicStats = false)
+            explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -55,7 +55,8 @@ namespace wolvrix::lib::grhsim
                   projected_(stateRanges_.size()), fanout_(model.values().size() + 1), producers_(model.values().size() + 1),
                   batchedHistories_(stateRanges_.size()),
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
-                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()), dynamicStats_(dynamicStats)
+                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()), dynamicStats_(dynamicStats),
+                  commitCompactWalk_(commitCompactWalk)
             {
                 if (dynamicStats_)
                 {
@@ -342,7 +343,9 @@ namespace wolvrix::lib::grhsim
                     " gate_hoisted_runs=" + std::to_string(gateHoistedRuns_) +
                     " gate_hoisted_gates=" + std::to_string(gateHoistedGates_) +
                     " gate_merged_gates=" + std::to_string(gateMergedGates_) +
-                    " gate_cold_hints=" + std::to_string(gateColdHints_);
+                    " gate_cold_hints=" + std::to_string(gateColdHints_) +
+                    " commit_compact_groups=" + std::to_string(commitCompactGroups_) +
+                    " commit_compact_ports=" + std::to_string(commitCompactPorts_);
             }
 
             PassResult write(const std::filesystem::path &directory)
@@ -2568,6 +2571,151 @@ namespace wolvrix::lib::grhsim
                 return guard;
             }
 
+            // Parsed value of a two-state scalar constant (≤64 bits), if the value's
+            // producer is a core.compute.constant.
+            std::optional<std::uint64_t> scalarConstantValue(ValueId operand) const
+            {
+                if (!operand || operand.index >= producers_.size()) return {};
+                const auto producer = producers_[operand.index];
+                if (!producer) return {};
+                const auto &op = model_.operations()[producer.index - 1];
+                if (model_.text(op.opType) != "core.compute.constant") return {};
+                const auto &operandType = type(operand);
+                if (operandType.kind != TypeKind::Logic || operandType.domain != LogicDomain::TwoState ||
+                    operandType.width == 0 || operandType.width > 64)
+                    return {};
+                const auto params = model_.parameters(op);
+                const auto *text = parameter<std::string>(model_, params, "value");
+                if (!text) text = parameter<std::string>(model_, params, "constValue");
+                if (!text) return {};
+                try
+                {
+                    auto parsed = slang::SVInt::fromString(*text).resize(operandType.width);
+                    parsed.flattenUnknowns();
+                    return parsed.as<std::uint64_t>();
+                }
+                catch (const std::exception &)
+                {
+                    return {};
+                }
+            }
+
+            // All-ones 64-bit two-state constant masks make the commit merge the identity:
+            // next == data, so the compact walk can compare current against data directly.
+            bool isAllOnesConstant64(ValueId operand) const
+            {
+                if (type(operand).width != 64) return false;
+                const auto bits = scalarConstantValue(operand);
+                return bits && *bits == std::numeric_limits<std::uint64_t>::max();
+            }
+
+            // Emit one full 64-port pflag word-group as a compact walk: the arm bits
+            // loaded as one uint64 drive a ctz iteration that visits exactly the armed
+            // ports (unarmed ports cost nothing), while the per-port commit bodies share
+            // one generic loop reading per-port descriptors (state/enable/data boundary
+            // offsets and notify constants) instead of inline constant test chains.
+            // Eligibility: every port of the group is a single-writer direct-commit
+            // u64 two-state regWrite/latchWrite with an all-ones mask (next == data) and
+            // a single-target notification. Evaluating an armed port is identical to the
+            // per-bit walk (enable gate, current != data, store, notify), in the same
+            // ascending port order; the group's bytes are consumed as a whole exactly
+            // like the portMask==255 per-byte clear under a uniform guard.
+            bool emitCommitCompactWalk(
+                std::ostream &out,
+                const std::vector<std::map<std::uint32_t, std::vector<OpId>>::const_iterator> &group, std::uint32_t base) const
+            {
+                if (!commitCompactWalk_ || group.size() != 8) return false;
+                struct Lane
+                {
+                    std::uint32_t stateOffset = 0, enableOffset = 0, dataOffset = 0, notifyOffset = 0;
+                    std::uint8_t notifyMask = 0, notifyFlags = 0;
+                    bool present = false;
+                };
+                std::array<Lane, 64> lanes;
+                for (auto entry : group)
+                {
+                    if (entry->second.size() != 8) return false;
+                    for (const auto opId : entry->second)
+                    {
+                        const auto &operation = model_.operations()[opId.index - 1];
+                        const auto name = model_.text(operation.opType);
+                        if (name != "core.state.regWrite" && name != "core.state.latchWrite") return false;
+                        const auto refs = model_.objectRefs(operation);
+                        const auto operands = model_.operands(operation);
+                        if (refs.empty() || refs[0].kind != ObjectKind::State || operands.size() < 3) return false;
+                        const StateId target{refs[0].index, 0};
+                        if (!directCommitStates_[target.index]) return false;
+                        const auto &targetType = stateType(target);
+                        if (targetType.kind != TypeKind::Logic || targetType.domain != LogicDomain::TwoState ||
+                            targetType.width != 64)
+                            return false;
+                        if (!isAllOnesConstant64(operands[2])) return false;
+                        // Constant operands render as literals via value(); their layout
+                        // slots are not live boundary storage. A constant enable is folded
+                        // into the descriptor flags; a constant data stays a fallback.
+                        Lane &lane = lanes[(entry->first - base) * 8 + portArmBits_[opId.index]];
+                        bool enableConstant = false;
+                        std::uint64_t enableConstValue = 0;
+                        if (const auto enableBits = scalarConstantValue(operands[0]))
+                        {
+                            if (*enableBits > 1) return false;
+                            enableConstant = true;
+                            enableConstValue = *enableBits;
+                        }
+                        else if (staticScalars_.count(operands[0].index))
+                            return false;
+                        if (staticScalars_.count(operands[1].index)) return false;
+                        const auto &enableSlot = layout_.values[operands[0].index - 1];
+                        const auto &dataSlot = layout_.values[operands[1].index - 1];
+                        if (!enableConstant && enableSlot.kind != CpuStorageKind::Boundary) return false;
+                        if (dataSlot.kind != CpuStorageKind::Boundary) return false;
+                        const auto range = stateRanges_[target.index];
+                        if (!projected_[target.index] && !range.count) return false;
+                        if (range.count != 1) return false;
+                        const auto &notification = stateTargets_[range.offset];
+                        lane.present = true;
+                        lane.stateOffset = static_cast<std::uint32_t>(object(ObjectRef::state(target)).offset);
+                        lane.enableOffset = static_cast<std::uint32_t>(enableSlot.offset);
+                        lane.dataOffset = static_cast<std::uint32_t>(dataSlot.offset);
+                        lane.notifyOffset = notification.offset;
+                        lane.notifyMask = notification.mask;
+                        lane.notifyFlags = (notification.arm ? 1 : 0) | (projected_[target.index] ? 2 : 0) |
+                                           (enableConstant ? 4 : 0) | (enableConstValue ? 8 : 0);
+                    }
+                }
+                for (const auto &lane : lanes) if (!lane.present) return false;
+                ++commitCompactGroups_;
+                commitCompactPorts_ += 64;
+                out << "{ // cpu_compact_walk\n"
+                    << "static constexpr std::uint32_t cpu_cw_state[64]={";
+                for (const auto &lane : lanes) out << lane.stateOffset << ',';
+                out << "};\nstatic constexpr std::uint32_t cpu_cw_enable[64]={";
+                for (const auto &lane : lanes) out << lane.enableOffset << ',';
+                out << "};\nstatic constexpr std::uint32_t cpu_cw_data[64]={";
+                for (const auto &lane : lanes) out << lane.dataOffset << ',';
+                out << "};\nstatic constexpr std::uint32_t cpu_cw_ntf[64]={";
+                for (const auto &lane : lanes) out << lane.notifyOffset << ',';
+                out << "};\nstatic constexpr std::uint8_t cpu_cw_nfmask[64]={";
+                for (const auto &lane : lanes) out << static_cast<unsigned>(lane.notifyMask) << ',';
+                out << "};\nstatic constexpr std::uint8_t cpu_cw_nfflags[64]={";
+                for (const auto &lane : lanes) out << static_cast<unsigned>(lane.notifyFlags) << ',';
+                out << "};\n";
+                out << "std::uint64_t cpu_todo=cpu_word8(cpu_pflags.data()," << base << ",8);\nif(cpu_todo){\n"
+                    << "{const std::uint64_t cpu_zero=0;std::memcpy(cpu_pflags.data()+" << base << ",&cpu_zero,8);}\n"
+                    << "do{const unsigned cpu_i=__builtin_ctzll(cpu_todo);cpu_todo&=cpu_todo-1;\n";
+                if (dynamicStats_) out << "++cpu_dyn_port_eval;\n";
+                out << "const bool cpu_en=(cpu_cw_nfflags[cpu_i]&4)?((cpu_cw_nfflags[cpu_i]&8)!=0):cpu_at<bool>(cpu_bnd_,cpu_cw_enable[cpu_i]);\n"
+                    << "if(cpu_en){\n"
+                    << "const std::uint64_t cpu_d=cpu_at<std::uint64_t>(cpu_bnd_,cpu_cw_data[cpu_i]);\n"
+                    << "auto &cpu_c=cpu_at<std::uint64_t>(cpu_obj_,cpu_cw_state[cpu_i]);\n"
+                    << "if(cpu_c!=cpu_d){cpu_c=cpu_d;\n";
+                if (dynamicStats_) out << "++cpu_dyn_port_fire;\n";
+                out << "cpu_direct_state_changed_one(cpu_cw_ntf[cpu_i],cpu_cw_nfmask[cpu_i],"
+                       "static_cast<bool>(cpu_cw_nfflags[cpu_i]&1),static_cast<bool>(cpu_cw_nfflags[cpu_i]&2));\n"
+                    << "}}}while(cpu_todo);\n}}\n";
+                return true;
+            }
+
             void directCommitBody(std::ostream &out, const SimOp &op) const
             {
                 const auto operands = model_.operands(op);
@@ -2578,8 +2726,7 @@ namespace wolvrix::lib::grhsim
                     << "auto &cpu_current=" << state(target) << ";\nconst auto cpu_value="
                     << normalize("(static_cast<std::uint64_t>(cpu_current)&~static_cast<std::uint64_t>(" + value(operands[2]) +
                         "))|(static_cast<std::uint64_t>(" + value(operands[1]) + ")&static_cast<std::uint64_t>(" + value(operands[2]) + "))",
-                        stateType(target)) << ";\nif(cpu_current!=cpu_value){cpu_current=cpu_value;\n";
-                if (projected_[target.index] || range.count)
+                        stateType(target)) << ";\nif(cpu_current!=cpu_value){cpu_current=cpu_value;\n";                if (projected_[target.index] || range.count)
                 {
                     if (range.count == 1)
                     {
@@ -3510,12 +3657,14 @@ if(terminal){
                                 ++sharedEdgeBlocks_;
                                 for (auto entry : group) sharedEdgePorts_ += entry->second.size();
                             }
-                            const bool packed = group.size() >= 2;
+                            const bool compact = !sharedGuard.empty() && emitCommitCompactWalk(out, group, base);
+                            const bool packed = !compact && group.size() >= 2;
                             if (packed)
                             {
                                 out << "if(cpu_word8(cpu_pflags.data()," << base << ',' << (group.back()->first - base + 1) << ")){\n";
                                 pflagPackedWords_ += group.size();
                             }
+                            if (!compact)
                             for (auto entry : group)
                             {
                                 out << "{const std::uint8_t cpu_armed=cpu_pflags[" << entry->first << "];if(cpu_armed){";
@@ -3698,6 +3847,7 @@ if(terminal){
             std::map<std::uint32_t, int> computeEdgeDirection_;
             uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0, edgeDirectionUnits_ = 0;
             mutable uint64_t gateHoistedRuns_ = 0, gateHoistedGates_ = 0, gateMergedGates_ = 0, gateColdHints_ = 0;
+            mutable uint64_t commitCompactGroups_ = 0, commitCompactPorts_ = 0;
             struct DirectSample { StateId state; ValueId event; bool projection; };
             std::vector<char> directSampleStates_;
             std::map<std::uint32_t, std::vector<DirectSample>> directSampleUnits_;
@@ -3714,6 +3864,7 @@ if(terminal){
             mutable std::uint64_t dispatchPackedBytes_ = 0, handoffPackedSlots_ = 0, pflagPackedWords_ = 0;
             mutable std::uint64_t sharedEdgeBlocks_ = 0, sharedEdgePorts_ = 0;
             bool dynamicStats_ = false;
+            bool commitCompactWalk_ = false;
             std::map<std::string, std::uint32_t> dynKinds_;
             std::uint32_t dynTaskSpan_ = 1;
             std::uint32_t dynKind(const SimOp &op) const { return dynKinds_.at(std::string(model_.text(op.opType))); }
@@ -3726,25 +3877,27 @@ if(terminal){
         class EmitCppPass final : public Pass
         {
         public:
-            explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false)
-                : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats) {}
+            explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false)
+                : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats),
+                  commitCompactWalk_(commitCompactWalk) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_); }
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_); }
         private:
             std::filesystem::path path_;
             bool dynamicStats_ = false;
+            bool commitCompactWalk_ = false;
         };
     }
 
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
-                          bool dynamicStats)
+                          bool dynamicStats, bool commitCompactWalk)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
         { diagnostics.error("CPU C++ emit requires a complete schedule", "cpu.st.emit-cpp"); return {false, false, {}}; }
         try
         {
-            Emitter emitter(model, dynamicStats); emitter.validate();
+            Emitter emitter(model, dynamicStats, commitCompactWalk); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
@@ -3760,20 +3913,23 @@ if(terminal){
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 if (args.empty() || args.size() % 2)
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>]"; return {}; }
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>]"; return {}; }
                 std::filesystem::path output;
                 bool dynamicStats = false;
+                bool commitCompactWalk = false;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
                     else if (args[i] == "--dynamic-stats" && (args[i + 1] == "true" || args[i + 1] == "false"))
                         dynamicStats = args[i + 1] == "true";
+                    else if (args[i] == "--commit-compact-walk" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        commitCompactWalk = args[i + 1] == "true";
                     else
-                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>]"; return {}; }
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>]"; return {}; }
                 }
                 if (output.empty())
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>]"; return {}; }
-                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats);
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk);
             }, error)) throw std::logic_error(error);
     }
 }

@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <streambuf>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace wolvrix::lib::grhsim
 {
@@ -47,7 +49,8 @@ namespace wolvrix::lib::grhsim
         class Emitter
         {
         public:
-            explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false)
+            explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false,
+                             bool commitMemWalk = false)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -56,7 +59,7 @@ namespace wolvrix::lib::grhsim
                   batchedHistories_(stateRanges_.size()),
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
                   historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()), dynamicStats_(dynamicStats),
-                  commitCompactWalk_(commitCompactWalk)
+                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk)
             {
                 if (dynamicStats_)
                 {
@@ -345,7 +348,11 @@ namespace wolvrix::lib::grhsim
                     " gate_merged_gates=" + std::to_string(gateMergedGates_) +
                     " gate_cold_hints=" + std::to_string(gateColdHints_) +
                     " commit_compact_groups=" + std::to_string(commitCompactGroups_) +
-                    " commit_compact_ports=" + std::to_string(commitCompactPorts_);
+                    " commit_compact_ports=" + std::to_string(commitCompactPorts_) +
+                    " mem_guard_hoist_runs=" + std::to_string(memGuardHoistRuns_) +
+                    " mem_guard_hoist_sites=" + std::to_string(memGuardHoistSites_) +
+                    " mem_enable_cache_values=" + std::to_string(memEnableCacheValues_) +
+                    " mem_enable_cache_sites=" + std::to_string(memEnableCacheSites_);
             }
 
             PassResult write(const std::filesystem::path &directory)
@@ -2532,6 +2539,17 @@ namespace wolvrix::lib::grhsim
                     << (scalar ? "," : ")=") << normalize(std::move(expression), type) << (scalar ? ");\n" : ";\n");
             }
 
+            // History sampling of a memWrite op, emitted separately when the write
+            // part moved into a guard-hoisted run block (cpu_mem_guard_hoist).
+            void memWriteStages(std::ostream &out, const SimOp &op) const
+            {
+                const auto refs = model_.objectRefs(op);
+                const auto operands = model_.operands(op);
+                const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
+                    stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
+            }
+
             std::string stageCell(StateId target, const std::string &row) const
             {
                 const auto &array = stateType(target);
@@ -2791,8 +2809,24 @@ namespace wolvrix::lib::grhsim
                                  ((*edges)[i] == "negedge" ? "!" : "") + event + ")";
                     }
                     if (!cachedGuard.empty()) guard = cachedGuard;
-                    out << "if((" << guard << ") && " << value(operands[0]) << " && static_cast<std::size_t>("
-                        << value(operands[1]) << ")<" << array.count << "){\n";
+                    // cpu_mem_guard_hoist: the run wrapper already tested this op's
+                    // snapshot guard; history sampling stays unconditional below,
+                    // emitted by the run handler after the guarded write block.
+                    const bool guardStripped = commitMemWalk_ && memGuardStripped_.contains(op.id.index);
+                    std::string enableText;
+                    if (const auto cached = memEnableCache_.find(operands[0].index);
+                        commitMemWalk_ && cached != memEnableCache_.end())
+                    { enableText = cached->second; ++memEnableCacheSites_; }
+                    else enableText = value(operands[0]);
+                    if (dynamicStats_)
+                        out << (guardStripped ? "++cpu_dyn_mw_gate;\n" : "if(" + guard + "){++cpu_dyn_mw_gate;}\n");
+                    if (guardStripped)
+                        out << "if(" << enableText << " && static_cast<std::size_t>("
+                            << value(operands[1]) << ")<" << array.count << "){\n";
+                    else
+                        out << "if((" << guard << ") && " << enableText << " && static_cast<std::size_t>("
+                            << value(operands[1]) << ")<" << array.count << "){\n";
+                    if (dynamicStats_) out << "++cpu_dyn_mw_fire;\n";
                     if (isScalarLogic(element))
                         writeCell(out, target, value(operands[1]), value(operands[2]), value(operands[3]));
                     else
@@ -2805,7 +2839,7 @@ namespace wolvrix::lib::grhsim
                             "))|(static_cast<std::uint64_t>(" + value(operands[2]) + ")&static_cast<std::uint64_t>(" + value(operands[3]) + "))", element) << ";\n";
                     }
                     out << "}\n";
-                    if (edges) for (std::size_t i = 0; i < edges->size(); ++i)
+                    if (edges && !guardStripped) for (std::size_t i = 0; i < edges->size(); ++i)
                         stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
                     return;
                 }
@@ -3057,6 +3091,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_act{},cpu_dyn_sn_body{},cpu_dyn_sn_grp{},cpu_dyn_sn_chg{};\n"
                         << "std::array<std::uint64_t," << dynTaskSpan_ << "> cpu_dyn_cm_ent{};\n"
                         << "std::uint64_t cpu_dyn_grp_pub=0,cpu_dyn_grp_fire=0,cpu_dyn_port_eval=0,cpu_dyn_port_fire=0;\n"
+                        << "std::uint64_t cpu_dyn_mw_gate=0,cpu_dyn_mw_fire=0;\n"
                         << "std::uint64_t cpu_dyn_in_chk=0,cpu_dyn_in_chg=0,cpu_dyn_pub_calls=0,cpu_dyn_pub_pending=0,cpu_dyn_pub_changes=0;\n"
                         << "std::uint64_t cpu_dyn_cm_stable=0,cpu_dyn_cm_inactive=0;\n";
                 out << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
@@ -3320,13 +3355,14 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "for(std::size_t i=0;i<" << dynTaskSpan_ << ";++i)if(cpu_dyn_cm_ent[i])"
                         << "std::fprintf(stderr,\"[grhsim-dyn] commit %zu ent=%llu\\n\",i,static_cast<unsigned long long>(cpu_dyn_cm_ent[i]));\n"
                         << "std::fprintf(stderr,\"[grhsim-dyn] totals grp_pub=%llu grp_fire=%llu port_eval=%llu port_fire=%llu "
-                        << "in_chk=%llu in_chg=%llu pub_calls=%llu pub_pending=%llu pub_changes=%llu cm_stable=%llu cm_inactive=%llu\\n\",\n"
+                        << "in_chk=%llu in_chg=%llu pub_calls=%llu pub_pending=%llu pub_changes=%llu cm_stable=%llu cm_inactive=%llu mw_gate=%llu mw_fire=%llu\\n\",\n"
                         << "static_cast<unsigned long long>(cpu_dyn_grp_pub),static_cast<unsigned long long>(cpu_dyn_grp_fire),\n"
                         << "static_cast<unsigned long long>(cpu_dyn_port_eval),static_cast<unsigned long long>(cpu_dyn_port_fire),\n"
                         << "static_cast<unsigned long long>(cpu_dyn_in_chk),static_cast<unsigned long long>(cpu_dyn_in_chg),\n"
                         << "static_cast<unsigned long long>(cpu_dyn_pub_calls),static_cast<unsigned long long>(cpu_dyn_pub_pending),\n"
                         << "static_cast<unsigned long long>(cpu_dyn_pub_changes),static_cast<unsigned long long>(cpu_dyn_cm_stable),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_cm_inactive));\n";
+                        << "static_cast<unsigned long long>(cpu_dyn_cm_inactive),\n"
+                        << "static_cast<unsigned long long>(cpu_dyn_mw_gate),static_cast<unsigned long long>(cpu_dyn_mw_fire));\n";
                 }
                 out << "}\n";
                 if (hasSystemTasks_) systemTaskDriver(out);
@@ -3603,19 +3639,96 @@ if(terminal){
                         const auto found = guards.find(id.index);
                         return found == guards.end() ? std::string{} : found->second;
                     };
+                    // cpu_mem_walk setup: cache the distinct boundary-bool enable
+                    // operands of this task's memWrite ports into locals. Commit
+                    // task bodies never write the boundary arena (commit ops produce
+                    // no values and history sampling stages states), so after the
+                    // early-return preambles the bytes stay stable for the whole walk.
+                    memEnableCache_.clear();
+                    memGuardStripped_.clear();
+                    if (commitMemWalk_)
+                    {
+                        std::vector<std::uint32_t> enables;
+                        std::unordered_map<std::uint32_t, std::uint32_t> uses;
+                        for (auto unit : tree.partitions[task.partition.index - 1].children)
+                            for (auto opId : tree.partitions[unit.index - 1].ops)
+                            {
+                                const auto &op = model_.operations()[opId.index - 1];
+                                if (model_.text(op.opType) != "core.state.memWrite") continue;
+                                const auto enable = model_.operands(op)[0];
+                                if (++uses[enable.index] != 1) continue;
+                                const auto &enableType = type(enable);
+                                if (enableType.kind != TypeKind::Logic || enableType.domain != LogicDomain::TwoState ||
+                                    enableType.width != 1 || enableType.isSigned) continue;
+                                if (layout_.values[enable.index - 1].kind != CpuStorageKind::Boundary) continue;
+                                if (staticScalars_.contains(enable.index) || readAliases_[enable.index]) continue;
+                                enables.push_back(enable.index);
+                            }
+                        // Only shared enables pay off: a single-use value caches into a
+                        // local for the same instruction count as the direct test.
+                        for (const auto index : enables)
+                        {
+                            if (uses[index] < 2) continue;
+                            const auto name = "cpu_men_" + std::to_string(index);
+                            out << "const bool " << name << '=' << value(ValueId{index, 0}) << ";\n";
+                            memEnableCache_.emplace(index, name);
+                            ++memEnableCacheValues_;
+                        }
+                    }
                     // Event sampling stays unconditional in original op order
                     // (shared histories overwrite in program order); only the
                     // armed write ports move into the change-gated groups.
+                    const auto memRunGuardOf = [&](OpId id) -> std::string {
+                        if (!commitMemWalk_ || portArmWords_[id.index] != ~std::uint32_t(0)) return {};
+                        const auto &op = model_.operations()[id.index - 1];
+                        if (model_.text(op.opType) != "core.state.memWrite") return {};
+                        return findGuard(id);
+                    };
                     bool anyArmed = false;
                     for (auto unit : tree.partitions[task.partition.index - 1].children)
-                        for (auto op : tree.partitions[unit.index - 1].ops)
+                        for (auto opIt = tree.partitions[unit.index - 1].ops.begin();
+                             opIt != tree.partitions[unit.index - 1].ops.end();)
                         {
+                            const auto op = *opIt;
                             if (portArmWords_[op.index] != ~std::uint32_t(0))
                             {
                                 anyArmed = true;
                                 sampleEvents(out, model_.operations()[op.index - 1], 1);
+                                ++opIt;
+                                continue;
                             }
-                            else commit(out, model_.operations()[op.index - 1], findGuard(op));
+                            // cpu_mem_guard_hoist: a run of same-snapshot-guard
+                            // memWrite ports evaluates the pure-read guard once;
+                            // port order inside the block is unchanged, and the
+                            // deferred history sampling is independent of the
+                            // writes (writes touch memory cells, sampling stages
+                            // state histories; pending record order is commutative
+                            // across disjoint keys).
+                            const std::string runGuard = memRunGuardOf(op);
+                            if (!runGuard.empty())
+                            {
+                                auto runEnd = std::next(opIt);
+                                while (runEnd != tree.partitions[unit.index - 1].ops.end() &&
+                                       memRunGuardOf(*runEnd) == runGuard) ++runEnd;
+                                if (runEnd - opIt >= 4)
+                                {
+                                    out << "if(" << runGuard << "){ // cpu_mem_guard_hoist ops=" << runEnd - opIt << '\n';
+                                    for (auto it = opIt; it != runEnd; ++it)
+                                    {
+                                        memGuardStripped_.insert(it->index);
+                                        commit(out, model_.operations()[it->index - 1], runGuard);
+                                        ++memGuardHoistSites_;
+                                    }
+                                    out << "}\n";
+                                    for (auto it = opIt; it != runEnd; ++it)
+                                        memWriteStages(out, model_.operations()[it->index - 1]);
+                                    ++memGuardHoistRuns_;
+                                    opIt = runEnd;
+                                    continue;
+                                }
+                            }
+                            commit(out, model_.operations()[op.index - 1], findGuard(op));
+                            ++opIt;
                         }
                     // A port is evaluated only when one of its boundary
                     // operands changed since its last evaluation (its arm bit
@@ -3865,6 +3978,13 @@ if(terminal){
             mutable std::uint64_t sharedEdgeBlocks_ = 0, sharedEdgePorts_ = 0;
             bool dynamicStats_ = false;
             bool commitCompactWalk_ = false;
+            // --commit-mem-walk: per-task scratch for memWrite walk skeleton
+            // reduction (snapshot-guard run hoisting + boundary-bool enable cache).
+            bool commitMemWalk_ = false;
+            mutable std::unordered_set<std::uint32_t> memGuardStripped_;
+            mutable std::unordered_map<std::uint32_t, std::string> memEnableCache_;
+            mutable std::uint64_t memGuardHoistRuns_ = 0, memGuardHoistSites_ = 0;
+            mutable std::uint64_t memEnableCacheValues_ = 0, memEnableCacheSites_ = 0;
             std::map<std::string, std::uint32_t> dynKinds_;
             std::uint32_t dynTaskSpan_ = 1;
             std::uint32_t dynKind(const SimOp &op) const { return dynKinds_.at(std::string(model_.text(op.opType))); }
@@ -3877,27 +3997,29 @@ if(terminal){
         class EmitCppPass final : public Pass
         {
         public:
-            explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false)
+            explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false,
+                                 bool commitMemWalk = false)
                 : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats),
-                  commitCompactWalk_(commitCompactWalk) {}
+                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_); }
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_); }
         private:
             std::filesystem::path path_;
             bool dynamicStats_ = false;
             bool commitCompactWalk_ = false;
+            bool commitMemWalk_ = false;
         };
     }
 
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
-                          bool dynamicStats, bool commitCompactWalk)
+                          bool dynamicStats, bool commitCompactWalk, bool commitMemWalk)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
         { diagnostics.error("CPU C++ emit requires a complete schedule", "cpu.st.emit-cpp"); return {false, false, {}}; }
         try
         {
-            Emitter emitter(model, dynamicStats, commitCompactWalk); emitter.validate();
+            Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
@@ -3913,10 +4035,11 @@ if(terminal){
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 if (args.empty() || args.size() % 2)
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>]"; return {}; }
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>]"; return {}; }
                 std::filesystem::path output;
                 bool dynamicStats = false;
                 bool commitCompactWalk = false;
+                bool commitMemWalk = false;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
@@ -3924,12 +4047,14 @@ if(terminal){
                         dynamicStats = args[i + 1] == "true";
                     else if (args[i] == "--commit-compact-walk" && (args[i + 1] == "true" || args[i + 1] == "false"))
                         commitCompactWalk = args[i + 1] == "true";
+                    else if (args[i] == "--commit-mem-walk" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        commitMemWalk = args[i + 1] == "true";
                     else
-                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>]"; return {}; }
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>]"; return {}; }
                 }
                 if (output.empty())
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>]"; return {}; }
-                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk);
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk);
             }, error)) throw std::logic_error(error);
     }
 }

@@ -2015,6 +2015,100 @@ namespace
                 " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    // A run of >=4 same-snapshot-guard memWrite ports hoists the pure-read edge
+    // guard once and caches the distinct boundary enable bytes in locals; a short
+    // run (<4) keeps the per-port form. Scoreboard checks aliasing address writes
+    // stay in program order inside the hoisted block.
+    void testCommitMemWalk(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_commit_memwalk"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto word = model.logicType(64, false, LogicDomain::TwoState);
+        const auto input = [&](const char *name, TypeId type) {
+            const auto port = model.addInput(name, type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto state = [&](const char *name, TypeId type) {
+            const auto id = model.addState(name, type);
+            const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+            const std::array initSteps{InitStep{model.intern(model.types()[type.index - 1].kind == TypeKind::Array ? "core.init.fill" : "core.init.const"), {0, 1}}};
+            model.addInit(id, initSteps, initParams); return id;
+        };
+        const auto compute = [&](const char *op, TypeId type, std::initializer_list<ValueId> args) {
+            const auto value = model.addValue(type);
+            model.addOperation(op, {args.begin(), args.size()}, std::array{value}); return value;
+        };
+        const auto constant = [&](TypeId type, const char *text) {
+            const auto value = model.addValue(type);
+            const std::array params{Parameter{model.intern("value"), std::string(text)}};
+            model.addOperation("core.compute.constant", {}, std::array{value}, {}, params); return value;
+        };
+        const auto slice = [&](ValueId source, long long index) {
+            const auto value = model.addValue(bit);
+            const std::array ops{source};
+            const std::array params{Parameter{model.intern("sliceStart"), index}, Parameter{model.intern("sliceEnd"), index}};
+            model.addOperation("core.compute.sliceStatic", ops, std::array{value}, {}, params); return value;
+        };
+        const auto clock = input("clock", bit), clock2 = input("clock2", bit);
+        const auto enw = input("enw", word), dw = input("dw", word), aw = input("aw", byte);
+        const auto fullMask = constant(word, "64'hffffffffffffffff");
+        const auto memory = state("mem", model.arrayType(word, 16));
+        const auto memory2 = state("mem2", model.arrayType(word, 16));
+        const auto port = [&](StateId array, ValueId clockEvent, ValueId enable, long long index) {
+            const auto stepW = constant(word, std::to_string(index).c_str());
+            const auto stepB = constant(byte, std::to_string(index).c_str());
+            const auto data = compute("core.compute.add", word, {dw, stepW});
+            const auto addr = compute("core.compute.add", byte, {aw, stepB});
+            const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            model.addOperation("core.state.memWrite", std::array{enable, addr, data, fullMask, clockEvent}, {},
+                               std::array{ObjectRef::state(array), ObjectRef::state(state("h", bit))}, edges);
+        };
+        // 12 same-guard ports (first four share one enable) -> one hoisted run with a
+        // deduplicated enable cache; 3 same-guard ports stay per-port (<4).
+        const auto sharedEnable = slice(enw, 0);
+        for (long long i = 0; i < 12; ++i) port(memory, clock, i < 4 ? sharedEnable : slice(enw, i), i);
+        for (long long i = 0; i < 3; ++i) port(memory2, clock2, slice(enw, 16 + i), i);
+        const auto foldCells = [&](StateId array, ValueId base) {
+            ValueId folded = base;
+            for (long long i = 0; i < 16; ++i)
+            {
+                const auto cell = model.addValue(word);
+                const std::array readOps{constant(byte, std::to_string(i).c_str())};
+                model.addOperation("core.state.memRead", readOps, std::array{cell},
+                                   std::array{ObjectRef::state(array)});
+                if (!folded) folded = cell;
+                else folded = compute("core.compute.xor", word, {folded, cell});
+            }
+            return folded;
+        };
+        const auto zeroW = constant(word, "0");
+        const auto folded = foldCells(memory, foldCells(memory2, zeroW));
+        const auto out = model.addOutput("x", word);
+        model.addOperation("core.output.write", std::array{folded}, {}, std::array{ObjectRef::output(out)});
+        map(model);
+        diag::Diagnostics diagnostics;
+        const auto emitted = emitCpuCpp(model, directory, diagnostics, false, false, true);
+        require(emitted.success, "commit mem walk emit failed");
+        std::string generated;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp")
+            {
+                std::ifstream stream(entry.path());
+                generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        require(generated.find("// cpu_mem_guard_hoist ops=12") != std::string::npos,
+                "same-guard memWrite run was not guard-hoisted");
+        require(generated.find("cpu_men_") != std::string::npos, "boundary enables were not cached");
+        require(generated.find("ops=3") == std::string::npos, "short memWrite run must stay per-port");
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_commit_memwalk.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testReplicateBroadcast(const std::filesystem::path &directory, bool helpers)
     {
         GrhSimModel model("cpu_replicate_broadcast"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -3000,6 +3094,7 @@ int main(int argc, char **argv)
         testMuxChainFold(directory / "mux_chain", false);
         testMuxChainFold(directory / "mux_chain_helpers", true);
         testCommitCompactWalk(directory / "commit_batch");
+        testCommitMemWalk(directory / "commit_memwalk");
         testDynamicStats(directory / "dynamic_stats");
         testReplicateBroadcast(directory / "replicate_broadcast", false);
         testReplicateBroadcast(directory / "replicate_broadcast_helpers", true);

@@ -8,7 +8,8 @@
 namespace wolvrix::lib::grhsim
 {
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory,
-                          wolvrix::lib::diag::Diagnostics &diagnostics, bool dynamicStats = false, bool commitCompactWalk = false);
+                          wolvrix::lib::diag::Diagnostics &diagnostics, bool dynamicStats = false, bool commitCompactWalk = false,
+                          bool commitMemWalk = false);
     void registerCpuEmitPasses(PassRegistry &registry);
 }
 

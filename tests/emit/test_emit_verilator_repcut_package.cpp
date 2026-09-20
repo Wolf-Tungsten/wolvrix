@@ -670,6 +670,17 @@ int main()
         !contains(wrapperHeader, "std::vector<StepFn> early_update_step_fns_;") ||
         !contains(wrapperHeader, "std::vector<StepFn> normal_eval_step_fns_;") ||
         !contains(wrapperHeader, "std::vector<StepFn> normal_update_step_fns_;") ||
+        !contains(wrapperHeader, "struct alignas(64) PhaseWorker {") ||
+        !contains(wrapperHeader, "std::atomic<bool> workFast{false};") ||
+        !contains(wrapperHeader, "std::atomic<bool> completedFast{false};") ||
+        !contains(wrapperHeader, "std::atomic<bool> stopFast{false};") ||
+        !contains(wrapperHeader, "std::exception_ptr error;") ||
+        !contains(wrapperHeader, "std::vector<int> original_host_cpu_ids_;") ||
+        !contains(wrapperHeader, "std::size_t phase_host_lane_{};") ||
+        !contains(wrapperHeader, "bool phase_host_participates_{};") ||
+        !contains(wrapperHeader, "bool phase_host_spin_infinite_{};") ||
+        !contains(wrapperHeader, "bool phase_worker_spin_infinite_{};") ||
+        !contains(wrapperHeader, "bool restore_host_affinity_{};") ||
         !contains(wrapperHeader, "void run_host_phase_(const std::vector<StepFn>& phaseFns);") ||
         !contains(wrapperHeader, "void run_phase_workers_(const std::vector<StepFn>& phaseFns);"))
     {
@@ -747,6 +758,9 @@ int main()
         return fail("wrapper source should not contain snapshot/writeback publish paths");
     }
     if (!contains(wrapperSource, "std::getenv(\"XS_EMU_THREADS\")") ||
+        !contains(wrapperSource, "std::getenv(\"WOLVI_REPCUT_HOST_LANE\")") ||
+        !contains(wrapperSource, "std::getenv(\"WOLVI_REPCUT_HOST_SPIN_US\")") ||
+        !contains(wrapperSource, "std::getenv(\"WOLVI_REPCUT_WORKER_SPIN_US\")") ||
         !contains(wrapperSource, "const std::size_t maxParallelFns = std::max({early_eval_step_fns_.size(), early_update_step_fns_.size(), normal_eval_step_fns_.size(), normal_update_step_fns_.size()});") ||
         !contains(wrapperSource, "[[noreturn]] inline void wolvi_repcut_thread_config_error") ||
         !contains(wrapperSource, "[WOLVI][thread-config] error=%s") ||
@@ -754,16 +768,37 @@ int main()
         !contains(wrapperSource, "if (*cursor < '0' || *cursor > '9')") ||
         !contains(wrapperSource, "errno == ERANGE") ||
         !contains(wrapperSource, "std::numeric_limits<std::size_t>::max()") ||
+        !contains(wrapperSource, "value > (maximum - digit) / 10") ||
+        !contains(wrapperSource, "workerCount >= 2 && workerCount == partitionCount") ||
+        !contains(wrapperSource, "std::min<std::size_t>(9, workerCount - 1)") ||
+        !contains(wrapperSource, "config.hostSpinInfinite = true;") ||
+        !contains(wrapperSource, "config.workerSpinInfinite = true;") ||
         !contains(wrapperSource, "if (requestedWorkers > 3)") ||
-        !contains(wrapperSource, "if (requestedWorkers != 0 && requestedWorkers > maxParallelFns)") ||
+        !contains(wrapperSource, "if (requestedWorkers != 0 && requestedWorkers > maxParallelFns && !waitConfig.hostParticipates)") ||
         !contains(wrapperSource, "if (requestedWorkers > availableCpuCount)") ||
-        !contains(wrapperSource, "std::size_t startedWorkerCount = 0;") ||
+        !contains(wrapperSource, "if (phase_host_participates_ && workerIndex == phase_host_lane_)") ||
+        !contains(wrapperSource, "throw std::runtime_error(\"failed to pin phase worker lane \"") ||
+        !contains(wrapperSource, "worker.cv.wait(lock, [&worker]() { return worker.completed; });") ||
+        !contains(wrapperSource, "wolvi_repcut_pin_current_thread(phase_cpu_ids_.at(phase_host_lane_))") ||
+        !contains(wrapperSource, "wolvi_repcut_set_current_thread_affinity(original_host_cpu_ids_)") ||
+        !contains(wrapperSource, "worker.workFast.store(true, std::memory_order_release);") ||
+        !contains(wrapperSource, "worker.workFast.load(std::memory_order_acquire)") ||
+        !contains(wrapperSource, "worker.completedFast.store(true, std::memory_order_release);") ||
+        !contains(wrapperSource, "worker.completedFast.load(std::memory_order_acquire)") ||
+        !contains(wrapperSource, "worker.stopFast.store(true, std::memory_order_release);") ||
+        !contains(wrapperSource, "worker.stopFast.load(std::memory_order_acquire)") ||
+        !contains(wrapperSource, "run_phase_batch_(phaseFns, phase_host_lane_, phase_worker_count_);") ||
+        !contains(wrapperSource, "if (!workerError && worker.error)") ||
+        !contains(wrapperSource, "std::rethrow_exception(hostError);") ||
+        !contains(wrapperSource, "std::rethrow_exception(workerError);") ||
+        !contains(wrapperSource, "\\\"wait_policy\\\":\\\"") ||
+        !contains(wrapperSource, "\\\"background_workers\\\":") ||
+        !contains(wrapperSource, "\\\"early_phases\\\":\\\"supported\\\"") ||
         !contains(wrapperSource, "} catch (...) {") ||
         !contains(wrapperSource, "worker.stop = true;") ||
         !contains(wrapperSource, "worker.cv.notify_one();") ||
         !contains(wrapperSource, "return worker.stop || worker.hasWork;") ||
-        !contains(wrapperSource, "phase_workers_[workerIndex].thread.join();") ||
-        !contains(wrapperSource, "failed to create phase worker thread") ||
+        !contains(wrapperSource, "worker.thread.join();") ||
         !contains(wrapperSource, "phase_worker_count_ = requestedWorkers;") ||
         !contains(wrapperSource, "[WOLVI][thread-config] requested=%zu effective=%zu max_parallel=%zu available_cpus=%zu") ||
         !contains(wrapperSource, "#if defined(__linux__)"))
@@ -914,6 +949,7 @@ int main()
         return fail("wrapper source missing expected constant definition");
     }
     if (!contains(smokeMain, "WolviRepCutVerilatorSim sim;") ||
+        !contains(smokeMain, "for (unsigned step = 0; step < 200; ++step)") ||
         !contains(smokeMain, "sim.step();"))
     {
         return fail("smoke main missing expected simulation bootstrap");

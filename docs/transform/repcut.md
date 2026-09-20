@@ -139,6 +139,32 @@ make build_xs_repcut_verilator XS_REPCUT_WEIGHT_MODE=closure-aware
 
 未设置 `XS_REPCUT_WEIGHT_MODE` 时使用 `baseline`。
 
+## Verilator RepCut 运行时
+
+`emit_verilator_repcut_package` 生成的仿真器使用 `XS_EMU_THREADS=N` 选择运行时并行度，设
+RepCut 分区数为 `K`：
+
+- `N=0` 或 `N=1`：Host 串行执行；
+- `2 <= N < K`：保留 N 个后台 worker 和 condition variable 调度；
+- `N=K>=2`：默认使用 Host 参与的 all-spin。Host 接管一个逻辑 lane，只创建 `N-1` 个后台
+  worker，Host 和 worker 均永久轮询，因此总 runnable 实体数仍为 N。
+
+`N=K` 默认 Host lane 为 `min(9, N-1)`；这保留了 K=32 XiangShan 实验使用的 lane 9，同时
+也覆盖较小 K。以下环境变量只允许在 `N=K>=2` 时设置：
+
+| 环境变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WOLVI_REPCUT_HOST_LANE` | `min(9, N-1)` | Host 接管的逻辑 lane，必须小于 N |
+| `WOLVI_REPCUT_HOST_SPIN_US` | `infinite` | `0..1000000` 微秒或 `infinite`；有限自旋后回退到 condition variable |
+| `WOLVI_REPCUT_WORKER_SPIN_US` | `infinite` | `0` 或 `infinite` |
+
+显式设置 `HOST_SPIN_US=0`、`WORKER_SPIN_US=0` 可保留 Host 参与但恢复全 CV 等待；设置
+`HOST_SPIN_US=50`、`WORKER_SPIN_US=0` 可恢复 Host 先自旋 50 us、worker 使用 CV 的实验配置。
+运行时会输出一行 `[runtime-config]` JSON，记录实际 Host lane、CPU 映射、等待策略及配置来源。
+
+all-spin 假设进程 affinity 中至少有 N 个专用 CPU，并会持续占满这些 CPU；它以 walltime 为优化
+目标，不以 task-clock 或功耗为目标。析构时 Host affinity 会恢复为构造仿真器前的完整掩码。
+
 ## 前置条件
 
 - 推荐在 `xmr-resolve` 之后运行

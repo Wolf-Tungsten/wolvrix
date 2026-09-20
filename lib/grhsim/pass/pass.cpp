@@ -6,6 +6,7 @@
 #include "grhsim/pass/bitwise_muxes.hpp"
 #include "grhsim/pass/mux_chain_fold.hpp"
 #include "grhsim/pass/pack_bit_registers.hpp"
+#include "grhsim/pass/used_bits.hpp"
 #include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
@@ -168,6 +169,7 @@ namespace wolvrix::lib::grhsim
         registerBitwiseMuxesPass(registry);
         registerMuxChainFoldPass(registry);
         registerPackBitRegistersPass(registry);
+        registerUsedBitsPass(registry);
         std::string error;
         registry.registerPass(
             "grhsim.verify", PassKind::Analysis,

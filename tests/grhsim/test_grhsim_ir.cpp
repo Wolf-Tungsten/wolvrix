@@ -973,6 +973,214 @@ namespace {
     }
 }
 
+namespace {
+    int runUsedBitsTest() {
+        using namespace grhsim;
+        const auto inputOf = [](GrhSimModel &model, TypeId type) {
+            const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto outputOf = [](GrhSimModel &model, ValueId value, TypeId type) {
+            const auto port = model.addOutput("o" + std::to_string(model.outputs().size()), type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto sliceOf = [](GrhSimModel &model, ValueId value, int64_t start, int64_t end, bool sign = false) {
+            const auto type = model.logicType(static_cast<uint32_t>(end - start + 1), sign, LogicDomain::TwoState);
+            const auto result = model.addValue(type);
+            const std::array params{Parameter{model.intern("sliceStart"), start},
+                                    Parameter{model.intern("sliceEnd"), end}};
+            model.addOperation("core.compute.sliceStatic", std::array{value}, std::array{result}, {}, params);
+            return result;
+        };
+        const auto widthOf = [](const GrhSimModel &model, ValueId value) {
+            return model.types()[model.values()[value.index - 1].type.index - 1].width;
+        };
+        const auto runPass = [](GrhSimModel &model) {
+            PassManager manager(defaultDialectRegistry());
+            std::string error;
+            manager.addPass(defaultPassRegistry().create("grhsim.used-bits", {}, error));
+            diag::Diagnostics diagnostics;
+            const auto result = manager.run(model, diagnostics);
+            if (!result.success || diagnostics.hasError()) {
+                for (const auto &message : diagnostics.messages())
+                    std::cerr << "[grhsim-ir] used-bits diagnostic: " << message.context << ": " << message.message << '\n';
+            }
+            return result;
+        };
+        // Scalar chain: a 64-bit add observed through a 39-bit slice narrows.
+        {
+            GrhSimModel model("used_bits_scalar"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto wide = model.logicType(64, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, wide), b = inputOf(model, wide);
+            const auto sum = model.addValue(wide);
+            model.addOperation("core.compute.add", std::array{a, b}, std::array{sum});
+            outputOf(model, sliceOf(model, sum, 0, 38), model.logicType(39, false, LogicDomain::TwoState));
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits missed a scalar narrowing");
+            bool narrowed = false;
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.compute.add")
+                    narrowed = widthOf(model, model.results(op)[0]) == 39;
+            if (!narrowed) return fail("used-bits add was not narrowed to 39 bits");
+            if (const auto again = runPass(model); !again.success || again.changed)
+                return fail("used-bits scalar narrowing is not idempotent");
+        }
+        // Wide downgrade: a 128-bit and observed through 64 bits becomes scalar.
+        {
+            GrhSimModel model("used_bits_wide"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto wide = model.logicType(128, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, wide), b = inputOf(model, wide);
+            const auto masked = model.addValue(wide);
+            model.addOperation("core.compute.and", std::array{a, b}, std::array{masked});
+            outputOf(model, sliceOf(model, masked, 0, 63), model.logicType(64, false, LogicDomain::TwoState));
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits missed a wide downgrade");
+            bool narrowed = false;
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.compute.and")
+                    narrowed = widthOf(model, model.results(op)[0]) == 64;
+            if (!narrowed) return fail("used-bits wide and was not downgraded to 64 bits");
+        }
+        // Non-transparent op: lshr keeps its width; a transparent consumer that
+        // narrows forces a boundary slice between them.
+        {
+            GrhSimModel model("used_bits_lshr"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto word = model.logicType(64, false, LogicDomain::TwoState);
+            const auto data = inputOf(model, word), amount = inputOf(model, model.logicType(6, false, LogicDomain::TwoState));
+            const auto other = inputOf(model, word);
+            const auto shifted = model.addValue(word);
+            model.addOperation("core.compute.lshr", std::array{data, amount}, std::array{shifted});
+            const auto masked = model.addValue(word);
+            model.addOperation("core.compute.and", std::array{shifted, other}, std::array{masked});
+            outputOf(model, sliceOf(model, masked, 0, 19), model.logicType(20, false, LogicDomain::TwoState));
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits missed an lshr boundary");
+            unsigned wideLshr = 0, boundarySlices = 0, narrowAnds = 0;
+            for (const auto &op : model.operations()) {
+                if (model.text(op.opType) == "core.compute.lshr")
+                    wideLshr += widthOf(model, model.results(op)[0]) == 64;
+                if (model.text(op.opType) == "core.compute.and")
+                    narrowAnds += widthOf(model, model.results(op)[0]) == 20;
+                if (model.text(op.opType) == "core.compute.sliceStatic" &&
+                    widthOf(model, model.results(op)[0]) == 20)
+                    for (const auto operand : model.operands(op))
+                        boundarySlices += widthOf(model, operand) == 64;
+            }
+            if (wideLshr != 1 || narrowAnds != 1 || boundarySlices != 1)
+                return fail("used-bits lshr boundary shape is wrong");
+        }
+        // Register narrowing: state, write port data/mask and reads all shrink;
+        // the event history and init record survive.
+        {
+            GrhSimModel model("used_bits_state"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto word = model.logicType(64, false, LogicDomain::TwoState);
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto state = model.addState("q", word);
+            const auto history = model.addState("q_clock_history", bit);
+            const std::array initParams{Parameter{model.intern("value"), std::string("64'h0")}};
+            const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(state, initSteps, initParams);
+            const std::array historyInitParams{Parameter{model.intern("value"), std::string("1'h0")}};
+            model.addInit(history, initSteps, historyInitParams);
+            const auto clock = inputOf(model, bit), enable = inputOf(model, bit);
+            const auto next = inputOf(model, word);
+            const auto maskConst = model.addValue(word);
+            const std::array maskParams{Parameter{model.intern("constValue"), std::string("64'hffffffffffffffff")}};
+            model.addOperation("core.compute.constant", {}, std::array{maskConst}, {}, maskParams);
+            const std::vector<std::string> edges{"posedge"};
+            const std::array writeParams{Parameter{model.intern("event_edges"), edges}};
+            model.addOperation("core.state.regWrite", std::array{enable, next, maskConst, clock}, {},
+                std::array{ObjectRef::state(state), ObjectRef::state(history)}, writeParams);
+            const auto read = model.addValue(word);
+            model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(state)});
+            outputOf(model, sliceOf(model, read, 0, 15), model.logicType(16, false, LogicDomain::TwoState));
+            const auto statesBefore = model.states().size();
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits missed a state narrowing");
+            if (model.states().size() != statesBefore) return fail("used-bits changed the state count on narrowing");
+            bool narrowState = false, historyKept = false;
+            StateId narrowedState;
+            for (const auto &entry : model.states())
+                if (model.text(entry.name) == "q") {
+                    narrowState = model.types()[entry.type.index - 1].width == 16;
+                    narrowedState = entry.id;
+                }
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.state.regWrite") {
+                    const auto refs = model.objectRefs(op);
+                    historyKept = refs.size() == 2 && refs[0].kind == ObjectKind::State &&
+                                  refs[0].index == narrowedState.index;
+                    const auto operands = model.operands(op);
+                    if (widthOf(model, operands[1]) != 16 || widthOf(model, operands[2]) != 16)
+                        return fail("used-bits regWrite data/mask did not follow the narrowed state");
+                }
+            if (!narrowState || !historyKept) return fail("used-bits state narrowing broke state/history wiring");
+            unsigned initRecords = 0;
+            for (const auto &record : model.initRecords())
+                initRecords += record.state == narrowedState;
+            if (initRecords != 1) return fail("used-bits lost the narrowed state's init record");
+        }
+        // Dead cone: unused compute chains, unread states and their write ports
+        // disappear; live logic is untouched.
+        {
+            GrhSimModel model("used_bits_dead"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, byte), b = inputOf(model, byte);
+            const auto deadNot = model.addValue(byte);
+            model.addOperation("core.compute.not", std::array{a}, std::array{deadNot});
+            const auto deadAnd = model.addValue(byte);
+            model.addOperation("core.compute.and", std::array{deadNot, b}, std::array{deadAnd});
+            const auto deadState = model.addState("dead_reg", byte);
+            const std::array initParams{Parameter{model.intern("value"), std::string("8'h00")}};
+            const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(deadState, initSteps, initParams);
+            const auto deadRead = model.addValue(byte);
+            model.addOperation("core.state.read", {}, std::array{deadRead}, std::array{ObjectRef::state(deadState)});
+            const auto live = model.addValue(byte);
+            model.addOperation("core.compute.xor", std::array{a, b}, std::array{live});
+            outputOf(model, live, byte);
+            const auto opsBefore = model.operations().size();
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits missed the dead cone");
+            if (model.operations().size() != opsBefore - 3)
+                return fail("used-bits removed a live op or left dead ops behind");
+            if (model.states().size() != 0)
+                return fail("used-bits left the unread state behind");
+            bool liveKept = false;
+            for (const auto &op : model.operations())
+                liveKept = liveKept || model.text(op.opType) == "core.compute.xor";
+            if (!liveKept) return fail("used-bits removed the live cone");
+            if (const auto again = runPass(model); !again.success || again.changed)
+                return fail("used-bits dead-cone elimination is not idempotent");
+        }
+        // Concat straddle: a 24-bit concat observed through 12 bits keeps only
+        // the low operands and truncates the straddler.
+        {
+            GrhSimModel model("used_bits_concat"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, byte), b = inputOf(model, byte), c = inputOf(model, byte);
+            const auto joined = model.addValue(model.logicType(24, false, LogicDomain::TwoState));
+            model.addOperation("core.compute.concat", std::array{a, b, c}, std::array{joined});
+            outputOf(model, sliceOf(model, joined, 0, 11), model.logicType(12, false, LogicDomain::TwoState));
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits missed a concat narrowing");
+            bool narrowed = false;
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.compute.concat") {
+                    narrowed = widthOf(model, model.results(op)[0]) == 12;
+                    const auto operands = model.operands(op);
+                    if (operands.size() != 2 || widthOf(model, operands[0]) != 4 || widthOf(model, operands[1]) != 8)
+                        return fail("used-bits concat kept the wrong segments");
+                }
+            if (!narrowed) return fail("used-bits concat was not narrowed to 12 bits");
+        }
+        return 0;
+    }
+}
+
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
 #error "WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR must be defined"
 #endif
@@ -990,6 +1198,7 @@ int main()
         if (const int status = runBitwisePredicatesTest(); status != 0) return status;
         if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
         if (const int status = runMuxChainFoldTest(); status != 0) return status;
+        if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();
     }

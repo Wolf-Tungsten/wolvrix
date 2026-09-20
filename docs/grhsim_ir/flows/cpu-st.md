@@ -54,6 +54,13 @@ CPU emitter使用现有标量concat/read/slice/write路径；打包收益须由�
 此 pass 在 semantic pipeline 末尾执行。它保留 producers、依赖与共享关系，
 不改变 state/commit/DPI 的执行条件。
 
+mux 链折叠之后、第二轮 mapping 之前运行
+[`grhsim.used-bits`](../passes/used-bits.md)：对全部二态 logic 值与寄存器状态做反向
+"实际使用位"不动点分析，删除结果不可观测的死锥（纯计算/读 op、无活读者状态的写口与
+状态本体），并把只被低 `[0,k)` 位观测的 op 锥与寄存器收窄到实际宽度（宽值跨越 64 位线时
+从多字 helper 路径降级为标量路径）。sink（输出、DPI/system、memory 端口、事件）按全宽
+保守处理；语义保持论证见 pass 文档。
+
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有
 消费者。`core.compute.assign` 唯一 operand 是源值，唯一 result 是赋值结果；
 op 不得带 objectRefs 或 parameters。例如：

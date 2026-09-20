@@ -129,6 +129,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/bitwise_predicates.cpp
     lib/grhsim/pass/bitwise_muxes.cpp
     lib/grhsim/pass/mux_chain_fold.cpp
+    lib/grhsim/pass/used_bits.cpp
     lib/grhsim/pass/pack_bit_registers.cpp
     lib/grhsim/backend/cpu.cpp
     lib/grhsim/backend/cpu_partition.cpp

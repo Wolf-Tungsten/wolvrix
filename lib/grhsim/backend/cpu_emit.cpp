@@ -58,7 +58,8 @@ namespace wolvrix::lib::grhsim
                   projected_(stateRanges_.size()), fanout_(model.values().size() + 1), producers_(model.values().size() + 1),
                   batchedHistories_(stateRanges_.size()),
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
-                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()), dynamicStats_(dynamicStats),
+                  historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()),
+                  commitDirectHistories_(stateRanges_.size()), dynamicStats_(dynamicStats),
                   commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk)
             {
                 if (dynamicStats_)
@@ -239,7 +240,15 @@ namespace wolvrix::lib::grhsim
                     for (const auto *name : {"cpu_dyn_wr", "cpu_dyn_ch", "cpu_dyn_silent", "cpu_dyn_sn_act", "cpu_dyn_sn_body",
                                              "cpu_dyn_sn_grp", "cpu_dyn_sn_chg", "cpu_dyn_cm_ent", "cpu_dyn_grp_pub", "cpu_dyn_grp_fire",
                                              "cpu_dyn_port_eval", "cpu_dyn_port_fire", "cpu_dyn_in_chk", "cpu_dyn_in_chg", "cpu_dyn_pub_calls",
-                                             "cpu_dyn_pub_pending", "cpu_dyn_pub_changes", "cpu_dyn_cm_stable", "cpu_dyn_cm_inactive"})
+                                             "cpu_dyn_pub_pending", "cpu_dyn_pub_changes", "cpu_dyn_cm_stable", "cpu_dyn_cm_inactive",
+                                             "cpu_dyn_edge", "cpu_dyn_round_cur", "cpu_dyn_eval_pos", "cpu_dyn_eval_neg", "cpu_dyn_eval_other",
+                                             "cpu_dyn_round_hist", "cpu_dyn_port_eval_pos", "cpu_dyn_port_eval_neg", "cpu_dyn_port_eval_r0",
+                                             "cpu_dyn_port_eval_rN", "cpu_dyn_port_fire_pos", "cpu_dyn_port_fire_neg", "cpu_dyn_mw_gate_pos",
+                                             "cpu_dyn_mw_gate_neg", "cpu_dyn_mw_fire_pos", "cpu_dyn_mw_fire_neg", "cpu_dyn_cm_ent_pos",
+                                             "cpu_dyn_cm_ent_neg", "cpu_dyn_cm_ent_r0", "cpu_dyn_cm_ent_rN", "cpu_dyn_sn_act_pos",
+                                             "cpu_dyn_sn_act_neg", "cpu_dyn_pub_pending_r0", "cpu_dyn_pub_pending_rN", "cpu_dyn_pub_changes_r0",
+                                             "cpu_dyn_pub_changes_rN", "cpu_dyn_pub_pending_pos", "cpu_dyn_pub_pending_neg", "cpu_dyn_pub_changes_pos",
+                                             "cpu_dyn_pub_changes_neg"})
                         names.insert(name);
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
@@ -300,6 +309,7 @@ namespace wolvrix::lib::grhsim
                 planComputeSharedHistories();
                 planComputeEdgeGuards();
                 planHistoryBatches();
+                planCommitDirectHistories();
                 planPortArms();
                 planComputeQuiescence();
                 planDirectSampling();
@@ -327,6 +337,7 @@ namespace wolvrix::lib::grhsim
                     " direct_sample_states=" + std::to_string(directSampleStateCount_) +
                     " direct_sample_units=" + std::to_string(directSampleUnitCount_) +
                     " direct_commit_states=" + std::to_string(directCommitCount_) +
+                    " commit_direct_histories=" + std::to_string(commitDirectHistoryCount_) +
                     " port_arm_ports=" + std::to_string(portArmPortCount_) +
                     " port_arm_tasks=" + std::to_string(portArmTaskCount_) +
                     " port_arm_values=" + std::to_string(portArmValueCount_) +
@@ -1076,6 +1087,65 @@ namespace wolvrix::lib::grhsim
                         }
                     }
                 }
+            }
+
+            // Commit-side private 1-bit event histories whose only fanout is the
+            // re-arm of their own domain retire their stage/pending/publish
+            // round trip into deferred direct stores at the task end.
+            // Certification: the byte is referenced by exactly one op (its own
+            // write port), is neither aliased nor batched, and its commit-fanout
+            // range is empty or just the self-domain arm. A history change can
+            // never make an edge guard newly true (guards require hist==old &&
+            // event==new), and every gate-value transition arms the domain
+            // anyway, so dropping the history's re-arm/projection contribution
+            // is unobservable. In-body guards keep reading the visible byte; the
+            // deferred store lands at task end, the same moment publish would
+            // have made it visible to the next round.
+            void planCommitDirectHistories()
+            {
+                const auto &tree = mapping_.partitionTree;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::DomainGatedCommit) continue;
+                    const auto &function = tree.partitions[task.partition.index - 1];
+                    if (!tree.partitions[function.parent.index - 1].attrs.eventGate) continue;
+                    const auto arm = armOffsets_[function.parent.index];
+                    for (auto unit : function.children)
+                        for (auto id : tree.partitions[unit.index - 1].ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            if (!edges || edges->empty()) continue;
+                            const auto refs = model_.objectRefs(op).last(edges->size());
+                            for (std::size_t i = 0; i < edges->size(); ++i)
+                            {
+                                if (refs[i].kind != ObjectKind::State) continue;
+                                const auto index = refs[i].index;
+                                if (!privateByteHistories_[index] || historyAliases_[index] || batchedHistories_[index]) continue;
+                                const auto range = stateRanges_[index];
+                                bool selfOnly = true;
+                                for (std::uint32_t t = 0; t < range.count && selfOnly; ++t)
+                                {
+                                    const auto &target = stateTargets_[range.offset + t];
+                                    if (!target.arm || target.offset != arm || target.mask != 1) selfOnly = false;
+                                }
+                                if (!selfOnly) continue;
+                                if (!commitDirectHistories_[index])
+                                {
+                                    commitDirectHistories_[index] = 1;
+                                    ++commitDirectHistoryCount_;
+                                }
+                            }
+                        }
+                }
+            }
+
+            void flushDeferredHistoryStores(std::ostream &out) const
+            {
+                for (const auto &[target, expression] : deferredHistoryStores_)
+                    out << at(stateType(target), arenaObjects(), object(ObjectRef::state(target)).offset) << '='
+                        << normalize(std::move(expression), stateType(target)) << ";\n";
+                deferredHistoryStores_.clear();
             }
 
             void sampleHistoryBatch(std::ostream &out, const HistoryBatch &batch) const
@@ -2532,6 +2602,12 @@ namespace wolvrix::lib::grhsim
                 if (batchedHistories_[target.index] || historyAliases_[target.index]) return;
                 // Unit-private histories are sampled directly at the unit block end.
                 if (directSampleStates_[target.index]) return;
+                // Commit-private histories defer to a direct store at the task end.
+                if (commitDirectHistories_[target.index])
+                {
+                    deferredHistoryStores_.emplace_back(target, std::move(expression));
+                    return;
+                }
                 const auto range = stateRanges_[target.index]; const auto &type = stateType(target);
                 const bool scalar = isScalarLogic(type);
                 out << (scalar ? "cpu_write_scalar<" : "cpu_stage<") << cppType(type) << ">(cpu_obj_,cpu_shadow_," << target.index << ',' << object(ObjectRef::state(target)).offset
@@ -2721,13 +2797,13 @@ namespace wolvrix::lib::grhsim
                 out << "std::uint64_t cpu_todo=cpu_word8(cpu_pflags.data()," << base << ",8);\nif(cpu_todo){\n"
                     << "{const std::uint64_t cpu_zero=0;std::memcpy(cpu_pflags.data()+" << base << ",&cpu_zero,8);}\n"
                     << "do{const unsigned cpu_i=__builtin_ctzll(cpu_todo);cpu_todo&=cpu_todo-1;\n";
-                if (dynamicStats_) out << "++cpu_dyn_port_eval;\n";
+                if (dynamicStats_) out << "++cpu_dyn_port_eval;if(cpu_dyn_edge==1)++cpu_dyn_port_eval_pos;else if(cpu_dyn_edge==2)++cpu_dyn_port_eval_neg;if(cpu_dyn_round_cur==0)++cpu_dyn_port_eval_r0;else ++cpu_dyn_port_eval_rN;\n";
                 out << "const bool cpu_en=(cpu_cw_nfflags[cpu_i]&4)?((cpu_cw_nfflags[cpu_i]&8)!=0):cpu_at<bool>(cpu_bnd_,cpu_cw_enable[cpu_i]);\n"
                     << "if(cpu_en){\n"
                     << "const std::uint64_t cpu_d=cpu_at<std::uint64_t>(cpu_bnd_,cpu_cw_data[cpu_i]);\n"
                     << "auto &cpu_c=cpu_at<std::uint64_t>(cpu_obj_,cpu_cw_state[cpu_i]);\n"
                     << "if(cpu_c!=cpu_d){cpu_c=cpu_d;\n";
-                if (dynamicStats_) out << "++cpu_dyn_port_fire;\n";
+                if (dynamicStats_) out << "++cpu_dyn_port_fire;if(cpu_dyn_edge==1)++cpu_dyn_port_fire_pos;else if(cpu_dyn_edge==2)++cpu_dyn_port_fire_neg;\n";
                 out << "cpu_direct_state_changed_one(cpu_cw_ntf[cpu_i],cpu_cw_nfmask[cpu_i],"
                        "static_cast<bool>(cpu_cw_nfflags[cpu_i]&1),static_cast<bool>(cpu_cw_nfflags[cpu_i]&2));\n"
                     << "}}}while(cpu_todo);\n}}\n";
@@ -2819,14 +2895,19 @@ namespace wolvrix::lib::grhsim
                     { enableText = cached->second; ++memEnableCacheSites_; }
                     else enableText = value(operands[0]);
                     if (dynamicStats_)
-                        out << (guardStripped ? "++cpu_dyn_mw_gate;\n" : "if(" + guard + "){++cpu_dyn_mw_gate;}\n");
+                    {
+                        const std::string mwGateEdgeSplit =
+                            "if(cpu_dyn_edge==1)++cpu_dyn_mw_gate_pos;else if(cpu_dyn_edge==2)++cpu_dyn_mw_gate_neg;";
+                        out << (guardStripped ? "++cpu_dyn_mw_gate;" + mwGateEdgeSplit + "\n"
+                                              : "if(" + guard + "){++cpu_dyn_mw_gate;" + mwGateEdgeSplit + "}\n");
+                    }
                     if (guardStripped)
                         out << "if(" << enableText << " && static_cast<std::size_t>("
                             << value(operands[1]) << ")<" << array.count << "){\n";
                     else
                         out << "if((" << guard << ") && " << enableText << " && static_cast<std::size_t>("
                             << value(operands[1]) << ")<" << array.count << "){\n";
-                    if (dynamicStats_) out << "++cpu_dyn_mw_fire;\n";
+                    if (dynamicStats_) out << "++cpu_dyn_mw_fire;if(cpu_dyn_edge==1)++cpu_dyn_mw_fire_pos;else if(cpu_dyn_edge==2)++cpu_dyn_mw_fire_neg;\n";
                     if (isScalarLogic(element))
                         writeCell(out, target, value(operands[1]), value(operands[2]), value(operands[3]));
                     else
@@ -3093,7 +3174,17 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "std::uint64_t cpu_dyn_grp_pub=0,cpu_dyn_grp_fire=0,cpu_dyn_port_eval=0,cpu_dyn_port_fire=0;\n"
                         << "std::uint64_t cpu_dyn_mw_gate=0,cpu_dyn_mw_fire=0;\n"
                         << "std::uint64_t cpu_dyn_in_chk=0,cpu_dyn_in_chg=0,cpu_dyn_pub_calls=0,cpu_dyn_pub_pending=0,cpu_dyn_pub_changes=0;\n"
-                        << "std::uint64_t cpu_dyn_cm_stable=0,cpu_dyn_cm_inactive=0;\n";
+                        << "std::uint64_t cpu_dyn_cm_stable=0,cpu_dyn_cm_inactive=0;\n"
+                        << "std::uint32_t cpu_dyn_edge=0,cpu_dyn_round_cur=0;\n"
+                        << "std::uint64_t cpu_dyn_eval_pos=0,cpu_dyn_eval_neg=0,cpu_dyn_eval_other=0;\n"
+                        << "std::uint64_t cpu_dyn_round_hist[8]={};\n"
+                        << "std::uint64_t cpu_dyn_port_eval_pos=0,cpu_dyn_port_eval_neg=0,cpu_dyn_port_eval_r0=0,cpu_dyn_port_eval_rN=0;\n"
+                        << "std::uint64_t cpu_dyn_port_fire_pos=0,cpu_dyn_port_fire_neg=0;\n"
+                        << "std::uint64_t cpu_dyn_mw_gate_pos=0,cpu_dyn_mw_gate_neg=0,cpu_dyn_mw_fire_pos=0,cpu_dyn_mw_fire_neg=0;\n"
+                        << "std::uint64_t cpu_dyn_cm_ent_pos=0,cpu_dyn_cm_ent_neg=0,cpu_dyn_cm_ent_r0=0,cpu_dyn_cm_ent_rN=0;\n"
+                        << "std::uint64_t cpu_dyn_sn_act_pos=0,cpu_dyn_sn_act_neg=0;\n"
+                        << "std::uint64_t cpu_dyn_pub_pending_r0=0,cpu_dyn_pub_pending_rN=0,cpu_dyn_pub_changes_r0=0,cpu_dyn_pub_changes_rN=0;\n"
+                        << "std::uint64_t cpu_dyn_pub_pending_pos=0,cpu_dyn_pub_pending_neg=0,cpu_dyn_pub_changes_pos=0,cpu_dyn_pub_changes_neg=0;\n";
                 out << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
                     << "struct Pending{std::size_t state,offset,size; std::uint32_t begin,count; bool projection;bool memory=false;};\n"
                     << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n"
@@ -3186,7 +3277,16 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 if (dynamicStats_)
                     out << "cpu_dyn_wr.fill(0);cpu_dyn_ch.fill(0);cpu_dyn_silent.fill(0);cpu_dyn_sn_act.fill(0);cpu_dyn_sn_body.fill(0);cpu_dyn_sn_grp.fill(0);cpu_dyn_sn_chg.fill(0);cpu_dyn_cm_ent.fill(0);\n"
                         << "cpu_dyn_grp_pub=0;cpu_dyn_grp_fire=0;cpu_dyn_port_eval=0;cpu_dyn_port_fire=0;cpu_dyn_in_chk=0;cpu_dyn_in_chg=0;\n"
-                        << "cpu_dyn_pub_calls=0;cpu_dyn_pub_pending=0;cpu_dyn_pub_changes=0;cpu_dyn_cm_stable=0;cpu_dyn_cm_inactive=0;\n";
+                        << "cpu_dyn_pub_calls=0;cpu_dyn_pub_pending=0;cpu_dyn_pub_changes=0;cpu_dyn_cm_stable=0;cpu_dyn_cm_inactive=0;\n"
+                        << "cpu_dyn_edge=0;cpu_dyn_round_cur=0;cpu_dyn_eval_pos=0;cpu_dyn_eval_neg=0;cpu_dyn_eval_other=0;\n"
+                        << "std::memset(cpu_dyn_round_hist,0,sizeof(cpu_dyn_round_hist));\n"
+                        << "cpu_dyn_port_eval_pos=0;cpu_dyn_port_eval_neg=0;cpu_dyn_port_eval_r0=0;cpu_dyn_port_eval_rN=0;\n"
+                        << "cpu_dyn_port_fire_pos=0;cpu_dyn_port_fire_neg=0;\n"
+                        << "cpu_dyn_mw_gate_pos=0;cpu_dyn_mw_gate_neg=0;cpu_dyn_mw_fire_pos=0;cpu_dyn_mw_fire_neg=0;\n"
+                        << "cpu_dyn_cm_ent_pos=0;cpu_dyn_cm_ent_neg=0;cpu_dyn_cm_ent_r0=0;cpu_dyn_cm_ent_rN=0;\n"
+                        << "cpu_dyn_sn_act_pos=0;cpu_dyn_sn_act_neg=0;\n"
+                        << "cpu_dyn_pub_pending_r0=0;cpu_dyn_pub_pending_rN=0;cpu_dyn_pub_changes_r0=0;cpu_dyn_pub_changes_rN=0;\n"
+                        << "cpu_dyn_pub_pending_pos=0;cpu_dyn_pub_pending_neg=0;cpu_dyn_pub_changes_pos=0;cpu_dyn_pub_changes_neg=0;\n";
                 out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
                 if (hasSystemTasks_) out << "cpu_first_eval=true;cpu_system_done.fill(false);cpu_strobes.clear();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "cpu_init_" << i << "();\n";
@@ -3196,10 +3296,10 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "cpu_direct_again=cpu_direct_again||projection;\n"
                     << "for(std::uint32_t i=begin;i<begin+count;++i){const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}\n";
                 out << "bool " << class_ << "::cpu_publish(){";
-                if (dynamicStats_) out << "++cpu_dyn_pub_calls;cpu_dyn_pub_pending+=cpu_pending.size();";
+                if (dynamicStats_) out << "++cpu_dyn_pub_calls;cpu_dyn_pub_pending+=cpu_pending.size();if(cpu_dyn_round_cur==0)cpu_dyn_pub_pending_r0+=cpu_pending.size();else cpu_dyn_pub_pending_rN+=cpu_pending.size();if(cpu_dyn_edge==1)cpu_dyn_pub_pending_pos+=cpu_pending.size();else if(cpu_dyn_edge==2)cpu_dyn_pub_pending_neg+=cpu_pending.size();";
                 out << "bool again=cpu_direct_again;cpu_direct_again=false;for(const auto &p:cpu_pending){\n"
                     << "if(std::memcmp(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size)!=0){";
-                if (dynamicStats_) out << "++cpu_dyn_pub_changes;";
+                if (dynamicStats_) out << "++cpu_dyn_pub_changes;if(cpu_dyn_round_cur==0)++cpu_dyn_pub_changes_r0;else ++cpu_dyn_pub_changes_rN;if(cpu_dyn_edge==1)++cpu_dyn_pub_changes_pos;else if(cpu_dyn_edge==2)++cpu_dyn_pub_changes_neg;";
                 out << "std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n"
                     << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
                 out << "void " << class_ << "::eval(){\n";
@@ -3214,6 +3314,18 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 std::vector<InputId> inputByValue(model_.values().size() + 1);
                 for (const auto &op : model_.operations()) if (model_.text(op.opType) == "core.input.read")
                     inputByValue[model_.results(op)[0].index] = {model_.objectRefs(op)[0].index, 0};
+                std::uint32_t clockDynValue = 0;
+                if (dynamicStats_)
+                    for (const auto &op : model_.operations())
+                        if (model_.text(op.opType) == "core.input.read" && type(model_.results(op)[0]).width == 1)
+                        {
+                            const std::uint32_t inputIndex = model_.objectRefs(op)[0].index;
+                            const auto found = std::find_if(model_.inputs().begin(), model_.inputs().end(),
+                                                            [&](const auto &io) { return io.id.index == inputIndex; });
+                            if (found != model_.inputs().end() && identifier(model_.text(found->name)) == "clock")
+                            { clockDynValue = model_.results(op)[0].index; break; }
+                        }
+                if (dynamicStats_) out << "cpu_dyn_edge=3;\n";
                 for (std::size_t i = 0; i < schedule_.inputFanout.size(); ++i)
                 {
                     const auto &row = schedule_.inputFanout[i]; const auto &shadow = schedule_.inputShadows[i];
@@ -3223,9 +3335,14 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     out << "if(" << previous << "!=" << current << "){";
                     if (dynamicStats_) out << "++cpu_dyn_in_chg;";
                     out << previous << '=' << current << ";\n";
+                    if (dynamicStats_ && row.source.index == clockDynValue)
+                        out << "cpu_dyn_edge=((" << current << ")!=0)?1u:2u;\n";
                     activate(out, row.targets, false); out << "}\n";
                 }
+                if (dynamicStats_)
+                    out << "if(cpu_dyn_edge==1)++cpu_dyn_eval_pos;else if(cpu_dyn_edge==2)++cpu_dyn_eval_neg;else ++cpu_dyn_eval_other;\n";
                 out << "for(std::uint32_t cpu_round=0;cpu_round<100000;++cpu_round){\n";
+                if (dynamicStats_) out << "cpu_dyn_round_cur=cpu_round;\n";
                 CpuActivationTargets seeds{schedule_.roundSeeds, {}}; activate(out, seeds, false);
                 out << "if(cpu_profile){++cpu_profile_data.rounds;cpu_profile_phase_begin=cpu_profile_clock::now();}\n";
                 // Word-packed dispatch: adjacent single-byte task checks sharing one
@@ -3326,6 +3443,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     cursor = end;
                 }
                 out << "if(!cpu_again){\n";
+                if (dynamicStats_) out << "++cpu_dyn_round_hist[cpu_round<8?cpu_round:7];\n";
                 if (hasSystemTasks_)
                     out << "cpu_first_eval=false;for(const auto &text:cpu_strobes)std::cout<<text<<'\\n';cpu_strobes.clear();\n";
                 for (const auto &output : model_.outputs()) out << "this->" << identifier(model_.text(output.name)) << '=' <<
@@ -3362,7 +3480,29 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "static_cast<unsigned long long>(cpu_dyn_pub_calls),static_cast<unsigned long long>(cpu_dyn_pub_pending),\n"
                         << "static_cast<unsigned long long>(cpu_dyn_pub_changes),static_cast<unsigned long long>(cpu_dyn_cm_stable),\n"
                         << "static_cast<unsigned long long>(cpu_dyn_cm_inactive),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_mw_gate),static_cast<unsigned long long>(cpu_dyn_mw_fire));\n";
+                        << "static_cast<unsigned long long>(cpu_dyn_mw_gate),static_cast<unsigned long long>(cpu_dyn_mw_fire));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] edge evals pos=%llu neg=%llu other=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_eval_pos),static_cast<unsigned long long>(cpu_dyn_eval_neg),"
+                        << "static_cast<unsigned long long>(cpu_dyn_eval_other));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] round_hist\");for(const auto h:cpu_dyn_round_hist)"
+                        << "std::fprintf(stderr,\" %llu\",static_cast<unsigned long long>(h));std::fprintf(stderr,\"\\n\");\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] edge port_eval pos=%llu neg=%llu fire_pos=%llu fire_neg=%llu eval_r0=%llu eval_rN=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_port_eval_pos),static_cast<unsigned long long>(cpu_dyn_port_eval_neg),"
+                        << "static_cast<unsigned long long>(cpu_dyn_port_fire_pos),static_cast<unsigned long long>(cpu_dyn_port_fire_neg),"
+                        << "static_cast<unsigned long long>(cpu_dyn_port_eval_r0),static_cast<unsigned long long>(cpu_dyn_port_eval_rN));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] edge mw_gate pos=%llu neg=%llu fire_pos=%llu fire_neg=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_mw_gate_pos),static_cast<unsigned long long>(cpu_dyn_mw_gate_neg),"
+                        << "static_cast<unsigned long long>(cpu_dyn_mw_fire_pos),static_cast<unsigned long long>(cpu_dyn_mw_fire_neg));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] edge cm_ent pos=%llu neg=%llu r0=%llu rN=%llu sn_act pos=%llu neg=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_cm_ent_pos),static_cast<unsigned long long>(cpu_dyn_cm_ent_neg),"
+                        << "static_cast<unsigned long long>(cpu_dyn_cm_ent_r0),static_cast<unsigned long long>(cpu_dyn_cm_ent_rN),"
+                        << "static_cast<unsigned long long>(cpu_dyn_sn_act_pos),static_cast<unsigned long long>(cpu_dyn_sn_act_neg));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] round pub_pending r0=%llu rN=%llu changes r0=%llu rN=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_pub_pending_r0),static_cast<unsigned long long>(cpu_dyn_pub_pending_rN),"
+                        << "static_cast<unsigned long long>(cpu_dyn_pub_changes_r0),static_cast<unsigned long long>(cpu_dyn_pub_changes_rN));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] edge pub_pending pos=%llu neg=%llu changes pos=%llu neg=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_pub_pending_pos),static_cast<unsigned long long>(cpu_dyn_pub_pending_neg),"
+                        << "static_cast<unsigned long long>(cpu_dyn_pub_changes_pos),static_cast<unsigned long long>(cpu_dyn_pub_changes_neg));\n";
                 }
                 out << "}\n";
                 if (hasSystemTasks_) systemTaskDriver(out);
@@ -3605,6 +3745,7 @@ if(terminal){
                 if (task.execution == CpuExecution::ActivityDrivenCompute)
                     for (const auto &function : model_.functions()) out << dpiDeclaration(function) << '\n';
                 out << "void " << class_ << "::cpu_task_" << task.id.index << "(){\n";
+                deferredHistoryStores_.clear();
                 localizeBuffers_ = true;
                 emitBufferLocals(out);
                 const auto eventCache = taskEventCache(task);
@@ -3614,7 +3755,7 @@ if(terminal){
                 const auto &tree = mapping_.partitionTree;
                 if (task.execution != CpuExecution::ActivityDrivenCompute)
                 {
-                    if (dynamicStats_) out << "++cpu_dyn_cm_ent[" << task.id.index << "];\n";
+                    if (dynamicStats_) out << "++cpu_dyn_cm_ent[" << task.id.index << "];if(cpu_dyn_edge==1)++cpu_dyn_cm_ent_pos;else if(cpu_dyn_edge==2)++cpu_dyn_cm_ent_neg;if(cpu_dyn_round_cur==0)++cpu_dyn_cm_ent_r0;else ++cpu_dyn_cm_ent_rN;\n";
                     if (const auto stable = stableCommitHistories(task); !stable.empty())
                     {
                         if (dynamicStats_)
@@ -3632,6 +3773,7 @@ if(terminal){
                             for (auto op : tree.partitions[unit.index - 1].ops) sampleEvents(out, model_.operations()[op.index - 1], 1);
                         if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
                             for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
+                        flushDeferredHistoryStores(out);
                         out << "return;}\n";
                     }
                     const auto guards = commitEdgeSnapshots(out, task);
@@ -3790,11 +3932,11 @@ if(terminal){
                                     const auto bit = 1u << portArmBits_[op.index];
                                     portMask |= bit;
                                     out << "if(cpu_armed&" << bit << "){";
-                                    if (dynamicStats_) out << "++cpu_dyn_port_eval;";
+                                    if (dynamicStats_) out << "++cpu_dyn_port_eval;if(cpu_dyn_edge==1)++cpu_dyn_port_eval_pos;else if(cpu_dyn_edge==2)++cpu_dyn_port_eval_neg;if(cpu_dyn_round_cur==0)++cpu_dyn_port_eval_r0;else ++cpu_dyn_port_eval_rN;";
                                     if (sharedGuard.empty())
                                         out << "if(" << commitEdgeGuard(operation, findGuard(op)) << "){cpu_consumed|=" << bit << ';';
                                     out << "if(" << value(model_.operands(operation)[0]) << "){\n";
-                                    if (dynamicStats_) out << "++cpu_dyn_port_fire;\n";
+                                    if (dynamicStats_) out << "++cpu_dyn_port_fire;if(cpu_dyn_edge==1)++cpu_dyn_port_fire_pos;else if(cpu_dyn_edge==2)++cpu_dyn_port_fire_neg;\n";
                                     directCommitBody(out, operation);
                                     out << (sharedGuard.empty() ? "}}}\n" : "}}\n");
                                 }
@@ -3812,6 +3954,7 @@ if(terminal){
                     // Private shadow writes commute; guards keep reading individual visible histories.
                     if (const auto batches = historyBatches_.find(task.id.index); batches != historyBatches_.end())
                         for (const auto &batch : batches->second) sampleHistoryBatch(out, batch);
+                    flushDeferredHistoryStores(out);
                 }
                 else
                     for (auto word : tree.partitions[task.partition.index - 1].children)
@@ -3822,7 +3965,7 @@ if(terminal){
                         {
                             const auto &partition = tree.partitions[unit.index - 1];
                             out << "if(cpu_active_word&" << activeMasks_[unit.index] << "){cpu_active_word&=~" << activeMasks_[unit.index] << ";\n";
-                            if (dynamicStats_) out << "++cpu_dyn_sn_act[" << unit.index << "];\n";
+                            if (dynamicStats_) out << "++cpu_dyn_sn_act[" << unit.index << "];if(cpu_dyn_edge==1)++cpu_dyn_sn_act_pos;else if(cpu_dyn_edge==2)++cpu_dyn_sn_act_neg;\n";
                             // Quiescent units (hist == event on every guard term) are inert: all
                             // edge guards are false and every embedded history sample is a
                             // current==next no-op, so the whole body is skipped.
@@ -3965,6 +4108,12 @@ if(terminal){
             std::vector<char> directSampleStates_;
             std::map<std::uint32_t, std::vector<DirectSample>> directSampleUnits_;
             uint64_t directSampleStateCount_ = 0, directSampleUnitCount_ = 0;
+            // Commit-side private 1-bit histories sampled by deferred direct stores,
+            // retiring their pending/publish/re-arm round trip (see
+            // planCommitDirectHistories).
+            std::vector<char> commitDirectHistories_;
+            uint64_t commitDirectHistoryCount_ = 0;
+            mutable std::vector<std::pair<StateId, std::string>> deferredHistoryStores_;
             uint64_t directCommitCount_ = 0;
             std::map<uint32_t, std::vector<HistoryBatch>> historyBatches_;
             uint64_t historyCandidates_ = 0, historyPrivateRejected_ = 0, historyLayoutRejected_ = 0;

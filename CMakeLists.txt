@@ -136,6 +136,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/backend/cpu_layout.cpp
     lib/grhsim/backend/cpu_schedule.cpp
     lib/grhsim/backend/cpu_emit.cpp
+    lib/grhsim/backend/cpu_block_share.cpp
     lib/grhsim/backend/cpu_shape_share.cpp
     lib/grhsim/convert/grh_to_grhsim.cpp
     lib/grhsim/io/json.cpp

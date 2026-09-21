@@ -3,6 +3,7 @@
 #include "emit/grhsim_runtime.hpp"
 #include "emit/readmem.hpp"
 #include "grhsim/backend/cpu.hpp"
+#include "grhsim/backend/cpu_block_share.hpp"
 #include "grhsim/backend/cpu_shape_share.hpp"
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/ir/verifier.hpp"
@@ -326,7 +327,8 @@ namespace wolvrix::lib::grhsim
         {
         public:
             explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false,
-                             bool commitMemWalk = false, bool shapeTwinShare = false)
+                             bool commitMemWalk = false, bool shapeTwinShare = false, bool branchShapeShare = false,
+                             std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -336,7 +338,9 @@ namespace wolvrix::lib::grhsim
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
                   historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()),
                   commitDirectHistories_(stateRanges_.size()), dynamicStats_(dynamicStats),
-                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare)
+                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare),
+                  branchShapeShare_(branchShapeShare), branchShapeHotnessFile_(std::move(branchShapeHotnessFile)),
+                  branchShapeGrowthBudget_(branchShapeGrowthBudget)
             {
                 if (dynamicStats_)
                 {
@@ -647,6 +651,11 @@ namespace wolvrix::lib::grhsim
                 return shapeShareSummary_.empty() ? std::string("shape_twin_groups=0") : shapeShareSummary_;
             }
 
+            std::string blockShareSummary() const
+            {
+                return blockShareSummary_.empty() ? std::string("branch_block_groups=0") : blockShareSummary_;
+            }
+
             PassResult write(const std::filesystem::path &directory)
             {
                 if (std::filesystem::exists(directory) && !std::filesystem::is_empty(directory))
@@ -682,10 +691,15 @@ namespace wolvrix::lib::grhsim
                     if (!out) throw std::runtime_error("cannot write CPU artifact: " + path.string());
                     artifacts.push_back(path.string());
                 };
-                // --shape-twin-share: pre-render task bodies so twin grouping
-                // runs before the header (which needs the shape declarations).
+                // Pre-render task bodies when a text-level sharing pass runs so
+                // grouping happens before the header (which needs the extra
+                // declarations). --shape-twin-share folds whole-task twins
+                // first; --branch-shape-share then folds branch-block twins in
+                // the remaining texts.
                 ShapeShareResult shapeShare;
-                if (shapeTwinShare_)
+                BlockShareResult blockShare;
+                std::vector<std::string> finalTexts;
+                if (shapeTwinShare_ || branchShapeShare_)
                 {
                     const auto &tasks = schedule_.numaNodes[0].cores[0].tasks;
                     std::vector<std::string> taskTexts, taskNames;
@@ -700,15 +714,38 @@ namespace wolvrix::lib::grhsim
                             taskBody(formatted, task);
                             formatted.flush();
                         }
-                        if (!buffer) throw std::runtime_error("cannot render CPU task body for shape twin share");
+                        if (!buffer) throw std::runtime_error("cannot render CPU task body for shape/branch share");
                         taskTexts.push_back(std::move(buffer).str());
                         taskNames.push_back("cpu_task_" + std::to_string(task.id.index));
                     }
-                    shapeShare = foldShapeTwins(taskTexts, taskNames, class_, 4000);
-                    shapeShareSummary_ = shapeShare.summary;
+                    if (shapeTwinShare_)
+                    {
+                        shapeShare = foldShapeTwins(taskTexts, taskNames, class_, 4000);
+                        shapeShareSummary_ = shapeShare.summary;
+                    }
+                    if (branchShapeShare_)
+                    {
+                        const std::vector<std::string> &base = shapeTwinShare_ ? shapeShare.taskTexts : taskTexts;
+                        BlockShareOptions blockOptions;
+                        blockOptions.minSourceBytes = 1500;
+                        std::unordered_map<std::string, double> taskHotness;
+                        if (!branchShapeHotnessFile_.empty())
+                        {
+                            taskHotness = loadTaskHotnessFile(branchShapeHotnessFile_);
+                            blockOptions.taskHotness = &taskHotness;
+                            blockOptions.growthBudget = branchShapeGrowthBudget_;
+                        }
+                        blockShare = foldBranchBlocks(base, taskNames, class_, blockOptions);
+                        blockShareSummary_ = blockShare.summary;
+                    }
+                    finalTexts = branchShapeShare_ ? blockShare.taskTexts : shapeShare.taskTexts;
                 }
                 file(prefix_ + "_runtime.hpp", [&](auto &out) { emit::writeGrhSimRuntime(out, {.systemTasks = hasSystemTasks_}); });
-                file(prefix_ + ".hpp", [&](auto &out) { header(out, shapeShare.decls); });
+                file(prefix_ + ".hpp", [&](auto &out) {
+                    std::vector<std::string> extraDecls = shapeShare.decls;
+                    extraDecls.insert(extraDecls.end(), blockShare.decls.begin(), blockShare.decls.end());
+                    header(out, extraDecls);
+                });
                 const auto main = prefix_ + ".cpp"; sources.push_back(main);
                 file(main, [&](auto &out) { driver(out); });
                 constexpr std::size_t initChunkSteps = 4096;
@@ -732,8 +769,8 @@ namespace wolvrix::lib::grhsim
                     const auto &task = schedTasks[taskIndex];
                     const auto source = prefix_ + "_task_" + std::to_string(task.id.index) + ".cpp";
                     sources.push_back(source);
-                    if (shapeTwinShare_)
-                        fileRaw(source, shapeShare.taskTexts[taskIndex]);
+                    if (shapeTwinShare_ || branchShapeShare_)
+                        fileRaw(source, finalTexts[taskIndex]);
                     else
                         file(source, [&](auto &out) { taskBody(out, task); });
                 }
@@ -742,6 +779,12 @@ namespace wolvrix::lib::grhsim
                     const auto shapesSource = prefix_ + "_shapes.cpp";
                     sources.push_back(shapesSource);
                     fileRaw(shapesSource, shapeShare.shapesCpp);
+                }
+                for (std::size_t chunkIndex = 0; chunkIndex < blockShare.blocksChunks.size(); ++chunkIndex)
+                {
+                    const auto blocksSource = prefix_ + "_blocks_" + std::to_string(chunkIndex) + ".cpp";
+                    sources.push_back(blocksSource);
+                    fileRaw(blocksSource, blockShare.blocksChunks[chunkIndex]);
                 }
                 file("Makefile", [&](auto &out) {
                     out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\nSOURCES :=";
@@ -4474,6 +4517,14 @@ if(terminal){
             // into shared noinline functions plus per-task param tables.
             bool shapeTwinShare_ = false;
             std::string shapeShareSummary_;
+            // --branch-shape-share: fold shape-identical activity-guard branch
+            // bodies into shared noinline helpers plus per-block param tables.
+            bool branchShapeShare_ = false;
+            // --branch-shape-hotness: optional perf-sample TSV guiding greedy
+            // exclusion of hot groups (cold outlining) under a growth budget.
+            std::string branchShapeHotnessFile_;
+            double branchShapeGrowthBudget_ = -1.0;
+            std::string blockShareSummary_;
             mutable std::unordered_set<std::uint32_t> memGuardStripped_;
             mutable std::unordered_map<std::uint32_t, std::string> memEnableCache_;
             mutable std::uint64_t memGuardHoistRuns_ = 0, memGuardHoistSites_ = 0;
@@ -4491,34 +4542,44 @@ if(terminal){
         {
         public:
             explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false,
-                                 bool commitMemWalk = false, bool shapeTwinShare = false)
+                                 bool commitMemWalk = false, bool shapeTwinShare = false, bool branchShapeShare = false,
+                                 std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0)
                 : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats),
-                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare) {}
+                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare),
+                  branchShapeShare_(branchShapeShare), branchShapeHotnessFile_(std::move(branchShapeHotnessFile)),
+                  branchShapeGrowthBudget_(branchShapeGrowthBudget) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_); }
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_, branchShapeShare_, branchShapeHotnessFile_, branchShapeGrowthBudget_); }
         private:
             std::filesystem::path path_;
             bool dynamicStats_ = false;
             bool commitCompactWalk_ = false;
             bool commitMemWalk_ = false;
             bool shapeTwinShare_ = false;
+            bool branchShapeShare_ = false;
+            std::string branchShapeHotnessFile_;
+            double branchShapeGrowthBudget_ = -1.0;
         };
     }
 
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
-                          bool dynamicStats, bool commitCompactWalk, bool commitMemWalk, bool shapeTwinShare)
+                          bool dynamicStats, bool commitCompactWalk, bool commitMemWalk, bool shapeTwinShare, bool branchShapeShare,
+                          const std::string &branchShapeHotnessFile, double branchShapeGrowthBudget)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
         { diagnostics.error("CPU C++ emit requires a complete schedule", "cpu.st.emit-cpp"); return {false, false, {}}; }
         try
         {
-            Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare); emitter.validate();
+            Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare,
+                            branchShapeHotnessFile, branchShapeGrowthBudget); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
             if (shapeTwinShare)
                 diagnostics.info(emitter.shapeShareSummary(), "cpu.st.emit-cpp");
+            if (branchShapeShare)
+                diagnostics.info(emitter.blockShareSummary(), "cpu.st.emit-cpp");
             return result;
         }
         catch (const std::exception &error)
@@ -4531,12 +4592,15 @@ if(terminal){
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 if (args.empty() || args.size() % 2)
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>]"; return {}; }
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
                 std::filesystem::path output;
                 bool dynamicStats = false;
                 bool commitCompactWalk = false;
                 bool commitMemWalk = false;
                 bool shapeTwinShare = false;
+                bool branchShapeShare = false;
+                std::string branchShapeHotnessFile;
+                double branchShapeGrowthBudget = -1.0;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
@@ -4548,12 +4612,21 @@ if(terminal){
                         commitMemWalk = args[i + 1] == "true";
                     else if (args[i] == "--shape-twin-share" && (args[i + 1] == "true" || args[i + 1] == "false"))
                         shapeTwinShare = args[i + 1] == "true";
+                    else if (args[i] == "--branch-shape-share" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        branchShapeShare = args[i + 1] == "true";
+                    else if (args[i] == "--branch-shape-hotness" && !args[i + 1].empty())
+                        branchShapeHotnessFile = std::string(args[i + 1]);
+                    else if (args[i] == "--branch-shape-growth-budget" && !args[i + 1].empty())
+                    {
+                        try { branchShapeGrowthBudget = std::stod(std::string(args[i + 1])); }
+                        catch (const std::exception &) { error = "invalid --branch-shape-growth-budget value"; return {}; }
+                    }
                     else
-                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>]"; return {}; }
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
                 }
                 if (output.empty())
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>]"; return {}; }
-                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare);
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare, std::move(branchShapeHotnessFile), branchShapeGrowthBudget);
             }, error)) throw std::logic_error(error);
     }
 }

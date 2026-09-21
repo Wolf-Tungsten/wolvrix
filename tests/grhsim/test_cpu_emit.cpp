@@ -1,4 +1,5 @@
 #include "grhsim/backend/cpu_emit.hpp"
+#include "grhsim/backend/cpu_block_share.hpp"
 #include "grhsim/backend/cpu_shape_share.hpp"
 #include "emit/readmem.hpp"
 #include "grhsim/dialect/registry.hpp"
@@ -17,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 
 namespace
 {
@@ -3093,6 +3095,97 @@ namespace
         require(solo.groups == 0 && solo.taskTexts[0] == taskA, "singleton task was rewritten");
     }
 
+    void testBranchBlockFold(const std::filesystem::path &directory)
+    {
+        const std::string taskA =
+            "void GrhSIM_top::cpu_task_1(){\n"
+            "    std::uint8_t cpu_active_word=cpu_flags[10];\n"
+            "    if(cpu_active_word){\n"
+            "        cpu_flags[10]=0;\n"
+            "        if(cpu_active_word&1){\n"
+            "            cpu_active_word&=~1;\n"
+            "            cpu_at<bool>(cpu_bnd_,100)=static_cast<bool>(grhsim_trunc_u64((cpu_at<bool>(cpu_bnd_,200)&cpu_at<bool>(cpu_bnd_,300)),1));\n"
+            "            cpu_at<std::uint16_t>(cpu_bnd_,400)=static_cast<std::uint16_t>(grhsim_trunc_u64((cpu_at<std::uint16_t>(cpu_bnd_,500)+cpu_at<std::uint16_t>(cpu_bnd_,600)),16));\n"
+            "            cpu_flags[700] |= (static_cast<std::uint8_t>(-static_cast<std::uint8_t>(cpu_at<bool>(cpu_bnd_,800))) & 1);\n"
+            "            if(cpu_active_word&2){\n"
+            "                cpu_active_word&=~2;\n"
+            "                cpu_flags[900]=1;\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "}\n";
+        std::string taskB = taskA;
+        const std::pair<const char *, const char *> subs[] = {{"100", "101"}, {"200", "201"}, {"300", "301"}, {"400", "401"},
+                                                              {"500", "501"}, {"600", "601"}, {"700", "701"}, {"800", "801"}};
+        for (const auto &sub : subs)
+        {
+            const std::string from = sub.first;
+            const std::string to = sub.second;
+            std::size_t pos = 0;
+            while ((pos = taskB.find(from, pos)) != std::string::npos)
+            {
+                const auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; };
+                const char prev = pos > 0 ? taskB[pos - 1] : '\0';
+                const char next = pos + from.size() < taskB.size() ? taskB[pos + from.size()] : '\0';
+                if (!ident(prev) && !ident(next))
+                    taskB.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        }
+        taskB.replace(taskB.find("cpu_task_1"), 10, "cpu_task_2");
+
+        // default options: fold all groups
+        const auto folded = foldBranchBlocks({taskA, taskB}, {"cpu_task_1", "cpu_task_2"}, "GrhSIM_top",
+                                             {.minSourceBytes = 100});
+        require(folded.groups == 1 && folded.instances == 2 && folded.excludedGroups == 0,
+                "branch block group not formed");
+        require(folded.taskTexts[0].find("static const std::uint32_t cpu_blk_params32[]={100,200,300,400,500,600,700,800};") != std::string::npos,
+                "call-site params for first instance differ");
+        require(folded.taskTexts[1].find("{101,201,301,401,501,601,701,801}") != std::string::npos,
+                "call-site params for second instance differ");
+        require(folded.taskTexts[0].find("cpu_active_word&=~1;") != std::string::npos &&
+                    folded.taskTexts[0].find("cpu_blk_0(cpu_blk_params32,nullptr,cpu_active_word);") != std::string::npos,
+                "bit clear or by-ref call shape differs");
+        require(folded.blocksChunks.size() == 1 &&
+                    folded.blocksChunks[0].find("__attribute__((noinline)) void GrhSIM_top::cpu_blk_0(") != std::string::npos,
+                "shared block definition missing or not noinline");
+        require(folded.blocksChunks[0].find("std::uint8_t &cpu_active_word") != std::string::npos,
+                "by-ref active word param missing");
+        require(folded.blocksChunks[0].find("if(cpu_active_word&2){") != std::string::npos,
+                "nested guard not preserved inside shared body");
+        require(folded.blocksChunks[0].find("cpu_flags[static_cast<int>(cpu_blk_p32[6])]") != std::string::npos,
+                "varying flag index was not parameterized");
+        require(folded.decls.size() == 1 && folded.decls[0].find("cpu_blk_0") != std::string::npos,
+                "header declaration missing");
+
+        // hotness-guided exclusion: hot group with zero budget stays inline
+        const std::unordered_map<std::string, double> hotness{{"cpu_task_1", 5.0}, {"cpu_task_2", 5.0}};
+        const auto cold = foldBranchBlocks({taskA, taskB}, {"cpu_task_1", "cpu_task_2"}, "GrhSIM_top",
+                                           {.minSourceBytes = 100, .taskHotness = &hotness, .growthBudget = 0.0});
+        require(cold.groups == 0 && cold.excludedGroups == 1 && cold.instances == 0,
+                "hot group was not excluded under zero budget");
+        require(cold.taskTexts[0] == taskA && cold.taskTexts[1] == taskB,
+                "excluded group text was rewritten");
+        require(cold.blocksChunks.empty() && cold.decls.empty(), "excluded group emitted helpers");
+
+        // generous budget keeps the fold and reports the estimate
+        const auto warm = foldBranchBlocks({taskA, taskB}, {"cpu_task_1", "cpu_task_2"}, "GrhSIM_top",
+                                           {.minSourceBytes = 100, .taskHotness = &hotness, .growthBudget = 1.0e9});
+        require(warm.groups == 1 && warm.excludedGroups == 0 && warm.estimatedGrowth > 0.0,
+                "generous budget changed the fold");
+
+        // hotness TSV loader: tolerant of malformed lines
+        std::filesystem::create_directories(directory);
+        const std::filesystem::path tsv = directory / "hotness.tsv";
+        {
+            std::ofstream out(tsv);
+            out << "cpu_task_1\t5.0\nmalformed\n\n\tmissing-name\ncpu_task_2\t2.5\n";
+        }
+        const auto loaded = loadTaskHotnessFile(tsv);
+        require(loaded.size() == 2 && loaded.at("cpu_task_1") == 5.0 && loaded.at("cpu_task_2") == 2.5,
+                "hotness TSV loader mismatch");
+    }
+
 int main(int argc, char **argv)
 {
     try
@@ -3120,6 +3213,7 @@ int main(int argc, char **argv)
         diag::Diagnostics repeated;
         require(!emitCpuCpp(model, directory, repeated).success, "emit overwrote nonempty directory");
         testShapeTwinFold();
+        testBranchBlockFold(directory / "branch_block");
         testStartup(directory / "startup");
         testWideBitwise(directory / "bitwise");
         testWideActivity(directory / "wide_activity");

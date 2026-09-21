@@ -1,4 +1,5 @@
 #include "grhsim/backend/cpu_emit.hpp"
+#include "grhsim/backend/cpu_shape_share.hpp"
 #include "emit/readmem.hpp"
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/io/json.hpp"
@@ -3038,6 +3039,60 @@ namespace
     }
 }
 
+    void testShapeTwinFold()
+    {
+        const std::string taskA =
+            "#include \"grhsim_top.hpp\"\n"
+            "void GrhSIM_top::cpu_task_1(){\n"
+            "    cpu_at<bool>(cpu_bnd_,100)=static_cast<bool>(grhsim_trunc_u64((cpu_at<bool>(cpu_bnd_,200)&cpu_at<bool>(cpu_bnd_,300)),1));\n"
+            "    if(cpu_at<bool>(cpu_bnd_,400)){\n"
+            "        cpu_write_cell<std::uint32_t,32>(cpu_obj_,cpu_shadow_,500,600,cpu_at<std::uint16_t>(cpu_bnd_,700),8,1,true,cpu_at<std::uint32_t>(cpu_bnd_,800),static_cast<std::uint32_t>(grhsim_trunc_u64(UINT64_C(4294967295),32)));\n"
+            "    }\n"
+            "}\n";
+        std::string taskB = taskA;
+        const std::pair<const char *, const char *> subs[] = {{"100", "101"}, {"200", "201"}, {"300", "301"}, {"400", "401"},
+                                                              {"500", "501"}, {"600", "601"}, {"700", "701"}, {"800", "801"}};
+        for (const auto &sub : subs)
+        {
+            const std::string from = sub.first;
+            const std::string to = sub.second;
+            std::size_t pos = 0;
+            while ((pos = taskB.find(from, pos)) != std::string::npos)
+            {
+                const auto ident = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; };
+                const char prev = pos > 0 ? taskB[pos - 1] : '\0';
+                const char next = pos + from.size() < taskB.size() ? taskB[pos + from.size()] : '\0';
+                if (!ident(prev) && !ident(next))
+                    taskB.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        }
+        taskB.replace(taskB.find("cpu_task_1"), 10, "cpu_task_2");
+        const auto folded = foldShapeTwins({taskA, taskB}, {"cpu_task_1", "cpu_task_2"}, "GrhSIM_top", 100);
+        require(folded.groups == 1 && folded.instances == 2, "shape twin group not formed");
+        require(folded.taskTexts[0].find("static const std::uint32_t cpu_shape_params32[]={100,200,300,400,500,600,700,800};") != std::string::npos,
+                "wrapper params for first instance differ");
+        require(folded.taskTexts[1].find("{101,201,301,401,501,601,701,801}") != std::string::npos,
+                "wrapper params for second instance differ");
+        require(folded.taskTexts[0].find("cpu_shape_0(cpu_shape_params32,nullptr);") != std::string::npos,
+                "wrapper call shape differs");
+        require(folded.shapesCpp.find("__attribute__((noinline)) void GrhSIM_top::cpu_shape_0(") != std::string::npos,
+                "shared definition missing or not noinline");
+        require(folded.shapesCpp.find("static_cast<int>(cpu_shape_p32[0])") != std::string::npos,
+                "shared body param read missing");
+        require(folded.shapesCpp.find("cpu_write_cell<std::uint32_t,32>") != std::string::npos,
+                "template argument was parameterized");
+        require(folded.shapesCpp.find("UINT64_C(4294967295)") != std::string::npos,
+                "uniform literal was parameterized");
+        require(folded.shapesCpp.find("),1));") != std::string::npos, "uniform trunc width was parameterized");
+        require(folded.decls.size() == 1 && folded.decls[0].find("cpu_shape_0") != std::string::npos,
+                "header declaration missing");
+        // non-twin tasks stay untouched
+        const auto solo = foldShapeTwins({taskA, std::string("void GrhSIM_top::cpu_task_2(){\n}\n")},
+                                         {"cpu_task_1", "cpu_task_2"}, "GrhSIM_top", 100);
+        require(solo.groups == 0 && solo.taskTexts[0] == taskA, "singleton task was rewritten");
+    }
+
 int main(int argc, char **argv)
 {
     try
@@ -3064,6 +3119,7 @@ int main(int argc, char **argv)
         checkBufferLocals(directory);
         diag::Diagnostics repeated;
         require(!emitCpuCpp(model, directory, repeated).success, "emit overwrote nonempty directory");
+        testShapeTwinFold();
         testStartup(directory / "startup");
         testWideBitwise(directory / "bitwise");
         testWideActivity(directory / "wide_activity");

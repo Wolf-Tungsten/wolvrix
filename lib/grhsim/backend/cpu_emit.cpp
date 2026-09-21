@@ -3,6 +3,7 @@
 #include "emit/grhsim_runtime.hpp"
 #include "emit/readmem.hpp"
 #include "grhsim/backend/cpu.hpp"
+#include "grhsim/backend/cpu_shape_share.hpp"
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/ir/verifier.hpp"
 #include "slang/numeric/SVInt.h"
@@ -325,7 +326,7 @@ namespace wolvrix::lib::grhsim
         {
         public:
             explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false,
-                             bool commitMemWalk = false)
+                             bool commitMemWalk = false, bool shapeTwinShare = false)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -335,7 +336,7 @@ namespace wolvrix::lib::grhsim
                   directCommitStates_(stateRanges_.size()), privateByteHistories_(stateRanges_.size()),
                   historyAliases_(stateRanges_.size()), sharedHistoryEligible_(stateRanges_.size()),
                   commitDirectHistories_(stateRanges_.size()), dynamicStats_(dynamicStats),
-                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk)
+                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare)
             {
                 if (dynamicStats_)
                 {
@@ -641,6 +642,11 @@ namespace wolvrix::lib::grhsim
                     " mem_enable_cache_sites=" + std::to_string(memEnableCacheSites_);
             }
 
+            std::string shapeShareSummary() const
+            {
+                return shapeShareSummary_.empty() ? std::string("shape_twin_groups=0") : shapeShareSummary_;
+            }
+
             PassResult write(const std::filesystem::path &directory)
             {
                 if (std::filesystem::exists(directory) && !std::filesystem::is_empty(directory))
@@ -668,8 +674,41 @@ namespace wolvrix::lib::grhsim
                     if (!out) throw std::runtime_error("cannot write CPU artifact: " + path.string());
                     artifacts.push_back(path.string());
                 };
+                const auto fileRaw = [&](const std::string &name, const std::string &text) {
+                    const auto path = directory / name;
+                    std::ofstream out(path, std::ios::binary);
+                    if (!out) throw std::runtime_error("cannot create CPU artifact: " + path.string());
+                    out << text;
+                    if (!out) throw std::runtime_error("cannot write CPU artifact: " + path.string());
+                    artifacts.push_back(path.string());
+                };
+                // --shape-twin-share: pre-render task bodies so twin grouping
+                // runs before the header (which needs the shape declarations).
+                ShapeShareResult shapeShare;
+                if (shapeTwinShare_)
+                {
+                    const auto &tasks = schedule_.numaNodes[0].cores[0].tasks;
+                    std::vector<std::string> taskTexts, taskNames;
+                    taskTexts.reserve(tasks.size());
+                    taskNames.reserve(tasks.size());
+                    for (const auto &task : tasks)
+                    {
+                        std::ostringstream buffer;
+                        {
+                            IndentBuffer indent(buffer.rdbuf());
+                            std::ostream formatted(&indent);
+                            taskBody(formatted, task);
+                            formatted.flush();
+                        }
+                        if (!buffer) throw std::runtime_error("cannot render CPU task body for shape twin share");
+                        taskTexts.push_back(std::move(buffer).str());
+                        taskNames.push_back("cpu_task_" + std::to_string(task.id.index));
+                    }
+                    shapeShare = foldShapeTwins(taskTexts, taskNames, class_, 4000);
+                    shapeShareSummary_ = shapeShare.summary;
+                }
                 file(prefix_ + "_runtime.hpp", [&](auto &out) { emit::writeGrhSimRuntime(out, {.systemTasks = hasSystemTasks_}); });
-                file(prefix_ + ".hpp", [&](auto &out) { header(out); });
+                file(prefix_ + ".hpp", [&](auto &out) { header(out, shapeShare.decls); });
                 const auto main = prefix_ + ".cpp"; sources.push_back(main);
                 file(main, [&](auto &out) { driver(out); });
                 constexpr std::size_t initChunkSteps = 4096;
@@ -687,10 +726,22 @@ namespace wolvrix::lib::grhsim
                         }
                         ++initSteps;
                     }
-                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                const auto &schedTasks = schedule_.numaNodes[0].cores[0].tasks;
+                for (std::size_t taskIndex = 0; taskIndex < schedTasks.size(); ++taskIndex)
                 {
+                    const auto &task = schedTasks[taskIndex];
                     const auto source = prefix_ + "_task_" + std::to_string(task.id.index) + ".cpp";
-                    sources.push_back(source); file(source, [&](auto &out) { taskBody(out, task); });
+                    sources.push_back(source);
+                    if (shapeTwinShare_)
+                        fileRaw(source, shapeShare.taskTexts[taskIndex]);
+                    else
+                        file(source, [&](auto &out) { taskBody(out, task); });
+                }
+                if (shapeTwinShare_ && !shapeShare.shapesCpp.empty())
+                {
+                    const auto shapesSource = prefix_ + "_shapes.cpp";
+                    sources.push_back(shapesSource);
+                    fileRaw(shapesSource, shapeShare.shapesCpp);
                 }
                 file("Makefile", [&](auto &out) {
                     out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\nSOURCES :=";
@@ -3283,7 +3334,7 @@ namespace wolvrix::lib::grhsim
                         stage(out, {refs[i + 1].index, 0}, eventValue(operands[operands.size() - edges->size() + i]));
             }
 
-            void header(std::ostream &out) const
+            void header(std::ostream &out, const std::vector<std::string> &extraDecls) const
             {
                 out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <memory>\n#include <stdexcept>\n";
                 out << "template<class T> inline T &cpu_at(std::byte *data, std::size_t offset){return *reinterpret_cast<T*>(data+offset);}\n";
@@ -3519,6 +3570,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         out << ");\n";
                     }
                 }
+                for (const auto &decl : extraDecls) out << decl << '\n';
                 out << "};\n";
             }
 
@@ -4418,6 +4470,10 @@ if(terminal){
             // --commit-mem-walk: per-task scratch for memWrite walk skeleton
             // reduction (snapshot-guard run hoisting + boundary-bool enable cache).
             bool commitMemWalk_ = false;
+            // --shape-twin-share: fold cross-file shape-identical task bodies
+            // into shared noinline functions plus per-task param tables.
+            bool shapeTwinShare_ = false;
+            std::string shapeShareSummary_;
             mutable std::unordered_set<std::uint32_t> memGuardStripped_;
             mutable std::unordered_map<std::uint32_t, std::string> memEnableCache_;
             mutable std::uint64_t memGuardHoistRuns_ = 0, memGuardHoistSites_ = 0;
@@ -4435,31 +4491,34 @@ if(terminal){
         {
         public:
             explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false,
-                                 bool commitMemWalk = false)
+                                 bool commitMemWalk = false, bool shapeTwinShare = false)
                 : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats),
-                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk) {}
+                  commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_); }
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_); }
         private:
             std::filesystem::path path_;
             bool dynamicStats_ = false;
             bool commitCompactWalk_ = false;
             bool commitMemWalk_ = false;
+            bool shapeTwinShare_ = false;
         };
     }
 
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
-                          bool dynamicStats, bool commitCompactWalk, bool commitMemWalk)
+                          bool dynamicStats, bool commitCompactWalk, bool commitMemWalk, bool shapeTwinShare)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
         { diagnostics.error("CPU C++ emit requires a complete schedule", "cpu.st.emit-cpp"); return {false, false, {}}; }
         try
         {
-            Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk); emitter.validate();
+            Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
+            if (shapeTwinShare)
+                diagnostics.info(emitter.shapeShareSummary(), "cpu.st.emit-cpp");
             return result;
         }
         catch (const std::exception &error)
@@ -4472,11 +4531,12 @@ if(terminal){
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 if (args.empty() || args.size() % 2)
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>]"; return {}; }
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>]"; return {}; }
                 std::filesystem::path output;
                 bool dynamicStats = false;
                 bool commitCompactWalk = false;
                 bool commitMemWalk = false;
+                bool shapeTwinShare = false;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
@@ -4486,12 +4546,14 @@ if(terminal){
                         commitCompactWalk = args[i + 1] == "true";
                     else if (args[i] == "--commit-mem-walk" && (args[i + 1] == "true" || args[i + 1] == "false"))
                         commitMemWalk = args[i + 1] == "true";
+                    else if (args[i] == "--shape-twin-share" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        shapeTwinShare = args[i + 1] == "true";
                     else
-                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>]"; return {}; }
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>]"; return {}; }
                 }
                 if (output.empty())
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>]"; return {}; }
-                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk);
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare);
             }, error)) throw std::logic_error(error);
     }
 }

@@ -300,17 +300,6 @@ namespace wolvrix::lib::grhsim
                 std::vector<std::vector<uint32_t>> users(removed.size());
                 for (const auto &op : model.operations())
                     for (auto value : model.results(op)) producer[value.index] = op.id.index;
-                std::vector<uint32_t> ready;
-                for (const auto &op : model.operations())
-                {
-                    if (removed[op.id.index]) continue;
-                    for (auto operand : model.operands(op))
-                    {
-                        users[producer[canonical[operand.index].index]].push_back(op.id.index);
-                        ++pending[op.id.index];
-                    }
-                    if (!pending[op.id.index]) ready.push_back(op.id.index);
-                }
                 const auto root = [&](ValueId value) {
                     auto current = value;
                     while (canonical[current.index] != current) current = canonical[current.index];
@@ -320,6 +309,86 @@ namespace wolvrix::lib::grhsim
                     }
                     return current;
                 };
+                // A concat of consecutive slices of one source is itself a slice of
+                // that source; a full-width in-order concat is the source. Packing
+                // per-bit registers into words creates this pattern when the old
+                // per-bit reads meet an original gather of those bits. Identity
+                // folds rewire uses to the source; range folds rewrite the concat
+                // in place into one sliceStatic so ids, results and the producer
+                // map stay valid for the topological pass below.
+                std::size_t concatIdentity = 0, concatRange = 0;
+                for (std::size_t index = 0; index < model.operations().size(); ++index)
+                {
+                    const auto &op = model.operations()[index];
+                    if (removed[op.id.index] || model.text(op.opType) != "core.compute.concat") continue;
+                    const auto args = model.operands(op), results = model.results(op);
+                    if (args.size() < 2 || results.size() != 1 || !model.objectRefs(op).empty() ||
+                        !model.parameters(op).empty()) continue;
+                    const auto resultTypeId = model.values()[results[0].index - 1].type;
+                    const auto &resultType = model.types()[resultTypeId.index - 1];
+                    if (resultType.kind != TypeKind::Logic || resultType.domain != LogicDomain::TwoState) continue;
+                    ValueId source{}; int64_t low = 0, high = -1; bool match = true;
+                    for (std::size_t i = 0; i < args.size() && match; ++i)
+                    {
+                        const auto value = root(args[i]);
+                        const auto pid = producer[value.index];
+                        if (!pid || removed[pid]) { match = false; break; }
+                        const auto &producerOp = model.operations()[pid - 1];
+                        if (model.text(producerOp.opType) != "core.compute.sliceStatic") { match = false; break; }
+                        const auto sliceArgs = model.operands(producerOp);
+                        const auto sliceParams = model.parameters(producerOp);
+                        if (sliceArgs.size() != 1 || !model.objectRefs(producerOp).empty() || sliceParams.size() != 2)
+                        { match = false; break; }
+                        std::optional<int64_t> start, end;
+                        for (const auto &parameter : sliceParams)
+                        {
+                            const auto *integer = std::get_if<int64_t>(&parameter.value);
+                            if (!integer) { match = false; break; }
+                            if (model.text(parameter.name) == "sliceStart") start = *integer;
+                            else if (model.text(parameter.name) == "sliceEnd") end = *integer;
+                            else { match = false; break; }
+                        }
+                        if (!match || !start || !end || *start < 0 || *end < *start) { match = false; break; }
+                        const auto &valueType = model.types()[model.values()[value.index - 1].type.index - 1];
+                        if (valueType.kind != TypeKind::Logic || valueType.domain != LogicDomain::TwoState ||
+                            valueType.width != static_cast<uint64_t>(*end - *start + 1)) { match = false; break; }
+                        const auto sliceSource = root(sliceArgs[0]);
+                        if (i == 0) { source = sliceSource; high = *end; }
+                        else if (sliceSource != source || low != *end + 1) { match = false; break; }
+                        low = *start;
+                    }
+                    if (!match) continue;
+                    const auto &sourceType = model.types()[model.values()[source.index - 1].type.index - 1];
+                    if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState ||
+                        high >= static_cast<int64_t>(sourceType.width) ||
+                        high - low + 1 != static_cast<int64_t>(resultType.width)) continue;
+                    if (low == 0 && high + 1 == static_cast<int64_t>(sourceType.width) &&
+                        model.values()[source.index - 1].type == resultTypeId)
+                    {
+                        canonical[results[0].index] = source;
+                        removed[op.id.index] = 1;
+                        ++concatIdentity;
+                        continue;
+                    }
+                    if (resultType.isSigned) continue;
+                    const std::vector<ValueId> foldOperands{source};
+                    const std::vector<ValueId> foldResults(results.begin(), results.end());
+                    const std::array foldParams{Parameter{model.intern("sliceStart"), low},
+                                                Parameter{model.intern("sliceEnd"), high}};
+                    model.replaceOperation(op.id, "core.compute.sliceStatic", foldOperands, foldResults, {}, foldParams);
+                    ++concatRange;
+                }
+                std::vector<uint32_t> ready;
+                for (const auto &op : model.operations())
+                {
+                    if (removed[op.id.index]) continue;
+                    for (auto operand : model.operands(op))
+                    {
+                        users[producer[root(operand).index]].push_back(op.id.index);
+                        ++pending[op.id.index];
+                    }
+                    if (!pending[op.id.index]) ready.push_back(op.id.index);
+                }
                 std::vector<std::optional<uint64_t>> constants(sources.size());
                 std::unordered_map<std::string, ValueId> expressions;
                 std::size_t common = 0, algebraic = 0;
@@ -379,7 +448,7 @@ namespace wolvrix::lib::grhsim
                 }
                 for (const auto &value : model.values()) canonical[value.id.index] = root(value.id);
                 const auto assigns = count;
-                count += common + algebraic;
+                count += common + algebraic + concatIdentity + concatRange;
                 if (count)
                 {
                     for (const auto &op : model.operations())
@@ -409,6 +478,8 @@ namespace wolvrix::lib::grhsim
                 diagnostics.info("identity_assigns_removed=" + std::to_string(assigns) +
                                  " algebraic_identities_removed=" + std::to_string(algebraic) +
                                  " common_expressions_removed=" + std::to_string(common) +
+                                 " concat_identity_folds=" + std::to_string(concatIdentity) +
+                                 " concat_range_folds=" + std::to_string(concatRange) +
                                  " rewritten_uses=" + std::to_string(uses), name());
                 return {true, count != 0, {}};
             }

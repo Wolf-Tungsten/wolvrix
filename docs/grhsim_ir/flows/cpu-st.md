@@ -44,8 +44,12 @@ reg-to-mem，也不修改 GRH。
 完成首次mapping后，XiangShan入口执行
 [`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)，依据同enable/mask、
 event/history初值和quiescence投影类别把普通单写口bit寄存器打包为至多64位word。
-该语义变换会使mapping失效，随后完整重跑八个CPU mapping pass。集成开关为
-`XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1`。读slice继续提供commit旧快照，
+该语义变换会使mapping失效。打包把原逐bit `core.state.read` 改写为
+`core.compute.sliceStatic(packed, bit, bit)`，原 IR 中对这些bit的
+`core.compute.concat` gather 因此退化为同一源值的连续切片拼接；随后立即重跑
+`grhsim.canonicalize-compute`，将全覆盖顺序拼接折叠回源值、连续区间拼接就地改写为
+单个 `sliceStatic`（详见下文该 pass 的代数规则），再完整重跑八个CPU mapping pass。
+集成开关为 `XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1`。读slice继续提供commit旧快照，
 CPU emitter使用现有标量concat/read/slice/write路径；打包收益须由性能实测判断。
 
 最终 mapping 前运行 [`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)，
@@ -110,6 +114,16 @@ operands 依次是左值 `a`、右值 `b`：`add(a,0)`、`sub(a,0)`、`mul(a,1)`
 按 ValueId 排序构造 CSE 键，`add(a,b)` 与 `add(b,a)` 可共享，非交换运算保持顺序。
 删除与重接发生于 IR，后续依赖分析和 mapping 使用化简后的图；语义 revision
 使旧 mapping 失效。状态共享若再暴露相同表达式，重复现有归一化过程。
+
+拓扑遍历之前还折叠同源连续切片的 `core.compute.concat`：全部 operand 都是
+同一 two-state logic 源值的 `sliceStatic` 结果、位段按 MSB 优先顺序首尾相接，
+且拼接宽度等于结果宽度时，`concat(slice(x,w-1),…,slice(x,0))` 在源值与结果
+同完整 TypeId 下接回源值（`concat_identity_folds`）；否则当结果为 unsigned
+two-state 时把 concat 原 op 就地改写为单个 `sliceStatic(x,lo,hi)`，op/result
+标识不变并继续参与后续 CSE（`concat_range_folds`）。位段有空缺、逆序、跨源、
+四态源或有符号结果的拼接保守保留。该形态主要由 pack-bit-registers 把逐 bit
+读改写为 word 切片后产生，故流水线在打包后重跑本 pass。诊断键相应增加
+`concat_identity_folds` 与 `concat_range_folds`。
 
 按下表顺序执行。前八步只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
 最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。

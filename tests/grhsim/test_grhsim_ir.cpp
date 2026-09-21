@@ -16,6 +16,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace
@@ -569,6 +570,128 @@ namespace
         manager.addPass(defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error));
         const auto result = manager.run(guards, diagnostics);
         if (!result.success || result.changed) return fail("algebraic pass ignored a type, parameter, or cycle guard");
+        return 0;
+    }
+
+    int runConcatSliceFoldTest()
+    {
+        using namespace grhsim;
+        GrhSimModel model("concat_slice_fold"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto u2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto u4 = model.logicType(4, false, LogicDomain::TwoState);
+        const auto u5 = model.logicType(5, false, LogicDomain::TwoState);
+        const auto u8 = model.logicType(8, false, LogicDomain::TwoState);
+        const auto s2 = model.logicType(2, true, LogicDomain::TwoState);
+        const auto f2 = model.logicType(2, false, LogicDomain::FourState);
+        std::vector<InputId> inputPorts;
+        const auto input = [&](std::string_view name, TypeId type) {
+            const auto port = model.addInput(std::string(name), type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            inputPorts.push_back(port);
+            return value;
+        };
+        const auto x = input("x", u8), y = input("y", u8), f = input("f", f2);
+        const auto xPort = inputPorts[0];
+        const auto slice = [&](ValueId source, int64_t low, int64_t high) {
+            const auto type = model.logicType(static_cast<uint32_t>(high - low + 1), false, LogicDomain::TwoState);
+            const auto value = model.addValue(type);
+            const std::array params{Parameter{model.intern("sliceStart"), low},
+                Parameter{model.intern("sliceEnd"), high}};
+            model.addOperation("core.compute.sliceStatic", std::array{source}, std::array{value}, {}, params);
+            return value;
+        };
+        const auto concat = [&](TypeId type, std::span<const ValueId> args) {
+            const auto value = model.addValue(type);
+            model.addOperation("core.compute.concat", args, std::array{value});
+            return value;
+        };
+        unsigned outputCount = 0;
+        const auto output = [&](ValueId value) {
+            const auto port = model.addOutput("o" + std::to_string(outputCount++),
+                model.values()[value.index - 1].type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+            return port;
+        };
+        // Identity: a full-width in-order gather of one source folds to the source.
+        std::vector<ValueId> bits;
+        for (int64_t b = 7; b >= 0; --b) bits.push_back(slice(x, b, b));
+        const auto multiUse = bits[4];
+        const auto identityPort = output(concat(u8, bits));
+        const auto multiUsePort = output(multiUse);
+        // Range: a consecutive slice run rewrites the concat in place to one sliceStatic.
+        const std::array rangeArgs{slice(x, 4, 5), slice(x, 2, 3)};
+        const auto rangePort = output(concat(u4, rangeArgs));
+        const auto twinPort = output(slice(x, 2, 5));
+        // Guards: a gap, reversed order, two sources, four-state source, and a
+        // signed result must all survive untouched.
+        const std::array gapArgs{slice(x, 6, 7), slice(x, 0, 2)};
+        const auto gapPort = output(concat(u5, gapArgs));
+        const std::array reversedArgs{slice(x, 0, 0), slice(x, 1, 1)};
+        const auto reversedPort = output(concat(u2, reversedArgs));
+        const std::array twoSourceArgs{slice(x, 1, 1), slice(y, 0, 0)};
+        const auto twoSourcePort = output(concat(u2, twoSourceArgs));
+        const std::array fourArgs{slice(f, 1, 1), slice(f, 0, 0)};
+        const auto fourPort = output(concat(u2, fourArgs));
+        const std::array signedArgs{slice(x, 1, 1), slice(x, 0, 0)};
+        const auto signedPort = output(concat(s2, signedArgs));
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error));
+        const auto result = manager.run(model, diagnostics);
+        if (!result.success || !result.changed) return fail("concat-slice fold pass failed or reported no change");
+        // Value ids are renumbered by compaction; resolve everything structurally.
+        std::vector<ValueId> outputs(model.outputs().size() + 1);
+        ValueId xRead{};
+        for (const auto &op : model.operations())
+        {
+            if (model.text(op.opType) == "core.output.write")
+                outputs[model.objectRefs(op)[0].index] = model.operands(op)[0];
+            if (model.text(op.opType) == "core.input.read" && model.objectRefs(op)[0].index == xPort.index)
+                xRead = model.results(op)[0];
+        }
+        if (!xRead) return fail("input read of x was not preserved");
+        const auto producerOf = [&](ValueId value) -> const SimOp & {
+            for (const auto &op : model.operations())
+                for (auto resultValue : model.results(op))
+                    if (resultValue == value) return op;
+            throw std::runtime_error("missing producer");
+        };
+        const auto sliceBounds = [&](const SimOp &op, int64_t &start, int64_t &end) {
+            start = end = -1;
+            for (const auto &parameter : model.parameters(op))
+            {
+                const auto *integer = std::get_if<int64_t>(&parameter.value);
+                if (!integer) return;
+                if (model.text(parameter.name) == "sliceStart") start = *integer;
+                if (model.text(parameter.name) == "sliceEnd") end = *integer;
+            }
+        };
+        if (outputs[identityPort.index] != xRead) return fail("identity concat did not fold to the source");
+        if (outputs[rangePort.index] != outputs[twinPort.index])
+            return fail("range fold slice was not shared with the identical existing slice");
+        {
+            const auto &op = producerOf(outputs[rangePort.index]);
+            if (model.text(op.opType) != "core.compute.sliceStatic" || model.operands(op)[0] != xRead)
+                return fail("range concat was not rewritten to a single sliceStatic");
+            int64_t start, end; sliceBounds(op, start, end);
+            if (start != 2 || end != 5) return fail("range fold slice bounds are wrong");
+        }
+        for (auto port : {gapPort, reversedPort, twoSourcePort, fourPort, signedPort})
+            if (model.text(producerOf(outputs[port.index]).opType) != "core.compute.concat")
+                return fail("a guarded concat was folded");
+        {
+            const auto &op = producerOf(outputs[multiUsePort.index]);
+            if (model.text(op.opType) != "core.compute.sliceStatic" || model.operands(op)[0] != xRead)
+                return fail("multi-use slice was removed with the identity concat");
+            int64_t start, end; sliceBounds(op, start, end);
+            if (start != 3 || end != 3) return fail("multi-use slice bounds changed");
+        }
+        const auto again = manager.run(model, diagnostics);
+        if (!again.success || again.changed) return fail("concat-slice fold pass is not idempotent");
+        std::stringstream serialized;
+        if (!writeGrhSimJson(model, serialized, defaultDialectRegistry(), diagnostics) ||
+            !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics))
+            return fail("concat-slice fold output does not round-trip");
         return 0;
     }
 
@@ -1195,6 +1318,7 @@ int main()
         if (const int status = runUndrivenTwoStateTest(); status != 0) return status;
         if (const int status = runIdentityAssignTest(); status != 0) return status;
         if (const int status = runAlgebraicComputeTest(); status != 0) return status;
+        if (const int status = runConcatSliceFoldTest(); status != 0) return status;
         if (const int status = runBitwisePredicatesTest(); status != 0) return status;
         if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
         if (const int status = runMuxChainFoldTest(); status != 0) return status;

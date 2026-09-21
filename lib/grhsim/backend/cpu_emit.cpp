@@ -352,8 +352,6 @@ namespace wolvrix::lib::grhsim
                 return "dispatch_packed_checks=" + std::to_string(dispatchPackedBytes_) +
                     " handoff_packed_slots=" + std::to_string(handoffPackedSlots_) +
                     " port_arm_walk_packed_words=" + std::to_string(pflagPackedWords_) +
-                    " fanout_bulk_groups=" + std::to_string(fanoutBulkGroups_) +
-                    " fanout_bulk_bytes=" + std::to_string(fanoutBulkBytes_) +
                     " shared_edge_blocks=" + std::to_string(sharedEdgeBlocks_) +
                     " shared_edge_ports=" + std::to_string(sharedEdgePorts_) +
                     " gate_hoisted_runs=" + std::to_string(gateHoistedRuns_) +
@@ -537,52 +535,11 @@ namespace wolvrix::lib::grhsim
                 return &portArmTargets_[value.index];
             }
 
-            // Fanout publication batching (gsim bulk-OR form): (offset, mask) OR
-            // targets sharing one aligned 8-byte window emit as a single
-            // memcpy-based uint64 OR — identical bits, branchless (no control-flow
-            // cost). Single-byte windows keep the byte form (cheaper). memcpy keeps
-            // the access inside uint8_t aliasing rules and compiles to one
-            // unaligned u64 load/store pair.
-            void emitFlagOrs(std::ostream &out, const char *arena,
-                             const std::map<std::uint32_t, std::uint32_t> &masks, const std::string &condition) const
-            {
-                std::map<std::uint32_t, std::uint64_t> groups;
-                for (const auto &[offset, mask] : masks)
-                {
-                    if (!mask) continue;
-                    groups[offset & ~std::uint32_t(7)] |= static_cast<std::uint64_t>(mask) << (8 * (offset & 7));
-                }
-                for (const auto &[base, merged] : groups)
-                {
-                    unsigned lanes = 0, firstLane = 0;
-                    for (unsigned i = 0; i < 8; ++i)
-                        if ((merged >> (8 * i)) & 0xff) { if (!lanes) firstLane = i; ++lanes; }
-                    if (lanes < 2)
-                    {
-                        const std::uint32_t mask8 = static_cast<std::uint32_t>((merged >> (8 * firstLane)) & 0xff);
-                        out << arena << '[' << base + firstLane << "] |= ";
-                        if (condition.empty()) out << mask8;
-                        else out << "(static_cast<std::uint8_t>(-static_cast<std::uint8_t>(" << condition
-                                 << ")) & " << mask8 << ')';
-                        out << ";\n";
-                        continue;
-                    }
-                    out << "{std::uint64_t cpu_or_tmp;std::memcpy(&cpu_or_tmp," << arena << ".data()+" << base
-                        << ",8);cpu_or_tmp|=";
-                    if (condition.empty()) out << "UINT64_C(0x" << std::hex << merged << std::dec << ')';
-                    else out << "(static_cast<std::uint64_t>(-static_cast<std::uint64_t>(" << condition
-                             << ")) & UINT64_C(0x" << std::hex << merged << std::dec << "))";
-                    out << ";std::memcpy(" << arena << ".data()+" << base << ",&cpu_or_tmp,8);}\n";
-                    ++fanoutBulkGroups_;
-                    fanoutBulkBytes_ += lanes;
-                }
-            }
-
             void armPorts(std::ostream &out, const std::vector<PortArmTarget> &targets, const std::string &condition) const
             {
-                std::map<std::uint32_t, std::uint32_t> masks;
-                for (const auto &target : targets) masks[target.offset] |= target.mask;
-                emitFlagOrs(out, "cpu_pflags", masks, condition);
+                for (const auto &target : targets)
+                    out << "cpu_pflags[" << target.offset << "] |= (static_cast<std::uint8_t>(-static_cast<std::uint8_t>("
+                        << condition << ")) & " << target.mask << ");\n";
             }
 
             struct QuiescenceTerm { StateId history; ValueId event; };
@@ -1786,18 +1743,10 @@ namespace wolvrix::lib::grhsim
                         "(static_cast<std::uint8_t>(-static_cast<std::uint8_t>(" + condition + ")) & " + std::to_string(mask) + ")";
                 };
                 if (localMask) out << "cpu_active_word |= " << gated(localMask) << ";\n";
-                if (next)
-                {
-                    emitFlagOrs(out, "cpu_flags", masks, condition);
-                    std::map<std::uint32_t, std::uint32_t> armMasks;
-                    for (auto target : targets.arm) armMasks[armOffsets_[target.index]] |= 1;
-                    emitFlagOrs(out, "cpu_next_arms", armMasks, condition);
-                }
-                else
-                {
-                    for (auto target : targets.arm) masks[armOffsets_[target.index]] |= 1;
-                    emitFlagOrs(out, "cpu_flags", masks, condition);
-                }
+                for (const auto &[offset, mask] : masks)
+                    out << "cpu_flags[" << offset << "] |= " << gated(mask) << ";\n";
+                for (auto target : targets.arm)
+                    out << (next ? "cpu_next_arms[" : "cpu_flags[") << armOffsets_[target.index] << "] |= " << gated(1) << ";\n";
             }
 
             std::string dpiType(TypeId id) const
@@ -4175,7 +4124,6 @@ if(terminal){
             std::uint32_t portArmWordCount_ = 0;
             std::uint64_t portArmPortCount_ = 0, portArmTaskCount_ = 0, portArmValueCount_ = 0;
             mutable std::uint64_t dispatchPackedBytes_ = 0, handoffPackedSlots_ = 0, pflagPackedWords_ = 0;
-            mutable std::uint64_t fanoutBulkGroups_ = 0, fanoutBulkBytes_ = 0;
             mutable std::uint64_t sharedEdgeBlocks_ = 0, sharedEdgePorts_ = 0;
             bool dynamicStats_ = false;
             bool commitCompactWalk_ = false;

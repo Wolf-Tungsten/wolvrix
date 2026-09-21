@@ -8,6 +8,7 @@
 #include "slang/numeric/SVInt.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -15,9 +16,11 @@
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace wolvrix::lib::grhsim
 {
@@ -45,6 +48,278 @@ namespace wolvrix::lib::grhsim
                 }
             return nullptr;
         }
+
+        // Re-indents generated C++ on the fly: one statement per line, block braces on
+        // their own lines, four spaces per brace depth. String/char literals and comments
+        // are lexed so braces or semicolons inside them never affect the layout, and a
+        // line comment trailing a statement stays glued to that statement.
+        class IndentBuffer final : public std::streambuf
+        {
+        public:
+            explicit IndentBuffer(std::streambuf *sink) : sink_(sink) {}
+            IndentBuffer(const IndentBuffer &) = delete;
+            IndentBuffer &operator=(const IndentBuffer &) = delete;
+            ~IndentBuffer() override
+            {
+                flushPiece(false);
+                emitPending();
+            }
+
+        protected:
+            int_type overflow(int_type ch) override
+            {
+                if (traits_type::eq_int_type(ch, traits_type::eof())) return traits_type::not_eof(ch);
+                put(static_cast<char>(ch));
+                return ch;
+            }
+            std::streamsize xsputn(const char *data, std::streamsize count) override
+            {
+                for (std::streamsize i = 0; i < count; ++i) put(data[i]);
+                return count;
+            }
+            int sync() override
+            {
+                flushPiece(false);
+                emitPending();
+                return failed_ || sink_->pubsync() != 0 ? -1 : 0;
+            }
+
+        private:
+            enum class Context
+            {
+                Code,
+                String,
+                Character,
+                LineComment,
+                BlockComment
+            };
+            enum class Brace
+            {
+                Block,
+                Init,
+                Case
+            };
+            static constexpr std::size_t indentWidth = 4;
+
+            static bool isSpace(char ch) { return ch == ' ' || ch == '\t' || ch == '\f' || ch == '\v'; }
+            static bool isWord(char ch) { return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_'; }
+
+            void append(char ch)
+            {
+                if (piece_.empty()) pieceParen_ = paren_;
+                piece_ += ch;
+            }
+
+            // A `{` opens a statement block after `)`, after a keyword such as `else`,
+            // or after a struct/class/enum tag; a braced case body is level-neutral.
+            // Anything else is a braced initializer that stays glued to its statement.
+            Brace braceKind() const
+            {
+                std::string_view text(piece_);
+                while (!text.empty() && isSpace(text.back())) text.remove_suffix(1);
+                if (text.empty()) return !braces_.empty() && braces_.back() == Brace::Init ? Brace::Init : Brace::Block;
+                const char last = text.back();
+                if (last == ')') return Brace::Block;
+                if (last == ':' && (text.starts_with("case ") || text.starts_with("default:"))) return Brace::Case;
+                if (last == '(' || last == '=' || last == ',' || last == '[' || last == '{') return Brace::Init;
+                std::size_t begin = text.size();
+                while (begin > 0 && isWord(text[begin - 1])) --begin;
+                const std::string_view lastWord = text.substr(begin);
+                if (lastWord == "else" || lastWord == "do" || lastWord == "try" || lastWord == "const" ||
+                    lastWord == "noexcept" || lastWord == "override" || lastWord == "final") return Brace::Block;
+                std::size_t end = 0;
+                while (end < text.size() && isWord(text[end])) ++end;
+                const std::string_view firstWord = text.substr(0, end);
+                if (firstWord == "struct" || firstWord == "class" || firstWord == "union" || firstWord == "enum" ||
+                    firstWord == "namespace") return Brace::Block;
+                return Brace::Init;
+            }
+
+            void put(char ch)
+            {
+                switch (context_)
+                {
+                case Context::String:
+                case Context::Character:
+                {
+                    append(ch);
+                    const char quote = context_ == Context::String ? '"' : '\'';
+                    if (escaped_) escaped_ = false;
+                    else if (ch == '\\') escaped_ = true;
+                    else if (ch == quote) context_ = Context::Code;
+                    return;
+                }
+                case Context::LineComment:
+                    if (ch == '\n')
+                    {
+                        context_ = Context::Code;
+                        flushPiece(true);
+                    }
+                    else append(ch);
+                    return;
+                case Context::BlockComment:
+                    append(ch);
+                    if (commentStar_ && ch == '/') context_ = Context::Code;
+                    commentStar_ = ch == '*';
+                    return;
+                default: break;
+                }
+                if (slash_)
+                {
+                    slash_ = false;
+                    if (ch == '/')
+                    {
+                        append('/');
+                        append('/');
+                        context_ = Context::LineComment;
+                        return;
+                    }
+                    if (ch == '*')
+                    {
+                        append('/');
+                        append('*');
+                        commentStar_ = false;
+                        context_ = Context::BlockComment;
+                        return;
+                    }
+                    append('/');
+                }
+                switch (ch)
+                {
+                case '\n': flushPiece(true); return;
+                case '\r': return;
+                case ' ':
+                case '\t':
+                case '\f':
+                case '\v':
+                    if (!piece_.empty()) append(ch);
+                    return;
+                case '/': slash_ = true; return;
+                case '"':
+                    append(ch);
+                    escaped_ = false;
+                    context_ = Context::String;
+                    return;
+                case '\'':
+                    append(ch);
+                    // A quote right after a digit is a digit separator, not a char literal.
+                    if (piece_.size() < 2 || !std::isdigit(static_cast<unsigned char>(piece_[piece_.size() - 2])))
+                    {
+                        escaped_ = false;
+                        context_ = Context::Character;
+                    }
+                    return;
+                case '(':
+                    ++paren_;
+                    append(ch);
+                    return;
+                case ')':
+                    if (paren_ > 0) --paren_;
+                    append(ch);
+                    return;
+                case '{':
+                {
+                    const Brace kind = braceKind();
+                    braces_.push_back(kind);
+                    append(ch);
+                    if (kind != Brace::Case) ++pieceDelta_;
+                    if (kind != Brace::Init)
+                    {
+                        parenStack_.push_back(paren_);
+                        paren_ = 0;
+                        flushPiece(false);
+                    }
+                    return;
+                }
+                case '}':
+                {
+                    const Brace kind = braces_.empty() ? Brace::Block : braces_.back();
+                    if (!braces_.empty()) braces_.pop_back();
+                    if (kind != Brace::Init)
+                    {
+                        paren_ = parenStack_.empty() ? 0 : parenStack_.back();
+                        if (!parenStack_.empty()) parenStack_.pop_back();
+                        if (!piece_.empty()) flushPiece(false);
+                    }
+                    append(ch);
+                    if (kind != Brace::Case) --pieceDelta_;
+                    return;
+                }
+                case ';':
+                    append(ch);
+                    if (paren_ == 0) flushPiece(false);
+                    return;
+                default: append(ch); return;
+                }
+            }
+
+            void flushPiece(bool newline)
+            {
+                while (!piece_.empty() && isSpace(piece_.back())) piece_.pop_back();
+                if (piece_.empty())
+                {
+                    pieceDelta_ = 0;
+                    pieceParen_ = 0;
+                    if (!pending_.empty()) emitPending();
+                    else if (newline) writeChar('\n');
+                    return;
+                }
+                if (!pending_.empty() && piece_.starts_with("//"))
+                {
+                    pending_ += ' ';
+                    pending_ += piece_;
+                    piece_.clear();
+                    pieceDelta_ = 0;
+                    pieceParen_ = 0;
+                    emitPending();
+                    return;
+                }
+                emitPending();
+                std::size_t leading = 0;
+                while (leading < piece_.size() && piece_[leading] == '}') ++leading;
+                std::size_t printLevel = level_ > leading ? level_ - leading : 0;
+                if (pieceParen_ > 0 && leading == 0) ++printLevel;
+                if (piece_ == "public:" || piece_ == "private:" || piece_ == "protected:" ||
+                    piece_.starts_with("case ") || piece_.starts_with("default:"))
+                    printLevel -= printLevel > 0 ? 1 : 0;
+                pending_.assign(printLevel * indentWidth, ' ');
+                pending_ += piece_;
+                const long next = static_cast<long>(level_) + pieceDelta_;
+                level_ = next > 0 ? static_cast<std::size_t>(next) : 0;
+                piece_.clear();
+                pieceDelta_ = 0;
+                pieceParen_ = 0;
+            }
+
+            void writeChar(char ch)
+            {
+                if (sink_->sputc(ch) == traits_type::eof()) failed_ = true;
+            }
+
+            void emitPending()
+            {
+                if (pending_.empty()) return;
+                const auto size = static_cast<std::streamsize>(pending_.size());
+                if (sink_->sputn(pending_.data(), size) != size) failed_ = true;
+                writeChar('\n');
+                pending_.clear();
+            }
+
+            std::streambuf *sink_;
+            std::string piece_;
+            std::string pending_;
+            std::vector<Brace> braces_;
+            std::vector<std::size_t> parenStack_;
+            std::size_t level_ = 0;
+            std::size_t paren_ = 0;
+            std::size_t pieceParen_ = 0;
+            long pieceDelta_ = 0;
+            Context context_ = Context::Code;
+            bool escaped_ = false;
+            bool slash_ = false;
+            bool commentStar_ = false;
+            bool failed_ = false;
+        };
 
         class Emitter
         {
@@ -376,7 +651,20 @@ namespace wolvrix::lib::grhsim
                     const auto path = directory / name;
                     std::ofstream out(path, std::ios::binary);
                     if (!out) throw std::runtime_error("cannot create CPU artifact: " + path.string());
-                    callback(out); out.flush();
+                    if (name == "Makefile")
+                    {
+                        // Recipe lines rely on literal leading tabs; never re-indent.
+                        callback(out);
+                        out.flush();
+                    }
+                    else
+                    {
+                        IndentBuffer indent(out.rdbuf());
+                        std::ostream formatted(&indent);
+                        callback(formatted);
+                        formatted.flush();
+                        if (!formatted) throw std::runtime_error("cannot write CPU artifact: " + path.string());
+                    }
                     if (!out) throw std::runtime_error("cannot write CPU artifact: " + path.string());
                     artifacts.push_back(path.string());
                 };

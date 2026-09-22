@@ -571,7 +571,7 @@ namespace {
                 signature+="/p"+std::to_string(p.name.index)+":"+std::to_string(value->size())+":"+*value;
             }
             if(cacheable) if(auto it=createdComputes.find(signature);it!=createdComputes.end()) return it->second;
-            auto v=m.addValue(t); const std::array result{v}; m.addOperation(k,args,result,{},ps);
+            auto v=m.addValue(t,{},computeOrigin); const std::array result{v}; m.addOperation(k,args,result,{},ps,{},computeOrigin);
             if(cacheable) createdComputes.emplace(std::move(signature),v);
             return v;
         }
@@ -625,6 +625,7 @@ namespace {
             for(const auto &init:m.initRecords()) inits[init.state.index]=&init;
             if(!merge) return;
             const auto &first=g.writes.front();
+            computeOrigin=m.operations()[first.op.index-1].origin;
             std::vector<ValueId> sequence;
             ValueId previousAddress;
             std::vector<ObjectRef> objects{ObjectRef::state(table)};
@@ -658,14 +659,14 @@ namespace {
             }
             if(sequence.size()==3) {
                 sequence.push_back(first.mask); sequence.insert(sequence.end(),first.events.begin(),first.events.end());
-                m.addOperation("core.state.memWrite",sequence,{},objects,ps);
+                m.addOperation("core.state.memWrite",sequence,{},objects,ps,{},computeOrigin);
             } else if(!sequence.empty()) {
                 sequence.insert(sequence.end(),first.events.begin(),first.events.end());
-                m.addOperation("core.state.memWriteSeq",sequence,{},objects,ps);
+                m.addOperation("core.state.memWriteSeq",sequence,{},objects,ps,{},computeOrigin);
             }
             for(const auto &[key,fill]:fills) {
                 (void)key;std::vector<ValueId> a{fill.first,fill.second};a.insert(a.end(),first.events.begin(),first.events.end());
-                m.addOperation("core.state.memFill",a,{},objects,ps);
+                m.addOperation("core.state.memFill",a,{},objects,ps,{},computeOrigin);
             }
             for(const auto &w:g.writes) {
                 removedOps[w.op.index]=1;
@@ -678,6 +679,7 @@ namespace {
                 auto op=m.operations()[i]; if(removedOps[op.id.index]) continue;
                 const auto objects=m.objectRefs(op);
                 if(objects.empty() || objects[0].kind!=ObjectKind::State || !rowMap[objects[0].index].first) continue;
+                computeOrigin=op.origin;
                 const auto [table,row]=rowMap[objects[0].index];
                 auto [it,inserted]=rowConstants.emplace(row,ValueId{});
                 if(inserted) it->second=constant(indexType,row);
@@ -716,6 +718,7 @@ namespace {
                 for(const auto &slice:view.slices) {
                     const auto id=slice.op;
                     const auto op=m.operations()[id.index-1];
+                    computeOrigin=op.origin;
                     const auto output=m.results(op)[0];
                     auto address=slice.index;
                     // Widen before adding the base, and clamp before memRead.
@@ -775,8 +778,8 @@ namespace {
                         const auto readKey=std::pair{table.index,safe.index};
                         auto [read,inserted]=createdReads.emplace(readKey,ValueId{});
                         if(inserted) {
-                            read->second=m.addValue(element);
-                            m.addOperation("core.state.memRead",std::array{safe},std::array{read->second},std::array{ObjectRef::state(table)});
+                            read->second=m.addValue(element,{},computeOrigin);
+                            m.addOperation("core.state.memRead",std::array{safe},std::array{read->second},std::array{ObjectRef::state(table)},{},{},computeOrigin);
                         }
                         auto selected=read->second;
                         if(bitOffset) selected=compute("core.compute.sliceDynamic",bit,{selected,bitOffset},
@@ -977,6 +980,9 @@ namespace {
         std::vector<PackedView> packedViews;
         std::unordered_map<uint32_t,std::vector<std::size_t>> viewsByFirstState;
         std::unordered_map<std::string,ValueId> createdComputes;
+        // Origin attached to helper ops created by compute(); set to the op
+        // currently being rewritten before each rewrite entry point.
+        OriginId computeOrigin;
         std::map<std::pair<uint32_t,uint32_t>,ValueId> createdReads;
         std::string parseReason;
         bool mutationStarted=false;

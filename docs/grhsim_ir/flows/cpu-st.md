@@ -291,6 +291,22 @@ publish 刚产生的唤醒。DPI/system task 在 compute 中登记的 history �
 fullpass 不是当前默认路线。只有在功能正确、已有 profile 将差距归因到激活检查/传播后，
 才可单独设计并验证快速路径；不能以忽略多时钟、混合边沿或派生事件来换取单时钟结果。
 
+### 6.1 srcloc 溯源链路
+
+生成的 C++ 需要能回查 RTL 源码位置。链路为：ingest 把 slang AST 的 `SourceLocation`
+写入 GRH op 的 `SrcLoc`（`grh.hpp`，JSON `loc` 字段随 store/load 保留）；GRH transform
+在改写时继承原 op 的 srcloc，新建 op 用 `origin="transform"` 标记来源 pass；
+`grh_to_grhsim` 在 `keep_origins`（Makefile 变量 `XS_WOLF_GRHSIM_IR_KEEP_ORIGINS`，默认 1）
+开启时把 `SrcLoc` 拷成 grhsim IR 的 `Origin`（JSON origins 表持久化）；grhsim pass 经
+`replaceOperation` 自动保留 origin，新建 op 必须显式继承被改写 op 的 origin。
+
+`cpu.st.emit-cpp` 默认（`--srcloc-comments true`）在每个 op 的生成代码前输出一行
+`// @<file>:<line>:<col> op=<opType> name=<opName>`；无源码位置的 op 输出
+`// @generated pass=<pass> note=<note>`。常量、别名读、静态字符串等不产出代码的 op
+不输出该行。shape-twin/branch-block share 在文本折叠前把行注释换成 `\x02` 哨兵，
+哨兵不进分组 key（分组不受影响），共享函数体恢复 host 任务的注释——被折叠成员任务的
+代码见共享体，注释位置一一对应但源码位置以 host 为准。
+
 ## 7. 验证与验收
 
 每阶段先验证结构，再验证生成物行为，最后才做性能结论：

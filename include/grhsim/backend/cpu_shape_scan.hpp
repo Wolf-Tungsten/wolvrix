@@ -51,12 +51,14 @@ namespace wolvrix::lib::grhsim::shapescan
     struct ScanResult
     {
         std::string key;        // normalized text with collapsed slots
-        std::string norm;       // normalized text with \x01<i>\x01 slots
+        std::string norm;       // normalized text with \x01<i>\x01 slots and \x02<i>\x02 comment sentinels
         std::vector<Token> tokens;
         std::vector<std::string> strings;
+        std::vector<std::string> comments; // line comments preserved as \x02 sentinels (kept out of `key`)
     };
 
-    inline void maskStringsAndComments(std::string &text, std::vector<std::string> &strings)
+    inline void maskStringsAndComments(std::string &text, std::vector<std::string> &strings,
+                                       std::vector<std::string> &comments)
     {
         std::string out;
         out.reserve(text.size());
@@ -85,8 +87,13 @@ namespace wolvrix::lib::grhsim::shapescan
             }
             if (c == '/' && i + 1 < text.size() && text[i + 1] == '/')
             {
+                const std::size_t begin = i;
                 while (i < text.size() && text[i] != '\n')
                     ++i;
+                comments.push_back(text.substr(begin, i - begin));
+                out += '\x02';
+                out += letterEncode(comments.size() - 1);
+                out += '\x02';
                 continue;
             }
             out += c;
@@ -101,6 +108,12 @@ namespace wolvrix::lib::grhsim::shapescan
         for (const std::string &prefix : prefixes)
         {
             const std::size_t plen = prefix.size();
+            // Single pass per prefix: matches are located left-to-right with the
+            // same skip/advance rules as an in-place replace loop, but the output
+            // is rebuilt once instead of memmoving the tail per replacement.
+            std::string out;
+            out.reserve(text.size());
+            std::size_t copied = 0;
             std::size_t pos = 0;
             while ((pos = text.find(prefix, pos)) != std::string::npos)
             {
@@ -124,9 +137,18 @@ namespace wolvrix::lib::grhsim::shapescan
                 auto [it, inserted] = ids.emplace(original, std::string());
                 if (inserted)
                     it->second = prefix + "Q" + letterEncode(ids.size() - 1);
-                text.replace(pos, digitEnd - pos, it->second);
-                pos += it->second.size();
+                out += text.substr(copied, pos - copied);
+                out += it->second;
+                copied = digitEnd;
+                // Past replacements always end on a non-identifier boundary, so
+                // resuming the search at digitEnd matches resuming after the
+                // replacement text in an in-place loop.
+                pos = digitEnd;
             }
+            if (copied == 0)
+                continue;
+            out += text.substr(copied);
+            text = std::move(out);
         }
     }
 
@@ -191,7 +213,7 @@ namespace wolvrix::lib::grhsim::shapescan
     {
         ScanResult result;
         std::string text = raw;
-        maskStringsAndComments(text, result.strings);
+        maskStringsAndComments(text, result.strings, result.comments);
         canonicalizeIds(text, canonicalPrefixes);
         if (!funcNameToStrip.empty())
         {
@@ -313,15 +335,38 @@ namespace wolvrix::lib::grhsim::shapescan
         if (check != text)
             throw std::runtime_error("shape scan round-trip mismatch");
 
-        std::string key = norm;
+        // Key: collapse each \x01<i>\x01 slot to "\x01\x01" and drop \x02..\x02
+        // comment sentinels entirely. Marker bytes only come from the slot and
+        // sentinel writers above (bodies never contain marker bytes), so a
+        // single forward pass reproduces the old erase/replace loop exactly
+        // without quadratic tail memmoves. Comment sentinels never join the
+        // key: srcloc/debug comments differ per instance and must not split
+        // shape groups.
+        std::string key;
+        key.reserve(norm.size());
         std::size_t kpos = 0;
-        while ((kpos = key.find('\x01', kpos)) != std::string::npos)
+        while (kpos < norm.size())
         {
-            const std::size_t close = key.find('\x01', kpos + 1);
-            if (close == std::string::npos)
-                break;
-            key.replace(kpos, close - kpos, "\x01");
-            kpos += 2;
+            const char c = norm[kpos];
+            if (c == '\x01' || c == '\x02')
+            {
+                const std::size_t close = norm.find(c, kpos + 1);
+                if (close == std::string::npos)
+                {
+                    key += c;
+                    ++kpos;
+                    continue;
+                }
+                if (c == '\x01')
+                {
+                    key += '\x01';
+                    key += '\x01';
+                }
+                kpos = close + 1;
+                continue;
+            }
+            key += c;
+            ++kpos;
         }
         result.norm = std::move(norm);
         result.key = std::move(key);
@@ -370,21 +415,23 @@ namespace wolvrix::lib::grhsim::shapescan
         return out;
     }
 
-    inline std::string unmaskStrings(std::string text, const std::vector<std::string> &strings)
+    inline std::string unmaskStrings(std::string text, const std::vector<std::string> &strings,
+                                     const std::vector<std::string> &comments = {})
     {
         std::string out;
         std::size_t pos = 0;
         while (pos < text.size())
         {
-            if (text[pos] == '\x00')
+            if (text[pos] == '\x00' || text[pos] == '\x02')
             {
-                const std::size_t close = text.find('\x00', pos + 1);
+                const char sentinel = text[pos];
+                const std::size_t close = text.find(sentinel, pos + 1);
                 if (close == std::string::npos)
-                    throw std::runtime_error("shape string sentinel unbalanced");
+                    throw std::runtime_error("shape string/comment sentinel unbalanced");
                 std::size_t index = 0;
                 for (std::size_t k = pos + 1; k < close; ++k)
                     index = index * 26 + static_cast<std::size_t>(text[k] - 'A' + 1);
-                out += strings.at(index - 1);
+                out += (sentinel == '\x00' ? strings : comments).at(index - 1);
                 pos = close + 1;
                 continue;
             }

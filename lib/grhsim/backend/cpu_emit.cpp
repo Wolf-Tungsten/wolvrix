@@ -266,8 +266,12 @@ namespace wolvrix::lib::grhsim
                     else if (newline) writeChar('\n');
                     return;
                 }
-                if (!pending_.empty() && piece_.starts_with("//"))
+                if (!pending_.empty() && piece_.starts_with("//") && !piece_.starts_with("// @"))
                 {
+                    // Intentional trailing markers (e.g. "// cpu_stable_history_skip")
+                    // glue onto the line they annotate. "// @" srcloc comments are the
+                    // exception: they document the *next* op and must stay on their
+                    // own line instead of gluing onto the previous op's closing brace.
                     pending_ += ' ';
                     pending_ += piece_;
                     piece_.clear();
@@ -328,7 +332,8 @@ namespace wolvrix::lib::grhsim
         public:
             explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false,
                              bool commitMemWalk = false, bool shapeTwinShare = false, bool branchShapeShare = false,
-                             std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0)
+                             std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0,
+                             bool srclocComments = true)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -340,7 +345,7 @@ namespace wolvrix::lib::grhsim
                   commitDirectHistories_(stateRanges_.size()), dynamicStats_(dynamicStats),
                   commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare),
                   branchShapeShare_(branchShapeShare), branchShapeHotnessFile_(std::move(branchShapeHotnessFile)),
-                  branchShapeGrowthBudget_(branchShapeGrowthBudget)
+                  branchShapeGrowthBudget_(branchShapeGrowthBudget), srclocComments_(srclocComments)
             {
                 if (dynamicStats_)
                 {
@@ -2536,8 +2541,52 @@ namespace wolvrix::lib::grhsim
                 return SideGateInfo{found->second, callCondition(operands[0]) + sideCallExtras(op), constantBody};
             }
 
+            void srclocComment(std::ostream &out, const SimOp &op) const
+            {
+                if (!srclocComments_)
+                    return;
+                // --srcloc-comments: one "// @..." line per op carrying the GRH
+                // source location (file:line:col) and the op name, keeping the
+                // generated code grep-able back to the RTL and the IR. Text-level
+                // share passes carry these lines through comment sentinels.
+                out << "// @";
+                bool located = false;
+                if (op.origin.valid())
+                {
+                    const Origin &origin = model_.origins()[op.origin.index - 1];
+                    if (origin.file.valid())
+                    {
+                        const std::string_view file = model_.text(origin.file);
+                        if (!file.empty())
+                        {
+                            out << file << ':' << origin.line << ':' << origin.column;
+                            located = true;
+                        }
+                    }
+                    if (!located)
+                    {
+                        out << "generated";
+                        if (origin.pass.valid())
+                            out << " pass=" << model_.text(origin.pass);
+                        if (origin.note.valid())
+                            out << " note=" << model_.text(origin.note);
+                    }
+                }
+                else
+                    out << "generated";
+                out << " op=" << model_.text(op.opType);
+                if (op.name.valid())
+                {
+                    const std::string_view name = model_.text(op.name);
+                    if (!name.empty())
+                        out << " name=" << name;
+                }
+                out << '\n';
+            }
+
             void sideCallBody(std::ostream &out, const SimOp &op) const
             {
+                srclocComment(out, op);
                 if (model_.text(op.opType) == "core.system.task") { systemTaskBody(out, op); return; }
                 out << dpiCallExpression(op) << ";\n";
             }
@@ -2724,6 +2773,17 @@ namespace wolvrix::lib::grhsim
             void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {},
                          const std::string &cachedGuard = {}) const
             {
+                if (srclocComments_)
+                {
+                    // Mirror computeGroup's emitsNothing: constants, aliased reads and
+                    // static strings stay pure no-ops (no comment line either).
+                    const auto results = model_.results(op);
+                    const bool silent = results.size() == 1 &&
+                        (staticScalars_.contains(results[0].index) || readAliases_[results[0].index] ||
+                         (type(results[0]).kind == TypeKind::String && staticStrings_.contains(results[0].index)));
+                    if (!silent)
+                        srclocComment(out, op);
+                }
                 if (model_.text(op.opType) == "core.system.task")
                 { systemTask(out, op, cachedGuard); return; }
                 if (model_.text(op.opType) == "core.dpi.call")
@@ -3277,6 +3337,7 @@ namespace wolvrix::lib::grhsim
 
             void commit(std::ostream &out, const SimOp &op, const std::string &cachedGuard = {}) const
             {
+                srclocComment(out, op);
                 const auto operands = model_.operands(op); const auto refs = model_.objectRefs(op);
                 const auto opName = model_.text(op.opType);
                 if (opName == "core.state.memFill")
@@ -4581,6 +4642,9 @@ if(terminal){
             // exclusion of hot groups (cold outlining) under a growth budget.
             std::string branchShapeHotnessFile_;
             double branchShapeGrowthBudget_ = -1.0;
+            // --srcloc-comments: emit a "// @file:line:col op=... name=..." line
+            // before each op's code so generated C++ maps back to RTL sources.
+            bool srclocComments_ = true;
             std::string blockShareSummary_;
             mutable std::unordered_set<std::uint32_t> memGuardStripped_;
             mutable std::unordered_map<std::uint32_t, std::string> memEnableCache_;
@@ -4600,13 +4664,14 @@ if(terminal){
         public:
             explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false,
                                  bool commitMemWalk = false, bool shapeTwinShare = false, bool branchShapeShare = false,
-                                 std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0)
+                                 std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0,
+                                 bool srclocComments = true)
                 : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats),
                   commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare),
                   branchShapeShare_(branchShapeShare), branchShapeHotnessFile_(std::move(branchShapeHotnessFile)),
-                  branchShapeGrowthBudget_(branchShapeGrowthBudget) {}
+                  branchShapeGrowthBudget_(branchShapeGrowthBudget), srclocComments_(srclocComments) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_, branchShapeShare_, branchShapeHotnessFile_, branchShapeGrowthBudget_); }
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_, branchShapeShare_, branchShapeHotnessFile_, branchShapeGrowthBudget_, srclocComments_); }
         private:
             std::filesystem::path path_;
             bool dynamicStats_ = false;
@@ -4616,12 +4681,13 @@ if(terminal){
             bool branchShapeShare_ = false;
             std::string branchShapeHotnessFile_;
             double branchShapeGrowthBudget_ = -1.0;
+            bool srclocComments_ = true;
         };
     }
 
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
                           bool dynamicStats, bool commitCompactWalk, bool commitMemWalk, bool shapeTwinShare, bool branchShapeShare,
-                          const std::string &branchShapeHotnessFile, double branchShapeGrowthBudget)
+                          const std::string &branchShapeHotnessFile, double branchShapeGrowthBudget, bool srclocComments)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
@@ -4629,7 +4695,7 @@ if(terminal){
         try
         {
             Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare,
-                            branchShapeHotnessFile, branchShapeGrowthBudget); emitter.validate();
+                            branchShapeHotnessFile, branchShapeGrowthBudget, srclocComments); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
@@ -4649,7 +4715,7 @@ if(terminal){
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 if (args.empty() || args.size() % 2)
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>] [--srcloc-comments <true|false>]"; return {}; }
                 std::filesystem::path output;
                 bool dynamicStats = false;
                 bool commitCompactWalk = false;
@@ -4658,6 +4724,7 @@ if(terminal){
                 bool branchShapeShare = false;
                 std::string branchShapeHotnessFile;
                 double branchShapeGrowthBudget = -1.0;
+                bool srclocComments = true;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
@@ -4678,12 +4745,14 @@ if(terminal){
                         try { branchShapeGrowthBudget = std::stod(std::string(args[i + 1])); }
                         catch (const std::exception &) { error = "invalid --branch-shape-growth-budget value"; return {}; }
                     }
+                    else if (args[i] == "--srcloc-comments" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        srclocComments = args[i + 1] == "true";
                     else
-                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>] [--srcloc-comments <true|false>]"; return {}; }
                 }
                 if (output.empty())
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
-                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare, std::move(branchShapeHotnessFile), branchShapeGrowthBudget);
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>] [--srcloc-comments <true|false>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare, std::move(branchShapeHotnessFile), branchShapeGrowthBudget, srclocComments);
             }, error)) throw std::logic_error(error);
     }
 }

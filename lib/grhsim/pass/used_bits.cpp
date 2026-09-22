@@ -488,7 +488,7 @@ namespace wolvrix::lib::grhsim
                     const std::array params{Parameter{model.intern("sliceStart"), int64_t(0)},
                                             Parameter{model.intern("sliceEnd"), int64_t(used - 1)}};
                     model.addOperation("core.compute.sliceStatic", std::array{result}, std::array{sliced},
-                                       {}, params);
+                                       {}, params, {}, model.values()[result.index - 1].origin);
                     rewire[result.index] = sliced;
                     ++stats.boundarySlices;
                 }
@@ -507,20 +507,23 @@ namespace wolvrix::lib::grhsim
                     if (type.width == targetWidth && scalarCastOk) return value;
                     if (type.width == targetWidth)
                     {
+                        const auto origin = model.values()[value.index - 1].origin;
                         const auto converted = model.addValue(
-                            model.logicType(targetWidth, targetSigned, LogicDomain::TwoState));
-                        model.addOperation("core.compute.assign", std::array{value}, std::array{converted});
+                            model.logicType(targetWidth, targetSigned, LogicDomain::TwoState), {}, origin);
+                        model.addOperation("core.compute.assign", std::array{value}, std::array{converted},
+                                           {}, {}, {}, origin);
                         ++stats.adaptSlices;
                         return converted;
                     }
                     if (type.width < targetWidth) return {};
                     if (scalarCastOk && type.width <= 64 && targetWidth <= 64) return value;
+                    const auto origin = model.values()[value.index - 1].origin;
                     const auto sliceType = model.logicType(targetWidth, targetSigned, LogicDomain::TwoState);
-                    const auto sliced = model.addValue(sliceType);
+                    const auto sliced = model.addValue(sliceType, {}, origin);
                     const std::array params{Parameter{model.intern("sliceStart"), int64_t(0)},
                                             Parameter{model.intern("sliceEnd"), int64_t(targetWidth - 1)}};
                     model.addOperation("core.compute.sliceStatic", std::array{value}, std::array{sliced},
-                                       {}, params);
+                                       {}, params, {}, origin);
                     ++stats.adaptSlices;
                     return sliced;
                 };
@@ -700,11 +703,11 @@ namespace wolvrix::lib::grhsim
                                 if (partWidth > need)
                                 {
                                     const auto sliceType = model.logicType(need, false, LogicDomain::TwoState);
-                                    const auto sliced = model.addValue(sliceType);
+                                    const auto sliced = model.addValue(sliceType, {}, op.origin);
                                     const std::array sliceParams{Parameter{model.intern("sliceStart"), int64_t(0)},
                                                                  Parameter{model.intern("sliceEnd"), int64_t(need - 1)}};
                                     model.addOperation("core.compute.sliceStatic", std::array{part},
-                                                       std::array{sliced}, {}, sliceParams);
+                                                       std::array{sliced}, {}, sliceParams, {}, op.origin);
                                     ++stats.adaptSlices;
                                     part = sliced;
                                 }
@@ -777,7 +780,7 @@ namespace wolvrix::lib::grhsim
                         const std::array params{Parameter{model.intern("sliceStart"), int64_t(0)},
                                                 Parameter{model.intern("sliceEnd"), int64_t(used - 1)}};
                         model.addOperation("core.compute.sliceStatic", std::array{result},
-                                           std::array{replacement[result.index]}, {}, params);
+                                           std::array{replacement[result.index]}, {}, params, {}, op.origin);
                         ++stats.boundarySlices;
                     }
                 }

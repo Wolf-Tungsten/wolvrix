@@ -3186,6 +3186,60 @@ namespace
                 "hotness TSV loader mismatch");
     }
 
+    void testInitZeroElide(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("zero_elide"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState),
+            half = model.logicType(16, false, LogicDomain::TwoState),
+            word = model.logicType(32, false, LogicDomain::TwoState),
+            wide = model.logicType(129, false, LogicDomain::TwoState),
+            index = model.logicType(3, false, LogicDomain::TwoState);
+        const auto input = model.addInput("address", index);
+        const auto address = model.addValue(index);
+        const std::array results{address}; const std::array refs{ObjectRef::input(input)};
+        model.addOperation("core.input.read", {}, results, refs);
+        initializedOutput(model, "scalar_zero8", byte, address, {{"core.init.const", {{"value", std::string("0")}}}});
+        initializedOutput(model, "scalar_one16", half, address, {{"core.init.const", {{"value", std::string("1")}}}});
+        initializedOutput(model, "wide_zero", wide, address, {{"core.init.const", {{"value", std::string("0")}}}});
+        initializedOutput(model, "wide_ones", wide, address, {{"core.init.const", {{"value", std::string("'1")}}}});
+        initializedOutput(model, "arr_zero", model.arrayType(byte, 8), address, {
+            {"core.init.fill", {{"value", std::string("0")}}}});
+        // A zero fill after a non-zero write to the same state is load-bearing: kept.
+        initializedOutput(model, "arr_nz_then_zero", model.arrayType(word, 4), address, {
+            {"core.init.fill", {{"value", std::string("32'hdeadbeef")}}},
+            {"core.init.fill", {{"value", std::string("0")}}}});
+        initializedOutput(model, "arr_zero_then_nz", model.arrayType(half, 4), address, {
+            {"core.init.fill", {{"value", std::string("0")}}},
+            {"core.init.fill", {{"value", std::string("16'h5")}, {"start", int64_t(1)}, {"count", int64_t(2)}}}});
+        initializedOutput(model, "arr_const_zero", model.arrayType(byte, 4), address, {
+            {"core.init.const", {{"value", std::vector<std::string>{"0", "0", "0", "0"}}}}});
+        initializedOutput(model, "arr_const_mixed", model.arrayType(byte, 4), address, {
+            {"core.init.const", {{"value", std::vector<std::string>{"0", "1", "0", "1"}}}}});
+        map(model);
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "zero-elide emit failed");
+        std::string generated;
+        for (const auto &entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().filename().string().find("_init_") != std::string::npos)
+            {
+                std::ifstream stream(entry.path());
+                generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+            }
+        const auto count = [&](const std::string &needle) {
+            std::size_t total = 0, pos = 0;
+            while ((pos = generated.find(needle, pos)) != std::string::npos) { ++total; pos += needle.size(); }
+            return total;
+        };
+        require(count("std::memset(cpu_objects.get()") == 1, "load-bearing zero fill was elided");
+        require(count("std::memcpy(cpu_objects.get()") == 2, "kept wide/const memcpys differ");
+        require(count("cpu_at<std::uint8_t>") == 0, "zero scalar or const array store leaked");
+        require(count("grhsim_trunc_u64(UINT64_C(0),8));") == 0, "zero scalar store leaked");
+        require(count("static const std::uint8_t data[]=") == 1, "mixed const array data differs");
+        require(count("cpu_at<std::uint16_t>") == 2, "kept half-word store or fill loop differs");
+        require(count("cpu_at<std::uint32_t>") == 1, "non-zero fill loop missing");
+        std::cout << "Init zero-store elision checks passed\n";
+    }
+
 int main(int argc, char **argv)
 {
     try
@@ -3219,6 +3273,7 @@ int main(int argc, char **argv)
         testWideActivity(directory / "wide_activity");
         testEmitShape(directory / "emit_shape");
         testInit(directory / "init");
+        testInitZeroElide(directory / "init_zero_elide");
         testCalls(directory / "calls");
         testSamplingLimit(directory / "sampling_limit");
         testHistoryScan(directory / "history_scan");

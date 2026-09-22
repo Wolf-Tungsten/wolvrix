@@ -1713,6 +1713,56 @@ namespace wolvrix::lib::grhsim
             using InitRows = std::vector<std::pair<uint64_t, std::string>>;
             mutable std::map<const InitStep *, InitRows> readmemRows_;
 
+            // init() memsets the whole object arena before running the init chunks, so a
+            // zero-valued initializer restates already-zero bytes and its emission can be
+            // dropped. A zero step is elidable only while no earlier step of the same
+            // state wrote a non-zero value (per-state granularity, in emission order);
+            // readmem/random steps are data-dependent and never elided.
+            mutable bool initElidableBuilt_ = false;
+            mutable std::unordered_set<const InitStep *> initElidable_;
+
+            bool initZeroElidable(const InitStep &step) const
+            {
+                if (!initElidableBuilt_)
+                {
+                    initElidableBuilt_ = true;
+                    std::vector<char> dirty(model_.states().size() + 1, 0);
+                    for (const auto &record : model_.initRecords())
+                        for (const auto &init : model_.steps(record))
+                        {
+                            const auto &target = stateType(record.state);
+                            const bool array = target.kind == TypeKind::Array;
+                            const auto &element = array ? model_.types()[target.elementType.index - 1] : target;
+                            bool zero = false;
+                            if (element.kind == TypeKind::Logic && element.domain == LogicDomain::TwoState)
+                            {
+                                const auto kind = model_.text(init.kind);
+                                const auto params = model_.parameters(init);
+                                if (kind == "core.init.const")
+                                {
+                                    if (!array)
+                                    {
+                                        if (const auto *text = parameter<std::string>(model_, params, "value"))
+                                            zero = initLiteral(*text, element) == literal("0", element);
+                                    }
+                                    else if (const auto *values = parameter<std::vector<std::string>>(model_, params, "value"))
+                                    {
+                                        zero = true;
+                                        for (const auto &text : *values)
+                                            if (initLiteral(text, element) != literal("0", element)) { zero = false; break; }
+                                    }
+                                }
+                                else if (kind == "core.init.fill")
+                                    if (const auto *text = parameter<std::string>(model_, params, "value"))
+                                        zero = initLiteral(*text, element) == literal("0", element);
+                            }
+                            if (zero && !dirty[record.state.index]) initElidable_.insert(&init);
+                            if (!zero) dirty[record.state.index] = 1;
+                        }
+                }
+                return initElidable_.contains(&step);
+            }
+
             const InitRows &readmemRows(const InitStep &step, const Type &element, uint64_t first, uint64_t end) const
             {
                 if (const auto found = readmemRows_.find(&step); found != readmemRows_.end()) return found->second;
@@ -1766,16 +1816,20 @@ namespace wolvrix::lib::grhsim
                 const auto kind = model_.text(step.kind);
                 const auto params = model_.parameters(step);
                 const auto offset = object(ObjectRef::state(id)).offset;
-                out << "{\n";
+                const bool elide = initZeroElidable(step);
+                if (!elide) out << "{\n";
                 if (!array)
                 {
                     if (kind == "core.init.const")
                     {
                         const auto *text = parameter<std::string>(model_, params, "value");
                         if (!text) throw std::runtime_error("CPU scalar initializer requires value literal");
-                        const auto expression = initLiteral(*text, element);
-                        if (element.width <= 64) out << state(id) << '=' << expression << ";\n";
-                        else out << "static const auto data=" << expression << ";\nstd::memcpy(cpu_objects.get()+" << offset << ",&data,sizeof(data));\n";
+                        if (!elide)
+                        {
+                            const auto expression = initLiteral(*text, element);
+                            if (element.width <= 64) out << state(id) << '=' << expression << ";\n";
+                            else out << "static const auto data=" << expression << ";\nstd::memcpy(cpu_objects.get()+" << offset << ",&data,sizeof(data));\n";
+                        }
                     }
                     else if (kind == "core.init.random")
                     {
@@ -1784,7 +1838,7 @@ namespace wolvrix::lib::grhsim
                         randomInit(out, element, state(id), seed ? "rng" : "cpu_rng");
                     }
                     else throw std::runtime_error("CPU scalar initializer must be const or random");
-                    out << "}\n";
+                    if (!elide) out << "}\n";
                     return;
                 }
 
@@ -1793,7 +1847,7 @@ namespace wolvrix::lib::grhsim
                     const auto *values = parameter<std::vector<std::string>>(model_, params, "value");
                     if (!values || values->size() != target.count)
                         throw std::runtime_error("CPU array const initializer requires exactly count element literals");
-                    if (!values->empty())
+                    if (!elide && !values->empty())
                     {
                         out << "static const " << cppType(element) << " data[]={\n";
                         for (const auto &text : *values) out << initLiteral(text, element) << ",\n";
@@ -1817,17 +1871,20 @@ namespace wolvrix::lib::grhsim
                         const auto *random = parameter<bool>(model_, params, "random");
                         if ((!text && !(random && *random)) || (text && random))
                             throw std::runtime_error("CPU array fill requires exactly one of value or random=true");
-                        const bool zero = text && (initLiteral(*text, element) == literal("0", element));
-                        if (zero)
-                            out << "std::memset(cpu_objects.get()+" << offset + first * rowBytes << ",0," << size * rowBytes << ");\n";
-                        else
+                        const bool zero = !elide && text && (initLiteral(*text, element) == literal("0", element));
+                        if (!elide)
                         {
-                            if (text) out << "static const auto data=" << initLiteral(*text, element) << ";\n";
-                            out << "for(std::size_t row=" << first << ";row<" << end << ";++row){\n"
-                                << "auto &dst=cpu_at<" << cppType(element) << ">(cpu_objects.get()," << offset << "+row*" << rowBytes << ");\n";
-                            if (text) out << "std::memcpy(&dst,&data,sizeof(data));\n";
-                            else randomInit(out, element, "dst", "cpu_rng");
-                            out << "}\n";
+                            if (zero)
+                                out << "std::memset(cpu_objects.get()+" << offset + first * rowBytes << ",0," << size * rowBytes << ");\n";
+                            else
+                            {
+                                if (text) out << "static const auto data=" << initLiteral(*text, element) << ";\n";
+                                out << "for(std::size_t row=" << first << ";row<" << end << ";++row){\n"
+                                    << "auto &dst=cpu_at<" << cppType(element) << ">(cpu_objects.get()," << offset << "+row*" << rowBytes << ");\n";
+                                if (text) out << "std::memcpy(&dst,&data,sizeof(data));\n";
+                                else randomInit(out, element, "dst", "cpu_rng");
+                                out << "}\n";
+                            }
                         }
                         if (covered) covered->emplace_back(first, end);
                     }
@@ -1847,7 +1904,7 @@ namespace wolvrix::lib::grhsim
                     }
                 }
                 else throw std::runtime_error("CPU C++ emit unsupported array initializer: " + std::string(kind));
-                out << "}\n";
+                if (!elide) out << "}\n";
             }
             std::string expression(const SimOp &op) const
             {

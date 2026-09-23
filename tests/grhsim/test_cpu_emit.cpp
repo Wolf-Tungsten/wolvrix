@@ -1,6 +1,5 @@
 #include "grhsim/backend/cpu_emit.hpp"
 #include "grhsim/backend/cpu_block_share.hpp"
-#include "grhsim/backend/cpu_shape_scan.hpp"
 #include "grhsim/backend/cpu_shape_share.hpp"
 #include "emit/readmem.hpp"
 #include "grhsim/dialect/registry.hpp"
@@ -3042,40 +3041,6 @@ namespace
     }
 }
 
-    void testShapeScanKeys()
-    {
-        namespace scan = wolvrix::lib::grhsim::shapescan;
-        const std::vector<std::string> prefixes = {"cpu_cached_value_", "cpu_cached_state_"};
-        // Twin tasks share structure but carry different srcloc comments: the
-        // comment text must never split the shape key.
-        const std::string twinA =
-            "void GrhSIM_top::cpu_task_1(){\n"
-            "    // @rtl/LoadUnit.sv:3942:7 op=core.compute.and name=_op_1\n"
-            "    cpu_at<bool>(cpu_bnd_,100)=static_cast<bool>(cpu_cached_value_12&1);\n"
-            "    // @generated pass=used-bits note=adapt\n"
-            "    cpu_cached_state_7=cpu_cached_value_12;\n"
-            "}\n";
-        std::string twinB = twinA;
-        twinB.replace(twinB.find("LoadUnit.sv:3942:7"), 18, "Other Unit.sv:77:19");
-        twinB.replace(twinB.find("used-bits"), 9, "reg-to-mem");
-        const auto scanA = scan::scanText(twinA, "cpu_task_1", prefixes);
-        const auto scanB = scan::scanText(twinB, "cpu_task_1", prefixes);
-        require(scanA.key == scanB.key, "comment text leaked into the shape key");
-        require(scanA.comments.size() == 2 &&
-                    scanA.comments[0] == "// @rtl/LoadUnit.sv:3942:7 op=core.compute.and name=_op_1" &&
-                    scanA.comments[1] == "// @generated pass=used-bits note=adapt",
-                "line comments were not preserved as sentinels");
-        const std::string restored = scan::unmaskStrings(scanA.norm, scanA.strings, scanA.comments);
-        require(restored.find(scanA.comments[0]) != std::string::npos &&
-                    restored.find(scanA.comments[1]) != std::string::npos,
-                "comment sentinels did not round-trip through the normalized text");
-        require(scanA.norm.find("cpu_cached_value_QA") != std::string::npos &&
-                    scanA.norm.find("cpu_cached_value_12") == std::string::npos,
-                "identifier canonicalization lost or kept an occurrence");
-        require(scanA.norm.find("cpu_cached_state_QB") != std::string::npos,
-                "second identifier prefix was not canonicalized");
-    }
-
     void testShapeTwinFold()
     {
         const std::string taskA =
@@ -3301,7 +3266,6 @@ int main(int argc, char **argv)
         checkBufferLocals(directory);
         diag::Diagnostics repeated;
         require(!emitCpuCpp(model, directory, repeated).success, "emit overwrote nonempty directory");
-        testShapeScanKeys();
         testShapeTwinFold();
         testBranchBlockFold(directory / "branch_block");
         testStartup(directory / "startup");

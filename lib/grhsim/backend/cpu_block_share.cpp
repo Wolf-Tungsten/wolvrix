@@ -287,15 +287,6 @@ namespace wolvrix::lib::grhsim
             std::size_t i = 0;
             while (i < norm.size())
             {
-                if (norm[i] == '\x02')
-                {
-                    // Comment sentinel: skip to the closing marker.
-                    const std::size_t close = norm.find('\x02', i + 1);
-                    if (close == std::string::npos)
-                        break;
-                    i = close + 1;
-                    continue;
-                }
                 if (shapescan::identChar(norm[i]) && !std::isdigit(static_cast<unsigned char>(norm[i])) &&
                     (i == 0 || !shapescan::identChar(norm[i - 1])) && norm[i] != '\x01')
                 {
@@ -572,7 +563,7 @@ namespace wolvrix::lib::grhsim
                 helper += "    (void)cpu_blk_p32;(void)cpu_blk_p64;\n";
             helper += substituteSlots(host.norm, host.tokens, rank32, rank64, "cpu_blk_p32", "cpu_blk_p64");
             helper += "}\n";
-            helperDefs.push_back(unmaskStrings(std::move(helper), host.strings, host.comments));
+            helperDefs.push_back(unmaskStrings(std::move(helper), host.strings));
             result.decls.push_back("    __attribute__((noinline)) void cpu_blk_" + std::to_string(gid) +
                                    "(const std::uint32_t *, const std::uint64_t *" + wordParam + ");");
 

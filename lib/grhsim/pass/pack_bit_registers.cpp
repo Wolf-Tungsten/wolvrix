@@ -120,8 +120,8 @@ namespace wolvrix::lib::grhsim
                         const auto type = model.logicType(count, false, LogicDomain::TwoState);
                         const auto name = "packed_bits_" + std::to_string(first.id.index);
                         const auto state = model.addState(name, type, first.origin);
-                        const auto read = model.addValue(type, {}, first.origin), data = model.addValue(type, {}, first.origin), mask = model.addValue(type, {}, first.origin);
-                        model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(state)}, {}, {}, first.origin);
+                        const auto read = model.addValue(type), data = model.addValue(type), mask = model.addValue(type);
+                        model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(state)});
                         std::vector<ValueId> bits;
                         uint64_t initialWord = 0;
                         for (std::size_t i = 0; i < count; ++i)
@@ -137,9 +137,9 @@ namespace wolvrix::lib::grhsim
                         }
                         // Lane zero is the low bit; concat inputs run MSB first.
                         std::reverse(bits.begin(), bits.end());
-                        model.addOperation("core.compute.concat", bits, std::array{data}, {}, {}, {}, first.origin);
+                        model.addOperation("core.compute.concat", bits, std::array{data});
                         const std::array replicate{Parameter{model.intern("rep"), static_cast<int64_t>(count)}};
-                        model.addOperation("core.compute.replicate", std::array{operands[2]}, std::array{mask}, {}, replicate, {}, first.origin);
+                        model.addOperation("core.compute.replicate", std::array{operands[2]}, std::array{mask}, {}, replicate);
                         operands[1] = data; operands[2] = mask; refs[0] = ObjectRef::state(state);
                         model.addOperation("core.state.regWrite", operands, {}, refs, params, name, first.origin);
                         const std::array initParams{Parameter{model.intern("value"),

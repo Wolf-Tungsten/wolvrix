@@ -156,8 +156,8 @@ namespace wolvrix::lib::grhsim
                 const std::size_t brace = func.find("){");
                 func.insert(brace + 2, "\n    (void)cpu_shape_p32;(void)cpu_shape_p64;");
             }
-            func = unmaskStrings(std::move(func), host.strings, host.comments);
-            sharedDefs.push_back(unmaskStrings(boiler, host.strings, host.comments) + func);
+            func = unmaskStrings(std::move(func), host.strings);
+            sharedDefs.push_back(unmaskStrings(boiler, host.strings) + func);
             result.decls.push_back("    __attribute__((noinline)) void cpu_shape_" + std::to_string(gid) +
                                    "(const std::uint32_t *, const std::uint64_t *);");
 
@@ -181,7 +181,7 @@ namespace wolvrix::lib::grhsim
                     }
                     result.varyingSlots += (rank32[slot] != kNoPos || rank64[slot] != kNoPos) ? 1 : 0;
                 }
-                std::string wrapper = unmaskStrings(boiler, host.strings, host.comments);
+                std::string wrapper = unmaskStrings(boiler, host.strings);
                 wrapper += "void " + className + "::" + taskFuncNames[member] + "(){\n";
                 if (!values32.empty())
                     wrapper += "    static const std::uint32_t cpu_shape_params32[]={" + values32 + "};\n";

@@ -10,6 +10,7 @@
 #include "slang/numeric/SVInt.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -596,6 +597,7 @@ namespace wolvrix::lib::grhsim
                 planComputeQuiescence();
                 planDirectSampling();
                 planFallingEdgeElision();
+                planConeGuards();
             }
 
             std::string historyBatchSummary() const
@@ -631,6 +633,16 @@ namespace wolvrix::lib::grhsim
             }
 
             std::string fpElisionSummary() const { return fpElisionSummary_; }
+
+            std::string coneGuardSummary() const
+            {
+                return "cone_guard_units=" + std::to_string(coneGuardUnits_) +
+                    " cone_guard_total_units=" + std::to_string(coneGuardTotalUnits_) +
+                    " cone_guard_chg_words=" + std::to_string(coneGuardWords_) +
+                    " cone_guard_tokens=" + std::to_string(coneGuardTokens_) +
+                    " cone_guard_mean_runs=" + (coneGuardUnits_ ?
+                        std::to_string(static_cast<double>(coneGuardRuns_) / coneGuardUnits_) : std::string("0"));
+            }
 
             std::string packSummary() const
             {
@@ -2216,6 +2228,448 @@ namespace wolvrix::lib::grhsim
                 }
             }
 
+            // NO00007 input-precision cone guards. A guarded compute supernode
+            // tracks which of its external inputs (boundary values produced by
+            // other units, states it reads, input ports it consumes) actually
+            // changed since its last execution; inside the body, only the op
+            // regions whose run-set mask RS intersects the changed-token mask
+            // execute. Everything here is derived from model_ + schedule_ +
+            // layout_; the schedule schema is untouched.
+            static constexpr double kConeGuardMaxCoverage = 0.5; // NO00007 pre-registered structural threshold
+            struct ConeGuardInfo
+            {
+                std::vector<OpId> ops;                          // unit ops in emission order
+                std::vector<std::uint64_t> rs;                  // per-op run-set masks, ops.size() * words
+                std::map<std::uint32_t, std::uint32_t> valueTokens; // ValueId.index -> token
+                std::map<std::uint32_t, std::uint32_t> stateTokens; // StateId.index -> token
+                std::uint32_t words = 0;                        // W = ceil(nTokens / 64)
+                std::uint32_t wordBase = 0;                     // this unit's offset into cpu_chgmask[]
+                std::uint32_t runs = 0;                         // adjacent same-RS run count (summary only)
+            };
+            struct ChgTarget
+            {
+                std::uint32_t word = 0;
+                std::uint64_t bit = 0;
+            };
+            std::map<std::uint32_t, ConeGuardInfo> coneGuards_;
+            std::vector<ChgTarget> chgTargets_;          // per (state, guarded reader) entries
+            std::vector<Range> stateChgRanges_;          // per state ranges into chgTargets_
+            std::vector<ChgTarget> memoryChgTargets_;    // parallel to memoryReaders_ (word == ~0u: no-op)
+            std::uint64_t coneGuardWords_ = 0;
+            std::uint64_t coneGuardUnits_ = 0, coneGuardTotalUnits_ = 0, coneGuardRuns_ = 0, coneGuardTokens_ = 0;
+            // NO00007-DEBUG (env GRHSIM_CONE_LEAKCHECK, dynamic stats only): execute
+            // every guarded run unconditionally and count masked runs whose stores
+            // still flipped a changed flag (token signaling leak). Default off.
+            bool coneLeakCheck_ = false;
+
+            const ConeGuardInfo *coneGuard(PartitionId unit) const
+            {
+                const auto found = coneGuards_.find(unit.index);
+                return found == coneGuards_.end() ? nullptr : &found->second;
+            }
+
+            void planConeGuards()
+            {
+                // NO00007 was rejected on mechanism; the cone guard is kept as tree
+                // knowledge and only plans under GRHSIM_CONE_GUARD=1. With the gate
+                // off (default) every emission path falls back byte-identically to
+                // the NO00004 parent output. stateChgRanges_ stays sized either way
+                // so the commit walks below can read it unconditionally.
+                stateChgRanges_.assign(model_.states().size() + 1, {});
+                if (!std::getenv("GRHSIM_CONE_GUARD")) return;
+                coneLeakCheck_ = std::getenv("GRHSIM_CONE_LEAKCHECK") != nullptr;
+                const auto &tree = mapping_.partitionTree;
+                // Token inversion: (a) computeSupernodeFanout gives every boundary
+                // value produced outside the unit that one of its ops consumes,
+                // (c) inputFanout gives every consumed input value (all activate
+                // targets, including the producer unit of the core.input.read).
+                std::map<std::uint32_t, std::set<uint32_t>> valueTokens, stateTokens;
+                for (const auto &row : schedule_.computeSupernodeFanout)
+                    for (auto target : row.targets.activate) valueTokens[target.index].insert(row.source.index);
+                for (const auto &row : schedule_.inputFanout)
+                    for (auto target : row.targets.activate) valueTokens[target.index].insert(row.source.index);
+                // (b) every state read by core.state.read/core.state.memRead ops in
+                // the unit (commitStateFanout activate targets only, never arm),
+                // plus consumers of aliased state reads (they read the state slot).
+                for (const auto &row : schedule_.commitStateFanout)
+                {
+                    for (auto target : row.targets.activate) stateTokens[target.index].insert(row.source.index);
+                    for (auto target : aliasConsumers_[row.source.index]) stateTokens[target.index].insert(row.source.index);
+                }
+                const auto emitsNothing = [&](OpId id) {
+                    const auto &op = model_.operations()[id.index - 1];
+                    const auto results = model_.results(op);
+                    if (results.size() != 1) return false;
+                    const auto result = results[0];
+                    return staticScalars_.contains(result.index) || readAliases_[result.index] ||
+                        (type(result).kind == TypeKind::String && staticStrings_.contains(result.index));
+                };
+                std::vector<std::uint64_t> supp, rs;
+                std::vector<char> isOutput;
+                std::vector<std::vector<std::uint32_t>> consumers;
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    {
+                        const auto &partition = tree.partitions[unit.index - 1];
+                        if (!partition.attrs.activeId) continue;
+                        ++coneGuardTotalUnits_;
+                        std::vector<OpId> ops;
+                        for (auto node : partition.children)
+                            ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                        if (ops.empty()) continue;
+                        // Eligibility, static only: endpoints (side-effecting calls)
+                        // and eventful units (edge-guarded ops or foreign object
+                        // references) are excluded; so are units other planning
+                        // passes attached event machinery to (defensive overlap).
+                        bool eligible = true;
+                        for (auto id : ops)
+                        {
+                            const auto &op = model_.operations()[id.index - 1];
+                            const auto name = model_.text(op.opType);
+                            if (name == "core.system.function" || name == "core.system.task" || name == "core.dpi.call")
+                            { eligible = false; break; }
+                            if (parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges"))
+                            { eligible = false; break; }
+                            if (!model_.objectRefs(op).empty() && name != "core.state.read" &&
+                                name != "core.state.memRead" && name != "core.input.read")
+                            { eligible = false; break; }
+                        }
+                        if (!eligible) continue;
+                        if (computeQuiescence_.contains(unit.index) || computeGuardGroups_.contains(unit.index) ||
+                            directSampleUnits_.contains(unit.index) || computeEdgeDirection_.contains(unit.index))
+                            continue;
+                        const auto values = valueTokens.find(unit.index), states = stateTokens.find(unit.index);
+                        const std::size_t valueCount = values == valueTokens.end() ? 0 : values->second.size();
+                        const std::size_t stateCount = states == stateTokens.end() ? 0 : states->second.size();
+                        if (valueCount + stateCount == 0) continue; // zero tokens: nothing to key on
+                        ConeGuardInfo info;
+                        info.ops = ops;
+                        std::uint32_t next = 0;
+                        if (values != valueTokens.end())
+                            for (const auto value : values->second) info.valueTokens.emplace(value, next++);
+                        if (states != stateTokens.end())
+                            for (const auto state : states->second) info.stateTokens.emplace(state, next++);
+                        const std::size_t tokenCount = next;
+                        const std::size_t W = (tokenCount + 63) / 64;
+                        info.words = static_cast<std::uint32_t>(W);
+                        const std::size_t n = ops.size();
+                        // Intra-unit def-use edges over the flattened op order.
+                        std::unordered_map<std::uint32_t, std::uint32_t> position;
+                        position.reserve(n * 2);
+                        for (std::size_t i = 0; i < n; ++i)
+                            for (auto result : model_.results(model_.operations()[ops[i].index - 1]))
+                                position.emplace(result.index, static_cast<std::uint32_t>(i));
+                        consumers.assign(n, {});
+                        supp.assign(n * W, 0);
+                        rs.assign(n * W, 0);
+                        isOutput.assign(n, 0);
+                        for (std::size_t i = 0; i < n; ++i)
+                        {
+                            const auto &op = model_.operations()[ops[i].index - 1];
+                            const auto name = model_.text(op.opType);
+                            for (auto result : model_.results(op))
+                                if (layout_.values[result.index - 1].kind == CpuStorageKind::Boundary)
+                                { isOutput[i] = 1; break; }
+                            // Token seeds: source ops seed themselves; every other
+                            // operand either flows intra-unit support or seeds the
+                            // external value's token (aliased operands seed the
+                            // underlying state token, their slot is never stored).
+                            if (name == "core.state.read" || name == "core.state.memRead")
+                            {
+                                const auto tok = info.stateTokens.find(model_.objectRefs(op)[0].index);
+                                if (tok != info.stateTokens.end())
+                                    supp[i * W + tok->second / 64] |= std::uint64_t(1) << (tok->second % 64);
+                            }
+                            if (name == "core.input.read")
+                            {
+                                const auto tok = info.valueTokens.find(model_.results(op)[0].index);
+                                if (tok != info.valueTokens.end())
+                                    supp[i * W + tok->second / 64] |= std::uint64_t(1) << (tok->second % 64);
+                            }
+                            for (auto operand : model_.operands(op))
+                            {
+                                if (const auto alias = readAliases_[operand.index])
+                                {
+                                    const auto tok = info.stateTokens.find(alias.index);
+                                    if (tok != info.stateTokens.end())
+                                        supp[i * W + tok->second / 64] |= std::uint64_t(1) << (tok->second % 64);
+                                }
+                                const auto found = position.find(operand.index);
+                                if (found != position.end() && found->second != i)
+                                {
+                                    consumers[found->second].push_back(static_cast<std::uint32_t>(i));
+                                    continue;
+                                }
+                                if (readAliases_[operand.index]) continue;
+                                const auto tok = info.valueTokens.find(operand.index);
+                                if (tok != info.valueTokens.end())
+                                    supp[i * W + tok->second / 64] |= std::uint64_t(1) << (tok->second % 64);
+                            }
+                        }
+                        // SUPP fixpoint over the def-use DAG (emission order is the
+                        // partition's topological order, so this settles at once).
+                        for (bool changed = true; changed;)
+                        {
+                            changed = false;
+                            for (std::size_t i = 0; i < n; ++i)
+                                for (auto operand : model_.operands(model_.operations()[ops[i].index - 1]))
+                                {
+                                    const auto found = position.find(operand.index);
+                                    if (found == position.end() || found->second == i) continue;
+                                    const std::size_t p = found->second;
+                                    for (std::size_t w = 0; w < W; ++w)
+                                    {
+                                        const std::uint64_t bits = supp[p * W + w] & ~supp[i * W + w];
+                                        if (bits) { supp[i * W + w] |= bits; changed = true; }
+                                    }
+                                }
+                        }
+                        // RS back-propagation: an op executes exactly the tokens its
+                        // downstream boundary-stored outputs may depend on.
+                        for (std::size_t i = 0; i < n; ++i)
+                            if (isOutput[i])
+                                for (std::size_t w = 0; w < W; ++w) rs[i * W + w] = supp[i * W + w];
+                        for (bool changed = true; changed;)
+                        {
+                            changed = false;
+                            for (std::size_t i = n; i-- > 0;)
+                                for (const auto consumer : consumers[i])
+                                {
+                                    for (std::size_t w = 0; w < W; ++w)
+                                    {
+                                        const std::uint64_t bits = rs[consumer * W + w] & ~rs[i * W + w];
+                                        if (bits) { rs[i * W + w] |= bits; changed = true; }
+                                    }
+                                }
+                        }
+                        // Static selector: mean per-token op coverage must stay under
+                        // the pre-registered structural threshold.
+                        std::uint64_t covered = 0;
+                        for (std::size_t i = 0; i < n; ++i)
+                            for (std::size_t w = 0; w < W; ++w) covered += std::popcount(rs[i * W + w]);
+                        const double coverage = static_cast<double>(covered) / (tokenCount * n);
+                        if (coverage > kConeGuardMaxCoverage) continue;
+                        // Correction for pure sources with boundary storage (e.g.
+                        // wide constants consumed cross-unit): their RS is empty by
+                        // the formula above, but their store must still run whenever
+                        // the unit runs, otherwise downstream readers never observe
+                        // the initial value. This keeps the spec's dead-op rule for
+                        // ops with no path to any output (RS stays empty), and the
+                        // selector above is measured before this adjustment.
+                        const std::uint64_t topMask = tokenCount % 64 ? (std::uint64_t(1) << (tokenCount % 64)) - 1 : ~std::uint64_t(0);
+                        for (std::size_t i = 0; i < n; ++i)
+                        {
+                            if (!isOutput[i]) continue;
+                            bool empty = true;
+                            for (std::size_t w = 0; w < W && empty; ++w) empty = rs[i * W + w] == 0;
+                            if (!empty) continue;
+                            for (std::size_t w = 0; w < W; ++w) rs[i * W + w] = w + 1 == W ? topMask : ~std::uint64_t(0);
+                        }
+                        // The correction above only repairs the boundary-storing op
+                        // itself; its in-unit producers (a constant cone whose SUPP
+                        // is empty all the way down, e.g. const-concat feeding a
+                        // reduce into a boundary store) would still carry RS == ∅
+                        // and be skipped while their consumer reads the frame slot.
+                        // Re-propagate so the repaired RS reaches them; truly dead
+                        // ops (no path to any output) receive nothing and stay out.
+                        for (bool changed = true; changed;)
+                        {
+                            changed = false;
+                            for (std::size_t i = n; i-- > 0;)
+                                for (const auto consumer : consumers[i])
+                                {
+                                    for (std::size_t w = 0; w < W; ++w)
+                                    {
+                                        const std::uint64_t bits = rs[consumer * W + w] & ~rs[i * W + w];
+                                        if (bits) { rs[i * W + w] |= bits; changed = true; }
+                                    }
+                                }
+                        }
+                        info.rs = rs;
+                        info.wordBase = static_cast<std::uint32_t>(coneGuardWords_);
+                        coneGuardWords_ += W;
+                        coneGuardTokens_ += tokenCount;
+                        // Adjacent same-RS run count for the summary line.
+                        std::uint32_t runs = 0;
+                        for (std::size_t pos = 0; pos < n;)
+                        {
+                            if (emitsNothing(ops[pos])) { ++pos; continue; }
+                            const std::uint64_t *mask = info.rs.data() + pos * W;
+                            std::size_t end = pos + 1;
+                            while (end < n)
+                            {
+                                if (emitsNothing(ops[end])) { ++end; continue; }
+                                if (!std::equal(mask, mask + W, info.rs.data() + end * W)) break;
+                                ++end;
+                            }
+                            bool any = false;
+                            for (std::size_t w = 0; w < W; ++w) any = any || mask[w];
+                            if (any) ++runs;
+                            pos = end;
+                        }
+                        info.runs = runs;
+                        coneGuardRuns_ += runs;
+                        ++coneGuardUnits_;
+                        // NO00007-DEBUG (env GRHSIM_CONE_DEADPUB): list dead-region
+                        // ops (RS == ∅ after all repairs) whose results can still
+                        // publish (fanout activate targets or port arms); eliding
+                        // their stores would drop baseline flag flips.
+                        if (std::getenv("GRHSIM_CONE_DEADPUB"))
+                            for (std::size_t i = 0; i < n; ++i)
+                            {
+                                if (emitsNothing(ops[i])) continue;
+                                bool dead = true;
+                                for (std::size_t w = 0; w < W && dead; ++w) dead = info.rs[i * W + w] == 0;
+                                if (!dead) continue;
+                                const auto &op = model_.operations()[ops[i].index - 1];
+                                for (auto result : model_.results(op))
+                                {
+                                    const auto *targets = fanout_[result.index];
+                                    const auto *ports = portArmTargets(result);
+                                    if (!targets && !ports) continue;
+                                    std::fprintf(stderr, "cone-deadpub unit=%u op=%u kind=%s value=%u fanout=%d ports=%d boundary=%d\n",
+                                        unit.index, ops[i].index, std::string(model_.text(op.opType)).c_str(), result.index,
+                                        targets ? 1 : 0, ports ? 1 : 0,
+                                        layout_.values[result.index - 1].kind == CpuStorageKind::Boundary ? 1 : 0);
+                                }
+                            }
+                        coneGuards_.emplace(unit.index, std::move(info));
+                    }
+                }
+                // Parallel per-(state, guarded reader) token table for the publish
+                // and direct-commit walks (cpu_targets is aggregated per flag byte
+                // and loses per-unit resolution).
+                stateChgRanges_.assign(model_.states().size() + 1, {});
+                chgTargets_.clear();
+                for (const auto &row : schedule_.commitStateFanout)
+                {
+                    auto &range = stateChgRanges_[row.source.index];
+                    range.offset = static_cast<std::uint32_t>(chgTargets_.size());
+                    std::set<std::uint32_t> units;
+                    for (auto target : row.targets.activate) units.insert(target.index);
+                    for (auto target : aliasConsumers_[row.source.index]) units.insert(target.index);
+                    for (const auto unitIndex : units)
+                    {
+                        const auto found = coneGuards_.find(unitIndex);
+                        if (found == coneGuards_.end()) continue;
+                        const auto tok = found->second.stateTokens.find(row.source.index);
+                        if (tok == found->second.stateTokens.end()) continue;
+                        chgTargets_.push_back({found->second.wordBase + tok->second / 64,
+                                               std::uint64_t(1) << (tok->second % 64)});
+                    }
+                    range.count = static_cast<std::uint32_t>(chgTargets_.size()) - range.offset;
+                }
+                // Memory-reader token table, parallel to memoryReaders_ and walked
+                // under the same per-cell offset check; unguarded readers get a
+                // sentinel word so the walk stays a single loop.
+                memoryChgTargets_.assign(memoryReaders_.size(), {~std::uint32_t(0), 0});
+                std::vector<std::vector<OpId>> reads(model_.states().size() + 1);
+                for (const auto &op : model_.operations())
+                    if (model_.text(op.opType) == "core.state.memRead")
+                        reads[model_.objectRefs(op)[0].index].push_back(op.id);
+                for (const auto &state : model_.states())
+                {
+                    const auto range = memoryRanges_[state.id.index];
+                    for (std::size_t i = 0; i < range.count; ++i)
+                    {
+                        const auto owner = computeOwners_[reads[state.id.index][i].index];
+                        const auto found = coneGuards_.find(owner.index);
+                        if (found == coneGuards_.end()) continue;
+                        const auto tok = found->second.stateTokens.find(state.id.index);
+                        if (tok == found->second.stateTokens.end()) continue;
+                        memoryChgTargets_[range.offset + i] = {found->second.wordBase + tok->second / 64,
+                                                               std::uint64_t(1) << (tok->second % 64)};
+                    }
+                }
+                // NO00007-AUDIT (env GRHSIM_CONE_AUDIT="u1,u2,..."): dump the token
+                // tables of the listed units with producer ownership, for counter
+                // chain drift analysis. No effect when the env var is unset.
+                if (const char *auditEnv = std::getenv("GRHSIM_CONE_AUDIT"))
+                {
+                    std::set<std::uint32_t> auditUnits;
+                    for (const char *p = auditEnv; *p;)
+                    {
+                        char *end = nullptr;
+                        const unsigned long v = std::strtoul(p, &end, 10);
+                        if (end == p) break;
+                        auditUnits.insert(static_cast<std::uint32_t>(v));
+                        p = *end == ',' ? end + 1 : end;
+                    }
+                    std::vector<std::uint32_t> producerOf(layout_.values.size() + 1, 0);
+                    for (const auto &op : model_.operations())
+                        for (auto result : model_.results(op))
+                            producerOf[result.index] = op.id.index;
+                    for (const auto unitIndex : auditUnits)
+                    {
+                        const auto found = coneGuards_.find(unitIndex);
+                        if (found == coneGuards_.end())
+                        {
+                            std::fprintf(stderr, "cone-audit unit=%u NOT-GUARDED\n", unitIndex);
+                            continue;
+                        }
+                        for (const auto &[value, tok] : found->second.valueTokens)
+                        {
+                            const std::uint32_t prodOp = producerOf[value];
+                            const auto prodUnit = prodOp ? computeOwners_[prodOp].index : 0;
+                            std::string kind = prodOp ? std::string(model_.text(model_.operations()[prodOp - 1].opType)) : "?";
+                            std::fprintf(stderr, "cone-audit unit=%u vtok=%u value=%u prodUnit=%u prodGuarded=%d prodKind=%s\n",
+                                unitIndex, tok, value, prodUnit, prodUnit && coneGuards_.contains(prodUnit) ? 1 : 0, kind.c_str());
+                        }
+                        for (const auto &[state, tok] : found->second.stateTokens)
+                            std::fprintf(stderr, "cone-audit unit=%u stok=%u state=%u\n", unitIndex, tok, state);
+                    }
+                }
+            }
+
+            // OR the token bits of the given changed values into every guarded
+            // activate target's chgmask words, under the same condition as the
+            // accompanying flag set (branchless, like activate()'s gating).
+            void emitChgmaskOr(std::ostream &out, const CpuActivationTargets &targets,
+                               std::span<const std::uint32_t> values, const std::string &condition) const
+            {
+                for (auto target : targets.activate)
+                {
+                    const auto found = coneGuards_.find(target.index);
+                    if (found == coneGuards_.end()) continue;
+                    std::map<std::uint32_t, std::uint64_t> masks;
+                    for (const auto value : values)
+                    {
+                        const auto tok = found->second.valueTokens.find(value);
+                        if (tok == found->second.valueTokens.end()) continue;
+                        masks[tok->second / 64] |= std::uint64_t(1) << (tok->second % 64);
+                    }
+                    for (const auto &[word, bits] : masks)
+                    {
+                        out << "cpu_chgmask[" << found->second.wordBase + word << "]|=";
+                        if (condition.empty()) out << "UINT64_C(" << bits << ");\n";
+                        else out << "(std::uint64_t(0)-static_cast<std::uint64_t>(" << condition << "))&UINT64_C(" << bits << ");\n";
+                    }
+                }
+            }
+
+            std::vector<std::string> coneGuardParams(PartitionId unit) const
+            {
+                std::vector<std::string> params;
+                const auto *info = coneGuard(unit);
+                if (!info) return params;
+                for (std::size_t w = 0; w < info->words; ++w) params.push_back("cpu_chg_" + std::to_string(w));
+                return params;
+            }
+
+            // Inline boundary stores (results outside every ChangedGroup) activate
+            // their fanout at the store site; the token OR must accompany the flag
+            // set there exactly like in the computeGroup epilogue.
+            void activateChanged(std::ostream &out, const CpuActivationTargets &targets, PartitionId activeUnit,
+                                 std::uint32_t changedValue) const
+            {
+                activate(out, targets, false, activeUnit);
+                const std::uint32_t changed[] = {changedValue};
+                emitChgmaskOr(out, targets, changed, {});
+            }
+
             void planHistoryBatches()
             {
                 std::vector<uint32_t> references(model_.states().size() + 1);
@@ -3161,7 +3615,8 @@ namespace wolvrix::lib::grhsim
                 }
                 out << "if(" << value(result) << "!=" << source << "){\n";
                 out << value(result) << "=std::move(" << source << ");\n";
-                if (const auto *targets = fanout_[result.index]) activate(out, *targets, false, activeUnit);
+                if (const auto *targets = fanout_[result.index])
+                    activateChanged(out, *targets, activeUnit, result.index);
                 out << "}}\n";
             }
 
@@ -3358,7 +3813,8 @@ namespace wolvrix::lib::grhsim
             }
 
             void computeGroup(std::ostream &out, std::span<const OpId> ops, PartitionId unit,
-                              const std::map<uint32_t, std::string> &guards = {}) const
+                              const std::map<uint32_t, std::string> &guards = {},
+                              const ConeGuardInfo *cone = nullptr, std::size_t opOffset = 0) const
             {
                 if (dynamicStats_) out << "++cpu_dyn_sn_grp[" << unit.index << "];\n";
                 // A compute helper observes a stable pre-commit snapshot. Cache
@@ -3396,6 +3852,7 @@ namespace wolvrix::lib::grhsim
                 {
                     const CpuActivationTargets *targets = nullptr;
                     const std::vector<PortArmTarget> *ports = nullptr;
+                    std::vector<std::uint32_t> members;
                 };
                 std::map<std::vector<uint32_t>, std::size_t> indices;
                 std::vector<ChangedGroup> groups;
@@ -3426,7 +3883,8 @@ namespace wolvrix::lib::grhsim
                             key.push_back(target.mask);
                         }
                     const auto [it, inserted] = indices.emplace(std::move(key), groups.size());
-                    if (inserted) groups.push_back({targets, ports});
+                    if (inserted) groups.push_back({targets, ports, {}});
+                    groups[it->second].members.push_back(result.index);
                     groupByValue.emplace(result.index, it->second);
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i) out << "bool cpu_changed_" << i << "=false;\n";
@@ -3449,6 +3907,96 @@ namespace wolvrix::lib::grhsim
                     return staticScalars_.contains(result.index) || readAliases_[result.index] ||
                         (type(result).kind == TypeKind::String && staticStrings_.contains(result.index));
                 };
+                if (cone)
+                {
+                    // NO00007 cone-guarded emission: adjacent ops with an identical
+                    // run-set mask form one run, wrapped in a token-mask guard.
+                    // Downward closure (RS[i] ⊇ RS[j] whenever j reads i) keeps every
+                    // frame temporary fresh: a firing run's producers' runs fired
+                    // earlier. Ops with RS == ∅ have no path to any output and are
+                    // never emitted. Guarded units are non-eventful, so no op here
+                    // is a gate-hoisted side call (verified below).
+                    const std::size_t W = cone->words;
+                    const std::uint64_t *const rsBase = cone->rs.data() + opOffset * W;
+                    for (std::size_t pos = 0; pos < ops.size();)
+                    {
+                        if (emitsNothing(ops[pos]))
+                        {
+                            ++pos;
+                            continue;
+                        }
+                        const std::uint64_t *const mask = rsBase + pos * W;
+                        std::size_t end = pos + 1;
+                        while (end < ops.size())
+                        {
+                            if (emitsNothing(ops[end]))
+                            {
+                                ++end;
+                                continue;
+                            }
+                            if (!std::equal(mask, mask + W, rsBase + end * W)) break;
+                            ++end;
+                        }
+                        std::size_t runOps = 0;
+                        for (std::size_t k = pos; k < end; ++k)
+                        {
+                            if (emitsNothing(ops[k])) continue;
+                            if (sideCallGate(model_.operations()[ops[k].index - 1], guards))
+                                throw std::runtime_error("CPU cone guard unit contains a gate-hoisted side call");
+                            ++runOps;
+                        }
+                        std::string guardText;
+                        for (std::size_t w = 0; w < W; ++w)
+                        {
+                            if (!mask[w]) continue;
+                            if (!guardText.empty()) guardText += " | ";
+                            guardText += "(cpu_chg_" + std::to_string(w) + " & UINT64_C(" + std::to_string(mask[w]) + "))";
+                        }
+                        if (guardText.empty() && !(coneLeakCheck_ && dynamicStats_))
+                        {
+                            pos = end;
+                            continue; // dead region: never executes
+                        }
+                        if (coneLeakCheck_ && dynamicStats_)
+                        {
+                            // Leak check: run the body unconditionally (baseline
+                            // semantics) and flag masked runs whose stores flipped
+                            // a changed flag anyway. Dead regions are emitted too
+                            // (fire=false): any flag flip there is by definition a
+                            // signaling gap.
+                            if (guardText.empty()) out << "{const bool cpu_lk_fire=false;\n";
+                            else out << "{const bool cpu_lk_fire=(" << guardText << ");\n";
+                            const auto leakOr = [&] {
+                                std::string text;
+                                for (std::size_t g = 0; g < groups.size(); ++g)
+                                {
+                                    if (!text.empty()) text += '|';
+                                    text += "cpu_changed_" + std::to_string(g);
+                                }
+                                return text;
+                            };
+                            if (!groups.empty()) out << "const bool cpu_lk_pre=" << leakOr() << ";\n";
+                            if (dynamicStats_) out << "cpu_dyn_sn_exec[" << unit.index << "]+=" << runOps << ";\n";
+                            for (std::size_t k = pos; k < end; ++k)
+                                if (!emitsNothing(ops[k])) emitOne(ops[k]);
+                            if (!groups.empty())
+                                out << "if(!cpu_lk_fire&&((" << leakOr() << ")!=cpu_lk_pre))++cpu_dyn_sn_leak[" << unit.index << "];\n";
+                            out << "} // cpu_cone_run ops=" << runOps << "\n";
+                            pos = end;
+                            continue;
+                        }
+                        if (W == 1 || guardText.find('|') == std::string::npos)
+                            out << "if(" << guardText << ")";
+                        else out << "if((" << guardText << "))";
+                        out << "{ // cpu_cone_run ops=" << runOps << "\n";
+                        if (dynamicStats_) out << "cpu_dyn_sn_exec[" << unit.index << "]+=" << runOps << ";\n";
+                        for (std::size_t k = pos; k < end; ++k)
+                            if (!emitsNothing(ops[k])) emitOne(ops[k]);
+                        out << "}\n";
+                        pos = end;
+                    }
+                }
+                else
                 for (std::size_t pos = 0; pos < ops.size();)
                 {
                     if (emitsNothing(ops[pos]))
@@ -3523,7 +4071,14 @@ namespace wolvrix::lib::grhsim
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i)
                 {
-                    if (groups[i].targets) activate(out, *groups[i].targets, false, unit, "cpu_changed_" + std::to_string(i));
+                    if (groups[i].targets)
+                    {
+                        const std::string changed = "cpu_changed_" + std::to_string(i);
+                        activate(out, *groups[i].targets, false, unit, changed);
+                        // Same place, same condition as the flag set: every guarded
+                        // target accumulates the token bits of all member values.
+                        emitChgmaskOr(out, *groups[i].targets, groups[i].members, changed);
+                    }
                     if (groups[i].ports) armPorts(out, *groups[i].ports, "cpu_changed_" + std::to_string(i));
                 }
                 if (dynamicStats_ && !groups.empty())
@@ -3599,12 +4154,12 @@ namespace wolvrix::lib::grhsim
                                 const auto kind = dynKind(op);
                                 out << "++cpu_dyn_wr[" << kind << "];if(" << value(result) << "!=cpu_concat){++cpu_dyn_ch[" << kind
                                     << "];" << value(result) << "=cpu_concat;\n";
-                                activate(out, *targets, false, activeUnit); out << "}\n";
+                                activateChanged(out, *targets, activeUnit, result.index); out << "}\n";
                             }
                             else
                             {
                                 out << "if(" << value(result) << "!=cpu_concat){" << value(result) << "=cpu_concat;\n";
-                                activate(out, *targets, false, activeUnit); out << "}\n";
+                                activateChanged(out, *targets, activeUnit, result.index); out << "}\n";
                             }
                         }
                         else if (dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
@@ -3641,7 +4196,7 @@ namespace wolvrix::lib::grhsim
                             else if (const auto *targets = fanout_[result.index])
                             {
                                 out << "if(cpu_rchanged){\n";
-                                activate(out, *targets, false, activeUnit); out << "}\n";
+                                activateChanged(out, *targets, activeUnit, result.index); out << "}\n";
                             }
                             out << "}\n";
                             return;
@@ -3668,12 +4223,12 @@ namespace wolvrix::lib::grhsim
                                 const auto kind = dynKind(op);
                                 out << "{const bool cpu_dyn_c=" << call << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind
                                     << "]+=cpu_dyn_c;if(cpu_dyn_c){\n";
-                                activate(out, *targets, false, activeUnit); out << "}}\n";
+                                activateChanged(out, *targets, activeUnit, result.index); out << "}}\n";
                             }
                             else
                             {
                                 out << "if(" << call << "){\n";
-                                activate(out, *targets, false, activeUnit); out << "}\n";
+                                activateChanged(out, *targets, activeUnit, result.index); out << "}\n";
                             }
                         }
                         else if (dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];(void)" << call << ";\n";
@@ -3720,13 +4275,13 @@ namespace wolvrix::lib::grhsim
                             const auto kind = dynKind(op);
                             out << "{const bool cpu_dyn_c="; call(out);
                             out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
-                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activate(out, *targets, false, activeUnit); out << "}}\n"; }
+                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}}\n"; }
                             else out << changed << "|=cpu_dyn_c;}\n";
                         }
                         else
                         {
                             out << (changed.empty() ? "if(" : changed + "|="); call(out);
-                            if (changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                            if (changed.empty()) { out << "){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}\n"; }
                             else out << ";\n";
                         }
                         out << "}\n";
@@ -3767,14 +4322,14 @@ namespace wolvrix::lib::grhsim
                             const auto kind = dynKind(op);
                             out << "{const bool cpu_dyn_c="; call(out);
                             out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
-                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activate(out, *targets, false, activeUnit); out << "}}\n"; }
+                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}}\n"; }
                             else out << changed << "|=cpu_dyn_c;}\n";
                         }
                         else
                         {
                             if (!targets && dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
                             out << (targets ? (changed.empty() ? "if(" : changed + "|=") : ""); call(out);
-                            if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                            if (targets && changed.empty()) { out << "){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}\n"; }
                             else out << ";\n";
                         }
                         out << "}\n";
@@ -3796,14 +4351,14 @@ namespace wolvrix::lib::grhsim
                             const auto kind = dynKind(op);
                             out << "{const bool cpu_dyn_c="; call(out);
                             out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
-                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activate(out, *targets, false, activeUnit); out << "}}\n"; }
+                            if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}}\n"; }
                             else out << changed << "|=cpu_dyn_c;}\n";
                         }
                         else
                         {
                             if (!targets && dynBoundary(result)) out << "++cpu_dyn_silent[" << dynKind(op) << "];\n";
                             out << (targets ? (changed.empty() ? "if(" : changed + "|=") : ""); call(out);
-                            if (targets && changed.empty()) { out << "){\n"; activate(out, *targets, false, activeUnit); out << "}\n"; }
+                            if (targets && changed.empty()) { out << "){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}\n"; }
                             else out << ";\n";
                         }
                         out << "}\n";
@@ -3831,13 +4386,13 @@ namespace wolvrix::lib::grhsim
                         const auto kind = dynKind(op);
                         out << "{ const auto cpu_value=" << expr << ";++cpu_dyn_wr[" << kind << "];if(" << value(result)
                             << "!=cpu_value){++cpu_dyn_ch[" << kind << "];\n" << value(result) << "=cpu_value;\n";
-                        activate(out, *targets, false, activeUnit); out << "}}\n";
+                        activateChanged(out, *targets, activeUnit, result.index); out << "}}\n";
                     }
                     else
                     {
                         out << "{ const auto cpu_value=" << expr << "; if(" << value(result) << "!=cpu_value){\n"
                             << value(result) << "=cpu_value;\n";
-                        activate(out, *targets, false, activeUnit); out << "}}\n";
+                        activateChanged(out, *targets, activeUnit, result.index); out << "}}\n";
                     }
                 }
                 else if (dynBoundary(result))
@@ -3976,6 +4531,7 @@ namespace wolvrix::lib::grhsim
                 struct Lane
                 {
                     std::uint32_t stateOffset = 0, enableOffset = 0, dataOffset = 0, notifyOffset = 0;
+                    std::uint32_t notifyChgBegin = 0, notifyChgCount = 0;
                     std::uint8_t notifyMask = 0, notifyFlags = 0;
                     bool present = false;
                 };
@@ -4029,6 +4585,9 @@ namespace wolvrix::lib::grhsim
                         lane.notifyMask = notification.mask;
                         lane.notifyFlags = (notification.arm ? 1 : 0) | (projected_[target.index] ? 2 : 0) |
                                            (enableConstant ? 4 : 0) | (enableConstValue ? 8 : 0);
+                        const auto chgRange = stateChgRanges_[target.index];
+                        lane.notifyChgBegin = chgRange.offset;
+                        lane.notifyChgCount = chgRange.count;
                     }
                 }
                 for (const auto &lane : lanes) if (!lane.present) return false;
@@ -4048,6 +4607,14 @@ namespace wolvrix::lib::grhsim
                 out << "};\nstatic constexpr std::uint8_t cpu_cw_nfflags[64]={";
                 for (const auto &lane : lanes) out << static_cast<unsigned>(lane.notifyFlags) << ',';
                 out << "};\n";
+                if (!coneGuards_.empty())
+                {
+                    out << "static constexpr std::uint32_t cpu_cw_chgb[64]={";
+                    for (const auto &lane : lanes) out << lane.notifyChgBegin << ',';
+                    out << "};\nstatic constexpr std::uint32_t cpu_cw_chgc[64]={";
+                    for (const auto &lane : lanes) out << lane.notifyChgCount << ',';
+                    out << "};\n";
+                }
                 out << "std::uint64_t cpu_todo=cpu_word8(cpu_pflags.data()," << base << ",8);\nif(cpu_todo){\n"
                     << "{const std::uint64_t cpu_zero=0;std::memcpy(cpu_pflags.data()+" << base << ",&cpu_zero,8);}\n"
                     << "do{const unsigned cpu_i=__builtin_ctzll(cpu_todo);cpu_todo&=cpu_todo-1;\n";
@@ -4059,7 +4626,9 @@ namespace wolvrix::lib::grhsim
                     << "if(cpu_c!=cpu_d){cpu_c=cpu_d;\n";
                 if (dynamicStats_) out << "++cpu_dyn_port_fire;if(cpu_dyn_edge==1)++cpu_dyn_port_fire_pos;else if(cpu_dyn_edge==2)++cpu_dyn_port_fire_neg;\n";
                 out << "cpu_direct_state_changed_one(cpu_cw_ntf[cpu_i],cpu_cw_nfmask[cpu_i],"
-                       "static_cast<bool>(cpu_cw_nfflags[cpu_i]&1),static_cast<bool>(cpu_cw_nfflags[cpu_i]&2));\n"
+                       "static_cast<bool>(cpu_cw_nfflags[cpu_i]&1),static_cast<bool>(cpu_cw_nfflags[cpu_i]&2)";
+                if (!coneGuards_.empty()) out << ",cpu_cw_chgb[cpu_i],cpu_cw_chgc[cpu_i]";
+                out << ");\n"
                     << "}}}while(cpu_todo);\n}}\n";
                 return true;
             }
@@ -4081,11 +4650,24 @@ namespace wolvrix::lib::grhsim
                         const auto &notification = stateTargets_[range.offset];
                         out << "cpu_direct_state_changed_one(" << notification.offset << ',' << notification.mask << ','
                             << (notification.arm ? "true" : "false") << ','
-                            << (projected_[target.index] ? "true" : "false") << ");\n";
+                            << (projected_[target.index] ? "true" : "false");
+                        if (!coneGuards_.empty())
+                        {
+                            const auto chgRange = stateChgRanges_[target.index];
+                            out << ',' << chgRange.offset << ',' << chgRange.count;
+                        }
+                        out << ");\n";
                     }
                     else
-                        out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ','
-                            << (projected_[target.index] ? "true" : "false") << ");\n";
+                    {
+                        out << "cpu_direct_state_changed(" << range.offset << ',' << range.count << ',';
+                        if (!coneGuards_.empty())
+                        {
+                            const auto chgRange = stateChgRanges_[target.index];
+                            out << chgRange.offset << ',' << chgRange.count << ',';
+                        }
+                        out << (projected_[target.index] ? "true" : "false") << ");\n";
+                    }
                 }
                 out << "}\n";
             }
@@ -4425,12 +5007,19 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n"
                     << "std::array<std::uint8_t," << layout_.runtimeBytes << "> cpu_flags{},cpu_next_arms{};\n"
                     << "std::array<std::uint8_t," << std::max<std::uint32_t>(portArmWordCount_, 1) << "> cpu_pflags{};\n";
+                if (!coneGuards_.empty())
+                    out << "std::array<std::uint64_t," << coneGuardWords_ << "> cpu_chgmask{};\n";
                 if (!fpPorts_.empty())
                     out << "const bool cpu_fp_disabled_=std::getenv(\"GRHSIM_IR_DISABLE_FP_ELISION\")!=nullptr;\n";
                 if (dynamicStats_)
+                {
                     out << "std::array<std::uint64_t," << dynKinds_.size() << "> cpu_dyn_wr{},cpu_dyn_ch{},cpu_dyn_silent{};\n"
-                        << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_act{},cpu_dyn_sn_body{},cpu_dyn_sn_grp{},cpu_dyn_sn_chg{};\n"
-                        << "std::array<std::uint64_t," << dynTaskSpan_ << "> cpu_dyn_cm_ent{};\n"
+                        << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_act{},cpu_dyn_sn_body{},cpu_dyn_sn_grp{},cpu_dyn_sn_chg{};\n";
+                    if (!coneGuards_.empty())
+                        out << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_exec{};\n"
+                            << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_leak{};\n"
+                            << "std::uint64_t cpu_dyn_tok_sum=0;\nstd::uint64_t cpu_dyn_tok_hist[8]={};\n";
+                    out << "std::array<std::uint64_t," << dynTaskSpan_ << "> cpu_dyn_cm_ent{};\n"
                         << "std::uint64_t cpu_dyn_grp_pub=0,cpu_dyn_grp_fire=0,cpu_dyn_port_eval=0,cpu_dyn_port_fire=0;\n"
                         << "std::uint64_t cpu_dyn_mw_gate=0,cpu_dyn_mw_fire=0;\n"
                         << "std::uint64_t cpu_dyn_in_chk=0,cpu_dyn_in_chg=0,cpu_dyn_pub_calls=0,cpu_dyn_pub_pending=0,cpu_dyn_pub_changes=0;\n"
@@ -4446,15 +5035,29 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "std::uint64_t cpu_dyn_pub_pending_r0=0,cpu_dyn_pub_pending_rN=0,cpu_dyn_pub_changes_r0=0,cpu_dyn_pub_changes_rN=0;\n"
                         << "std::uint64_t cpu_dyn_pub_pending_pos=0,cpu_dyn_pub_pending_neg=0,cpu_dyn_pub_changes_pos=0,cpu_dyn_pub_changes_neg=0;\n"
                         << "std::uint64_t cpu_dyn_fp_evals=0;\n";
+                }
                 out << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
                     << "struct Pending{std::size_t state,offset,size; std::uint32_t begin,count; bool projection;bool memory=false;};\n"
-                    << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n"
-                    << "static const std::array<Target," << stateTargets_.size() << "> cpu_targets;\nstd::vector<Pending> cpu_pending;\n"
-                    << "static const std::array<Target," << memoryReaders_.size() << "> cpu_memory_readers;\n"
-                    << "std::array<std::size_t," << memoryReaders_.size() << "> cpu_read_offsets{};\n"
-                    << "bool cpu_direct_again=false;\nvoid cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection);\n"
-                    << "void cpu_direct_state_changed_one(std::uint32_t offset,std::uint8_t mask,bool arm,bool projection){cpu_direct_again=cpu_direct_again||projection;if(arm)cpu_next_arms[offset]=1;else cpu_flags[offset]|=mask;}\n"
-                    << "std::byte *cpu_stage_cell(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                    << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n";
+                if (!coneGuards_.empty())
+                    out << "struct ChgTarget{std::uint32_t word; std::uint64_t bit;};\n"
+                        << "struct ChgRange{std::uint32_t begin,count;};\n";
+                out << "static const std::array<Target," << stateTargets_.size() << "> cpu_targets;\nstd::vector<Pending> cpu_pending;\n";
+                if (!coneGuards_.empty())
+                    out << "static const std::array<ChgTarget," << chgTargets_.size() << "> cpu_chg_targets;\n"
+                        << "static const std::array<ChgRange," << stateChgRanges_.size() << "> cpu_chg_ranges;\n";
+                out << "static const std::array<Target," << memoryReaders_.size() << "> cpu_memory_readers;\n";
+                if (!coneGuards_.empty())
+                    out << "static const std::array<ChgTarget," << memoryChgTargets_.size() << "> cpu_memory_chg;\n";
+                out << "std::array<std::size_t," << memoryReaders_.size() << "> cpu_read_offsets{};\n"
+                    << "bool cpu_direct_again=false;\n";
+                if (!coneGuards_.empty())
+                    out << "void cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,std::uint32_t chgBegin,std::uint32_t chgCount,bool projection);\n"
+                        << "void cpu_direct_state_changed_one(std::uint32_t offset,std::uint8_t mask,bool arm,bool projection,std::uint32_t chgBegin,std::uint32_t chgCount){cpu_direct_again=cpu_direct_again||projection;if(arm)cpu_next_arms[offset]=1;else cpu_flags[offset]|=mask;for(std::uint32_t i=chgBegin;i<chgBegin+chgCount;++i){const auto &c=cpu_chg_targets[i];cpu_chgmask[c.word]|=c.bit;}}\n";
+                else
+                    out << "void cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection);\n"
+                        << "void cpu_direct_state_changed_one(std::uint32_t offset,std::uint8_t mask,bool arm,bool projection){cpu_direct_again=cpu_direct_again||projection;if(arm)cpu_next_arms[offset]=1;else cpu_flags[offset]|=mask;}\n";
+                out << "std::byte *cpu_stage_cell(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::size_t key,std::size_t offset,std::size_t size,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection){\n"
                     << "key+=row;offset+=row*size;if(!cpu_dirty[key]){cpu_dirty[key]=1;std::memcpy(cpu_shadow_+offset,cpu_obj_+offset,size);cpu_pending.push_back({key,offset,size,begin,count,projection,true});}return cpu_shadow_+offset;}\n"
                     << "template<class T,unsigned Width> void cpu_write_cell(std::byte *__restrict cpu_obj_,std::byte *__restrict cpu_shadow_,std::size_t key,std::size_t offset,std::size_t row,std::uint32_t begin,std::uint32_t count,bool projection,std::uint64_t data,std::uint64_t mask){\n"
                     << "key+=row;offset+=row*sizeof(T);const T current=cpu_at<T>(cpu_dirty[key]?cpu_shadow_:cpu_obj_,offset);\n"
@@ -4489,6 +5092,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         out << "void cpu_helper_" << partition.id.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word";
                         for (const auto &param : computeGuardParams(partition.id, std::span<const OpId>(ops).subspan(range.offset, range.count)))
                             out << ",bool " << param;
+                        for (const auto &param : coneGuardParams(partition.id)) out << ",std::uint64_t " << param;
                         out << ");\n";
                     }
                 }
@@ -4528,17 +5132,37 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 for (auto target : stateTargets_) out << '{' << target.offset << ',' << target.mask << ',' << (target.arm ? "true" : "false") << "},\n";
                 out << "}};\nconst std::array<" << class_ << "::Target," << memoryReaders_.size() << "> " << class_ << "::cpu_memory_readers{{\n";
                 for (auto target : memoryReaders_) out << '{' << target.offset << ',' << target.mask << ",false},\n";
-                out << "}};\nvoid " << class_ << "::cpu_bind_strings(){\n";
+                out << "}};\n";
+                if (!coneGuards_.empty())
+                {
+                    out << "const std::array<" << class_ << "::ChgTarget," << chgTargets_.size() << "> " << class_ << "::cpu_chg_targets{{\n";
+                    for (const auto &target : chgTargets_) out << '{' << target.word << ",UINT64_C(" << target.bit << ")},\n";
+                    out << "}};\nconst std::array<" << class_ << "::ChgRange," << stateChgRanges_.size() << "> " << class_ << "::cpu_chg_ranges{{\n";
+                    for (const auto &range : stateChgRanges_) out << '{' << range.offset << ',' << range.count << "},\n";
+                    out << "}};\nconst std::array<" << class_ << "::ChgTarget," << memoryChgTargets_.size() << "> " << class_ << "::cpu_memory_chg{{\n";
+                    for (const auto &target : memoryChgTargets_) out << '{' << target.word << ",UINT64_C(" << target.bit << ")},\n";
+                    out << "}};\n";
+                }
+                out << "void " << class_ << "::cpu_bind_strings(){\n";
                 for (std::size_t i = 0; i < persistentStrings_.size(); ++i)
                     out << "cpu_at<std::string*>(" << persistentStrings_[i].first << ',' << persistentStrings_[i].second
                         << ")=&cpu_strings[" << i << "];\n";
                 out << "}\nvoid " << class_ << "::init(){\nstd::memset(cpu_objects.get(),0," << layout_.objectBytes << ");\nstd::memset(cpu_boundary.get(),0," << layout_.boundaryBytes << ");\n"
                     << "cpu_inputs.fill(std::byte{});cpu_flags.fill(0);cpu_next_arms.fill(0);cpu_pflags.fill(255);std::fill(cpu_dirty.begin(),cpu_dirty.end(),0);cpu_pending.clear();cpu_direct_again=false;cpu_read_offsets.fill(0);\n";
+                // Every unit is flagged at init, so every guarded body runs once
+                // before any token could have been published; an all-ones mask
+                // makes that mandatory initial activation execute every run
+                // (otherwise initial values would never propagate downstream).
+                if (!coneGuards_.empty())
+                    out << "cpu_chgmask.fill(~UINT64_C(0));\n";
                 out << "for(std::size_t i=0;i<" << persistentStrings_.size() << ";++i)cpu_strings[i].clear();\ncpu_bind_strings();\n";
                 out << "cpu_profile_data={};\n";
                 if (dynamicStats_)
-                    out << "cpu_dyn_wr.fill(0);cpu_dyn_ch.fill(0);cpu_dyn_silent.fill(0);cpu_dyn_sn_act.fill(0);cpu_dyn_sn_body.fill(0);cpu_dyn_sn_grp.fill(0);cpu_dyn_sn_chg.fill(0);cpu_dyn_cm_ent.fill(0);\n"
-                        << "cpu_dyn_grp_pub=0;cpu_dyn_grp_fire=0;cpu_dyn_port_eval=0;cpu_dyn_port_fire=0;cpu_dyn_in_chk=0;cpu_dyn_in_chg=0;\n"
+                {
+                    out << "cpu_dyn_wr.fill(0);cpu_dyn_ch.fill(0);cpu_dyn_silent.fill(0);cpu_dyn_sn_act.fill(0);cpu_dyn_sn_body.fill(0);cpu_dyn_sn_grp.fill(0);cpu_dyn_sn_chg.fill(0);cpu_dyn_cm_ent.fill(0);\n";
+                    if (!coneGuards_.empty())
+                        out << "cpu_dyn_sn_exec.fill(0);cpu_dyn_sn_leak.fill(0);cpu_dyn_tok_sum=0;std::memset(cpu_dyn_tok_hist,0,sizeof(cpu_dyn_tok_hist));\n";
+                    out << "cpu_dyn_grp_pub=0;cpu_dyn_grp_fire=0;cpu_dyn_port_eval=0;cpu_dyn_port_fire=0;cpu_dyn_in_chk=0;cpu_dyn_in_chg=0;\n"
                         << "cpu_dyn_pub_calls=0;cpu_dyn_pub_pending=0;cpu_dyn_pub_changes=0;cpu_dyn_cm_stable=0;cpu_dyn_cm_inactive=0;\n"
                         << "cpu_dyn_edge=0;cpu_dyn_round_cur=0;cpu_dyn_eval_pos=0;cpu_dyn_eval_neg=0;cpu_dyn_eval_other=0;\n"
                         << "std::memset(cpu_dyn_round_hist,0,sizeof(cpu_dyn_round_hist));\n"
@@ -4550,21 +5174,31 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "cpu_dyn_pub_pending_r0=0;cpu_dyn_pub_pending_rN=0;cpu_dyn_pub_changes_r0=0;cpu_dyn_pub_changes_rN=0;\n"
                         << "cpu_dyn_pub_pending_pos=0;cpu_dyn_pub_pending_neg=0;cpu_dyn_pub_changes_pos=0;cpu_dyn_pub_changes_neg=0;\n"
                         << "cpu_dyn_fp_evals=0;\n";
+                }
                 out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
                 if (hasSystemTasks_) out << "cpu_first_eval=true;cpu_system_done.fill(false);cpu_strobes.clear();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "cpu_init_" << i << "();\n";
                 for (const auto &slot : layout_.runtime)
                     if (slot.kind != CpuRuntimeKind::EventEdge) out << "cpu_flags[" << slot.offset << "]=" << (slot.kind == CpuRuntimeKind::ActiveWord ? 255 : 1) << ";\n";
-                out << "}\nvoid " << class_ << "::cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection){\n"
-                    << "cpu_direct_again=cpu_direct_again||projection;\n"
-                    << "for(std::uint32_t i=begin;i<begin+count;++i){const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}\n";
+                if (!coneGuards_.empty())
+                    out << "}\nvoid " << class_ << "::cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,std::uint32_t chgBegin,std::uint32_t chgCount,bool projection){\n"
+                        << "cpu_direct_again=cpu_direct_again||projection;\n"
+                        << "for(std::uint32_t i=begin;i<begin+count;++i){const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}\n"
+                        << "for(std::uint32_t i=chgBegin;i<chgBegin+chgCount;++i){const auto &c=cpu_chg_targets[i];cpu_chgmask[c.word]|=c.bit;}}\n";
+                else
+                    out << "}\nvoid " << class_ << "::cpu_direct_state_changed(std::uint32_t begin,std::uint32_t count,bool projection){\n"
+                        << "cpu_direct_again=cpu_direct_again||projection;\n"
+                        << "for(std::uint32_t i=begin;i<begin+count;++i){const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}\n";
                 out << "bool " << class_ << "::cpu_publish(){";
                 if (dynamicStats_) out << "++cpu_dyn_pub_calls;cpu_dyn_pub_pending+=cpu_pending.size();if(cpu_dyn_round_cur==0)cpu_dyn_pub_pending_r0+=cpu_pending.size();else cpu_dyn_pub_pending_rN+=cpu_pending.size();if(cpu_dyn_edge==1)cpu_dyn_pub_pending_pos+=cpu_pending.size();else if(cpu_dyn_edge==2)cpu_dyn_pub_pending_neg+=cpu_pending.size();";
                 out << "bool again=cpu_direct_again;cpu_direct_again=false;for(const auto &p:cpu_pending){\n"
                     << "if(std::memcmp(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size)!=0){";
                 if (dynamicStats_) out << "++cpu_dyn_pub_changes;if(cpu_dyn_round_cur==0)++cpu_dyn_pub_changes_r0;else ++cpu_dyn_pub_changes_rN;if(cpu_dyn_edge==1)++cpu_dyn_pub_changes_pos;else if(cpu_dyn_edge==2)++cpu_dyn_pub_changes_neg;";
-                out << "std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n"
-                    << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
+                out << "std::memcpy(cpu_objects.get()+p.offset,cpu_shadow.get()+p.offset,p.size);\n";
+                if (!coneGuards_.empty())
+                    out << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;const auto &c=cpu_memory_chg[i];if(c.word!=~std::uint32_t(0))cpu_chgmask[c.word]|=c.bit;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}if(!p.memory){const auto &cr=cpu_chg_ranges[p.state];for(std::uint32_t j=cr.begin;j<cr.begin+cr.count;++j){const auto &c=cpu_chg_targets[j];cpu_chgmask[c.word]|=c.bit;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
+                else
+                    out << "again=again||p.projection;for(std::uint32_t i=p.begin;i<p.begin+p.count;++i){if(p.memory){if(cpu_read_offsets[i]==p.offset){const auto &t=cpu_memory_readers[i];cpu_flags[t.offset]|=t.mask;}}else{const auto &t=cpu_targets[i];if(t.arm)cpu_next_arms[t.offset]=1;else cpu_flags[t.offset]|=t.mask;}}}cpu_dirty[p.state]=0;}cpu_pending.clear();return again;}\n";
                 out << "void " << class_ << "::eval(){\n";
                 out << "using cpu_profile_clock=std::chrono::steady_clock;\n"
                     << "const bool cpu_profile=cpu_profile_enabled;\n"
@@ -4632,7 +5266,10 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     else out << "cpu_chg_mask=~UINT64_C(0);";
                     if (dynamicStats_ && row.source.index == clockDynValue)
                         out << "cpu_dyn_edge=((" << current << ")!=0)?1u:2u;\n";
-                    activate(out, row.targets, false); out << "}\n";
+                    activate(out, row.targets, false);
+                    const std::uint32_t changedInput[] = {row.source.index};
+                    emitChgmaskOr(out, row.targets, changedInput, {});
+                    out << "}\n";
                 }
                 out << "const unsigned cpu_edge_cls=(cpu_chg_mask!=0&&(cpu_chg_mask&(cpu_chg_mask-1))==0&&(cpu_chg_mask&UINT64_C("
                     << oneBitPortMask << "))!=0)?((cpu_chg_up&cpu_chg_mask)!=0?1u:2u):3u;\n"
@@ -4819,19 +5456,53 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "for(std::size_t i=0;i<" << mapping_.partitionTree.partitions.size() + 1 << ";++i)if(cpu_dyn_sn_act[i])"
                         << "std::fprintf(stderr,\"[grhsim-dyn] sn %zu act=%llu body=%llu grp=%llu chg=%llu\\n\",i,"
                         << "static_cast<unsigned long long>(cpu_dyn_sn_act[i]),static_cast<unsigned long long>(cpu_dyn_sn_body[i]),"
-                        << "static_cast<unsigned long long>(cpu_dyn_sn_grp[i]),static_cast<unsigned long long>(cpu_dyn_sn_chg[i]));\n"
-                        << "for(std::size_t i=0;i<" << dynTaskSpan_ << ";++i)if(cpu_dyn_cm_ent[i])"
-                        << "std::fprintf(stderr,\"[grhsim-dyn] commit %zu ent=%llu\\n\",i,static_cast<unsigned long long>(cpu_dyn_cm_ent[i]));\n"
-                        << "std::fprintf(stderr,\"[grhsim-dyn] totals grp_pub=%llu grp_fire=%llu port_eval=%llu port_fire=%llu "
-                        << "in_chk=%llu in_chg=%llu pub_calls=%llu pub_pending=%llu pub_changes=%llu cm_stable=%llu cm_inactive=%llu mw_gate=%llu mw_fire=%llu\\n\",\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_grp_pub),static_cast<unsigned long long>(cpu_dyn_grp_fire),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_port_eval),static_cast<unsigned long long>(cpu_dyn_port_fire),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_in_chk),static_cast<unsigned long long>(cpu_dyn_in_chg),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_pub_calls),static_cast<unsigned long long>(cpu_dyn_pub_pending),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_pub_changes),static_cast<unsigned long long>(cpu_dyn_cm_stable),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_cm_inactive),\n"
-                        << "static_cast<unsigned long long>(cpu_dyn_mw_gate),static_cast<unsigned long long>(cpu_dyn_mw_fire));\n"
-                        << "std::fprintf(stderr,\"[grhsim-dyn] edge evals pos=%llu neg=%llu other=%llu\\n\","
+                        << "static_cast<unsigned long long>(cpu_dyn_sn_grp[i]),static_cast<unsigned long long>(cpu_dyn_sn_chg[i]));\n";
+                    // NO00007 per-guarded-unit executed-op lines (new format; the
+                    // sn line above is byte-identical to previous builds).
+                    for (const auto &[unitIndex, info] : coneGuards_)
+                    {
+                        (void)info;
+                        out << "if(cpu_dyn_sn_act[" << unitIndex << "])std::fprintf(stderr,\"[grhsim-dyn] snx " << unitIndex
+                            << " exec=%llu\\n\",static_cast<unsigned long long>(cpu_dyn_sn_exec[" << unitIndex << "]));\n";
+                    }
+                    if (!coneGuards_.empty())
+                    {
+                        // NO00007-DEBUG leak report (all zero unless the build was
+                        // emitted with GRHSIM_CONE_LEAKCHECK set).
+                        out << "for(std::size_t i=0;i<" << mapping_.partitionTree.partitions.size() + 1 << ";++i)if(cpu_dyn_sn_leak[i])"
+                            << "std::fprintf(stderr,\"[grhsim-dyn] snl %zu leak=%llu\\n\",i,static_cast<unsigned long long>(cpu_dyn_sn_leak[i]));\n";
+                        out << "std::uint64_t cpu_dyn_exec_ops=0;for(const auto cpu_dyn_v:cpu_dyn_sn_exec)cpu_dyn_exec_ops+=cpu_dyn_v;\n";
+                    }
+                    out << "for(std::size_t i=0;i<" << dynTaskSpan_ << ";++i)if(cpu_dyn_cm_ent[i])"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] commit %zu ent=%llu\\n\",i,static_cast<unsigned long long>(cpu_dyn_cm_ent[i]));\n";
+                    if (!coneGuards_.empty())
+                        out << "std::fprintf(stderr,\"[grhsim-dyn] totals grp_pub=%llu grp_fire=%llu port_eval=%llu port_fire=%llu "
+                            << "in_chk=%llu in_chg=%llu pub_calls=%llu pub_pending=%llu pub_changes=%llu cm_stable=%llu cm_inactive=%llu mw_gate=%llu mw_fire=%llu "
+                            << "tok_sum=%llu tok_hist0=%llu tok_hist1=%llu tok_hist2=%llu tok_hist3=%llu tok_hist4=%llu tok_hist5=%llu tok_hist6=%llu tok_hist7=%llu exec_ops=%llu\\n\",\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_grp_pub),static_cast<unsigned long long>(cpu_dyn_grp_fire),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_port_eval),static_cast<unsigned long long>(cpu_dyn_port_fire),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_in_chk),static_cast<unsigned long long>(cpu_dyn_in_chg),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_pub_calls),static_cast<unsigned long long>(cpu_dyn_pub_pending),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_pub_changes),static_cast<unsigned long long>(cpu_dyn_cm_stable),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_cm_inactive),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_mw_gate),static_cast<unsigned long long>(cpu_dyn_mw_fire),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_tok_sum),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_tok_hist[0]),static_cast<unsigned long long>(cpu_dyn_tok_hist[1]),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_tok_hist[2]),static_cast<unsigned long long>(cpu_dyn_tok_hist[3]),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_tok_hist[4]),static_cast<unsigned long long>(cpu_dyn_tok_hist[5]),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_tok_hist[6]),static_cast<unsigned long long>(cpu_dyn_tok_hist[7]),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_exec_ops));\n";
+                    else
+                        out << "std::fprintf(stderr,\"[grhsim-dyn] totals grp_pub=%llu grp_fire=%llu port_eval=%llu port_fire=%llu "
+                            << "in_chk=%llu in_chg=%llu pub_calls=%llu pub_pending=%llu pub_changes=%llu cm_stable=%llu cm_inactive=%llu mw_gate=%llu mw_fire=%llu\\n\",\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_grp_pub),static_cast<unsigned long long>(cpu_dyn_grp_fire),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_port_eval),static_cast<unsigned long long>(cpu_dyn_port_fire),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_in_chk),static_cast<unsigned long long>(cpu_dyn_in_chg),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_pub_calls),static_cast<unsigned long long>(cpu_dyn_pub_pending),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_pub_changes),static_cast<unsigned long long>(cpu_dyn_cm_stable),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_cm_inactive),\n"
+                            << "static_cast<unsigned long long>(cpu_dyn_mw_gate),static_cast<unsigned long long>(cpu_dyn_mw_fire));\n";
+                    out << "std::fprintf(stderr,\"[grhsim-dyn] edge evals pos=%llu neg=%llu other=%llu\\n\","
                         << "static_cast<unsigned long long>(cpu_dyn_eval_pos),static_cast<unsigned long long>(cpu_dyn_eval_neg),"
                         << "static_cast<unsigned long long>(cpu_dyn_eval_other));\n"
                         << "std::fprintf(stderr,\"[grhsim-dyn] fp_evals=%llu\\n\",static_cast<unsigned long long>(cpu_dyn_fp_evals));\n"
@@ -5317,6 +5988,25 @@ if(terminal){
                             const auto &partition = tree.partitions[unit.index - 1];
                             out << "if(cpu_active_word&" << activeMasks_[unit.index] << "){cpu_active_word&=~" << activeMasks_[unit.index] << ";\n";
                             if (dynamicStats_) out << "++cpu_dyn_sn_act[" << unit.index << "];if(cpu_dyn_edge==1)++cpu_dyn_sn_act_pos;else if(cpu_dyn_edge==2)++cpu_dyn_sn_act_neg;\n";
+                            // NO00007 cone guard entry: the body actually runs now,
+                            // so consume (load + zero) the unit's sticky token words.
+                            // Quiescence/edge-direction skips below only exist for
+                            // eventful units, which are never guarded, so no mask
+                            // bits can be lost here.
+                            if (const ConeGuardInfo *cone = coneGuard(unit))
+                            {
+                                for (std::size_t w = 0; w < cone->words; ++w)
+                                    out << "const std::uint64_t cpu_chg_" << w << "=cpu_chgmask[" << cone->wordBase + w
+                                        << "];cpu_chgmask[" << cone->wordBase + w << "]=0;\n";
+                                if (dynamicStats_)
+                                {
+                                    out << "{const unsigned cpu_tok_n=";
+                                    for (std::size_t w = 0; w < cone->words; ++w)
+                                        out << (w ? "+" : "") << "__builtin_popcountll(cpu_chg_" << w << ")";
+                                    out << ";cpu_dyn_tok_sum+=cpu_tok_n;++cpu_dyn_tok_hist[cpu_tok_n==0?0:cpu_tok_n==1?1:cpu_tok_n==2?2:"
+                                        << "cpu_tok_n==3?3:cpu_tok_n==4?4:cpu_tok_n<=8?5:cpu_tok_n<=16?6:7];}\n";
+                                }
+                            }
                             // Quiescent units (hist == event on every guard term) are inert: all
                             // edge guards are false and every embedded history sample is a
                             // current==next no-op, so the whole body is skipped.
@@ -5357,6 +6047,7 @@ if(terminal){
                                     out << "cpu_helper_" << unit.index << '_' << i << "(cpu_local,cpu_active_word";
                                     for (const auto &param : computeGuardParams(unit, std::span<const OpId>(ops).subspan(range.offset, range.count)))
                                         out << ',' << param;
+                                    for (const auto &param : coneGuardParams(unit)) out << ',' << param;
                                     out << ");\n";
                                 }
                             }
@@ -5367,7 +6058,7 @@ if(terminal){
                                     ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
                                 emitComputeGuardLocals(out, unit);
                                 const auto guards = computeGuardMap(unit);
-                                computeGroup(out, ops, unit, guards);
+                                computeGroup(out, ops, unit, guards, coneGuard(unit), 0);
                             }
                             if (edgeDirection != 0) out << "}\n";
                             if (const auto samples = directSampleUnits_.find(unit.index); samples != directSampleUnits_.end())
@@ -5396,10 +6087,11 @@ if(terminal){
                                 const auto chunk = std::span<const OpId>(ops).subspan(range.offset, range.count);
                                 out << "void " << class_ << "::cpu_helper_" << unit.index << '_' << i << "(std::byte *cpu_local,std::uint8_t &cpu_active_word";
                                 for (const auto &param : computeGuardParams(unit, chunk)) out << ",bool " << param;
+                                for (const auto &param : coneGuardParams(unit)) out << ",std::uint64_t " << param;
                                 out << "){\n";
                                 emitBufferLocals(out);
                                 const auto guards = computeGuardMap(unit);
-                                computeGroup(out, chunk, unit, guards);
+                                computeGroup(out, chunk, unit, guards, coneGuard(unit), range.offset);
                                 out << "}\n";
                             }
                         }
@@ -5557,6 +6249,7 @@ if(terminal){
             Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare,
                             branchShapeHotnessFile, branchShapeGrowthBudget, fallingEdgeElision); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
+            diagnostics.info(emitter.coneGuardSummary(), "cpu.st.emit-cpp");
             if (const auto fp = emitter.fpElisionSummary(); !fp.empty()) diagnostics.info(fp, "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");

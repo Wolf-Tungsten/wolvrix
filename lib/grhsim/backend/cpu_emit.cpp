@@ -598,6 +598,7 @@ namespace wolvrix::lib::grhsim
                 planDirectSampling();
                 planFallingEdgeElision();
                 planConeGuards();
+                planLocalValuePromotion();
             }
 
             std::string historyBatchSummary() const
@@ -2228,6 +2229,100 @@ namespace wolvrix::lib::grhsim
                 }
             }
 
+            // NO00009 unit-local narrow value promotion. A PartitionLocal
+            // two-state scalar (width 1..64) whose definition and every use
+            // fall inside one helper chunk (an unsplit unit counts as one
+            // chunk) is declared as a typed C++ local cpu_l<value.index> in
+            // that chunk's body instead of a cpu_local frame slot, so the
+            // compiler can register-allocate it. The frame layout is
+            // untouched: promoted slots stay allocated but unreferenced.
+            void planLocalValuePromotion()
+            {
+                constexpr std::uint32_t undef = ~std::uint32_t(0);
+                promotedLocalChunk_.assign(model_.values().size() + 1, undef);
+                // NO00009 was rejected on mechanism: promoting frame slots to
+                // typed SSA locals netted +2.9% dynamic instructions under
+                // clang PGO (phi-merge mov$0+cmov materialization, SLP
+                // vectorization misfires on bool chains, spill/reload growth)
+                // because the cpu_local frame gave the compiler free memory
+                // merges and opaque SLP-resistant accesses. The planner is
+                // kept for future selective promotion and only plans under
+                // GRHSIM_PROMOTE_LOCALS=1. With the gate off (default) every
+                // emission path falls back byte-identically to the NO00004
+                // frame-slot output; promotedLocalChunk_ stays all-undef.
+                if (!std::getenv("GRHSIM_PROMOTE_LOCALS")) return;
+                const auto &tree = mapping_.partitionTree;
+                std::vector<std::uint32_t> defPos(model_.values().size() + 1, undef);
+                std::vector<std::uint32_t> owner(model_.values().size() + 1, 0);
+                for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                {
+                    if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    {
+                        const auto &partition = tree.partitions[unit.index - 1];
+                        std::vector<OpId> ops;
+                        for (auto node : partition.children)
+                            ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                        if (ops.empty()) continue;
+                        auto chunks = partition.attrs.helperChunks;
+                        if (chunks.empty()) chunks.push_back({0, static_cast<std::uint32_t>(ops.size())});
+                        const auto chunkOf = [&](std::uint32_t pos) {
+                            for (std::uint32_t i = 0; i < chunks.size(); ++i)
+                                if (pos >= chunks[i].offset && pos - chunks[i].offset < chunks[i].count) return i;
+                            return undef;
+                        };
+                        // The flat op order is topological, so every in-unit use
+                        // follows its definition; assert instead of relying on it.
+                        std::vector<std::uint32_t> touched;
+                        std::unordered_set<std::uint32_t> rejected;
+                        for (std::uint32_t pos = 0; pos < ops.size(); ++pos)
+                        {
+                            const auto &op = model_.operations()[ops[pos].index - 1];
+                            for (auto operand : model_.operands(op))
+                            {
+                                if (defPos[operand.index] == undef) continue;
+                                if (defPos[operand.index] >= pos)
+                                    throw std::runtime_error("CPU compute unit use precedes its definition");
+                                if (chunkOf(defPos[operand.index]) != chunkOf(pos)) rejected.insert(operand.index);
+                            }
+                            for (auto result : model_.results(op))
+                            {
+                                defPos[result.index] = pos;
+                                touched.push_back(result.index);
+                            }
+                        }
+                        for (const auto index : touched)
+                        {
+                            const auto pos = defPos[index];
+                            defPos[index] = undef;
+                            if (rejected.contains(index)) continue;
+                            if (layout_.values[index - 1].kind != CpuStorageKind::PartitionLocal) continue;
+                            const ValueId value{index, 0};
+                            if (!isScalarLogic(type(value))) continue;
+                            // These forms emit no definition statement at all.
+                            if (readAliases_[index] || staticScalars_.contains(index) || staticStrings_.contains(index)) continue;
+                            // A PartitionLocal value cannot have cross-unit consumers.
+                            if (fanout_[index] || portArmTargets(value))
+                                throw std::runtime_error("CPU promoted local unexpectedly has activation fanout");
+                            const auto chunk = chunkOf(pos);
+                            if (chunk == undef) continue;
+                            promotedLocalChunk_[index] = chunk;
+                            owner[index] = unit.index;
+                            auto &decls = promotedLocalDecls_[unit.index];
+                            if (decls.size() <= chunk) decls.resize(chunk + 1);
+                            decls[chunk].push_back(index);
+                        }
+                    }
+                }
+                // A use outside the owning unit would contradict the layout's
+                // PartitionLocal classification; demote defensively if one slips through.
+                for (const auto &op : model_.operations())
+                    for (auto operand : model_.operands(op))
+                        if (promotedLocalChunk_[operand.index] != undef && computeOwners_[op.id.index].index != owner[operand.index])
+                            promotedLocalChunk_[operand.index] = undef;
+            }
+
             // NO00007 input-precision cone guards. A guarded compute supernode
             // tracks which of its external inputs (boundary values produced by
             // other units, states it reads, input ports it consumes) actually
@@ -2895,6 +2990,8 @@ namespace wolvrix::lib::grhsim
                 if (const auto it = staticScalars_.find(value.index); it != staticScalars_.end()) return it->second;
                 if (type(value).kind == TypeKind::String)
                     if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
+                if (value.index < promotedLocalChunk_.size() && promotedLocalChunk_[value.index] != ~std::uint32_t(0))
+                    return "cpu_l" + std::to_string(value.index);
                 const auto &slot = layout_.values[value.index - 1];
                 return at(type(value), slot.kind == CpuStorageKind::Boundary ? arenaBoundary() : "cpu_local", slot.offset);
             }
@@ -5749,6 +5846,20 @@ if(terminal){
                         << "); // cpu_cevent uses=" << group.ops.size() << '\n';
             }
 
+            // NO00009: typed locals for the unit's promoted narrow values of one
+            // chunk. [[maybe_unused]] + zero-init cover cone-guard elided
+            // definitions/uses (downward closure keeps every emitted use defined).
+            void emitPromotedLocals(std::ostream &out, PartitionId unit, std::uint32_t chunk) const
+            {
+                const auto found = promotedLocalDecls_.find(unit.index);
+                if (found == promotedLocalDecls_.end() || chunk >= found->second.size()) return;
+                for (const auto index : found->second[chunk])
+                {
+                    if (promotedLocalChunk_[index] != chunk) continue;
+                    out << "[[maybe_unused]] " << cppType(type(ValueId{index, 0})) << " cpu_l" << index << "{};\n";
+                }
+            }
+
             std::vector<std::string> computeGuardParams(PartitionId unit, std::span<const OpId> chunk) const
             {
                 std::vector<std::string> params;
@@ -6056,6 +6167,7 @@ if(terminal){
                                 std::vector<OpId> ops;
                                 for (auto node : partition.children)
                                     ops.insert(ops.end(), tree.partitions[node.index - 1].ops.begin(), tree.partitions[node.index - 1].ops.end());
+                                emitPromotedLocals(out, unit, 0);
                                 emitComputeGuardLocals(out, unit);
                                 const auto guards = computeGuardMap(unit);
                                 computeGroup(out, ops, unit, guards, coneGuard(unit), 0);
@@ -6090,6 +6202,7 @@ if(terminal){
                                 for (const auto &param : coneGuardParams(unit)) out << ",std::uint64_t " << param;
                                 out << "){\n";
                                 emitBufferLocals(out);
+                                emitPromotedLocals(out, unit, static_cast<std::uint32_t>(i));
                                 const auto guards = computeGuardMap(unit);
                                 computeGroup(out, chunk, unit, guards, coneGuard(unit), range.offset);
                                 out << "}\n";
@@ -6145,6 +6258,10 @@ if(terminal){
             std::map<std::uint32_t, std::vector<QuiescenceTerm>> computeQuiescence_;
             std::map<std::uint32_t, int> computeEdgeDirection_;
             uint64_t computeQuiescenceUnits_ = 0, computeQuiescenceTerms_ = 0, edgeDirectionUnits_ = 0;
+            // NO00009: value.index -> owning helper chunk ordinal (~0u: not promoted);
+            // per unit the promoted value indices per chunk, in definition order.
+            std::vector<std::uint32_t> promotedLocalChunk_;
+            std::map<std::uint32_t, std::vector<std::vector<std::uint32_t>>> promotedLocalDecls_;
             mutable uint64_t gateHoistedRuns_ = 0, gateHoistedGates_ = 0, gateMergedGates_ = 0, gateColdHints_ = 0;
             mutable uint64_t commitCompactGroups_ = 0, commitCompactPorts_ = 0;
             struct DirectSample { StateId state; ValueId event; bool projection; };

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -328,7 +329,8 @@ namespace wolvrix::lib::grhsim
         public:
             explicit Emitter(const GrhSimModel &model, bool dynamicStats = false, bool commitCompactWalk = false,
                              bool commitMemWalk = false, bool shapeTwinShare = false, bool branchShapeShare = false,
-                             std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0)
+                             std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0,
+                             bool fallingEdgeElision = true)
                 : model_(model), mapping_(*model.cpuMapping()), layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule),
                   prefix_("grhsim_" + identifier(model.text(model.name()))), class_("GrhSIM_" + identifier(model.text(model.name()))),
                   wordOffsets_(mapping_.partitionTree.partitions.size() + 1), armOffsets_(wordOffsets_.size()), frameSizes_(wordOffsets_.size()),
@@ -340,7 +342,7 @@ namespace wolvrix::lib::grhsim
                   commitDirectHistories_(stateRanges_.size()), dynamicStats_(dynamicStats),
                   commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare),
                   branchShapeShare_(branchShapeShare), branchShapeHotnessFile_(std::move(branchShapeHotnessFile)),
-                  branchShapeGrowthBudget_(branchShapeGrowthBudget)
+                  branchShapeGrowthBudget_(branchShapeGrowthBudget), fallingEdgeElision_(fallingEdgeElision)
             {
                 if (dynamicStats_)
                 {
@@ -515,7 +517,7 @@ namespace wolvrix::lib::grhsim
                     "CpuRuntimeProfile", "cpu_runtime_profile", "cpu_profile_enabled", "cpu_profile_data", "cpu_profile",
                     "cpu_profile_clock", "cpu_profile_eval_begin", "cpu_profile_phase_begin", "cpu_profile_tick",
                     "cpu_stage_cell", "cpu_write_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed",
-                    "cpu_rword", "cpu_rchanged", "cpu_rnext"};
+                    "cpu_rword", "cpu_rchanged", "cpu_rnext", "cpu_fp_disabled_"};
                 if (dynamicStats_)
                     for (const auto *name : {"cpu_dyn_wr", "cpu_dyn_ch", "cpu_dyn_silent", "cpu_dyn_sn_act", "cpu_dyn_sn_body",
                                              "cpu_dyn_sn_grp", "cpu_dyn_sn_chg", "cpu_dyn_cm_ent", "cpu_dyn_grp_pub", "cpu_dyn_grp_fire",
@@ -528,7 +530,7 @@ namespace wolvrix::lib::grhsim
                                              "cpu_dyn_cm_ent_neg", "cpu_dyn_cm_ent_r0", "cpu_dyn_cm_ent_rN", "cpu_dyn_sn_act_pos",
                                              "cpu_dyn_sn_act_neg", "cpu_dyn_pub_pending_r0", "cpu_dyn_pub_pending_rN", "cpu_dyn_pub_changes_r0",
                                              "cpu_dyn_pub_changes_rN", "cpu_dyn_pub_pending_pos", "cpu_dyn_pub_pending_neg", "cpu_dyn_pub_changes_pos",
-                                             "cpu_dyn_pub_changes_neg"})
+                                             "cpu_dyn_pub_changes_neg", "cpu_dyn_fp_evals"})
                         names.insert(name);
                 if (hasSystemTasks_)
                     for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_strobes", "cpu_system_task"}) names.insert(name);
@@ -593,6 +595,7 @@ namespace wolvrix::lib::grhsim
                 planPortArms();
                 planComputeQuiescence();
                 planDirectSampling();
+                planFallingEdgeElision();
             }
 
             std::string historyBatchSummary() const
@@ -626,6 +629,8 @@ namespace wolvrix::lib::grhsim
                     " scalar_constants=" + std::to_string(staticScalars_.size()) +
                     " memory_cell_readers=" + std::to_string(memoryReaders_.size());
             }
+
+            std::string fpElisionSummary() const { return fpElisionSummary_; }
 
             std::string packSummary() const
             {
@@ -1142,6 +1147,816 @@ namespace wolvrix::lib::grhsim
                     ++directSampleStateCount_;
                 }
                 directSampleUnitCount_ = directSampleUnits_.size();
+            }
+
+            // Falling-edge eval elision ("fast path"). A 1-bit input port P is
+            // eligible when an eval in which P is the only changed input, going
+            // 1->0, provably performs no observable work: every P-dependent
+            // event is a posedge-only term that const-folds to 0 under P==0 (so
+            // no commit edge guard can fire), no commit op's non-event operands,
+            // no system/DPI op's non-event operands, and no output.write data
+            // operand depend on P, every unit holding
+            // system/DPI ops is edge-quiescent, and every P-dependent value in
+            // the backward cone of a P-dependent event either is stageable
+            // (Boundary 1-bit, non-aliased, P==0 image const-folds to 0) or is
+            // partition-local. eval() then runs the input scan as usual, zeroes
+            // the P-dependent event boundary bytes, their history state bytes
+            // (replicating the skipped samples), and the stageable cone bytes
+            // (replicating the skipped recomputes), mirrors the normal exit
+            // tail and returns, skipping the round loop. Scan-set flags/armed
+            // pflag bits persist into the next eval and drive the same work
+            // there; the zeroed bytes make the next eval's change detection
+            // bit-identical to the un-elided run for every value an event
+            // producer can read, so the next posedge propagates identically.
+            struct FpTri { std::uint64_t value = 0, known = 0; };
+
+            static FpTri fpResize(FpTri tri, std::uint32_t from, std::uint32_t to, bool isSigned)
+            {
+                const auto mask = [](std::uint32_t width) { return width >= 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << width) - 1; };
+                const std::uint64_t fromMask = mask(from);
+                if (to == from) return {tri.value & fromMask, tri.known & fromMask};
+                const std::uint64_t toMask = mask(to);
+                if (to < from) return {tri.value & toMask, tri.known & toMask};
+                if (!isSigned) return {tri.value & fromMask, (tri.known & fromMask) | (toMask & ~fromMask)};
+                const std::uint64_t signBit = std::uint64_t(1) << (from - 1);
+                if (!(tri.known & signBit)) return {tri.value & fromMask, tri.known & fromMask};
+                const std::uint64_t extension = toMask & ~fromMask;
+                return {(tri.value & fromMask) | ((tri.value & signBit) ? extension : 0),
+                        (tri.known & fromMask) | extension};
+            }
+
+            // 1 if some bit is known-1, 0 if every bit is known, else -1 (X).
+            static int fpTruth(FpTri tri, std::uint32_t width)
+            {
+                const std::uint64_t mask = width >= 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << width) - 1;
+                if (tri.value & tri.known & mask) return 1;
+                if ((tri.known & mask) == mask) return 0;
+                return -1;
+            }
+
+            // Memoized 3-valued (0/1/X) evaluator over a value's backward op
+            // cone with the candidate port's input reads pinned to 0. Other
+            // input/state/memory reads are X; unknown ops are X. Only scalar
+            // (<=64 bit) two-state values are evaluated; anything wider is X.
+            FpTri fpFold(ValueId value, std::uint32_t inputObject,
+                         std::unordered_map<std::uint32_t, FpTri> &memo, std::uint32_t depth) const
+            {
+                if (depth > 4096 || !value || value.index >= producers_.size()) return {};
+                if (const auto found = memo.find(value.index); found != memo.end()) return found->second;
+                FpTri result;
+                const auto producer = producers_[value.index];
+                const auto widthMask = [](std::uint32_t width) { return width >= 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << width) - 1; };
+                do
+                {
+                    if (!producer) break;
+                    const auto &op = model_.operations()[producer.index - 1];
+                    const auto name = model_.text(op.opType);
+                    const auto &resultType = type(value);
+                    if (resultType.kind != TypeKind::Logic || resultType.domain != LogicDomain::TwoState ||
+                        resultType.width == 0 || resultType.width > 64) break;
+                    const std::uint64_t mask = widthMask(resultType.width);
+                    if (name == "core.input.read")
+                    {
+                        const auto refs = model_.objectRefs(op);
+                        if (refs.size() == 1 && refs[0].kind == ObjectKind::Input && refs[0].index == inputObject)
+                            result = {0, mask};
+                        break;
+                    }
+                    if (name == "core.compute.constant")
+                    {
+                        const auto params = model_.parameters(op);
+                        const auto *text = parameter<std::string>(model_, params, "value");
+                        if (!text) text = parameter<std::string>(model_, params, "constValue");
+                        if (text)
+                        {
+                            try
+                            {
+                                auto parsed = slang::SVInt::fromString(*text).resize(resultType.width);
+                                parsed.flattenUnknowns();
+                                if (const auto bits = parsed.as<std::uint64_t>()) result = {*bits & mask, mask};
+                            }
+                            catch (const std::exception &) {}
+                            break;
+                        }
+                        const auto *integer = parameter<int64_t>(model_, params, "value");
+                        if (!integer) integer = parameter<int64_t>(model_, params, "constValue");
+                        if (integer) { result = {static_cast<std::uint64_t>(*integer) & mask, mask}; break; }
+                        const auto *boolean = parameter<bool>(model_, params, "value");
+                        if (!boolean) boolean = parameter<bool>(model_, params, "constValue");
+                        if (boolean) result = {*boolean ? std::uint64_t(1) : std::uint64_t(0), mask};
+                        break;
+                    }
+                    if (!name.starts_with("core.compute.")) break;
+                    const auto kind = name.substr(13);
+                    const auto operands = model_.operands(op);
+                    const auto fold = [&](std::size_t i) -> FpTri {
+                        if (i >= operands.size()) return {};
+                        return fpFold(operands[i], inputObject, memo, depth + 1);
+                    };
+                    const auto resizeOf = [&](std::size_t i, std::uint32_t to) -> FpTri {
+                        if (i >= operands.size()) return {};
+                        const auto &source = type(operands[i]);
+                        if (source.kind != TypeKind::Logic || source.width == 0) return {};
+                        return fpResize(fold(i), source.width, to, source.isSigned);
+                    };
+                    const auto width = resultType.width;
+                    if (kind == "assign") { result = resizeOf(0, width); break; }
+                    if (kind == "and" || kind == "or" || kind == "xor" || kind == "xnor")
+                    {
+                        const FpTri a = resizeOf(0, width), b = resizeOf(1, width);
+                        if (kind == "and")
+                        {
+                            const auto known = (a.known & b.known) | (a.known & ~a.value) | (b.known & ~b.value);
+                            result = {a.value & b.value & known & mask, known & mask};
+                        }
+                        else if (kind == "or")
+                        {
+                            const auto known = (a.known & b.known) | (a.known & a.value) | (b.known & b.value);
+                            result = {(a.value | b.value) & known & mask, known & mask};
+                        }
+                        else
+                        {
+                            const auto known = a.known & b.known & mask;
+                            const auto xored = (kind == "xor" ? a.value ^ b.value : ~(a.value ^ b.value)) & mask;
+                            result = {xored & known, known};
+                        }
+                        break;
+                    }
+                    if (kind == "not")
+                    {
+                        const FpTri a = resizeOf(0, width);
+                        result = {~a.value & a.known, a.known};
+                        break;
+                    }
+                    if (kind == "logicNot")
+                    {
+                        if (operands.empty()) break;
+                        const int a = fpTruth(fold(0), type(operands[0]).width);
+                        if (a == 1) result = {0, 1};
+                        else if (a == 0) result = {1, 1};
+                        break;
+                    }
+                    if (kind == "logicAnd" || kind == "logicOr")
+                    {
+                        if (operands.size() < 2) break;
+                        const int a = fpTruth(fold(0), type(operands[0]).width);
+                        const int b = fpTruth(fold(1), type(operands[1]).width);
+                        if (kind == "logicAnd")
+                        {
+                            if (a == 0 || b == 0) result = {0, 1};
+                            else if (a == 1 && b == 1) result = {1, 1};
+                        }
+                        else
+                        {
+                            if (a == 1 || b == 1) result = {1, 1};
+                            else if (a == 0 && b == 0) result = {0, 1};
+                        }
+                        break;
+                    }
+                    if (kind == "mux")
+                    {
+                        if (operands.size() < 3) break;
+                        const int c = fpTruth(fold(0), type(operands[0]).width);
+                        const FpTri t = resizeOf(1, width), f = resizeOf(2, width);
+                        if (c == 1) result = t;
+                        else if (c == 0) result = f;
+                        else
+                        {
+                            const auto known = t.known & f.known & ~(t.value ^ f.value) & mask;
+                            result = {t.value & known, known};
+                        }
+                        break;
+                    }
+                    if (kind == "bitSelect")
+                    {
+                        if (operands.size() < 3) break;
+                        const FpTri s = resizeOf(0, width), a = resizeOf(1, width), b = resizeOf(2, width);
+                        const auto known = ((s.known & ((s.value & a.known) | (~s.value & b.known))) |
+                                            (a.known & b.known & ~(a.value ^ b.value))) & mask;
+                        result = {((s.value & a.value) | (~s.value & b.value)) & known, known};
+                        break;
+                    }
+                    if (kind == "prioritySelect")
+                    {
+                        if (operands.size() < 3 || operands.size() % 2 == 0) break;
+                        const std::size_t count = (operands.size() - 1) / 2;
+                        FpTri selected = resizeOf(2 * count, width);
+                        for (std::size_t i = count; i-- > 0;)
+                        {
+                            const int c = fpTruth(fold(i), type(operands[i]).width);
+                            if (c == 0) continue;
+                            const FpTri t = resizeOf(count + i, width);
+                            if (c == 1) { selected = t; continue; }
+                            const auto known = t.known & selected.known & ~(t.value ^ selected.value) & mask;
+                            selected = {t.value & known, known};
+                        }
+                        result = selected;
+                        break;
+                    }
+                    if (kind == "concat")
+                    {
+                        FpTri joined;
+                        std::uint64_t offset = 0;
+                        bool valid = true;
+                        for (std::size_t i = 0; i < operands.size(); ++i)
+                        {
+                            const auto partWidth = type(operands[i]).width;
+                            const FpTri part = fold(i);
+                            if (partWidth == 0 || partWidth > 64) { valid = false; break; }
+                            if (offset < 64)
+                            {
+                                joined.value |= part.value << offset;
+                                joined.known |= part.known << offset;
+                            }
+                            offset += partWidth;
+                        }
+                        if (valid) result = {joined.value & mask, joined.known & mask};
+                        break;
+                    }
+                    if (kind == "replicate")
+                    {
+                        const auto *rep = parameter<int64_t>(model_, model_.parameters(op), "rep");
+                        if (!rep || *rep < 0 || operands.empty()) break;
+                        const auto partWidth = type(operands[0]).width;
+                        if (partWidth == 0 || partWidth > 64) break;
+                        const FpTri part = fold(0);
+                        FpTri joined;
+                        for (int64_t i = 0; i < *rep && static_cast<std::uint64_t>(i) * partWidth < 64; ++i)
+                        {
+                            joined.value |= part.value << (static_cast<std::uint64_t>(i) * partWidth);
+                            joined.known |= part.known << (static_cast<std::uint64_t>(i) * partWidth);
+                        }
+                        result = {joined.value & mask, joined.known & mask};
+                        break;
+                    }
+                    if (kind == "sliceStatic" || kind == "sliceDynamic" || kind == "sliceArray")
+                    {
+                        if (operands.size() < 2) break;
+                        const auto sourceWidth = type(operands[0]).width;
+                        std::uint64_t start = 0;
+                        if (kind == "sliceStatic")
+                        {
+                            const auto *param = parameter<int64_t>(model_, model_.parameters(op), "sliceStart");
+                            if (!param || *param < 0) break;
+                            start = static_cast<std::uint64_t>(*param);
+                        }
+                        else
+                        {
+                            const auto indexWidth = type(operands[1]).width;
+                            if (indexWidth == 0 || indexWidth > 64) break;
+                            const FpTri index = fold(1);
+                            if ((index.known & widthMask(indexWidth)) != widthMask(indexWidth)) break;
+                            start = index.value;
+                            if (kind == "sliceArray")
+                            {
+                                if (start != 0 && start > (~std::uint64_t(0)) / width) break;
+                                start *= width;
+                            }
+                        }
+                        if (start >= sourceWidth || start + width > sourceWidth || start + width > 64) break;
+                        const FpTri source = fold(0);
+                        result = {(source.value >> start) & mask, (source.known >> start) & mask};
+                        break;
+                    }
+                    static const std::set<std::string_view> equalities{"eq", "ne", "caseEq", "caseNe", "wildcardEq", "wildcardNe"};
+                    static const std::set<std::string_view> orderings{"lt", "le", "gt", "ge"};
+                    if (equalities.contains(kind) || orderings.contains(kind))
+                    {
+                        if (operands.size() < 2) break;
+                        const auto width0 = type(operands[0]).width, width1 = type(operands[1]).width;
+                        const auto compareWidth = std::max(width0, width1);
+                        const FpTri a = resizeOf(0, compareWidth), b = resizeOf(1, compareWidth);
+                        const auto compareMask = widthMask(compareWidth);
+                        if (equalities.contains(kind) && (a.known & b.known & (a.value ^ b.value) & compareMask))
+                        {
+                            const bool ne = kind == "ne" || kind == "caseNe" || kind == "wildcardNe";
+                            result = {ne ? std::uint64_t(1) : std::uint64_t(0), 1};
+                            break;
+                        }
+                        if ((a.known & compareMask) != compareMask || (b.known & compareMask) != compareMask) break;
+                        const std::uint64_t av = a.value & compareMask, bv = b.value & compareMask;
+                        const bool sign = type(operands[0]).isSigned && type(operands[1]).isSigned;
+                        const auto less = [&] {
+                            if (!sign) return av < bv;
+                            const auto shift = 64 - compareWidth;
+                            return static_cast<std::int64_t>(av << shift) < static_cast<std::int64_t>(bv << shift);
+                        };
+                        bool outcome;
+                        if (kind == "eq" || kind == "caseEq" || kind == "wildcardEq") outcome = av == bv;
+                        else if (kind == "ne" || kind == "caseNe" || kind == "wildcardNe") outcome = av != bv;
+                        else if (kind == "lt") outcome = less();
+                        else if (kind == "le") outcome = av == bv || less();
+                        else if (kind == "gt") outcome = av != bv && !less();
+                        else outcome = !less();
+                        result = {outcome ? std::uint64_t(1) : std::uint64_t(0), 1};
+                        break;
+                    }
+                    if (kind == "add" || kind == "sub" || kind == "mul")
+                    {
+                        const FpTri a = resizeOf(0, width), b = resizeOf(1, width);
+                        if ((a.known & mask) != mask || (b.known & mask) != mask) break;
+                        std::uint64_t value = kind == "add" ? a.value + b.value : kind == "sub" ? a.value - b.value : a.value * b.value;
+                        result = {value & mask, mask};
+                        break;
+                    }
+                    if (kind == "div" || kind == "mod")
+                    {
+                        const FpTri a = resizeOf(0, width), b = resizeOf(1, width);
+                        if ((a.known & mask) != mask || (b.known & mask) != mask || !b.value) break;
+                        const bool sign = type(operands[0]).isSigned && type(operands[1]).isSigned;
+                        std::uint64_t value = 0;
+                        if (!sign) value = kind == "div" ? a.value / b.value : a.value % b.value;
+                        else
+                        {
+                            const auto shift = 64 - width;
+                            const auto sa = static_cast<std::int64_t>(a.value << shift) >> shift;
+                            const auto sb = static_cast<std::int64_t>(b.value << shift) >> shift;
+                            if (sb == 0 || (sa == std::numeric_limits<std::int64_t>::min() && sb == -1)) break;
+                            value = static_cast<std::uint64_t>(kind == "div" ? sa / sb : sa % sb);
+                        }
+                        result = {value & mask, mask};
+                        break;
+                    }
+                    if (kind == "shl" || kind == "lshr" || kind == "ashr")
+                    {
+                        const FpTri a = resizeOf(0, width);
+                        if (operands.size() < 2) break;
+                        const auto amountWidth = type(operands[1]).width;
+                        if (amountWidth == 0 || amountWidth > 64) break;
+                        const FpTri amount = fold(1);
+                        if ((a.known & mask) != mask || (amount.known & widthMask(amountWidth)) != widthMask(amountWidth)) break;
+                        if (amount.value >= width)
+                        {
+                            const bool fill = kind == "ashr" && type(operands[0]).isSigned && (a.value >> (width - 1)) & 1;
+                            result = {fill ? mask : std::uint64_t(0), mask};
+                            break;
+                        }
+                        std::uint64_t value = kind == "shl" ? a.value << amount.value : a.value >> amount.value;
+                        if (kind == "ashr" && type(operands[0]).isSigned && amount.value)
+                        {
+                            const auto shift = 64 - width;
+                            value = static_cast<std::uint64_t>(static_cast<std::int64_t>(a.value << shift) >> (shift + amount.value));
+                        }
+                        result = {value & mask, mask};
+                        break;
+                    }
+                    if (kind == "reduceAnd" || kind == "reduceNand" || kind == "reduceOr" || kind == "reduceNor" ||
+                        kind == "reduceXor" || kind == "reduceXnor")
+                    {
+                        if (operands.empty()) break;
+                        const auto operandWidth = type(operands[0]).width;
+                        if (operandWidth == 0 || operandWidth > 64) break;
+                        const auto operandMask = widthMask(operandWidth);
+                        const FpTri a = fold(0);
+                        const bool andKind = kind == "reduceAnd" || kind == "reduceNand";
+                        const bool orKind = kind == "reduceOr" || kind == "reduceNor";
+                        if (andKind && (a.known & ~a.value & operandMask)) { result = {kind == "reduceAnd" ? 0ull : 1ull, 1}; break; }
+                        if (orKind && (a.known & a.value & operandMask)) { result = {kind == "reduceOr" ? 1ull : 0ull, 1}; break; }
+                        if ((a.known & operandMask) != operandMask) break;
+                        bool reduction;
+                        if (andKind) reduction = (a.value & operandMask) == operandMask;
+                        else if (orKind) reduction = (a.value & operandMask) != 0;
+                        else
+                        {
+                            std::uint64_t bits = a.value & operandMask;
+                            bits ^= bits >> 32; bits ^= bits >> 16; bits ^= bits >> 8; bits ^= bits >> 4;
+                            reduction = (0x6996 >> (bits & 0xf)) & 1;
+                        }
+                        const bool negate = kind == "reduceNand" || kind == "reduceNor" || kind == "reduceXnor";
+                        result = {(reduction != negate) ? std::uint64_t(1) : std::uint64_t(0), 1};
+                        break;
+                    }
+                } while (false);
+                memo.emplace(value.index, result);
+                return result;
+            }
+
+            void planFallingEdgeElision()
+            {
+                fpPorts_.clear();
+                fpElisionSummary_.clear();
+                if (!fallingEdgeElision_) return;
+                std::ostringstream log;
+                const auto &inputs = model_.inputs();
+                if (inputs.size() > 64)
+                {
+                    fpElisionSummary_ = "fp_elision: disabled inputs=" + std::to_string(inputs.size()) + " (>64)";
+                    return;
+                }
+                // Every edge term in the model: (event value, history state, direction).
+                struct EdgeTerm { ValueId event; std::uint32_t history; bool posedge; };
+                std::vector<EdgeTerm> terms;
+                bool malformed = false;
+                for (const auto &op : model_.operations())
+                {
+                    const auto name = model_.text(op.opType);
+                    const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                    if (!edges || edges->empty()) continue;
+                    std::size_t historyBase;
+                    if (isCpuCommitOp(name)) historyBase = 1;
+                    else if (name == "core.system.task") historyBase = 0;
+                    else if (name == "core.dpi.call") historyBase = 1;
+                    else { malformed = true; continue; }
+                    const auto operands = model_.operands(op);
+                    const auto refs = model_.objectRefs(op);
+                    if (operands.size() < edges->size() || refs.size() < historyBase + edges->size())
+                    { malformed = true; continue; }
+                    const auto events = operands.last(edges->size());
+                    for (std::size_t i = 0; i < edges->size(); ++i)
+                    {
+                        const auto &direction = (*edges)[i];
+                        if ((direction != "posedge" && direction != "negedge") ||
+                            refs[historyBase + i].kind != ObjectKind::State)
+                        { malformed = true; continue; }
+                        terms.push_back({events[i], refs[historyBase + i].index, direction == "posedge"});
+                    }
+                }
+                if (malformed)
+                {
+                    fpElisionSummary_ = "fp_elision: disabled malformed edge terms";
+                    return;
+                }
+                const bool fpDebug = std::getenv("WOLVRIX_FP_ELISION_DEBUG") != nullptr;
+                auto fmtOrigin = [&](OriginId id) -> std::string
+                {
+                    if (!id.valid()) return "no-origin";
+                    const auto &origin = model_.origins()[id.index - 1];
+                    return std::string(model_.text(origin.file)) + ":" + std::to_string(origin.line) + ":" +
+                           std::to_string(origin.column);
+                };
+                auto fmtValue = [&](std::uint32_t valueIndex) -> std::string
+                {
+                    if (valueIndex == 0 || valueIndex >= producers_.size() || !producers_[valueIndex].valid())
+                        return "no-producer";
+                    const auto &producer = model_.operations()[producers_[valueIndex].index - 1];
+                    return "op=" + std::to_string(producer.id.index) + " type=" +
+                           std::string(model_.text(producer.opType)) + " @" + fmtOrigin(producer.origin);
+                };
+                auto execName = [](CpuExecution exec) -> const char *
+                {
+                    switch (exec)
+                    {
+                    case CpuExecution::ActivityDrivenCompute: return "ActivityDrivenCompute";
+                    case CpuExecution::DomainGatedCommit: return "DomainGatedCommit";
+                    case CpuExecution::AlwaysScanCommit: return "AlwaysScanCommit";
+                    }
+                    return "unknown";
+                };
+                // Units holding system/DPI ops must all be edge-quiescent.
+                bool systemUnitsOk = true;
+                {
+                    const auto &tree = mapping_.partitionTree;
+                    for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
+                    {
+                        if (task.execution != CpuExecution::ActivityDrivenCompute) continue;
+                        for (auto word : tree.partitions[task.partition.index - 1].children)
+                        for (auto unit : tree.partitions[word.index - 1].children)
+                        {
+                            bool system = false;
+                            for (auto node : tree.partitions[unit.index - 1].children)
+                            for (auto opId : tree.partitions[node.index - 1].ops)
+                            {
+                                const auto name = model_.text(model_.operations()[opId.index - 1].opType);
+                                if (name == "core.system.task" || name == "core.dpi.call") { system = true; break; }
+                            }
+                            if (system && !computeQuiescence_.contains(unit.index))
+                            {
+                                systemUnitsOk = false;
+                                if (fpDebug)
+                                {
+                                    log << "fp_elision_dbg: system_unit index=" << unit.index << '\n';
+                                    for (auto node : tree.partitions[unit.index - 1].children)
+                                    for (auto opId : tree.partitions[node.index - 1].ops)
+                                    {
+                                        const auto &sysOp = model_.operations()[opId.index - 1];
+                                        const auto sysType = model_.text(sysOp.opType);
+                                        if (sysType == "core.system.task" || sysType == "core.dpi.call")
+                                            log << "fp_elision_dbg: system_unit_op id=" << sysOp.id.index
+                                                << " type=" << sysType << " @" << fmtOrigin(sysOp.origin) << '\n';
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Alias-aware state reference totals for history exclusivity.
+                std::vector<std::uint32_t> stateRefs(model_.states().size() + 1, 0);
+                for (auto ref : model_.objectRefPool())
+                    if (ref.kind == ObjectKind::State) ++stateRefs[ref.index];
+                std::vector<std::vector<std::uint32_t>> preimage(model_.states().size() + 1);
+                for (std::size_t index = 1; index < historyAliases_.size(); ++index)
+                    if (historyAliases_[index]) preimage[historyAliases_[index].index].push_back(index);
+                std::map<std::uint32_t, std::uint32_t> termRefs;
+                for (const auto &term : terms)
+                {
+                    const auto alias = historyAliases_[term.history];
+                    ++termRefs[alias ? alias.index : term.history];
+                }
+                // Value consumers for the dependency propagation.
+                std::vector<std::vector<OpId>> consumers(model_.values().size() + 1);
+                for (const auto &op : model_.operations())
+                    for (auto operand : model_.operands(op))
+                        consumers[operand.index].push_back(op.id);
+                std::vector<std::uint32_t> portOfInput(inputs.size() + 1, ~std::uint32_t(0));
+                for (std::size_t i = 0; i < inputs.size(); ++i) portOfInput[inputs[i].id.index] = i;
+                std::vector<bool> dependent(model_.values().size() + 1);
+                std::vector<std::uint32_t> queue;
+                std::unordered_map<std::uint32_t, CpuExecution> opExec;
+                if (fpDebug)
+                {
+                    const auto &tree = mapping_.partitionTree;
+                    for (const auto &numa : schedule_.numaNodes)
+                    for (const auto &core : numa.cores)
+                    for (const auto &task : core.tasks)
+                    for (auto word : tree.partitions[task.partition.index - 1].children)
+                    for (auto unit : tree.partitions[word.index - 1].children)
+                    for (auto node : tree.partitions[unit.index - 1].children)
+                    for (auto opId : tree.partitions[node.index - 1].ops)
+                        opExec[opId.index] = task.execution;
+                }
+
+                for (std::size_t port = 0; port < inputs.size(); ++port)
+                {
+                    const auto &portType = model_.types()[inputs[port].type.index - 1];
+                    if (portType.kind != TypeKind::Logic || portType.width != 1) continue;
+                    std::fill(dependent.begin(), dependent.end(), false);
+                    queue.clear();
+                    for (const auto &op : model_.operations())
+                        if (model_.text(op.opType) == "core.input.read")
+                        {
+                            const auto refs = model_.objectRefs(op);
+                            if (refs.size() == 1 && refs[0].kind == ObjectKind::Input &&
+                                refs[0].index < portOfInput.size() && portOfInput[refs[0].index] == port)
+                                for (auto result : model_.results(op))
+                                    if (!dependent[result.index])
+                                    {
+                                        dependent[result.index] = true;
+                                        queue.push_back(result.index);
+                                    }
+                        }
+                    // A dependent operand makes every result dependent, except
+                    // state.read results (state bytes are stable across the
+                    // window); memRead results follow their address operand by
+                    // the same generic rule (it is the only operand).
+                    for (std::size_t head = 0; head < queue.size(); ++head)
+                        for (auto opId : consumers[queue[head]])
+                        {
+                            const auto &op = model_.operations()[opId.index - 1];
+                            if (model_.text(op.opType) == "core.state.read") continue;
+                            for (auto result : model_.results(op))
+                                if (!dependent[result.index])
+                                {
+                                    dependent[result.index] = true;
+                                    queue.push_back(result.index);
+                                }
+                        }
+                    std::uint64_t rejNegedge = 0, rejNotZero = 0, rejEventWidth = 0, rejEventStorage = 0,
+                                  rejSharedHistory = 0, rejHistoryRefs = 0, rejHistorySize = 0,
+                                  rejCommitOperand = 0, rejOutputData = 0, rejSystemUnits = systemUnitsOk ? 0 : 1,
+                                  rejSysOperand = 0, rejConeMemRead = 0, rejConeWidth = 0, rejConeAlias = 0,
+                                  rejConeImage = 0, rejConeStorage = 0;
+                    bool rejected = !systemUnitsOk;
+                    std::map<std::tuple<std::string, std::string, bool>, std::uint64_t> commitHist, sysHist;
+                    std::set<std::uint32_t> eventOffsets, historyOffsets, depHistories, freeHistories;
+                    for (const auto &term : terms)
+                    {
+                        const auto slot = object(ObjectRef::state(StateId{term.history, 0}));
+                        (dependent[term.event.index] ? depHistories : freeHistories).insert(slot.offset);
+                    }
+                    for (const auto offset : depHistories)
+                        if (freeHistories.contains(offset)) ++rejSharedHistory;
+                    rejected |= rejSharedHistory != 0;
+                    std::unordered_map<std::uint32_t, FpTri> memo;
+                    for (const auto &term : terms)
+                    {
+                        if (!dependent[term.event.index]) continue;
+                        if (!term.posedge)
+                        {
+                            ++rejNegedge;
+                            rejected = true;
+                            if (fpDebug && rejNegedge <= 8)
+                                log << "fp_elision_dbg: input " << port << " negedge event=" << term.event.index
+                                    << " history=" << term.history << " producer: " << fmtValue(term.event.index)
+                                    << '\n';
+                            continue;
+                        }
+                        const auto &eventType = type(term.event);
+                        if (eventType.kind != TypeKind::Logic || eventType.width != 1)
+                        { ++rejEventWidth; rejected = true; continue; }
+                        const FpTri folded = fpFold(term.event, inputs[port].id.index, memo, 0);
+                        if (folded.known != 1 || folded.value != 0)
+                        {
+                            ++rejNotZero;
+                            rejected = true;
+                            if (fpDebug && rejNotZero <= 8)
+                                log << "fp_elision_dbg: input " << port << " not_zero event=" << term.event.index
+                                    << " known=" << folded.known << " value=" << folded.value
+                                    << " producer: " << fmtValue(term.event.index) << '\n';
+                            continue;
+                        }
+                        if (readAliases_[term.event.index]) { ++rejEventStorage; rejected = true; continue; }
+                        const auto &slot = layout_.values[term.event.index - 1];
+                        if (slot.kind != CpuStorageKind::Boundary || layout_.types[slot.type.index - 1].size != 1 ||
+                            slot.offset > std::numeric_limits<std::uint32_t>::max())
+                        { ++rejEventStorage; rejected = true; continue; }
+                        const auto alias = historyAliases_[term.history];
+                        const std::uint32_t resolved = alias ? alias.index : term.history;
+                        std::uint32_t total = stateRefs[resolved];
+                        for (auto index : preimage[resolved]) total += stateRefs[index];
+                        if (total != termRefs[resolved]) { ++rejHistoryRefs; rejected = true; continue; }
+                        const auto &historySlot = object(ObjectRef::state(StateId{resolved, 0}));
+                        if (layout_.types[historySlot.type.index - 1].size != 1 ||
+                            historySlot.offset > std::numeric_limits<std::uint32_t>::max() ||
+                            stateType(StateId{resolved, 0}).width != 1)
+                        { ++rejHistorySize; rejected = true; continue; }
+                        eventOffsets.insert(static_cast<std::uint32_t>(slot.offset));
+                        historyOffsets.insert(static_cast<std::uint32_t>(historySlot.offset));
+                    }
+                    // Cone staging ("R2"): every P-dependent value in the full
+                    // transitive backward cone of every P-dependent event is also
+                    // staged to 0, so the byte state after the fast path matches
+                    // the skipped eval for every value an event producer can read
+                    // at the next eval. Only values whose P==0 image const-folds
+                    // to a known 0 are stageable; anything else rejects the port
+                    // (a staged intermediate that would recompute to 1 could fail
+                    // to re-arm its fanout and corrupt event edge detection).
+                    std::set<std::uint32_t> coneOffsets;
+                    if (!rejected)
+                    {
+                        std::unordered_set<std::uint32_t> depEvents;
+                        for (const auto &term : terms)
+                            if (dependent[term.event.index]) depEvents.insert(term.event.index);
+                        std::vector<bool> visited(model_.values().size() + 1, false);
+                        std::vector<ValueId> work;
+                        for (const auto index : depEvents)
+                        {
+                            visited[index] = true;
+                            work.push_back(ValueId{index, 0});
+                        }
+                        for (std::size_t head = 0; head < work.size() && !rejected; ++head)
+                        {
+                            const auto value = work[head];
+                            const auto producer = producers_[value.index];
+                            if (!producer) { ++rejConeStorage; rejected = true; break; }
+                            const auto &op = model_.operations()[producer.index - 1];
+                            if (model_.text(op.opType) == "core.state.memRead")
+                            { ++rejConeMemRead; rejected = true; }
+                            for (auto operand : model_.operands(op))
+                                if (dependent[operand.index] && !visited[operand.index])
+                                {
+                                    visited[operand.index] = true;
+                                    work.push_back(operand);
+                                }
+                            if (depEvents.contains(value.index)) continue; // staged via eventOffsets
+                            if (readAliases_[value.index]) { ++rejConeAlias; rejected = true; continue; }
+                            const auto &valueType = type(value);
+                            if (valueType.kind != TypeKind::Logic || valueType.domain != LogicDomain::TwoState ||
+                                valueType.width != 1)
+                            { ++rejConeWidth; rejected = true; continue; }
+                            const auto &slot = layout_.values[value.index - 1];
+                            if (slot.kind == CpuStorageKind::PartitionLocal) continue; // stack frame: no persistence
+                            if (slot.kind != CpuStorageKind::Boundary || layout_.types[slot.type.index - 1].size != 1 ||
+                                slot.offset > std::numeric_limits<std::uint32_t>::max())
+                            { ++rejConeStorage; rejected = true; continue; }
+                            const FpTri image = fpFold(value, inputs[port].id.index, memo, 0);
+                            if (image.known != 1 || image.value != 0) { ++rejConeImage; rejected = true; continue; }
+                            coneOffsets.insert(static_cast<std::uint32_t>(slot.offset));
+                        }
+                    }
+                    for (const auto &op : model_.operations())
+                    {
+                        const auto name = model_.text(op.opType);
+                        if (isCpuCommitOp(name))
+                        {
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            const auto operands = model_.operands(op);
+                            const std::size_t eventCount = edges ? edges->size() : 0;
+                            if (operands.size() < eventCount)
+                            {
+                                ++rejCommitOperand;
+                                rejected = true;
+                                if (fpDebug)
+                                {
+                                    const char *execStr = "unknown";
+                                    if (const auto it = opExec.find(op.id.index); it != opExec.end()) execStr = execName(it->second);
+                                    const auto count = ++commitHist[std::make_tuple(std::string(name), std::string(execStr), false)];
+                                    if (count <= 8)
+                                        log << "fp_elision_dbg: input " << port << " commit_operand op=" << op.id.index
+                                            << " type=" << name << " exec=" << execStr << " allposedge=0 shape=short-operands @"
+                                            << fmtOrigin(op.origin) << '\n';
+                                }
+                                continue;
+                            }
+                            for (std::size_t i = 0; i + eventCount < operands.size(); ++i)
+                                if (dependent[operands[i].index])
+                                {
+                                    ++rejCommitOperand;
+                                    rejected = true;
+                                    if (fpDebug)
+                                    {
+                                        bool allPosedge = edges != nullptr && !edges->empty();
+                                        if (edges)
+                                            for (const auto &edge : *edges)
+                                                allPosedge = allPosedge && edge == "posedge";
+                                        const char *execStr = "unknown";
+                                        if (const auto it = opExec.find(op.id.index); it != opExec.end()) execStr = execName(it->second);
+                                        const auto count = ++commitHist[std::make_tuple(std::string(name), std::string(execStr), allPosedge)];
+                                        if (count <= 8)
+                                            log << "fp_elision_dbg: input " << port << " commit_operand op=" << op.id.index
+                                                << " type=" << name << " exec=" << execStr << " allposedge=" << (allPosedge ? 1 : 0)
+                                                << " @" << fmtOrigin(op.origin) << " operand=" << operands[i].index
+                                                << " producer: " << fmtValue(operands[i].index) << '\n';
+                                    }
+                                }
+                            continue;
+                        }
+                        if (name == "core.system.task" || name == "core.dpi.call")
+                        {
+                            // Same staleness frontier as commit operands: a task
+                            // firing on a P-free edge at the next eval would read a
+                            // P-dependent data byte the elided eval never refreshed.
+                            const auto *edges = parameter<std::vector<std::string>>(model_, model_.parameters(op), "event_edges");
+                            const auto operands = model_.operands(op);
+                            const std::size_t eventCount = edges ? edges->size() : 0;
+                            if (operands.size() < eventCount)
+                            {
+                                ++rejSysOperand;
+                                rejected = true;
+                                if (fpDebug)
+                                {
+                                    const char *execStr = "unknown";
+                                    if (const auto it = opExec.find(op.id.index); it != opExec.end()) execStr = execName(it->second);
+                                    const auto count = ++sysHist[std::make_tuple(std::string(name), std::string(execStr), false)];
+                                    if (count <= 8)
+                                        log << "fp_elision_dbg: input " << port << " sys_operand op=" << op.id.index
+                                            << " type=" << name << " exec=" << execStr << " allposedge=0 shape=short-operands @"
+                                            << fmtOrigin(op.origin) << '\n';
+                                }
+                                continue;
+                            }
+                            for (std::size_t i = 0; i + eventCount < operands.size(); ++i)
+                                if (dependent[operands[i].index])
+                                {
+                                    ++rejSysOperand;
+                                    rejected = true;
+                                    if (fpDebug)
+                                    {
+                                        bool allPosedge = edges != nullptr && !edges->empty();
+                                        if (edges)
+                                            for (const auto &edge : *edges)
+                                                allPosedge = allPosedge && edge == "posedge";
+                                        const char *execStr = "unknown";
+                                        if (const auto it = opExec.find(op.id.index); it != opExec.end()) execStr = execName(it->second);
+                                        const auto count = ++sysHist[std::make_tuple(std::string(name), std::string(execStr), allPosedge)];
+                                        if (count <= 8)
+                                            log << "fp_elision_dbg: input " << port << " sys_operand op=" << op.id.index
+                                                << " type=" << name << " exec=" << execStr << " allposedge=" << (allPosedge ? 1 : 0)
+                                                << " @" << fmtOrigin(op.origin) << " operand=" << operands[i].index
+                                                << " producer: " << fmtValue(operands[i].index) << '\n';
+                                    }
+                                }
+                            continue;
+                        }
+                        if (name == "core.output.write")
+                        {
+                            const auto operands = model_.operands(op);
+                            if (!operands.empty() && dependent[operands.front().index]) { ++rejOutputData; rejected = true; }
+                        }
+                    }
+                    if (fpDebug)
+                    {
+                        log << "fp_elision_dbg: input " << port << " name=" << model_.text(inputs[port].name) << '\n';
+                        for (const auto &[key, count] : commitHist)
+                            log << "fp_elision_dbg: input " << port << " commit_hist " << std::get<0>(key) << '|'
+                                << std::get<1>(key) << "|allposedge=" << (std::get<2>(key) ? 1 : 0) << " = " << count
+                                << '\n';
+                        for (const auto &[key, count] : sysHist)
+                            log << "fp_elision_dbg: input " << port << " sys_hist " << std::get<0>(key) << '|'
+                                << std::get<1>(key) << "|allposedge=" << (std::get<2>(key) ? 1 : 0) << " = " << count
+                                << '\n';
+                    }
+                    log << "fp_elision: input " << port;
+                    if (rejected)
+                    {
+                        log << " rejected: negedge=" << rejNegedge << " not_zero=" << rejNotZero
+                            << " event_width=" << rejEventWidth << " event_storage=" << rejEventStorage
+                            << " shared_history=" << rejSharedHistory << " history_refs=" << rejHistoryRefs
+                            << " history_size=" << rejHistorySize << " commit_operand=" << rejCommitOperand
+                            << " output_data=" << rejOutputData << " system_units=" << rejSystemUnits
+                            << " sys_operand=" << rejSysOperand
+                            << " cone_memread=" << rejConeMemRead << " cone_width=" << rejConeWidth
+                            << " cone_alias=" << rejConeAlias << " cone_image=" << rejConeImage
+                            << " cone_storage=" << rejConeStorage << '\n';
+                        continue;
+                    }
+                    log << " eligible events=" << eventOffsets.size() << " hists=" << historyOffsets.size()
+                        << " cone=" << coneOffsets.size() << '\n';
+                    fpPorts_.push_back({static_cast<std::uint32_t>(port),
+                                        {eventOffsets.begin(), eventOffsets.end()},
+                                        {historyOffsets.begin(), historyOffsets.end()},
+                                        {coneOffsets.begin(), coneOffsets.end()}});
+                }
+                fpElisionSummary_ = log.str();
             }
 
             std::string quiescenceCheck(const std::vector<QuiescenceTerm> &terms) const
@@ -3437,6 +4252,7 @@ namespace wolvrix::lib::grhsim
             void header(std::ostream &out, const std::vector<std::string> &extraDecls) const
             {
                 out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <memory>\n#include <stdexcept>\n";
+                if (!fpPorts_.empty()) out << "#include <cstdlib>\n";
                 out << "template<class T> inline T &cpu_at(std::byte *data, std::size_t offset){return *reinterpret_cast<T*>(data+offset);}\n";
                 // Zero test over a run of activity bytes; byte order is irrelevant for emptiness.
                 out << "inline std::uint64_t cpu_word8(const std::uint8_t *data, std::size_t offset, std::size_t bytes){std::uint64_t value=0;std::memcpy(&value,data+offset,bytes);return value;}\n";
@@ -3588,7 +4404,10 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 for (const auto &input : model_.inputs()) out << cppType(model_.types()[input.type.index - 1]) << ' ' << identifier(model_.text(input.name)) << "{};\n";
                 for (const auto &output : model_.outputs()) out << cppType(model_.types()[output.type.index - 1]) << ' ' << identifier(model_.text(output.name)) << "{};\n";
                 out << class_ << "(){cpu_bind_strings();}\n"
-                    << "struct CpuRuntimeProfile{std::uint64_t evals=0,rounds=0,eval_ns=0,compute_ns=0,commit_ns=0,publish_ns=0;};\n"
+                    << "struct CpuRuntimeProfile{std::uint64_t evals=0,rounds=0,eval_ns=0,compute_ns=0,commit_ns=0,publish_ns=0,"
+                    << "evals_pos=0,rounds_pos=0,eval_ns_pos=0,compute_ns_pos=0,commit_ns_pos=0,publish_ns_pos=0,"
+                    << "evals_neg=0,rounds_neg=0,eval_ns_neg=0,compute_ns_neg=0,commit_ns_neg=0,publish_ns_neg=0,"
+                    << "evals_other=0,rounds_other=0,eval_ns_other=0,compute_ns_other=0,commit_ns_other=0,publish_ns_other=0,fp_evals=0;};\n"
                     << "void init();\nvoid eval();\n"
                     << "void set_runtime_profile_enabled(bool enabled){cpu_profile_enabled=enabled;if(enabled)cpu_profile_data={};}\n"
                     << "const CpuRuntimeProfile &cpu_runtime_profile() const{return cpu_profile_data;}\n"
@@ -3606,6 +4425,8 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n"
                     << "std::array<std::uint8_t," << layout_.runtimeBytes << "> cpu_flags{},cpu_next_arms{};\n"
                     << "std::array<std::uint8_t," << std::max<std::uint32_t>(portArmWordCount_, 1) << "> cpu_pflags{};\n";
+                if (!fpPorts_.empty())
+                    out << "const bool cpu_fp_disabled_=std::getenv(\"GRHSIM_IR_DISABLE_FP_ELISION\")!=nullptr;\n";
                 if (dynamicStats_)
                     out << "std::array<std::uint64_t," << dynKinds_.size() << "> cpu_dyn_wr{},cpu_dyn_ch{},cpu_dyn_silent{};\n"
                         << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_act{},cpu_dyn_sn_body{},cpu_dyn_sn_grp{},cpu_dyn_sn_chg{};\n"
@@ -3623,7 +4444,8 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "std::uint64_t cpu_dyn_cm_ent_pos=0,cpu_dyn_cm_ent_neg=0,cpu_dyn_cm_ent_r0=0,cpu_dyn_cm_ent_rN=0;\n"
                         << "std::uint64_t cpu_dyn_sn_act_pos=0,cpu_dyn_sn_act_neg=0;\n"
                         << "std::uint64_t cpu_dyn_pub_pending_r0=0,cpu_dyn_pub_pending_rN=0,cpu_dyn_pub_changes_r0=0,cpu_dyn_pub_changes_rN=0;\n"
-                        << "std::uint64_t cpu_dyn_pub_pending_pos=0,cpu_dyn_pub_pending_neg=0,cpu_dyn_pub_changes_pos=0,cpu_dyn_pub_changes_neg=0;\n";
+                        << "std::uint64_t cpu_dyn_pub_pending_pos=0,cpu_dyn_pub_pending_neg=0,cpu_dyn_pub_changes_pos=0,cpu_dyn_pub_changes_neg=0;\n"
+                        << "std::uint64_t cpu_dyn_fp_evals=0;\n";
                 out << "std::vector<std::uint8_t> cpu_dirty=std::vector<std::uint8_t>(" << dirtyBytes_ << ");\n"
                     << "struct Pending{std::size_t state,offset,size; std::uint32_t begin,count; bool projection;bool memory=false;};\n"
                     << "struct Target{std::uint32_t offset; std::uint8_t mask; bool arm;};\n"
@@ -3726,7 +4548,8 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "cpu_dyn_cm_ent_pos=0;cpu_dyn_cm_ent_neg=0;cpu_dyn_cm_ent_r0=0;cpu_dyn_cm_ent_rN=0;\n"
                         << "cpu_dyn_sn_act_pos=0;cpu_dyn_sn_act_neg=0;\n"
                         << "cpu_dyn_pub_pending_r0=0;cpu_dyn_pub_pending_rN=0;cpu_dyn_pub_changes_r0=0;cpu_dyn_pub_changes_rN=0;\n"
-                        << "cpu_dyn_pub_pending_pos=0;cpu_dyn_pub_pending_neg=0;cpu_dyn_pub_changes_pos=0;cpu_dyn_pub_changes_neg=0;\n";
+                        << "cpu_dyn_pub_pending_pos=0;cpu_dyn_pub_pending_neg=0;cpu_dyn_pub_changes_pos=0;cpu_dyn_pub_changes_neg=0;\n"
+                        << "cpu_dyn_fp_evals=0;\n";
                 out << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
                 if (hasSystemTasks_) out << "cpu_first_eval=true;cpu_system_done.fill(false);cpu_strobes.clear();\n";
                 for (std::size_t i = 0; i < initChunkCount(); ++i) out << "cpu_init_" << i << "();\n";
@@ -3747,13 +4570,38 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     << "const bool cpu_profile=cpu_profile_enabled;\n"
                     << "const auto cpu_profile_eval_begin=cpu_profile?cpu_profile_clock::now():cpu_profile_clock::time_point{};\n"
                     << "auto cpu_profile_phase_begin=cpu_profile_eval_begin;\n"
-                    << "const auto cpu_profile_tick=[&](std::uint64_t &counter){if(cpu_profile){const auto now=cpu_profile_clock::now();\n"
-                    << "counter+=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-cpu_profile_phase_begin).count());cpu_profile_phase_begin=now;}};\n";
+                    << "const auto cpu_profile_tick=[&](std::uint64_t &counter,std::uint64_t &bucket){if(cpu_profile){const auto now=cpu_profile_clock::now();\n"
+                    << "const std::uint64_t cpu_dt=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-cpu_profile_phase_begin).count());counter+=cpu_dt;bucket+=cpu_dt;cpu_profile_phase_begin=now;}};\n";
                 for (const auto &input : model_.inputs()) out << at(model_.types()[input.type.index - 1], "cpu_objects.get()", object(ObjectRef::input(input.id)).offset)
                     << '=' << normalize("this->" + identifier(model_.text(input.name)), model_.types()[input.type.index - 1]) << ";\n";
                 std::vector<InputId> inputByValue(model_.values().size() + 1);
                 for (const auto &op : model_.operations()) if (model_.text(op.opType) == "core.input.read")
                     inputByValue[model_.results(op)[0].index] = {model_.objectRefs(op)[0].index, 0};
+                // Edge classification: bit N of cpu_chg_mask/cpu_chg_up is input
+                // port N's changed/rose bits for this eval; rows with no port
+                // mapping (or port >= 64) poison the mask so no fast path fires.
+                std::vector<int> inputPortBit(schedule_.inputFanout.size(), -1);
+                std::uint64_t oneBitPortMask = 0;
+                {
+                    std::unordered_map<std::uint32_t, std::uint32_t> portIndexOfInput;
+                    for (std::size_t port = 0; port < model_.inputs().size(); ++port)
+                        portIndexOfInput[model_.inputs()[port].id.index] = static_cast<std::uint32_t>(port);
+                    for (std::size_t port = 0; port < model_.inputs().size() && port < 64; ++port)
+                    {
+                        const auto &portType = model_.types()[model_.inputs()[port].type.index - 1];
+                        if (portType.kind == TypeKind::Logic && portType.width == 1)
+                            oneBitPortMask |= std::uint64_t(1) << port;
+                    }
+                    for (std::size_t i = 0; i < schedule_.inputFanout.size(); ++i)
+                    {
+                        const auto input = inputByValue[schedule_.inputFanout[i].source.index];
+                        if (!input) continue;
+                        const auto found = portIndexOfInput.find(input.index);
+                        if (found != portIndexOfInput.end() && found->second < 64)
+                            inputPortBit[i] = static_cast<int>(found->second);
+                    }
+                }
+                out << "std::uint64_t cpu_chg_mask=0,cpu_chg_up=0;\n";
                 std::uint32_t clockDynValue = 0;
                 if (dynamicStats_)
                     for (const auto &op : model_.operations())
@@ -3775,16 +4623,65 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     out << "if(" << previous << "!=" << current << "){";
                     if (dynamicStats_) out << "++cpu_dyn_in_chg;";
                     out << previous << '=' << current << ";\n";
+                    if (inputPortBit[i] >= 0)
+                    {
+                        out << "cpu_chg_mask|=UINT64_C(1)<<" << inputPortBit[i] << ';';
+                        if (type(row.source).kind == TypeKind::Logic && type(row.source).width <= 64)
+                            out << "if((" << current << ")!=0)cpu_chg_up|=UINT64_C(1)<<" << inputPortBit[i] << ';';
+                    }
+                    else out << "cpu_chg_mask=~UINT64_C(0);";
                     if (dynamicStats_ && row.source.index == clockDynValue)
                         out << "cpu_dyn_edge=((" << current << ")!=0)?1u:2u;\n";
                     activate(out, row.targets, false); out << "}\n";
                 }
+                out << "const unsigned cpu_edge_cls=(cpu_chg_mask!=0&&(cpu_chg_mask&(cpu_chg_mask-1))==0&&(cpu_chg_mask&UINT64_C("
+                    << oneBitPortMask << "))!=0)?((cpu_chg_up&cpu_chg_mask)!=0?1u:2u):3u;\n"
+                    << "auto &cpu_b_evals=cpu_edge_cls==1?cpu_profile_data.evals_pos:cpu_edge_cls==2?cpu_profile_data.evals_neg:cpu_profile_data.evals_other;\n"
+                    << "auto &cpu_b_rounds=cpu_edge_cls==1?cpu_profile_data.rounds_pos:cpu_edge_cls==2?cpu_profile_data.rounds_neg:cpu_profile_data.rounds_other;\n"
+                    << "auto &cpu_b_eval_ns=cpu_edge_cls==1?cpu_profile_data.eval_ns_pos:cpu_edge_cls==2?cpu_profile_data.eval_ns_neg:cpu_profile_data.eval_ns_other;\n"
+                    << "auto &cpu_b_compute_ns=cpu_edge_cls==1?cpu_profile_data.compute_ns_pos:cpu_edge_cls==2?cpu_profile_data.compute_ns_neg:cpu_profile_data.compute_ns_other;\n"
+                    << "auto &cpu_b_commit_ns=cpu_edge_cls==1?cpu_profile_data.commit_ns_pos:cpu_edge_cls==2?cpu_profile_data.commit_ns_neg:cpu_profile_data.commit_ns_other;\n"
+                    << "auto &cpu_b_publish_ns=cpu_edge_cls==1?cpu_profile_data.publish_ns_pos:cpu_edge_cls==2?cpu_profile_data.publish_ns_neg:cpu_profile_data.publish_ns_other;\n";
                 if (dynamicStats_)
                     out << "if(cpu_dyn_edge==1)++cpu_dyn_eval_pos;else if(cpu_dyn_edge==2)++cpu_dyn_eval_neg;else ++cpu_dyn_eval_other;\n";
+                // Falling-edge eval elision fast path: the scan above already
+                // updated input shadows and set activation flags (they persist
+                // into the next eval); staging the provably-zero event/history
+                // bytes replicates the skipped round loop's history sampling.
+                for (const auto &fp : fpPorts_)
+                {
+                    out << "if(!cpu_fp_disabled_&&cpu_chg_mask==(UINT64_C(1)<<" << fp.inputIndex
+                        << ")&&!(cpu_chg_up&(UINT64_C(1)<<" << fp.inputIndex << "))){ // cpu_fp_elision\n";
+                    if (!fp.eventOffsets.empty())
+                    {
+                        out << "static constexpr std::uint32_t cpu_fp_events[]={";
+                        for (std::size_t i = 0; i < fp.eventOffsets.size(); ++i) out << (i ? "," : "") << fp.eventOffsets[i] << 'u';
+                        out << "};for(const auto cpu_fp_off:cpu_fp_events)cpu_boundary.get()[cpu_fp_off]=std::byte{0};\n";
+                    }
+                    if (!fp.historyOffsets.empty())
+                    {
+                        out << "static constexpr std::uint32_t cpu_fp_hists[]={";
+                        for (std::size_t i = 0; i < fp.historyOffsets.size(); ++i) out << (i ? "," : "") << fp.historyOffsets[i] << 'u';
+                        out << "};for(const auto cpu_fp_off:cpu_fp_hists)cpu_objects.get()[cpu_fp_off]=std::byte{0};\n";
+                    }
+                    if (!fp.coneOffsets.empty())
+                    {
+                        out << "static constexpr std::uint32_t cpu_fp_cone[]={";
+                        for (std::size_t i = 0; i < fp.coneOffsets.size(); ++i) out << (i ? "," : "") << fp.coneOffsets[i] << 'u';
+                        out << "};for(const auto cpu_fp_off:cpu_fp_cone)cpu_boundary.get()[cpu_fp_off]=std::byte{0};\n";
+                    }
+                    if (hasSystemTasks_)
+                        out << "cpu_first_eval=false;for(const auto &text:cpu_strobes)std::cout<<text<<'\\n';cpu_strobes.clear();\n";
+                    for (const auto &output : model_.outputs()) out << "this->" << identifier(model_.text(output.name)) << '=' <<
+                        at(model_.types()[output.type.index - 1], "cpu_objects.get()", object(ObjectRef::output(output.id)).offset) << ";\n";
+                    out << "if(cpu_profile){++cpu_profile_data.fp_evals;++cpu_profile_data.evals;++cpu_b_evals;const std::uint64_t cpu_fp_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_profile_clock::now()-cpu_profile_eval_begin).count());cpu_profile_data.eval_ns+=cpu_fp_ns;cpu_b_eval_ns+=cpu_fp_ns;}\n";
+                    if (dynamicStats_) out << "++cpu_dyn_fp_evals;\n";
+                    out << "return;}\n";
+                }
                 out << "for(std::uint32_t cpu_round=0;cpu_round<100000;++cpu_round){\n";
                 if (dynamicStats_) out << "cpu_dyn_round_cur=cpu_round;\n";
                 CpuActivationTargets seeds{schedule_.roundSeeds, {}}; activate(out, seeds, false);
-                out << "if(cpu_profile){++cpu_profile_data.rounds;cpu_profile_phase_begin=cpu_profile_clock::now();}\n";
+                out << "if(cpu_profile){++cpu_profile_data.rounds;++cpu_b_rounds;cpu_profile_phase_begin=cpu_profile_clock::now();}\n";
                 // Word-packed dispatch: adjacent single-byte task checks sharing one
                 // 8-byte flags bucket get a uint64 emptiness prefilter; a zero word
                 // proves every covered check false, so task order and semantics are
@@ -3829,7 +4726,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 {
                     const bool computePhase = dispatch[cursor].compute;
                     if (profileCompute && *profileCompute != computePhase)
-                        out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
+                        out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns,cpu_b_compute_ns" : "commit_ns,cpu_b_commit_ns") << ");\n";
                     profileCompute = computePhase;
                     std::size_t end = cursor + 1;
                     if (dispatch[cursor].offset != ~std::uint32_t(0))
@@ -3854,8 +4751,8 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     cursor = end;
                 }
                 if (profileCompute)
-                    out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns" : "commit_ns") << ");\n";
-                out << "const bool cpu_again=cpu_publish();\ncpu_profile_tick(cpu_profile_data.publish_ns);\n";
+                    out << "cpu_profile_tick(cpu_profile_data." << (*profileCompute ? "compute_ns,cpu_b_compute_ns" : "commit_ns,cpu_b_commit_ns") << ");\n";
+                out << "const bool cpu_again=cpu_publish();\ncpu_profile_tick(cpu_profile_data.publish_ns,cpu_b_publish_ns);\n";
                 // A domain slot needs the copy/clear only when its next-arm or current
                 // flag byte is non-zero; bucket prefilters keep the per-slot semantics.
                 std::vector<std::uint32_t> domainSlots;
@@ -3888,14 +4785,27 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     out << "cpu_first_eval=false;for(const auto &text:cpu_strobes)std::cout<<text<<'\\n';cpu_strobes.clear();\n";
                 for (const auto &output : model_.outputs()) out << "this->" << identifier(model_.text(output.name)) << '=' <<
                     at(model_.types()[output.type.index - 1], "cpu_objects.get()", object(ObjectRef::output(output.id)).offset) << ";\n";
-                out << "if(cpu_profile){++cpu_profile_data.evals;cpu_profile_data.eval_ns+=static_cast<std::uint64_t>(\n"
-                    << "std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_profile_clock::now()-cpu_profile_eval_begin).count());}\n"
+                out << "if(cpu_profile){++cpu_profile_data.evals;++cpu_b_evals;const std::uint64_t cpu_eval_ns=static_cast<std::uint64_t>(\n"
+                    << "std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_profile_clock::now()-cpu_profile_eval_begin).count());cpu_profile_data.eval_ns+=cpu_eval_ns;cpu_b_eval_ns+=cpu_eval_ns;}\n"
                     << "return;}}throw std::runtime_error(\"CPU model did not converge\");}\n";
                 out << "void " << class_ << "::dump_runtime_profile() const{if(!cpu_profile_data.evals)return;const auto &p=cpu_profile_data;\n"
                     << "std::fprintf(stderr,\"[grhsim-cpu-phase] evals=%llu rounds=%llu eval_ns=%llu compute_ns=%llu commit_ns=%llu publish_ns=%llu\\n\",\n"
-                    << "static_cast<unsigned long long>(p.evals),static_cast<unsigned long long>(p.rounds),\n"
-                    << "static_cast<unsigned long long>(p.eval_ns),static_cast<unsigned long long>(p.compute_ns),\n"
-                    << "static_cast<unsigned long long>(p.commit_ns),static_cast<unsigned long long>(p.publish_ns));";
+                    << "static_cast<unsigned long long>(p.evals_pos+p.evals_neg+p.evals_other),static_cast<unsigned long long>(p.rounds_pos+p.rounds_neg+p.rounds_other),\n"
+                    << "static_cast<unsigned long long>(p.eval_ns_pos+p.eval_ns_neg+p.eval_ns_other),static_cast<unsigned long long>(p.compute_ns_pos+p.compute_ns_neg+p.compute_ns_other),\n"
+                    << "static_cast<unsigned long long>(p.commit_ns_pos+p.commit_ns_neg+p.commit_ns_other),static_cast<unsigned long long>(p.publish_ns_pos+p.publish_ns_neg+p.publish_ns_other));\n"
+                    << "std::fprintf(stderr,\"[grhsim-cpu-edge] evals_pos=%llu rounds_pos=%llu eval_ns_pos=%llu compute_ns_pos=%llu commit_ns_pos=%llu publish_ns_pos=%llu "
+                    << "evals_neg=%llu rounds_neg=%llu eval_ns_neg=%llu compute_ns_neg=%llu commit_ns_neg=%llu publish_ns_neg=%llu "
+                    << "evals_other=%llu rounds_other=%llu eval_ns_other=%llu compute_ns_other=%llu commit_ns_other=%llu publish_ns_other=%llu fp_evals=%llu\\n\",\n"
+                    << "static_cast<unsigned long long>(p.evals_pos),static_cast<unsigned long long>(p.rounds_pos),\n"
+                    << "static_cast<unsigned long long>(p.eval_ns_pos),static_cast<unsigned long long>(p.compute_ns_pos),\n"
+                    << "static_cast<unsigned long long>(p.commit_ns_pos),static_cast<unsigned long long>(p.publish_ns_pos),\n"
+                    << "static_cast<unsigned long long>(p.evals_neg),static_cast<unsigned long long>(p.rounds_neg),\n"
+                    << "static_cast<unsigned long long>(p.eval_ns_neg),static_cast<unsigned long long>(p.compute_ns_neg),\n"
+                    << "static_cast<unsigned long long>(p.commit_ns_neg),static_cast<unsigned long long>(p.publish_ns_neg),\n"
+                    << "static_cast<unsigned long long>(p.evals_other),static_cast<unsigned long long>(p.rounds_other),\n"
+                    << "static_cast<unsigned long long>(p.eval_ns_other),static_cast<unsigned long long>(p.compute_ns_other),\n"
+                    << "static_cast<unsigned long long>(p.commit_ns_other),static_cast<unsigned long long>(p.publish_ns_other),\n"
+                    << "static_cast<unsigned long long>(p.fp_evals));";
                 if (dynamicStats_)
                 {
                     std::vector<std::string> names(dynKinds_.size());
@@ -3924,6 +4834,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "std::fprintf(stderr,\"[grhsim-dyn] edge evals pos=%llu neg=%llu other=%llu\\n\","
                         << "static_cast<unsigned long long>(cpu_dyn_eval_pos),static_cast<unsigned long long>(cpu_dyn_eval_neg),"
                         << "static_cast<unsigned long long>(cpu_dyn_eval_other));\n"
+                        << "std::fprintf(stderr,\"[grhsim-dyn] fp_evals=%llu\\n\",static_cast<unsigned long long>(cpu_dyn_fp_evals));\n"
                         << "std::fprintf(stderr,\"[grhsim-dyn] round_hist\");for(const auto h:cpu_dyn_round_hist)"
                         << "std::fprintf(stderr,\" %llu\",static_cast<unsigned long long>(h));std::fprintf(stderr,\"\\n\");\n"
                         << "std::fprintf(stderr,\"[grhsim-dyn] edge port_eval pos=%llu neg=%llu fire_pos=%llu fire_neg=%llu eval_r0=%llu eval_rN=%llu\\n\","
@@ -4582,6 +5493,19 @@ if(terminal){
             std::string branchShapeHotnessFile_;
             double branchShapeGrowthBudget_ = -1.0;
             std::string blockShareSummary_;
+            // --falling-edge-elision (default on): per eligible 1-bit input port,
+            // the boundary event offsets and object history offsets zeroed by the
+            // eval fast path (see planFallingEdgeElision).
+            bool fallingEdgeElision_ = true;
+            struct FpElisionPort
+            {
+                std::uint32_t inputIndex = 0;
+                std::vector<std::uint32_t> eventOffsets;
+                std::vector<std::uint32_t> historyOffsets;
+                std::vector<std::uint32_t> coneOffsets;
+            };
+            std::vector<FpElisionPort> fpPorts_;
+            std::string fpElisionSummary_;
             mutable std::unordered_set<std::uint32_t> memGuardStripped_;
             mutable std::unordered_map<std::uint32_t, std::string> memEnableCache_;
             mutable std::uint64_t memGuardHoistRuns_ = 0, memGuardHoistSites_ = 0;
@@ -4600,13 +5524,14 @@ if(terminal){
         public:
             explicit EmitCppPass(std::filesystem::path path, bool dynamicStats = false, bool commitCompactWalk = false,
                                  bool commitMemWalk = false, bool shapeTwinShare = false, bool branchShapeShare = false,
-                                 std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0)
+                                 std::string branchShapeHotnessFile = std::string(), double branchShapeGrowthBudget = -1.0,
+                                 bool fallingEdgeElision = true)
                 : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), dynamicStats_(dynamicStats),
                   commitCompactWalk_(commitCompactWalk), commitMemWalk_(commitMemWalk), shapeTwinShare_(shapeTwinShare),
                   branchShapeShare_(branchShapeShare), branchShapeHotnessFile_(std::move(branchShapeHotnessFile)),
-                  branchShapeGrowthBudget_(branchShapeGrowthBudget) {}
+                  branchShapeGrowthBudget_(branchShapeGrowthBudget), fallingEdgeElision_(fallingEdgeElision) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_, branchShapeShare_, branchShapeHotnessFile_, branchShapeGrowthBudget_); }
+            { return emitCpuCpp(model, path_, diagnostics, dynamicStats_, commitCompactWalk_, commitMemWalk_, shapeTwinShare_, branchShapeShare_, branchShapeHotnessFile_, branchShapeGrowthBudget_, fallingEdgeElision_); }
         private:
             std::filesystem::path path_;
             bool dynamicStats_ = false;
@@ -4616,12 +5541,13 @@ if(terminal){
             bool branchShapeShare_ = false;
             std::string branchShapeHotnessFile_;
             double branchShapeGrowthBudget_ = -1.0;
+            bool fallingEdgeElision_ = true;
         };
     }
 
     PassResult emitCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory, diag::Diagnostics &diagnostics,
                           bool dynamicStats, bool commitCompactWalk, bool commitMemWalk, bool shapeTwinShare, bool branchShapeShare,
-                          const std::string &branchShapeHotnessFile, double branchShapeGrowthBudget)
+                          const std::string &branchShapeHotnessFile, double branchShapeGrowthBudget, bool fallingEdgeElision)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         if (!model.cpuMapping() || model.cpuMapping()->stage != CpuMappingStage::Schedule)
@@ -4629,8 +5555,9 @@ if(terminal){
         try
         {
             Emitter emitter(model, dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare,
-                            branchShapeHotnessFile, branchShapeGrowthBudget); emitter.validate();
+                            branchShapeHotnessFile, branchShapeGrowthBudget, fallingEdgeElision); emitter.validate();
             diagnostics.info(emitter.historyBatchSummary(), "cpu.st.emit-cpp");
+            if (const auto fp = emitter.fpElisionSummary(); !fp.empty()) diagnostics.info(fp, "cpu.st.emit-cpp");
             auto result = emitter.write(directory);
             diagnostics.info(emitter.packSummary(), "cpu.st.emit-cpp");
             if (shapeTwinShare)
@@ -4649,7 +5576,7 @@ if(terminal){
         if (!registry.registerPass("cpu.st.emit-cpp", PassKind::Emit,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 if (args.empty() || args.size() % 2)
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>] [--falling-edge-elision <true|false>]"; return {}; }
                 std::filesystem::path output;
                 bool dynamicStats = false;
                 bool commitCompactWalk = false;
@@ -4658,6 +5585,7 @@ if(terminal){
                 bool branchShapeShare = false;
                 std::string branchShapeHotnessFile;
                 double branchShapeGrowthBudget = -1.0;
+                bool fallingEdgeElision = true;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     if (args[i] == "--output" && output.empty() && !args[i + 1].empty()) output = args[i + 1];
@@ -4678,12 +5606,14 @@ if(terminal){
                         try { branchShapeGrowthBudget = std::stod(std::string(args[i + 1])); }
                         catch (const std::exception &) { error = "invalid --branch-shape-growth-budget value"; return {}; }
                     }
+                    else if (args[i] == "--falling-edge-elision" && (args[i + 1] == "true" || args[i + 1] == "false"))
+                        fallingEdgeElision = args[i + 1] == "true";
                     else
-                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
+                    { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>] [--falling-edge-elision <true|false>]"; return {}; }
                 }
                 if (output.empty())
-                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>]"; return {}; }
-                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare, std::move(branchShapeHotnessFile), branchShapeGrowthBudget);
+                { error = "expected --output <empty-directory> [--dynamic-stats <true|false>] [--commit-compact-walk <true|false>] [--commit-mem-walk <true|false>] [--shape-twin-share <true|false>] [--branch-shape-share <true|false>] [--branch-shape-hotness <tsv-path>] [--branch-shape-growth-budget <float>] [--falling-edge-elision <true|false>]"; return {}; }
+                return std::make_unique<EmitCppPass>(std::move(output), dynamicStats, commitCompactWalk, commitMemWalk, shapeTwinShare, branchShapeShare, std::move(branchShapeHotnessFile), branchShapeGrowthBudget, fallingEdgeElision);
             }, error)) throw std::logic_error(error);
     }
 }

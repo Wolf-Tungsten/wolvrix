@@ -2692,6 +2692,69 @@ namespace
                 " CXXFLAGS='-std=c++20 -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
     }
 
+    // Two-level event cone (clk & a & b, each op in its own supernode): the
+    // falling-edge elision zeroes the event/history bytes, and the next
+    // posedge must still propagate through the unchanged intermediate.
+    void testFallingEdgeElisionDeepCone(const std::filesystem::path &directory)
+    {
+        GrhSimModel model("cpu_fp_cone"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto input = [&](const std::string &name) {
+            const auto id = model.addInput(name, bit); const auto value = model.addValue(bit);
+            const std::array results{value}; const std::array refs{ObjectRef::input(id)};
+            model.addOperation("core.input.read", {}, results, refs); return value;
+        };
+        const auto constant = [&](std::string literal) {
+            const auto value = model.addValue(bit); const std::array results{value};
+            const std::array params{Parameter{model.intern("value"), std::move(literal)}};
+            model.addOperation("core.compute.constant", {}, results, {}, params); return value;
+        };
+        const auto state = [&] {
+            const auto id = model.addState("s" + std::to_string(model.states().size()), bit);
+            const std::array params{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}}; model.addInit(id, steps, params); return id;
+        };
+        const auto clk = input("clk"), a = input("a"), b = input("b"), data = input("data");
+        const auto one = constant("1");
+        const auto combined = model.addValue(bit); const std::array andOne{clk, a}; const std::array andOneResult{combined};
+        model.addOperation("core.compute.and", andOne, andOneResult, {});
+        const auto event = model.addValue(bit); const std::array andTwo{combined, b}; const std::array andTwoResult{event};
+        model.addOperation("core.compute.and", andTwo, andTwoResult, {});
+        const auto reg = state(); const auto history = state();
+        const std::array writeOperands{one, data, one, event};
+        const std::array writeRefs{ObjectRef::state(reg), ObjectRef::state(history)};
+        const std::array writeParams{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        model.addOperation("core.state.regWrite", writeOperands, {}, writeRefs, writeParams);
+        const auto read = model.addValue(bit); const std::array readResults{read}; const std::array readRefs{ObjectRef::state(reg)};
+        model.addOperation("core.state.read", {}, readResults, readRefs);
+        const auto port = model.addOutput("q", bit); const std::array ports{ObjectRef::output(port)};
+        const std::array writeOut{read};
+        model.addOperation("core.output.write", writeOut, {}, ports);
+        // Toggle register on the same event cone: observes every posedge even
+        // when no data input changes in the same eval.
+        const auto toggle = state(); const auto toggleHistory = state();
+        const auto toggleRead = model.addValue(bit); const std::array toggleReadResults{toggleRead};
+        const std::array toggleReadRefs{ObjectRef::state(toggle)};
+        model.addOperation("core.state.read", {}, toggleReadResults, toggleReadRefs);
+        const auto toggleNext = model.addValue(bit); const std::array notOperands{toggleRead};
+        const std::array notResults{toggleNext};
+        model.addOperation("core.compute.not", notOperands, notResults, {});
+        const std::array toggleOperands{one, toggleNext, one, event};
+        const std::array toggleRefs{ObjectRef::state(toggle), ObjectRef::state(toggleHistory)};
+        model.addOperation("core.state.regWrite", toggleOperands, {}, toggleRefs, writeParams);
+        const auto togglePort = model.addOutput("t", bit); const std::array togglePorts{ObjectRef::output(togglePort)};
+        const std::array toggleOut{toggleRead};
+        model.addOperation("core.output.write", toggleOut, {}, togglePorts);
+        map(model, "1", "1");
+        diag::Diagnostics diagnostics;
+        require(emitCpuCpp(model, directory, diagnostics).success, "fp cone emit failed");
+        for (const auto &message : diagnostics.messages()) std::cout << message.message << '\n';
+        const auto makefile = std::filesystem::path(WOLVRIX_GRHSIM_TEST_DATA_DIR) / "cpu_fp_cone.mk";
+        command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
+                " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
     void testMemoryStaging(const std::filesystem::path &directory)
     {
         GrhSimModel model("cpu_memory_stage"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -3286,6 +3349,7 @@ int main(int argc, char **argv)
         testSharedCommitEdges(directory / "notifications", "128", "10000");
         testSharedCommitEdges(directory / "notifications_split", "2", "1");
         testScalarStaging(directory / "scalar_staging");
+        testFallingEdgeElisionDeepCone(directory / "fp_cone");
         testIdentityAssigns(directory / "identity_assign", false);
         testIdentityAssigns(directory / "identity_assign_helpers", true);
         testSharedComputeClones(directory / "clones", false);

@@ -4168,15 +4168,21 @@ namespace wolvrix::lib::grhsim
                 }
                 for (std::size_t i = 0; i < groups.size(); ++i)
                 {
+                    const std::string changed = "cpu_changed_" + std::to_string(i);
+                    // NO00010: groups fire rarely (measured ~2.6% of bodies), and
+                    // every arm below is `x |= (-(u8)changed) & mask` — a strict
+                    // no-op when unchanged — so guarding the arm sequence is exact
+                    // and skips the dead work under one strongly biased branch.
+                    out << "if(" << changed << "){\n";
                     if (groups[i].targets)
                     {
-                        const std::string changed = "cpu_changed_" + std::to_string(i);
                         activate(out, *groups[i].targets, false, unit, changed);
                         // Same place, same condition as the flag set: every guarded
                         // target accumulates the token bits of all member values.
                         emitChgmaskOr(out, *groups[i].targets, groups[i].members, changed);
                     }
-                    if (groups[i].ports) armPorts(out, *groups[i].ports, "cpu_changed_" + std::to_string(i));
+                    if (groups[i].ports) armPorts(out, *groups[i].ports, changed);
+                    out << "}\n";
                 }
                 if (dynamicStats_ && !groups.empty())
                 {

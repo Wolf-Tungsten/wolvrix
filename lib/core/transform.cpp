@@ -12,6 +12,7 @@
 #include "transform/mem_to_reg.hpp"
 #include "transform/memory_init_check.hpp"
 #include "transform/memory_read_retime.hpp"
+#include "transform/memory_write_coalesce.hpp"
 #include "transform/multidriven_guard.hpp"
 #include "transform/reg_to_mem.hpp"
 #include "transform/repcut.hpp"
@@ -416,6 +417,7 @@ namespace wolvrix::lib::transform
             "activity-schedule",
             "latch-transparent-read",
             "memory-read-retime",
+            "memory-write-coalesce",
             "slice-index-const",
             "multidriven-guard",
             "hier-flatten",
@@ -2499,6 +2501,15 @@ namespace wolvrix::lib::transform
             }
             return std::make_unique<MemToRegPass>(options);
         }
+        if (normalized == "memory-write-coalesce")
+        {
+            if (!args.empty())
+            {
+                error = "memory-write-coalesce does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<MemoryWriteCoalescePass>();
+        }
         if (normalized == "memory-read-retime")
         {
             if (!args.empty())
@@ -2545,6 +2556,28 @@ namespace wolvrix::lib::transform
                 else if (arg == "-no-decoded-write-storage")
                 {
                     options.enableDecodedWriteStorage = false;
+                }
+                else if (arg == "-profitability-filter")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-profitability-filter expects a value";
+                        return nullptr;
+                    }
+                    const std::string_view value = args[++i];
+                    if (value == "none")
+                    {
+                        options.profitabilityFilter = RegToMemProfitabilityPolicy::None;
+                    }
+                    else if (value == "verilator-v1")
+                    {
+                        options.profitabilityFilter = RegToMemProfitabilityPolicy::VerilatorV1;
+                    }
+                    else
+                    {
+                        error = "invalid -profitability-filter value";
+                        return nullptr;
+                    }
                 }
                 else if (arg == "-min-element-count")
                 {
@@ -2647,6 +2680,20 @@ namespace wolvrix::lib::transform
         if (normalized == "repcut")
         {
             RepcutOptions options;
+            auto parseCostModel = [&](std::string_view value) -> bool {
+                if (value == "legacy")
+                {
+                    options.costModel = RepcutCostModel::kLegacy;
+                    return true;
+                }
+                if (value == "verilator-v1")
+                {
+                    options.costModel = RepcutCostModel::kVerilatorV1;
+                    return true;
+                }
+                error = "invalid -cost-model value; expected legacy or verilator-v1";
+                return false;
+            };
             auto parseWeightMode = [&](std::string_view value) -> bool {
                 if (value == "baseline")
                 {
@@ -2809,6 +2856,25 @@ namespace wolvrix::lib::transform
                     catch (const std::exception &)
                     {
                         error = "invalid -mtkahypar-threads value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-cost-model")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-cost-model expects a value";
+                        return nullptr;
+                    }
+                    if (!parseCostModel(args[++i]))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-cost-model="))
+                {
+                    if (!parseCostModel(arg.substr(std::string_view("-cost-model=").size())))
+                    {
                         return nullptr;
                     }
                 }

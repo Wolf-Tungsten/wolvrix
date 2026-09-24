@@ -53,25 +53,26 @@ namespace
         return op;
     }
 
-    void populateBasicRepcutDesign(wolvrix::lib::grh::Design &design, const std::string &topName)
+    void populateBasicRepcutDesign(wolvrix::lib::grh::Design &design, const std::string &topName,
+                                  int32_t width = 8)
     {
         wolvrix::lib::grh::Graph &graph = design.createGraph(topName);
 
-        const auto inA = makeValue(graph, "a");
-        const auto inB = makeValue(graph, "b");
+        const auto inA = makeValue(graph, "a", width);
+        const auto inB = makeValue(graph, "b", width);
         const auto en = makeValue(graph, "en", 1, false);
         graph.bindInputPort("a", inA);
         graph.bindInputPort("b", inB);
         graph.bindInputPort("en", en);
 
-        const auto shared = makeValue(graph, "shared");
+        const auto shared = makeValue(graph, "shared", width);
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kAdd, "shared_add", inA, inB, shared);
 
         constexpr int kSinkCount = 6;
         for (int i = 0; i < kSinkCount; ++i)
         {
             const std::string suffix = std::to_string(i);
-            const auto datav = makeValue(graph, "wr_data_" + suffix);
+            const auto datav = makeValue(graph, "wr_data_" + suffix, width);
             const auto kind = (i % 2 == 0) ? wolvrix::lib::grh::OperationKind::kAdd
                                            : wolvrix::lib::grh::OperationKind::kSub;
             const std::string dataOpName = (i % 2 == 0 ? "sink_add_" : "sink_sub_") + suffix;
@@ -80,7 +81,7 @@ namespace
             const std::string latchName = "lat_" + suffix;
             const auto latchDecl = graph.createOperation(wolvrix::lib::grh::OperationKind::kLatch,
                                                          graph.internSymbol(latchName));
-            graph.setAttr(latchDecl, "width", static_cast<int64_t>(8));
+            graph.setAttr(latchDecl, "width", static_cast<int64_t>(width));
             graph.setAttr(latchDecl, "isSigned", false);
 
             const auto writeOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kLatchWritePort,
@@ -351,6 +352,10 @@ int main()
         };
 
         RepcutOptions currentOptions = deterministicOptions;
+        if (currentOutDir == deterministicOutDir2)
+        {
+            currentOptions.costModel = RepcutCostModel::kLegacy;
+        }
         currentOptions.workDir = currentOutDir.string();
         currentManager.addPass(std::make_unique<RepcutPass>(currentOptions));
 
@@ -408,6 +413,56 @@ int main()
     if (readFile(deterministicPart1) != readFile(deterministicPart2))
     {
         return fail("expected repeated repcut runs to emit identical mt-kahypar partition files");
+    }
+    const auto defaultHgr = readFile(deterministicOutDir1 / "top_repeat_repcut_k2.hgr");
+    if (defaultHgr.empty() || defaultHgr != readFile(deterministicOutDir2 / "top_repeat_repcut_k2.hgr"))
+    {
+        return fail("default and explicit legacy must emit identical HGR weights");
+    }
+
+    for (const auto weightMode : {RepcutWeightMode::kBaseline, RepcutWeightMode::kClosureAware})
+    {
+        std::string legacyHgr;
+        for (const auto costModel : {RepcutCostModel::kLegacy,
+                                    RepcutCostModel::kVerilatorV1})
+        {
+            wolvrix::lib::grh::Design costDesign;
+            populateBasicRepcutDesign(costDesign, "top_wide", 256);
+            RepcutOptions costOptions = deterministicOptions;
+            costOptions.path = "top_wide";
+            costOptions.weightMode = weightMode;
+            costOptions.costModel = costModel;
+            const auto costOutDir = outDir / (weightMode == RepcutWeightMode::kBaseline ?
+                                                 "cost_baseline" : "cost_closure") /
+                                    std::string(repcutCostModelName(costModel));
+            std::filesystem::create_directories(costOutDir);
+            costOptions.workDir = costOutDir.string();
+            PassManager costManager;
+            costManager.options().verbosity = PassVerbosity::Info;
+            costManager.addPass(std::make_unique<RepcutPass>(costOptions));
+            PassDiagnostics costDiags;
+            const auto costResult = costManager.run(costDesign, costDiags);
+            const auto *costStats = findRepcutStatsDiagnostic(costDiags);
+            const auto modelField = "\"cost_model\":\"" + std::string(repcutCostModelName(costModel)) + "\"";
+            if (!costResult.success || !costResult.changed || costDiags.hasError() || costStats == nullptr ||
+                costStats->find(modelField) == std::string::npos ||
+                costStats->find("\"cost_model_legacy_fallback_op_count\":") == std::string::npos)
+            {
+                return fail("cost-model integration or diagnostics failed");
+            }
+            if (weightMode == RepcutWeightMode::kClosureAware &&
+                costStats->find("\"exact_referenced_closure_weight\":") == std::string::npos)
+            {
+                return fail("cost model did not reach closure-aware diagnostics");
+            }
+            const auto hgr = readFile(costOutDir / "top_wide_repcut_k2.hgr");
+            if (hgr.empty())
+                return fail("cost-model integration missing HGR");
+            if (costModel == RepcutCostModel::kLegacy)
+                legacyHgr = hgr;
+            else if (hgr == legacyHgr)
+                return fail("wide fixture must exercise backend-specific solver weights");
+        }
     }
 
     wolvrix::lib::grh::Design closureAwareDesign;
@@ -501,6 +556,7 @@ int main()
 
     const std::string *stats = findRepcutStatsDiagnostic(diags);
     if (stats == nullptr ||
+        stats->find("\"cost_model\":\"legacy\"") == std::string::npos ||
         stats->find("\"partition_static_features\":[") == std::string::npos ||
         stats->find("\"part_name\":\"part_0\"") == std::string::npos ||
         stats->find("\"op_kind_counts\":{") == std::string::npos ||

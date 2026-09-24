@@ -603,6 +603,13 @@ def _compile_reg_to_mem_kwargs(named: dict[str, Any]) -> list[str]:
     min_element_count = _pop_named(local, "min_element_count", None)
     if min_element_count is not None:
         out.extend(["-min-element-count", str(min_element_count)])
+    profitability_filter = _pop_named(local, "profitability_filter", None)
+    if profitability_filter is not None:
+        if not isinstance(profitability_filter, str) or profitability_filter not in {
+            "none", "verilator-v1",
+        }:
+            raise ValueError("profitability_filter must be one of: none, verilator-v1")
+        out.extend(["-profitability-filter", profitability_filter])
     _ensure_no_extra_named("reg-to-mem", local)
     return out
 
@@ -657,6 +664,16 @@ def _compile_repcut_kwargs(named: dict[str, Any]) -> list[str]:
     threads = _pop_named(local, "mtkahypar_threads", None)
     if threads is not None:
         out.extend(["-mtkahypar-threads", str(threads)])
+    cost_model = _pop_named(local, "cost_model", None)
+    if cost_model is not None:
+        if not isinstance(cost_model, str) or cost_model not in {
+            "legacy",
+            "verilator-v1",
+        }:
+            raise ValueError(
+                "cost_model must be one of: legacy, verilator-v1"
+            )
+        out.extend(["-cost-model", cost_model])
     weight_mode = _pop_named(local, "weight_mode", None)
     if weight_mode is not None:
         if not isinstance(weight_mode, str) or weight_mode not in {

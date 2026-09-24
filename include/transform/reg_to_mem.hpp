@@ -5,6 +5,11 @@
 
 namespace wolvrix::lib::transform
 {
+    enum class RegToMemProfitabilityPolicy
+    {
+        None,
+        VerilatorV1,
+    };
 
     struct RegToMemOptions
     {
@@ -13,6 +18,7 @@ namespace wolvrix::lib::transform
         bool enableOrderedWrites = false;
         bool enableDecodedWriteStorage = true;
         std::size_t minElementCount = 4;
+        RegToMemProfitabilityPolicy profitabilityFilter = RegToMemProfitabilityPolicy::None;
     };
 
     class RegToMemPass : public Pass

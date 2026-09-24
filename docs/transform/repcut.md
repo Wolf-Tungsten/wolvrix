@@ -69,6 +69,7 @@
 | `-mtkahypar-preset` | `deterministic-quality` | mt-kahypar 预设；`repcut` 会强制使用确定性 preset |
 | `-mtkahypar-threads` | `0` | 线程数，`0` 表示后端默认 |
 | `-weight-mode` | `baseline` | 求解器 vertex weight 模式；严格支持 `baseline` 或 `closure-aware` |
+| `-cost-model` | `legacy` | 操作计算成本模型；支持 `legacy` 和实验性 `verilator-v1` |
 | `-keep-intermediate-files` | false | 是否保留中间文件 |
 
 `baseline` 保留原有 RepCut vertex weight 口径。`closure-aware` 包含三步：
@@ -94,6 +95,53 @@ piece closure；Phase E 另行归属的 storage/source 和重建 adapter 继续�
 启用 `-keep-intermediate-files` 时，solver 原始分区保存在常规 `.hgr.partK` 文件，refine 后实际用于
 重建的分区另存为 `.hgr.closure-aware.partK`。最终 info stats 会记录 `closure_weight_stats`、
 `partition_refine_stats`，以及每个 part 的 `exact_referenced_closure_weight`。
+
+## 后端计算成本模型
+
+`cost-model` 与 `weight-mode` 正交：前者给单个 GRH 操作计价，后者决定这些成本如何分配到
+ASC（不可拆分的原子逻辑锥）、共享 piece（逻辑片段）和分区。两者的四种组合均支持。
+操作成本贯穿 HGR 顶点权重、共享 piece 复制惩罚、exact closure refinement 和分区静态统计。
+通信 proxy 公式和 ASC/storage 共置规则不变；closure-aware 边权含共享计算成本，因此其数值会随模型改变。
+
+`legacy` 保留历史位宽/扇出规则，仍是默认。`verilator-v1` 根据当前 Verilator 的 scalar/wide
+表示和 helper 实现给出相对工作量：它不是周期数或生成 C++ 字节数，尚未完成跨设计或 walltime 验证。
+模型不随 emitter 自动切换，也不使用香山分区耗时拟合。未覆盖的操作显式回退 legacy。
+
+记 `L(W)=1`（`W<=64`），否则为 `ceil(W/32)`；`O` 为最大结果位宽，`I` 为最大操作数位宽。
+首版主要规则如下，系数是机制启发式，不是已标定硬件常数：
+
+| 操作 | 相对成本 |
+| --- | --- |
+| add/sub、shift | `2*L(O)` |
+| bitwise、assign、replicate | `L(O)` |
+| AND/OR/NAND/NOR reduction、逻辑非 | `L(I)` |
+| XOR/XNOR reduction、比较 | `2*L(I)` |
+| 逻辑与/或 | `1 + sum(L(operand width))` |
+| mux / concat | `1+L(O)` / `operand count+L(O)` |
+| 静态 / 动态切片 | `L(O)` / `2+2*L(O)`；array slice 额外 `+1` |
+| write，全零 / 全一常量 mask | `1` / `1+L(data width)` |
+| memory write，部分常量 / 动态 mask | `1+mask ones` / `1+2*data width` |
+| register/latch write，其他 mask | 回退 legacy，等待后端合并行为验证 |
+
+写口操作数必须按类型解释：register write 是 `[enable, data, mask, events...]`，
+latch write 是 `[enable, data, mask]`（无 event），
+memory write 是 `[enable, address, data, mask, events...]`。
+例如 memory write 的 `[1-bit en, 8-bit addr, 256-bit data, 256-bit mask]` 使用 256-bit data 计价，
+不会误将 8-bit address 当作 data。动态 memory mask 的逐 bit 成本来自当前 SV emitter，
+不预测运行时全一快速路径的命中率；窄动态切片按输出宽度计价，不按整个宽输入扫描。
+
+mul/div/mod、memory read、storage、常量和 effects 等未覆盖类型保留 legacy 成本。
+新规则不再叠加历史扇出系数，但 fallback 仍保留旧公式。新规则的单操作成本饱和到 `UINT32_MAX-1`，
+新模型的 piece 总和溢出时明确报错；legacy 保持历史累加行为。不同模型的绝对权重不能直接比较。
+常量 mask 使用 sized literal 解析，另支持无尺寸 `'0`；`'1`、未知位或无法解析的 mask 暂按动态规则保守计价。
+
+最终 stats 的 `cost_model` 标记选用模型；各分区的 `cost_model_legacy_fallback_op_count`
+统计其原始节点集中使用回退计价的操作数（不是动态执行次数，也不含重建后新增的 adapter）。
+`estimated_node_weight_sum` 和 `exact_referenced_closure_weight` 使用相同选定模型，但节点范围不同。
+
+扩展其他仿真器时，在 `repcut_cost_model.hpp/.cpp` 添加独立、有版本的模型及对应选项校验，
+复用 `estimateRepcutOperationCost` 接口与现有汇总流程；不要把新后端映射成 Verilator 别名。
+新增模型需独立算子 fixture、默认兼容性和跨设计验证。当前不接受 `gsim`/`grhsim`，避免误称已支持。
 
 ## 示例
 
@@ -137,7 +185,32 @@ XiangShan Make 流程通过同名实验变量选择模式：
 make build_xs_repcut_verilator XS_REPCUT_WEIGHT_MODE=closure-aware
 ```
 
-未设置 `XS_REPCUT_WEIGHT_MODE` 时使用 `baseline`。
+通用 RepCut pass 未设置 `weight_mode` 时仍使用 `baseline`；当前 XiangShan Make
+流程将 `XS_REPCUT_WEIGHT_MODE` 默认覆盖为 `closure-aware`。
+
+### 示例 4：显式选择实验性 Verilator 成本
+
+```python
+session.run_pass(
+    "repcut", design="design.main", path="SimTop", partition_count=32,
+    weight_mode="closure-aware", cost_model="verilator-v1",
+)
+```
+
+```bash
+make build_xs_repcut_verilator XS_REPCUT_WEIGHT_MODE=closure-aware XS_REPCUT_COST_MODEL=verilator-v1
+```
+
+CLI 对应 `-cost-model=verilator-v1`。Python 省略 `cost_model` 或传 `None` 时不发送该选项，
+沿用 C++ 默认 `legacy`；当前 XiangShan Make 流程将 `XS_REPCUT_COST_MODEL` 默认覆盖为
+`verilator-v1`。
+
+当前 XiangShan 主线脚本在 RepCut 完成后默认继续执行全分区的
+`memory-write-coalesce`，以及带 Verilator 成本门槛的
+`reg-to-mem(intent=false, profitability_filter=verilator-v1)`。这些是流程级默认值，
+不改变 `RegToMemOptions::profitabilityFilter` 在通用库/API 中的默认 `None`；可分别通过
+`XS_REPCUT_MEMORY_WRITE_COALESCE=0`、`XS_REPCUT_REG_TO_MEM=0` 或
+`XS_REPCUT_REG_TO_MEM_PROFITABILITY_FILTER=none` 关闭/回退。
 
 ## Verilator RepCut 运行时
 

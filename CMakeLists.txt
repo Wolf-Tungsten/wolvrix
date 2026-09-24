@@ -124,6 +124,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/simplify.cpp
     lib/transform/memory_init_check.cpp
     lib/transform/memory_read_retime.cpp
+    lib/transform/memory_write_coalesce.cpp
     lib/transform/mem_to_reg.cpp
     lib/transform/reg_to_mem.cpp
     lib/transform/multidriven_guard.cpp
@@ -137,6 +138,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/slice_index_const.cpp
     lib/transform/strip_debug.cpp
     lib/transform/repcut.cpp
+    lib/transform/repcut_cost_model.cpp
 )
 
 add_library(wolvrix-lib SHARED ${WOLVRIX_LIB_SOURCES})
@@ -415,6 +417,11 @@ target_compile_definitions(emit-sv-storage-ports
 
 register_test_exe(emit-sv-storage-ports)
 
+add_executable(emit-sv-shift-low-bit tests/emit/test_emit_sv_shift_low_bit.cpp)
+target_link_libraries(emit-sv-shift-low-bit PRIVATE wolvrix-lib)
+target_compile_definitions(emit-sv-shift-low-bit PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")
+register_test_exe(emit-sv-shift-low-bit)
+
 add_executable(emit-sv-top-reachable
     tests/emit/test_emit_sv_top_reachable.cpp
 )
@@ -660,6 +667,14 @@ target_link_libraries(transform-memory-read-retime
 
 register_test_exe(transform-memory-read-retime)
 
+add_executable(transform-memory-write-coalesce
+    tests/transform/test_memory_write_coalesce.cpp
+)
+target_link_libraries(transform-memory-write-coalesce PRIVATE wolvrix-lib)
+target_compile_definitions(transform-memory-write-coalesce PRIVATE
+    WOLF_MEMORY_COALESCE_ARTIFACT_DIR="${CMAKE_CURRENT_BINARY_DIR}/artifacts/memory-write-coalesce")
+register_test_exe(transform-memory-write-coalesce)
+
 # transform: reg-to-mem
 add_executable(transform-reg-to-mem
     tests/transform/test_reg_to_mem_pass.cpp
@@ -700,6 +715,10 @@ target_compile_definitions(transform-repcut
 )
 
 register_test_exe(transform-repcut)
+
+add_executable(transform-repcut-cost-model tests/transform/test_repcut_cost_model.cpp)
+target_link_libraries(transform-repcut-cost-model PRIVATE wolvrix-lib)
+register_test_exe(transform-repcut-cost-model)
 
 add_executable(transform-repcut-partition-set
     tests/transform/test_repcut_partition_set.cpp

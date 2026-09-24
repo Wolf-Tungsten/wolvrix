@@ -281,6 +281,7 @@ namespace wolvrix::lib::transform
             std::size_t trueAnchors = 0;
             std::size_t trueMembers = 0;
             std::size_t skippedTrueCandidates = 0;
+            std::size_t profitabilityRejectedGroups = 0;
         };
 
         struct RegToMemProfile
@@ -315,6 +316,59 @@ namespace wolvrix::lib::transform
             bool verbose = false;
             bool branchNotInUpdate = false;
         };
+
+        struct PriorityWritePlan
+        {
+            std::size_t conflicts = 0;
+            std::size_t indexMismatches = 0;
+            std::size_t rankDistinct = 0;
+            std::size_t rankMin = 0;
+            std::size_t rankMax = 0;
+            bool rankValid = false;
+            bool orderedWrites = false;
+        };
+
+        PriorityWritePlan planPriorityWrites(const TrueMergeCandidate &candidate, bool enableOrderedWrites)
+        {
+            PriorityWritePlan plan;
+            const std::size_t writers = candidate.regulars.size();
+            plan.rankMin = writers;
+            std::vector<uint8_t> seenRanks(writers, 0);
+            for (std::size_t index = 0; index < writers; ++index)
+            {
+                const std::size_t rank = candidate.regulars[index].conflicts.size();
+                plan.conflicts += rank;
+                plan.indexMismatches += rank != index ? 1 : 0;
+                plan.rankMin = std::min(plan.rankMin, rank);
+                plan.rankMax = std::max(plan.rankMax, rank);
+                if (rank < seenRanks.size() && seenRanks[rank] == 0)
+                {
+                    seenRanks[rank] = 1;
+                    ++plan.rankDistinct;
+                }
+            }
+            plan.rankValid = plan.rankDistinct == writers &&
+                             plan.rankMin == 0 && plan.rankMax + 1 == writers;
+            plan.orderedWrites = enableOrderedWrites && writers > 1 && plan.rankValid;
+            return plan;
+        }
+
+        bool rejectForVerilatorProfitability(const GroupCandidate &group,
+                                             const TrueMergeCandidate &candidate,
+                                             const PriorityWritePlan &writePlan)
+        {
+            if (!group.anchors.empty() || writePlan.orderedWrites)
+            {
+                return false;
+            }
+            const std::size_t rows = group.elementCount;
+            const std::size_t writers = candidate.regulars.size();
+            // Compare without multiplying rows * writers, which can overflow size_t.
+            return writers > 0 &&
+                   (writePlan.conflicts / writers > rows ||
+                    (writePlan.conflicts / writers == rows &&
+                     writePlan.conflicts % writers != 0));
+        }
 
         bool shouldProfileGroupRow(const GroupProfileContext *groupProfile, std::size_t row, std::size_t rowCount)
         {
@@ -4145,36 +4199,8 @@ namespace wolvrix::lib::transform
                            " ms=" + std::to_string(ms) +
                            (extra.empty() ? "" : " " + extra));
             };
-            const std::size_t priorityConflictCount = std::accumulate(
-                candidate.regulars.begin(),
-                candidate.regulars.end(),
-                std::size_t{0},
-                [](std::size_t count, const RegularWriteFamily &regular) {
-                    return count + regular.conflicts.size();
-                });
-            std::size_t priorityIndexMismatches = 0;
-            std::size_t priorityRankDistinct = 0;
-            std::size_t priorityRankMin = candidate.regulars.size();
-            std::size_t priorityRankMax = 0;
-            std::vector<uint8_t> seenPriorityRanks(candidate.regulars.size(), 0);
-            for (std::size_t regularIndex = 0; regularIndex < candidate.regulars.size(); ++regularIndex)
-            {
-                const std::size_t priorityRank = candidate.regulars[regularIndex].conflicts.size();
-                priorityIndexMismatches += priorityRank != regularIndex ? 1 : 0;
-                priorityRankMin = std::min(priorityRankMin, priorityRank);
-                priorityRankMax = std::max(priorityRankMax, priorityRank);
-                if (priorityRank < seenPriorityRanks.size() && seenPriorityRanks[priorityRank] == 0)
-                {
-                    seenPriorityRanks[priorityRank] = 1;
-                    ++priorityRankDistinct;
-                }
-            }
-            const bool orderedRankValid = priorityRankDistinct == candidate.regulars.size() &&
-                                          priorityRankMin == 0 &&
-                                          priorityRankMax + 1 == candidate.regulars.size();
-            const bool orderedWrites = enableOrderedWrites &&
-                                       candidate.regulars.size() > 1 &&
-                                       orderedRankValid;
+            const PriorityWritePlan writePlan = planPriorityWrites(candidate, enableOrderedWrites);
+            const bool orderedWrites = writePlan.orderedWrites;
             if (groupProfile != nullptr && groupProfile->verbose)
             {
                 profileLog("group_detail graph_index=" + std::to_string(groupProfile->graphIndex) +
@@ -4184,12 +4210,12 @@ namespace wolvrix::lib::transform
                            " members=" + std::to_string(group.regSymbols.size()) +
                            " write_families=" + std::to_string(candidate.regulars.size()) +
                            " ordered_writes=" + std::to_string(orderedWrites ? 1 : 0) +
-                           " priority_conflicts=" + std::to_string(priorityConflictCount) +
-                           " priority_rank_min=" + std::to_string(priorityRankMin) +
-                           " priority_rank_max=" + std::to_string(priorityRankMax) +
-                           " priority_rank_distinct=" + std::to_string(priorityRankDistinct) +
-                           " priority_rank_valid=" + std::to_string(orderedRankValid ? 1 : 0) +
-                           " priority_index_mismatches=" + std::to_string(priorityIndexMismatches) +
+                           " priority_conflicts=" + std::to_string(writePlan.conflicts) +
+                           " priority_rank_min=" + std::to_string(writePlan.rankMin) +
+                           " priority_rank_max=" + std::to_string(writePlan.rankMax) +
+                           " priority_rank_distinct=" + std::to_string(writePlan.rankDistinct) +
+                           " priority_rank_valid=" + std::to_string(writePlan.rankValid ? 1 : 0) +
+                           " priority_index_mismatches=" + std::to_string(writePlan.indexMismatches) +
                            " reset=" + std::to_string(candidate.reset.has_value() ? 1 : 0) +
                            " packed_reset=" + std::to_string(candidate.reset && candidate.reset->packed ? 1 : 0));
             }
@@ -4854,6 +4880,7 @@ namespace wolvrix::lib::transform
             const std::size_t graphIntentCandidateGroups = groupedAnchors.candidateGroups;
             const std::size_t graphIntentConflictGroups = groupedAnchors.conflictGroups;
             std::size_t graphSkippedTrue = 0;
+            std::size_t graphProfitabilityRejected = 0;
             for (auto &group : groups)
             {
                 ++visitedGroups;
@@ -4899,6 +4926,35 @@ namespace wolvrix::lib::transform
                                                         &groupProfile);
                     if (trueCandidate)
                     {
+                        if (options_.profitabilityFilter == RegToMemProfitabilityPolicy::VerilatorV1)
+                        {
+                            const PriorityWritePlan writePlan = planPriorityWrites(
+                                *trueCandidate, options_.enableOrderedWrites);
+                            if (rejectForVerilatorProfitability(group, *trueCandidate, writePlan))
+                            {
+                                ++stats.profitabilityRejectedGroups;
+                                ++graphProfitabilityRejected;
+                                ++stats.skippedTrueCandidates;
+                                ++graphSkippedTrue;
+                                const std::size_t writers = trueCandidate->regulars.size();
+                                const std::size_t rowWriteBudget =
+                                    group.elementCount > std::numeric_limits<std::size_t>::max() / writers
+                                        ? std::numeric_limits<std::size_t>::max()
+                                        : group.elementCount * writers;
+                                const std::string detail =
+                                    "reg-to-mem: profitability_rejected reason=explicit_priority_conflicts" +
+                                    std::string(" graph=") + graph.symbol() +
+                                    " first_reg=" + group.regSymbols.front() +
+                                    " D=" + std::to_string(group.elementCount) +
+                                    " B=" + std::to_string(group.elementWidth) +
+                                    " W=" + std::to_string(writers) +
+                                    " P=" + std::to_string(writePlan.conflicts) +
+                                    " row_write_budget=" + std::to_string(rowWriteBudget);
+                                profileLog(detail);
+                                diags().info(std::string(kPassId), detail);
+                                continue;
+                            }
+                        }
                         stageStart = ProfileClock::now();
                         if (verboseGroup)
                         {
@@ -4994,6 +5050,7 @@ namespace wolvrix::lib::transform
                        " true_groups=" + std::to_string(graphTrueGroups) +
                        " edge_padded_true_groups=" + std::to_string(graphEdgePaddedTrueGroups) +
                        " true_skipped=" + std::to_string(graphSkippedTrue) +
+                       " profitability_rejected=" + std::to_string(graphProfitabilityRejected) +
                        " intent_groups=" + std::to_string(graphIntentGroups));
         }
 
@@ -5032,6 +5089,7 @@ namespace wolvrix::lib::transform
                          " true_anchors=" + std::to_string(stats.trueAnchors) +
                          " true_members=" + std::to_string(stats.trueMembers) +
                          " true_skipped=" + std::to_string(stats.skippedTrueCandidates) +
+                         " profitability_rejected=" + std::to_string(stats.profitabilityRejectedGroups) +
                          " intent_groups=" + std::to_string(stats.intentGroups) +
                          " intent_anchors=" + std::to_string(stats.intentAnchors) +
                          " intent_members=" + std::to_string(stats.intentMembers));

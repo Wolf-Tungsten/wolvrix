@@ -824,6 +824,42 @@ namespace wolvrix::lib::emit
             return true;
         }
 
+        std::optional<uint64_t> parseUnsignedShiftLiteral(std::string_view literal, int64_t width)
+        {
+            if (width <= 0 || width > slang::SVInt::MAX_BITS)
+            {
+                return std::nullopt;
+            }
+            std::string compact;
+            compact.reserve(literal.size());
+            for (const char ch : literal)
+            {
+                if (!std::isspace(static_cast<unsigned char>(ch)) && ch != '_')
+                {
+                    compact.push_back(ch);
+                }
+            }
+            if (compact.empty())
+            {
+                return std::nullopt;
+            }
+            try
+            {
+                slang::SVInt parsed = slang::SVInt::fromString(compact);
+                if (parsed.hasUnknown() || (parsed.isSigned() && parsed.isNegative()))
+                {
+                    return std::nullopt;
+                }
+                parsed = parsed.resize(static_cast<slang::bitwidth_t>(width));
+                parsed.setSigned(false);
+                return parsed.as<uint64_t>();
+            }
+            catch (const std::exception &)
+            {
+                return std::nullopt;
+            }
+        }
+
         std::string parenIfNeeded(std::string_view expr)
         {
             if (expr.empty() || isSimpleIdentifier(expr))
@@ -2633,6 +2669,130 @@ namespace wolvrix::lib::emit
                 return dpiDependsDense[idx] > 0;
             };
 
+            auto shiftedLowBitExpr = [&](const wolvrix::lib::grh::Operation &slice,
+                                         const ExprTools &exprTools) -> std::optional<std::string>
+            {
+                const auto operands = slice.operands();
+                const auto results = slice.results();
+                const auto start = getAttribute<int64_t>(*graph, slice, "sliceStart");
+                const auto end = getAttribute<int64_t>(*graph, slice, "sliceEnd");
+                if (operands.size() != 1 || results.size() != 1 || !start || !end ||
+                    *start != 0 || *end != 0 || graph->valueWidth(results[0]) != 1)
+                {
+                    return std::nullopt;
+                }
+                const auto shiftId = graph->getValue(operands[0]).definingOp();
+                if (!shiftId.valid())
+                {
+                    return std::nullopt;
+                }
+                const auto shift = graph->getOperation(shiftId);
+                const auto shiftOperands = shift.operands();
+                if (shift.kind() != wolvrix::lib::grh::OperationKind::kLShr || shiftOperands.size() != 2)
+                {
+                    return std::nullopt;
+                }
+                const auto data = shiftOperands[0];
+                const auto index = shiftOperands[1];
+                const int64_t width = graph->valueWidth(data);
+                if (width <= 64 || graph->valueWidth(operands[0]) != width ||
+                    graph->valueSigned(data) || graph->valueSigned(index) ||
+                    graph->valueType(data) != wolvrix::lib::grh::ValueType::Logic ||
+                    graph->valueType(index) != wolvrix::lib::grh::ValueType::Logic)
+                {
+                    return std::nullopt;
+                }
+                const std::string dataExpr = exprTools.valueExpr(data);
+                if (!isSimpleIdentifier(dataExpr))
+                {
+                    return std::nullopt;
+                }
+                // A logical shift returns zero out of range, unlike a bit select.
+                // Keep the complete index so unknown upper bits cannot wrap or disappear.
+                const std::string offset = "$unsigned(" + exprTools.valueExpr(index) + ")";
+                return "(" + offset + " >= 32'd" + std::to_string(width) + ") ? 1'b0 : " +
+                       dataExpr + "[" + offset + "]";
+            };
+
+            auto shiftedValueBitExpr = [&](wolvrix::lib::grh::ValueId shifted, int64_t bit,
+                                           const ExprTools &exprTools) -> std::optional<std::string>
+            {
+                const int64_t shiftedWidth = graph->valueWidth(shifted);
+                if (shiftedWidth <= 64 || bit < 0 || bit >= shiftedWidth)
+                {
+                    return std::nullopt;
+                }
+                const auto shiftId = graph->valueDef(shifted);
+                if (!shiftId.valid())
+                {
+                    return std::nullopt;
+                }
+                const auto shift = graph->getOperation(shiftId);
+                const auto shiftOperands = shift.operands();
+                if (shift.kind() != wolvrix::lib::grh::OperationKind::kShl ||
+                    shiftOperands.size() != 2)
+                {
+                    return std::nullopt;
+                }
+                const auto data = shiftOperands[0];
+                const int64_t width = graph->valueWidth(data);
+                if (width <= 0 || width > shiftedWidth ||
+                    graph->valueSigned(data) || graph->valueSigned(shifted) ||
+                    graph->valueSigned(shiftOperands[1]) ||
+                    graph->valueType(data) != wolvrix::lib::grh::ValueType::Logic ||
+                    graph->valueType(shifted) != wolvrix::lib::grh::ValueType::Logic ||
+                    graph->valueType(shiftOperands[1]) != wolvrix::lib::grh::ValueType::Logic)
+                {
+                    return std::nullopt;
+                }
+                const auto literal = constLiteralRawFor(shiftOperands[1]);
+                if (!literal)
+                {
+                    return std::nullopt;
+                }
+                const std::string dataExpr = exprTools.valueExpr(data);
+                if (!isSimpleIdentifier(dataExpr))
+                {
+                    return std::nullopt;
+                }
+                const auto amount = parseUnsignedShiftLiteral(*literal, graph->valueWidth(shiftOperands[1]));
+                if (!amount)
+                {
+                    return std::nullopt;
+                }
+                // kShl zero-extends the unsigned source before shifting. Never
+                // select outside the original result (an out-of-range select is X).
+                if (*amount > static_cast<uint64_t>(bit) ||
+                    static_cast<uint64_t>(bit) - *amount >= static_cast<uint64_t>(width))
+                {
+                    return "1'b0";
+                }
+                return width == 1 ? dataExpr :
+                    dataExpr + "[" + std::to_string(static_cast<uint64_t>(bit) - *amount) + "]";
+            };
+
+            auto shiftedConstBitExpr = [&](const wolvrix::lib::grh::Operation &slice,
+                                           const ExprTools &exprTools) -> std::optional<std::string>
+            {
+                const auto operands = slice.operands();
+                const auto results = slice.results();
+                const auto start = getAttribute<int64_t>(*graph, slice, "sliceStart");
+                const auto end = getAttribute<int64_t>(*graph, slice, "sliceEnd");
+                if (operands.size() != 1 || results.size() != 1 || !start || !end ||
+                    *start != *end || graph->valueWidth(results[0]) != 1)
+                {
+                    return std::nullopt;
+                }
+                // Explicit slices keep the narrower initial eligibility rule.
+                const auto shiftId = graph->valueDef(operands[0]);
+                if (!shiftId.valid() || graph->opOperands(shiftId).empty() ||
+                    graph->valueWidth(graph->opOperands(shiftId)[0]) != graph->valueWidth(operands[0]))
+                {
+                    return std::nullopt;
+                }
+                return shiftedValueBitExpr(operands[0], *start, exprTools);
+            };
+
             wolvrix::lib::grh::OperationId dpiInlineSink = wolvrix::lib::grh::OperationId::invalid();
             std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> dpiInlineResolving;
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> dpiInlineCache;
@@ -2913,6 +3073,16 @@ namespace wolvrix::lib::emit
                 }
                 case wolvrix::lib::grh::OperationKind::kSliceStatic:
                 {
+                    if (auto narrowed = shiftedConstBitExpr(defOp, inlineExpr))
+                    {
+                        expr = *narrowed;
+                        break;
+                    }
+                    if (auto narrowed = shiftedLowBitExpr(defOp, inlineExpr))
+                    {
+                        expr = *narrowed;
+                        break;
+                    }
                     if (!ops.empty())
                     {
                         auto sliceStart = getAttribute<int64_t>(*graph, defOp, "sliceStart");
@@ -4180,6 +4350,18 @@ namespace wolvrix::lib::emit
                         reportError("kSliceStatic missing sliceStart or sliceEnd", opContext);
                         break;
                     }
+                    if (auto narrowed = shiftedConstBitExpr(op, baseExpr))
+                    {
+                        addValueAssign(results[0], *narrowed, opId);
+                        ensureWireDecl(results[0]);
+                        break;
+                    }
+                    if (auto narrowed = shiftedLowBitExpr(op, baseExpr))
+                    {
+                        addValueAssign(results[0], *narrowed, opId);
+                        ensureWireDecl(results[0]);
+                        break;
+                    }
                     const int64_t operandWidth = graph->valueWidth(operands[0]);
                     std::ostringstream expr;
                     if (operandWidth == 1)
@@ -5050,14 +5232,103 @@ namespace wolvrix::lib::emit
                         }
                         else
                         {
-                            for (int64_t bit = 0; bit < memWidth; ++bit)
+                            auto appendBitWrite = [&](int64_t bit)
                             {
-                                if ((*maskBits)[static_cast<std::size_t>(bit)] != 0)
+                                std::string bitExpr = dataExpr + "[" + std::to_string(bit) + "]";
+                                // Preserve each NBA, its mask and its ordering. Only
+                                // avoid materializing a shifted wide RHS per written bit.
+                                if (dataWidth == memWidth && !valueDependsOnDpi(data) &&
+                                    dpiDrivenStateOps.find(opId) == dpiDrivenStateOps.end())
                                 {
-                                    appendIndented(stmt, baseIndent,
-                                                   memSymbol + "[" + addrExpr + "][" + std::to_string(bit) + "] <= " +
-                                                       dataExpr + "[" + std::to_string(bit) + "];");
+                                    if (auto narrowed = shiftedValueBitExpr(data, bit, baseExpr))
+                                    {
+                                        bitExpr = *narrowed;
+                                    }
                                 }
+                                appendIndented(stmt, baseIndent,
+                                               memSymbol + "[" + addrExpr + "][" + std::to_string(bit) + "] <= " +
+                                                   bitExpr + ";");
+                            };
+                            for (int64_t bit = 0; bit < memWidth;)
+                            {
+                                if ((*maskBits)[static_cast<std::size_t>(bit)] == 0)
+                                {
+                                    ++bit;
+                                    continue;
+                                }
+                                const int64_t runStart = bit;
+                                while (bit + 1 < memWidth &&
+                                       (*maskBits)[static_cast<std::size_t>(bit + 1)] != 0)
+                                {
+                                    ++bit;
+                                }
+                                const int64_t runEnd = bit;
+                                bool emittedPartSelect = false;
+                                if (runEnd > runStart && dataWidth == memWidth &&
+                                    !valueDependsOnDpi(data) &&
+                                    dpiDrivenStateOps.find(opId) == dpiDrivenStateOps.end())
+                                {
+                                    // A constant shift preserves contiguous source bits only
+                                    // when the whole run stays within the source value.
+                                    const auto shiftId = graph->valueDef(data);
+                                    if (shiftId.valid())
+                                    {
+                                        const auto shift = graph->getOperation(shiftId);
+                                        const auto shiftOperands = shift.operands();
+                                        if (shift.kind() == wolvrix::lib::grh::OperationKind::kShl &&
+                                            shiftOperands.size() == 2 &&
+                                            graph->valueWidth(shiftOperands[0]) <= dataWidth &&
+                                            !graph->valueSigned(shiftOperands[0]) &&
+                                            !graph->valueSigned(shiftOperands[1]) &&
+                                            graph->valueType(shiftOperands[0]) == wolvrix::lib::grh::ValueType::Logic &&
+                                            graph->valueType(shiftOperands[1]) == wolvrix::lib::grh::ValueType::Logic)
+                                        {
+                                            const auto literal = constLiteralRawFor(shiftOperands[1]);
+                                            const auto amount = literal ?
+                                                parseUnsignedShiftLiteral(*literal, graph->valueWidth(shiftOperands[1])) :
+                                                std::nullopt;
+                                            const int64_t sourceWidth = graph->valueWidth(shiftOperands[0]);
+                                            if (amount && *amount <= static_cast<uint64_t>(runStart) &&
+                                                static_cast<uint64_t>(runEnd) - *amount < static_cast<uint64_t>(sourceWidth))
+                                            {
+                                                const std::string sourceExpr = baseExpr.valueExpr(shiftOperands[0]);
+                                                if (isSimpleIdentifier(sourceExpr))
+                                                {
+                                                    const int64_t sourceStart = runStart - static_cast<int64_t>(*amount);
+                                                    const int64_t sourceEnd = runEnd - static_cast<int64_t>(*amount);
+                                                    appendIndented(stmt, baseIndent,
+                                                                   memSymbol + "[" + addrExpr + "][" +
+                                                                       std::to_string(runEnd) + ":" +
+                                                                       std::to_string(runStart) + "] <= " + sourceExpr + "[" +
+                                                                       std::to_string(sourceEnd) + ":" +
+                                                                       std::to_string(sourceStart) + "];" );
+                                                    emittedPartSelect = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // A plain full-width identifier is also safe to
+                                    // coalesce, even when it is not a shift result.
+                                    // Keep complex expressions on the old bitwise path.
+                                    if (!emittedPartSelect && isSimpleIdentifier(dataExpr))
+                                    {
+                                        appendIndented(stmt, baseIndent,
+                                                       memSymbol + "[" + addrExpr + "][" +
+                                                           std::to_string(runEnd) + ":" +
+                                                           std::to_string(runStart) + "] <= " + dataExpr + "[" +
+                                                           std::to_string(runEnd) + ":" +
+                                                           std::to_string(runStart) + "];" );
+                                        emittedPartSelect = true;
+                                    }
+                                }
+                                if (!emittedPartSelect)
+                                {
+                                    for (int64_t selectedBit = runStart; selectedBit <= runEnd; ++selectedBit)
+                                    {
+                                        appendBitWrite(selectedBit);
+                                    }
+                                }
+                                ++bit;
                             }
                         }
                         if (guardUpdate)

@@ -17,6 +17,7 @@
 #include <optional>
 #include <sstream>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -2943,204 +2944,17 @@ namespace wolvrix::lib::transform
             return maxWidth;
         }
 
-        int32_t getOperandWidth(const wolvrix::lib::grh::Graph &graph,
-                                const wolvrix::lib::grh::Operation &op,
-                                size_t operandIndex)
-        {
-            if (operandIndex >= op.operands().size())
-            {
-                return 1;
-            }
-            return safeValueWidth(graph, op.operands()[operandIndex]);
-        }
-
         uint32_t calculateNodeWeight(const wolvrix::lib::grh::Graph &graph,
                                      const PhaseAData &phaseA,
                                      NodeId node,
-                                     std::vector<uint32_t> &nodeWeights)
+                                     std::vector<uint32_t> &nodeWeights,
+                                     RepcutCostModel costModel)
         {
             if (node >= phaseA.nodeToOp.size())
-            {
                 return 1;
-            }
-            if (nodeWeights[node] != std::numeric_limits<uint32_t>::max())
-            {
-                return nodeWeights[node];
-            }
-
-            const wolvrix::lib::grh::Operation op = graph.getOperation(phaseA.nodeToOp[node]);
-            uint32_t weight = 1;
-            switch (op.kind())
-            {
-            case wolvrix::lib::grh::OperationKind::kConstant:
-                weight = 1;
-                break;
-            case wolvrix::lib::grh::OperationKind::kAdd:
-            case wolvrix::lib::grh::OperationKind::kSub:
-                weight = 2;
-                break;
-            case wolvrix::lib::grh::OperationKind::kMul:
-                weight = 4;
-                break;
-            case wolvrix::lib::grh::OperationKind::kDiv:
-            case wolvrix::lib::grh::OperationKind::kMod:
-                weight = 6;
-                break;
-            case wolvrix::lib::grh::OperationKind::kEq:
-            case wolvrix::lib::grh::OperationKind::kNe:
-            case wolvrix::lib::grh::OperationKind::kCaseEq:
-            case wolvrix::lib::grh::OperationKind::kCaseNe:
-            case wolvrix::lib::grh::OperationKind::kWildcardEq:
-            case wolvrix::lib::grh::OperationKind::kWildcardNe:
-            case wolvrix::lib::grh::OperationKind::kLt:
-            case wolvrix::lib::grh::OperationKind::kLe:
-            case wolvrix::lib::grh::OperationKind::kGt:
-            case wolvrix::lib::grh::OperationKind::kGe:
-                weight = 2;
-                break;
-            case wolvrix::lib::grh::OperationKind::kShl:
-            case wolvrix::lib::grh::OperationKind::kLShr:
-            case wolvrix::lib::grh::OperationKind::kAShr:
-                weight = 2;
-                break;
-            case wolvrix::lib::grh::OperationKind::kAnd:
-            case wolvrix::lib::grh::OperationKind::kOr:
-            case wolvrix::lib::grh::OperationKind::kXor:
-            case wolvrix::lib::grh::OperationKind::kXnor:
-            case wolvrix::lib::grh::OperationKind::kNot:
-            case wolvrix::lib::grh::OperationKind::kLogicAnd:
-            case wolvrix::lib::grh::OperationKind::kLogicOr:
-            case wolvrix::lib::grh::OperationKind::kLogicNot:
-            case wolvrix::lib::grh::OperationKind::kReduceAnd:
-            case wolvrix::lib::grh::OperationKind::kReduceOr:
-            case wolvrix::lib::grh::OperationKind::kReduceXor:
-            case wolvrix::lib::grh::OperationKind::kReduceNor:
-            case wolvrix::lib::grh::OperationKind::kReduceNand:
-            case wolvrix::lib::grh::OperationKind::kReduceXnor:
-                weight = (static_cast<uint32_t>(getResultWidth(graph, op)) + 63u) / 64u;
-                weight = std::max(weight, 1u);
-                break;
-            case wolvrix::lib::grh::OperationKind::kMux:
-            {
-                const uint32_t nWords = (static_cast<uint32_t>(getResultWidth(graph, op)) + 63u) / 64u;
-                weight = std::max(1u, nWords * 6u);
-                break;
-            }
-            case wolvrix::lib::grh::OperationKind::kConcat:
-                weight = std::max<uint32_t>(1u, static_cast<uint32_t>(op.operands().size()));
-                break;
-            case wolvrix::lib::grh::OperationKind::kReplicate:
-                weight = 2;
-                break;
-            case wolvrix::lib::grh::OperationKind::kSliceStatic:
-            case wolvrix::lib::grh::OperationKind::kSliceDynamic:
-            case wolvrix::lib::grh::OperationKind::kSliceArray:
-                weight = 1;
-                break;
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-                weight = 4;
-                break;
-            case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
-            case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            {
-                const uint32_t nWords = (static_cast<uint32_t>(getOperandWidth(graph, op, 1)) + 63u) / 64u;
-                weight = std::max(2u, nWords + 1u);
-                break;
-            }
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            {
-                const uint32_t wrEnWords = (static_cast<uint32_t>(getOperandWidth(graph, op, 0)) + 63u) / 64u;
-                const uint32_t wrDataWords = (static_cast<uint32_t>(getOperandWidth(graph, op, 1)) + 63u) / 64u;
-                weight = 1u + std::max(1u, wrEnWords) + std::max(1u, wrDataWords);
-                break;
-            }
-            default:
-            {
-                if (isCombOp(op))
-                {
-                    const uint32_t widthScaled = (static_cast<uint32_t>(getMaxOperandWidth(graph, op)) + 63u) / 64u;
-                    weight = std::max(1u, widthScaled);
-                }
-                else
-                {
-                    weight = 1;
-                }
-                break;
-            }
-            }
-
-            auto getResultFanout = [&](const wolvrix::lib::grh::Operation &curOp) -> std::size_t {
-                std::size_t totalFanout = 0;
-                for (const auto resultValue : curOp.results())
-                {
-                    if (!resultValue.valid())
-                    {
-                        continue;
-                    }
-                    totalFanout += graph.getValue(resultValue).users().size();
-                }
-                return totalFanout;
-            };
-
-            auto isWideLogicSensitiveKind = [](wolvrix::lib::grh::OperationKind kind) noexcept {
-                switch (kind)
-                {
-                case wolvrix::lib::grh::OperationKind::kEq:
-                case wolvrix::lib::grh::OperationKind::kNe:
-                case wolvrix::lib::grh::OperationKind::kCaseEq:
-                case wolvrix::lib::grh::OperationKind::kCaseNe:
-                case wolvrix::lib::grh::OperationKind::kWildcardEq:
-                case wolvrix::lib::grh::OperationKind::kWildcardNe:
-                case wolvrix::lib::grh::OperationKind::kLt:
-                case wolvrix::lib::grh::OperationKind::kLe:
-                case wolvrix::lib::grh::OperationKind::kGt:
-                case wolvrix::lib::grh::OperationKind::kGe:
-                case wolvrix::lib::grh::OperationKind::kAnd:
-                case wolvrix::lib::grh::OperationKind::kOr:
-                case wolvrix::lib::grh::OperationKind::kXor:
-                case wolvrix::lib::grh::OperationKind::kXnor:
-                case wolvrix::lib::grh::OperationKind::kNot:
-                case wolvrix::lib::grh::OperationKind::kLogicAnd:
-                case wolvrix::lib::grh::OperationKind::kLogicOr:
-                case wolvrix::lib::grh::OperationKind::kLogicNot:
-                case wolvrix::lib::grh::OperationKind::kReduceAnd:
-                case wolvrix::lib::grh::OperationKind::kReduceOr:
-                case wolvrix::lib::grh::OperationKind::kReduceXor:
-                case wolvrix::lib::grh::OperationKind::kReduceNor:
-                case wolvrix::lib::grh::OperationKind::kReduceNand:
-                case wolvrix::lib::grh::OperationKind::kReduceXnor:
-                case wolvrix::lib::grh::OperationKind::kMux:
-                    return true;
-                default:
-                    return false;
-                }
-            };
-
-            const int32_t clampedResultWidth = std::max(1, getResultWidth(graph, op));
-            const std::size_t resultWords = static_cast<std::size_t>((clampedResultWidth + 63) / 64);
-            double fanoutScale = 1.0 + 0.12 * std::log2(1.0 + static_cast<double>(getResultFanout(op)));
-            double widthScale = 1.0;
-            if (resultWords == 2)
-            {
-                widthScale = 1.15;
-            }
-            else if (resultWords >= 3 && resultWords <= 4)
-            {
-                widthScale = 1.30;
-            }
-            else if (resultWords > 4)
-            {
-                widthScale = 1.50;
-            }
-            const double specialScale = isWideLogicSensitiveKind(op.kind()) ? widthScale : 1.0;
-            const double scaledWeight =
-                static_cast<double>(std::max(1u, weight)) * std::max(1.0, fanoutScale) * std::max(1.0, specialScale);
-
-            const std::size_t roundedWeight =
-                (scaledWeight <= 1.0) ? 1u : static_cast<std::size_t>(std::llround(scaledWeight));
-            nodeWeights[node] = roundedWeight > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())
-                                    ? std::numeric_limits<uint32_t>::max()
-                                    : static_cast<uint32_t>(roundedWeight);
+            if (nodeWeights[node] == std::numeric_limits<uint32_t>::max())
+                nodeWeights[node] = estimateRepcutOperationCost(
+                    graph, graph.getOperation(phaseA.nodeToOp[node]), costModel).weight;
             return nodeWeights[node];
         }
 
@@ -3149,7 +2963,8 @@ namespace wolvrix::lib::transform
                                       const PhaseBData &phaseB,
                                       PieceId pid,
                                       std::vector<uint32_t> &nodeWeights,
-                                      std::vector<uint32_t> &pieceWeights)
+                                      std::vector<uint32_t> &pieceWeights,
+                                      RepcutCostModel costModel)
         {
             if (pid >= phaseB.pieces.size())
             {
@@ -3194,12 +3009,12 @@ namespace wolvrix::lib::transform
             }
 
             std::unordered_set<NodeId> visited;
-            std::function<uint32_t(NodeId)> stmtWeight = [&](NodeId node) -> uint32_t {
+            std::function<uint64_t(NodeId)> stmtWeight = [&](NodeId node) -> uint64_t {
                 if (!visited.insert(node).second)
                 {
                     return 0;
                 }
-                uint32_t w = calculateNodeWeight(graph, phaseA, node, nodeWeights);
+                uint64_t w = calculateNodeWeight(graph, phaseA, node, nodeWeights, costModel);
                 for (const NodeId pred : phaseA.inNeighbors[node])
                 {
                     if (piece.find(pred) != piece.end())
@@ -3210,13 +3025,21 @@ namespace wolvrix::lib::transform
                 return w;
             };
 
-            uint32_t totalWeight = 0;
+            uint64_t totalWeight = 0;
             for (const NodeId sink : pieceSinks)
             {
                 totalWeight += stmtWeight(sink);
             }
 
-            pieceWeights[pid] = std::max(1u, totalWeight);
+            if (costModel == RepcutCostModel::kLegacy)
+            {
+                // Preserve legacy uint32 accumulation, including its historical wraparound.
+                pieceWeights[pid] = std::max(1u, static_cast<uint32_t>(totalWeight));
+                return pieceWeights[pid];
+            }
+            if (totalWeight >= std::numeric_limits<uint32_t>::max())
+                throw std::overflow_error("repcut piece cost exceeds uint32 cache range");
+            pieceWeights[pid] = static_cast<uint32_t>(std::max<uint64_t>(1u, totalWeight));
             return pieceWeights[pid];
         }
 
@@ -3469,6 +3292,7 @@ namespace wolvrix::lib::transform
             std::size_t resultWordCount = 0;
             std::size_t fanoutCount = 0;
             std::size_t estimatedNodeWeightSum = 0;
+            std::size_t legacyFallbackOpCount = 0;
             std::size_t hyperNodeWeight = 0;
             uint64_t exactReferencedClosureWeight = 0;
             std::size_t crossInValueCount = 0;
@@ -3496,10 +3320,12 @@ namespace wolvrix::lib::transform
             const std::vector<std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash>> &partitionOps,
             const std::vector<CrossPartitionValue> &crossValues,
             const std::vector<std::size_t> &partitionWeights,
-            const std::vector<uint64_t> &exactReferencedClosureWeights)
+            const std::vector<uint64_t> &exactReferencedClosureWeights,
+            RepcutCostModel costModel)
         {
             std::vector<PartitionStaticFeatureRecord> records(partitionOps.size());
             std::vector<uint32_t> nodeWeights(phaseA.nodeToOp.size(), std::numeric_limits<uint32_t>::max());
+            std::vector<bool> legacyFallback(phaseA.nodeToOp.size(), false);
 
             for (std::size_t partId = 0; partId < partitionOps.size(); ++partId)
             {
@@ -3564,8 +3390,15 @@ namespace wolvrix::lib::transform
                     if (nodeIt != phaseA.opToNode.end())
                     {
                         ++record.phaseANodeCount;
-                        record.estimatedNodeWeightSum +=
-                            calculateNodeWeight(graph, phaseA, nodeIt->second, nodeWeights);
+                        const NodeId node = nodeIt->second;
+                        if (nodeWeights[node] == std::numeric_limits<uint32_t>::max())
+                        {
+                            const auto cost = estimateRepcutOperationCost(graph, op, costModel);
+                            nodeWeights[node] = cost.weight;
+                            legacyFallback[node] = cost.usedLegacyFallback;
+                        }
+                        record.estimatedNodeWeightSum += nodeWeights[node];
+                        record.legacyFallbackOpCount += legacyFallback[node] ? 1u : 0u;
                     }
                     else
                     {
@@ -3604,6 +3437,7 @@ namespace wolvrix::lib::transform
                                    const PhaseAData &phaseA,
                                    const PhaseBData &phaseB,
                                    RepcutWeightMode weightMode,
+                                   RepcutCostModel costModel,
                                    std::vector<uint32_t> &nodeWeights,
                                    std::vector<uint32_t> &pieceWeights,
                                    std::vector<uint32_t> &edgeProxyWeights,
@@ -3618,7 +3452,7 @@ namespace wolvrix::lib::transform
 
             for (PieceId pid = 0; pid < phaseB.pieces.size(); ++pid)
             {
-                (void)calculatePieceWeight(graph, phaseA, phaseB, pid, nodeWeights, pieceWeights);
+                (void)calculatePieceWeight(graph, phaseA, phaseB, pid, nodeWeights, pieceWeights, costModel);
             }
 
             std::vector<PieceCommStats> pieceCommStats(phaseB.pieces.size());
@@ -4673,6 +4507,12 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (repcutCostModelName(options_.costModel) == "unknown")
+        {
+            error("repcut has an unknown cost model");
+            result.failed = true;
+            return result;
+        }
         std::string resolveError;
         const std::optional<std::string> targetGraphName = resolveTargetGraphName(design(), options_.path, resolveError);
         if (!targetGraphName)
@@ -4701,6 +4541,7 @@ namespace wolvrix::lib::transform
                  << " mtkahypar_preset=" << options_.mtKaHyParPreset
                  << " mtkahypar_threads=" << options_.mtKaHyParThreads
                  << " weight_mode=" << repcutWeightModeName(options_.weightMode)
+                 << " cost_model=" << repcutCostModelName(options_.costModel)
                  << " mem_cone_union=true"
                  << " keep_intermediate=" << (options_.keepIntermediateFiles ? "true" : "false");
             logInfo(boot.str());
@@ -4902,6 +4743,7 @@ namespace wolvrix::lib::transform
             data,
             phaseB,
             options_.weightMode,
+            options_.costModel,
             nodeWeights,
             pieceWeights,
             edgeProxyWeights,
@@ -5009,6 +4851,7 @@ namespace wolvrix::lib::transform
         std::ostringstream phaseCSummary;
         phaseCSummary << "repcut phase-c: graph=" << graph->symbol()
                       << " weight_mode=" << repcutWeightModeName(options_.weightMode)
+                      << " cost_model=" << repcutCostModelName(options_.costModel)
                       << " weighted_nodes=" << weightedNodeCount
                       << " total_node_weight=" << totalNodeWeight
                       << " max_node_weight=" << maxNodeWeight
@@ -5674,7 +5517,8 @@ namespace wolvrix::lib::transform
                 partitionOps,
                 crossValues,
                 partitionWeights,
-                closureRefineStats.after.partitionLoads);
+                closureRefineStats.after.partitionLoads,
+                options_.costModel);
 
         const auto phaseERebuildStart = std::chrono::steady_clock::now();
         logInfo("repcut phase-e rebuild: begin graph=" + graph->symbol() +
@@ -7336,6 +7180,7 @@ namespace wolvrix::lib::transform
               << "\"pass\":\"repcut\""
               << ",\"graph\":\"" << escapeJson(topName) << "\""
               << ",\"weight_mode\":\"" << repcutWeightModeName(options_.weightMode) << "\""
+              << ",\"cost_model\":\"" << repcutCostModelName(options_.costModel) << "\""
               << ",\"partition_count_requested\":" << options_.partitionCount
               << ",\"partition_count_observed\":" << partInfos.size()
               << ",\"asc_count\":" << phaseB.ascs.size()
@@ -7501,6 +7346,7 @@ namespace wolvrix::lib::transform
                   << ",\"result_word_count\":" << record.resultWordCount
                   << ",\"fanout_count\":" << record.fanoutCount
                   << ",\"estimated_node_weight_sum\":" << record.estimatedNodeWeightSum
+                  << ",\"cost_model_legacy_fallback_op_count\":" << record.legacyFallbackOpCount
                   << ",\"hyper_partition_weight\":" << record.hyperNodeWeight
                   << ",\"exact_referenced_closure_weight\":" << record.exactReferencedClosureWeight
                   << ",\"cross_in_value_count\":" << record.crossInValueCount

@@ -2,6 +2,7 @@
 #define WOLVRIX_TRANSFORM_REPCUT_HPP
 
 #include "core/transform.hpp"
+#include "transform/repcut_cost_model.hpp"
 
 #include <cstddef>
 #include <string>
@@ -25,6 +26,7 @@ namespace wolvrix::lib::transform
         std::string mtKaHyParPreset = "deterministic-quality";
         std::size_t mtKaHyParThreads = 0;
         RepcutWeightMode weightMode = RepcutWeightMode::kBaseline;
+        RepcutCostModel costModel = RepcutCostModel::kLegacy;
         bool keepIntermediateFiles = false;
     };
 

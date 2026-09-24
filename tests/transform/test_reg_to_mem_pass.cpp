@@ -192,7 +192,8 @@ namespace
     int runPass(Design &design,
                 bool trueMerge,
                 bool orderedWrites = false,
-                bool decodedWriteStorage = true)
+                bool decodedWriteStorage = true,
+                RegToMemProfitabilityPolicy profitabilityFilter = RegToMemProfitabilityPolicy::None)
     {
         PassManager manager;
         RegToMemOptions options;
@@ -200,6 +201,7 @@ namespace
         options.enableTrueMerge = trueMerge;
         options.enableOrderedWrites = orderedWrites;
         options.enableDecodedWriteStorage = decodedWriteStorage;
+        options.profitabilityFilter = profitabilityFilter;
         manager.addPass(std::make_unique<RegToMemPass>(options));
         PassDiagnostics diags;
         const PassManagerResult result = manager.run(design, diags);
@@ -223,6 +225,12 @@ namespace
     int runOrderedTruePass(Design &design)
     {
         return runPass(design, true, true);
+    }
+
+    int runVerilatorProfitabilityPass(Design &design, bool orderedWrites = false)
+    {
+        return runPass(design, true, orderedWrites, true,
+                       RegToMemProfitabilityPolicy::VerilatorV1);
     }
 
     int runCombLanePackAndSimplify(Design &design)
@@ -1262,15 +1270,19 @@ namespace
         return design;
     }
 
-    Design buildWriteOnlyDecodedStorageDesign(std::size_t writers = 65)
+    Design buildWriteOnlyDecodedStorageDesign(std::size_t writers = 65,
+                                              std::size_t rows = 4)
     {
         Design design;
         Graph &graph = design.createGraph("top");
         design.markAsTop(graph.symbol());
 
         constexpr int32_t width = 8;
-        constexpr int32_t addrWidth = 3;
-        constexpr std::size_t rows = 4;
+        int32_t addrWidth = 1;
+        while ((std::size_t{1} << addrWidth) <= rows)
+        {
+            ++addrWidth;
+        }
         std::vector<std::string> regs;
         regs.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row)
@@ -1339,7 +1351,7 @@ namespace
                                                  "write_only_row_" + rowSuffix + "_op",
                                                  "write_only_row_" + rowSuffix,
                                                  addrWidth,
-                                                 "3'd" + rowSuffix);
+                                                 std::to_string(addrWidth) + "'d" + rowSuffix);
             std::vector<ValueId> guards;
             guards.reserve(writers);
             ValueId priorityAllowed = notReset;
@@ -3061,6 +3073,105 @@ namespace
         }
         return 0;
     }
+
+    int testVerilatorProfitabilityRejectsHighConflictStorage()
+    {
+        Design design = buildWriteOnlyDecodedStorageDesign();
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runVerilatorProfitabilityPass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 0 ||
+            countKind(graph, OperationKind::kRegister) != 4 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 4 ||
+            countKind(graph, OperationKind::kRegisterReadPort) != 4)
+        {
+            return fail("Verilator profitability filter changed rejected scalar storage");
+        }
+        for (OperationId regOpId : opsOfKind(graph, OperationKind::kRegister))
+        {
+            if (hasIntentGroup(graph, regOpId))
+            {
+                return fail("Verilator profitability rejection leaked intent annotation");
+            }
+        }
+        return 0;
+    }
+
+    int testVerilatorProfitabilityKeepsBoundaryAndLowConflictStorage()
+    {
+        // 65 writers have 2080 ordered pair conflicts; 32 rows make P == D * W.
+        Design boundary = buildWriteOnlyDecodedStorageDesign(65, 32);
+        Graph &boundaryGraph = *boundary.findGraph("top");
+        if (const int rc = runVerilatorProfitabilityPass(boundary); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(boundaryGraph, OperationKind::kMemory) != 1 ||
+            countKind(boundaryGraph, OperationKind::kRegister) != 0)
+        {
+            return fail("Verilator profitability filter rejected the P == D * W boundary");
+        }
+
+        Design lowConflict = buildTrueStorageOnlyDesign(true);
+        Graph &lowConflictGraph = *lowConflict.findGraph("top");
+        if (const int rc = runVerilatorProfitabilityPass(lowConflict); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(lowConflictGraph, OperationKind::kMemory) != 1)
+        {
+            return fail("Verilator profitability filter rejected conflict-free storage");
+        }
+        return 0;
+    }
+
+    int testVerilatorProfitabilityKeepsOrderedWrites()
+    {
+        Design design = buildWriteOnlyDecodedStorageDesign();
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runVerilatorProfitabilityPass(design, true); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 65)
+        {
+            return fail("Verilator profitability filter rejected ordered-write lowering");
+        }
+        return 0;
+    }
+
+    int testVerilatorProfitabilityOptionParsing()
+    {
+        const std::array<std::string_view, 2> enabled{
+            "-profitability-filter", "verilator-v1"};
+        const std::array<std::string_view, 2> disabled{
+            "-profitability-filter", "none"};
+        const std::array<std::string_view, 2> invalid{
+            "-profitability-filter", "unknown"};
+        const std::array<std::string_view, 1> missing{"-profitability-filter"};
+        std::string error;
+        if (!makePass("reg-to-mem", enabled, error) ||
+            !makePass("reg-to-mem", disabled, error) ||
+            !makePass("reg-to-mem", {}, error))
+        {
+            return fail("valid profitability option was not accepted");
+        }
+        error.clear();
+        if (makePass("reg-to-mem", invalid, error) || error.empty())
+        {
+            return fail("unknown profitability policy was accepted");
+        }
+        error.clear();
+        if (makePass("reg-to-mem", missing, error) || error.empty())
+        {
+            return fail("missing profitability policy was accepted");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -3200,6 +3311,22 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeWriteOnlyDecodedStorageOrderedWrites(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testVerilatorProfitabilityRejectsHighConflictStorage(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testVerilatorProfitabilityKeepsBoundaryAndLowConflictStorage(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testVerilatorProfitabilityKeepsOrderedWrites(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testVerilatorProfitabilityOptionParsing(); rc != 0)
         {
             return rc;
         }

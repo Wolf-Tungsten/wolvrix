@@ -633,7 +633,11 @@ namespace wolvrix::lib::grhsim
                 if (schedule.quiescenceProjection[bit]) projectionWords[bit / 64] |= std::uint64_t(1) << (bit % 64);
             writer.value(static_cast<std::uint64_t>(schedule.quiescenceProjection.size())); writer.startArray();
             for (const auto word : projectionWords) writer.value(word);
-            writer.endArray(); writer.endArray();
+            writer.endArray();
+            // Optional trailing field: only written when set, so flag-off
+            // checkpoints stay byte-compatible with the pre-NO00014 schema.
+            if (schedule.demonitorRedundant) writer.value(static_cast<std::uint64_t>(1));
+            writer.endArray();
         }
 
         void writeCpuMapping(StreamWriter &writer, const CpuBackendMapping &cpu)
@@ -839,6 +843,7 @@ namespace wolvrix::lib::grhsim
                 for (std::size_t i = 0; i < 64 && bit < projectionBits; ++i, ++bit)
                     if ((word >> i) & 1) schedule.quiescenceProjection[bit] = true;
             }
+            if (reader.comma()) schedule.demonitorRedundant = reader.unsignedInteger() != 0;
             reader.endArray();
             return schedule;
         }

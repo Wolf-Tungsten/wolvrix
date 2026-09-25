@@ -464,6 +464,11 @@ namespace wolvrix::lib::grhsim
         std::vector<PartitionId> roundSeeds;
         std::vector<CpuInputShadow> inputShadows;
         uint64_t inputShadowBytes = 0;
+        // Optional for old checkpoints. NO00014: when true, computeSupernodeFanout
+        // has been post-processed by the redundant de-monitor rule inside
+        // buildSchedule (activation-covered rows removed; writes/stores stay).
+        // Kept as a plan flag so verifyCpuSchedule's rebuild reproduces the plan.
+        bool demonitorRedundant = false;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 

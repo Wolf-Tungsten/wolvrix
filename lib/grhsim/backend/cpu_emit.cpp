@@ -564,7 +564,7 @@ namespace wolvrix::lib::grhsim
                     "cpu_stage_cell", "cpu_write_cell", "cpu_stage_bytes_overwrite", "cpu_memory_readers", "cpu_read_offsets", "cpu_pflags", "cpu_armed", "cpu_consumed",
                     "cpu_rword", "cpu_rchanged", "cpu_rnext", "cpu_fp_disabled_"};
                 if (dynamicStats_)
-                    for (const auto *name : {"cpu_dyn_wr", "cpu_dyn_ch", "cpu_dyn_silent", "cpu_dyn_sn_act", "cpu_dyn_sn_body",
+                    for (const auto *name : {"cpu_dyn_wr", "cpu_dyn_ch", "cpu_dyn_silent", "cpu_dyn_vw", "cpu_dyn_sn_act", "cpu_dyn_sn_body",
                                              "cpu_dyn_sn_grp", "cpu_dyn_sn_chg", "cpu_dyn_cm_ent", "cpu_dyn_grp_pub", "cpu_dyn_grp_fire",
                                              "cpu_dyn_port_eval", "cpu_dyn_port_fire", "cpu_dyn_in_chk", "cpu_dyn_in_chg", "cpu_dyn_pub_calls",
                                              "cpu_dyn_pub_pending", "cpu_dyn_pub_changes", "cpu_dyn_cm_stable", "cpu_dyn_cm_inactive",
@@ -4354,6 +4354,9 @@ namespace wolvrix::lib::grhsim
                 // are available at every use, with no later change to publish.
                 if (staticScalars_.contains(result.index)) return;
                 if (readAliases_[result.index]) return;
+                // NO00012 per-value change counter (dynamicStats only): packs
+                // (writes<<32)|changes for this result at each detect site.
+                const std::string dynVw = dynamicStats_ ? "cpu_dyn_vw[" + std::to_string(result.index) + "]" : std::string();
                 if (const auto read = memoryReadIds_[op.id.index])
                     out << "cpu_read_offsets[" << read - 1 << "]=" << object(model_.objectRefs(op)[0]).offset
                         << "+static_cast<std::size_t>(" << value(model_.operands(op)[0]) << ")*" << storageBytes(resultType) << ";\n";
@@ -4388,7 +4391,7 @@ namespace wolvrix::lib::grhsim
                                 {
                                     const auto kind = dynKind(op);
                                     out << "{const bool cpu_dyn_c=(" << value(result) << "!=cpu_concat);++cpu_dyn_wr[" << kind
-                                        << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;" << changed << "|=cpu_dyn_c;"
+                                        << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;" << changed << "|=cpu_dyn_c;"
                                         << value(result) << "=cpu_concat;}\n";
                                 }
                                 else out << changed << "|=(" << value(result) << "!=cpu_concat);" << value(result) << "=cpu_concat;\n";
@@ -4396,8 +4399,8 @@ namespace wolvrix::lib::grhsim
                             else if (dynamicStats_)
                             {
                                 const auto kind = dynKind(op);
-                                out << "++cpu_dyn_wr[" << kind << "];if(" << value(result) << "!=cpu_concat){++cpu_dyn_ch[" << kind
-                                    << "];" << value(result) << "=cpu_concat;\n";
+                                out << "++cpu_dyn_wr[" << kind << "];" << dynVw << "+=UINT64_C(4294967296);if(" << value(result) << "!=cpu_concat){++cpu_dyn_ch[" << kind
+                                    << "];++" << dynVw << ";" << value(result) << "=cpu_concat;\n";
                                 activateChanged(out, *targets, activeUnit, result.index); out << "}\n";
                             }
                             else
@@ -4435,7 +4438,7 @@ namespace wolvrix::lib::grhsim
                                     << ";cpu_rchanged|=(" << value(result) << '[' << word << "]!=cpu_rnext);" << value(result) << '['
                                     << word << "]=cpu_rnext;}\n";
                             }
-                            if (dynamicStats_) out << "cpu_dyn_ch[" << kind << "]+=cpu_rchanged;\n";
+                            if (dynamicStats_) out << "cpu_dyn_ch[" << kind << "]+=cpu_rchanged;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_rchanged;\n";
                             if (!changed.empty()) out << changed << "|=cpu_rchanged;\n";
                             else if (const auto *targets = fanout_[result.index])
                             {
@@ -4456,7 +4459,7 @@ namespace wolvrix::lib::grhsim
                             {
                                 const auto kind = dynKind(op);
                                 out << "{const bool cpu_dyn_c=" << call << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind
-                                    << "]+=cpu_dyn_c;" << changed << "|=cpu_dyn_c;}\n";
+                                    << "]+=cpu_dyn_c;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;" << changed << "|=cpu_dyn_c;}\n";
                             }
                             else out << changed << "|=" << call << ";\n";
                         }
@@ -4466,7 +4469,7 @@ namespace wolvrix::lib::grhsim
                             {
                                 const auto kind = dynKind(op);
                                 out << "{const bool cpu_dyn_c=" << call << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind
-                                    << "]+=cpu_dyn_c;if(cpu_dyn_c){\n";
+                                    << "]+=cpu_dyn_c;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;if(cpu_dyn_c){\n";
                                 activateChanged(out, *targets, activeUnit, result.index); out << "}}\n";
                             }
                             else
@@ -4518,7 +4521,7 @@ namespace wolvrix::lib::grhsim
                         {
                             const auto kind = dynKind(op);
                             out << "{const bool cpu_dyn_c="; call(out);
-                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
+                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;";
                             if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}}\n"; }
                             else out << changed << "|=cpu_dyn_c;}\n";
                         }
@@ -4565,7 +4568,7 @@ namespace wolvrix::lib::grhsim
                         {
                             const auto kind = dynKind(op);
                             out << "{const bool cpu_dyn_c="; call(out);
-                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
+                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;";
                             if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}}\n"; }
                             else out << changed << "|=cpu_dyn_c;}\n";
                         }
@@ -4594,7 +4597,7 @@ namespace wolvrix::lib::grhsim
                         {
                             const auto kind = dynKind(op);
                             out << "{const bool cpu_dyn_c="; call(out);
-                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;";
+                            out << ";++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;" << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;";
                             if (changed.empty()) { out << "if(cpu_dyn_c){\n"; activateChanged(out, *targets, activeUnit, result.index); out << "}}\n"; }
                             else out << changed << "|=cpu_dyn_c;}\n";
                         }
@@ -4617,6 +4620,7 @@ namespace wolvrix::lib::grhsim
                         const auto kind = dynKind(op);
                         out << "{const auto cpu_value=" << expr << ";const bool cpu_dyn_c=(" << value(result)
                             << "!=cpu_value);++cpu_dyn_wr[" << kind << "];cpu_dyn_ch[" << kind << "]+=cpu_dyn_c;"
+                            << dynVw << "+=UINT64_C(4294967296)+(std::uint64_t)cpu_dyn_c;"
                             << changed << "|=cpu_dyn_c;" << value(result) << "=cpu_value;}\n";
                     }
                     else
@@ -4628,8 +4632,8 @@ namespace wolvrix::lib::grhsim
                     if (dynamicStats_)
                     {
                         const auto kind = dynKind(op);
-                        out << "{ const auto cpu_value=" << expr << ";++cpu_dyn_wr[" << kind << "];if(" << value(result)
-                            << "!=cpu_value){++cpu_dyn_ch[" << kind << "];\n" << value(result) << "=cpu_value;\n";
+                        out << "{ const auto cpu_value=" << expr << ";++cpu_dyn_wr[" << kind << "];" << dynVw << "+=UINT64_C(4294967296);if(" << value(result)
+                            << "!=cpu_value){++cpu_dyn_ch[" << kind << "];++" << dynVw << "];\n" << value(result) << "=cpu_value;\n";
                         activateChanged(out, *targets, activeUnit, result.index); out << "}}\n";
                     }
                     else
@@ -5258,6 +5262,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 if (dynamicStats_)
                 {
                     out << "std::array<std::uint64_t," << dynKinds_.size() << "> cpu_dyn_wr{},cpu_dyn_ch{},cpu_dyn_silent{};\n"
+                        << "std::array<std::uint64_t," << model_.values().size() + 1 << "> cpu_dyn_vw{};\n"
                         << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_act{},cpu_dyn_sn_body{},cpu_dyn_sn_grp{},cpu_dyn_sn_chg{};\n";
                     if (!coneGuards_.empty())
                         out << "std::array<std::uint64_t," << mapping_.partitionTree.partitions.size() + 1 << "> cpu_dyn_sn_exec{};\n"
@@ -5403,7 +5408,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 out << "cpu_profile_data={};\n";
                 if (dynamicStats_)
                 {
-                    out << "cpu_dyn_wr.fill(0);cpu_dyn_ch.fill(0);cpu_dyn_silent.fill(0);cpu_dyn_sn_act.fill(0);cpu_dyn_sn_body.fill(0);cpu_dyn_sn_grp.fill(0);cpu_dyn_sn_chg.fill(0);cpu_dyn_cm_ent.fill(0);\n";
+                    out << "cpu_dyn_wr.fill(0);cpu_dyn_ch.fill(0);cpu_dyn_silent.fill(0);cpu_dyn_vw.fill(0);cpu_dyn_sn_act.fill(0);cpu_dyn_sn_body.fill(0);cpu_dyn_sn_grp.fill(0);cpu_dyn_sn_chg.fill(0);cpu_dyn_cm_ent.fill(0);\n";
                     if (!coneGuards_.empty())
                         out << "cpu_dyn_sn_exec.fill(0);cpu_dyn_sn_leak.fill(0);cpu_dyn_tok_sum=0;std::memset(cpu_dyn_tok_hist,0,sizeof(cpu_dyn_tok_hist));\n";
                     out << "cpu_dyn_grp_pub=0;cpu_dyn_grp_fire=0;cpu_dyn_port_eval=0;cpu_dyn_port_fire=0;cpu_dyn_in_chk=0;cpu_dyn_in_chg=0;\n"
@@ -5697,6 +5702,9 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << "for(std::size_t i=0;i<" << names.size() << ";++i)if(cpu_dyn_wr[i]||cpu_dyn_ch[i]||cpu_dyn_silent[i])"
                         << "std::fprintf(stderr,\"[grhsim-dyn] kind %s wr=%llu ch=%llu silent=%llu\\n\",cpu_dyn_names[i],"
                         << "static_cast<unsigned long long>(cpu_dyn_wr[i]),static_cast<unsigned long long>(cpu_dyn_ch[i]),static_cast<unsigned long long>(cpu_dyn_silent[i]));\n"
+                        << "for(std::size_t i=0;i<" << model_.values().size() + 1 << ";++i)if(cpu_dyn_vw[i])"
+                        << "std::fprintf(stderr,\"[grhsim-vchg] v %zu wr=%llu ch=%llu\\n\",i,"
+                        << "static_cast<unsigned long long>(cpu_dyn_vw[i]>>32),static_cast<unsigned long long>(cpu_dyn_vw[i]&UINT64_C(0xffffffff)));\n"
                         << "for(std::size_t i=0;i<" << mapping_.partitionTree.partitions.size() + 1 << ";++i)if(cpu_dyn_sn_act[i])"
                         << "std::fprintf(stderr,\"[grhsim-dyn] sn %zu act=%llu body=%llu grp=%llu chg=%llu\\n\",i,"
                         << "static_cast<unsigned long long>(cpu_dyn_sn_act[i]),static_cast<unsigned long long>(cpu_dyn_sn_body[i]),"

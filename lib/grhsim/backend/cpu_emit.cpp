@@ -348,7 +348,16 @@ namespace wolvrix::lib::grhsim
                 if (dynamicStats_)
                 {
                     std::set<std::string> kinds;
-                    for (const auto &op : model_.operations()) kinds.emplace(model_.text(op.opType));
+                    for (const auto &op : model_.operations())
+                    {
+                        // A fused expr op keeps its root's original kind (the "rk"
+                        // parameter) so dynamic counter keys are fusion-invariant.
+                        std::string_view kind = model_.text(op.opType);
+                        if (kind == "core.compute.expr")
+                            if (const auto *rk = parameter<std::string>(model_, model_.parameters(op), "rk"))
+                                kind = *rk;
+                        kinds.emplace(kind);
+                    }
                     for (const auto &kind : kinds) dynKinds_.emplace(kind, dynKinds_.size());
                     for (const auto &task : schedule_.numaNodes[0].cores[0].tasks)
                         dynTaskSpan_ = std::max(dynTaskSpan_, task.id.index + 1);
@@ -407,6 +416,41 @@ namespace wolvrix::lib::grhsim
                         activeMasks_[partition.id.index] = 1u << (*partition.attrs.activeId % 8);
                     }
                 for (const auto &row : schedule_.computeSupernodeFanout) fanout_[row.source.index] = &row.targets;
+                // NO00011: fused expr trees absorb their intermediate ops, which stay
+                // in the model and partition tables (mapping coverage is unchanged)
+                // but are skipped by the compute emission. Collect their OpIds and
+                // verify each absorbed op keeps no observable result slot.
+                for (const auto &op : model_.operations())
+                {
+                    if (model_.text(op.opType) != "core.compute.expr") continue;
+                    const auto *tree = parameter<std::vector<std::string>>(model_, model_.parameters(op), "tree");
+                    if (!tree || tree->empty())
+                        throw std::runtime_error("CPU expr op requires a nonempty tree parameter");
+                    std::uint32_t nodes = 0;
+                    for (const auto &token : *tree)
+                    {
+                        if (token.size() < 2 || token[0] != 'n') continue;
+                        ++nodes;
+                        const auto fields = splitExprToken(token);
+                        if (fields.size() < 6)
+                            throw std::runtime_error("CPU expr tree node token is malformed");
+                        const auto origin = static_cast<std::uint32_t>(std::stoul(std::string(fields[5])));
+                        if (origin == op.id.index) continue;
+                        if (!origin || origin > model_.operations().size())
+                            throw std::runtime_error("CPU expr tree references an invalid intermediate op");
+                        const auto fusedResults = model_.results(model_.operations()[origin - 1]);
+                        if (fusedResults.size() != 1 || fanout_[fusedResults[0].index] ||
+                            layout_.values[fusedResults[0].index - 1].kind == CpuStorageKind::Boundary)
+                            throw std::runtime_error("CPU expr tree absorbs an op with an observable result slot");
+                        fusedAway_.insert(origin);
+                    }
+                    if (dynamicStats_ && nodes)
+                    {
+                        if (fusedTreeWeight_.size() < model_.operations().size() + 1)
+                            fusedTreeWeight_.resize(model_.operations().size() + 1, 0);
+                        fusedTreeWeight_[op.id.index] = nodes;
+                    }
+                }
                 projected_ = schedule_.quiescenceProjection;
                 if (projected_.size() < model_.states().size() + 1) projected_.resize(model_.states().size() + 1, false);
                 planReadAliases();
@@ -3272,16 +3316,235 @@ namespace wolvrix::lib::grhsim
                 else throw std::runtime_error("CPU C++ emit unsupported array initializer: " + std::string(kind));
                 if (!elide) out << "}\n";
             }
+            // Shared scalar (<=64-bit two-state) compute expression body: the model
+            // path binds raw/typeOf/number to an op's operands, the fused expr path
+            // binds them to the tree's value stack. Text output is identical either
+            // way.
+            template <typename Raw, typename TypeOf, typename Number>
+            std::string scalarExpression(std::string_view kind, const Type &result, std::size_t arity,
+                                         const Raw &raw, const TypeOf &typeOf, const Number &number) const
+            {
+                const auto width = result.width;
+                const auto cast = [&](std::size_t i, uint32_t width) {
+                    const auto expr = raw(i); const auto &source = typeOf(i);
+                    return "grhsim_cast_u64(" + expr + "," + std::to_string(source.width) + "," + std::to_string(width) +
+                           "," + (source.isSigned ? "true" : "false") + ")";
+                };
+                if (kind == "assign") return cast(0, width);
+                if ((kind == "and" || kind == "or") && arity == 2 &&
+                    width == 1 && !result.isSigned &&
+                    typeOf(0).width == 1 && !typeOf(0).isSigned &&
+                    typeOf(1).width == 1 && !typeOf(1).isSigned)
+                    return "(" + raw(0) + (kind == "and" ? "&" : "|") + raw(1) + ")";
+                static const std::map<std::string_view, std::string_view> binary{
+                    {"add", "+"}, {"sub", "-"}, {"mul", "*"}, {"and", "&"}, {"or", "|"}, {"xor", "^"},
+                    {"logicAnd", "&&"}, {"logicOr", "||"}};
+                if (auto it = binary.find(kind); it != binary.end())
+                    return "(" + (kind.starts_with("logic") ? raw(0) : cast(0, width)) + std::string(it->second) +
+                           (kind.starts_with("logic") ? raw(1) : cast(1, width)) + ")";
+                if (kind == "not" || kind == "logicNot") return "(" + std::string(kind == "not" ? "~" : "!") + raw(0) + ")";
+                if (kind == "xnor") return "~(" + cast(0, width) + "^" + cast(1, width) + ")";
+                if (kind == "mux")
+                {
+                    // A two-state scalar mux is a pure bit-select.  Use the
+                    // branchless mask form so the hot compute path does not
+                    // expose a data-dependent conditional branch for every
+                    // mux result.  grhsim_mux_u64 preserves the SV condition
+                    // rule (any non-zero condition selects the true arm),
+                    // while the surrounding normalize() applies the result
+                    // width and signedness exactly as before.
+                    if (result.domain == LogicDomain::TwoState && width <= 64 && arity == 3)
+                        return "grhsim_mux_u64(" + raw(0) + "," + cast(1, width) + "," + cast(2, width) + ")";
+                    return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
+                }
+                if (kind == "prioritySelect")
+                {
+                    // [c0..cN-1, a0..aN-1, default]: the first true condition wins,
+                    // exactly the folded mux chain.  Emit as one right-nested
+                    // branchless select expression: the intermediate slot stores
+                    // and reloads of the link chain disappear while the per-link
+                    // mask select and casts stay bit-identical.
+                    const std::size_t count = (arity - 1) / 2;
+                    if (count < 3 || count > 64)
+                        throw std::runtime_error("CPU C++ emit prioritySelect condition count is out of range");
+                    std::string expr = cast(2 * count, width);
+                    for (std::size_t i = count; i-- > 0;)
+                        expr = "grhsim_mux_u64(" + raw(i) + "," + cast(count + i, width) + "," + expr + ")";
+                    return expr;
+                }
+                if (kind == "bitSelect") {
+                    if (width == 1 && !result.isSigned)
+                        return "((" + raw(0) + "&" + raw(1) + ")|((" + raw(0) + "^1)&" + raw(2) + "))";
+                    return "((" + cast(0, width) + "&" + cast(1, width) + ")|(~" + cast(0, width) +
+                           "&" + cast(2, width) + "))";
+                }
+                if (kind == "shl" || kind == "lshr" || kind == "ashr")
+                    return "grhsim_" + std::string(kind) + "_u64(" + cast(0, width) + ",grhsim_index_words(" + raw(1) + "," + std::to_string(width) + ")," + std::to_string(width) + ")";
+                if (kind == "div" || kind == "mod")
+                    return "grhsim_" + std::string(typeOf(0).isSigned && typeOf(1).isSigned ? "s" : "u") +
+                           std::string(kind) + "_u64(" + cast(0, width) + "," + cast(1, width) + "," + std::to_string(width) + ")";
+                static const std::map<std::string_view, std::string_view> compares{
+                    {"eq", "=="}, {"ne", "!="}, {"caseEq", "=="}, {"caseNe", "!="},
+                    {"wildcardEq", "=="}, {"wildcardNe", "!="}, {"lt", "<"}, {"le", "<="}, {"gt", ">"}, {"ge", ">="}};
+                if (auto it = compares.find(kind); it != compares.end())
+                {
+                    const auto compareWidth = std::max(typeOf(0).width, typeOf(1).width);
+                    if (compareWidth > 64)
+                    {
+                        std::string prefix = "([&](){";
+                        std::array<std::string, 2> pointers;
+                        for (std::size_t i = 0; i < 2; ++i)
+                        {
+                            if (typeOf(i).width > 64) pointers[i] = "(" + raw(i) + ").data()";
+                            else
+                            {
+                                const auto local = "cpu_cmp_" + std::to_string(i);
+                                prefix += "const std::uint64_t " + local + "=static_cast<std::uint64_t>(" + raw(i) + ");";
+                                pointers[i] = "&" + local;
+                            }
+                        }
+                        return prefix + "return grhsim_compare_extended_words(" + pointers[0] + "," +
+                            std::to_string((typeOf(0).width + 63u) / 64u) + "," + std::to_string(typeOf(0).width) + "," +
+                            pointers[1] + "," + std::to_string((typeOf(1).width + 63u) / 64u) + "," +
+                            std::to_string(typeOf(1).width) + "," +
+                            (typeOf(0).isSigned && typeOf(1).isSigned ? "true" : "false") + ")" +
+                            std::string(it->second) + "0;}())";
+                    }
+                    return "(grhsim_compare_" + std::string(typeOf(0).isSigned && typeOf(1).isSigned ? "signed" : "unsigned") +
+                           "_u64(" + cast(0, compareWidth) + "," + cast(1, compareWidth) + "," + std::to_string(compareWidth) + ")" +
+                           std::string(it->second) + "0)";
+                }
+                static const std::map<std::string_view, std::string_view> reduces{
+                    {"reduceAnd", "and"}, {"reduceNand", "nand"}, {"reduceOr", "or"}, {"reduceNor", "nor"},
+                    {"reduceXor", "xor"}, {"reduceXnor", "xnor"}};
+                if (auto it = reduces.find(kind); it != reduces.end())
+                {
+                    const auto operandWidth = typeOf(0).width;
+                    if (operandWidth > 64)
+                        return "grhsim_reduce_" + std::string(it->second) + "_words(" + raw(0) + "," + std::to_string(operandWidth) + ")";
+                    return "grhsim_reduce_" + std::string(it->second) + "_u64(" + raw(0) + "," + std::to_string(operandWidth) + ")";
+                }
+                if (kind == "sliceStatic" || kind == "sliceDynamic" || kind == "sliceArray")
+                {
+                    if (typeOf(0).width > 64)
+                    {
+                        const auto srcWords = (typeOf(0).width + 63u) / 64u;
+                        std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, typeOf(1).width);
+                        if (kind == "sliceArray") start = "(" + start + ")*" + std::to_string(width);
+                        return "grhsim_slice_words_u64<" + std::to_string(srcWords) + ">( " + raw(0) + "," + start + "," + std::to_string(width) + ")";
+                    }
+                    std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, typeOf(1).width);
+                    if (kind == "sliceArray")
+                        start = "(" + start + ">=64/" + std::to_string(width) + "+1?64:" + start + "*" + std::to_string(width) + ")";
+                    return "grhsim_slice_dynamic_u64(grhsim_trunc_u64(" + raw(0) + "," + std::to_string(typeOf(0).width) +
+                           ")," + start + "," + std::to_string(width) + ")";
+                }
+                if (kind == "concat" || kind == "replicate")
+                {
+                    const auto &sourceType = typeOf(0);
+                    if (kind == "replicate" && sourceType.kind == TypeKind::Logic && sourceType.width == 1 &&
+                        !sourceType.isSigned && sourceType.domain == LogicDomain::TwoState)
+                    {
+                        // {rep{bit}} broadcasts the bit: 0/-bit fills every lane in one
+                        // subtract; normalize() applies the result width truncation.
+                        return "(0-static_cast<std::uint64_t>(" + raw(0) + "))";
+                    }
+                    std::string expr = "UINT64_C(0)"; uint64_t total = 0;
+                    const auto count = kind == "replicate" ? number("rep") : arity;
+                    if (!count || count > 64) throw std::runtime_error("invalid CPU scalar concatenation/replication count");
+                    for (uint64_t i = 0; i < count; ++i)
+                    {
+                        const auto index = kind == "replicate" ? 0 : i;
+                        expr = "grhsim_concat_u64(" + expr + "," + std::to_string(total) + "," + raw(index) + "," +
+                               std::to_string(typeOf(index).width) + ")";
+                        total += typeOf(index).width;
+                    }
+                    return expr;
+                }
+                throw std::runtime_error("CPU C++ emit unsupported computation: " + std::string(kind));
+            }
+
+            // Emit a fused expression tree op (grhsim.fuse-expr-chains). The "tree"
+            // parameter holds postfix tokens — leaf "l<k>" (operand k) or node
+            // "n;<kind>;<width>;<signed01>;<arity>;<opId>[;key=int64...]" — evaluated
+            // on a text stack. Internal nodes are normalized to their original per-op
+            // result type exactly like the per-op emission; the outer compute()
+            // applies the root normalization.
+            std::string fusedExpression(const SimOp &op) const
+            {
+                const auto *tree = parameter<std::vector<std::string>>(model_, model_.parameters(op), "tree");
+                if (!tree || tree->empty())
+                    throw std::runtime_error("CPU expr op requires a nonempty tree parameter");
+                const auto operands = model_.operands(op);
+                struct Entry
+                {
+                    std::string text;
+                    Type type;
+                };
+                std::vector<Entry> stack;
+                stack.reserve(tree->size());
+                for (std::size_t cursor = 0; cursor < tree->size(); ++cursor)
+                {
+                    const std::string &token = (*tree)[cursor];
+                    if (token.size() > 1 && token[0] == 'l')
+                    {
+                        const auto leaf = static_cast<std::size_t>(std::stoul(token.substr(1)));
+                        if (leaf >= operands.size())
+                            throw std::runtime_error("CPU expr tree leaf operand index is out of range");
+                        stack.push_back({value(operands[leaf]), type(operands[leaf])});
+                        continue;
+                    }
+                    const auto fields = splitExprToken(token);
+                    if (fields.size() < 6 || fields[0] != "n")
+                        throw std::runtime_error("CPU expr tree node token is malformed");
+                    Type nodeType{};
+                    nodeType.kind = TypeKind::Logic;
+                    nodeType.domain = LogicDomain::TwoState;
+                    nodeType.width = static_cast<uint32_t>(std::stoul(std::string(fields[2])));
+                    nodeType.isSigned = fields[3] == "1";
+                    const auto arity = static_cast<std::size_t>(std::stoul(std::string(fields[4])));
+                    if (arity > stack.size())
+                        throw std::runtime_error("CPU expr tree node arity underflows the value stack");
+                    const std::size_t base = stack.size() - arity;
+                    const auto number = [&](std::string_view key) {
+                        for (std::size_t i = 6; i < fields.size(); ++i)
+                        {
+                            const auto eq = fields[i].find('=');
+                            if (eq != std::string_view::npos && fields[i].substr(0, eq) == key)
+                                return std::stoull(std::string(fields[i].substr(eq + 1)));
+                        }
+                        throw std::runtime_error("missing or negative CPU slice/replication parameter");
+                    };
+                    std::string expr = scalarExpression(fields[1], nodeType, arity,
+                        [&](std::size_t i) { return stack[base + i].text; },
+                        [&](std::size_t i) -> const Type & { return stack[base + i].type; }, number);
+                    if (cursor + 1 != tree->size()) expr = normalize(std::move(expr), nodeType);
+                    stack.resize(base);
+                    stack.push_back({std::move(expr), nodeType});
+                }
+                if (stack.size() != 1)
+                    throw std::runtime_error("CPU expr tree did not reduce to a single value");
+                return stack.front().text;
+            }
+
+            static std::vector<std::string_view> splitExprToken(const std::string &token)
+            {
+                std::vector<std::string_view> fields;
+                std::size_t begin = 0;
+                for (std::size_t i = 0; i <= token.size(); ++i)
+                    if (i == token.size() || token[i] == ';')
+                    {
+                        fields.push_back(std::string_view(token).substr(begin, i - begin));
+                        begin = i + 1;
+                    }
+                return fields;
+            }
+
             std::string expression(const SimOp &op) const
             {
                 const auto name = model_.text(op.opType); const auto operands = model_.operands(op);
                 const auto &result = type(model_.results(op)[0]); const auto width = result.width;
                 const auto raw = [&](std::size_t i) { if (i >= operands.size()) throw std::runtime_error("CPU op operand arity"); return value(operands[i]); };
-                const auto cast = [&](std::size_t i, uint32_t width) {
-                    const auto expr = raw(i); const auto &source = type(operands[i]);
-                    return "grhsim_cast_u64(" + expr + "," + std::to_string(source.width) + "," + std::to_string(width) +
-                           "," + (source.isSigned ? "true" : "false") + ")";
-                };
                 const auto number = [&](std::string_view key) {
                     const auto *n = parameter<int64_t>(model_, model_.parameters(op), key);
                     if (!n || *n < 0) throw std::runtime_error("missing or negative CPU slice/replication parameter");
@@ -3396,138 +3659,9 @@ namespace wolvrix::lib::grhsim
                     }
                     throw std::runtime_error("CPU C++ emit unsupported wide operation: " + std::string(kind) + " width=" + std::to_string(width));
                 }
-                if (kind == "assign") return cast(0, width);
-                if ((kind == "and" || kind == "or") && operands.size() == 2 &&
-                    width == 1 && !result.isSigned &&
-                    type(operands[0]).width == 1 && !type(operands[0]).isSigned &&
-                    type(operands[1]).width == 1 && !type(operands[1]).isSigned)
-                    return "(" + raw(0) + (kind == "and" ? "&" : "|") + raw(1) + ")";
-                static const std::map<std::string_view, std::string_view> binary{
-                    {"add", "+"}, {"sub", "-"}, {"mul", "*"}, {"and", "&"}, {"or", "|"}, {"xor", "^"},
-                    {"logicAnd", "&&"}, {"logicOr", "||"}};
-                if (auto it = binary.find(kind); it != binary.end())
-                    return "(" + (kind.starts_with("logic") ? raw(0) : cast(0, width)) + std::string(it->second) +
-                           (kind.starts_with("logic") ? raw(1) : cast(1, width)) + ")";
-                if (kind == "not" || kind == "logicNot") return "(" + std::string(kind == "not" ? "~" : "!") + raw(0) + ")";
-                if (kind == "xnor") return "~(" + cast(0, width) + "^" + cast(1, width) + ")";
-                if (kind == "mux")
-                {
-                    // A two-state scalar mux is a pure bit-select.  Use the
-                    // branchless mask form so the hot compute path does not
-                    // expose a data-dependent conditional branch for every
-                    // mux result.  grhsim_mux_u64 preserves the SV condition
-                    // rule (any non-zero condition selects the true arm),
-                    // while the surrounding normalize() applies the result
-                    // width and signedness exactly as before.
-                    if (result.domain == LogicDomain::TwoState && width <= 64 && operands.size() == 3)
-                        return "grhsim_mux_u64(" + raw(0) + "," + cast(1, width) + "," + cast(2, width) + ")";
-                    return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
-                }
-                if (kind == "prioritySelect")
-                {
-                    // [c0..cN-1, a0..aN-1, default]: the first true condition wins,
-                    // exactly the folded mux chain.  Emit as one right-nested
-                    // branchless select expression: the intermediate slot stores
-                    // and reloads of the link chain disappear while the per-link
-                    // mask select and casts stay bit-identical.
-                    const std::size_t count = (operands.size() - 1) / 2;
-                    if (count < 3 || count > 64)
-                        throw std::runtime_error("CPU C++ emit prioritySelect condition count is out of range");
-                    std::string expr = cast(2 * count, width);
-                    for (std::size_t i = count; i-- > 0;)
-                        expr = "grhsim_mux_u64(" + raw(i) + "," + cast(count + i, width) + "," + expr + ")";
-                    return expr;
-                }
-                if (kind == "bitSelect") {
-                    if (width == 1 && !result.isSigned)
-                        return "((" + raw(0) + "&" + raw(1) + ")|((" + raw(0) + "^1)&" + raw(2) + "))";
-                    return "((" + cast(0, width) + "&" + cast(1, width) + ")|(~" + cast(0, width) +
-                           "&" + cast(2, width) + "))";
-                }
-                if (kind == "shl" || kind == "lshr" || kind == "ashr")
-                    return "grhsim_" + std::string(kind) + "_u64(" + cast(0, width) + ",grhsim_index_words(" + raw(1) + "," + std::to_string(width) + ")," + std::to_string(width) + ")";
-                if (kind == "div" || kind == "mod")
-                    return "grhsim_" + std::string(type(operands[0]).isSigned && type(operands[1]).isSigned ? "s" : "u") +
-                           std::string(kind) + "_u64(" + cast(0, width) + "," + cast(1, width) + "," + std::to_string(width) + ")";
-                static const std::map<std::string_view, std::string_view> compares{
-                    {"eq", "=="}, {"ne", "!="}, {"caseEq", "=="}, {"caseNe", "!="},
-                    {"wildcardEq", "=="}, {"wildcardNe", "!="}, {"lt", "<"}, {"le", "<="}, {"gt", ">"}, {"ge", ">="}};
-                if (auto it = compares.find(kind); it != compares.end())
-                {
-                    const auto compareWidth = std::max(type(operands[0]).width, type(operands[1]).width);
-                    if (compareWidth > 64)
-                    {
-                        std::string prefix = "([&](){";
-                        std::array<std::string, 2> pointers;
-                        for (std::size_t i = 0; i < 2; ++i)
-                        {
-                            if (type(operands[i]).width > 64) pointers[i] = "(" + raw(i) + ").data()";
-                            else
-                            {
-                                const auto local = "cpu_cmp_" + std::to_string(i);
-                                prefix += "const std::uint64_t " + local + "=static_cast<std::uint64_t>(" + raw(i) + ");";
-                                pointers[i] = "&" + local;
-                            }
-                        }
-                        return prefix + "return grhsim_compare_extended_words(" + pointers[0] + "," +
-                            std::to_string((type(operands[0]).width + 63u) / 64u) + "," + std::to_string(type(operands[0]).width) + "," +
-                            pointers[1] + "," + std::to_string((type(operands[1]).width + 63u) / 64u) + "," +
-                            std::to_string(type(operands[1]).width) + "," +
-                            (type(operands[0]).isSigned && type(operands[1]).isSigned ? "true" : "false") + ")" +
-                            std::string(it->second) + "0;}())";
-                    }
-                    return "(grhsim_compare_" + std::string(type(operands[0]).isSigned && type(operands[1]).isSigned ? "signed" : "unsigned") +
-                           "_u64(" + cast(0, compareWidth) + "," + cast(1, compareWidth) + "," + std::to_string(compareWidth) + ")" +
-                           std::string(it->second) + "0)";
-                }
-                static const std::map<std::string_view, std::string_view> reduces{
-                    {"reduceAnd", "and"}, {"reduceNand", "nand"}, {"reduceOr", "or"}, {"reduceNor", "nor"},
-                    {"reduceXor", "xor"}, {"reduceXnor", "xnor"}};
-                if (auto it = reduces.find(kind); it != reduces.end())
-                {
-                    const auto operandWidth = type(operands[0]).width;
-                    if (operandWidth > 64)
-                        return "grhsim_reduce_" + std::string(it->second) + "_words(" + raw(0) + "," + std::to_string(operandWidth) + ")";
-                    return "grhsim_reduce_" + std::string(it->second) + "_u64(" + raw(0) + "," + std::to_string(operandWidth) + ")";
-                }
-                if (kind == "sliceStatic" || kind == "sliceDynamic" || kind == "sliceArray")
-                {
-                    if (type(operands[0]).width > 64)
-                    {
-                        const auto srcWords = (type(operands[0]).width + 63u) / 64u;
-                        std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, type(operands[1]).width);
-                        if (kind == "sliceArray") start = "(" + start + ")*" + std::to_string(width);
-                        return "grhsim_slice_words_u64<" + std::to_string(srcWords) + ">( " + raw(0) + "," + start + "," + std::to_string(width) + ")";
-                    }
-                    std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, type(operands[1]).width);
-                    if (kind == "sliceArray")
-                        start = "(" + start + ">=64/" + std::to_string(width) + "+1?64:" + start + "*" + std::to_string(width) + ")";
-                    return "grhsim_slice_dynamic_u64(grhsim_trunc_u64(" + raw(0) + "," + std::to_string(type(operands[0]).width) +
-                           ")," + start + "," + std::to_string(width) + ")";
-                }
-                if (kind == "concat" || kind == "replicate")
-                {
-                    const auto &sourceType = type(operands[0]);
-                    if (kind == "replicate" && sourceType.kind == TypeKind::Logic && sourceType.width == 1 &&
-                        !sourceType.isSigned && sourceType.domain == LogicDomain::TwoState)
-                    {
-                        // {rep{bit}} broadcasts the bit: 0/-bit fills every lane in one
-                        // subtract; normalize() applies the result width truncation.
-                        return "(0-static_cast<std::uint64_t>(" + raw(0) + "))";
-                    }
-                    std::string expr = "UINT64_C(0)"; uint64_t total = 0;
-                    const auto count = kind == "replicate" ? number("rep") : operands.size();
-                    if (!count || count > 64) throw std::runtime_error("invalid CPU scalar concatenation/replication count");
-                    for (uint64_t i = 0; i < count; ++i)
-                    {
-                        const auto index = kind == "replicate" ? 0 : i;
-                        expr = "grhsim_concat_u64(" + expr + "," + std::to_string(total) + "," + raw(index) + "," +
-                               std::to_string(type(operands[index]).width) + ")";
-                        total += type(operands[index]).width;
-                    }
-                    return expr;
-                }
-                throw std::runtime_error("CPU C++ emit unsupported computation: " + std::string(kind));
+                if (kind == "expr") return fusedExpression(op);
+                return scalarExpression(kind, result, operands.size(), raw,
+                    [&](std::size_t i) -> const Type & { return type(operands[i]); }, number);
             }
 
             void activate(std::ostream &out, const CpuActivationTargets &targets, bool next, PartitionId activeUnit = {},
@@ -3995,8 +4129,10 @@ namespace wolvrix::lib::grhsim
                 };
                 // Constants, aliased reads and static strings emit nothing, so they
                 // must not split a gate run (they sit between the endpoint calls in
-                // program order). compute() is a pure no-op for them.
+                // program order). compute() is a pure no-op for them. Fused expr
+                // intermediates are absorbed by their tree root and emit nothing too.
                 const auto emitsNothing = [&](OpId id) {
+                    if (!fusedAway_.empty() && fusedAway_.contains(id.index)) return true;
                     const auto &op = model_.operations()[id.index - 1];
                     const auto results = model_.results(op);
                     if (results.size() != 1) return false;
@@ -4040,7 +4176,10 @@ namespace wolvrix::lib::grhsim
                             if (emitsNothing(ops[k])) continue;
                             if (sideCallGate(model_.operations()[ops[k].index - 1], guards))
                                 throw std::runtime_error("CPU cone guard unit contains a gate-hoisted side call");
-                            ++runOps;
+                            // Fused expr ops count their absorbed intermediates so
+                            // cpu_dyn_sn_exec stays fusion-invariant.
+                            runOps += fusedTreeWeight_.empty() ? 1 :
+                                std::max<std::uint32_t>(fusedTreeWeight_[ops[k].index], 1);
                         }
                         std::string guardText;
                         for (std::size_t w = 0; w < W; ++w)
@@ -4197,6 +4336,8 @@ namespace wolvrix::lib::grhsim
             void compute(std::ostream &out, const SimOp &op, PartitionId activeUnit, const std::string &changed = {},
                          const std::string &cachedGuard = {}) const
             {
+                // Absorbed expr-tree intermediates are emitted inline by their root.
+                if (!fusedAway_.empty() && fusedAway_.contains(op.id.index)) return;
                 if (model_.text(op.opType) == "core.system.task")
                 { systemTask(out, op, cachedGuard); return; }
                 if (model_.text(op.opType) == "core.dpi.call")
@@ -6326,8 +6467,20 @@ if(terminal){
             mutable std::uint64_t memGuardHoistRuns_ = 0, memGuardHoistSites_ = 0;
             mutable std::uint64_t memEnableCacheValues_ = 0, memEnableCacheSites_ = 0;
             std::map<std::string, std::uint32_t> dynKinds_;
+            // NO00011: OpIds of expr-tree intermediates skipped by the compute
+            // emission; per-expr-op original node counts keep dyn exec counters
+            // fusion-invariant.
+            std::unordered_set<std::uint32_t> fusedAway_;
+            std::vector<std::uint32_t> fusedTreeWeight_;
             std::uint32_t dynTaskSpan_ = 1;
-            std::uint32_t dynKind(const SimOp &op) const { return dynKinds_.at(std::string(model_.text(op.opType))); }
+            std::uint32_t dynKind(const SimOp &op) const
+            {
+                const auto name = model_.text(op.opType);
+                if (name == "core.compute.expr")
+                    if (const auto *rk = parameter<std::string>(model_, model_.parameters(op), "rk"))
+                        return dynKinds_.at(*rk);
+                return dynKinds_.at(std::string(name));
+            }
             bool dynBoundary(ValueId result) const
             {
                 return dynamicStats_ && layout_.values[result.index - 1].kind == CpuStorageKind::Boundary;

@@ -426,6 +426,21 @@ namespace wolvrix::lib::grhsim
         return false;
     }
 
+    bool refreshCpuDataLayout(GrhSimModel &model, diag::Diagnostics &diagnostics)
+    {
+        const auto *previous = model.cpuMapping();
+        if (!previous || previous->stage < CpuMappingStage::DataLayout || !previous->dataLayout)
+        {
+            diagnostics.error("CPU data layout refresh requires a data-layout stage mapping", "cpu.layout");
+            return false;
+        }
+        const bool readCaches = previous->dataLayout->helperReadCaches.has_value();
+        auto mapping = *previous;
+        mapping.dataLayout = buildLayout(model, mapping.partitionTree, readCaches);
+        model.setCpuMapping(std::move(mapping));
+        return true;
+    }
+
     void registerCpuLayoutPasses(PassRegistry &registry)
     {
         std::string error;

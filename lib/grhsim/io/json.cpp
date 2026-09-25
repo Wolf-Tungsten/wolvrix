@@ -914,6 +914,18 @@ namespace wolvrix::lib::grhsim
 
         void writeCounts(StreamWriter &writer, const GrhSimModel &model)
         {
+            // replaceOperation leaves orphaned ranges in the shared pools, so pool
+            // capacity can exceed what the payload carries (each operation's own
+            // spans); the counts must match the serialized spans for load-side
+            // verification.
+            uint64_t operandCount = 0, resultCount = 0, objectRefCount = 0, parameterCount = 0;
+            for (const auto &op : model.operations())
+            {
+                operandCount += model.operands(op).size();
+                resultCount += model.results(op).size();
+                objectRefCount += model.objectRefs(op).size();
+                parameterCount += model.parameters(op).size();
+            }
             writer.startObject();
             writer.key("strings"); writer.value(static_cast<uint64_t>(model.strings().size()));
             writer.key("dialects"); writer.value(static_cast<uint64_t>(model.dialects().size()));
@@ -929,10 +941,10 @@ namespace wolvrix::lib::grhsim
             writer.value(static_cast<uint64_t>(model.interfacePorts().size()));
             writer.key("values"); writer.value(static_cast<uint64_t>(model.values().size()));
             writer.key("operations"); writer.value(static_cast<uint64_t>(model.operations().size()));
-            writer.key("operands"); writer.value(static_cast<uint64_t>(model.operandPool().size()));
-            writer.key("results"); writer.value(static_cast<uint64_t>(model.resultPool().size()));
-            writer.key("object_refs"); writer.value(static_cast<uint64_t>(model.objectRefPool().size()));
-            writer.key("parameters"); writer.value(static_cast<uint64_t>(model.parameterPool().size()));
+            writer.key("operands"); writer.value(operandCount);
+            writer.key("results"); writer.value(resultCount);
+            writer.key("object_refs"); writer.value(objectRefCount);
+            writer.key("parameters"); writer.value(parameterCount);
             writer.key("init_records"); writer.value(static_cast<uint64_t>(model.initRecords().size()));
             writer.key("init_steps"); writer.value(static_cast<uint64_t>(model.initSteps().size()));
             writer.key("init_parameters");

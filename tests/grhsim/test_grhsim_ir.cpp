@@ -1302,6 +1302,143 @@ namespace {
         }
         return 0;
     }
+
+    int runFuseExprChainsTest(const std::filesystem::path &artifactDir) {
+        using namespace grhsim;
+        const auto inputOf = [](GrhSimModel &model, TypeId type) {
+            const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto runMappedFusion = [](GrhSimModel &model, diag::Diagnostics &diagnostics) {
+            PassManager manager(defaultDialectRegistry()); std::string error;
+            for (const char *name : {"cpu.st.split-phase", "cpu.st.form-event-domains",
+                                     "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
+                                     "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
+                                     "cpu.st.layout-data", "cpu.st.build-schedule",
+                                     "grhsim.fuse-expr-chains"})
+                manager.addPass(defaultPassRegistry().create(name, {}, error));
+            return manager.run(model, diagnostics);
+        };
+        // Positive: a three-op single-use chain fuses into one core.compute.expr
+        // whose operands are the chain leaves; intermediates stay in the model;
+        // the pass is idempotent.
+        {
+            GrhSimModel model("fuse_expr_chain"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, byte), b = inputOf(model, byte), c = inputOf(model, byte);
+            const auto t1 = model.addValue(byte), t2 = model.addValue(byte), t3 = model.addValue(byte);
+            model.addOperation("core.compute.and", std::array{a, b}, std::array{t1});
+            model.addOperation("core.compute.xor", std::array{t1, c}, std::array{t2});
+            model.addOperation("core.compute.add", std::array{t2, a}, std::array{t3});
+            const auto output = model.addOutput("o", byte);
+            model.addOperation("core.output.write", std::array{t3}, {}, std::array{ObjectRef::output(output)});
+            diag::Diagnostics diagnostics;
+            const auto first = runMappedFusion(model, diagnostics);
+            if (!first.success || !first.changed) return fail("fuse-expr-chains missed a three-op chain");
+            unsigned exprs = 0, plainAdds = 0;
+            const SimOp *expr = nullptr;
+            for (const auto &op : model.operations()) {
+                if (model.text(op.opType) == "core.compute.expr") { ++exprs; expr = &op; }
+                else if (model.text(op.opType) == "core.compute.add") ++plainAdds;
+            }
+            if (exprs != 1 || plainAdds != 0 || !expr) return fail("fuse-expr-chains left a residual chain root");
+            const auto operands = model.operands(*expr);
+            if (operands.size() != 3 || operands[0] != a || operands[1] != b || operands[2] != c)
+                return fail("fuse-expr-chains leaf operand order changed");
+            if (model.results(*expr).size() != 1 || model.results(*expr)[0] != t3)
+                return fail("fuse-expr-chains lost the chain root result");
+            const Parameter *tree = nullptr, *rk = nullptr;
+            for (const auto &param : model.parameters(*expr)) {
+                if (model.text(param.name) == "tree") tree = &param;
+                if (model.text(param.name) == "rk") rk = &param;
+            }
+            if (!tree || !rk || !std::holds_alternative<std::vector<std::string>>(tree->value) ||
+                !std::holds_alternative<std::string>(rk->value) ||
+                std::get<std::string>(rk->value) != "core.compute.add")
+                return fail("fuse-expr-chains wrote malformed expr parameters");
+            const auto &tokens = std::get<std::vector<std::string>>(tree->value);
+            unsigned nodes = 0, leaves = 0;
+            for (const auto &token : tokens) (token.size() > 1 && token[0] == 'n' ? nodes : leaves)++;
+            if (nodes != 3 || leaves != 4 || tokens.back().find("n;add;8;0;2;") != 0)
+                return fail("fuse-expr-chains encoded the wrong tree shape");
+            unsigned ands = 0, xors = 0;
+            for (const auto &op : model.operations()) {
+                ands += model.text(op.opType) == "core.compute.and";
+                xors += model.text(op.opType) == "core.compute.xor";
+            }
+            if (ands != 1 || xors != 1) return fail("fuse-expr-chains dropped intermediate ops");
+            diag::Diagnostics secondDiagnostics;
+            PassManager second(defaultDialectRegistry()); std::string error;
+            second.addPass(defaultPassRegistry().create("grhsim.fuse-expr-chains", {}, error));
+            const auto again = second.run(model, secondDiagnostics);
+            if (!again.success || again.changed) return fail("fuse-expr-chains is not idempotent");
+            // replaceOperation leaves orphaned pool ranges; the fused model must
+            // still round-trip through JSON (header counts describe the serialized
+            // spans, not pool capacity) and re-store byte-identical after loading.
+            std::filesystem::create_directories(artifactDir);
+            const auto fusedPath = artifactDir / "grhsim_fuse_expr.json";
+            const auto fusedReloadPath = artifactDir / "grhsim_fuse_expr_roundtrip.json";
+            diag::Diagnostics storeDiagnostics;
+            if (!storeGrhSimModel(model, fusedPath, defaultDialectRegistry(), storeDiagnostics))
+                return fail("fused GrhSIM JSON store failed");
+            diag::Diagnostics loadDiagnostics;
+            const auto loaded = loadGrhSimModel(fusedPath, defaultDialectRegistry(), loadDiagnostics);
+            if (!loaded || loadDiagnostics.hasError()) return fail("fused GrhSIM JSON load failed");
+            unsigned loadedExprs = 0;
+            for (const auto &op : loaded->operations())
+                loadedExprs += loaded->text(op.opType) == "core.compute.expr";
+            if (loadedExprs != 1) return fail("fused GrhSIM JSON load lost the expr op");
+            diag::Diagnostics reloadStoreDiagnostics;
+            if (!storeGrhSimModel(*loaded, fusedReloadPath, defaultDialectRegistry(), reloadStoreDiagnostics))
+                return fail("fused GrhSIM JSON round-trip store failed");
+            if (readFile(fusedPath) != readFile(fusedReloadPath))
+                return fail("fused store/load/store did not produce stable bytes");
+        }
+        // Guard: a tapped (multi-use) intermediate stays a leaf of the fused tree.
+        {
+            GrhSimModel model("fuse_expr_tap"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, byte), b = inputOf(model, byte), c = inputOf(model, byte);
+            const auto t1 = model.addValue(byte), t2 = model.addValue(byte), t3 = model.addValue(byte);
+            model.addOperation("core.compute.and", std::array{a, b}, std::array{t1});
+            model.addOperation("core.compute.xor", std::array{t1, c}, std::array{t2});
+            model.addOperation("core.compute.add", std::array{t2, a}, std::array{t3});
+            const auto tap = model.addOutput("tap", byte);
+            model.addOperation("core.output.write", std::array{t1}, {}, std::array{ObjectRef::output(tap)});
+            const auto output = model.addOutput("o", byte);
+            model.addOperation("core.output.write", std::array{t3}, {}, std::array{ObjectRef::output(output)});
+            diag::Diagnostics diagnostics;
+            const auto result = runMappedFusion(model, diagnostics);
+            if (!result.success || !result.changed) return fail("fuse-expr-chains missed a tapped chain");
+            bool found = false;
+            for (const auto &op : model.operations()) {
+                if (model.text(op.opType) != "core.compute.expr") continue;
+                found = true;
+                const auto operands = model.operands(op);
+                if (operands.size() != 3 || operands[0] != t1 || operands[1] != c || operands[2] != a)
+                    return fail("fuse-expr-chains absorbed a multi-use value");
+            }
+            if (!found) return fail("fuse-expr-chains produced no expr op for a tapped chain");
+        }
+        // The verifier rejects malformed expr trees (stack underflow).
+        {
+            GrhSimModel model("fuse_expr_invalid"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto a = inputOf(model, byte);
+            const auto result = model.addValue(byte);
+            const std::vector<std::string> tree{"n;and;8;0;2;1"};
+            const std::array params{Parameter{model.intern("tree"), tree},
+                                    Parameter{model.intern("rk"), std::string("core.compute.and")}};
+            model.addOperation("core.compute.expr", std::array{a}, std::array{result},
+                std::span<const ObjectRef>{}, std::span<const Parameter>(params));
+            diag::Diagnostics diagnostics;
+            if (verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+                return fail("malformed core.compute.expr passed verification");
+        }
+        return 0;
+    }
 }
 
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
@@ -1322,6 +1459,7 @@ int main()
         if (const int status = runBitwisePredicatesTest(); status != 0) return status;
         if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
         if (const int status = runMuxChainFoldTest(); status != 0) return status;
+        if (const int status = runFuseExprChainsTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();

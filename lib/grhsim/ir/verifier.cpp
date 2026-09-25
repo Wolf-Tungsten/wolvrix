@@ -423,6 +423,81 @@ namespace wolvrix::lib::grhsim
                     }
                     if (!valid) error("prioritySelect requires 2N+1 operands (3<=N<=64): N one-bit unsigned two-state conditions, N arms and one default of scalar two-state types, and one result", context());
                 }
+                else if (opName == "core.compute.expr") {
+                    // Fused expression tree (grhsim.fuse-expr-chains): operands are the
+                    // tree's leaf values; the "tree" parameter holds postfix tokens —
+                    // leaf "l<k>" (operand k) or node
+                    // "n;<kind>;<width>;<signed01>;<arity>;<opId>[;key=int64...]" — and
+                    // "rk" names the root's original op kind for dynamic accounting.
+                    // The root token is last and the stack must reduce to one value.
+                    bool valid = results.size() == 1 && refs.empty();
+                    const Parameter *tree = findParameter(model, parameters, "tree");
+                    const Parameter *rk = findParameter(model, parameters, "rk");
+                    const std::vector<std::string> *tokens = nullptr;
+                    if (!tree || !std::holds_alternative<std::vector<std::string>>(tree->value) ||
+                        (tokens = &std::get<std::vector<std::string>>(tree->value))->empty())
+                        valid = false;
+                    if (!rk || !std::holds_alternative<std::string>(rk->value) ||
+                        !std::get<std::string>(rk->value).starts_with("core.compute.") ||
+                        std::get<std::string>(rk->value) == "core.compute.expr")
+                        valid = false;
+                    if (valid) {
+                        const auto parseUnsigned = [](std::string_view text, std::uint64_t &out) {
+                            if (text.empty()) return false;
+                            for (const char ch : text) if (ch < '0' || ch > '9') return false;
+                            out = std::stoull(std::string(text));
+                            return true;
+                        };
+                        std::size_t depth = 0;
+                        for (const auto &token : *tokens) {
+                            if (!valid) break;
+                            if (token.size() > 1 && token[0] == 'l') {
+                                std::uint64_t leaf = 0;
+                                if (!parseUnsigned(std::string_view(token).substr(1), leaf) ||
+                                    leaf >= operands.size()) { valid = false; break; }
+                                ++depth;
+                                continue;
+                            }
+                            std::vector<std::string_view> fields;
+                            std::size_t begin = 0;
+                            for (std::size_t i = 0; i <= token.size(); ++i)
+                                if (i == token.size() || token[i] == ';') {
+                                    fields.push_back(std::string_view(token).substr(begin, i - begin));
+                                    begin = i + 1;
+                                }
+                            std::uint64_t width = 0, arity = 0, origin = 0;
+                            if (fields.size() < 6 || fields[0] != "n" || fields[1].empty() ||
+                                fields[1] == "expr" || fields[1].find_first_of(";= ") != std::string_view::npos ||
+                                !parseUnsigned(fields[2], width) || width == 0 || width > 64 ||
+                                (fields[3] != "0" && fields[3] != "1") ||
+                                !parseUnsigned(fields[4], arity) || arity == 0 || arity > depth ||
+                                !parseUnsigned(fields[5], origin) || origin == 0 ||
+                                origin > model.operations().size()) { valid = false; break; }
+                            for (std::size_t i = 6; i < fields.size() && valid; ++i) {
+                                const auto eq = fields[i].find('=');
+                                std::string_view number = eq == std::string_view::npos ? std::string_view{} :
+                                    fields[i].substr(eq + 1);
+                                if (!number.empty() && number.front() == '-') number.remove_prefix(1);
+                                std::uint64_t ignored = 0;
+                                if (eq == std::string_view::npos || eq == 0 || !parseUnsigned(number, ignored))
+                                    valid = false;
+                            }
+                            depth = depth - arity + 1;
+                        }
+                        if (depth != 1 || (*tokens).back()[0] != 'n') valid = false;
+                        const auto scalar = [&](ValueId value) {
+                            if (!validId(value, model.values().size())) return false;
+                            const auto id = model.values()[value.index - 1].type;
+                            if (!validId(id, model.types().size())) return false;
+                            const auto &type = model.types()[id.index - 1];
+                            return type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
+                                   type.width > 0 && type.width <= 64;
+                        };
+                        for (const auto value : operands) valid &= scalar(value);
+                        for (const auto value : results) valid &= scalar(value);
+                    }
+                    if (!valid) error("core.compute.expr requires one scalar two-state result, scalar two-state leaf operands, a postfix \"tree\" string-array parameter reducing to one value and a \"rk\" string parameter naming the root's original op kind", context());
+                }
 
                 const Parameter *edges = findParameter(model, parameters, "event_edges");
                 if (edges && !std::holds_alternative<std::vector<std::string>>(edges->value))

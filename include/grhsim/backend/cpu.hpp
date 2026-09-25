@@ -19,6 +19,13 @@ namespace wolvrix::lib::grhsim
                            wolvrix::lib::diag::Diagnostics &diagnostics);
     bool verifyCpuDataLayout(const GrhSimModel &model, const CpuBackendMapping &mapping,
                              wolvrix::lib::diag::Diagnostics &diagnostics);
+    // Recompute the canonical data layout over the mapping's partition tree and
+    // install it into the cpu mapping; stage, schedule and partition tree stay
+    // untouched. Required after mapping-preserving passes that rewrite operand
+    // structure (e.g. grhsim.fuse-expr-chains), since helper read caches and
+    // boundary densification are functions of op operands.
+    bool refreshCpuDataLayout(GrhSimModel &model,
+                              wolvrix::lib::diag::Diagnostics &diagnostics);
 }
 
 #endif

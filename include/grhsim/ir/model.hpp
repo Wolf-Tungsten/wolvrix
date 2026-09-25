@@ -469,6 +469,15 @@ namespace wolvrix::lib::grhsim
         // buildSchedule (activation-covered rows removed; writes/stores stay).
         // Kept as a plan flag so verifyCpuSchedule's rebuild reproduces the plan.
         bool demonitorRedundant = false;
+        // Optional for old checkpoints. NO00015: edge-completion de-monitoring.
+        // When set, buildSchedule post-processes computeSupernodeFanout by
+        // adding the missing operand->consumer activation edges for each value
+        // in demonitorEdgeCompletionRemoved (sorted, unique) and then removing
+        // that value's fanout row. The selection is computed by the
+        // grhsim.demonitor-edge-completion pass from a dynamic change profile
+        // (pricing only); safety is re-validated statically on application.
+        bool demonitorEdgeCompletion = false;
+        std::vector<ValueId> demonitorEdgeCompletionRemoved;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 

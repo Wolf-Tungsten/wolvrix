@@ -132,6 +132,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/fuse_expr_chains.cpp
     lib/grhsim/pass/migrate_boundary_ops.cpp
     lib/grhsim/pass/demonitor_redundant.cpp
+    lib/grhsim/pass/demonitor_edge_completion.cpp
     lib/grhsim/pass/used_bits.cpp
     lib/grhsim/pass/pack_bit_registers.cpp
     lib/grhsim/backend/cpu.cpp

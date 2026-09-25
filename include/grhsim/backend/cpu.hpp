@@ -33,6 +33,26 @@ namespace wolvrix::lib::grhsim
     // shadows and task structure are functions of partition membership.
     bool refreshCpuSchedule(GrhSimModel &model,
                             wolvrix::lib::diag::Diagnostics &diagnostics);
+
+    // NO00015 edge-completion de-monitoring selection: statically eligible
+    // values priced with a dynamic per-value change profile (write/change
+    // counts indexed by value id, sized values()+1; pricing only, safety is
+    // static). Returns the sorted removal list plus pricing aggregates
+    // (integer-scaled by 4) for diagnostics. Applying the list adds the
+    // missing operand->consumer activation edges and removes the rows.
+    struct DemonitorEdgeCompletionSelection
+    {
+        std::vector<ValueId> removed;
+        uint64_t eligible = 0;
+        uint64_t profitable = 0;
+        uint64_t cascadeTrimmed = 0;
+        uint64_t addedEdges = 0;
+        int64_t saveX4 = 0;
+        int64_t widenX4 = 0;
+    };
+    DemonitorEdgeCompletionSelection computeDemonitorEdgeCompletionSelection(
+        const GrhSimModel &model, const CpuBackendMapping &mapping,
+        const std::vector<uint64_t> &writeCounts, const std::vector<uint64_t> &changeCounts);
 }
 
 #endif

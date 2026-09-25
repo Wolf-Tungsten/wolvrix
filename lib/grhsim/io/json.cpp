@@ -636,7 +636,12 @@ namespace wolvrix::lib::grhsim
             writer.endArray();
             // Optional trailing field: only written when set, so flag-off
             // checkpoints stay byte-compatible with the pre-NO00014 schema.
-            if (schedule.demonitorRedundant) writer.value(static_cast<std::uint64_t>(1));
+            if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion)
+                writer.value(static_cast<std::uint64_t>(schedule.demonitorRedundant ? 1 : 0));
+            // Optional trailing field (NO00015): sorted removal value ids;
+            // presence implies the edge-completion post-processing is applied.
+            if (schedule.demonitorEdgeCompletion)
+                writeIdArray<ValueId>(writer, schedule.demonitorEdgeCompletionRemoved);
             writer.endArray();
         }
 
@@ -844,6 +849,11 @@ namespace wolvrix::lib::grhsim
                     if ((word >> i) & 1) schedule.quiescenceProjection[bit] = true;
             }
             if (reader.comma()) schedule.demonitorRedundant = reader.unsignedInteger() != 0;
+            if (reader.comma())
+            {
+                schedule.demonitorEdgeCompletionRemoved = readIdArray<ValueId>(reader, "edge-completion removal");
+                schedule.demonitorEdgeCompletion = true;
+            }
             reader.endArray();
             return schedule;
         }

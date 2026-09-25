@@ -316,10 +316,340 @@ namespace wolvrix::lib::grhsim
                        rows.end());
         }
 
+        // NO00015 edge-completion de-monitoring rule. For a monitored boundary
+        // value v (producer op X in unit A), NO00014 dropped v's compute fanout
+        // row only when every consumer unit B was already activated by every
+        // non-constant operand of X. This rule prices the complementary class:
+        // B misses some operand edges, but each missing edge (B, w) can be added
+        // — w is itself a monitored boundary value whose fanout row already
+        // activates A (freshness: any w change fires A, X re-evaluates, and
+        // topological order A < B lets B read the fresh v in the same round).
+        // After completion v's row is redundant and removed; B may then fire on
+        // w changes that leave v unchanged (widen), which is unobservable since
+        // B is side-effect free and recomputes identical outputs. Eligibility is
+        // fully static (dependency-driven, mirrors grhsim_edgecomplete_census.py);
+        // the selection among eligible values is priced with a dynamic per-value
+        // change profile: profit = wr(v)*(K_DETECT+K_STORE) − Σ_added ch(w)*
+        // (ops(B)*K_OP + K_SET) > 0, evaluated in exact integer arithmetic
+        // scaled by 4 (K_OP = 13/4) so the pass and the census select identical
+        // sets. A selected value's non-constant producer operands must not be
+        // selected (their rows carry the completed edges), so the removal set
+        // is the greatest fixpoint over the profitable set.
+        // A completion edge is only as good as the runtime row that carries
+        // it: emit aliases eligible core.state.read results onto their state
+        // slot (planReadAliases, cpu_emit.cpp), so such a value's schedule row
+        // is dead code and an added activate target would never fire; and a
+        // core.dpi.call result's row is live but the vchg profile has no
+        // counters at the DPI publish site, so its ch is pricing-blind. Both
+        // are rejected as completion sources when an edge would be missing.
+        constexpr int64_t kEdgeCompletionSaveX4 = 16; // (K_DETECT + K_STORE) * 4
+        constexpr int64_t kEdgeCompletionOpX4 = 13;   // K_OP * 4
+        constexpr int64_t kEdgeCompletionSetX4 = 4;   // K_SET * 4
+
+        struct EdgeCompletionView
+        {
+            const GrhSimModel &model;
+            const CpuPartitionTree &tree;
+            const CpuDataLayout &layout;
+            const ScheduleGraph &graph;
+            const CpuSchedulePlan &schedule;
+            std::vector<uint8_t> pinned;
+            std::vector<uint8_t> portArm;
+            std::vector<uint8_t> aliased;
+            std::vector<uint8_t> dpiProduced;
+            std::vector<uint32_t> rowOf;
+            std::vector<std::vector<uint32_t>> unitOps;
+            mutable std::vector<int8_t> safeMemo;
+
+            EdgeCompletionView(const GrhSimModel &model_, const CpuBackendMapping &mapping,
+                               const ScheduleGraph &graph_, const CpuSchedulePlan &schedule_)
+                : model(model_), tree(mapping.partitionTree), layout(*mapping.dataLayout), graph(graph_),
+                  schedule(schedule_), pinned(model_.values().size() + 1, 0),
+                  portArm(model_.values().size() + 1, 0), aliased(model_.values().size() + 1, 0),
+                  dpiProduced(model_.values().size() + 1, 0), rowOf(model_.values().size() + 1, 0),
+                  unitOps(mapping.partitionTree.partitions.size() + 1),
+                  safeMemo(mapping.partitionTree.partitions.size() + 1, -1)
+            {
+                for (const auto &slot : layout.runtime)
+                    if (slot.value) pinned[slot.value.index] = 1;
+                for (const auto &shadow : schedule.inputShadows) pinned[shadow.value.index] = 1;
+                for (const auto &row : schedule.inputFanout) pinned[row.source.index] = 1;
+                for (const auto &partition : tree.partitions)
+                    if (partition.attrs.eventGate)
+                        for (const auto &event : partition.attrs.eventGate->events)
+                            pinned[event.value.index] = 1;
+                for (const auto &op : model.operations())
+                {
+                    const auto name = model.text(op.opType);
+                    if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
+                    const auto operands = model.operands(op);
+                    for (std::size_t i = 0; i < 3 && i < operands.size(); ++i)
+                        portArm[operands[i].index] = 1;
+                }
+                for (uint32_t i = 0; i < schedule.computeSupernodeFanout.size(); ++i)
+                    rowOf[schedule.computeSupernodeFanout[i].source.index] = i + 1;
+                for (const auto &op : model.operations())
+                {
+                    const auto unit = graph.owner[op.id.index];
+                    if (unit) unitOps[unit.index].push_back(op.id.index);
+                    if (model.text(op.opType) == "core.dpi.call")
+                        for (const auto result : model.results(op)) dpiProduced[result.index] = 1;
+                }
+                // Mirror of emit planReadAliases (cpu_emit.cpp): a core.state.read
+                // result inside a compute unit whose state is quiescence-projected,
+                // which no non-compute op or event gate reads, and whose type
+                // matches the state is emitted as a direct alias of the state
+                // slot -- its fanout row is dead code at runtime.
+                std::vector<PartitionId> computeOwner(model.operations().size() + 1);
+                for (const auto &task : schedule.numaNodes[0].cores[0].tasks)
+                    if (task.execution == CpuExecution::ActivityDrivenCompute)
+                        for (const auto word : tree.partitions[task.partition.index - 1].children)
+                            for (const auto unit : tree.partitions[word.index - 1].children)
+                                for (const auto node : tree.partitions[unit.index - 1].children)
+                                    for (const auto op : tree.partitions[node.index - 1].ops)
+                                        computeOwner[op.index] = unit;
+                std::vector<uint8_t> snapshot(model.values().size() + 1, 0);
+                for (const auto &op : model.operations())
+                    if (!computeOwner[op.id.index])
+                        for (const auto operand : model.operands(op)) snapshot[operand.index] = 1;
+                for (const auto &partition : tree.partitions)
+                    if (partition.attrs.eventGate)
+                        for (const auto &event : partition.attrs.eventGate->events)
+                            snapshot[event.value.index] = 1;
+                for (const auto &op : model.operations())
+                {
+                    if (model.text(op.opType) != "core.state.read" || !computeOwner[op.id.index] ||
+                        model.results(op).empty() || model.objectRefs(op).empty())
+                        continue;
+                    const auto result = model.results(op)[0];
+                    const auto source = model.objectRefs(op)[0].index;
+                    if (source < schedule.quiescenceProjection.size() &&
+                        schedule.quiescenceProjection[source] && !snapshot[result.index] &&
+                        model.types()[model.values()[result.index - 1].type.index - 1].kind ==
+                            TypeKind::Logic &&
+                        model.values()[result.index - 1].type == model.states()[source - 1].type)
+                        aliased[result.index] = 1;
+                }
+            }
+
+            bool sideEffectFree(PartitionId unit) const
+            {
+                auto &memo = safeMemo[unit.index];
+                if (memo >= 0) return memo != 0;
+                bool safe = true;
+                for (auto opIdx : unitOps[unit.index])
+                {
+                    const auto name = model.text(model.operations()[opIdx - 1].opType);
+                    if (name.size() >= 13 && name.compare(0, 13, "core.compute.") == 0) continue;
+                    if (name == "core.state.read" || name == "core.state.memRead") continue;
+                    safe = false;
+                    break;
+                }
+                memo = safe ? int8_t(1) : int8_t(0);
+                return safe;
+            }
+
+            bool activates(uint32_t value, PartitionId unit) const
+            {
+                const auto row = rowOf[value];
+                if (!row) return false;
+                const auto &activate = schedule.computeSupernodeFanout[row - 1].targets.activate;
+                return std::find(activate.begin(), activate.end(), unit) != activate.end();
+            }
+
+            bool constantProduced(uint32_t value) const
+            {
+                const auto prod = graph.producer[value].index;
+                return prod && model.text(model.operations()[prod - 1].opType) == "core.compute.constant";
+            }
+
+            // Full static eligibility of value index v. When eligible, the
+            // missing (target, operand) completion edges are collected.
+            bool eligible(uint32_t v, std::vector<std::pair<PartitionId, uint32_t>> *missingEdges) const
+            {
+                if (missingEdges) missingEdges->clear();
+                if (layout.values[v - 1].kind != CpuStorageKind::Boundary) return false;
+                if (pinned[v] || portArm[v]) return false;
+                const auto &type = model.types()[model.values()[v - 1].type.index - 1];
+                if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
+                    type.width < 1 || type.width > 64) return false;
+                const auto rowIdx = rowOf[v];
+                if (!rowIdx) return false;
+                const auto &row = schedule.computeSupernodeFanout[rowIdx - 1];
+                if (row.targets.activate.empty() || !row.targets.arm.empty()) return false;
+                const auto xopIdx = graph.producer[v].index;
+                if (!xopIdx) return false;
+                const auto &xop = model.operations()[xopIdx - 1];
+                const std::string_view xname = model.text(xop.opType);
+                if (xname.size() < 13 || xname.compare(0, 13, "core.compute.") != 0 ||
+                    xname == "core.compute.constant" || xname == "core.compute.expr") return false;
+                if (!model.objectRefs(xop).empty() || model.results(xop).size() != 1) return false;
+                const auto unitA = graph.owner[xopIdx];
+                if (!unitA) return false;
+                for (const auto target : row.targets.activate)
+                {
+                    const auto &part = tree.partitions[target.index - 1];
+                    // Compute supernode (attrs.phase stays None in the tree; a
+                    // compute supernode is identified by its Node children).
+                    if (part.attrs.kind != CpuPartitionKind::Supernode || part.children.empty() ||
+                        tree.partitions[part.children.front().index - 1].attrs.kind != CpuPartitionKind::Node ||
+                        target == unitA || !sideEffectFree(target))
+                        return false;
+                }
+                std::vector<uint32_t> operands;
+                for (const auto operand : model.operands(xop))
+                {
+                    const auto w = operand.index;
+                    if (constantProduced(w)) continue;
+                    if (layout.values[w - 1].kind != CpuStorageKind::Boundary) return false;
+                    if (pinned[w]) return false;
+                    if (!activates(w, unitA)) return false;
+                    operands.push_back(w);
+                }
+                bool anyMissing = false;
+                for (const auto target : row.targets.activate)
+                    for (const auto w : operands)
+                        if (!activates(w, target))
+                        {
+                            // The edge would be carried by w's runtime row: an
+                            // emit-aliased state read has a dead row (the
+                            // activation would never fire) and a DPI result is
+                            // change-blind in the vchg profile (unpriceable
+                            // widen). The candidate cannot be completed.
+                            if (aliased[w] || dpiProduced[w]) return false;
+                            anyMissing = true;
+                            if (missingEdges) missingEdges->emplace_back(target, w);
+                        }
+                return anyMissing;
+            }
+        };
+
+        DemonitorEdgeCompletionSelection selectDemonitorEdgeCompletion(
+            const GrhSimModel &model, const CpuBackendMapping &mapping, const ScheduleGraph &graph,
+            const CpuSchedulePlan &schedule,
+            const std::vector<uint64_t> &writeCounts, const std::vector<uint64_t> &changeCounts)
+        {
+            EdgeCompletionView view(model, mapping, graph, schedule);
+            const auto &operations = model.operations();
+            DemonitorEdgeCompletionSelection result;
+            std::vector<uint8_t> selected(model.values().size() + 1, 0);
+            std::vector<std::pair<PartitionId, uint32_t>> missing;
+            for (const auto &row : schedule.computeSupernodeFanout)
+            {
+                const auto v = row.source.index;
+                if (!view.eligible(v, &missing)) continue;
+                ++result.eligible;
+                int64_t widenX4 = 0;
+                for (const auto &[target, w] : missing)
+                    widenX4 += static_cast<int64_t>(changeCounts[w]) *
+                               (static_cast<int64_t>(view.unitOps[target.index].size()) * kEdgeCompletionOpX4 +
+                                kEdgeCompletionSetX4);
+                if (static_cast<int64_t>(writeCounts[v]) * kEdgeCompletionSaveX4 - widenX4 <= 0) continue;
+                selected[v] = 1;
+            }
+            result.profitable = static_cast<uint64_t>(std::count(selected.begin(), selected.end(), 1));
+            // Greatest fixpoint over the profitable set: a removed value's
+            // non-constant producer operands must keep their rows.
+            while (true)
+            {
+                std::vector<uint32_t> drop;
+                for (const auto &row : schedule.computeSupernodeFanout)
+                {
+                    const auto v = row.source.index;
+                    if (!selected[v]) continue;
+                    for (const auto operand : model.operands(operations[graph.producer[v].index - 1]))
+                    {
+                        const auto w = operand.index;
+                        if (view.constantProduced(w)) continue;
+                        if (selected[w])
+                        {
+                            drop.push_back(v);
+                            break;
+                        }
+                    }
+                }
+                if (drop.empty()) break;
+                for (const auto v : drop) selected[v] = 0;
+                result.cascadeTrimmed += drop.size();
+            }
+            for (const auto &row : schedule.computeSupernodeFanout)
+            {
+                const auto v = row.source.index;
+                if (!selected[v]) continue;
+                if (!view.eligible(v, &missing))
+                    throw std::runtime_error("CPU schedule edge-completion selection changed eligibility");
+                result.removed.push_back(row.source);
+                result.addedEdges += missing.size();
+                result.saveX4 += static_cast<int64_t>(writeCounts[v]) * kEdgeCompletionSaveX4;
+                for (const auto &[target, w] : missing)
+                    result.widenX4 += static_cast<int64_t>(changeCounts[w]) *
+                                      (static_cast<int64_t>(view.unitOps[target.index].size()) * kEdgeCompletionOpX4 +
+                                       kEdgeCompletionSetX4);
+            }
+            return result;
+        }
+
+        // Validate and apply a stored edge-completion removal list: every entry
+        // must pass the full static eligibility rule, the list must satisfy the
+        // cascade fixpoint, then the completion edges are appended to the
+        // operand rows and the selected rows are removed.
+        void applyDemonitorEdgeCompletion(const GrhSimModel &model, const CpuBackendMapping &mapping,
+                                          const ScheduleGraph &graph, CpuSchedulePlan &schedule)
+        {
+            if (schedule.demonitorEdgeCompletionRemoved.empty())
+            {
+                if (schedule.demonitorEdgeCompletion)
+                    throw std::runtime_error("CPU schedule edge-completion flag set with empty removal list");
+                return;
+            }
+            if (!schedule.demonitorEdgeCompletion)
+                throw std::runtime_error("CPU schedule edge-completion removal list without flag");
+            EdgeCompletionView view(model, mapping, graph, schedule);
+            const auto &operations = model.operations();
+            const auto &removed = schedule.demonitorEdgeCompletionRemoved;
+            std::vector<uint8_t> removedSet(model.values().size() + 1, 0);
+            std::vector<std::vector<std::pair<PartitionId, uint32_t>>> missingOf(removed.size());
+            for (std::size_t i = 0; i < removed.size(); ++i)
+            {
+                const auto v = removed[i].index;
+                if ((i && removed[i - 1].index >= v) || !v || v >= removedSet.size() ||
+                    !view.eligible(v, &missingOf[i]))
+                    throw std::runtime_error("CPU schedule edge-completion removal fails static validation");
+                removedSet[v] = 1;
+            }
+            for (const auto value : removed)
+                for (const auto operand : model.operands(operations[graph.producer[value.index].index - 1]))
+                {
+                    const auto w = operand.index;
+                    if (!view.constantProduced(w) && removedSet[w])
+                        throw std::runtime_error("CPU schedule edge-completion removal violates the cascade fixpoint");
+                }
+            std::vector<std::vector<PartitionId>> additions(model.values().size() + 1);
+            for (const auto &entry : missingOf)
+                for (const auto &[target, w] : entry)
+                    additions[w].push_back(target);
+            auto &rows = schedule.computeSupernodeFanout;
+            for (uint32_t w = 1; w < additions.size(); ++w)
+            {
+                if (additions[w].empty()) continue;
+                const auto rowIdx = view.rowOf[w];
+                if (!rowIdx) throw std::runtime_error("CPU schedule edge-completion source row missing");
+                auto &activate = rows[rowIdx - 1].targets.activate;
+                activate.insert(activate.end(), additions[w].begin(), additions[w].end());
+                sortActive(activate, view.tree);
+            }
+            rows.erase(std::remove_if(rows.begin(), rows.end(),
+                                      [&](const auto &row) { return removedSet[row.source.index] != 0; }),
+                       rows.end());
+        }
+
         CpuSchedulePlan buildSchedule(const GrhSimModel &model, const CpuBackendMapping &mapping)
         {
             CpuSchedulePlan schedule;
             schedule.demonitorRedundant = mapping.schedule && mapping.schedule->demonitorRedundant;
+            schedule.demonitorEdgeCompletion = mapping.schedule && mapping.schedule->demonitorEdgeCompletion;
+            if (mapping.schedule)
+                schedule.demonitorEdgeCompletionRemoved = mapping.schedule->demonitorEdgeCompletionRemoved;
             schedule.numaNodes.push_back({0, {{0, {}}}});
             auto &tasks = schedule.numaNodes.front().cores.front().tasks;
             const auto &tree = mapping.partitionTree;
@@ -414,6 +744,7 @@ namespace wolvrix::lib::grhsim
             }
             schedule.inputShadowBytes = addBytes(schedule.inputShadowBytes, 7) & ~uint64_t(7);
             if (schedule.demonitorRedundant) applyDemonitorRedundant(model, mapping, graph, schedule);
+            if (schedule.demonitorEdgeCompletion) applyDemonitorEdgeCompletion(model, mapping, graph, schedule);
             return schedule;
         }
 
@@ -444,6 +775,18 @@ namespace wolvrix::lib::grhsim
                 return {true, true, {}};
             }
         };
+    }
+
+    DemonitorEdgeCompletionSelection computeDemonitorEdgeCompletionSelection(
+        const GrhSimModel &model, const CpuBackendMapping &mapping,
+        const std::vector<uint64_t> &writeCounts, const std::vector<uint64_t> &changeCounts)
+    {
+        if (mapping.stage != CpuMappingStage::Schedule || !mapping.dataLayout || !mapping.schedule)
+            throw std::runtime_error("edge-completion selection requires a complete CPU schedule mapping");
+        if (writeCounts.size() != model.values().size() + 1 || changeCounts.size() != writeCounts.size())
+            throw std::runtime_error("edge-completion profile size mismatch");
+        const ScheduleGraph graph(model, mapping.partitionTree);
+        return selectDemonitorEdgeCompletion(model, mapping, graph, *mapping.schedule, writeCounts, changeCounts);
     }
 
     bool verifyCpuSchedule(const GrhSimModel &model, const CpuBackendMapping &mapping, diag::Diagnostics &diagnostics)

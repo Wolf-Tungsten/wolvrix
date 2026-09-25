@@ -298,6 +298,21 @@ namespace wolvrix::lib::grhsim
         return true;
     }
 
+    bool refreshCpuSchedule(GrhSimModel &model, diag::Diagnostics &diagnostics)
+    {
+        const auto *previous = model.cpuMapping();
+        if (!previous || previous->stage < CpuMappingStage::DataLayout || !previous->dataLayout)
+        {
+            diagnostics.error("CPU schedule refresh requires a data-layout stage mapping", "cpu.schedule");
+            return false;
+        }
+        auto mapping = *previous;
+        mapping.schedule = buildSchedule(model, mapping);
+        mapping.stage = CpuMappingStage::Schedule;
+        model.setCpuMapping(std::move(mapping));
+        return true;
+    }
+
     void registerCpuSchedulePasses(PassRegistry &registry)
     {
         std::string error;

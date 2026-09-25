@@ -26,6 +26,13 @@ namespace wolvrix::lib::grhsim
     // boundary densification are functions of op operands.
     bool refreshCpuDataLayout(GrhSimModel &model,
                               wolvrix::lib::diag::Diagnostics &diagnostics);
+    // Recompute the canonical schedule over the mapping's partition tree and
+    // data layout, and install it into the cpu mapping; stage and partition tree
+    // stay untouched. Required after mapping-preserving passes that move ops
+    // between partitions (e.g. grhsim.migrate-boundary-ops), since fanout,
+    // shadows and task structure are functions of partition membership.
+    bool refreshCpuSchedule(GrhSimModel &model,
+                            wolvrix::lib::diag::Diagnostics &diagnostics);
 }
 
 #endif

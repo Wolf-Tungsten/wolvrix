@@ -636,12 +636,19 @@ namespace wolvrix::lib::grhsim
             writer.endArray();
             // Optional trailing field: only written when set, so flag-off
             // checkpoints stay byte-compatible with the pre-NO00014 schema.
-            if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion)
+            if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion || schedule.foldResidue)
                 writer.value(static_cast<std::uint64_t>(schedule.demonitorRedundant ? 1 : 0));
             // Optional trailing field (NO00015): sorted removal value ids;
             // presence implies the edge-completion post-processing is applied.
-            if (schedule.demonitorEdgeCompletion)
+            // Written (possibly empty) when NO00016 fold-residue follows so the
+            // trailing fields stay positional; an empty array reads back as
+            // flag-off (the flag is never set with an empty removal list).
+            if (schedule.demonitorEdgeCompletion || schedule.foldResidue)
                 writeIdArray<ValueId>(writer, schedule.demonitorEdgeCompletionRemoved);
+            // Optional trailing field (NO00016): sorted folded op ids; presence
+            // implies the residue-fold post-processing is applied.
+            if (schedule.foldResidue)
+                writeIdArray<OpId>(writer, schedule.foldResidueOps);
             writer.endArray();
         }
 
@@ -852,7 +859,12 @@ namespace wolvrix::lib::grhsim
             if (reader.comma())
             {
                 schedule.demonitorEdgeCompletionRemoved = readIdArray<ValueId>(reader, "edge-completion removal");
-                schedule.demonitorEdgeCompletion = true;
+                schedule.demonitorEdgeCompletion = !schedule.demonitorEdgeCompletionRemoved.empty();
+            }
+            if (reader.comma())
+            {
+                schedule.foldResidueOps = readIdArray<OpId>(reader, "residue fold ops");
+                schedule.foldResidue = !schedule.foldResidueOps.empty();
             }
             reader.endArray();
             return schedule;

@@ -648,8 +648,12 @@ namespace wolvrix::lib::grhsim
             CpuSchedulePlan schedule;
             schedule.demonitorRedundant = mapping.schedule && mapping.schedule->demonitorRedundant;
             schedule.demonitorEdgeCompletion = mapping.schedule && mapping.schedule->demonitorEdgeCompletion;
+            schedule.foldResidue = mapping.schedule && mapping.schedule->foldResidue;
             if (mapping.schedule)
+            {
                 schedule.demonitorEdgeCompletionRemoved = mapping.schedule->demonitorEdgeCompletionRemoved;
+                schedule.foldResidueOps = mapping.schedule->foldResidueOps;
+            }
             schedule.numaNodes.push_back({0, {{0, {}}}});
             auto &tasks = schedule.numaNodes.front().cores.front().tasks;
             const auto &tree = mapping.partitionTree;

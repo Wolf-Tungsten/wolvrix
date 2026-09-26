@@ -451,6 +451,20 @@ namespace wolvrix::lib::grhsim
                         fusedTreeWeight_[op.id.index] = nodes;
                     }
                 }
+                // NO00016: residue-folded ops stay in the model and partition
+                // tables (mapping coverage is unchanged) but emit nothing; the
+                // pass already rewired their unselected consumers to the fold
+                // source. Verify each folded op keeps no observable result slot.
+                for (const auto folded : schedule_.foldResidueOps)
+                {
+                    if (!folded || folded.index > model_.operations().size())
+                        throw std::runtime_error("CPU residue fold references an invalid op");
+                    const auto foldedResults = model_.results(model_.operations()[folded.index - 1]);
+                    if (foldedResults.size() != 1 || fanout_[foldedResults[0].index] ||
+                        layout_.values[foldedResults[0].index - 1].kind == CpuStorageKind::Boundary)
+                        throw std::runtime_error("CPU residue fold removes an op with an observable result slot");
+                    foldedOps_.insert(folded.index);
+                }
                 projected_ = schedule_.quiescenceProjection;
                 if (projected_.size() < model_.states().size() + 1) projected_.resize(model_.states().size() + 1, false);
                 planReadAliases();
@@ -4133,6 +4147,7 @@ namespace wolvrix::lib::grhsim
                 // intermediates are absorbed by their tree root and emit nothing too.
                 const auto emitsNothing = [&](OpId id) {
                     if (!fusedAway_.empty() && fusedAway_.contains(id.index)) return true;
+                    if (!foldedOps_.empty() && foldedOps_.contains(id.index)) return true;
                     const auto &op = model_.operations()[id.index - 1];
                     const auto results = model_.results(op);
                     if (results.size() != 1) return false;
@@ -4338,6 +4353,8 @@ namespace wolvrix::lib::grhsim
             {
                 // Absorbed expr-tree intermediates are emitted inline by their root.
                 if (!fusedAway_.empty() && fusedAway_.contains(op.id.index)) return;
+                // NO00016: residue-folded ops emit nothing.
+                if (!foldedOps_.empty() && foldedOps_.contains(op.id.index)) return;
                 if (model_.text(op.opType) == "core.system.task")
                 { systemTask(out, op, cachedGuard); return; }
                 if (model_.text(op.opType) == "core.dpi.call")
@@ -6480,6 +6497,9 @@ if(terminal){
             // fusion-invariant.
             std::unordered_set<std::uint32_t> fusedAway_;
             std::vector<std::uint32_t> fusedTreeWeight_;
+            // NO00016: OpIds of residue-folded ops skipped by the compute
+            // emission; their consumers were rewired by grhsim.fold-residue.
+            std::unordered_set<std::uint32_t> foldedOps_;
             std::uint32_t dynTaskSpan_ = 1;
             std::uint32_t dynKind(const SimOp &op) const
             {

@@ -9,6 +9,7 @@
 #include "grhsim/pass/migrate_boundary_ops.hpp"
 #include "grhsim/pass/demonitor_redundant.hpp"
 #include "grhsim/pass/demonitor_edge_completion.hpp"
+#include "grhsim/pass/fold_residue.hpp"
 #include "grhsim/pass/pack_bit_registers.hpp"
 #include "grhsim/pass/used_bits.hpp"
 #include "grhsim/backend/cpu.hpp"
@@ -176,6 +177,7 @@ namespace wolvrix::lib::grhsim
         registerMigrateBoundaryOpsPass(registry);
         registerDemonitorRedundantPass(registry);
         registerDemonitorEdgeCompletionPass(registry);
+        registerFoldResiduePass(registry);
         registerPackBitRegistersPass(registry);
         registerUsedBitsPass(registry);
         std::string error;

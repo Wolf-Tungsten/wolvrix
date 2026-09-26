@@ -478,6 +478,14 @@ namespace wolvrix::lib::grhsim
         // (pricing only); safety is re-validated statically on application.
         bool demonitorEdgeCompletion = false;
         std::vector<ValueId> demonitorEdgeCompletionRemoved;
+        // Optional for old checkpoints. NO00016: post-schedule residue folding.
+        // foldResidueOps (sorted, unique) names pure compute ops with a local,
+        // unpinned result whose unselected consumers were rewired to the fold
+        // source value by the grhsim.fold-residue pass. The ops stay in the
+        // model and partition tables; the CPU emitter skips their statements.
+        // Carried as plan data so verifyCpuSchedule's rebuild replays the plan.
+        bool foldResidue = false;
+        std::vector<OpId> foldResidueOps;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 

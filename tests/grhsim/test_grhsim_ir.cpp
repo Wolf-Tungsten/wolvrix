@@ -1439,6 +1439,148 @@ namespace {
         }
         return 0;
     }
+
+    int runFoldResidueTest(const std::filesystem::path &artifactDir) {
+        using namespace grhsim;
+        const auto inputOf = [](GrhSimModel &model, TypeId type) {
+            const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+            const auto value = model.addValue(type);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto outputOf = [](GrhSimModel &model, ValueId value, TypeId type) {
+            const auto port = model.addOutput("o" + std::to_string(model.outputs().size()), type);
+            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
+        };
+        const auto constantOf = [](GrhSimModel &model, TypeId type, std::string literal) {
+            const auto value = model.addValue(type);
+            const std::array params{Parameter{model.intern("constValue"), std::move(literal)}};
+            return std::pair{model.addOperation("core.compute.constant", {}, std::array{value}, {}, params), value};
+        };
+        const auto operandsOf = [](const GrhSimModel &model, OpId id) {
+            const auto span = model.operands(model.operations()[id.index - 1]);
+            return std::vector<ValueId>(span.begin(), span.end());
+        };
+        // One mapped model covering every fold class: assign_strict (t_assign),
+        // not_not + dce_cascade (n2, n1), self_eq -> existing 1 constant (r_eq),
+        // const_slice CSE hit (r4) and CSE-miss rejection (r4hi), and a consumer
+        // rule rejection (t_out feeds output.write directly). Expect five folded
+        // ops and rewired consumers.
+        GrhSimModel model("fold_residue"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto nibble = model.logicType(4, false, LogicDomain::TwoState);
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto a = inputOf(model, byte), b = inputOf(model, byte);
+        const auto p = inputOf(model, bit), q = inputOf(model, bit);
+        const auto i4 = inputOf(model, nibble);
+        const auto [k1op, k1] = constantOf(model, byte, "8'hab");
+        const auto [k4op, k4] = constantOf(model, nibble, "4'hb");
+        const auto [k1bitop, k1bit] = constantOf(model, bit, "1'h1");
+        const auto tAssign = model.addValue(byte);
+        const auto assignOp = model.addOperation("core.compute.assign", std::array{a}, std::array{tAssign});
+        const auto tXor = model.addValue(byte);
+        model.addOperation("core.compute.xor", std::array{tAssign, b}, std::array{tXor});
+        outputOf(model, tXor, byte);
+        const auto n1 = model.addValue(bit);
+        const auto not1Op = model.addOperation("core.compute.not", std::array{p}, std::array{n1});
+        const auto n2 = model.addValue(bit);
+        const auto not2Op = model.addOperation("core.compute.not", std::array{n1}, std::array{n2});
+        const auto tAnd = model.addValue(bit);
+        model.addOperation("core.compute.and", std::array{n2, q}, std::array{tAnd});
+        outputOf(model, tAnd, bit);
+        const auto rEq = model.addValue(bit);
+        const auto eqOp = model.addOperation("core.compute.eq", std::array{a, a}, std::array{rEq});
+        const auto tOr = model.addValue(bit);
+        model.addOperation("core.compute.or", std::array{rEq, q}, std::array{tOr});
+        outputOf(model, tOr, bit);
+        const auto r4 = model.addValue(nibble);
+        const std::array lowParams{Parameter{model.intern("sliceStart"), int64_t{0}},
+                                   Parameter{model.intern("sliceEnd"), int64_t{3}}};
+        const auto sliceLowOp = model.addOperation("core.compute.sliceStatic", std::array{k1}, std::array{r4}, {}, lowParams);
+        const auto tAdd = model.addValue(nibble);
+        model.addOperation("core.compute.add", std::array{r4, i4}, std::array{tAdd});
+        outputOf(model, tAdd, nibble);
+        const auto r4hi = model.addValue(nibble);
+        const std::array highParams{Parameter{model.intern("sliceStart"), int64_t{4}},
+                                    Parameter{model.intern("sliceEnd"), int64_t{7}}};
+        model.addOperation("core.compute.sliceStatic", std::array{k1}, std::array{r4hi}, {}, highParams);
+        const auto tAddHi = model.addValue(nibble);
+        model.addOperation("core.compute.add", std::array{r4hi, i4}, std::array{tAddHi});
+        outputOf(model, tAddHi, nibble);
+        const auto tOut = model.addValue(byte);
+        model.addOperation("core.compute.assign", std::array{b}, std::array{tOut});
+        outputOf(model, tOut, byte);
+
+        PassManager manager(defaultDialectRegistry()); std::string error;
+        for (const char *name : {"cpu.st.split-phase", "cpu.st.form-event-domains",
+                                 "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
+                                 "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
+                                 "cpu.st.layout-data", "cpu.st.build-schedule",
+                                 "grhsim.fold-residue"})
+            manager.addPass(defaultPassRegistry().create(name, {}, error));
+        diag::Diagnostics diagnostics;
+        const auto result = manager.run(model, diagnostics);
+        if (!result.success || !result.changed) return fail("fold-residue missed the residue ops");
+        const auto *mapping = model.cpuMapping();
+        if (!mapping || !mapping->schedule || !mapping->schedule->foldResidue)
+            return fail("fold-residue did not mark the schedule plan");
+        const std::vector<OpId> expected{assignOp, not1Op, not2Op, eqOp, sliceLowOp};
+        if (mapping->schedule->foldResidueOps != expected)
+            return fail("fold-residue selected the wrong op set");
+        for (const auto &op : model.operations()) {
+            const auto kind = model.text(op.opType);
+            if (kind == "core.compute.xor" && operandsOf(model, op.id) != std::vector<ValueId>{a, b})
+                return fail("fold-residue did not rewire the assign consumer");
+            if (kind == "core.compute.and" && operandsOf(model, op.id) != std::vector<ValueId>{p, q})
+                return fail("fold-residue did not resolve the not-not chain");
+            if (kind == "core.compute.or" && operandsOf(model, op.id) != std::vector<ValueId>{k1bit, q})
+                return fail("fold-residue did not rewire self-eq to the existing constant");
+            if (kind == "core.compute.add" && model.results(op)[0] == tAdd &&
+                operandsOf(model, op.id) != std::vector<ValueId>{k4, i4})
+                return fail("fold-residue did not rewire const-slice to the existing constant");
+            if (kind == "core.compute.add" && model.results(op)[0] == tAddHi &&
+                operandsOf(model, op.id) != std::vector<ValueId>{r4hi, i4})
+                return fail("fold-residue rewired a CSE-miss const-slice consumer");
+        }
+        // Idempotency: a second run leaves the model unchanged.
+        diag::Diagnostics secondDiagnostics;
+        PassManager second(defaultDialectRegistry());
+        second.addPass(defaultPassRegistry().create("grhsim.fold-residue", {}, error));
+        const auto again = second.run(model, secondDiagnostics);
+        if (!again.success || again.changed) return fail("fold-residue is not idempotent");
+        // Emit accepts the fold set (constructor revalidates every folded op).
+        std::filesystem::create_directories(artifactDir);
+        std::filesystem::remove_all(artifactDir / "fold_residue_emit");
+        PassManager emitManager(defaultDialectRegistry());
+        const auto emitDir = (artifactDir / "fold_residue_emit").string();
+        const std::array<std::string_view, 2> emitArgs{"--output", emitDir};
+        emitManager.addPass(defaultPassRegistry().create("cpu.st.emit-cpp", emitArgs, error));
+        diag::Diagnostics emitDiagnostics;
+        if (!emitManager.run(model, emitDiagnostics).success) {
+            for (const auto &message : emitDiagnostics.messages())
+                std::cerr << "[grhsim-ir] emit: " << message.message << '\n';
+            return fail("fold-residue model failed CPU emission");
+        }
+        // JSON round-trip stays byte stable with the schedule trailing field.
+        const auto foldedPath = artifactDir / "grhsim_fold_residue.json";
+        const auto foldedReloadPath = artifactDir / "grhsim_fold_residue_roundtrip.json";
+        diag::Diagnostics storeDiagnostics;
+        if (!storeGrhSimModel(model, foldedPath, defaultDialectRegistry(), storeDiagnostics))
+            return fail("fold-residue GrhSIM JSON store failed");
+        diag::Diagnostics loadDiagnostics;
+        const auto loaded = loadGrhSimModel(foldedPath, defaultDialectRegistry(), loadDiagnostics);
+        if (!loaded || loadDiagnostics.hasError()) return fail("fold-residue GrhSIM JSON load failed");
+        const auto *loadedMapping = loaded->cpuMapping();
+        if (!loadedMapping || !loadedMapping->schedule || !loadedMapping->schedule->foldResidue ||
+            loadedMapping->schedule->foldResidueOps != expected)
+            return fail("fold-residue JSON load lost the schedule fold set");
+        diag::Diagnostics reloadStoreDiagnostics;
+        if (!storeGrhSimModel(*loaded, foldedReloadPath, defaultDialectRegistry(), reloadStoreDiagnostics))
+            return fail("fold-residue GrhSIM JSON round-trip store failed");
+        if (readFile(foldedPath) != readFile(foldedReloadPath))
+            return fail("fold-residue store/load/store did not produce stable bytes");
+        return 0;
+    }
 }
 
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
@@ -1460,6 +1602,7 @@ int main()
         if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
         if (const int status = runMuxChainFoldTest(); status != 0) return status;
         if (const int status = runFuseExprChainsTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
+        if (const int status = runFoldResidueTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         return runHierarchyRejectionTest();

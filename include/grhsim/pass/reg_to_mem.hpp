@@ -14,6 +14,7 @@ namespace wolvrix::lib::grhsim {
         bool enableSameAddressFusion = true;
         bool enableCostSelection = true;
         bool enableRowConstantFill = false;
+        bool enableOrWriteMerge = false;
         bool analysisOnly = false;
         std::filesystem::path report;
     };

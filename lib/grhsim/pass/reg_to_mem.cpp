@@ -41,6 +41,7 @@ namespace {
         std::vector<std::string> edges;
         std::vector<StateId> histories;
         std::string key;
+        bool orMerge = false;
     };
     struct Group {
         std::vector<StateId> rows;
@@ -265,6 +266,92 @@ namespace {
             cached=1;
             return true;
         }
+        // Flatten a boolean OR, including reduceOr(concat(one-bit hits)).
+        // Other one-bit values remain atoms; no truth-table approximation.
+        bool disjunction(ValueId value, std::vector<ValueId> &leaves) {
+            std::vector<ValueId> pending{value};
+            std::unordered_set<uint32_t> seen;
+            while (!pending.empty()) {
+                const auto v = unwrap(pending.back()); pending.pop_back();
+                if (!seen.insert(v.index).second) continue;
+                if (seen.size() > 4096 || type(v).domain != LogicDomain::TwoState) return false;
+                const auto *op = def(v);
+                const auto k = op ? kind(*op) : std::string_view{};
+                if (op && (k == "core.compute.reduceOr" || k == "core.compute.concat" ||
+                    (type(v).width == 1 && (k == "core.compute.or" || k == "core.compute.logicOr")))) {
+                    for (auto a : m.operands(*op)) pending.push_back(a);
+                } else {
+                    if (type(v).width != 1) return false;
+                    if (number(v) != std::optional<uint64_t>{0}) leaves.push_back(v);
+                }
+            }
+            std::sort(leaves.begin(), leaves.end(), [](auto a, auto b) { return a.index < b.index; });
+            leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
+            return true;
+        }
+        bool parseOrWrite(RowWrite &result, ValueId update, ValueId data, std::optional<uint64_t> &row) {
+            const auto *root = def(unwrap(data));
+            if (!root || kind(*root) != "core.compute.or" || !ones(result.mask)) return false;
+            std::vector<ValueId> pending{data}, conditions;
+            std::vector<Branch> branches;
+            std::unordered_set<uint32_t> seen;
+            auto decodedRow = row;
+            while (!pending.empty()) {
+                const auto v = unwrap(pending.back()); pending.pop_back();
+                if (!seen.insert(v.index).second) continue;
+                if (seen.size() > 4096 || typeId(v) != typeId(data)) return false;
+                const auto *op = def(v);
+                if (!op) return false;
+                const auto args = m.operands(*op);
+                if (kind(*op) == "core.compute.or") {
+                    for (auto a : args) pending.push_back(a);
+                    continue;
+                }
+                if (auto n = literal(v); n && !n->hasUnknown() && n->countOnes() == 0) continue;
+                if (kind(*op) != "core.compute.mux" || args.size() != 3 ||
+                    typeId(args[1]) != typeId(data) || typeId(args[2]) != typeId(data) ||
+                    type(args[0]).width != 1 || type(args[0]).domain != LogicDomain::TwoState) return false;
+                const auto zero = literal(args[2]);
+                if (!zero || zero->hasUnknown() || zero->countOnes() != 0) return false;
+                const auto condition = unwrap(args[0]);
+                auto g = guard(condition, decodedRow);
+                if (!g || !g->address || !g->conflicts.empty() ||
+                    type(g->address).domain != LogicDomain::TwoState) return false;
+                decodedRow = g->row;
+                if (!branches.empty() && typeId(g->address) != typeId(branches[0].guard.address)) return false;
+                conditions.push_back(condition);
+                branches.push_back({std::move(*g), unwrap(args[1])});
+                if (branches.size() > 64) return false;
+            }
+            if (branches.size() < 2) return false;
+            std::sort(conditions.begin(), conditions.end(), [](auto a, auto b) { return a.index < b.index; });
+            conditions.erase(std::unique(conditions.begin(), conditions.end()), conditions.end());
+            std::vector<ValueId> updateTerms;
+            flatten(update, true, updateTerms);
+            bool covered = false;
+            std::vector<ValueId> globalTerms;
+            for (auto term : updateTerms) {
+                std::vector<ValueId> leaves;
+                if (disjunction(term, leaves) && leaves == conditions) covered = true;
+                else globalTerms.push_back(term);
+            }
+            // A looser enable can clear an unwritten row to zero. A stricter
+            // enable must be preserved, even when every data mux is enabled.
+            if (!covered) return false;
+            for (auto &branch : branches) {
+                auto &terms = branch.guard.terms;
+                terms.insert(terms.end(), globalTerms.begin(), globalTerms.end());
+                std::sort(terms.begin(), terms.end(), [](auto a, auto b) { return a.index < b.index; });
+                terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+            }
+            std::stable_sort(branches.begin(), branches.end(), [&](const Branch &a, const Branch &b) {
+                return std::pair{guardKey(a.guard), key(a.data)} < std::pair{guardKey(b.guard), key(b.data)};
+            });
+            row = decodedRow;
+            result.branches = std::move(branches);
+            result.orMerge = true;
+            return true;
+        }
         std::optional<RowWrite> parseWrite(StateId s, std::optional<uint64_t> row={}) {
             parseReason="write-shape";
             if(writers[s.index].size()!=1) return {};
@@ -281,59 +368,63 @@ namespace {
             // effective branch guard; otherwise a false updateCond would still
             // commit a recovered memory write.
             const ValueId updateCond = unwrap(operands[0]);
-            const bool always=number(updateCond)==std::optional<uint64_t>{1};
-            std::vector<std::pair<ValueId,ValueId>> branches;
-            auto current=unwrap(operands[1]); std::unordered_set<uint32_t> seen;
-            while(seen.insert(current.index).second && branches.size()<2048) {
-                const auto *mux=def(current);
-                if(!mux || kind(*mux)!="core.compute.mux" || m.operands(*mux).size()!=3) break;
-                const auto a=m.operands(*mux);
-                if(typeId(a[1])!=typeId(current) || typeId(a[2])!=typeId(current)) return {};
-                branches.emplace_back(unwrap(a[0]),unwrap(a[1])); current=unwrap(a[2]);
-            }
-            std::vector<ValueId> updates; flatten(updateCond,false,updates);
-            const auto *fallback=def(current);
-            const bool hold=fallback && kind(*fallback)=="core.state.read" && m.objectRefs(*fallback)[0]==ObjectRef::state(s);
-            if(branches.empty()) {
-                if(hold) return {};
-                branches.emplace_back(updateCond,current);
-            } else if(!hold) {
-                // The fallback is unreachable only if every update disjunct
-                // implies at least one mux condition. Otherwise keep it at
-                // lowest priority; planWrites must prove overlap is legal.
-                const auto covered=[&](ValueId u) {
-                    if(std::any_of(branches.begin(),branches.end(),[&](const auto &branch) {return u==branch.first;}))
-                        return true;
-                    std::vector<ValueId> assumptions{u}; flatten(u,true,assumptions);
-                    return std::any_of(branches.begin(),branches.end(),[&](const auto &branch) {
-                        return implies(assumptions,branch.first);
-                    });
-                };
-                std::vector<ValueId> fallbackUpdates;
-                for(auto u:updates) if(!covered(u)) fallbackUpdates.push_back(u);
-                for(auto u:fallbackUpdates) branches.emplace_back(u,current);
-            }
-            for(const auto &[condition,data]:branches) {
-                auto g=guard(condition,row); if(!g) {parseReason="ambiguous-address";return {};}
-                // If the mux branch only carries the address hit and the
-                // regWrite update condition was separate, conjoin it here.
-                // Avoid duplicating it when the branch already implies it.
-                std::vector<ValueId> assumptions{condition}; flatten(condition,true,assumptions);
-                const bool impliesUpdate=always || std::find(updates.begin(),updates.end(),condition)!=updates.end() ||
-                    implies(assumptions,updateCond) ||
-                    std::any_of(updates.begin(),updates.end(),[&](ValueId u) { return implies(assumptions,u); });
-                if(!always && !impliesUpdate) {
-                    bool present=std::find(g->terms.begin(),g->terms.end(),updateCond)!=g->terms.end();
-                    if(!present) g->terms.push_back(updateCond);
-                    std::sort(g->terms.begin(),g->terms.end(),[](auto a,auto b){return a.index<b.index;});
-                    g->terms.erase(std::unique(g->terms.begin(),g->terms.end()),g->terms.end());
+            const bool orWrite = options.enableOrWriteMerge && parseOrWrite(result, updateCond, operands[1], row);
+            if (!orWrite) {
+                const bool always=number(updateCond)==std::optional<uint64_t>{1};
+                std::vector<std::pair<ValueId,ValueId>> branches;
+                auto current=unwrap(operands[1]); std::unordered_set<uint32_t> seen;
+                while(seen.insert(current.index).second && branches.size()<2048) {
+                    const auto *mux=def(current);
+                    if(!mux || kind(*mux)!="core.compute.mux" || m.operands(*mux).size()!=3) break;
+                    const auto a=m.operands(*mux);
+                    if(typeId(a[1])!=typeId(current) || typeId(a[2])!=typeId(current)) return {};
+                    branches.emplace_back(unwrap(a[0]),unwrap(a[1])); current=unwrap(a[2]);
                 }
-                if(g->address) { if(row && g->row!=*row) {parseReason="row-map";return {};} row=g->row; }
-                result.branches.push_back({std::move(*g),data});
+                std::vector<ValueId> updates; flatten(updateCond,false,updates);
+                const auto *fallback=def(current);
+                const bool hold=fallback && kind(*fallback)=="core.state.read" && m.objectRefs(*fallback)[0]==ObjectRef::state(s);
+                if(branches.empty()) {
+                    if(hold) return {};
+                    branches.emplace_back(updateCond,current);
+                } else if(!hold) {
+                    // The fallback is unreachable only if every update disjunct
+                    // implies at least one mux condition. Otherwise keep it at
+                    // lowest priority; planWrites must prove overlap is legal.
+                    const auto covered=[&](ValueId u) {
+                        if(std::any_of(branches.begin(),branches.end(),[&](const auto &branch) {return u==branch.first;}))
+                            return true;
+                        std::vector<ValueId> assumptions{u}; flatten(u,true,assumptions);
+                        return std::any_of(branches.begin(),branches.end(),[&](const auto &branch) {
+                            return implies(assumptions,branch.first);
+                        });
+                    };
+                    std::vector<ValueId> fallbackUpdates;
+                    for(auto u:updates) if(!covered(u)) fallbackUpdates.push_back(u);
+                    for(auto u:fallbackUpdates) branches.emplace_back(u,current);
+                }
+                for(const auto &[condition,data]:branches) {
+                    auto g=guard(condition,row); if(!g) {parseReason="ambiguous-address";return {};}
+                    // If the mux branch only carries the address hit and the
+                    // regWrite update condition was separate, conjoin it here.
+                    // Avoid duplicating it when the branch already implies it.
+                    std::vector<ValueId> assumptions{condition}; flatten(condition,true,assumptions);
+                    const bool impliesUpdate=always || std::find(updates.begin(),updates.end(),condition)!=updates.end() ||
+                        implies(assumptions,updateCond) ||
+                        std::any_of(updates.begin(),updates.end(),[&](ValueId u) { return implies(assumptions,u); });
+                    if(!always && !impliesUpdate) {
+                        bool present=std::find(g->terms.begin(),g->terms.end(),updateCond)!=g->terms.end();
+                        if(!present) g->terms.push_back(updateCond);
+                        std::sort(g->terms.begin(),g->terms.end(),[](auto a,auto b){return a.index<b.index;});
+                        g->terms.erase(std::unique(g->terms.begin(),g->terms.end()),g->terms.end());
+                    }
+                    if(g->address) { if(row && g->row!=*row) {parseReason="row-map";return {};} row=g->row; }
+                    result.branches.push_back({std::move(*g),data});
+                }
             }
             if(!row) {parseReason="no-decoded-address";return {};}
             result.row=*row;
             result.key=std::to_string(m.states()[s.index-1].type.index)+"/"+key(result.mask);
+            if (result.orMerge) result.key += "/or";
             for(std::size_t i=0;i<result.events.size();++i) result.key+="/"+key(result.events[i])+result.edges[i];
             for(const auto &b:result.branches) {
                 result.key+="/"+guardKey(b.guard)+"=";
@@ -530,6 +621,11 @@ namespace {
                 }
             }
             const auto n=first.branches.size();
+            if (first.orMerge) {
+                g.order.resize(n);
+                std::iota(g.order.begin(), g.order.end(), 0);
+                return true;
+            }
             std::vector<std::vector<uint8_t>> blocks(n,std::vector<uint8_t>(n));
             for(std::size_t i=0;i<n;++i) {
                 const auto &gi=first.branches[i].guard;
@@ -649,6 +745,27 @@ namespace {
             std::vector<Parameter> ps{{m.intern("event_edges"),first.edges}};
             std::map<std::string,std::pair<ValueId,ValueId>> fills;
             std::vector<ValueId> staticFills;
+            std::vector<ValueId> writeData;
+            for (auto i : g.order) {
+                const auto &current = first.branches[i];
+                auto data = current.data;
+                if (first.orMerge) for (auto j : g.order) {
+                    if (j == i) break;
+                    const auto &previous = first.branches[j];
+                    if (exclusive(current.guard, previous.guard)) continue;
+                    auto hit = conjunction(previous.guard.terms);
+                    if (previous.guard.address != current.guard.address) {
+                        const auto equal = compute("core.compute.eq", bit,
+                            {previous.guard.address, current.guard.address});
+                        hit = compute("core.compute.logicAnd", bit, {hit, equal});
+                    }
+                    const auto part = compute("core.compute.mux", element,
+                        {hit, previous.data, constant(element, 0)});
+                    data = compute("core.compute.or", element, {data, part});
+                }
+                writeData.push_back(data);
+            }
+            std::size_t ordinal = 0;
             // Emit one triple per logical write source in low-to-high priority
             // order.  Each scalar row carries the same source after family
             // validation; iterating rows here would write different row data
@@ -656,6 +773,7 @@ namespace {
             for (auto index : g.order) {
                 if (index >= first.branches.size()) { sequence.clear(); break; }
                 const auto &branch = first.branches[index];
+                const auto data = writeData[ordinal++];
                 auto enable = conjunction(branch.guard.terms);
                 if (m.types()[element.index - 1].width == 1 && !ones(first.mask))
                     enable = compute("core.compute.logicAnd", bit, {enable, first.mask});
@@ -697,9 +815,9 @@ namespace {
                 auto address = boundedAddress(branch.guard.address, g.base, g.rows.size(), enable);
                 if(options.enableSameAddressFusion && previousAddress==branch.guard.address && !sequence.empty()) {
                     const auto offset=sequence.size()-3;
-                    sequence[offset+2]=compute("core.compute.mux",element,{enable,branch.data,sequence[offset+2]});
+                    sequence[offset+2]=compute("core.compute.mux",element,{enable,data,sequence[offset+2]});
                     sequence[offset]=compute("core.compute.logicOr",bit,{sequence[offset],enable});
-                } else sequence.insert(sequence.end(), {enable, address, branch.data});
+                } else sequence.insert(sequence.end(), {enable, address, data});
                 previousAddress=branch.guard.address;
             }
             if (!staticFills.empty())
@@ -952,6 +1070,12 @@ namespace {
                     if(branch.guard.address) writeAdded+=2+(g.base?3:0);
                     else writeAdded+=g.rows.size(); // Broadcast touches every cell.
                 }
+                if (first.orMerge) {
+                    // Pairwise collision merging is shared by every table row.
+                    const auto ports = static_cast<int64_t>(first.branches.size());
+                    writeAdded += 4 * ports * (ports - 1) / 2;
+                    g.detail += "or-merge; ";
+                }
             }
             std::vector<OpId> combined=writeRoots;
             combined.insert(combined.end(),readRoots.begin(),readRoots.end());
@@ -1097,6 +1221,7 @@ void registerRegToMemPass(PassRegistry &registry) {
                     if(name=="--enable-same-address-fusion") flag=&o.enableSameAddressFusion;
                     if(name=="--enable-cost-selection") flag=&o.enableCostSelection;
                     if(name=="--enable-row-constant-fill") flag=&o.enableRowConstantFill;
+                    if(name=="--enable-or-write-merge") flag=&o.enableOrWriteMerge;
                     if(!flag || (value!="true" && value!="false")) {error="unknown reg-to-mem option or invalid boolean";return {};}
                     *flag=value=="true";
                 }

@@ -152,6 +152,8 @@ private:
         else if (kind == "core.compute.xor") result = a(0) ^ a(1);
         else if (kind == "core.compute.lshr") result = a(1)>=64?0:a(0)>>a(1);
         else if (kind == "core.compute.and") result = a(0) & a(1);
+        else if (kind == "core.compute.or") result = a(0) | a(1);
+        else if (kind == "core.compute.reduceOr") result = a(0) != 0;
         else if (kind == "core.compute.logicAnd") result = a(0) && a(1);
         else if (kind == "core.compute.logicOr") result = a(0) || a(1);
         else if (kind == "core.compute.logicNot") result = !a(0);
@@ -307,6 +309,119 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
     return m;
 }
 
+// OR collision semantics differ from priority muxes even with identical ports.
+GrhSimModel orFixture(unsigned mode = 0) {
+    GrhSimModel m("or-writes");
+    m.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+    const auto bit = m.logicType(1, false, LogicDomain::TwoState);
+    const auto word = m.logicType(mode == 4 ? 1 : mode == 13 ? 64 : 2, false, LogicDomain::TwoState);
+    const auto address = m.logicType(3, false, LogicDomain::TwoState);
+    auto input = [&](std::string_view name, TypeId type) {
+        const auto id = m.addInput(name, type);
+        const auto v = m.addValue(type);
+        m.addOperation("core.input.read", {}, std::array{v}, std::array{ObjectRef::input(id)});
+        return v;
+    };
+    auto compute = [&](std::string_view k, TypeId type, std::vector<ValueId> args) {
+        const auto v = m.addValue(type);
+        m.addOperation(k, args, std::array{v});
+        return v;
+    };
+    auto constant = [&](TypeId type, uint64_t n) {
+        const auto v = m.addValue(type);
+        m.addOperation("core.compute.constant", {}, std::array{v}, {},
+            std::array{Parameter{m.intern("value"), std::to_string(m.types()[type.index - 1].width) + "'d" + std::to_string(n)}});
+        return v;
+    };
+    std::array<ValueId, 3> addresses, data, enables;
+    for (unsigned i = 0; i < 3; ++i) {
+        addresses[i] = input("addr" + std::to_string(i), address);
+        data[i] = input("data" + std::to_string(i), word);
+        enables[i] = input("enable" + std::to_string(i), bit);
+    }
+    const auto global = input("global", bit), clock = input("clock", bit);
+    const auto zero = constant(word, mode == 7 ? 1 : 0);
+    const auto mask = constant(word, mode == 8 ? 1 : mode == 13 ? ~uint64_t{0} : mode == 4 ? 1 : 3);
+    ValueId feedback;
+    for (unsigned row = 1; row <= 4; ++row) {
+        const auto q = m.addState("opaque" + std::to_string((row * 17 + 3) % 37), word);
+        const auto history = m.addState("edge" + std::to_string(7 - row), bit);
+        const std::array steps{InitStep{m.intern("core.init.const"), {0, 1}}};
+        m.addInit(q, steps, std::array{Parameter{m.intern("value"), std::to_string(m.types()[word.index - 1].width) + "'d" + std::to_string(row % (mode == 4 ? 2 : 4))}});
+        m.addInit(history, steps, std::array{Parameter{m.intern("value"), std::string("1'b1")}});
+        const auto old = m.addValue(word);
+        m.addOperation("core.state.read", {}, std::array{old}, std::array{ObjectRef::state(q)});
+        if (!feedback) feedback = old;
+        const auto out = m.addOutput("out" + std::to_string(row), word);
+        m.addOperation("core.output.write", std::array{old}, {}, std::array{ObjectRef::output(out)});
+        std::vector<ValueId> hits;
+        ValueId next;
+        for (unsigned port = 0; port < 3; ++port) {
+            auto hit = compute("core.compute.eq", bit,
+                {addresses[mode == 3 ? 0 : port], constant(address, row)});
+            hit = compute("core.compute.and", bit, {enables[port], hit});
+            if (mode == 9 && port == 2)
+                hit = compute("core.compute.and", bit, {hit, compute("core.compute.logicNot", bit, {hits[0]})});
+            hits.push_back(hit);
+            const auto part = compute("core.compute.mux", word,
+                {hit, mode == 11 && port == 0 ? feedback : data[port], zero});
+            next = next ? compute("core.compute.or", word, {next, part}) : part;
+        }
+        auto update = compute("core.compute.or", bit, {hits[0], hits[1]});
+        if (mode != 6) update = compute("core.compute.or", bit, {update, hits[2]});
+        if (mode == 1 || mode == 2 || mode == 13)
+            update = compute("core.compute.reduceOr", bit, {compute("core.compute.concat", address, hits)});
+        if (mode == 2) update = compute("core.compute.and", bit, {global, update});
+        if (mode == 5) update = compute("core.compute.or", bit, {global, update});
+        m.addOperation("core.state.regWrite", std::array{update, next, mask, mode == 10 && row == 4 ? global : clock}, {},
+            std::array{ObjectRef::state(q), ObjectRef::state(history)},
+            std::array{Parameter{m.intern("event_edges"), std::vector<std::string>{"posedge"}}});
+    }
+    return m;
+}
+
+void orWriteTests() {
+    for (unsigned mode : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 13u}) {
+        for (bool enabled : {false, true}) {
+            auto original = orFixture(mode), rewritten = orFixture(mode);
+            auto options = semanticOptions();
+            options.enableOrWriteMerge = enabled;
+            options.enableReadRewrite = false;
+            diag::Diagnostics diagnostics;
+            check(verifyGrhSimModel(original, defaultDialectRegistry(), diagnostics), "invalid OR fixture");
+            std::ostringstream before, after;
+            check(writeGrhSimJson(rewritten, before, defaultDialectRegistry(), diagnostics), "OR snapshot failed");
+            RegToMemPass pass(options);
+            const auto result = pass.run(rewritten, diagnostics);
+            const bool accepted = enabled && (mode <= 4 || mode == 11 || mode == 13);
+            if (!result.success || result.changed != accepted)
+                throw std::runtime_error("OR candidate selection failed mode=" + std::to_string(mode) + " gate=" + std::to_string(enabled));
+            check(verifyGrhSimModel(rewritten, defaultDialectRegistry(), diagnostics), "invalid OR rewrite");
+            if (!accepted) {
+                check(writeGrhSimJson(rewritten, after, defaultDialectRegistry(), diagnostics), "OR resnapshot failed");
+                check(before.str() == after.str(), "rejected or disabled OR candidate mutated model");
+                continue;
+            }
+            check(!pass.run(rewritten, diagnostics).changed, "OR rewrite is not idempotent");
+            Simulation reference(original), candidate(rewritten);
+            std::mt19937_64 random(240927 + mode);
+            for (unsigned sample = 0; sample < 32768; ++sample) {
+                std::vector<uint64_t> inputs;
+                for (unsigned port = 0; port < 3; ++port) {
+                    // Force frequent 3-port collisions, including data 1|2.
+                    inputs.push_back(sample % 4 == 0 ? 1 : random() % 8);
+                    inputs.push_back(mode == 13 ? random() : mode == 4 ? random() % 2 : (sample % 4 == 0 ? (port % 2) + 1 : random() % 4));
+                    inputs.push_back(sample % 4 == 0 ? 1 : random() % 2);
+                }
+                inputs.push_back(random() % 2);
+                inputs.push_back(sample % 4 == 0 ? 1 : random() % 2);
+                reference.step(inputs); candidate.step(inputs);
+                check(reference.outputs() == candidate.outputs(), "OR merge changed state transition");
+            }
+        }
+    }
+}
+
 // Observe scalar reads through an event-sensitive side effect with no results.
 // Its history and old-state arguments must survive storage compaction.
 void addDpiProbe(GrhSimModel &model) {
@@ -406,6 +521,7 @@ GrhSimModel readFixture(bool readOnly, bool repeated, unsigned window=0, unsigne
 }
 
 void regToMemSemanticsTests() {
+    orWriteTests();
     {
         // Names are diagnostic hints only. Row zero may be a constant output
         // outside the recovered writable range [1, 5).
@@ -862,8 +978,9 @@ void regToMemSemanticsTests() {
 }
 
 void regToMemEmitChecks(const std::filesystem::path &directory) {
-    for(unsigned shape=0;shape<10;++shape) {
+    for(unsigned shape=0;shape<14;++shape) {
         const auto build=[&]() {
+            if(shape>=10) return orFixture(std::array{0u,2u,11u,13u}[shape-10]);
             if(shape==8) return fixture(21,4,true);
             if(shape==9) return fixture(22,4,true);
             if(shape==4) return readFixture(false,false,1,1);
@@ -874,13 +991,15 @@ void regToMemEmitChecks(const std::filesystem::path &directory) {
         };
         auto original=build(), rewritten=build();
         const auto path=directory/std::array{"writes","reads","windows","shifted_windows","edge_window","overlap",
-            "multi_bit_window","multi_bit_shift","row_constant_fill","row_constant_fill_overlap"}[shape];
+            "multi_bit_window","multi_bit_shift","row_constant_fill","row_constant_fill_overlap",
+            "or_writes","or_global","or_feedback","or_word64"}[shape];
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
         diag::Diagnostics diagnostics;
         PassManager manager(defaultDialectRegistry());
         auto options = semanticOptions();
         options.enableRowConstantFill = shape >= 8;
+        options.enableOrWriteMerge = shape >= 10;
         manager.addPass(std::make_unique<RegToMemPass>(options));
         for(auto name:{"cpu.st.split-phase","cpu.st.form-event-domains","cpu.st.build-compute-nodes",
             "cpu.st.merge-compute-supernodes","cpu.st.pack-active-words","cpu.st.pack-emit-functions",

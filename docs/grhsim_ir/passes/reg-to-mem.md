@@ -39,6 +39,44 @@ data to write; event operands follow the triples. Later triples win on an
 address collision. Overlapping fill branches may be combined only when their
 data agree in every row; equality in the first row alone is insufficient.
 
+With `--enable-or-write-merge`, the pass also recovers OR reductions of
+zero-fallback muxes. These are simultaneous writes, so a collision must combine
+data rather than choose one port. For three ports, with
+`hit_j(row) = enable_j && address_j == row`, the original row is:
+
+```text
+if (hit_0(row) || hit_1(row) || hit_2(row))
+    q[row] = (hit_0(row) ? data_0 : 0)
+           | (hit_1(row) ? data_1 : 0)
+           | (hit_2(row) ? data_2 : 0)
+```
+
+The replacement builds shared data expressions before mapping:
+
+```text
+merged_0 = data_0
+merged_1 = data_1 | (enable_0 && address_0 == address_1 ? data_0 : 0)
+merged_2 = data_2 | (enable_0 && address_0 == address_2 ? data_0 : 0)
+                 | (enable_1 && address_1 == address_2 ? data_1 : 0)
+memWriteSeq(table, (enable_0, address_0, merged_0),
+                  (enable_1, address_1, merged_1),
+                  (enable_2, address_2, merged_2), clock)
+```
+
+The last enabled port at each address contains all enabled data for that
+address. Two colliding writes of 1 and 2 therefore produce 3. No enabled port
+means no write; every operand still reads pre-commit state. Bounds and nonzero
+row bases use the existing address normalization. The number of collision
+expressions depends on the port count, not the number of rows.
+
+Recognition requires two-state data, all-ones masks, address-decoded guards,
+zero mux fallbacks, and an update condition equal to the OR of the mux guards.
+`reduceOr(concat(one-bit guards))` is also recognized. Common global AND terms
+are retained on every port. Extra/missing update disjuncts, priority blockers,
+different address types, and more than 64 ports are rejected. The existing
+event-history, initialization, ownership and cost checks still apply. The cost
+estimate charges the pairwise collision logic; it is not a runtime prediction.
+
 Tables can be discovered from writes without a packed read anchor, or from concat
 read views. Compatible shared `sliceArray` users become indexed `memRead`.
 `sliceDynamic` windows up to 64 bits and `sliceStatic(lshr(...))` windows become a
@@ -70,6 +108,7 @@ Factory options take explicit values:
 | `--enable-same-address-fusion` | `true` | Combine adjacent sequence writes with identical addresses |
 | `--enable-cost-selection` | `true` | Skip plans whose estimated access/computation savings are nonpositive |
 | `--enable-row-constant-fill` | `false` | Merge families whose fill data is a per-row constant, expanding the fill to static-address sequence triples |
+| `--enable-or-write-merge` | `false` | Recover OR-of-zero-mux writes while preserving same-address data OR |
 | `--report` | unset | Write a candidate TSV report |
 
 Mandatory fixed-address reference replacement still happens when read compression is

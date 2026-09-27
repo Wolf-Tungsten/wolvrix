@@ -263,8 +263,18 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
         }
         auto update = mode == 0 ? u : compute("core.compute.logicOr", bit, {low, high});
         if (mode >= 4 && mode!=20) update = compute("core.compute.logicOr", bit, {reset, update});
-        auto next = compute("core.compute.mux", word, {low, d0, mode == 0 ? old : zero});
+        // Mode 21: the reset fallback writes the row number (identity init), so
+        // the fill data is a per-row constant that only the row-constant-fill
+        // extension may merge.
+        auto next = compute("core.compute.mux", word, {low, d0, mode == 0 ? old :
+            (mode == 21 ? constant(word, row) : zero)});
         next = compute("core.compute.mux", word, {high, d1, next});
+        if (mode == 22) {
+            // Both fills write zero in the first row, but disagree elsewhere.
+            // The higher-priority fill must not be reordered before memFill.
+            const auto fill = compute("core.compute.logicAnd", bit, {reset, e0});
+            next = compute("core.compute.mux", word, {fill, constant(word, row), next});
+        }
         if(mode==20) {
             // Same-address writes separated by a possibly aliasing write must
             // preserve the middle writer's priority; adjacent fusion cannot jump it.
@@ -513,6 +523,102 @@ void regToMemSemanticsTests() {
                         check(reference.outputs() == candidate.outputs(), "reg-to-mem changed a state transition");
                     }
     }
+    {
+        auto model = fixture(22, 4, true);
+        auto options = semanticOptions();
+        options.enableReadRewrite = false;
+        options.enableRowConstantFill = true;
+        diag::Diagnostics diagnostics;
+        check(verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics),
+            "invalid overlapping row-constant-fill fixture");
+        std::ostringstream before, after;
+        check(writeGrhSimJson(model, before, defaultDialectRegistry(), diagnostics),
+            "overlapping fill snapshot failed");
+        RegToMemPass pass(options);
+        const auto result = pass.run(model, diagnostics);
+        check(result.success && !result.changed,
+            "overlapping fills were accepted using only the first row's data");
+        check(writeGrhSimJson(model, after, defaultDialectRegistry(), diagnostics),
+            "overlapping fill resnapshot failed");
+        check(before.str() == after.str(), "rejected overlapping fills mutated the model");
+    }
+    for (bool rowConstantFill : {false, true}) {
+        // NO00022: identity-init reset writes the row number, so the fill data
+        // is a per-row constant.  The family must stay scalar without the gate
+        // and merge into one static-triple sequence with it.
+        auto original = fixture(21), rewritten = fixture(21, 4, true);
+        diag::Diagnostics diagnostics;
+        RegToMemOptions options;
+        options.enableCostSelection = false;
+        options.enableReadRewrite = false;
+        options.enableRowConstantFill = rowConstantFill;
+        RegToMemPass pass(options);
+        check(verifyGrhSimModel(original, defaultDialectRegistry(), diagnostics),
+            "invalid row-constant-fill fixture");
+        if (!rowConstantFill) {
+            std::ostringstream before, after;
+            check(writeGrhSimJson(rewritten, before, defaultDialectRegistry(), diagnostics),
+                "row-constant-fill gate-off snapshot failed");
+            const auto result = pass.run(rewritten, diagnostics);
+            check(result.success && !result.changed, "row-constant fill merged without its gate");
+            check(writeGrhSimJson(rewritten, after, defaultDialectRegistry(), diagnostics),
+                "row-constant-fill gate-off resnapshot failed");
+            check(before.str() == after.str(), "disabled row-constant fill mutated the model");
+            continue;
+        }
+        const auto result = pass.run(rewritten, diagnostics);
+        check(result.success && result.changed, "row-constant-fill family was not recovered");
+        check(verifyGrhSimModel(rewritten, defaultDialectRegistry(), diagnostics),
+            "invalid row-constant-fill rewrite");
+        auto constValue = [&](ValueId v) -> std::optional<uint64_t> {
+            for (const auto &op : rewritten.operations())
+                for (auto result : rewritten.results(op)) {
+                    if (result != v || rewritten.text(op.opType) != "core.compute.constant") continue;
+                    for (const auto &p : rewritten.parameters(op))
+                        if (rewritten.text(p.name) == "value") {
+                            const auto text = std::get<std::string>(p.value);
+                            return std::stoull(text.substr(text.find('\'') + 2));
+                        }
+                }
+            return std::nullopt;
+        };
+        unsigned sequences = 0, fills = 0;
+        for (const auto &op : rewritten.operations()) {
+            const auto kind = rewritten.text(op.opType);
+            fills += kind == "core.state.memFill";
+            if (kind != "core.state.memWriteSeq") continue;
+            ++sequences;
+            const auto args = rewritten.operands(op);
+            std::size_t events = 0;
+            for (const auto &p : rewritten.parameters(op))
+                if (rewritten.text(p.name) == "event_edges")
+                    events = std::get<std::vector<std::string>>(p.value).size();
+            const std::size_t triples = (args.size() - events) / 3;
+            check(triples == 6, "row-constant fill did not emit 4 static + 2 port triples");
+            const auto sharedEnable = args[0];
+            for (std::size_t row = 0; row < 4; ++row) {
+                check(args[row * 3] == sharedEnable, "static fill triples lost the shared fill enable");
+                check(constValue(args[row * 3 + 1]) == std::optional<uint64_t>(row),
+                    "static fill triple address is not the row position");
+                check(constValue(args[row * 3 + 2]) == std::optional<uint64_t>(row),
+                    "static fill triple data is not the per-row constant");
+            }
+        }
+        check(sequences == 1 && fills == 0, "row-constant fill left a memFill or extra sequence");
+        check(!pass.run(rewritten, diagnostics).changed, "row-constant fill is not idempotent");
+        Simulation reference(original), candidate(rewritten);
+        for (uint64_t a0 = 0; a0 < 8; ++a0) for (uint64_t a1 = 0; a1 < 8; ++a1)
+            for (uint64_t enables = 0; enables < 8; ++enables)
+                for (uint64_t data = 0; data < 16; ++data)
+                    for (uint64_t clock : {1u, 0u, 1u, 1u}) {
+                        const std::vector<uint64_t> inputs{a0, a1, data & 3, data >> 2,
+                            enables & 1, (enables >> 1) & 1, enables >> 2, clock};
+                        reference.step(inputs);
+                        candidate.step(inputs);
+                        check(reference.outputs() == candidate.outputs(),
+                            "row-constant fill changed a state transition");
+                    }
+    }
     for(bool readOnly:{false,true}) for(bool repeated:{false,true}) {
         auto original=readFixture(readOnly,repeated), rewritten=readFixture(readOnly,repeated);
         diag::Diagnostics diagnostics;
@@ -756,8 +862,10 @@ void regToMemSemanticsTests() {
 }
 
 void regToMemEmitChecks(const std::filesystem::path &directory) {
-    for(unsigned shape=0;shape<8;++shape) {
+    for(unsigned shape=0;shape<10;++shape) {
         const auto build=[&]() {
+            if(shape==8) return fixture(21,4,true);
+            if(shape==9) return fixture(22,4,true);
             if(shape==4) return readFixture(false,false,1,1);
             if(shape==5) return readFixture(false,false,0,2);
             if(shape==6) return readFixture(false,false,1,1,3);
@@ -766,12 +874,14 @@ void regToMemEmitChecks(const std::filesystem::path &directory) {
         };
         auto original=build(), rewritten=build();
         const auto path=directory/std::array{"writes","reads","windows","shifted_windows","edge_window","overlap",
-            "multi_bit_window","multi_bit_shift"}[shape];
+            "multi_bit_window","multi_bit_shift","row_constant_fill","row_constant_fill_overlap"}[shape];
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
         diag::Diagnostics diagnostics;
         PassManager manager(defaultDialectRegistry());
-        manager.addPass(std::make_unique<RegToMemPass>(semanticOptions()));
+        auto options = semanticOptions();
+        options.enableRowConstantFill = shape >= 8;
+        manager.addPass(std::make_unique<RegToMemPass>(options));
         for(auto name:{"cpu.st.split-phase","cpu.st.form-event-domains","cpu.st.build-compute-nodes",
             "cpu.st.merge-compute-supernodes","cpu.st.pack-active-words","cpu.st.pack-emit-functions",
             "cpu.st.layout-data","cpu.st.build-schedule"}) {

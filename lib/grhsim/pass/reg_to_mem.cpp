@@ -335,7 +335,16 @@ namespace {
             result.row=*row;
             result.key=std::to_string(m.states()[s.index-1].type.index)+"/"+key(result.mask);
             for(std::size_t i=0;i<result.events.size();++i) result.key+="/"+key(result.events[i])+result.edges[i];
-            for(const auto &b:result.branches) result.key+="/"+guardKey(b.guard)+"="+key(b.data);
+            for(const auto &b:result.branches) {
+                result.key+="/"+guardKey(b.guard)+"=";
+                // A fill branch whose data is a compile-time constant may
+                // legitimately differ per row (identity-init reset writes the
+                // row number).  Mark it row-independently so such rows still
+                // form one family; rewriteGroup re-expands the per-row data.
+                if(options.enableRowConstantFill && !b.guard.address && literal(b.data))
+                    result.key+="ROWCONST";
+                else result.key+=key(b.data);
+            }
             return result;
         }
 
@@ -542,7 +551,15 @@ namespace {
                 const auto &a=first.branches[i].guard, &b=first.branches[j].guard;
                 if(exclusive(a,b)) continue;
                 if(!a.address || !b.address) {
-                    if(!a.address && !b.address && key(first.branches[i].data)==key(first.branches[j].data)) continue;
+                    if (!a.address && !b.address &&
+                        key(first.branches[i].data) == key(first.branches[j].data)) {
+                        // Row-constant family keys omit fill data. Equal fills
+                        // in the first row need not agree in the other rows.
+                        if (!options.enableRowConstantFill ||
+                            std::all_of(g.writes.begin(), g.writes.end(), [&](const RowWrite &write) {
+                                return key(write.branches[i].data) == key(write.branches[j].data);
+                            })) continue;
+                    }
                     g.reason="fill-overlap"; return false;
                 }
                 if(blocks[i][j] && blocks[j][i]) {g.reason="priority-cycle";return false;}
@@ -631,6 +648,7 @@ namespace {
             for(auto h:first.histories) objects.push_back(ObjectRef::state(h));
             std::vector<Parameter> ps{{m.intern("event_edges"),first.edges}};
             std::map<std::string,std::pair<ValueId,ValueId>> fills;
+            std::vector<ValueId> staticFills;
             // Emit one triple per logical write source in low-to-high priority
             // order.  Each scalar row carries the same source after family
             // validation; iterating rows here would write different row data
@@ -642,6 +660,34 @@ namespace {
                 if (m.types()[element.index - 1].width == 1 && !ones(first.mask))
                     enable = compute("core.compute.logicAnd", bit, {enable, first.mask});
                 if (!branch.guard.address) {
+                    if (options.enableRowConstantFill) {
+                        // A fill branch whose data is a per-row constant (e.g.
+                        // an identity-init reset writing the row number) cannot
+                        // share one memFill value.  Expand it to one
+                        // static-address triple per row; planWrites proved the
+                        // fill guard exclusive with every addressed branch, so
+                        // placing these triples at the front (lowest priority)
+                        // keeps the original fallback semantics.
+                        bool uniform = true, allConstant = true;
+                        std::vector<ValueId> rowData;
+                        rowData.reserve(g.writes.size());
+                        const auto firstDataKey = key(branch.data);
+                        for (const auto &w : g.writes) {
+                            const ValueId data = w.branches[index].data;
+                            rowData.push_back(data);
+                            uniform &= key(data) == firstDataKey;
+                            allConstant &= literal(data).has_value();
+                        }
+                        if (!uniform) {
+                            if (!allConstant)
+                                throw std::runtime_error("reg-to-mem row-constant fill data is not constant");
+                            for (uint32_t row = 0; row < rowData.size(); ++row) {
+                                const ValueId rowAddress = constant(indexType, row);
+                                staticFills.insert(staticFills.end(), {enable, rowAddress, rowData[row]});
+                            }
+                            continue;
+                        }
+                    }
                     const auto k = key(branch.data);
                     auto it = fills.find(k);
                     if (it == fills.end()) fills.emplace(k, std::pair{enable, branch.data});
@@ -656,6 +702,8 @@ namespace {
                 } else sequence.insert(sequence.end(), {enable, address, branch.data});
                 previousAddress=branch.guard.address;
             }
+            if (!staticFills.empty())
+                sequence.insert(sequence.begin(), staticFills.begin(), staticFills.end());
             if(sequence.size()==3) {
                 sequence.push_back(first.mask); sequence.insert(sequence.end(),first.events.begin(),first.events.end());
                 m.addOperation("core.state.memWrite",sequence,{},objects,ps);
@@ -892,9 +940,14 @@ namespace {
                 const auto &first=g.writes[0];
                 keep(first.mask);
                 for(auto value:first.events) keep(value);
-                for(const auto &branch:first.branches) {
+                for(std::size_t bi=0;bi<first.branches.size();++bi) {
+                    const auto &branch=first.branches[bi];
                     keep(branch.guard.address);keep(branch.data);
                     for(auto value:branch.guard.terms) keep(value);
+                    // Row-constant fill triples reference every row's own data
+                    // constant, not only the first row's.
+                    if(options.enableRowConstantFill && !branch.guard.address)
+                        for(const auto &w:g.writes) keep(w.branches[bi].data);
                     writeAdded+=static_cast<int64_t>(branch.guard.terms.size())+3;
                     if(branch.guard.address) writeAdded+=2+(g.base?3:0);
                     else writeAdded+=g.rows.size(); // Broadcast touches every cell.
@@ -1043,6 +1096,7 @@ void registerRegToMemPass(PassRegistry &registry) {
                     if(name=="--enable-write-merge") flag=&o.enableWriteMerge;
                     if(name=="--enable-same-address-fusion") flag=&o.enableSameAddressFusion;
                     if(name=="--enable-cost-selection") flag=&o.enableCostSelection;
+                    if(name=="--enable-row-constant-fill") flag=&o.enableRowConstantFill;
                     if(!flag || (value!="true" && value!="false")) {error="unknown reg-to-mem option or invalid boolean";return {};}
                     *flag=value=="true";
                 }

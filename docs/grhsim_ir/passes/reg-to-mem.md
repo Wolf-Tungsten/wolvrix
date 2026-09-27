@@ -22,8 +22,22 @@ history object detect the event independently of the write enables.
 The pass preserves a separate `regWrite` update condition unless implication is
 proved. It also preserves uncovered default-value branches. Identical broadcast
 updates can become `memFill(enable, data, events...)`, provided they do not overlap
-other writes. A single indexed update uses `memWrite(enable, address, data, mask,
-events...)`. Multi-bit masked sequences are rejected because `memWriteSeq` has no mask.
+other writes. With `--enable-row-constant-fill`, a default branch whose data is a
+compile-time constant that differs per row (for example an identity-init reset
+writing the row number) no longer fragments the family key; the branch expands to
+one static-address sequence triple per row at the lowest priority instead of a
+`memFill`. The usual overlap proof still applies, so those triples stay exclusive
+with every decoded write. A single indexed update uses `memWrite(enable, address,
+data, mask, events...)`. Multi-bit masked sequences are rejected because
+`memWriteSeq` has no mask.
+
+For example, `if (reset) q[row] = row; else if (en && addr == row)
+q[row] = data` becomes one array and a `memWriteSeq` with triples
+`(reset, 0, 0), (reset, 1, 1), ..., (!reset && en, addr, data)`. Each triple
+contains an enable, an array index relative to the recovered row base, and the
+data to write; event operands follow the triples. Later triples win on an
+address collision. Overlapping fill branches may be combined only when their
+data agree in every row; equality in the first row alone is insufficient.
 
 Tables can be discovered from writes without a packed read anchor, or from concat
 read views. Compatible shared `sliceArray` users become indexed `memRead`.
@@ -55,6 +69,7 @@ Factory options take explicit values:
 | `--enable-write-merge` | `true` | Consolidate compatible writes |
 | `--enable-same-address-fusion` | `true` | Combine adjacent sequence writes with identical addresses |
 | `--enable-cost-selection` | `true` | Skip plans whose estimated access/computation savings are nonpositive |
+| `--enable-row-constant-fill` | `false` | Merge families whose fill data is a per-row constant, expanding the fill to static-address sequence triples |
 | `--report` | unset | Write a candidate TSV report |
 
 Mandatory fixed-address reference replacement still happens when read compression is

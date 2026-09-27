@@ -260,6 +260,21 @@ namespace wolvrix::lib::grh
                 }
                 clone.addDeclaredSymbol(dstSym);
             }
+
+            for (const auto &srcGroup : source.generateGroups())
+            {
+                const SymbolId dstScope = mapSymbol(srcGroup.scope);
+                const SymbolId dstName = mapSymbol(srcGroup.name);
+                const std::size_t dstGroup = clone.addGenerateGroup(dstScope, dstName);
+                for (const auto srcSym : srcGroup.symbols)
+                {
+                    if (!srcSym.valid())
+                    {
+                        continue;
+                    }
+                    clone.addGenerateGroupSymbol(dstGroup, mapSymbol(srcSym));
+                }
+            }
         }
     } // namespace
 
@@ -3060,6 +3075,97 @@ namespace wolvrix::lib::grh
         return std::span<const SymbolId>(declaredSymbols_.data(), declaredSymbols_.size());
     }
 
+    std::size_t Graph::addGenerateGroup(SymbolId scope, SymbolId name)
+    {
+        if (!scope.valid() || !name.valid())
+        {
+            throw std::runtime_error("Generate group scope/name symbol is invalid");
+        }
+        if (!symbols_.valid(scope) || !symbols_.valid(name))
+        {
+            throw std::runtime_error(
+                "Generate group scope/name symbol is not in the graph symbol table");
+        }
+        generateGroups_.push_back(GenerateGroup{scope, name, {}});
+        return generateGroups_.size() - 1;
+    }
+
+    void Graph::addGenerateGroupSymbol(std::size_t group, SymbolId symbol)
+    {
+        if (group >= generateGroups_.size())
+        {
+            throw std::runtime_error("Generate group index out of range");
+        }
+        if (!symbol.valid())
+        {
+            throw std::runtime_error("Generate group symbol is invalid");
+        }
+        if (!symbols_.valid(symbol))
+        {
+            throw std::runtime_error("Generate group symbol is not in the graph symbol table");
+        }
+        generateGroups_[group].symbols.push_back(symbol);
+    }
+
+    const std::vector<Graph::GenerateGroup>& Graph::generateGroups() const noexcept
+    {
+        return generateGroups_;
+    }
+
+    std::vector<std::string> Graph::validateDeclaredSymbols() const
+    {
+        std::vector<std::string> issues;
+        auto memberText = [&](SymbolId sym) -> std::string
+        {
+            if (sym.valid() && symbols_.valid(sym))
+            {
+                return std::string(symbolText(sym));
+            }
+            return std::string("<invalid>");
+        };
+        auto checkMember = [&](SymbolId sym, std::string_view prefix)
+        {
+            if (!sym.valid() || !symbols_.valid(sym) ||
+                (!findValue(sym).valid() && !findOperation(sym).valid()))
+            {
+                issues.push_back(std::string(prefix) + memberText(sym));
+            }
+        };
+        for (const SymbolId sym : declaredSymbols_)
+        {
+            checkMember(sym, "declared:");
+        }
+        for (const GenerateGroup& group : generateGroups_)
+        {
+            if (!group.scope.valid() || !symbols_.valid(group.scope))
+            {
+                issues.push_back("generateGroupScope:" + memberText(group.scope));
+            }
+            if (!group.name.valid() || !symbols_.valid(group.name))
+            {
+                issues.push_back("generateGroupName:" + memberText(group.name));
+            }
+            for (const SymbolId sym : group.symbols)
+            {
+                checkMember(sym, "generateGroup:");
+            }
+        }
+        return issues;
+    }
+
+    void Graph::removeSymbolFromGenerateGroups(SymbolId sym) noexcept
+    {
+        if (!sym.valid() || generateGroups_.empty())
+        {
+            return;
+        }
+        for (GenerateGroup& group : generateGroups_)
+        {
+            std::vector<SymbolId>& symbols = group.symbols;
+            symbols.erase(std::remove(symbols.begin(), symbols.end(), sym), symbols.end());
+        }
+    }
+
     void Graph::freeze()
     {
         if (builder_)
@@ -3829,6 +3935,7 @@ namespace wolvrix::lib::grh
             {
                 removeDeclaredSymbol(declaredSymbol);
             }
+            removeSymbolFromGenerateGroups(declaredSymbol);
             invalidateOperationsCache();
         }
         return result;
@@ -3850,6 +3957,7 @@ namespace wolvrix::lib::grh
             {
                 removeDeclaredSymbol(declaredSymbol);
             }
+            removeSymbolFromGenerateGroups(declaredSymbol);
             invalidateOperationsCache();
         }
         return result;
@@ -3871,6 +3979,7 @@ namespace wolvrix::lib::grh
             {
                 removeDeclaredSymbol(declaredSymbol);
             }
+            removeSymbolFromGenerateGroups(declaredSymbol);
             invalidateOperationsCache();
         }
         return result;
@@ -3892,6 +4001,7 @@ namespace wolvrix::lib::grh
             {
                 removeDeclaredSymbol(declaredSymbol);
             }
+            removeSymbolFromGenerateGroups(declaredSymbol);
             invalidateValuesCache();
         }
         return result;
@@ -3913,6 +4023,7 @@ namespace wolvrix::lib::grh
             {
                 removeDeclaredSymbol(declaredSymbol);
             }
+            removeSymbolFromGenerateGroups(declaredSymbol);
             invalidateValuesCache();
         }
         return result;
@@ -3955,6 +4066,11 @@ namespace wolvrix::lib::grh
 
     void Graph::setOpSymbol(OperationId op, SymbolId sym)
     {
+        // Only rebinds the op's symbol. declaredSymbols_/generateGroups_
+        // membership is keyed on SymbolId and is intentionally not updated:
+        // symbol transplantation (handing the old SymbolId to an equivalent
+        // new entity) preserves membership naturally, while a plain rename
+        // leaves the old SymbolId's membership untouched.
         GraphBuilder &builder = ensureBuilder();
         builder.setOpSymbol(op, sym);
         // No cache invalidation needed - doesn't affect value/op/port lists
@@ -3962,6 +4078,8 @@ namespace wolvrix::lib::grh
 
     void Graph::setValueSymbol(ValueId value, SymbolId sym)
     {
+        // Only rebinds the value's symbol; same declaredSymbols_/generateGroups_
+        // membership contract as setOpSymbol.
         GraphBuilder &builder = ensureBuilder();
         builder.setValueSymbol(value, sym);
         // No cache invalidation needed - doesn't affect value/op/port lists
@@ -4024,6 +4142,29 @@ namespace wolvrix::lib::grh
             writer.writeValue(requireSymbolText(sym, "Declared symbol"));
         }
         writer.endArray();
+
+        if (!generateGroups_.empty())
+        {
+            writer.writeProperty("generateGroups");
+            writer.startArray();
+            for (const GenerateGroup &group : generateGroups_)
+            {
+                writer.startObject();
+                writer.writeProperty("scope");
+                writer.writeValue(requireSymbolText(group.scope, "Generate group scope"));
+                writer.writeProperty("name");
+                writer.writeValue(requireSymbolText(group.name, "Generate group name"));
+                writer.writeProperty("symbols");
+                writer.startArray();
+                for (const auto sym : group.symbols)
+                {
+                    writer.writeValue(requireSymbolText(sym, "Generate group symbol"));
+                }
+                writer.endArray();
+                writer.endObject();
+            }
+            writer.endArray();
+        }
 
         writer.writeProperty("vals");
         writer.startArray();

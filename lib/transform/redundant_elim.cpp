@@ -909,7 +909,8 @@ namespace wolvrix::lib::transform
                             }
                         }
                     }
-                    if (alwaysTrue)
+                    if (alwaysTrue &&
+                        (isTemporarySymbol(graph, resultValue) || isOutputPortValue(resultValue)))
                     {
                         auto onError = [&](const std::string &msg)
                         { this->error(graph, op, msg); };

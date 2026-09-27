@@ -345,6 +345,54 @@ namespace wolvrix::lib::transform
             return info;
         };
 
+        // Path segments that match no instance op may name generate scopes.
+        // Ingest names generate-scope signals "<block>$<round>$...$<name>"
+        // inside the enclosing graph, so the remaining segments compose the
+        // leaf symbol text directly ("gen_loop[3]" -> "gen_loop$3").
+        auto composeGenerateLeafName = [](const std::vector<std::string> &segments,
+                                          std::size_t first) -> std::string
+        {
+            std::string out;
+            for (std::size_t k = first; k < segments.size(); ++k)
+            {
+                if (!out.empty())
+                {
+                    out.push_back('$');
+                }
+                const std::string_view seg = segments[k];
+                const std::size_t open = seg.find('[');
+                if (open != std::string_view::npos && !seg.empty() && seg.back() == ']')
+                {
+                    out.append(seg.substr(0, open));
+                    out.push_back('$');
+                    out.append(seg.substr(open + 1, seg.size() - open - 2));
+                    continue;
+                }
+                out.append(seg);
+            }
+            return out;
+        };
+
+        auto findGenerateLeaf = [&](wolvrix::lib::grh::Graph &graph,
+                                    const std::vector<std::string> &segments,
+                                    std::size_t first) -> std::optional<std::string>
+        {
+            if (first >= segments.size())
+            {
+                return std::nullopt;
+            }
+            std::string candidate = composeGenerateLeafName(segments, first);
+            if (candidate.empty())
+            {
+                return std::nullopt;
+            }
+            if (graph.findValue(candidate).valid() || graph.findOperation(candidate).valid())
+            {
+                return candidate;
+            }
+            return std::nullopt;
+        };
+
         auto ensureOutputPort = [&](wolvrix::lib::grh::Graph &graph,
                                     const std::string &portName,
                                     wolvrix::lib::grh::ValueId value,
@@ -616,12 +664,18 @@ namespace wolvrix::lib::transform
             };
             std::vector<Hop> hops;
             wolvrix::lib::grh::Graph *current = &root;
+            std::optional<std::string> generateLeafName;
             for (std::size_t i = 0; i + 1 < segments.size(); ++i)
             {
                 const std::string &instName = segments[i];
                 wolvrix::lib::grh::OperationId instOp = findInstanceOp(*current, instName);
                 if (!instOp.valid())
                 {
+                    generateLeafName = findGenerateLeaf(*current, segments, i);
+                    if (generateLeafName)
+                    {
+                        break;
+                    }
                     warning(root, root.getOperation(opId),
                             "XMR read instance not found: " + instName);
                     return std::nullopt;
@@ -646,7 +700,8 @@ namespace wolvrix::lib::transform
             }
 
             wolvrix::lib::grh::Graph *leafGraph = current;
-            const std::string &leafName = segments.back();
+            const std::string leafName =
+                generateLeafName ? *generateLeafName : segments.back();
             wolvrix::lib::grh::ValueId propagated = wolvrix::lib::grh::ValueId::invalid();
             if (auto storage = findStorageInfo(root, *leafGraph, leafName, contextOp))
             {
@@ -735,12 +790,18 @@ namespace wolvrix::lib::transform
             };
             std::vector<Hop> hops;
             wolvrix::lib::grh::Graph *current = &root;
+            std::optional<std::string> generateLeafName;
             for (std::size_t i = 0; i + 1 < segments.size(); ++i)
             {
                 const std::string &instName = segments[i];
                 wolvrix::lib::grh::OperationId instOp = findInstanceOp(*current, instName);
                 if (!instOp.valid())
                 {
+                    generateLeafName = findGenerateLeaf(*current, segments, i);
+                    if (generateLeafName)
+                    {
+                        break;
+                    }
                     warning(root, root.getOperation(opId),
                             "XMR write instance not found: " + instName);
                     return false;
@@ -765,7 +826,8 @@ namespace wolvrix::lib::transform
             }
 
             wolvrix::lib::grh::Graph *leafGraph = current;
-            const std::string &leafName = segments.back();
+            const std::string leafName =
+                generateLeafName ? *generateLeafName : segments.back();
             const std::optional<StorageInfo> storage =
                 findStorageInfo(root, *leafGraph, leafName, contextOp);
 

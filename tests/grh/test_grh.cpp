@@ -219,6 +219,111 @@ int main()
 
         design.markAsTop("demo");
 
+        // Generate group annotation: two per-round copies of one declaration.
+        const SymbolId symGenScope = graph.internSymbol("gen_loop");
+        const SymbolId symGenName = graph.internSymbol("sig");
+        const SymbolId symGen0 = graph.internSymbol("gen_loop$0$sig");
+        const SymbolId symGen1 = graph.internSymbol("gen_loop$1$sig");
+        graph.createValue(symGen0, 8, false);
+        graph.createValue(symGen1, 8, false);
+        graph.addDeclaredSymbol(symGen0);
+        graph.addDeclaredSymbol(symGen1);
+        const std::size_t genGroup = graph.addGenerateGroup(symGenScope, symGenName);
+        graph.addGenerateGroupSymbol(genGroup, symGen0);
+        graph.addGenerateGroupSymbol(genGroup, symGen1);
+        // Post-flatten shape: instance prefix folded into the scope, the bare
+        // declaration name symbol shared, members renamed hierarchically.
+        const SymbolId symHierScope = graph.internSymbol("u_child$gen_loop");
+        const SymbolId symHierGen0 = graph.internSymbol("u_child$gen_loop$0$sig");
+        const SymbolId symHierGen1 = graph.internSymbol("u_child$gen_loop$1$sig");
+        graph.createValue(symHierGen0, 8, false);
+        graph.createValue(symHierGen1, 8, false);
+        graph.addDeclaredSymbol(symHierGen0);
+        graph.addDeclaredSymbol(symHierGen1);
+        const std::size_t hierGroup = graph.addGenerateGroup(symHierScope, symGenName);
+        graph.addGenerateGroupSymbol(hierGroup, symHierGen0);
+        graph.addGenerateGroupSymbol(hierGroup, symHierGen1);
+        if (graph.generateGroups().size() != 2 ||
+            graph.generateGroups().front().symbols.size() != 2 ||
+            graph.generateGroups().back().symbols.size() != 2)
+        {
+            return fail("Generate group registration failed");
+        }
+
+        // eraseOp/eraseValue must drop the erased entity's symbol from every
+        // generate group while keeping the (possibly empty) group itself.
+        Graph &eraseGraph = design.createGraph("erase_case");
+        const SymbolId eraseScope = eraseGraph.internSymbol("gen");
+        const SymbolId eraseName = eraseGraph.internSymbol("w");
+        const SymbolId eraseSymVal = eraseGraph.internSymbol("gen$0$w");
+        const SymbolId eraseSymOp = eraseGraph.internSymbol("gen$1$w");
+        const SymbolId eraseSymKeep = eraseGraph.internSymbol("gen$2$w");
+        const ValueId eraseVal = eraseGraph.createValue(eraseSymVal, 8, false);
+        eraseGraph.createValue(eraseSymKeep, 8, false);
+        const OperationId eraseOp =
+            eraseGraph.createOperation(OperationKind::kConstant, eraseSymOp);
+        eraseGraph.setAttr(eraseOp, "constValue", AttributeValue(std::string("8'h0")));
+        eraseGraph.addDeclaredSymbol(eraseSymVal);
+        eraseGraph.addDeclaredSymbol(eraseSymOp);
+        eraseGraph.addDeclaredSymbol(eraseSymKeep);
+        const std::size_t eraseGroup =
+            eraseGraph.addGenerateGroup(eraseScope, eraseName);
+        eraseGraph.addGenerateGroupSymbol(eraseGroup, eraseSymVal);
+        eraseGraph.addGenerateGroupSymbol(eraseGroup, eraseSymOp);
+        eraseGraph.addGenerateGroupSymbol(eraseGroup, eraseSymKeep);
+        if (!eraseGraph.eraseValue(eraseVal))
+        {
+            return fail("eraseValue failed for generate group member");
+        }
+        if (!eraseGraph.eraseOp(eraseOp))
+        {
+            return fail("eraseOp failed for generate group member");
+        }
+        if (eraseGraph.isDeclaredSymbol(eraseSymVal) || eraseGraph.isDeclaredSymbol(eraseSymOp))
+        {
+            return fail("Erased symbols still marked declared");
+        }
+        if (eraseGraph.generateGroups().size() != 1)
+        {
+            return fail("Erase removed the generate group itself");
+        }
+        const auto &eraseGroupSymbols = eraseGraph.generateGroups().front().symbols;
+        if (eraseGroupSymbols.size() != 1 || eraseGroupSymbols.front() != eraseSymKeep)
+        {
+            return fail("Generate group membership not cleaned on erase");
+        }
+        if (eraseGraph.lookupSymbol("gen$0$w").valid() &&
+            eraseGraph.findValue("gen$0$w").valid())
+        {
+            return fail("Erased value still resolvable");
+        }
+        if (!eraseGraph.validateDeclaredSymbols().empty())
+        {
+            return fail("validateDeclaredSymbols reports issues on a consistent graph");
+        }
+
+        // Renaming a declared value leaves its old symbol dangling in the
+        // annotations; validateDeclaredSymbols must flag every entry.
+        {
+            Design danglingDesign;
+            Graph &danglingGraph = danglingDesign.createGraph("dangling_case");
+            const SymbolId danglingSym = danglingGraph.internSymbol("sig");
+            const ValueId danglingVal = danglingGraph.createValue(danglingSym, 8, false);
+            danglingGraph.addDeclaredSymbol(danglingSym);
+            const std::size_t danglingGroup = danglingGraph.addGenerateGroup(
+                danglingGraph.internSymbol("gen"), danglingGraph.internSymbol("w"));
+            danglingGraph.addGenerateGroupSymbol(danglingGroup, danglingSym);
+            if (!danglingGraph.validateDeclaredSymbols().empty())
+            {
+                return fail("validateDeclaredSymbols false positive before rename");
+            }
+            danglingGraph.setValueSymbol(danglingVal, danglingGraph.internSymbol("renamed"));
+            if (danglingGraph.validateDeclaredSymbols().size() != 2)
+            {
+                return fail("validateDeclaredSymbols missed dangling entries");
+            }
+        }
+
         StoreDiagnostics emitDiagnostics;
         StoreJson emitter(&emitDiagnostics);
         StoreOptions emitOptions;
@@ -279,6 +384,92 @@ int main()
         if (!parsedModuleSym.valid() || !parsed.isDeclaredSymbol(parsedModuleSym))
         {
             return fail("Declared symbol not preserved in design");
+        }
+
+        if (parsedGraph->generateGroups().size() != 2)
+        {
+            return fail("Generate group not preserved in graph");
+        }
+        const auto &parsedGroup = parsedGraph->generateGroups().front();
+        if (parsedGraph->symbolText(parsedGroup.scope) != "gen_loop" ||
+            parsedGraph->symbolText(parsedGroup.name) != "sig" ||
+            parsedGroup.symbols.size() != 2 ||
+            parsedGraph->symbolText(parsedGroup.symbols[0]) != "gen_loop$0$sig" ||
+            parsedGraph->symbolText(parsedGroup.symbols[1]) != "gen_loop$1$sig")
+        {
+            return fail("Generate group content mismatch after round-trip");
+        }
+        const auto &parsedHierGroup = parsedGraph->generateGroups().back();
+        if (parsedGraph->symbolText(parsedHierGroup.scope) != "u_child$gen_loop" ||
+            parsedGraph->symbolText(parsedHierGroup.name) != "sig" ||
+            parsedHierGroup.symbols.size() != 2 ||
+            parsedGraph->symbolText(parsedHierGroup.symbols[0]) != "u_child$gen_loop$0$sig" ||
+            parsedGraph->symbolText(parsedHierGroup.symbols[1]) != "u_child$gen_loop$1$sig")
+        {
+            return fail("Hierarchical generate group content mismatch after round-trip");
+        }
+        const Graph *parsedEraseGraph = parsed.findGraph("erase_case");
+        if (!parsedEraseGraph || parsedEraseGraph->generateGroups().size() != 1 ||
+            parsedEraseGraph->generateGroups().front().symbols.size() != 1 ||
+            parsedEraseGraph->symbolText(parsedEraseGraph->generateGroups().front().symbols[0]) !=
+                "gen$2$w")
+        {
+            return fail("Generate group erase cleanup not preserved after round-trip");
+        }
+        if (json.find("\"generateGroups\"") == std::string::npos)
+        {
+            return fail("Emitted JSON missing generateGroups field");
+        }
+
+        // Compact mode writes through Graph::writeJson; groups must survive too.
+        emitDiagnostics.clear();
+        StoreOptions compactOptions;
+        compactOptions.jsonMode = JsonPrintMode::Compact;
+        auto compactJsonOpt = emitter.storeToString(design, compactOptions);
+        if (!compactJsonOpt || emitDiagnostics.hasError())
+        {
+            return fail("Failed to emit compact JSON for design");
+        }
+        if (compactJsonOpt->find("\"generateGroups\"") == std::string::npos)
+        {
+            return fail("Compact JSON missing generateGroups field");
+        }
+        Design compactParsed = Design::fromJsonString(*compactJsonOpt);
+        const Graph *compactGraph = compactParsed.findGraph("demo");
+        if (!compactGraph || compactGraph->generateGroups().size() != 2 ||
+            compactGraph->generateGroups().front().symbols.size() != 2 ||
+            compactGraph->generateGroups().back().symbols.size() != 2)
+        {
+            return fail("Generate group not preserved in compact round-trip");
+        }
+
+        // JSON written before the field existed omits it; it must still load.
+        const std::string legacyJson = R"({
+  "graphs": [
+    {
+      "symbol": "legacy",
+      "declaredSymbols": [],
+      "vals": [],
+      "ports": {
+        "in": [],
+        "out": [],
+        "inout": []
+      },
+      "ops": []
+    }
+  ],
+  "declaredSymbols": [],
+  "tops": ["legacy"]
+})";
+        Design legacy = Design::fromJsonString(legacyJson);
+        const Graph *legacyGraph = legacy.findGraph("legacy");
+        if (!legacyGraph)
+        {
+            return fail("Legacy JSON without generateGroups failed to load");
+        }
+        if (!legacyGraph->generateGroups().empty())
+        {
+            return fail("Legacy JSON produced unexpected generate groups");
         }
 
         const OperationId parsedOpId = parsedGraph->findOperation("add0");

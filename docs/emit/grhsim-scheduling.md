@@ -102,14 +102,12 @@ supernode。
 - `ops`：该 node 内的 source-class op 和 compute op。
 - `boundaryInputs`：该 node 读取、但不由该 node 内部 op 产生的 value。
 - `commonExpr`：共享表达式 owner 标记。
-- `indivisible` / `intentGroup`：保护特定语义形态，例如 reg-to-mem intent。
 
 Builder 会从 root value 反向追依赖，尽量把局部组合 producer 吸收到当前
 compute node。以下情况会停止吸收，并把 operand 记为 boundary input：
 
 - producer 已经属于另一个 compute node。
 - producer 是共享表达式 owner，不能安全并入当前消费者。
-- 当前 node 是不可分 intent group。
 - 当前 node 达到 `maxOpInComputeNode`。
 - producer 不是可本地共享的 compute op，或有副作用。
 - producer 不在本 graph 内，或 classification 不可用于本地吸收。

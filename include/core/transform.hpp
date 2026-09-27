@@ -80,6 +80,8 @@ namespace wolvrix::lib::transform
         PassVerbosity verbosity = PassVerbosity::Info;
         LogLevel logLevel = LogLevel::Warn;
         std::function<void(LogLevel, std::string_view, std::string_view)> logSink;
+        // declaredSymbols/generateGroups are semantic anchors produced by
+        // ingest; passes must preserve them. Pipelines must not turn this off.
         bool keepDeclaredSymbols = true;
         SessionStore *session = nullptr;
     };
@@ -238,6 +240,8 @@ namespace wolvrix::lib::transform
         PassVerbosity verbosity = PassVerbosity::Info;
         LogLevel logLevel = LogLevel::Warn;
         std::function<void(LogLevel, std::string_view, std::string_view)> logSink;
+        // Forwarded to every PassContext; declaredSymbols are semantic anchors
+        // and must stay enabled in all pipelines (see PassContext).
         bool keepDeclaredSymbols = true;
         SessionStore *session = nullptr;
     };

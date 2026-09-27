@@ -16,6 +16,9 @@ namespace wolvrix::lib::grhsim
         std::string top;
         LogicDomain logicDomain = LogicDomain::FourState;
         bool keepOrigins = true;
+        // Carry GRH declaredSymbols/generateGroups into the model as read-only
+        // metadata. Independent of keepOrigins: the name lists are small.
+        bool keepDeclaredSymbols = true;
     };
 
     std::unique_ptr<GrhSimModel> lowerGrhToGrhSim(

@@ -202,6 +202,33 @@ op 之间的依赖只通过 value 数据流表达；`ops` 的数组顺序不代�
 是读取还是写入由 `op_type` 规定；`parameters` 只保存常量、slice 范围等不经 value 传递的
 静态参数，其名称、类型和含义同样由 `op_type` 规定。
 
+### 3.4 来源注解（metadata）
+
+除上述语义分量外，`GrhSimModel` 还携带若干只读 metadata：模型名、对象/value/op 的名字、
+origin（源码位置与来源），以及从 GRH 图继承的两份符号清单：
+
+```text
+declaredSymbols: String[]          # 源码显式声明符号名（扁平化后为 '$' 连接的层次路径）
+generateGroups:  GenerateGroup[]   # generate 作用域声明的逐轮副本分组
+
+GenerateGroup
+  scope: String                    # generate 作用域路径，'$' 连接
+  name: String                     # 裸声明名
+  symbols: String[]                # 各轮副本符号名，下标 = generate-for 轮次
+```
+
+metadata 的共同契约：
+
+- 只存名字，不存实体 Id，不构成语义约束；改写 metadata 只产生 metadata revision，
+  不会使后端映射失效；
+- pass 可以读取（例如用 generateGroups 做并行化候选提示），但**没有维护义务**：
+  `compact()` 与各 pass 照常重编号、改写实体，被注解的实体消失后锚点名字可能
+  无法再解析到存活 value，属预期行为；
+- 等价性判断必须由语义验证兜底，不得以名字文本匹配作为优化触发条件。
+
+JSON checkpoint 中 `declaredSymbols` 与 `generateGroups` 是 `mappings` 之后的可选尾键，
+缺省为空集合；旧格式 checkpoint 不含这两键，可直接读取。
+
 ## 4. 执行语义
 
 ### 4.1 单次图状态转移

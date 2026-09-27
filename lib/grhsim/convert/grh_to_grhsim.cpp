@@ -327,9 +327,10 @@ namespace wolvrix::lib::grhsim
             parameterCount += graph->opAttrs(id).size();
         }
         model->reserve(ModelReserve{
-            .strings = options.keepOrigins
-                           ? graph->values().size() + graph->operations().size()
-                           : graph->operations().size() / 8 + 128,
+            .strings = (options.keepOrigins
+                            ? graph->values().size() + graph->operations().size()
+                            : graph->operations().size() / 8 + 128) +
+                       (options.keepDeclaredSymbols ? graph->declaredSymbols().size() : 0),
             .dialects = 1,
             .types = 32,
             .inputs = graph->inputPorts().size() + graph->inoutPorts().size(),
@@ -349,7 +350,9 @@ namespace wolvrix::lib::grhsim
             .initRecords = graph->operations().size() / 8,
             .initSteps = graph->operations().size() / 8,
             .initParameters = graph->operations().size() / 8,
-            .origins = options.keepOrigins ? graph->values().size() + graph->operations().size() : 0});
+            .origins = options.keepOrigins ? graph->values().size() + graph->operations().size() : 0,
+            .declaredSymbols = options.keepDeclaredSymbols ? graph->declaredSymbols().size() : 0,
+            .generateGroups = options.keepDeclaredSymbols ? graph->generateGroups().size() : 0});
 
         std::vector<grhsim::ValueId> valueMap(static_cast<std::size_t>(maxValueIndex) + 1);
         for (grh::ValueId valueId : graph->values())
@@ -686,6 +689,34 @@ namespace wolvrix::lib::grhsim
         }
 
         if (diagnostics.hasError()) return nullptr;
+
+        // Read-only provenance metadata: carry the (flattened) declared symbol
+        // names and generate copy groups as pure text. Empty names are skipped;
+        // the model deduplicates.
+        if (options.keepDeclaredSymbols)
+        {
+            for (const grh::SymbolId symbol : graph->declaredSymbols())
+            {
+                const std::string_view text = graph->symbolText(symbol);
+                if (text.empty()) continue;
+                model->addDeclaredSymbol(model->intern(text));
+            }
+            for (const grh::Graph::GenerateGroup &group : graph->generateGroups())
+            {
+                const std::string_view scope = graph->symbolText(group.scope);
+                const std::string_view name = graph->symbolText(group.name);
+                if (scope.empty() || name.empty()) continue;
+                const std::size_t index =
+                    model->addGenerateGroup(model->intern(scope), model->intern(name));
+                for (const grh::SymbolId symbol : group.symbols)
+                {
+                    const std::string_view text = graph->symbolText(symbol);
+                    if (text.empty()) continue;
+                    model->addGenerateGroupSymbol(index, model->intern(text));
+                }
+            }
+        }
+
         if (!verifyGrhSimModel(*model, defaultDialectRegistry(), diagnostics)) return nullptr;
         return model;
     }

@@ -9,11 +9,9 @@
 #include "transform/hier_flatten.hpp"
 #include "transform/instance_inline.hpp"
 #include "transform/latch_transparent_read.hpp"
-#include "transform/mem_to_reg.hpp"
 #include "transform/memory_init_check.hpp"
 #include "transform/memory_read_retime.hpp"
 #include "transform/multidriven_guard.hpp"
-#include "transform/reg_to_mem.hpp"
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
 #include "transform/slice_index_const.hpp"
@@ -422,8 +420,6 @@ namespace wolvrix::lib::transform
             "instance-inline",
             "xmr-resolve",
             "memory-init-check",
-            "mem-to-reg",
-            "reg-to-mem",
             "simplify",
             "stats",
             "strip-debug",
@@ -1539,62 +1535,6 @@ namespace wolvrix::lib::transform
             }
             return std::make_unique<MemoryInitCheckPass>();
         }
-        if (normalized == "mem-to-reg")
-        {
-            MemToRegOptions options;
-            for (std::size_t i = 0; i < args.size(); ++i)
-            {
-                const std::string_view arg = args[i];
-                if (arg == "-row-limit")
-                {
-                    if (i + 1 >= args.size())
-                    {
-                        error = "-row-limit expects a value";
-                        return nullptr;
-                    }
-                    try
-                    {
-                        options.rowLimit = std::stoll(std::string(args[++i]));
-                    }
-                    catch (const std::exception &)
-                    {
-                        error = "invalid -row-limit value";
-                        return nullptr;
-                    }
-                }
-                else if (arg.starts_with("-row-limit="))
-                {
-                    try
-                    {
-                        options.rowLimit = std::stoll(std::string(arg.substr(std::string_view("-row-limit=").size())));
-                    }
-                    catch (const std::exception &)
-                    {
-                        error = "invalid -row-limit value";
-                        return nullptr;
-                    }
-                }
-                else if (arg == "-strict-init")
-                {
-                    options.strictInit = true;
-                }
-                else if (arg == "-no-strict-init")
-                {
-                    options.strictInit = false;
-                }
-                else
-                {
-                    error = "unknown mem-to-reg option";
-                    return nullptr;
-                }
-            }
-            if (options.rowLimit <= 0)
-            {
-                error = "-row-limit must be > 0";
-                return nullptr;
-            }
-            return std::make_unique<MemToRegPass>(options);
-        }
         if (normalized == "memory-read-retime")
         {
             if (!args.empty())
@@ -1603,74 +1543,6 @@ namespace wolvrix::lib::transform
                 return nullptr;
             }
             return std::make_unique<MemoryReadRetimePass>();
-        }
-        if (normalized == "reg-to-mem")
-        {
-            RegToMemOptions options;
-            for (std::size_t i = 0; i < args.size(); ++i)
-            {
-                const std::string_view arg = args[i];
-                if (arg == "-no-intent")
-                {
-                    options.enableIntent = false;
-                }
-                else if (arg == "-intent")
-                {
-                    options.enableIntent = true;
-                }
-                else if (arg == "-true-merge")
-                {
-                    options.enableTrueMerge = true;
-                }
-                else if (arg == "-no-true-merge")
-                {
-                    options.enableTrueMerge = false;
-                }
-                else if (arg == "-ordered-writes")
-                {
-                    options.enableOrderedWrites = true;
-                }
-                else if (arg == "-no-ordered-writes")
-                {
-                    options.enableOrderedWrites = false;
-                }
-                else if (arg == "-decoded-write-storage")
-                {
-                    options.enableDecodedWriteStorage = true;
-                }
-                else if (arg == "-no-decoded-write-storage")
-                {
-                    options.enableDecodedWriteStorage = false;
-                }
-                else if (arg == "-min-element-count")
-                {
-                    if (i + 1 >= args.size())
-                    {
-                        error = "-min-element-count expects a value";
-                        return nullptr;
-                    }
-                    try
-                    {
-                        options.minElementCount = static_cast<std::size_t>(std::stoull(std::string(args[++i])));
-                    }
-                    catch (const std::exception &)
-                    {
-                        error = "invalid -min-element-count value";
-                        return nullptr;
-                    }
-                }
-                else
-                {
-                    error = "unknown reg-to-mem option";
-                    return nullptr;
-                }
-            }
-            if (options.minElementCount < 2)
-            {
-                error = "-min-element-count must be >= 2";
-                return nullptr;
-            }
-            return std::make_unique<RegToMemPass>(options);
         }
         if (normalized == "latch-transparent-read")
         {

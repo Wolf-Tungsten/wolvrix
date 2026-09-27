@@ -128,6 +128,18 @@ int main()
         src.addDeclaredSymbol(symA);
         src.addDeclaredSymbol(symSum);
 
+        const SymbolId symGenScope = src.internSymbol("gen_loop");
+        const SymbolId symGenName = src.internSymbol("sig");
+        const SymbolId symGen0 = src.internSymbol("gen_loop$0$sig");
+        const SymbolId symGen1 = src.internSymbol("gen_loop$1$sig");
+        src.createValue(symGen0, 8, false);
+        src.createValue(symGen1, 8, false);
+        src.addDeclaredSymbol(symGen0);
+        src.addDeclaredSymbol(symGen1);
+        const std::size_t genGroup = src.addGenerateGroup(symGenScope, symGenName);
+        src.addGenerateGroupSymbol(genGroup, symGen0);
+        src.addGenerateGroupSymbol(genGroup, symGen1);
+
         Graph &clone = design.cloneGraph("src", "clone");
         if (clone.symbol() != "clone")
         {
@@ -312,6 +324,32 @@ int main()
             if (!clone.isDeclaredSymbol(clone.lookupSymbol(text)))
             {
                 return fail("Clone missing declared symbol: " + std::string(text));
+            }
+        }
+
+        if (clone.generateGroups().size() != src.generateGroups().size())
+        {
+            return fail("Clone generate group count mismatch");
+        }
+        for (std::size_t i = 0; i < src.generateGroups().size(); ++i)
+        {
+            const auto &srcGroup = src.generateGroups()[i];
+            const auto &cloneGroup = clone.generateGroups()[i];
+            if (clone.symbolText(cloneGroup.scope) != src.symbolText(srcGroup.scope) ||
+                clone.symbolText(cloneGroup.name) != src.symbolText(srcGroup.name))
+            {
+                return fail("Clone generate group scope/name mismatch");
+            }
+            if (cloneGroup.symbols.size() != srcGroup.symbols.size())
+            {
+                return fail("Clone generate group member count mismatch");
+            }
+            for (std::size_t k = 0; k < srcGroup.symbols.size(); ++k)
+            {
+                if (clone.symbolText(cloneGroup.symbols[k]) != src.symbolText(srcGroup.symbols[k]))
+                {
+                    return fail("Clone generate group member mismatch");
+                }
             }
         }
     }

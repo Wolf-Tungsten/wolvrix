@@ -550,6 +550,24 @@ namespace wolvrix::lib::grhsim
                       std::to_string(initCount[i]), "states[" + std::to_string(i) + "]");
         }
 
+        for (std::size_t i = 0; i < model.declaredSymbols().size(); ++i)
+        {
+            if (!model.strings().valid(model.declaredSymbols()[i]))
+                error("declared symbol has an invalid StringId",
+                      "declaredSymbols[" + std::to_string(i) + "]");
+        }
+        for (std::size_t i = 0; i < model.generateGroups().size(); ++i)
+        {
+            const GenerateGroup &group = model.generateGroups()[i];
+            const std::string context = "generateGroups[" + std::to_string(i) + "]";
+            if (!model.strings().valid(group.scope) || !model.strings().valid(group.name))
+                error("generate group scope/name has an invalid StringId", context);
+            for (std::size_t j = 0; j < group.symbols.size(); ++j)
+                if (!model.strings().valid(group.symbols[j]))
+                    error("generate group member has an invalid StringId",
+                          context + ".symbols[" + std::to_string(j) + "]");
+        }
+
         std::unordered_set<uint32_t> mappingBackends;
         const bool validModel = ok && !diagnostics.hasError();
         for (std::size_t i = 0; i < model.mappings().size(); ++i)

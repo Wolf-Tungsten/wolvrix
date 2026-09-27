@@ -212,6 +212,14 @@ struct InstanceInfo {
     std::string paramSignature;
 };
 
+// Plan-level record of one generate-scope declaration: all elaboration
+// copies of the same declaration, in elaboration (round) order.
+struct GenerateGroupPlan {
+    std::string scope;                  // generate scope path, '$'-joined block names
+    std::string name;                   // bare declaration name
+    std::vector<PlanSymbolId> symbols;  // per-round copies in elaboration order
+};
+
 struct ModulePlan {
     const slang::ast::InstanceBodySymbol* body = nullptr;
     PlanSymbolTable symbolTable;
@@ -221,6 +229,11 @@ struct ModulePlan {
     std::vector<SignalInfo> signals;
     std::vector<InstanceInfo> instances;
     std::vector<InoutSignalInfo> inoutSignals;
+    // Signals interned under scope-qualified generate names cannot be found by
+    // bare-name text lookup; resolve them by slang symbol identity instead.
+    std::unordered_map<const slang::ast::Symbol*, PlanSymbolId> signalBySlangSymbol;
+    std::vector<GenerateGroupPlan> generateGroups;
+    std::unordered_map<std::string, std::size_t> generateGroupByKey;
 };
 
 inline const PortInfo* findPortByName(const ModulePlan& plan, std::string_view name)

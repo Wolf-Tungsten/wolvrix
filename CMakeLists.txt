@@ -154,8 +154,6 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/simplify.cpp
     lib/transform/memory_init_check.cpp
     lib/transform/memory_read_retime.cpp
-    lib/transform/mem_to_reg.cpp
-    lib/transform/reg_to_mem.cpp
     lib/transform/multidriven_guard.cpp
     lib/transform/blackbox_guard.cpp
     lib/transform/comb_lane_pack.cpp
@@ -675,6 +673,17 @@ target_link_libraries(transform-xmr-resolve-storage
 
 register_test_exe(transform-xmr-resolve-storage)
 
+add_executable(transform-xmr-resolve-generate
+    tests/transform/test_xmr_resolve_generate.cpp
+)
+
+target_link_libraries(transform-xmr-resolve-generate
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-xmr-resolve-generate)
+
 # transform: latch-transparent-read
 add_executable(transform-latch-transparent-read
     tests/transform/test_latch_transparent_read.cpp
@@ -698,18 +707,6 @@ target_link_libraries(transform-memory-read-retime
 )
 
 register_test_exe(transform-memory-read-retime)
-
-# transform: reg-to-mem
-add_executable(transform-reg-to-mem
-    tests/transform/test_reg_to_mem_pass.cpp
-)
-
-target_link_libraries(transform-reg-to-mem
-    PRIVATE
-        wolvrix-lib
-)
-
-register_test_exe(transform-reg-to-mem)
 
 # transform: strip-debug
 add_executable(transform-strip-debug
@@ -925,6 +922,20 @@ target_compile_definitions(ingest-graph-assembly-register-init
         WOLF_SV_INGEST_GRAPH_ASSEMBLY_REGISTER_INIT_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/graph_assembly_register_init.sv"
 )
 register_test_exe(ingest-graph-assembly-register-init)
+
+# ingest: generate block scope declarations
+add_executable(ingest-generate-scope
+    tests/ingest/test_ingest_generate_scope.cpp
+)
+target_link_libraries(ingest-generate-scope
+    PRIVATE
+        wolvrix-lib
+)
+target_compile_definitions(ingest-generate-scope
+    PRIVATE
+        WOLF_SV_INGEST_GENERATE_SCOPE_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/generate_scope.sv"
+)
+register_test_exe(ingest-generate-scope)
 
 # ingest: graph assembly memory
 add_executable(ingest-graph-assembly-memory

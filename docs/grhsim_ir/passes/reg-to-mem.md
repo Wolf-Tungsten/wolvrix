@@ -1,8 +1,8 @@
 # Recovering scalarized tables
 
 `grhsim.reg-to-mem` is a semantic pass run after GRH-to-GrhSIM lowering and before CPU
-split-phase and mapping. It creates core array states from compatible scalar states;
-it does not consume legacy `regToMem.intent.*` attributes or depend on RTL module names.
+split-phase and mapping. It creates core array states from compatible scalar states
+without depending on RTL module names.
 
 For example, with `hit_k(i) = enable_k && address_k == i`:
 

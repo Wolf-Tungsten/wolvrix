@@ -53,7 +53,6 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::transform::ActivityScheduleValueFanout;
 
         constexpr std::size_t kInlineSystemTaskArgLimit = 16;
-        constexpr std::size_t kRegToMemIntentIndexInlineOpLimit = 32;
         constexpr std::size_t kOrderedMemoryWriteAffineMinWrites = 16;
         constexpr std::size_t kPureEventVolatileBatchMaxEligibleWords = 2;
 
@@ -976,8 +975,6 @@ namespace wolvrix::lib::emit
         bool isWritePortKind(OperationKind kind) noexcept;
         bool valueNeedsTrackedChange(const EmitModel &model, ValueId resultValue);
         bool isMaterializedValue(const EmitModel &model, ValueId value);
-        bool isRegToMemIntentBypassOp(const EmitModel &model, OperationId opId) noexcept;
-        void collectRegToMemIntentBypassOps(const Graph &graph, EmitModel &model);
         std::optional<std::string> stableValueExpr(const Graph &graph, const EmitModel &model, ValueId value);
         std::string resolvedScheduleValueExpr(const EmitModel &model,
                                               ValueId value,
@@ -2205,7 +2202,7 @@ namespace wolvrix::lib::emit
                 uint32_t bit = 0;
                 std::string_view name;
             };
-            constexpr std::array<ReasonName, 11> kReasonNames = {{
+            constexpr std::array<ReasonName, 10> kReasonNames = {{
                 {1u << 0u, "output"},
                 {1u << 1u, "inout"},
                 {1u << 2u, "waveform"},
@@ -2216,7 +2213,6 @@ namespace wolvrix::lib::emit
                 {1u << 7u, "non_logic"},
                 {1u << 8u, "side_effect_result"},
                 {1u << 9u, "phase_crossing"},
-                {1u << 10u, "reg_to_mem_intent_index"},
             }};
             std::string out;
             for (const auto &entry : kReasonNames)
@@ -2366,21 +2362,6 @@ namespace wolvrix::lib::emit
             std::size_t wordCount = 0;
             std::optional<InitExprCode> initExpr;
             std::vector<std::optional<InitExprCode>> memoryInitRowExprs;
-            bool regToMemIntentStorage = false;
-            std::string regToMemIntentGroup;
-            std::string regToMemIntentFieldName;
-            std::size_t regToMemIntentRow = 0;
-            std::size_t regToMemIntentElementCount = 0;
-        };
-
-        struct RegToMemIntentStorageDecl
-        {
-            std::string group;
-            std::string fieldName;
-            std::string cppType;
-            int32_t elementWidth = 0;
-            bool isSigned = false;
-            std::size_t elementCount = 0;
         };
 
         InitExprCode randomInitExprForWidth(int32_t width)
@@ -2556,11 +2537,6 @@ namespace wolvrix::lib::emit
             std::vector<ValueId> commitInputValues;
             std::vector<std::size_t> activeIdBySupernode;
             std::unordered_map<std::string, StateDecl> stateBySymbol;
-            std::unordered_map<std::string, RegToMemIntentStorageDecl> regToMemIntentStorageByGroup;
-            std::unordered_map<OperationId, std::string, OperationIdHash> regToMemIntentSliceGroupByOp;
-            std::unordered_map<OperationId, std::string, OperationIdHash> regToMemIntentConcatGroupByOp;
-            std::unordered_map<OperationId, std::string, OperationIdHash> regToMemIntentReadGroupByOp;
-            std::unordered_set<OperationId, OperationIdHash> regToMemIntentBypassOps;
             std::unordered_map<std::string, std::vector<uint32_t>> stateHeadSupernodesBySymbol;
             std::unordered_map<std::string, std::size_t> memoryRowReaderActivationBySymbol;
             std::vector<MemoryRowReaderActivationDecl> memoryRowReaderActivations;
@@ -3411,10 +3387,6 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                if (stateIt->second.regToMemIntentStorage)
-                {
-                    continue;
-                }
                 orderedEntries.push_back(OrderedLogicStorageEntry{
                     .kind = OrderedLogicStorageEntry::Kind::kState,
                     .stateSymbol = stateSymbol,
@@ -3466,10 +3438,6 @@ namespace wolvrix::lib::emit
             {
                 const auto stateIt = model.stateBySymbol.find(stateSymbol);
                 if (stateIt == model.stateBySymbol.end() || stateIt->second.kind == StateDecl::Kind::Memory)
-                {
-                    continue;
-                }
-                if (stateIt->second.regToMemIntentStorage)
                 {
                     continue;
                 }
@@ -3623,11 +3591,6 @@ namespace wolvrix::lib::emit
                     StateDecl &state = model.stateBySymbol.at(entry.stateSymbol);
                     if (state.kind == StateDecl::Kind::Memory)
                     {
-                        continue;
-                    }
-                    if (state.regToMemIntentStorage)
-                    {
-                        state.slotIndex = kInvalidIndex;
                         continue;
                     }
                     if (isWideLogicWidth(state.width))
@@ -3940,7 +3903,7 @@ namespace wolvrix::lib::emit
             }
 
             const auto noteStateAnchor = [&](std::size_t &anchor, const StateDecl &state) {
-                if (state.kind == StateDecl::Kind::Memory || state.regToMemIntentStorage)
+                if (state.kind == StateDecl::Kind::Memory)
                 {
                     return;
                 }
@@ -4515,11 +4478,6 @@ namespace wolvrix::lib::emit
             return "state_mem_" + sanitizeIdentifier(symbol) + "_" + std::to_string(uniqueIndex) + "_";
         }
 
-        std::string regToMemIntentStorageFieldName(std::string_view group)
-        {
-            return "state_reg_to_mem_" + sanitizeIdentifier(group) + "_";
-        }
-
         std::string stateStorageFieldName(StateDecl::Kind kind, std::string_view symbol, std::size_t uniqueIndex)
         {
             switch (kind)
@@ -4541,10 +4499,6 @@ namespace wolvrix::lib::emit
 
         std::string stateRef(const StateDecl &state)
         {
-            if (state.regToMemIntentStorage)
-            {
-                return state.regToMemIntentFieldName + "[" + std::to_string(state.regToMemIntentRow) + "]";
-            }
             if (state.kind == StateDecl::Kind::Memory)
             {
                 return state.fieldName;
@@ -4631,10 +4585,6 @@ namespace wolvrix::lib::emit
                 const bool commitPhaseOp = isCommitPhaseOp(op);
                 if ((phase == ScheduleBatch::Phase::kCompute && commitPhaseOp) ||
                     (phase == ScheduleBatch::Phase::kCommit && !commitPhaseOp))
-                {
-                    continue;
-                }
-                if (isRegToMemIntentBypassOp(model, opId))
                 {
                     continue;
                 }
@@ -4732,15 +4682,12 @@ namespace wolvrix::lib::emit
                     continue;
                 }
                 const std::string aliasName =
-                    stateIt->second.regToMemIntentStorage
-                        ? ("grhsim_state_reg_to_mem_" + sanitizeIdentifier(stateIt->second.regToMemIntentGroup) +
-                           "_row_" + std::to_string(stateIt->second.regToMemIntentRow))
-                        : (isWideLogicWidth(stateIt->second.width)
-                               ? ("grhsim_state_words_" + std::to_string(stateIt->second.wordCount) + "_slot_" +
-                                  std::to_string(stateIt->second.slotIndex))
-                               : ("grhsim_state_scalar_" +
-                                  std::to_string(static_cast<std::size_t>(stateIt->second.scalarKind)) + "_slot_" +
-                                  std::to_string(stateIt->second.slotIndex)));
+                    isWideLogicWidth(stateIt->second.width)
+                        ? ("grhsim_state_words_" + std::to_string(stateIt->second.wordCount) + "_slot_" +
+                           std::to_string(stateIt->second.slotIndex))
+                        : ("grhsim_state_scalar_" +
+                           std::to_string(static_cast<std::size_t>(stateIt->second.scalarKind)) + "_slot_" +
+                           std::to_string(stateIt->second.slotIndex));
                 aliases.push_back(SupernodeStorageRefAliasDecl{
                     .aliasName = aliasName,
                     .initExpr = stateRef(stateIt->second),
@@ -5289,254 +5236,6 @@ namespace wolvrix::lib::emit
             return isStoredValue(model, value);
         }
 
-        std::optional<std::string> regToMemIntentGroupForRole(const Operation &op, std::string_view role);
-        bool hasRegToMemIntentShape(const Operation &op,
-                                    std::string_view group,
-                                    int64_t elementWidth,
-                                    int64_t elementCount);
-        std::optional<ValueId> regToMemIntentSliceIndexValue(const Graph &graph, const Operation &op);
-
-        bool isRegToMemIntentBypassOp(const EmitModel &model, OperationId opId) noexcept
-        {
-            return model.regToMemIntentBypassOps.contains(opId);
-        }
-
-        struct RegToMemIntentConcatInfo
-        {
-            std::string group;
-            std::string storageGroup;
-            int64_t elementWidth = 0;
-            int64_t elementCount = 0;
-            int64_t storageElementCount = 0;
-            int64_t storageRowOffset = 0;
-        };
-
-        std::optional<RegToMemIntentConcatInfo>
-        regToMemIntentConcatInfo(const Graph &graph,
-                                 const EmitModel &model,
-                                 const Operation &op)
-        {
-            const auto group = regToMemIntentGroupForRole(op, "concat");
-            const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
-            const auto elementCount = getAttribute<int64_t>(op, "regToMem.intent.elementCount");
-            const auto storageGroupAttr = getAttribute<std::string>(op, "regToMem.intent.storageGroup");
-            const auto storageElementCountAttr = getAttribute<int64_t>(op, "regToMem.intent.storageElementCount");
-            const auto storageRowOffsetAttr = getAttribute<int64_t>(op, "regToMem.intent.storageRowOffset");
-            const auto regSymbols = getAttribute<std::vector<std::string>>(op, "regToMem.intent.regSymbols");
-            const auto operandRows = getAttribute<std::vector<int64_t>>(op, "regToMem.intent.operandRows");
-            if (op.kind() != OperationKind::kConcat || op.results().size() != 1 ||
-                !group || !elementWidth || !elementCount || !regSymbols || !operandRows ||
-                *elementWidth <= 0 || *elementCount <= 0 ||
-                op.operands().size() != static_cast<std::size_t>(*elementCount) ||
-                operandRows->size() != op.operands().size() ||
-                regSymbols->size() != static_cast<std::size_t>(*elementCount))
-            {
-                return std::nullopt;
-            }
-            if (*elementCount > std::numeric_limits<int64_t>::max() / *elementWidth ||
-                graph.valueWidth(op.results().front()) != (*elementWidth * *elementCount))
-            {
-                return std::nullopt;
-            }
-            const std::string storageGroup = storageGroupAttr.value_or(*group);
-            const int64_t storageElementCount = storageElementCountAttr.value_or(*elementCount);
-            const int64_t storageRowOffset = storageRowOffsetAttr.value_or(0);
-            if (storageGroup.empty() ||
-                storageElementCount < *elementCount ||
-                storageRowOffset < 0 ||
-                storageRowOffset > storageElementCount ||
-                storageElementCount - storageRowOffset < *elementCount)
-            {
-                return std::nullopt;
-            }
-            const auto storageIt = model.regToMemIntentStorageByGroup.find(storageGroup);
-            if (storageIt == model.regToMemIntentStorageByGroup.end() ||
-                storageIt->second.elementWidth != *elementWidth ||
-                storageIt->second.elementCount != static_cast<std::size_t>(storageElementCount))
-            {
-                return std::nullopt;
-            }
-
-            for (std::size_t operandIndex = 0; operandIndex < op.operands().size(); ++operandIndex)
-            {
-                const ValueId operand = op.operands()[operandIndex];
-                const int64_t row = (*operandRows)[operandIndex];
-                if (row < 0 || row >= *elementCount || graph.valueWidth(operand) != *elementWidth)
-                {
-                    return std::nullopt;
-                }
-                const OperationId readOpId = graph.valueDef(operand);
-                if (!readOpId.valid())
-                {
-                    return std::nullopt;
-                }
-                const Operation readOp = graph.getOperation(readOpId);
-                const auto readGroup = regToMemIntentGroupForRole(readOp, "read");
-                const auto readRow = getAttribute<int64_t>(readOp, "regToMem.intent.row");
-                const auto readStorageGroup = getAttribute<std::string>(readOp, "regToMem.intent.storageGroup");
-                const auto readStorageRow = getAttribute<int64_t>(readOp, "regToMem.intent.storageRow");
-                const bool readLocalMatch = readGroup && *readGroup == *group && readRow && *readRow == row;
-                const bool readStorageMatch = readStorageGroup && *readStorageGroup == storageGroup &&
-                                              readStorageRow &&
-                                              *readStorageRow == row + storageRowOffset;
-                const auto regSymbol = getAttribute<std::string>(readOp, "regSymbol");
-                if (readOp.kind() != OperationKind::kRegisterReadPort ||
-                    (!readLocalMatch && !readStorageMatch) || !regSymbol ||
-                    (*regSymbols)[static_cast<std::size_t>(row)] != *regSymbol)
-                {
-                    return std::nullopt;
-                }
-                const auto stateIt = model.stateBySymbol.find(*regSymbol);
-                if (stateIt == model.stateBySymbol.end() ||
-                    !stateIt->second.regToMemIntentStorage ||
-                    stateIt->second.regToMemIntentGroup != storageGroup ||
-                    stateIt->second.regToMemIntentRow != static_cast<std::size_t>(row + storageRowOffset) ||
-                    stateIt->second.width != *elementWidth)
-                {
-                    return std::nullopt;
-                }
-            }
-
-            return RegToMemIntentConcatInfo{
-                .group = *group,
-                .storageGroup = storageGroup,
-                .elementWidth = *elementWidth,
-                .elementCount = *elementCount,
-                .storageElementCount = storageElementCount,
-                .storageRowOffset = storageRowOffset,
-            };
-        }
-
-        bool isRegToMemIntentSliceOfConcat(const Graph &graph,
-                                           const Operation &op,
-                                           ValueId concatValue,
-                                           const RegToMemIntentConcatInfo &concatInfo)
-        {
-            if ((op.kind() != OperationKind::kSliceArray && op.kind() != OperationKind::kSliceDynamic) ||
-                op.operands().size() != 2 || op.results().size() != 1 ||
-                op.operands().front() != concatValue ||
-                !regToMemIntentGroupForRole(op, "slice") ||
-                !hasRegToMemIntentShape(op,
-                                        concatInfo.group,
-                                        concatInfo.elementWidth,
-                                        concatInfo.elementCount) ||
-                !regToMemIntentSliceIndexValue(graph, op))
-            {
-                return false;
-            }
-            const auto storageGroup = getAttribute<std::string>(op, "regToMem.intent.storageGroup");
-            const auto storageElementCount = getAttribute<int64_t>(op, "regToMem.intent.storageElementCount");
-            const auto storageRowOffset = getAttribute<int64_t>(op, "regToMem.intent.storageRowOffset");
-            if (storageGroup.value_or(concatInfo.group) != concatInfo.storageGroup ||
-                storageElementCount.value_or(concatInfo.elementCount) != concatInfo.storageElementCount ||
-                storageRowOffset.value_or(0) != concatInfo.storageRowOffset)
-            {
-                return false;
-            }
-            const auto sliceWidth = getAttribute<int64_t>(op, "sliceWidth");
-            return sliceWidth && *sliceWidth == concatInfo.elementWidth &&
-                   graph.valueWidth(op.results().front()) == concatInfo.elementWidth;
-        }
-
-        bool regToMemIntentValueCanBypass(const EmitModel &model, ValueId value)
-        {
-            return value.valid() && !isMaterializedValue(model, value) && !valueNeedsTrackedChange(model, value);
-        }
-
-        void collectRegToMemIntentBypassOps(const Graph &graph, EmitModel &model)
-        {
-            model.regToMemIntentSliceGroupByOp.clear();
-            model.regToMemIntentConcatGroupByOp.clear();
-            model.regToMemIntentReadGroupByOp.clear();
-            model.regToMemIntentBypassOps.clear();
-
-            std::unordered_map<OperationId, RegToMemIntentConcatInfo, OperationIdHash> concatInfoByOp;
-            for (OperationId opId : graph.operations())
-            {
-                const Operation op = graph.getOperation(opId);
-                if (auto concatInfo = regToMemIntentConcatInfo(graph, model, op))
-                {
-                    concatInfoByOp.emplace(opId, *concatInfo);
-                    model.regToMemIntentConcatGroupByOp.emplace(opId, concatInfo->group);
-                }
-            }
-
-            for (const auto &[concatOpId, concatInfo] : concatInfoByOp)
-            {
-                const Operation concatOp = graph.getOperation(concatOpId);
-                const ValueId concatValue = concatOp.results().front();
-                bool hasSliceUser = false;
-                bool allUsersAreIntentSlices = true;
-                const Value concatValueInfo = graph.getValue(concatValue);
-                for (const auto &user : concatValueInfo.users())
-                {
-                    if (!user.operation.valid())
-                    {
-                        allUsersAreIntentSlices = false;
-                        break;
-                    }
-                    const Operation userOp = graph.getOperation(user.operation);
-                    if (!isRegToMemIntentSliceOfConcat(graph, userOp, concatValue, concatInfo))
-                    {
-                        allUsersAreIntentSlices = false;
-                        break;
-                    }
-                    hasSliceUser = true;
-                    model.regToMemIntentSliceGroupByOp.insert_or_assign(user.operation, concatInfo.group);
-                }
-                if (hasSliceUser && allUsersAreIntentSlices && regToMemIntentValueCanBypass(model, concatValue))
-                {
-                    model.regToMemIntentBypassOps.insert(concatOpId);
-                }
-            }
-
-            for (const auto &[concatOpId, concatInfo] : concatInfoByOp)
-            {
-                if (!model.regToMemIntentBypassOps.contains(concatOpId))
-                {
-                    continue;
-                }
-                const Operation concatOp = graph.getOperation(concatOpId);
-                for (ValueId operand : concatOp.operands())
-                {
-                    const OperationId readOpId = graph.valueDef(operand);
-                    if (!readOpId.valid() || !regToMemIntentValueCanBypass(model, operand))
-                    {
-                        continue;
-                    }
-                    const Operation readOp = graph.getOperation(readOpId);
-                    const auto readGroup = regToMemIntentGroupForRole(readOp, "read");
-                    if (!readGroup || *readGroup != concatInfo.group)
-                    {
-                        continue;
-                    }
-                    bool onlyBypassConcatUsers = true;
-                    const Value operandInfo = graph.getValue(operand);
-                    for (const auto &user : operandInfo.users())
-                    {
-                        if (!user.operation.valid() ||
-                            !model.regToMemIntentBypassOps.contains(user.operation))
-                        {
-                            onlyBypassConcatUsers = false;
-                            break;
-                        }
-                        const auto concatGroupIt = model.regToMemIntentConcatGroupByOp.find(user.operation);
-                        if (concatGroupIt == model.regToMemIntentConcatGroupByOp.end() ||
-                            concatGroupIt->second != concatInfo.group)
-                        {
-                            onlyBypassConcatUsers = false;
-                            break;
-                        }
-                    }
-                    if (onlyBypassConcatUsers)
-                    {
-                        model.regToMemIntentBypassOps.insert(readOpId);
-                        model.regToMemIntentReadGroupByOp.insert_or_assign(readOpId, concatInfo.group);
-                    }
-                }
-            }
-        }
-
         bool opNeedsWordLogicEmit(const Graph &graph, const Operation &op) noexcept;
         std::string valueRef(const EmitModel &model, ValueId value);
 
@@ -5617,77 +5316,6 @@ namespace wolvrix::lib::emit
                 }
             }
             return true;
-        }
-
-        std::optional<std::string> regToMemIntentGroupForRole(const Operation &op, std::string_view role)
-        {
-            const auto group = getAttribute<std::string>(op, "regToMem.intent.group");
-            if (!group || group->empty() ||
-                getAttribute<std::string>(op, "regToMem.intent.role").value_or(std::string()) != role ||
-                getAttribute<std::string>(op, "regToMem.intent.mode").value_or(std::string()) != "array-index")
-            {
-                return std::nullopt;
-            }
-            return group;
-        }
-
-        bool hasRegToMemIntentShape(const Operation &op,
-                                    std::string_view group,
-                                    int64_t elementWidth,
-                                    int64_t elementCount)
-        {
-            const auto opGroup = getAttribute<std::string>(op, "regToMem.intent.group");
-            const auto opElementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
-            const auto opElementCount = getAttribute<int64_t>(op, "regToMem.intent.elementCount");
-            return opGroup && *opGroup == group &&
-                   opElementWidth && *opElementWidth == elementWidth &&
-                   opElementCount && *opElementCount == elementCount;
-        }
-
-        std::optional<ValueId> regToMemIntentSliceIndexValue(const Graph &graph, const Operation &op)
-        {
-            if ((op.kind() != OperationKind::kSliceArray && op.kind() != OperationKind::kSliceDynamic) ||
-                op.operands().size() != 2 ||
-                !regToMemIntentGroupForRole(op, "slice"))
-            {
-                return std::nullopt;
-            }
-            if (op.kind() == OperationKind::kSliceArray)
-            {
-                return op.operands()[1];
-            }
-
-            const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
-            if (!elementWidth || *elementWidth <= 0)
-            {
-                return std::nullopt;
-            }
-            if (*elementWidth == 1)
-            {
-                return op.operands()[1];
-            }
-            const OperationId startDefId = graph.valueDef(op.operands()[1]);
-            if (!startDefId.valid())
-            {
-                return std::nullopt;
-            }
-            const Operation startDef = graph.getOperation(startDefId);
-            if (startDef.kind() != OperationKind::kMul || startDef.operands().size() != 2)
-            {
-                return std::nullopt;
-            }
-            const std::size_t width = static_cast<std::size_t>(*elementWidth);
-            const auto lhsConst = constLogicIndexValue(graph, startDef.operands()[0], width + 1u);
-            if (lhsConst && *lhsConst == width)
-            {
-                return startDef.operands()[1];
-            }
-            const auto rhsConst = constLogicIndexValue(graph, startDef.operands()[1], width + 1u);
-            if (rhsConst && *rhsConst == width)
-            {
-                return startDef.operands()[0];
-            }
-            return std::nullopt;
         }
 
         bool isConstLogicAllOnes(const Graph &graph, ValueId value, int32_t width)
@@ -6618,7 +6246,7 @@ namespace wolvrix::lib::emit
                     const Operation op = graph.getOperation(opId);
                     if ((op.kind() != OperationKind::kRegisterReadPort &&
                          op.kind() != OperationKind::kLatchReadPort) ||
-                        op.results().size() != 1 || isRegToMemIntentBypassOp(model, opId))
+                        op.results().size() != 1)
                     {
                         continue;
                     }
@@ -6779,7 +6407,6 @@ namespace wolvrix::lib::emit
                     const StateDecl &state = stateIt->second;
                     bool rawEligible =
                         state.kind == StateDecl::Kind::Register &&
-                        !state.regToMemIntentStorage &&
                         !isWideLogicWidth(state.width) &&
                         registerWriteCountBySymbol[*targetSymbol] == 1u &&
                         model.materializedValues.contains(resultValue) &&
@@ -6789,8 +6416,7 @@ namespace wolvrix::lib::emit
                         graph.valueSigned(resultValue) == state.isSigned &&
                         valueNeedsTrackedChange(model, resultValue) &&
                         !protectedValues.contains(resultValue) &&
-                        !model.packedArrayLaneViewByValue.contains(resultValue) &&
-                        !isRegToMemIntentBypassOp(model, opId);
+                        !model.packedArrayLaneViewByValue.contains(resultValue);
 
                     const auto boundaryIt = model.boundaryFanoutByValue.find(resultValue);
                     rawEligible = rawEligible &&
@@ -6925,11 +6551,6 @@ namespace wolvrix::lib::emit
             model.stateBySymbol.clear();
             model.stateOrder.clear();
             model.stateFieldDecls.clear();
-            model.regToMemIntentStorageByGroup.clear();
-            model.regToMemIntentSliceGroupByOp.clear();
-            model.regToMemIntentConcatGroupByOp.clear();
-            model.regToMemIntentReadGroupByOp.clear();
-            model.regToMemIntentBypassOps.clear();
             model.stateHeadSupernodesBySymbol.clear();
             model.memoryRowReaderActivationBySymbol.clear();
             model.memoryRowReaderActivations.clear();
@@ -7055,102 +6676,27 @@ namespace wolvrix::lib::emit
                             error = "storage width must be positive: " + state.symbol;
                             return false;
                         }
-                        if (state.kind == StateDecl::Kind::Register)
-                        {
-                            const auto intentGroup = getAttribute<std::string>(op, "regToMem.intent.group");
-                            const auto intentMode = getAttribute<std::string>(op, "regToMem.intent.mode");
-                            const auto intentRow = getAttribute<int64_t>(op, "regToMem.intent.row");
-                            const auto intentElementWidth =
-                                getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
-                            const auto intentElementCount =
-                                getAttribute<int64_t>(op, "regToMem.intent.elementCount");
-                            if (intentGroup || intentRow || intentElementWidth || intentElementCount)
-                            {
-                                if (!intentGroup || !intentRow || !intentElementWidth || !intentElementCount ||
-                                    intentMode.value_or(std::string()) != "array-index")
-                                {
-                                    error = "incomplete reg-to-mem intent attrs on register: " + state.symbol;
-                                    return false;
-                                }
-                                if (*intentElementWidth != state.width)
-                                {
-                                    error = "reg-to-mem intent width mismatch on register: " + state.symbol;
-                                    return false;
-                                }
-                                if (*intentElementCount <= 0 || *intentRow < 0 || *intentRow >= *intentElementCount)
-                                {
-                                    error = "reg-to-mem intent row out of range on register: " + state.symbol;
-                                    return false;
-                                }
-
-                                state.regToMemIntentStorage = true;
-                                state.regToMemIntentGroup = *intentGroup;
-                                state.regToMemIntentRow = static_cast<std::size_t>(*intentRow);
-                                state.regToMemIntentElementCount =
-                                    static_cast<std::size_t>(*intentElementCount);
-                                state.regToMemIntentFieldName =
-                                    regToMemIntentStorageFieldName(*intentGroup);
-                                state.cppType = logicCppType(state.width);
-                                if (isWideLogicWidth(state.width))
-                                {
-                                    state.wordCount = logicWordCount(state.width);
-                                }
-                                else
-                                {
-                                    state.scalarKind = valueScalarSlotKindForWidth(state.width);
-                                }
-
-                                auto storageIt = model.regToMemIntentStorageByGroup.find(*intentGroup);
-                                if (storageIt == model.regToMemIntentStorageByGroup.end())
-                                {
-                                    RegToMemIntentStorageDecl storage;
-                                    storage.group = *intentGroup;
-                                    storage.fieldName = state.regToMemIntentFieldName;
-                                    storage.elementWidth = state.width;
-                                    storage.isSigned = state.isSigned;
-                                    storage.elementCount = state.regToMemIntentElementCount;
-                                    storage.cppType =
-                                        fixedArrayType(logicCppType(state.width), storage.elementCount);
-                                    model.regToMemIntentStorageByGroup.emplace(*intentGroup, std::move(storage));
-                                }
-                                else
-                                {
-                                    const RegToMemIntentStorageDecl &storage = storageIt->second;
-                                    if (storage.elementWidth != state.width ||
-                                        storage.isSigned != state.isSigned ||
-                                        storage.elementCount != state.regToMemIntentElementCount ||
-                                        storage.fieldName != state.regToMemIntentFieldName)
-                                    {
-                                        error = "reg-to-mem intent group mismatch on register: " + state.symbol;
-                                        return false;
-                                    }
-                                }
-                            }
-                        }
                         const std::string cppType =
                             isWideLogicWidth(state.width)
                                 ? logicCppType(state.width)
                                 : scalarLogicSlotCppType(valueScalarSlotKindForWidth(state.width));
-                        if (!state.regToMemIntentStorage)
+                        state.cppType = cppType;
+                        if (isWideLogicWidth(state.width))
                         {
-                            state.cppType = cppType;
-                            if (isWideLogicWidth(state.width))
-                            {
-                                state.wordCount = logicWordCount(state.width);
-                                model.stateLogicWideSlotCountsByWords[state.wordCount]++;
-                                stateLogicStorageOffset = alignTo(stateLogicStorageOffset, alignof(std::uint64_t));
-                                state.slotIndex = stateLogicStorageOffset;
-                                stateLogicStorageOffset += state.wordCount * sizeof(std::uint64_t);
-                            }
-                            else
-                            {
-                                state.scalarKind = valueScalarSlotKindForWidth(state.width);
-                                stateLogicStorageOffset =
-                                    alignTo(stateLogicStorageOffset, valuePackedScalarSlotAlignment(state.scalarKind));
-                                state.slotIndex = stateLogicStorageOffset;
-                                model.stateLogicScalarSlotCounts[static_cast<std::size_t>(state.scalarKind)]++;
-                                stateLogicStorageOffset += valuePackedScalarSlotByteSize(state.scalarKind);
-                            }
+                            state.wordCount = logicWordCount(state.width);
+                            model.stateLogicWideSlotCountsByWords[state.wordCount]++;
+                            stateLogicStorageOffset = alignTo(stateLogicStorageOffset, alignof(std::uint64_t));
+                            state.slotIndex = stateLogicStorageOffset;
+                            stateLogicStorageOffset += state.wordCount * sizeof(std::uint64_t);
+                        }
+                        else
+                        {
+                            state.scalarKind = valueScalarSlotKindForWidth(state.width);
+                            stateLogicStorageOffset =
+                                alignTo(stateLogicStorageOffset, valuePackedScalarSlotAlignment(state.scalarKind));
+                            state.slotIndex = stateLogicStorageOffset;
+                            model.stateLogicScalarSlotCounts[static_cast<std::size_t>(state.scalarKind)]++;
+                            stateLogicStorageOffset += valuePackedScalarSlotByteSize(state.scalarKind);
                         }
                         if (auto initValue = getAttribute<std::string>(op, "initValue"))
                         {
@@ -7211,21 +6757,6 @@ namespace wolvrix::lib::emit
                 default:
                     break;
                 }
-            }
-
-            std::vector<std::string> regToMemIntentGroups;
-            regToMemIntentGroups.reserve(model.regToMemIntentStorageByGroup.size());
-            for (const auto &[group, _] : model.regToMemIntentStorageByGroup)
-            {
-                (void)_;
-                regToMemIntentGroups.push_back(group);
-            }
-            std::sort(regToMemIntentGroups.begin(), regToMemIntentGroups.end());
-            for (const std::string &group : regToMemIntentGroups)
-            {
-                const RegToMemIntentStorageDecl &storage = model.regToMemIntentStorageByGroup.at(group);
-                model.stateFieldDecls.push_back("    " + storage.cppType + " " + storage.fieldName + " = " +
-                                                storage.cppType + "{};");
             }
 
             model.stateLogicStorageBytes = stateLogicStorageOffset;
@@ -7625,68 +7156,10 @@ namespace wolvrix::lib::emit
                 }
             }
 
-            std::unordered_set<ValueId, ValueIdHash> regToMemIntentIndexValues;
+            for (auto &[valueId, fanout] : model.boundaryFanoutByValue)
             {
-                constexpr uint32_t kNoSupernode = std::numeric_limits<uint32_t>::max();
-                std::vector<uint32_t> opSupernode;
-                if (!graph.operations().empty())
-                {
-                    opSupernode.assign(graph.operations().back().index + 1u, kNoSupernode);
-                }
-                for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
-                {
-                    for (const OperationId opId : schedule.supernodeToOps[supernodeId])
-                    {
-                        if (opId.index >= opSupernode.size())
-                        {
-                            opSupernode.resize(opId.index + 1u, kNoSupernode);
-                        }
-                        opSupernode[opId.index] = supernodeId;
-                    }
-                }
-                auto noteIntentIndexFanout = [&](ValueId valueId, uint32_t supernodeId) {
-                    if (!valueId.valid() || !isComputeSupernode(model, supernodeId) ||
-                        supernodeId >= model.activeIdBySupernode.size() ||
-                        model.activeIdBySupernode[supernodeId] == kInvalidIndex)
-                    {
-                        return;
-                    }
-                    const auto activeId = static_cast<uint32_t>(model.activeIdBySupernode[supernodeId]);
-                    if (model.inputFieldByValue.contains(valueId))
-                    {
-                        model.inputHeadSupernodesByValue[valueId].push_back(activeId);
-                        return;
-                    }
-                    auto &fanout = model.boundaryFanoutByValue[valueId];
-                    fanout.push_back(activeId);
-                };
-                for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
-                {
-                    for (const OperationId opId : schedule.supernodeToOps[supernodeId])
-                    {
-                        const Operation op = graph.getOperation(opId);
-                        const auto indexValue = regToMemIntentSliceIndexValue(graph, op);
-                        if (!indexValue)
-                        {
-                            continue;
-                        }
-                        regToMemIntentIndexValues.insert(*indexValue);
-                        const OperationId defOpId = graph.valueDef(*indexValue);
-                        const uint32_t defSupernode =
-                            defOpId.valid() && defOpId.index < opSupernode.size()
-                                ? opSupernode[defOpId.index]
-                                : kNoSupernode;
-                        if (defSupernode != supernodeId)
-                        {
-                            noteIntentIndexFanout(*indexValue, supernodeId);
-                        }
-                    }
-                }
-                for (auto &[valueId, fanout] : model.boundaryFanoutByValue)
-                {
-                    (void)valueId;
-                    sortUniqueVector(fanout);
-                }
+                (void)valueId;
+                sortUniqueVector(fanout);
             }
 
             discoverPackedArrayLaneViews(graph, waveformValueIds, model);
@@ -7705,7 +7178,6 @@ namespace wolvrix::lib::emit
                 kPersistentNonLogic = 1u << 7u,
                 kPersistentSideEffectResult = 1u << 8u,
                 kPersistentPhaseCrossing = 1u << 9u,
-                kPersistentRegToMemIntentIndex = 1u << 10u,
             };
             std::unordered_map<ValueId, uint32_t, ValueIdHash> persistentReasonByValue;
             persistentReasonByValue.reserve(graph.values().size());
@@ -7747,10 +7219,6 @@ namespace wolvrix::lib::emit
             {
                 (void)_;
                 markPersistent(valueId, kPersistentBoundaryFanout);
-            }
-            for (ValueId valueId : regToMemIntentIndexValues)
-            {
-                markPersistent(valueId, kPersistentRegToMemIntentIndex);
             }
             for (OperationId opId : graph.operations())
             {
@@ -7880,7 +7348,6 @@ namespace wolvrix::lib::emit
             {
                 model.materializedValues.insert(valueId);
             }
-            collectRegToMemIntentBypassOps(graph, model);
             buildSameSupernodeStateReadSlotAliases(graph, schedule, waveformValueIds, model);
             if (emitMaterializedValueStatsEnabled())
             {
@@ -8325,72 +7792,6 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, std::size_t, ValueIdHash> &costCache,
             std::size_t &totalOps,
             std::size_t opBudget);
-
-        std::string resolvedRegToMemIntentIndexExpr(const Graph &graph,
-                                                    const EmitModel &model,
-                                                    ValueId value,
-                                                    const SupernodeLocalExprContext *context = nullptr)
-        {
-            if (context != nullptr)
-            {
-                const auto storedIt = context->storedValueRefByValue.find(value);
-                if (storedIt != context->storedValueRefByValue.end())
-                {
-                    return storedIt->second;
-                }
-            }
-            if (const auto *expr = findSupernodeLocalExpr(context, value); expr != nullptr)
-            {
-                return "(" + expr->expr + ")";
-            }
-            if (auto inputIt = model.inputFieldByValue.find(value); inputIt != model.inputFieldByValue.end())
-            {
-                return inputIt->second;
-            }
-
-            const OperationId defOpId = graph.valueDef(value);
-            if (defOpId.valid())
-            {
-                const Operation defOp = graph.getOperation(defOpId);
-                if (defOp.kind() == OperationKind::kConstant)
-                {
-                    if (auto expr = constantExpr(graph, defOp, value))
-                    {
-                        return *expr;
-                    }
-                }
-                if (defOp.kind() == OperationKind::kRegisterReadPort ||
-                    defOp.kind() == OperationKind::kLatchReadPort)
-                {
-                    const char *symbolAttr =
-                        defOp.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol";
-                    if (auto symbol = getAttribute<std::string>(defOp, symbolAttr))
-                    {
-                        if (auto stateIt = model.stateBySymbol.find(*symbol); stateIt != model.stateBySymbol.end())
-                        {
-                            return resolvedStateRefExpr(stateIt->second, context);
-                        }
-                    }
-                }
-            }
-
-            std::unordered_map<ValueId, std::optional<std::string>, ValueIdHash> exprCache;
-            std::unordered_map<ValueId, std::size_t, ValueIdHash> costCache;
-            std::size_t totalOps = 0;
-            if (auto pureExpr = pureExprForValue(
-                    graph,
-                    model,
-                    value,
-                    exprCache,
-                    costCache,
-                    totalOps,
-                    kRegToMemIntentIndexInlineOpLimit))
-            {
-                return *pureExpr;
-            }
-
-            return resolvedScheduleValueExpr(model, value, context);
-        }
 
         bool isCheapScalarInlineExpr(std::string_view expr) noexcept
         {
@@ -9125,7 +8526,7 @@ namespace wolvrix::lib::emit
                     for (OperationId opId : supernodeOps)
                     {
                         const Operation op = graph.getOperation(opId);
-                        if (isCommitPhaseOp(op) || isRegToMemIntentBypassOp(model, opId))
+                        if (isCommitPhaseOp(op))
                         {
                             continue;
                         }
@@ -12075,159 +11476,6 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        struct RegToMemIntentRowAccessExpr
-        {
-            std::string rowExpr;
-            std::string inRangeExpr;
-            bool alwaysInRange = false;
-        };
-
-        std::optional<ValueId> regToMemIntentSliceDynamicIndexValue(const Graph &graph,
-                                                                    const Operation &op,
-                                                                    int64_t elementWidth)
-        {
-            (void)elementWidth;
-            if (op.kind() != OperationKind::kSliceDynamic)
-            {
-                return std::nullopt;
-            }
-            return regToMemIntentSliceIndexValue(graph, op);
-        }
-
-        std::optional<RegToMemIntentRowAccessExpr>
-        regToMemIntentRowAccessExpr(const Graph &graph,
-                                    const EmitModel &model,
-                                    const Operation &op,
-                                    ValueId indexValue,
-                                    std::string_view indexExpr)
-        {
-            if ((op.kind() != OperationKind::kSliceArray && op.kind() != OperationKind::kSliceDynamic) ||
-                op.operands().size() != 2 || op.results().empty() || !indexValue.valid())
-            {
-                return std::nullopt;
-            }
-            const auto group = getAttribute<std::string>(op, "regToMem.intent.group");
-            const auto mode = getAttribute<std::string>(op, "regToMem.intent.mode");
-            const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
-            const auto elementCount = getAttribute<int64_t>(op, "regToMem.intent.elementCount");
-            const auto storageGroupAttr = getAttribute<std::string>(op, "regToMem.intent.storageGroup");
-            const auto storageElementCountAttr = getAttribute<int64_t>(op, "regToMem.intent.storageElementCount");
-            const auto storageRowOffsetAttr = getAttribute<int64_t>(op, "regToMem.intent.storageRowOffset");
-            const auto sliceWidth = getAttribute<int64_t>(op, "sliceWidth");
-            if (!group || mode.value_or(std::string()) != "array-index" ||
-                !elementWidth || !elementCount || !sliceWidth ||
-                *elementWidth <= 0 || *elementCount <= 0 ||
-                *sliceWidth != *elementWidth ||
-                graph.valueWidth(op.results().front()) != *elementWidth)
-            {
-                return std::nullopt;
-            }
-            const std::string storageGroup = storageGroupAttr.value_or(*group);
-            const int64_t storageElementCount = storageElementCountAttr.value_or(*elementCount);
-            const int64_t storageRowOffset = storageRowOffsetAttr.value_or(0);
-            if (storageGroup.empty() ||
-                storageElementCount < *elementCount ||
-                storageRowOffset < 0 ||
-                storageRowOffset > storageElementCount ||
-                storageElementCount - storageRowOffset < *elementCount)
-            {
-                return std::nullopt;
-            }
-            const auto storageIt = model.regToMemIntentStorageByGroup.find(storageGroup);
-            if (storageIt == model.regToMemIntentStorageByGroup.end())
-            {
-                return std::nullopt;
-            }
-            const RegToMemIntentStorageDecl &storage = storageIt->second;
-            if (storage.elementWidth != *elementWidth ||
-                storage.elementCount != static_cast<std::size_t>(storageElementCount))
-            {
-                return std::nullopt;
-            }
-            const int32_t indexWidth = graph.valueWidth(indexValue);
-            RegToMemIntentRowAccessExpr access;
-            const auto storageIndexExpr = [&](std::string baseExpr) {
-                if (storageRowOffset == 0)
-                {
-                    return baseExpr;
-                }
-                return "(" + std::move(baseExpr) + " + " + std::to_string(storageRowOffset) + "u)";
-            };
-            if (isWideLogicWidth(indexWidth))
-            {
-                const std::size_t wordCount = logicWordCount(indexWidth);
-                access.rowExpr =
-                    storage.fieldName + "[static_cast<std::size_t>(" +
-                    storageIndexExpr("(" + std::string(indexExpr) + ")[0]") + ")]";
-                std::ostringstream cond;
-                cond << "(";
-                for (std::size_t i = 1; i < wordCount; ++i)
-                {
-                    if (i != 1)
-                    {
-                        cond << " && ";
-                    }
-                    cond << "((" << indexExpr << ")[" << i << "] == UINT64_C(0))";
-                }
-                if (wordCount > 1)
-                {
-                    cond << " && ";
-                }
-                cond << "((" << indexExpr << ")[0] < " << *elementCount << "u))";
-                access.inRangeExpr = cond.str();
-                access.alwaysInRange = false;
-                return access;
-            }
-            const std::string scalarIndexExpr =
-                "static_cast<std::uint64_t>(" + std::string(indexExpr) + ")";
-            if (indexWidth > 0 && indexWidth < 64 &&
-                (UINT64_C(1) << static_cast<std::size_t>(indexWidth)) <=
-                    static_cast<std::uint64_t>(*elementCount))
-            {
-                access.rowExpr = storage.fieldName + "[static_cast<std::size_t>(" +
-                                 storageIndexExpr(scalarIndexExpr) + ")]";
-                access.inRangeExpr = "true";
-                access.alwaysInRange = true;
-                return access;
-            }
-            access.rowExpr = storage.fieldName + "[static_cast<std::size_t>(" +
-                             storageIndexExpr(scalarIndexExpr) + ")]";
-            access.inRangeExpr = "(" + scalarIndexExpr + " < " + std::to_string(*elementCount) + "u)";
-            access.alwaysInRange = false;
-            return access;
-        }
-
-        std::optional<std::string> regToMemIntentSliceExpr(const Graph &graph,
-                                                           const EmitModel &model,
-                                                           const Operation &op,
-                                                           ValueId resultValue,
-                                                           ValueId indexValue,
-                                                           std::string_view indexExpr)
-        {
-            auto access = regToMemIntentRowAccessExpr(graph, model, op, indexValue, indexExpr);
-            if (!access)
-            {
-                return std::nullopt;
-            }
-            if (isWideLogicValue(graph, resultValue))
-            {
-                if (access->alwaysInRange)
-                {
-                    return access->rowExpr;
-                }
-                return "((" + access->inRangeExpr + ") ? " + access->rowExpr + " : " +
-                       wordsArrayTypeForWidth(graph.valueWidth(resultValue)) + "{})";
-            }
-            const std::string rowExpr =
-                "static_cast<" + cppTypeForValue(graph, resultValue) + ">(" + access->rowExpr + ")";
-            if (access->alwaysInRange)
-            {
-                return rowExpr;
-            }
-            return "((" + access->inRangeExpr + ") ? " + rowExpr + " : " +
-                   defaultInitExprForLogicWidth(graph.valueWidth(resultValue)) + ")";
-        }
-
         std::optional<std::string> eventExprMaterializedBodyForValue(
             const Graph &graph,
             const EmitModel &model,
@@ -13463,7 +12711,7 @@ namespace wolvrix::lib::emit
             for (OperationId opId : supernodeToOps[supernodeId])
             {
                 const Operation op = graph.getOperation(opId);
-                if (isCommitPhaseOp(op) || isRegToMemIntentBypassOp(model, opId))
+                if (isCommitPhaseOp(op))
                 {
                     return std::nullopt;
                 }
@@ -13694,7 +12942,7 @@ namespace wolvrix::lib::emit
                 return std::nullopt;
             }
             const StateDecl &state = stateIt->second;
-            if (state.regToMemIntentStorage || isWideLogicWidth(state.width) || state.slotIndex == kInvalidIndex)
+            if (isWideLogicWidth(state.width) || state.slotIndex == kInvalidIndex)
             {
                 return std::nullopt;
             }
@@ -14696,10 +13944,6 @@ namespace wolvrix::lib::emit
                     {
                         continue;
                     }
-                    if (isRegToMemIntentBypassOp(model, useOpId))
-                    {
-                        continue;
-                    }
                     for (ValueId operand : useOp.operands())
                     {
                         ++localExprContext.useCountByValue[operand];
@@ -14735,11 +13979,6 @@ namespace wolvrix::lib::emit
                     const bool commitPhaseOp = isCommitPhaseOp(op);
                     if ((batch.phase == ScheduleBatch::Phase::kCompute && commitPhaseOp) ||
                         (batch.phase == ScheduleBatch::Phase::kCommit && !commitPhaseOp))
-                    {
-                        ++opIndex;
-                        continue;
-                    }
-                    if (isRegToMemIntentBypassOp(model, opId))
                     {
                         ++opIndex;
                         continue;
@@ -15419,65 +14658,6 @@ namespace wolvrix::lib::emit
                         {
                             return emitError("unsupported kSystemFunction result type in grhsim-cpp emit",
                                              std::string(op.symbolText()));
-                        }
-                        if ((op.kind() == OperationKind::kSliceArray || op.kind() == OperationKind::kSliceDynamic) &&
-                            operands.size() == 2)
-                        {
-                            ValueId indexValue = ValueId::invalid();
-                            if (op.kind() == OperationKind::kSliceArray)
-                            {
-                                indexValue = operands[1];
-                            }
-                            else
-                            {
-                                const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
-                                if (elementWidth)
-                                {
-                                    if (auto normalized = regToMemIntentSliceDynamicIndexValue(graph, op, *elementWidth))
-                                    {
-                                        indexValue = *normalized;
-                                    }
-                                }
-                            }
-                            if (indexValue.valid())
-                            {
-                                const std::string indexExpr =
-                                    resolvedRegToMemIntentIndexExpr(graph, model, indexValue, &localExprContext);
-                                if (auto expr = regToMemIntentSliceExpr(
-                                        graph,
-                                        model,
-                                        op,
-                                        resultValue,
-                                        indexValue,
-                                        indexExpr))
-                                {
-                                    emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
-                                    if (isWideLogicValue(graph, resultValue))
-                                    {
-                                        emitLogicAssignFromWideWordsExpr(stream,
-                                                                         graph,
-                                                                         model,
-                                                                         resultValue,
-                                                                         *expr,
-                                                                         &localExprContext,
-                                                                         &activationContext,
-                                                                         &deferredActivationContext);
-                                    }
-                                    else
-                                    {
-                                        emitLogicAssignFromScalarExpr(stream,
-                                                                      graph,
-                                                                      model,
-                                                                      resultValue,
-                                                                      "static_cast<std::uint64_t>(" + *expr + ")",
-                                                                      true,
-                                                                      &localExprContext,
-                                                                      &activationContext,
-                                                                      &deferredActivationContext);
-                                    }
-                                    break;
-                                }
-                            }
                         }
                         if (op.kind() == OperationKind::kSystemFunction)
                         {

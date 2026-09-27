@@ -468,6 +468,45 @@ endmodule
 
 即使 `temp` 未被使用，由于它是 Declared Symbol，工具可能会保留它用于调试或报告。
 
+**Generate 块内声明**：
+
+generate 块（for/if/case）内声明的网表与变量同样进入 Declared Symbol。由于同一声明在 elaboration 后存在多份副本，块内符号以**作用域限定名**登记：每一层 generate-for 轮次分量形如 `<块名>$<轮次>`，叶子为裸声明名，分量之间以 `$` 连接。
+
+```sv
+generate
+    for (i = 0; i < 2; i++) begin : gen_loop
+        logic [7:0] sig;    // 登记为 "gen_loop$0$sig"、"gen_loop$1$sig"
+    end
+endgenerate
+```
+
+嵌套 generate 作用域逐层拼接（如 `outer$2$inner$5$sig`）。standalone if/case generate 块分量只有块名、无轮次（如 `gen_if$sig`）。
+
+**Generate 副本分组（Generate Group）**：
+
+Graph 额外维护 **Generate Group** 列表（`generateGroups()`），作为 Declared Symbol 之上的纯来源注解，描述"同一 generate 块内声明的各 elaboration 副本"。每个组包含：
+- `scope`：无轮次的作用域路径（嵌套时以 `$` 连接块名，如 `gen_loop`、`outer$inner`）
+- `name`：裸声明名（如 `sig`）
+- `symbols`：按 elaboration 顺序排列的各副本 SymbolId（如 `gen_loop$0$sig`、`gen_loop$1$sig`）
+
+语义约定：
+- 组成员**同时**出现在 Declared Symbol 列表中；组只是分组视图，不改变符号的声明语义
+- 组仅在 ingest 阶段生成；`cloneGraph` 会随符号重映射复制组
+- `eraseOp`/`eraseValue` 擦除组内成员实体时，会同步把该 SymbolId 从所有组中移除；组本身保留（允许空组）
+- `setOpSymbol`/`setValueSymbol` 只改实体绑定的 Symbol，不维护组成员身份（成员身份按 SymbolId 键控）
+
+不纳入 Declared Symbol / Generate Group 的类别：`parameter`/`localparam`、过程块（always/initial 等）内的局部变量。
+
+**hier-flatten 下的形态约定**：
+
+`hier-flatten` 内联子图时，declaredSymbol 与 generateGroups 按同一路径传播：
+
+- 子图的 declared value/op 一律改名为 `$` 连接的层次路径（`inst$...$name`；generate 副本为 `inst$...$gen_loop$i$sig`，实例前缀叠加在 ingest 期已写入的 generate 分量之前）并重新登记为 declared，与 `symProtect` 模式无关（该选项目前只控制父图未声明端口值的改名）；未声明的子图符号一律改内部名 `_val_N`/`_op_N`。
+- **顶图符号保持原名**（层次路径之根）；端口映射冲突时父图 declared 名优先，子图端口名不保留（不引入双名/alias）。
+- generateGroups 随 declared 身份同路径传播：组的 `scope` 叠加实例路径前缀（如 `gen_loop` → `u_inst$gen_loop`，嵌套实例逐级叠加），`name` 保持裸声明名不变，组内成员重映射到克隆/改名后的新符号（成员名形如 `u_inst$gen_loop$i$sig`）。
+- 同一模块的多实例产生各自独立的组（`scope` 前缀不同）；成员符号在内联中被丢弃时（如子图端口名被父图名取代）相应地从组中移除；组变空则不写入主图。
+- flatten 对已展平图是幂等的：前缀只在内联 `kInstance` 时叠加，而实例 op 随内联被删除，重复执行不会二次加前缀。
+
 ---
 
 # 5. Design 详解

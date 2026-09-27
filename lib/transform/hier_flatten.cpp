@@ -254,8 +254,6 @@ namespace wolvrix::lib::transform
                                  const ValueMap &portMap,
                                  InlineState &state);
 
-        bool isStatefulKind(wolvrix::lib::grh::OperationKind kind);
-
         bool inlineInstanceInfo(const wolvrix::lib::grh::Graph &sourceGraph,
                                 const InstanceInfo &info,
                                 const ValueMap &valueMap,
@@ -336,6 +334,9 @@ namespace wolvrix::lib::transform
                 return it->second;
             };
 
+            // Declared child symbols are preserved in every symProtect mode by
+            // inlineGraphContents; the mode only controls whether an undeclared
+            // parent-side port value adopts the child hierarchical port name.
             const bool renamePorts =
                 state.symProtect == HierFlattenOptions::SymProtectMode::All ||
                 state.symProtect == HierFlattenOptions::SymProtectMode::Hierarchy;
@@ -561,6 +562,96 @@ namespace wolvrix::lib::transform
             return info;
         }
 
+        // Propagate the inlined child graph's generate groups into the target:
+        // members are remapped to the cloned/renamed symbols, the group scope
+        // gains the instance path prefix (e.g. "gen_loop" -> "u_inst$gen_loop"),
+        // and the bare declaration name is kept unchanged. Members whose symbols
+        // were dropped during inlining (e.g. child port names superseded by the
+        // parent-side declared name) are removed; groups left empty are skipped.
+        bool propagateGenerateGroups(const wolvrix::lib::grh::Graph &source,
+                                     wolvrix::lib::grh::Graph &target,
+                                     const std::string &prefix,
+                                     const std::unordered_map<std::string, std::string> &valueRename,
+                                     const std::unordered_map<std::string, std::string> &opRename,
+                                     InlineState &state)
+        {
+            auto lookupOrIntern = [&](std::string_view text) -> wolvrix::lib::grh::SymbolId {
+                wolvrix::lib::grh::SymbolId sym = target.lookupSymbol(text);
+                if (!sym.valid())
+                {
+                    sym = target.internSymbol(text);
+                }
+                return sym;
+            };
+            for (const auto &srcGroup : source.generateGroups())
+            {
+                const std::string_view srcScope = source.symbolText(srcGroup.scope);
+                const std::string_view srcName = source.symbolText(srcGroup.name);
+                if (srcScope.empty() || srcName.empty())
+                {
+                    continue;
+                }
+                std::vector<wolvrix::lib::grh::SymbolId> newMembers;
+                newMembers.reserve(srcGroup.symbols.size());
+                for (const wolvrix::lib::grh::SymbolId srcSym : srcGroup.symbols)
+                {
+                    if (!srcSym.valid())
+                    {
+                        continue;
+                    }
+                    const std::string oldText = std::string(source.symbolText(srcSym));
+                    if (oldText.empty())
+                    {
+                        continue;
+                    }
+                    std::string_view newText;
+                    if (auto it = valueRename.find(oldText); it != valueRename.end())
+                    {
+                        newText = it->second;
+                    }
+                    else if (auto it = opRename.find(oldText); it != opRename.end())
+                    {
+                        newText = it->second;
+                    }
+                    else
+                    {
+                        // Symbol was dropped while inlining (port mapping, etc.).
+                        continue;
+                    }
+                    const wolvrix::lib::grh::SymbolId dstSym = target.lookupSymbol(newText);
+                    if (!dstSym.valid())
+                    {
+                        state.graphError(source,
+                                         "Flatten generate group member missing after rename: " +
+                                             std::string(newText));
+                        state.failed = true;
+                        return false;
+                    }
+                    newMembers.push_back(dstSym);
+                }
+                if (newMembers.empty())
+                {
+                    continue;
+                }
+                const std::string newScope = makeHierName(prefix, srcScope);
+                const wolvrix::lib::grh::SymbolId scopeSym = lookupOrIntern(newScope);
+                const wolvrix::lib::grh::SymbolId nameSym = lookupOrIntern(srcName);
+                if (!scopeSym.valid() || !nameSym.valid())
+                {
+                    state.graphError(source,
+                                     "Flatten generate group scope/name collision: " + newScope);
+                    state.failed = true;
+                    return false;
+                }
+                const std::size_t dstGroup = target.addGenerateGroup(scopeSym, nameSym);
+                for (const wolvrix::lib::grh::SymbolId sym : newMembers)
+                {
+                    target.addGenerateGroupSymbol(dstGroup, sym);
+                }
+            }
+            return true;
+        }
+
         bool inlineGraphContents(const wolvrix::lib::grh::Graph &source,
                                  wolvrix::lib::grh::Graph &target,
                                  const std::string &prefix,
@@ -591,31 +682,15 @@ namespace wolvrix::lib::transform
             auto isDeclared = [&](wolvrix::lib::grh::SymbolId sym) -> bool {
                 return sym.valid() && declaredSet.find(sym.value) != declaredSet.end();
             };
+            // Declared symbols are always preserved under their hierarchical
+            // name and re-registered as declared, independent of
+            // HierFlattenOptions::symProtect (the mode now only gates
+            // parent-side port renaming, see renamePorts).
             auto shouldProtectValue = [&](const wolvrix::lib::grh::Value &value) -> bool {
-                switch (state.symProtect)
-                {
-                case HierFlattenOptions::SymProtectMode::All:
-                    return isDeclared(value.symbol());
-                case HierFlattenOptions::SymProtectMode::Hierarchy:
-                    return value.isInput() || value.isOutput() || value.isInout();
-                case HierFlattenOptions::SymProtectMode::Stateful:
-                case HierFlattenOptions::SymProtectMode::None:
-                    return false;
-                }
-                return false;
+                return isDeclared(value.symbol());
             };
             auto shouldProtectOp = [&](const wolvrix::lib::grh::Operation &op) -> bool {
-                switch (state.symProtect)
-                {
-                case HierFlattenOptions::SymProtectMode::All:
-                    return isDeclared(op.symbol());
-                case HierFlattenOptions::SymProtectMode::Hierarchy:
-                case HierFlattenOptions::SymProtectMode::Stateful:
-                    return isStatefulKind(op.kind());
-                case HierFlattenOptions::SymProtectMode::None:
-                    return false;
-                }
-                return false;
+                return isDeclared(op.symbol());
             };
 
             ValueMap valueMap = portMap;
@@ -657,6 +732,7 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            std::unordered_map<std::string, std::string> valueRename;
             for (const auto valueId : source.values())
             {
                 if (!valueId.valid())
@@ -690,6 +766,11 @@ namespace wolvrix::lib::transform
                     target.setValueSrcLoc(newValue, *value.srcLoc());
                 }
                 valueMap.emplace(valueId, newValue);
+                if (!value.symbolText().empty())
+                {
+                    valueRename.emplace(std::string(value.symbolText()),
+                                        std::string(target.symbolText(newSym)));
+                }
                 state.changed = true;
             }
 
@@ -886,6 +967,11 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            if (!state.failed && !source.generateGroups().empty())
+            {
+                propagateGenerateGroups(source, target, prefix, valueRename, opRename, state);
+            }
+
             state.stack.erase(&source);
             return !state.failed;
         }
@@ -906,19 +992,6 @@ namespace wolvrix::lib::transform
                 }
             }
             return false;
-        }
-
-        bool isStatefulKind(wolvrix::lib::grh::OperationKind kind)
-        {
-            switch (kind)
-            {
-            case wolvrix::lib::grh::OperationKind::kRegister:
-            case wolvrix::lib::grh::OperationKind::kMemory:
-            case wolvrix::lib::grh::OperationKind::kLatch:
-                return true;
-            default:
-                return false;
-            }
         }
 
     } // namespace
@@ -989,6 +1062,10 @@ namespace wolvrix::lib::transform
             error(graph, op, std::move(message));
         };
 
+        // Invariant: top-graph symbols are never renamed; they are the root of
+        // every hierarchical path. Only symbols cloned from inlined child
+        // graphs receive the `inst$...$` prefix (and only child graphs'
+        // generate groups gain the scope prefix).
         ValueMap identity;
         identity.reserve(top->values().size());
         for (const auto valueId : top->values())
@@ -1000,6 +1077,10 @@ namespace wolvrix::lib::transform
             identity.emplace(valueId, valueId);
         }
 
+        // Prefixing happens only while inlining a kInstance op, and the op is
+        // erased as it is inlined; re-running the pass on an already flattened
+        // graph finds no instances and is a no-op, so already-prefixed symbols
+        // never gain a second prefix.
         std::vector<wolvrix::lib::grh::OperationId> instanceOps;
         for (const auto opId : top->operations())
         {

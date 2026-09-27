@@ -17,19 +17,21 @@
 
 ### 符号保护模式
 
+declaredSymbol（declared 的 value/op）在任何模式下都会保留为层次路径名并维持 declared 身份；未声明的子图符号一律改用内部名（`_val_N`/`_op_N`）。`symProtect` 模式目前只影响一种情形：父图侧**未声明**的端口映射值是否改名为子图的层次端口名。
+
 | 模式 | 说明 |
 |------|------|
-| `all` | 保护所有符号（默认） |
-| `hierarchy` | 仅保护层级路径符号 |
-| `stateful` | 仅保护状态元素（寄存器、锁存器、存储器） |
-| `none` | 不保护任何符号 |
+| `all` | 父图未声明端口值改名为层次端口名（默认） |
+| `hierarchy` | 同 `all` |
+| `stateful` | 不改名父图端口值 |
+| `none` | 不改名父图端口值 |
 
 ## 配置选项
 
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
 | `-preserve-modules` | false | 保留被扁平化的模块定义 |
-| `-sym-protect` | `all` | 符号保护模式 |
+| `-sym-protect` | `all` | 符号保护模式（见上表） |
 
 ## 使用示例
 
@@ -52,10 +54,12 @@ wolvrix --pass=hier-flatten:-sym-protect=none input.sv
 扁平化后的符号名称遵循以下格式：
 
 ```
-<parent_prefix>$<instance_name>$_<original_symbol>
+<instance_path>$<original_symbol>
 ```
 
-例如：`top$alu$_result` 表示顶层模块中 `alu` 实例的 `result` 信号。
+其中 `<instance_path>` 由逐层实例名以 `$` 连接（如 `u_m1$u_leaf`）。例如：`u_m1$u_leaf$w` 表示实例路径 `u_m1.u_leaf` 下的 `w` 信号。顶图符号保持原名，作为层次路径之根；端口映射冲突时父图 declared 名优先，子图端口名不保留。名称冲突时追加 `_N` 后缀去重。
+
+generate 块内声明的符号在 ingest 期已含作用域分量（`gen_loop$0$sig`），扁平化时实例前缀叠加在其前（`u_m1$gen_loop$0$sig`）；对应的 generate 副本分组（`generateGroups`）随之传播：组的 `scope` 叠加实例前缀（`u_m1$gen_loop`），`name` 保持裸声明名，成员重映射到改名后的符号；成员被丢弃的组会收缩，空组不写入主图。同一模块的多实例产生各自独立的组。
 
 ## 注意事项
 

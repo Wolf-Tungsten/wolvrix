@@ -640,6 +640,16 @@ class Design;
 
 class Graph {
 public:
+    // Provenance annotation for declarations inside generate scopes: one group
+    // per generate-scope declaration, holding the SymbolIds of its per-round
+    // elaboration copies (ingest emits them in round order). Pure metadata;
+    // see docs/grh/grh-ir.md 4.3.2 for the maintenance contract.
+    struct GenerateGroup {
+        SymbolId scope;                // generate scope path text, '$'-joined (e.g. "gen_loop", nested "outer$inner")
+        SymbolId name;                 // bare declaration name (e.g. "sig")
+        std::vector<SymbolId> symbols; // per-round copy symbols, index = generate-for round
+    };
+
     Graph(Design& owner, std::string symbol, GraphId graphId);
     Graph(const Graph&) = delete;
     Graph& operator=(const Graph&) = delete;
@@ -694,6 +704,14 @@ public:
     void clearDeclaredSymbols();
     bool isDeclaredSymbol(SymbolId sym) const noexcept;
     std::span<const SymbolId> declaredSymbols() const noexcept;
+    std::size_t addGenerateGroup(SymbolId scope, SymbolId name);
+    void addGenerateGroupSymbol(std::size_t group, SymbolId symbol);
+    const std::vector<GenerateGroup>& generateGroups() const noexcept;
+    // Debug consistency check over the provenance annotations: reports one
+    // entry per dangling declaredSymbol or generateGroup member (a member is
+    // dangling when its symbol no longer resolves to a live value/operation).
+    // Returns an empty vector when the annotations are consistent.
+    std::vector<std::string> validateDeclaredSymbols() const;
 
     bool frozen() const noexcept { return !builder_.has_value(); }
     void freeze();
@@ -784,6 +802,7 @@ private:
     void ensureOperationsCache() const;
     void ensurePortsCache() const;
     GraphBuilder& ensureBuilder();
+    void removeSymbolFromGenerateGroups(SymbolId sym) noexcept;
     const GraphView& view() const;
     Value valueFromView(ValueId id) const;
     Value valueFromBuilder(ValueId id) const;
@@ -799,6 +818,7 @@ private:
     std::optional<GraphBuilder> builder_;
     std::vector<SymbolId> declaredSymbols_;
     std::unordered_set<uint32_t> declaredSymbolSet_;
+    std::vector<GenerateGroup> generateGroups_;
     mutable std::vector<ValueId> valuesCache_;
     mutable std::vector<OperationId> operationsCache_;
     mutable std::vector<Port> inputPortsCache_;

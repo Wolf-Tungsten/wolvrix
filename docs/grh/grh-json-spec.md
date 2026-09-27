@@ -14,6 +14,10 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
 ## Graph 结构（按字段顺序输出）
 - `symbol`: 图名称（必需，缺失视为错误）。
 - `declaredSymbols`: 模块内部声明的符号名数组（必需）。
+- `generateGroups`: 可选，generate 块内声明的副本分组数组（仅非空时写出，缺失视为空集合）。每项 `{ scope, name, symbols }`，均为符号文本：
+  - `scope`: 无轮次的作用域路径（嵌套时以 `$` 连接块名，如 `gen_loop`、`outer$inner`）；hier-flatten 后叠加实例路径前缀（如 `u_inst$gen_loop`）。
+  - `name`: 裸声明名（flatten 不改动该字段）。
+  - `symbols`: 按 elaboration 顺序排列的副本符号名（如 `gen_loop$0$sig`；flatten 后为 `u_inst$gen_loop$0$sig`）。
 - `vals`: 值列表，保持创建顺序。每个值包含：
   - `sym`: 符号名（必需，缺失视为错误）。
   - `w`: 位宽。

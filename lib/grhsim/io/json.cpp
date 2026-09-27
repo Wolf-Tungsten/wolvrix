@@ -1180,6 +1180,27 @@ namespace wolvrix::lib::grhsim
                 writer.endArray();
             }
             writer.endArray();
+            // Optional trailing keys, positional: declaredSymbols then
+            // generateGroups. Only written when non-empty, so metadata-free
+            // checkpoints stay byte-compatible with the pre-metadata schema.
+            if (!model.declaredSymbols().empty() || !model.generateGroups().empty())
+            {
+                writer.key("declaredSymbols");
+                writeIdArray<StringId>(writer, model.declaredSymbols());
+                if (!model.generateGroups().empty())
+                {
+                    writer.key("generateGroups");
+                    writer.startArray();
+                    for (const GenerateGroup &group : model.generateGroups())
+                    {
+                        writer.startArray();
+                        writeId(writer, group.scope); writeId(writer, group.name);
+                        writeIdArray<StringId>(writer, group.symbols);
+                        writer.endArray();
+                    }
+                    writer.endArray();
+                }
+            }
             writer.endObject();
         }
 
@@ -1395,6 +1416,39 @@ namespace wolvrix::lib::grhsim
                         throw std::runtime_error("CPU mapping completion disagrees with stage");
                     model->setCpuMapping(std::move(cpu));
                     reader.endArray();
+                }
+            }
+
+            // Optional trailing keys (absent in old checkpoints): a
+            // "declaredSymbols" string-id array, then a "generateGroups" array
+            // of [scope, name, [symbol ids]] entries.
+            if (reader.comma())
+            {
+                if (reader.string() != "declaredSymbols")
+                    throw std::runtime_error("expected property 'declaredSymbols'");
+                reader.expect(':');
+                for (const StringId symbol : readIdArray<StringId>(reader, "declared symbol"))
+                    model->addDeclaredSymbol(symbol);
+                if (reader.comma())
+                {
+                    if (reader.string() != "generateGroups")
+                        throw std::runtime_error("expected property 'generateGroups'");
+                    reader.expect(':');
+                    bool groupFirst = true;
+                    reader.startArray();
+                    while (reader.nextArray(groupFirst))
+                    {
+                        reader.startArray();
+                        const StringId scope = readId<StringId>(reader, "generate group scope");
+                        expectComma(reader);
+                        const StringId name = readId<StringId>(reader, "generate group name");
+                        expectComma(reader);
+                        auto symbols = readIdArray<StringId>(reader, "generate group symbol");
+                        reader.endArray();
+                        const std::size_t group = model->addGenerateGroup(scope, name);
+                        for (const StringId symbol : symbols)
+                            model->addGenerateGroupSymbol(group, symbol);
+                    }
                 }
             }
             reader.endObject(); reader.finish();

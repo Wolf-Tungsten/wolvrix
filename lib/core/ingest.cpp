@@ -1142,6 +1142,24 @@ PlanSymbolId resolveSimpleSymbolForPlan(const slang::ast::Expression& expr,
 const SignalInfo* findSignalBySymbol(const ModulePlan& plan, PlanSymbolId symbol);
 PlanSymbolId makeInternalPlanValueSymbol(ModulePlan& plan);
 
+// Resolves a slang symbol to its plan signal symbol. Signals declared inside
+// generate scopes are interned under scope-qualified names, so bare-name text
+// lookup would miss them (or silently hit a same-named top-level symbol); the
+// identity map recorded by collectSignals resolves them exactly.
+PlanSymbolId lookupPlanSignal(const ModulePlan& plan, const slang::ast::Symbol& symbol)
+{
+    if (auto it = plan.signalBySlangSymbol.find(&symbol);
+        it != plan.signalBySlangSymbol.end())
+    {
+        return it->second;
+    }
+    if (symbol.name.empty())
+    {
+        return {};
+    }
+    return plan.symbolTable.lookup(symbol.name);
+}
+
 struct StmtLowererState {
     class AssignmentExprVisitor;
 
@@ -2215,7 +2233,7 @@ struct StmtLowererState {
         }
         if (value != kInvalidPlanIndex)
         {
-            PlanSymbolId target = plan.symbolTable.lookup(net.name);
+            PlanSymbolId target = lookupPlanSignal(plan, net);
             if (target.valid())
             {
                 WriteIntent intent;
@@ -2226,6 +2244,11 @@ struct StmtLowererState {
                 intent.isNonBlocking = false;
                 intent.location = init->sourceRange.start();
                 recordWriteIntent(std::move(intent));
+            }
+            else if (diagnostics)
+            {
+                diagnostics->error(net.location,
+                                   "Unresolved target of net initializer");
             }
         }
         domain = saved;
@@ -2243,9 +2266,14 @@ struct StmtLowererState {
             return;
         }
 
-        PlanSymbolId target = plan.symbolTable.lookup(variable.name);
+        PlanSymbolId target = lookupPlanSignal(plan, variable);
         if (!target.valid())
         {
+            if (diagnostics)
+            {
+                diagnostics->error(variable.location,
+                                   "Unresolved target of variable initializer");
+            }
             return;
         }
         const SignalInfo* signal = findSignalBySymbol(plan, target);
@@ -3660,7 +3688,7 @@ private:
             {
                 return *local;
             }
-            return plan.symbolTable.lookup(named->symbol.name);
+            return lookupPlanSignal(plan, named->symbol);
         }
         if (const auto* hier = expr.as_if<slang::ast::HierarchicalValueExpression>())
         {
@@ -4181,7 +4209,7 @@ public:
         }
         else
         {
-            id = plan.symbolTable.lookup(valueSymbol->name);
+            id = lookupPlanSignal(plan, *valueSymbol);
         }
         if (!id.valid())
         {
@@ -4308,7 +4336,7 @@ private:
                 {
                     return;
                 }
-                PlanSymbolId id = state_.plan.symbolTable.lookup(expr.symbol.name);
+                PlanSymbolId id = lookupPlanSignal(state_.plan, expr.symbol);
                 if (!id.valid())
                 {
                     found_ = true;
@@ -5654,7 +5682,7 @@ private:
         {
             return std::nullopt;
         }
-        const PlanSymbolId baseId = plan.symbolTable.lookup(baseNamed->symbol.name);
+        const PlanSymbolId baseId = lookupPlanSignal(plan, baseNamed->symbol);
         const SignalInfo* signal = findSignalBySymbol(plan, baseId);
         if (!signal || !isFlattenedNetArray(*signal))
         {
@@ -7547,7 +7575,7 @@ private:
             }
             else
             {
-                node.symbol = plan.symbolTable.lookup(named->symbol.name);
+                node.symbol = lookupPlanSignal(plan, named->symbol);
             }
             if (!node.symbol.valid() &&
                 (named->symbol.kind == slang::ast::SymbolKind::Parameter ||
@@ -8773,7 +8801,7 @@ private:
             {
                 return *local;
             }
-            return plan.symbolTable.lookup(named->symbol.name);
+            return lookupPlanSignal(plan, named->symbol);
         }
         if (const auto* hier = expr.as_if<slang::ast::HierarchicalValueExpression>())
         {
@@ -8830,7 +8858,7 @@ private:
                                            select->sourceRange.start());
                     slice.location = select->sourceRange.start();
                     slices.push_back(std::move(slice));
-                    return plan.symbolTable.lookup(chain->baseExpr->symbol.name);
+                    return lookupPlanSignal(plan, chain->baseExpr->symbol);
                 }
             }
             PlanSymbolId base = resolveLValueSymbol(select->value(), slices, xmrPath);
@@ -9433,7 +9461,7 @@ public:
                 {
                     continue;
                 }
-                PlanSymbolId id = plan.symbolTable.lookup(symbol->name);
+                PlanSymbolId id = lookupPlanSignal(plan, *symbol);
                 if (!id.valid())
                 {
                     continue;
@@ -9455,7 +9483,7 @@ public:
                 {
                     continue;
                 }
-                PlanSymbolId id = plan.symbolTable.lookup(symbol->name);
+                PlanSymbolId id = lookupPlanSignal(plan, *symbol);
                 if (!id.valid())
                 {
                     continue;
@@ -9488,7 +9516,7 @@ public:
                 {
                     continue;
                 }
-                PlanSymbolId id = plan.symbolTable.lookup(symbol->name);
+                PlanSymbolId id = lookupPlanSignal(plan, *symbol);
                 if (!id.valid())
                 {
                     continue;
@@ -9884,74 +9912,234 @@ void collectParameters(const slang::ast::InstanceBodySymbol& body, ModulePlan& p
 void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan,
                     ConvertDiagnostics* diagnostics)
 {
+    // Generate scope path: symbolPrefix embeds the elaboration round of each
+    // enclosing generate-for entry ("gen_loop$3"), groupScope holds the bare
+    // block names only ("gen_loop") and keys the per-declaration copy groups.
+    struct GenerateScopePath {
+        std::string symbolPrefix;
+        std::string groupScope;
+    };
+
+    auto appendScope = [](const std::string& base, std::string_view component) {
+        if (base.empty())
+        {
+            return std::string(component);
+        }
+        std::string out = base;
+        out.push_back('$');
+        out.append(component);
+        return out;
+    };
+
+    auto recordSignal = [&](const slang::ast::ValueSymbol& symbol, PlanSymbolId id,
+                            const GenerateScopePath& scope)
+    {
+        plan.signalBySlangSymbol.emplace(&symbol, id);
+        if (scope.groupScope.empty())
+        {
+            return;
+        }
+        std::string key = scope.groupScope;
+        key.push_back('\x1f');
+        key.append(symbol.name);
+        auto [it, inserted] =
+            plan.generateGroupByKey.try_emplace(key, plan.generateGroups.size());
+        if (inserted)
+        {
+            GenerateGroupPlan group;
+            group.scope = scope.groupScope;
+            group.name = std::string(symbol.name);
+            plan.generateGroups.push_back(std::move(group));
+        }
+        plan.generateGroups[it->second].symbols.push_back(id);
+    };
+
+    auto internSignal = [&](const slang::ast::ValueSymbol& symbol,
+                            const GenerateScopePath& scope) -> PlanSymbolId
+    {
+        PlanSymbolId id;
+        if (scope.symbolPrefix.empty())
+        {
+            id = plan.symbolTable.intern(symbol.name);
+        }
+        else
+        {
+            id = plan.symbolTable.intern(appendScope(scope.symbolPrefix, symbol.name));
+        }
+        recordSignal(symbol, id, scope);
+        return id;
+    };
+
+    std::function<void(const slang::ast::NetSymbol&, const GenerateScopePath&)> collectNet =
+        [&](const slang::ast::NetSymbol& net, const GenerateScopePath& scope)
+    {
+        if (net.name.empty())
+        {
+            if (diagnostics)
+            {
+                diagnostics->warn(net, "Skipping anonymous net symbol");
+            }
+            return;
+        }
+        SignalInfo info;
+        info.symbol = internSignal(net, scope);
+        info.kind = SignalKind::Net;
+        TypeResolution typeInfo = analyzeSignalType(net.getType(), net, diagnostics);
+        info.width = typeInfo.width;
+        info.isSigned = typeInfo.isSigned;
+        info.valueType = typeInfo.valueType;
+        info.memoryRows = typeInfo.memoryRows;
+        info.packedDims = std::move(typeInfo.packedDims);
+        info.unpackedDims = std::move(typeInfo.unpackedDims);
+        plan.signals.push_back(std::move(info));
+    };
+
+    std::function<void(const slang::ast::VariableSymbol&, const GenerateScopePath&)>
+        collectVariable = [&](const slang::ast::VariableSymbol& variable,
+                              const GenerateScopePath& scope)
+    {
+        if (variable.name.empty())
+        {
+            if (diagnostics)
+            {
+                diagnostics->warn(variable, "Skipping anonymous variable symbol");
+            }
+            return;
+        }
+        if (variable.getType().isEvent())
+        {
+            if (diagnostics)
+            {
+                diagnostics->warn(variable, "Skipping event variable symbol");
+            }
+            return;
+        }
+        SignalInfo info;
+        info.symbol = internSignal(variable, scope);
+        info.kind = SignalKind::Variable;
+        TypeResolution typeInfo = analyzeSignalType(variable.getType(), variable, diagnostics);
+        if (auto packedMemory =
+                analyzePackedElementMemoryType(variable.getType(), variable, diagnostics))
+        {
+            typeInfo.width = packedMemory->first;
+            typeInfo.memoryRows = packedMemory->second;
+            typeInfo.unpackedDims.clear();
+            UnpackedDimInfo dim;
+            dim.extent = static_cast<int32_t>(packedMemory->second);
+            dim.left = 0;
+            dim.right = static_cast<int32_t>(packedMemory->second - 1);
+            typeInfo.unpackedDims.push_back(dim);
+            typeInfo.packedDims.clear();
+        }
+        info.width = typeInfo.width;
+        info.isSigned = typeInfo.isSigned;
+        info.valueType = typeInfo.valueType;
+        info.memoryRows = typeInfo.memoryRows;
+        info.packedDims = std::move(typeInfo.packedDims);
+        info.unpackedDims = std::move(typeInfo.unpackedDims);
+        plan.signals.push_back(std::move(info));
+    };
+
+    std::function<void(const slang::ast::GenerateBlockSymbol&, const GenerateScopePath&)>
+        collectBlock;
+
+    std::function<void(const slang::ast::GenerateBlockArraySymbol&, const GenerateScopePath&)>
+        collectArray = [&](const slang::ast::GenerateBlockArraySymbol& array,
+                           const GenerateScopePath& scope)
+    {
+        if (!array.valid)
+        {
+            return;
+        }
+        const std::string arrayName =
+            array.name.empty() ? array.getExternalName() : std::string(array.name);
+        // The group scope names the declaration (no round); the symbol prefix
+        // embeds the elaboration round so each copy gets a unique name.
+        const std::string arrayGroupScope = appendScope(scope.groupScope, arrayName);
+        for (const slang::ast::GenerateBlockSymbol* entry : array.entries)
+        {
+            if (!entry || entry->isUninstantiated)
+            {
+                continue;
+            }
+            int64_t round = static_cast<int64_t>(entry->constructIndex);
+            if (entry->arrayIndex)
+            {
+                if (const std::optional<int64_t> value = entry->arrayIndex->as<int64_t>())
+                {
+                    round = *value;
+                }
+            }
+            GenerateScopePath entryScope{
+                appendScope(scope.symbolPrefix, arrayName + "$" + std::to_string(round)),
+                arrayGroupScope};
+            collectBlock(*entry, entryScope);
+        }
+    };
+
+    collectBlock = [&](const slang::ast::GenerateBlockSymbol& block,
+                       const GenerateScopePath& scope)
+    {
+        if (block.isUninstantiated)
+        {
+            return;
+        }
+        for (const slang::ast::Symbol& member : block.members())
+        {
+            if (const auto* net = member.as_if<slang::ast::NetSymbol>())
+            {
+                collectNet(*net, scope);
+                continue;
+            }
+            if (const auto* variable = member.as_if<slang::ast::VariableSymbol>())
+            {
+                collectVariable(*variable, scope);
+                continue;
+            }
+            if (const auto* nestedBlock = member.as_if<slang::ast::GenerateBlockSymbol>())
+            {
+                // Standalone if/case generate block: a single copy, no round.
+                const std::string blockName = nestedBlock->name.empty()
+                                                  ? nestedBlock->getExternalName()
+                                                  : std::string(nestedBlock->name);
+                GenerateScopePath childScope{appendScope(scope.symbolPrefix, blockName),
+                                             appendScope(scope.groupScope, blockName)};
+                collectBlock(*nestedBlock, childScope);
+                continue;
+            }
+            if (const auto* nestedArray =
+                    member.as_if<slang::ast::GenerateBlockArraySymbol>())
+            {
+                collectArray(*nestedArray, scope);
+                continue;
+            }
+        }
+    };
+
+    const GenerateScopePath topScope{};
     for (const slang::ast::Symbol& member : body.members())
     {
         if (const auto* net = member.as_if<slang::ast::NetSymbol>())
         {
-            if (net->name.empty())
-            {
-                if (diagnostics)
-                {
-                    diagnostics->warn(*net, "Skipping anonymous net symbol");
-                }
-                continue;
-            }
-            SignalInfo info;
-            info.symbol = plan.symbolTable.intern(net->name);
-            info.kind = SignalKind::Net;
-            TypeResolution typeInfo = analyzeSignalType(net->getType(), *net, diagnostics);
-            info.width = typeInfo.width;
-            info.isSigned = typeInfo.isSigned;
-            info.valueType = typeInfo.valueType;
-            info.memoryRows = typeInfo.memoryRows;
-            info.packedDims = std::move(typeInfo.packedDims);
-            info.unpackedDims = std::move(typeInfo.unpackedDims);
-            plan.signals.push_back(std::move(info));
+            collectNet(*net, topScope);
             continue;
         }
 
         if (const auto* variable = member.as_if<slang::ast::VariableSymbol>())
         {
-            if (variable->name.empty())
-            {
-                if (diagnostics)
-                {
-                    diagnostics->warn(*variable, "Skipping anonymous variable symbol");
-                }
-                continue;
-            }
-            if (variable->getType().isEvent())
-            {
-                if (diagnostics)
-                {
-                    diagnostics->warn(*variable, "Skipping event variable symbol");
-                }
-                continue;
-            }
-            SignalInfo info;
-            info.symbol = plan.symbolTable.intern(variable->name);
-            info.kind = SignalKind::Variable;
-            TypeResolution typeInfo = analyzeSignalType(variable->getType(), *variable, diagnostics);
-            if (auto packedMemory =
-                    analyzePackedElementMemoryType(variable->getType(), *variable, diagnostics))
-            {
-                typeInfo.width = packedMemory->first;
-                typeInfo.memoryRows = packedMemory->second;
-                typeInfo.unpackedDims.clear();
-                UnpackedDimInfo dim;
-                dim.extent = static_cast<int32_t>(packedMemory->second);
-                dim.left = 0;
-                dim.right = static_cast<int32_t>(packedMemory->second - 1);
-                typeInfo.unpackedDims.push_back(dim);
-                typeInfo.packedDims.clear();
-            }
-            info.width = typeInfo.width;
-            info.isSigned = typeInfo.isSigned;
-            info.valueType = typeInfo.valueType;
-            info.memoryRows = typeInfo.memoryRows;
-            info.packedDims = std::move(typeInfo.packedDims);
-            info.unpackedDims = std::move(typeInfo.unpackedDims);
-            plan.signals.push_back(std::move(info));
+            collectVariable(*variable, topScope);
+            continue;
+        }
+
+        if (const auto* generateBlock = member.as_if<slang::ast::GenerateBlockSymbol>())
+        {
+            collectBlock(*generateBlock, topScope);
+            continue;
+        }
+
+        if (const auto* generateArray = member.as_if<slang::ast::GenerateBlockArraySymbol>())
+        {
+            collectArray(*generateArray, topScope);
             continue;
         }
     }
@@ -9970,7 +10158,7 @@ PlanSymbolId resolveSimpleSymbolForPlan(const slang::ast::Expression& expr,
     }
     if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
     {
-        return plan.symbolTable.lookup(named->symbol.name);
+        return lookupPlanSignal(plan, named->symbol);
     }
     if (const auto* conversion = expr.as_if<slang::ast::ConversionExpression>())
     {
@@ -16650,6 +16838,7 @@ public:
         createPortValues();
         createSignalValues();
         createInoutSignalValues();
+        emitGenerateGroups();
         createMemoryOps();
         emitMemoryPorts();
         emitSideEffects();
@@ -17293,6 +17482,42 @@ private:
                     isPackedAggregateVariable(signal) ? flattenedAggregateWidth(signal)
                                                       : flattenedNetWidth(signal)));
             createValue(signal.symbol, width, signal.isSigned, signal.valueType);
+        }
+    }
+
+    // Emits the generate-scope copy groups collected by collectSignals. Group
+    // members are the same SymbolIds that were marked declared, so the group
+    // list is pure annotation on top of the declared set.
+    void emitGenerateGroups()
+    {
+        auto lookupOrIntern = [&](std::string_view text) -> wolvrix::lib::grh::SymbolId
+        {
+            wolvrix::lib::grh::SymbolId sym = graph_.lookupSymbol(text);
+            if (!sym.valid())
+            {
+                sym = graph_.internSymbol(text);
+            }
+            if (!sym.valid())
+            {
+                throw std::runtime_error(
+                    "Generate group symbol is already bound to value/operation: " +
+                    std::string(text));
+            }
+            return sym;
+        };
+        for (const auto& groupPlan : plan_.generateGroups)
+        {
+            const wolvrix::lib::grh::SymbolId scope = lookupOrIntern(groupPlan.scope);
+            const wolvrix::lib::grh::SymbolId name = lookupOrIntern(groupPlan.name);
+            const std::size_t groupIndex = graph_.addGenerateGroup(scope, name);
+            for (const PlanSymbolId member : groupPlan.symbols)
+            {
+                const wolvrix::lib::grh::SymbolId sym = symbolForPlan(member);
+                if (sym.valid())
+                {
+                    graph_.addGenerateGroupSymbol(groupIndex, sym);
+                }
+            }
         }
     }
 
@@ -18575,7 +18800,7 @@ private:
                 return false;
             }
             const PlanSymbolId baseId =
-                plan_.symbolTable.lookup(baseNamed->symbol.name);
+                lookupPlanSignal(plan_, baseNamed->symbol);
             const SignalInfo* signal = findSignalBySymbol(plan_, baseId);
             if (!signal || !isFlattenedNetArray(*signal))
             {
@@ -18722,7 +18947,7 @@ private:
             }
             if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
             {
-                out.target = plan_.symbolTable.lookup(named->symbol.name);
+                out.target = lookupPlanSignal(plan_, named->symbol);
                 out.low = 0;
                 out.width = portWidth;
                 out.location = expr.sourceRange.start();
@@ -20041,7 +20266,7 @@ private:
         }
         if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
         {
-            return plan_.symbolTable.lookup(named->symbol.name);
+            return lookupPlanSignal(plan_, named->symbol);
         }
         if (const auto* hier = expr.as_if<slang::ast::HierarchicalValueExpression>())
         {
@@ -20444,7 +20669,7 @@ private:
                     }
                 }
                 node.kind = ExprNodeKind::Symbol;
-                node.symbol = state_.plan_.symbolTable.lookup(named->symbol.name);
+                node.symbol = lookupPlanSignal(state_.plan_, named->symbol);
                 if (const PortInfo::InoutBinding* inout =
                         state_.resolveInoutBinding(node.symbol))
                 {

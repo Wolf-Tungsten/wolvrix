@@ -1302,6 +1302,59 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
+        void writeGenerateGroupsInline(std::string &out,
+                                       const wolvrix::lib::grh::Graph &graph,
+                                       int indent)
+        {
+            auto symbolTextRequired = [&](wolvrix::lib::grh::SymbolId sym) -> std::string_view
+            {
+                std::string_view text = graph.symbolText(sym);
+                if (text.empty())
+                {
+                    throw std::runtime_error("Graph generate group symbol is empty");
+                }
+                return text;
+            };
+            out.push_back('[');
+            bool firstGroup = true;
+            for (const auto &group : graph.generateGroups())
+            {
+                if (!firstGroup)
+                {
+                    out.push_back(',');
+                }
+                appendNewlineAndIndent(out, indent + 1);
+                out.push_back('{');
+                appendQuotedString(out, "scope");
+                out.append(": ");
+                appendQuotedString(out, symbolTextRequired(group.scope));
+                out.append(", ");
+                appendQuotedString(out, "name");
+                out.append(": ");
+                appendQuotedString(out, symbolTextRequired(group.name));
+                out.append(", ");
+                appendQuotedString(out, "symbols");
+                out.append(": [");
+                bool firstSym = true;
+                for (const auto sym : group.symbols)
+                {
+                    if (!firstSym)
+                    {
+                        out.append(", ");
+                    }
+                    appendQuotedString(out, symbolTextRequired(sym));
+                    firstSym = false;
+                }
+                out.append("]}");
+                firstGroup = false;
+            }
+            if (!graph.generateGroups().empty())
+            {
+                appendNewlineAndIndent(out, indent);
+            }
+            out.push_back(']');
+        }
+
         void writeGraphPrettyCompact(std::string &out,
                                      const wolvrix::lib::grh::Graph &graph,
                                      int baseIndent,
@@ -1351,6 +1404,14 @@ namespace wolvrix::lib::store
             {
                 stats->declaredMs = toMillis(TimingClock::now() - sectionStart);
                 sectionStart = TimingClock::now();
+            }
+            if (!graph.generateGroups().empty())
+            {
+                out.push_back(',');
+                appendNewlineAndIndent(out, indent);
+                appendQuotedString(out, "generateGroups");
+                out.append(": ");
+                writeGenerateGroupsInline(out, graph, indent);
             }
             out.push_back(',');
 

@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -508,6 +509,17 @@ namespace wolvrix::lib::grhsim
         std::optional<CpuBackendMapping> cpu;
     };
 
+    // Read-only provenance annotation carried over from the GRH graph: one group
+    // per generate-scope declaration, holding the names of its per-round
+    // elaboration copies in round order. Pure metadata; see the maintenance
+    // contract on GrhSimModel::declaredSymbols.
+    struct GenerateGroup
+    {
+        StringId scope;                // scope path text, '$'-joined (flattened: instance prefix included)
+        StringId name;                 // bare declaration name
+        std::vector<StringId> symbols; // per-round copy symbols, index = generate-for round
+    };
+
     struct ModelReserve
     {
         std::size_t strings = 0;
@@ -531,6 +543,8 @@ namespace wolvrix::lib::grhsim
         std::size_t mappings = 0;
         std::size_t mappingParameters = 0;
         std::size_t origins = 0;
+        std::size_t declaredSymbols = 0;
+        std::size_t generateGroups = 0;
     };
 
     class GrhSimModel
@@ -598,6 +612,22 @@ namespace wolvrix::lib::grhsim
                         std::span<const Parameter> parameters = {});
         const CpuBackendMapping *cpuMapping() const noexcept;
         void setCpuMapping(CpuBackendMapping mapping);
+
+        // Read-only provenance metadata: source-level declared symbol names and
+        // generate-scope copy groups, filled by the GRH lowering. These are pure
+        // name (group) lists — no entity IDs, no semantic constraint. Passes may
+        // read them but have no maintenance obligation: compact() and passes
+        // renumber or rewrite entities freely, and after such rewrites an anchor
+        // name may no longer resolve to a live value, which is expected.
+        // Editing these lists is a metadata mutation (commitMetadataMutation,
+        // never semantic); like the entity builders, the add* methods leave the
+        // revision commit to the caller.
+        void addDeclaredSymbol(StringId symbol);
+        bool isDeclaredSymbol(StringId symbol) const noexcept;
+        const std::vector<StringId> &declaredSymbols() const noexcept { return declaredSymbols_; }
+        std::size_t addGenerateGroup(StringId scope, StringId name);
+        void addGenerateGroupSymbol(std::size_t group, StringId symbol);
+        const std::vector<GenerateGroup> &generateGroups() const noexcept { return generateGroups_; }
 
         const std::vector<DialectUse> &dialects() const noexcept { return dialects_; }
         const std::vector<Type> &types() const noexcept { return types_; }
@@ -676,6 +706,9 @@ namespace wolvrix::lib::grhsim
         std::vector<BackendMapping> mappings_;
         std::vector<Parameter> mappingParameterPool_;
         std::vector<Origin> origins_;
+        std::vector<StringId> declaredSymbols_;
+        std::unordered_set<uint32_t> declaredSymbolSet_;
+        std::vector<GenerateGroup> generateGroups_;
     };
 
     std::string_view toString(LogicDomain domain) noexcept;

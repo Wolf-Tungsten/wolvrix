@@ -37,13 +37,15 @@ namespace wolvrix::app::pybind
         const char *top = nullptr;
         const char *domainText = "4-state";
         int keepOrigins = 1;
+        int keepDeclaredSymbols = 1;
         int consume = 0;
         int replace = 0;
         static const char *kwlist[] = {"session", "design", "out_model", "top", "logic_domain",
-                                       "keep_origins", "consume", "replace", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|zsppp", const_cast<char **>(kwlist),
+                                       "keep_origins", "keep_declared_symbols", "consume",
+                                       "replace", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|zspppp", const_cast<char **>(kwlist),
                                          &sessionObj, &designKey, &outModel, &top, &domainText,
-                                         &keepOrigins, &consume, &replace))
+                                         &keepOrigins, &keepDeclaredSymbols, &consume, &replace))
             return nullptr;
         SessionHandle *session = getSessionHandle(sessionObj);
         if (!session) return nullptr;
@@ -71,6 +73,7 @@ namespace wolvrix::app::pybind
         if (top) options.top = top;
         options.logicDomain = *domain;
         options.keepOrigins = keepOrigins != 0;
+        options.keepDeclaredSymbols = keepDeclaredSymbols != 0;
         auto model = wolvrix::lib::grhsim::lowerGrhToGrhSim(*design, options, diagnostics);
         const bool success = model && !diagnostics.hasError();
         if (success)

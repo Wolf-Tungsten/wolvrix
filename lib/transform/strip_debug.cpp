@@ -902,6 +902,12 @@ namespace wolvrix::lib::transform
                 topInt.eraseOp(intOpId);
             }
 
+            std::vector<std::string> topDeclaredSymbols;
+            topDeclaredSymbols.reserve(top->declaredSymbols().size());
+            for (const SymbolId sym : top->declaredSymbols())
+            {
+                topDeclaredSymbols.emplace_back(top->symbolText(sym));
+            }
             std::vector<std::string> topAliases = design().aliasesForGraph(topName);
             design().deleteGraph(topName);
 
@@ -964,6 +970,15 @@ namespace wolvrix::lib::transform
             if (!topInoutPorts.empty())
             {
                 newTop.bindInoutPorts(topInoutPorts);
+            }
+            for (const std::string &text : topDeclaredSymbols)
+            {
+                const SymbolId sym = newTop.lookupSymbol(text);
+                if (sym.valid() &&
+                    (newTop.findValue(sym).valid() || newTop.findOperation(sym).valid()))
+                {
+                    newTop.addDeclaredSymbol(sym);
+                }
             }
 
             std::unordered_map<ValueId, ValueId, ValueIdHash> linkValuesIn;

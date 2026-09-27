@@ -906,6 +906,56 @@ namespace wolvrix::lib::load
                 declaredEnd = TimingClock::now();
             }
 
+            // generateGroups is an optional field: JSON written before its
+            // introduction omits it entirely and loads as an empty set.
+            if (auto groupsIt = graphObj.find("generateGroups"); groupsIt != graphObj.end())
+            {
+                auto symbolByText = [&](const std::string &text,
+                                        std::string_view context) -> SymbolId
+                {
+                    if (text.empty())
+                    {
+                        throw std::runtime_error(std::string(context) + " symbol is empty");
+                    }
+                    SymbolId sym = graph.lookupSymbol(text);
+                    if (!sym.valid())
+                    {
+                        sym = graph.internSymbol(text);
+                    }
+                    if (!sym.valid())
+                    {
+                        throw std::runtime_error(std::string(context) +
+                                                 " symbol already bound to value/operation: " + text);
+                    }
+                    return sym;
+                };
+                const auto &groupsArray = groupsIt->second.asArray("graph.generateGroups");
+                for (const auto &entry : groupsArray)
+                {
+                    const auto &groupObj = entry.asObject("graph.generateGroups[]");
+                    const auto scopeIt = groupObj.find("scope");
+                    const auto nameIt = groupObj.find("name");
+                    const auto symbolsIt = groupObj.find("symbols");
+                    if (scopeIt == groupObj.end() || nameIt == groupObj.end() ||
+                        symbolsIt == groupObj.end())
+                    {
+                        throw std::runtime_error("Generate group entry missing required fields");
+                    }
+                    const SymbolId scope = symbolByText(
+                        scopeIt->second.asString("generateGroups.scope"), "Generate group scope");
+                    const SymbolId groupName = symbolByText(
+                        nameIt->second.asString("generateGroups.name"), "Generate group name");
+                    const std::size_t groupIndex = graph.addGenerateGroup(scope, groupName);
+                    for (const auto &symEntry : symbolsIt->second.asArray("generateGroups.symbols"))
+                    {
+                        const SymbolId member = symbolByText(
+                            symEntry.asString("generateGroups.symbols[]"),
+                            "Generate group member");
+                        graph.addGenerateGroupSymbol(groupIndex, member);
+                    }
+                }
+            }
+
             std::unordered_map<std::string, ValueId> valueBySymbol;
             std::unordered_set<uint32_t> declaredInputs;
             std::unordered_set<uint32_t> declaredOutputs;

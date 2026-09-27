@@ -173,6 +173,9 @@ namespace wolvrix::lib::grhsim
         result.mappings_ = mappings_;
         result.mappingParameterPool_ = mappingParameterPool_;
         result.origins_ = origins_;
+        result.declaredSymbols_ = declaredSymbols_;
+        result.declaredSymbolSet_ = declaredSymbolSet_;
+        result.generateGroups_ = generateGroups_;
         result.poisoned_ = poisoned_;
         for (auto &mapping : result.mappings_)
         {
@@ -207,6 +210,9 @@ namespace wolvrix::lib::grhsim
         mappings_.reserve(counts.mappings);
         mappingParameterPool_.reserve(counts.mappingParameters);
         origins_.reserve(counts.origins);
+        declaredSymbols_.reserve(counts.declaredSymbols);
+        declaredSymbolSet_.reserve(counts.declaredSymbols);
+        generateGroups_.reserve(counts.generateGroups);
     }
 
     void GrhSimModel::commitSemanticMutation()
@@ -516,6 +522,36 @@ namespace wolvrix::lib::grhsim
         }
         addMapping("cpu", "cpu.st.v1", cpu.stage == CpuMappingStage::Schedule);
         mappings_.back().cpu = std::move(cpu);
+    }
+
+    void GrhSimModel::addDeclaredSymbol(StringId symbol)
+    {
+        if (!strings_.valid(symbol))
+            throw std::out_of_range("declared symbol is not a valid model string");
+        if (declaredSymbolSet_.insert(symbol.index).second)
+            declaredSymbols_.push_back(symbol);
+    }
+
+    bool GrhSimModel::isDeclaredSymbol(StringId symbol) const noexcept
+    {
+        return symbol.valid() && declaredSymbolSet_.contains(symbol.index);
+    }
+
+    std::size_t GrhSimModel::addGenerateGroup(StringId scope, StringId name)
+    {
+        if (!strings_.valid(scope) || !strings_.valid(name))
+            throw std::out_of_range("generate group scope/name is not a valid model string");
+        generateGroups_.push_back(GenerateGroup{scope, name, {}});
+        return generateGroups_.size() - 1;
+    }
+
+    void GrhSimModel::addGenerateGroupSymbol(std::size_t group, StringId symbol)
+    {
+        if (group >= generateGroups_.size())
+            throw std::out_of_range("generate group index is out of range");
+        if (!strings_.valid(symbol))
+            throw std::out_of_range("generate group symbol is not a valid model string");
+        generateGroups_[group].symbols.push_back(symbol);
     }
 
     std::span<const ValueId> GrhSimModel::operands(const SimOp &op) const

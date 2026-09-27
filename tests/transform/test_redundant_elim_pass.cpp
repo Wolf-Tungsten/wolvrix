@@ -158,5 +158,68 @@ int main()
         }
     }
 
+    {
+        wolvrix::lib::grh::Design declaredDesign;
+        wolvrix::lib::grh::Graph &declaredGraph = declaredDesign.createGraph("declared");
+
+        const wolvrix::lib::grh::SymbolId declResetSym = declaredGraph.internSymbol("reset");
+        wolvrix::lib::grh::ValueId declReset = declaredGraph.createValue(declResetSym, 1, false);
+        declaredGraph.bindInputPort("reset", declReset);
+
+        wolvrix::lib::grh::ValueId declNotReset =
+            declaredGraph.createValue(declaredGraph.internSymbol("not_reset"), 1, false);
+        wolvrix::lib::grh::OperationId declNotOp =
+            declaredGraph.createOperation(wolvrix::lib::grh::OperationKind::kLogicNot,
+                                          declaredGraph.internSymbol("not_op"));
+        declaredGraph.addOperand(declNotOp, declReset);
+        declaredGraph.addResult(declNotOp, declNotReset);
+
+        const wolvrix::lib::grh::SymbolId declGuardSym = declaredGraph.internSymbol("guard");
+        wolvrix::lib::grh::ValueId declGuard = declaredGraph.createValue(declGuardSym, 1, false);
+        declaredGraph.addDeclaredSymbol(declGuardSym);
+        wolvrix::lib::grh::OperationId declOrOp =
+            declaredGraph.createOperation(wolvrix::lib::grh::OperationKind::kLogicOr,
+                                          declaredGraph.internSymbol("or_op"));
+        declaredGraph.addOperand(declOrOp, declReset);
+        declaredGraph.addOperand(declOrOp, declNotReset);
+        declaredGraph.addResult(declOrOp, declGuard);
+
+        PassManager declaredManager;
+        declaredManager.addPass(std::make_unique<RedundantElimPass>());
+
+        PassDiagnostics declaredDiags;
+        PassManagerResult declaredRes{};
+        try
+        {
+            declaredRes = declaredManager.run(declaredDesign, declaredDiags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during declared run: ") + ex.what());
+        }
+        if (!declaredRes.success || declaredDiags.hasError())
+        {
+            return fail("Expected redundant elimination declared run to succeed");
+        }
+        if (!declaredGraph.findOperation("or_op").valid())
+        {
+            return fail("declared guard kLogicOr must not be folded away");
+        }
+        const wolvrix::lib::grh::ValueId guardAfter = declaredGraph.findValue("guard");
+        if (!guardAfter.valid())
+        {
+            return fail("declared guard value must survive");
+        }
+        if (declaredGraph.getValue(guardAfter).definingOp() != declOrOp)
+        {
+            return fail("declared guard must stay driven by or_op");
+        }
+        const std::vector<std::string> issues = declaredGraph.validateDeclaredSymbols();
+        if (!issues.empty())
+        {
+            return fail(std::string("declared symbols inconsistent after run: ") + issues.front());
+        }
+    }
+
     return 0;
 }

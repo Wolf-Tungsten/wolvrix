@@ -35,11 +35,15 @@ logic value，lower 显式生成同位宽、同有符号属性的 `core.compute.
 外部 input 和 inout 输入侧由 `core.input.read` 提供 producer，不补零；没有引用的 detached
 value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认为二态零。
 
+lower 还把 GRH 图的 `declaredSymbols` 与 `generateGroups` 原样携带为模型的只读
+metadata（见 [Overview](../overview.md) 第 3.4 节；`keep_declared_symbols=False` 可关闭，
+与 `keep_origins` 独立）。两者是来源注解，不参与仿真语义，cpu.st 各 pass 与
+`compact()` 对它们没有维护义务；checkpoint 往返保持不变。
+
 XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`、
 `grhsim.canonicalize-compute` 和
 [`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)、
-[`grhsim.bitwise-predicates`](../passes/bitwise-predicates.md)，再进入下表的 CPU mapping；这不依赖 GRH 侧
-reg-to-mem，也不修改 GRH。
+[`grhsim.bitwise-predicates`](../passes/bitwise-predicates.md)，再进入下表的 CPU mapping；这些 pass 不修改 GRH。
 
 完成首次mapping后，XiangShan入口执行
 [`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)，依据同enable/mask、

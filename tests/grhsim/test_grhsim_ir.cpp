@@ -874,6 +874,176 @@ namespace
         }
         return 0;
     }
+
+    struct GenerateGroupTexts
+    {
+        std::string scope;
+        std::string name;
+        std::vector<std::string> symbols;
+        bool operator==(const GenerateGroupTexts &) const = default;
+    };
+
+    std::vector<std::string> declaredSymbolTexts(const grhsim::GrhSimModel &model)
+    {
+        std::vector<std::string> texts;
+        for (const auto symbol : model.declaredSymbols())
+            texts.emplace_back(model.text(symbol));
+        return texts;
+    }
+
+    std::vector<GenerateGroupTexts> generateGroupTexts(const grhsim::GrhSimModel &model)
+    {
+        std::vector<GenerateGroupTexts> groups;
+        for (const auto &group : model.generateGroups())
+        {
+            GenerateGroupTexts texts{std::string(model.text(group.scope)),
+                                     std::string(model.text(group.name)), {}};
+            for (const auto symbol : group.symbols)
+                texts.symbols.emplace_back(model.text(symbol));
+            groups.push_back(std::move(texts));
+        }
+        return groups;
+    }
+
+    grh::Design makeDeclaredMetadataDesign()
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("top");
+        // internSymbol refuses texts already bound to an entity, so capture the
+        // SymbolIds at creation time (the ingest pattern).
+        const auto enableSym = graph.internSymbol("enable");
+        const auto dataSym = graph.internSymbol("data");
+        const auto sig0Sym = graph.internSymbol("gen_loop$0$sig");
+        const auto sig1Sym = graph.internSymbol("gen_loop$1$sig");
+        const auto enable = graph.createValue(enableSym, 1, false);
+        graph.bindInputPort("enable", enable);
+        const auto data = graph.createValue(dataSym, 8, false);
+        const auto constant = graph.createOperation(grh::OperationKind::kConstant,
+                                                    graph.internSymbol("data_const"));
+        graph.setAttr(constant, "constValue", std::string("8'h00"));
+        graph.addResult(constant, data);
+        graph.bindOutputPort("data", data);
+        design.markAsTop("top");
+
+        graph.addDeclaredSymbol(enableSym);
+        graph.addDeclaredSymbol(dataSym);
+        graph.addDeclaredSymbol(sig0Sym);
+        graph.addDeclaredSymbol(sig1Sym);
+        // Duplicate adds collapse; the list keeps first-insertion order.
+        graph.addDeclaredSymbol(dataSym);
+        const std::size_t group = graph.addGenerateGroup(graph.internSymbol("gen_loop"),
+                                                         graph.internSymbol("sig"));
+        graph.addGenerateGroupSymbol(group, sig0Sym);
+        graph.addGenerateGroupSymbol(group, sig1Sym);
+        return design;
+    }
+
+    int runDeclaredSymbolMetadataTest(const std::filesystem::path &artifactDir)
+    {
+        const std::vector<std::string> expectedDeclared{"enable", "data",
+                                                        "gen_loop$0$sig", "gen_loop$1$sig"};
+        const std::vector<GenerateGroupTexts> expectedGroups{
+            GenerateGroupTexts{"gen_loop", "sig", {"gen_loop$0$sig", "gen_loop$1$sig"}}};
+
+        // (a) Lowering carries declaredSymbols and generateGroups into the model.
+        auto design = makeDeclaredMetadataDesign();
+        diag::Diagnostics diagnostics;
+        grhsim::GrhToGrhSimOptions options;
+        options.top = "top";
+        options.logicDomain = grhsim::LogicDomain::TwoState;
+        auto model = grhsim::lowerGrhToGrhSim(design, options, diagnostics);
+        if (!model || diagnostics.hasError()) return fail("metadata GRH lowering failed");
+        if (declaredSymbolTexts(*model) != expectedDeclared)
+            return fail("lowered declaredSymbols do not match the GRH graph");
+        if (generateGroupTexts(*model) != expectedGroups)
+            return fail("lowered generateGroups do not match the GRH graph");
+        if (!model->isDeclaredSymbol(model->strings().lookup("gen_loop$1$sig")) ||
+            model->isDeclaredSymbol(model->strings().lookup("data_const")) ||
+            model->isDeclaredSymbol(grhsim::StringId{}))
+            return fail("isDeclaredSymbol disagrees with the declared set");
+
+        // (b) keepDeclaredSymbols=false drops both lists.
+        {
+            auto stripped = makeDeclaredMetadataDesign();
+            diag::Diagnostics stripDiagnostics;
+            grhsim::GrhToGrhSimOptions stripOptions;
+            stripOptions.top = "top";
+            stripOptions.logicDomain = grhsim::LogicDomain::TwoState;
+            stripOptions.keepDeclaredSymbols = false;
+            auto strippedModel = grhsim::lowerGrhToGrhSim(stripped, stripOptions, stripDiagnostics);
+            if (!strippedModel || stripDiagnostics.hasError())
+                return fail("keepDeclaredSymbols=false lowering failed");
+            if (!strippedModel->declaredSymbols().empty() || !strippedModel->generateGroups().empty())
+                return fail("keepDeclaredSymbols=false retained metadata");
+        }
+
+        // (c) JSON round trip preserves both lists and stays byte stable.
+        std::filesystem::create_directories(artifactDir);
+        const auto firstPath = artifactDir / "grhsim_declared.json";
+        const auto secondPath = artifactDir / "grhsim_declared_roundtrip.json";
+        diag::Diagnostics storeDiagnostics;
+        if (!grhsim::storeGrhSimModel(*model, firstPath, grhsim::defaultDialectRegistry(),
+                                      storeDiagnostics))
+            return fail("declared-symbol GrhSIM JSON store failed");
+        if (readFile(firstPath).find("\"declaredSymbols\"") == std::string::npos ||
+            readFile(firstPath).find("\"generateGroups\"") == std::string::npos)
+            return fail("serialized JSON is missing the metadata keys");
+        diag::Diagnostics loadDiagnostics;
+        auto loaded = grhsim::loadGrhSimModel(firstPath, grhsim::defaultDialectRegistry(),
+                                              loadDiagnostics);
+        if (!loaded || loadDiagnostics.hasError()) return fail("declared-symbol JSON load failed");
+        if (declaredSymbolTexts(*loaded) != expectedDeclared ||
+            generateGroupTexts(*loaded) != expectedGroups)
+            return fail("JSON round trip changed the declared metadata");
+        if (!loaded->isDeclaredSymbol(loaded->strings().lookup("gen_loop$0$sig")))
+            return fail("loaded model lost declared membership");
+        if (loaded->semanticRevision() != 1 || loaded->metadataRevision() != 1)
+            return fail("loaded model revisions must restart at one");
+        diag::Diagnostics secondStoreDiagnostics;
+        if (!grhsim::storeGrhSimModel(*loaded, secondPath, grhsim::defaultDialectRegistry(),
+                                      secondStoreDiagnostics))
+            return fail("declared-symbol round-trip store failed");
+        if (readFile(firstPath) != readFile(secondPath))
+            return fail("declared-symbol store/load/store did not produce stable bytes");
+
+        // (d) A checkpoint without the trailing keys (old format) loads with
+        // empty metadata.
+        {
+            auto legacy = makeDeclaredMetadataDesign();
+            diag::Diagnostics legacyDiagnostics;
+            grhsim::GrhToGrhSimOptions legacyOptions;
+            legacyOptions.top = "top";
+            legacyOptions.logicDomain = grhsim::LogicDomain::TwoState;
+            legacyOptions.keepDeclaredSymbols = false;
+            auto legacyModel = grhsim::lowerGrhToGrhSim(legacy, legacyOptions, legacyDiagnostics);
+            if (!legacyModel) return fail("legacy-format fixture lowering failed");
+            std::stringstream serialized;
+            diag::Diagnostics writeDiagnostics;
+            if (!grhsim::writeGrhSimJson(*legacyModel, serialized, grhsim::defaultDialectRegistry(),
+                                         writeDiagnostics))
+                return fail("legacy-format fixture store failed");
+            if (serialized.str().find("\"declaredSymbols\"") != std::string::npos)
+                return fail("metadata-free model should serialize without the trailing keys");
+            diag::Diagnostics readDiagnostics;
+            auto reloaded = grhsim::readGrhSimJson(serialized, grhsim::defaultDialectRegistry(),
+                                                   readDiagnostics);
+            if (!reloaded || readDiagnostics.hasError())
+                return fail("old-format checkpoint without metadata keys was rejected");
+            if (!reloaded->declaredSymbols().empty() || !reloaded->generateGroups().empty())
+                return fail("old-format checkpoint must load with empty metadata");
+        }
+
+        // (e) clone() preserves both lists.
+        {
+            auto copy = model->clone();
+            if (declaredSymbolTexts(copy) != expectedDeclared ||
+                generateGroupTexts(copy) != expectedGroups)
+                return fail("clone() dropped the declared metadata");
+            if (!copy.isDeclaredSymbol(copy.strings().lookup("enable")))
+                return fail("clone() lost declared membership");
+        }
+        return 0;
+    }
 }
 
 namespace {
@@ -1605,6 +1775,8 @@ int main()
         if (const int status = runFoldResidueTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
+        if (const int status = runDeclaredSymbolMetadataTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
+            return status;
         return runHierarchyRejectionTest();
     }
     catch (const std::exception &ex)

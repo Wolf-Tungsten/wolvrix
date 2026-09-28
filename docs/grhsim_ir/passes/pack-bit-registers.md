@@ -4,7 +4,17 @@
 two-state, one-bit registers into scalar words. It requires a completed CPU
 schedule so it can separate states by quiescence projection membership. The
 semantic transform invalidates that schedule; run all eight CPU mapping passes
-again before emission. It has no options and does not match object names.
+again before emission. It does not match object names.
+
+`--report <path>` is an optional diagnostic dump, disabled by default. When
+enabled, the pass finishes by writing a tab-separated membership list with the
+header row `packed_state	bit_index	member_name	init_bit` and one row per
+packed register: the packed word name, the zero-based bit index, the original
+register name and its initial bit (`0` or `1`). Rows within a word ascend by
+bit index and words appear in creation order. Member names are cached before
+compaction rebuilds dense state IDs; the dump is read-only on the model. A
+failure to open or write the file is a diagnostics error. Without the option
+the pass performs no I/O and behaves exactly as before.
 
 Each candidate must have one `core.state.regWrite` and at least one ordinary,
 parameterless `core.state.read` of the exact state type. No other references to

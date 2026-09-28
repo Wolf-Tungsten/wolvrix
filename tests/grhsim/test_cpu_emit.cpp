@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 
 namespace
 {
@@ -1529,7 +1530,7 @@ namespace
         }
     }
 
-    void testPackedBitRegisters(const std::filesystem::path &directory, bool helpers)
+    std::pair<GrhSimModel, std::vector<std::string>> packedBitRegistersFixture(bool helpers)
     {
         GrhSimModel model("cpu_packed_bits"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
@@ -1659,6 +1660,12 @@ namespace
         map(model, helpers ? "1" : "128", helpers ? "1" : "10000");
         for (auto id : privateStates)
             require(!model.cpuMapping()->schedule->quiescenceProjection[id.index], "packing fixture private state is projected");
+        return {std::move(model), std::move(excluded)};
+    }
+
+    void testPackedBitRegisters(const std::filesystem::path &directory, bool helpers)
+    {
+        auto [model, excluded] = packedBitRegistersFixture(helpers);
         auto reference = model.clone();
         PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
         manager.addPass(defaultPassRegistry().create("grhsim.pack-bit-registers", {}, error));
@@ -1685,6 +1692,113 @@ namespace
         command("make --no-print-directory -C " + quote(directory.string()) + " -f " + quote(makefile.string()) +
                 " -j 2 check CXX=" + quote(WOLVRIX_TEST_CXX) +
                 " CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'");
+    }
+
+    void testPackedBitRegistersReport(const std::filesystem::path &directory)
+    {
+        auto [model, excluded] = packedBitRegistersFixture(false);
+        // Resolve each member's expected packed word name before packing runs:
+        // the word is named after the first write operation of its chunk.
+        const auto wordOf = [&](const std::string &member) {
+            uint32_t stateIndex = 0;
+            for (const auto &state : model.states())
+                if (model.text(state.name) == member) { stateIndex = state.id.index; break; }
+            require(stateIndex != 0, "packing report fixture member is missing");
+            for (const auto &op : model.operations())
+            {
+                if (model.text(op.opType) != "core.state.regWrite") continue;
+                const auto refs = model.objectRefs(op);
+                if (!refs.empty() && refs[0].kind == ObjectKind::State && refs[0].index == stateIndex)
+                    return "packed_bits_" + std::to_string(op.id.index);
+            }
+            require(false, "packing report fixture member write is missing");
+            return std::string{};
+        };
+        const std::array<unsigned, 6> counts{2u, 64u, 130u, 3u, 3u, 2u};
+        std::unordered_map<std::string, std::string> expectedWord;
+        std::unordered_map<std::string, uint32_t> expectedBit;
+        std::unordered_map<std::string, char> expectedInit;
+        unsigned expectedMembers = 0, expectedWords = 0;
+        for (unsigned group = 0; group < counts.size(); ++group)
+        {
+            expectedMembers += counts[group];
+            expectedWords += counts[group] / 64 + (counts[group] % 64 >= 2 ? 1 : 0);
+            for (unsigned i = 0; i < counts[group]; ++i)
+            {
+                const auto member = "q" + std::to_string(group) + "_" + std::to_string(i);
+                const auto chunkFirst = "q" + std::to_string(group) + "_" + std::to_string(i - i % 64);
+                expectedWord.emplace(member, wordOf(chunkFirst));
+                expectedBit.emplace(member, group == 2 ? i % 64 : i);
+                expectedInit.emplace(member, i % 2 ? '1' : '0');
+            }
+        }
+        std::filesystem::create_directories(directory);
+        const auto report = directory / "members.tsv";
+        const auto reportString = report.string();
+        const std::array<std::string_view, 2> args{"--report", reportString};
+        PassManager manager(defaultDialectRegistry()); std::string error; diag::Diagnostics diagnostics;
+        manager.addPass(defaultPassRegistry().create("grhsim.pack-bit-registers", args, error));
+        const auto result = manager.run(model, diagnostics);
+        require(result.success && result.changed, "bit packing with membership report failed");
+        std::ifstream stream(report);
+        require(bool(stream), "membership report was not written");
+        std::string line;
+        require(std::getline(stream, line) && line == "packed_state\tbit_index\tmember_name\tinit_bit",
+                "membership report header differs");
+        std::vector<std::string> wordOrder; std::set<std::string> seen;
+        std::string word; uint32_t nextBit = 0; unsigned rows = 0;
+        while (std::getline(stream, line))
+        {
+            ++rows;
+            std::array<std::string, 4> fields; std::size_t begin = 0;
+            for (unsigned field = 0; field < 4; ++field)
+            {
+                const auto tab = line.find('\t', begin);
+                require(field == 3 ? tab == std::string::npos : tab != std::string::npos,
+                        "membership report row is not four tab-separated columns");
+                fields[field] = line.substr(begin, tab == std::string::npos ? tab : tab - begin);
+                begin = tab == std::string::npos ? line.size() : tab + 1;
+            }
+            const auto &[packedState, bitIndex, memberName, initBit] = fields;
+            require(expectedWord.count(memberName) != 0, "membership report lists an unexpected register");
+            require(packedState == expectedWord[memberName],
+                    "membership report packed word name differs: member=" + memberName +
+                    " report=" + packedState + " expected=" + expectedWord[memberName]);
+            require(bitIndex == std::to_string(expectedBit[memberName]), "membership report bit index differs");
+            require(initBit.size() == 1 && initBit[0] == expectedInit[memberName], "membership report initial bit differs");
+            require(seen.insert(memberName).second, "membership report lists a register twice");
+            if (packedState != word) { word = packedState; nextBit = 0; wordOrder.push_back(word); }
+            require(std::stoul(bitIndex) == nextBit++, "membership report bits do not ascend from zero per word");
+        }
+        require(rows == expectedMembers && seen.size() == expectedMembers,
+                "membership report row count differs from packed member count");
+        for (const auto &name : excluded)
+            require(seen.count(name) == 0, "membership report lists an excluded register");
+        // Words in creation order, matching the packed state order after compaction.
+        std::vector<std::string> modelWords;
+        for (const auto &state : model.states())
+        {
+            const auto name = model.text(state.name);
+            if (name.substr(0, 12) == "packed_bits_") modelWords.emplace_back(name);
+        }
+        require(wordOrder == modelWords && wordOrder.size() == expectedWords,
+                "membership report word order differs from creation order");
+        // Unknown options and a missing option value stay rejected.
+        std::string badError;
+        const std::array<std::string_view, 2> unknown{"--bogus", "x"};
+        require(!defaultPassRegistry().create("grhsim.pack-bit-registers", unknown, badError) && !badError.empty(),
+                "bit packing accepted an unknown option");
+        const std::array<std::string_view, 1> missing{"--report"};
+        require(!defaultPassRegistry().create("grhsim.pack-bit-registers", missing, badError),
+                "bit packing accepted a valueless option");
+        // The default run performs no file I/O at all.
+        const auto quiet = directory / "quiet";
+        std::filesystem::create_directories(quiet);
+        auto plain = packedBitRegistersFixture(false).first;
+        PassManager plainManager(defaultDialectRegistry()); std::string plainError; diag::Diagnostics plainDiagnostics;
+        plainManager.addPass(defaultPassRegistry().create("grhsim.pack-bit-registers", {}, plainError));
+        require(plainManager.run(plain, plainDiagnostics).success, "default bit packing failed");
+        require(std::filesystem::is_empty(quiet), "default bit packing wrote a file");
     }
 
     void testBitwisePredicates(const std::filesystem::path &directory, bool helpers)
@@ -3369,6 +3483,7 @@ int main(int argc, char **argv)
         testReplicateBroadcast(directory / "replicate_broadcast_helpers", true);
         testPackedBitRegisters(directory / "packed_bits", false);
         testPackedBitRegisters(directory / "packed_bits_helpers", true);
+        testPackedBitRegistersReport(directory / "packed_bits_report");
         testBitPackingDomains();
         testScalarConstants(directory / "constants", false);
         testScalarConstants(directory / "constants_helpers", true);

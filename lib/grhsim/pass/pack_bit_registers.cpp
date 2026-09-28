@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 
@@ -31,7 +33,8 @@ namespace wolvrix::lib::grhsim
         class PackBitRegistersPass final : public Pass
         {
         public:
-            PackBitRegistersPass() : Pass("grhsim.pack-bit-registers", PassKind::SemanticTransform) {}
+            explicit PackBitRegistersPass(std::filesystem::path report = {})
+                : Pass("grhsim.pack-bit-registers", PassKind::SemanticTransform), report_(std::move(report)) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
@@ -106,6 +109,10 @@ namespace wolvrix::lib::grhsim
                 std::vector<uint8_t> removeOps(originalOps + 1), removeStates(originalStates + 1);
                 struct Slice { ValueId packed; uint32_t bit = 0; };
                 std::vector<Slice> slices(originalStates + 1);
+                // Cached before compact() rebuilds dense state IDs; only
+                // populated when the report option is enabled.
+                struct ReportRow { std::string word; uint32_t bit; std::string member; bool init; };
+                std::vector<ReportRow> reportRows;
                 uint32_t packedBits = 0, words = 0;
                 for (const auto &[key, group] : groups)
                 {
@@ -128,6 +135,9 @@ namespace wolvrix::lib::grhsim
                         {
                             const auto op = model.operations()[group[begin + i].index - 1];
                             const auto target = model.objectRefs(op)[0].index;
+                            if (!report_.empty())
+                                reportRows.push_back({name, static_cast<uint32_t>(i),
+                                    std::string(model.text(model.states()[target - 1].name)), *initial[target]});
                             bits.push_back(model.operands(op)[1]);
                             initialWord |= uint64_t(*initial[target]) << i;
                             slices[target] = {read, static_cast<uint32_t>(i)};
@@ -169,10 +179,30 @@ namespace wolvrix::lib::grhsim
                     removeOps.resize(model.operations().size() + 1); removeStates.resize(model.states().size() + 1);
                     model.compact(removeOps, removeStates);
                 }
+                if (!report_.empty())
+                {
+                    std::ofstream out(report_);
+                    if (!out)
+                    {
+                        diagnostics.error("cannot open pack-bit-registers report", name());
+                        return {false, words != 0, {}};
+                    }
+                    out << "packed_state\tbit_index\tmember_name\tinit_bit\n";
+                    for (const auto &row : reportRows)
+                        out << row.word << '\t' << row.bit << '\t' << row.member << '\t' << (row.init ? '1' : '0') << '\n';
+                    if (!out)
+                    {
+                        diagnostics.error("cannot write pack-bit-registers report", name());
+                        return {false, words != 0, {}};
+                    }
+                }
                 diagnostics.info("packed_register_bits=" + std::to_string(packedBits) +
                                  " packed_register_words=" + std::to_string(words), name());
                 return {true, words != 0, {}};
             }
+
+        private:
+            std::filesystem::path report_;
         };
     }
 
@@ -181,8 +211,14 @@ namespace wolvrix::lib::grhsim
         std::string error;
         registry.registerPass("grhsim.pack-bit-registers", PassKind::SemanticTransform,
             [](std::span<const std::string_view> args, std::string &factoryError) -> std::unique_ptr<Pass> {
-                if (!args.empty()) { factoryError = "grhsim.pack-bit-registers does not accept arguments"; return {}; }
-                return std::make_unique<PackBitRegistersPass>();
+                std::filesystem::path report;
+                for (std::size_t i = 0; i < args.size(); i += 2)
+                {
+                    if (i + 1 == args.size()) { factoryError = "grhsim.pack-bit-registers option requires a value"; return {}; }
+                    if (args[i] != "--report") { factoryError = "unknown grhsim.pack-bit-registers option"; return {}; }
+                    report = args[i + 1];
+                }
+                return std::make_unique<PackBitRegistersPass>(std::move(report));
             }, error);
     }
 }

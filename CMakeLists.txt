@@ -140,6 +140,8 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/cone_extract.cpp
     lib/grhsim/pass/classify_event_inputs.cpp
     lib/grhsim/pass/lower_edge_detect.cpp
+    lib/grhsim/pass/extract_output_cones.cpp
+    lib/grhsim/pass/migrate_timeslot_tasks.cpp
     lib/grhsim/backend/cpu.cpp
     lib/grhsim/backend/cpu_partition.cpp
     lib/grhsim/backend/cpu_layout.cpp

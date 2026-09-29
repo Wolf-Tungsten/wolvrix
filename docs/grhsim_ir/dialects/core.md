@@ -310,6 +310,14 @@ core.system.task
 其中 `%format` 和 `%data` 是任务实参，`%clk` 是唯一 event；`@S.display_event0` 保存该 event 的
 上一次取值。该 op 不能拆成格式化、输出和事件判断等多个 core op。
 
+> 演进说明（M2b）：`name` 为 `strobe`/`monitor` 的 `core.system.task` 是 time-slot 任务，
+> `grhsim.migrate-timeslot-tasks` pass（见
+> [migrate-timeslot-tasks](../passes/migrate-timeslot-tasks.md)）把它们迁入 P_output：带
+> `event_acts` 的追加 `timeslotFlag` 参数（event_acts 保留给 M4 建映射），无事件的改用
+> `__tslot_prev_<opId>_<i>` 历史状态 + ne/or changed 归约改写 guard，prev 状态由 Output 相
+> `core.state.latchWrite` 在 P_output 末尾（M5 emit 契约）回写。其他 name 的 system task
+> 不参与该迁移。
+
 ### 7.2 DPI
 
 DPI import 只是声明，不产生计算：它不占 `G` 的 op，进入 `GrhSimModel` 的外部函数表 `F`。

@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -209,6 +210,51 @@ namespace
         return readFile(firstPath) == readFile(secondPath);
     }
 
+    // The M2 lowering pipeline in registration order (one PassManager run).
+    PassRun runLoweringPipeline(grhsim::GrhSimModel &model, diag::Diagnostics &diagnostics)
+    {
+        return runPasses(model,
+                         {"grhsim.classify-event-inputs", "grhsim.lower-edge-detect",
+                          "grhsim.extract-output-cones", "grhsim.migrate-timeslot-tasks"},
+                         diagnostics);
+    }
+
+    const grhsim::SimOp *findTask(const grhsim::GrhSimModel &model, std::string_view taskName)
+    {
+        for (const auto *op : opsOfType(model, "core.system.task"))
+            if (getStringParam(model, *op, "name", taskName)) return op;
+        return nullptr;
+    }
+
+    std::optional<std::string> initConstLiteral(const grhsim::GrhSimModel &model,
+                                                grhsim::StateId state)
+    {
+        for (const auto &record : model.initRecords())
+        {
+            if (record.state.index != state.index) continue;
+            for (const auto &step : model.steps(record))
+            {
+                if (model.text(step.kind) != "core.init.const") continue;
+                const auto *value = findParam(model, model.parameters(step), "value");
+                if (const auto *text = value ? std::get_if<std::string>(&value->value) : nullptr)
+                    return *text;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::string> constValueOf(const grhsim::GrhSimModel &model,
+                                            grhsim::ValueId value)
+    {
+        const auto *producer = producerOf(model, value);
+        if (!producer || model.text(producer->opType) != "core.compute.constant")
+            return std::nullopt;
+        const auto *param = findParam(model, model.parameters(*producer), "constValue");
+        if (const auto *text = param ? std::get_if<std::string>(&param->value) : nullptr)
+            return *text;
+        return std::nullopt;
+    }
+
     // Spec case 1: the dut_081 shape end to end (pass 1 + 2).
     int runDut081ShapeTest(const std::filesystem::path &artifactDir)
     {
@@ -323,10 +369,50 @@ namespace
 
         const auto outputs = opsOfType(model, "core.output.write");
         if (outputs.size() != 1 || outputs.front()->phase != SimPhase::None)
-            return fail("dut_081: output.write must stay untouched (M2b scope)");
+            return fail("dut_081: pass 2 must not touch output.write");
         if (!verifies(model)) return fail("dut_081: lowered model rejected");
         if (!jsonRoundTripStable(model, artifactDir, "dut_081_lowered"))
             return fail("dut_081: JSON round trip not byte stable");
+
+        // Pass 3 (M2b): the output cone is cloned into P_output and the
+        // original state.read, now dead, is swept.
+        diag::Diagnostics pass3Diagnostics;
+        const auto pass3 = runPasses(model, {"grhsim.extract-output-cones"}, pass3Diagnostics);
+        if (!pass3.success || !pass3.changed) return fail("dut_081: extract pass failed");
+        if (!hasInfo(pass3Diagnostics, "grhsim.extract-output-cones",
+                     "cloned_ops=1 removed_ops=1"))
+            return fail("dut_081: extract diagnostic counts wrong");
+        if (model.operations().size() != 7)
+            return fail("dut_081: unexpected op count after extract");
+        const auto extracted = opsOfType(model, "core.output.write");
+        if (extracted.size() != 1 || extracted.front()->phase != SimPhase::Output)
+            return fail("dut_081: output.write not tagged Output");
+        const auto outOperands = model.operands(*extracted.front());
+        if (outOperands.size() != 1) return fail("dut_081: output.write operand lost");
+        const auto *outProducer = producerOf(model, outOperands[0]);
+        if (!outProducer || model.text(outProducer->opType) != "core.state.read" ||
+            outProducer->phase != SimPhase::Output)
+            return fail("dut_081: output cone clone missing");
+        // compact renumbered the model; re-resolve the q state.
+        const auto *extractedQ = findState(model, "q");
+        const auto outRefs = model.objectRefs(*outProducer);
+        if (outRefs.size() != 1 || !extractedQ || outRefs[0].index != extractedQ->id.index)
+            return fail("dut_081: output cone clone references the wrong state");
+        if (opsOfType(model, "core.state.read").size() != 1)
+            return fail("dut_081: original output cone op was not swept");
+        if (!verifies(model)) return fail("dut_081: extracted model rejected");
+        if (!jsonRoundTripStable(model, artifactDir, "dut_081_extracted"))
+            return fail("dut_081: extracted JSON round trip not byte stable");
+
+        // Pass 4 (M2b): dut_081 has no timeslot tasks, so it is a no-op.
+        diag::Diagnostics pass4Diagnostics;
+        const auto pass4 =
+            runPasses(model, {"grhsim.migrate-timeslot-tasks"}, pass4Diagnostics);
+        if (!pass4.success || pass4.changed)
+            return fail("dut_081: migrate pass should be a no-op");
+        if (!hasInfo(pass4Diagnostics, "grhsim.migrate-timeslot-tasks",
+                     "migrated_event_tasks=0 migrated_free_tasks=0 timeslot_flags=0"))
+            return fail("dut_081: migrate diagnostic counts wrong");
         return 0;
     }
 
@@ -733,7 +819,273 @@ namespace
         return 0;
     }
 
-    // Spec case 11: both passes are idempotent — a second run reports no
+    // Spec case 9: an event-driven $strobe gains a timeslotFlag, keeps its
+    // event_acts and moves to P_output with its operand cone cloned.
+    int runEventStrobeTaskTest(const std::filesystem::path &artifactDir)
+    {
+        using namespace grhsim;
+        GrhSimModel model("event_strobe");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto q = addState(model, "q", bit, "1'h0");
+        const auto history = addState(model, "__event_4_0", bit, "0");
+        const auto strobeHistory = addState(model, "__event_6_0", bit, "0");
+        const auto clk = addInputRead(model, "clk");
+        const auto d = addInputRead(model, "d");
+        const auto one = addConstant(model, bit, "1'b1");
+        addRegWrite(model, one, d, one, q, clk, "posedge", history);
+        const auto qv = model.addValue(bit, "q_value");
+        model.addOperation("core.state.read", {}, std::array{qv},
+                           std::array{ObjectRef::state(q)});
+        // $strobe("q=%b", q) on the same clock: [callCond, arg, event].
+        const std::array strobeOperands{one, qv, clk};
+        const std::array strobeRefs{ObjectRef::state(strobeHistory)};
+        const std::array strobeParams{
+            Parameter{model.intern("name"), std::string("strobe")},
+            Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}},
+            Parameter{model.intern("proc_kind"), std::string("always")},
+            Parameter{model.intern("has_timing"), false}};
+        model.addOperation("core.system.task", strobeOperands, {}, strobeRefs, strobeParams);
+        if (!verifies(model)) return fail("event_strobe: pre-pass model rejected");
+
+        diag::Diagnostics diagnostics;
+        const auto run = runLoweringPipeline(model, diagnostics);
+        if (!run.success || !run.changed) return fail("event_strobe: pipeline failed");
+        if (!hasInfo(diagnostics, "grhsim.migrate-timeslot-tasks",
+                     "migrated_event_tasks=1 migrated_free_tasks=0 timeslot_flags=1"))
+            return fail("event_strobe: migrate diagnostic counts wrong");
+
+        const auto tasks = opsOfType(model, "core.system.task");
+        if (tasks.size() != 1) return fail("event_strobe: task lost");
+        const auto *task = tasks.front();
+        if (task->phase != SimPhase::Output)
+            return fail("event_strobe: task is not in Output phase");
+        if (!getStringParam(model, *task, "name", "strobe") ||
+            !getStringParam(model, *task, "proc_kind", "always"))
+            return fail("event_strobe: task parameters lost");
+        if (!getIntParam(model, *task, "timeslotFlag", 0))
+            return fail("event_strobe: timeslotFlag missing or wrong");
+        if (!getActsParam(model, *task, {0}))
+            return fail("event_strobe: event_acts not preserved");
+        if (findParam(model, model.parameters(*task), "event_edges"))
+            return fail("event_strobe: event_edges survived");
+        const auto taskOperands = model.operands(*task);
+        if (taskOperands.size() != 2 || !model.objectRefs(*task).empty())
+            return fail("event_strobe: task shape wrong");
+        for (const auto operand : taskOperands)
+        {
+            const auto *producer = producerOf(model, operand);
+            if (!producer || producer->phase != SimPhase::Output)
+                return fail("event_strobe: task operand not produced in P_output");
+        }
+        // The cone cloned the constant and the state.read of q into P_output.
+        unsigned outputConstants = 0;
+        unsigned outputReads = 0;
+        for (const auto *op : opsOfType(model, "core.compute.constant"))
+            if (op->phase == SimPhase::Output) ++outputConstants;
+        for (const auto *op : opsOfType(model, "core.state.read"))
+            if (op->phase == SimPhase::Output) ++outputReads;
+        if (outputConstants != 1 || outputReads != 1)
+            return fail("event_strobe: Output cone clone shape wrong");
+        // The original q state.read had no other user and was swept; the
+        // constant stays (dual use by the regWrite).
+        if (opsOfType(model, "core.state.read").size() != 1)
+            return fail("event_strobe: original state.read was not swept");
+        if (!verifies(model)) return fail("event_strobe: migrated model rejected");
+        if (!jsonRoundTripStable(model, artifactDir, "event_strobe"))
+            return fail("event_strobe: JSON round trip not byte stable");
+        return 0;
+    }
+
+    // Spec case 10: event-free $monitor/$strobe get __tslot_prev_* states, an
+    // ne/or changed reduction feeding a logicAnd guard and Output-phase
+    // latchWrite write-backs; other tasks (display) stay untouched.
+    int runFreeTimeslotTaskTest(const std::filesystem::path &artifactDir)
+    {
+        using namespace grhsim;
+        GrhSimModel model("free_timeslot");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto q1 = addState(model, "q1", bit, "1'h0");
+        const auto q2 = addState(model, "q2", word, "8'h00");
+        const auto en = addInputRead(model, "en");
+        const auto q1v = model.addValue(bit, "q1_value");
+        model.addOperation("core.state.read", {}, std::array{q1v},
+                           std::array{ObjectRef::state(q1)});
+        const auto q2v = model.addValue(word, "q2_value");
+        model.addOperation("core.state.read", {}, std::array{q2v},
+                           std::array{ObjectRef::state(q2)});
+        const auto taskParams = [&](std::string taskName) {
+            return std::array{
+                Parameter{model.intern("name"), std::move(taskName)},
+                Parameter{model.intern("proc_kind"), std::string("always")},
+                Parameter{model.intern("has_timing"), false}};
+        };
+        // Op ids at creation: 1=input.read, 2/3=state.read, 4=monitor,
+        // 5=strobe, 6=display — the prev states are named after 4 and 5.
+        model.addOperation("core.system.task", std::array{en, q1v, q2v}, {}, {},
+                           taskParams("monitor"));
+        model.addOperation("core.system.task", std::array{en}, {}, {}, taskParams("strobe"));
+        model.addOperation("core.system.task", std::array{en, q1v}, {}, {},
+                           taskParams("display"));
+        if (!verifies(model)) return fail("free_tslot: pre-pass model rejected");
+
+        diag::Diagnostics diagnostics;
+        const auto run = runLoweringPipeline(model, diagnostics);
+        if (!run.success || !run.changed) return fail("free_tslot: pipeline failed");
+        if (!hasInfo(diagnostics, "grhsim.migrate-timeslot-tasks",
+                     "migrated_event_tasks=0 migrated_free_tasks=2 timeslot_flags=0"))
+            return fail("free_tslot: migrate diagnostic counts wrong");
+
+        // Prev states: one per operand slot of each migrated task, zero-init.
+        const auto *prev40 = findState(model, "__tslot_prev_4_0");
+        const auto *prev41 = findState(model, "__tslot_prev_4_1");
+        const auto *prev42 = findState(model, "__tslot_prev_4_2");
+        const auto *prev50 = findState(model, "__tslot_prev_5_0");
+        if (!prev40 || !prev41 || !prev42 || !prev50)
+            return fail("free_tslot: __tslot_prev_* states missing");
+        if (prev40->type != bit || prev41->type != bit || prev42->type != word ||
+            prev50->type != bit)
+            return fail("free_tslot: prev state types wrong");
+        if (initConstLiteral(model, prev40->id) != std::optional<std::string>("1'h0") ||
+            initConstLiteral(model, prev41->id) != std::optional<std::string>("1'h0") ||
+            initConstLiteral(model, prev42->id) != std::optional<std::string>("8'h00") ||
+            initConstLiteral(model, prev50->id) != std::optional<std::string>("1'h0"))
+            return fail("free_tslot: prev state init literals wrong");
+        if (model.states().size() != 6) return fail("free_tslot: state count wrong");
+
+        // The shared en input.read was cloned once into P_output; the
+        // original stays for the untouched display task.
+        unsigned outputInputReads = 0;
+        for (const auto *op : opsOfType(model, "core.input.read"))
+            if (op->phase == SimPhase::Output) ++outputInputReads;
+        if (outputInputReads != 1) return fail("free_tslot: en clone missing");
+
+        const auto *monitor = findTask(model, "monitor");
+        const auto *strobe = findTask(model, "strobe");
+        const auto *display = findTask(model, "display");
+        if (!monitor || !strobe || !display) return fail("free_tslot: task lost");
+        if (monitor->phase != SimPhase::Output || strobe->phase != SimPhase::Output)
+            return fail("free_tslot: migrated task not in Output phase");
+        if (display->phase != SimPhase::None)
+            return fail("free_tslot: display task must stay phase-less");
+        if (findParam(model, model.parameters(*monitor), "timeslotFlag") ||
+            findParam(model, model.parameters(*strobe), "timeslotFlag"))
+            return fail("free_tslot: free task must not carry timeslotFlag");
+        const auto monitorOperands = model.operands(*monitor);
+        const auto strobeOperands = model.operands(*strobe);
+        const auto displayOperands = model.operands(*display);
+        if (monitorOperands.size() != 3 || strobeOperands.size() != 1 ||
+            displayOperands.size() != 2)
+            return fail("free_tslot: task operand counts wrong");
+        // display still reads the original (phase-less) en and q1v values.
+        for (const auto operand : displayOperands)
+        {
+            const auto *producer = producerOf(model, operand);
+            if (!producer || producer->phase != SimPhase::None)
+                return fail("free_tslot: display operands must stay on the original cone");
+        }
+        // monitor args are the q1v/q2v clones.
+        const auto *arg1 = producerOf(model, monitorOperands[1]);
+        const auto *arg2 = producerOf(model, monitorOperands[2]);
+        if (!arg1 || !arg2 || arg1->phase != SimPhase::Output ||
+            arg2->phase != SimPhase::Output ||
+            model.text(arg1->opType) != "core.state.read" ||
+            model.text(arg2->opType) != "core.state.read")
+            return fail("free_tslot: monitor args not rewired to Output clones");
+
+        // Guard: logicAnd(en clone, changed). monitor's changed is the top of
+        // a two-op or chain over three ne; strobe's is a single ne.
+        const auto *monitorGuard = producerOf(model, monitorOperands[0]);
+        if (!monitorGuard || model.text(monitorGuard->opType) != "core.compute.logicAnd" ||
+            monitorGuard->phase != SimPhase::Output)
+            return fail("free_tslot: monitor guard is not an Output logicAnd");
+        const auto guardInputs = model.operands(*monitorGuard);
+        if (guardInputs.size() != 2) return fail("free_tslot: guard operand count wrong");
+        const auto *guardCond = producerOf(model, guardInputs[0]);
+        if (!guardCond || model.text(guardCond->opType) != "core.input.read" ||
+            guardCond->phase != SimPhase::Output)
+            return fail("free_tslot: guard does not read the en clone");
+        const auto *guardChanged = producerOf(model, guardInputs[1]);
+        if (!guardChanged || model.text(guardChanged->opType) != "core.compute.or" ||
+            guardChanged->phase != SimPhase::Output)
+            return fail("free_tslot: monitor changed must be an or reduction");
+        const auto *strobeGuard = producerOf(model, strobeOperands[0]);
+        if (!strobeGuard || model.text(strobeGuard->opType) != "core.compute.logicAnd" ||
+            strobeGuard->phase != SimPhase::Output)
+            return fail("free_tslot: strobe guard is not an Output logicAnd");
+        const auto strobeGuardInputs = model.operands(*strobeGuard);
+        if (strobeGuardInputs.size() != 2) return fail("free_tslot: strobe guard wrong");
+        const auto *strobeChanged = producerOf(model, strobeGuardInputs[1]);
+        if (!strobeChanged || model.text(strobeChanged->opType) != "core.compute.ne" ||
+            strobeChanged->phase != SimPhase::Output)
+            return fail("free_tslot: single-slot changed must be the bare ne");
+
+        // Reduction op census: 4 ne (3 monitor + 1 strobe), 2 or, 2 logicAnd.
+        unsigned nes = 0, ors = 0, ands = 0;
+        for (const auto *op : opsOfType(model, "core.compute.ne"))
+            if (op->phase == SimPhase::Output) ++nes;
+        for (const auto *op : opsOfType(model, "core.compute.or"))
+            if (op->phase == SimPhase::Output) ++ors;
+        for (const auto *op : opsOfType(model, "core.compute.logicAnd"))
+            if (op->phase == SimPhase::Output) ++ands;
+        if (nes != 4 || ors != 2 || ands != 2)
+            return fail("free_tslot: changed-reduction op counts wrong");
+
+        // Every ne compares a current-value clone against its prev read.
+        for (const auto *op : opsOfType(model, "core.compute.ne"))
+        {
+            const auto neOperands = model.operands(*op);
+            if (neOperands.size() != 2) return fail("free_tslot: ne shape wrong");
+            const auto *prevRead = producerOf(model, neOperands[1]);
+            if (!prevRead || model.text(prevRead->opType) != "core.state.read" ||
+                prevRead->phase != SimPhase::Output)
+                return fail("free_tslot: ne does not read a prev state");
+            const auto refs = model.objectRefs(*prevRead);
+            if (refs.size() != 1 || refs[0].index == 0 ||
+                refs[0].index > model.states().size())
+                return fail("free_tslot: prev read ref wrong");
+            const auto &state = model.states()[refs[0].index - 1];
+            if (!model.text(state.name).starts_with("__tslot_prev_"))
+                return fail("free_tslot: ne compared against a non-prev state");
+        }
+
+        // latchWrite write-backs: Output phase, enable=1'h1, all-ones mask of
+        // the prev width, data = the current-value clone.
+        const auto latchWrites = opsOfType(model, "core.state.latchWrite");
+        if (latchWrites.size() != 4) return fail("free_tslot: latchWrite count wrong");
+        for (const auto *write : latchWrites)
+        {
+            if (write->phase != SimPhase::Output)
+                return fail("free_tslot: latchWrite not in Output phase");
+            const auto operands = model.operands(*write);
+            const auto refs = model.objectRefs(*write);
+            if (operands.size() != 3 || refs.size() != 1)
+                return fail("free_tslot: latchWrite shape wrong");
+            if (refs[0].index == 0 || refs[0].index > model.states().size())
+                return fail("free_tslot: latchWrite ref wrong");
+            const auto &state = model.states()[refs[0].index - 1];
+            if (!model.text(state.name).starts_with("__tslot_prev_"))
+                return fail("free_tslot: latchWrite must target a prev state");
+            if (constValueOf(model, operands[0]) != std::optional<std::string>("1'h1"))
+                return fail("free_tslot: latchWrite enable must be constant 1");
+            const auto *data = producerOf(model, operands[1]);
+            if (!data || data->phase != SimPhase::Output)
+                return fail("free_tslot: latchWrite data must come from P_output");
+            const auto width = model.types()[state.type.index - 1].width;
+            const std::string expectedMask = width == 1 ? "1'h1" : "8'hff";
+            if (constValueOf(model, operands[2]) != std::optional<std::string>(expectedMask))
+                return fail("free_tslot: latchWrite mask literal wrong");
+        }
+        if (!verifies(model)) return fail("free_tslot: migrated model rejected");
+        if (!jsonRoundTripStable(model, artifactDir, "free_timeslot"))
+            return fail("free_tslot: JSON round trip not byte stable");
+        return 0;
+    }
+
+
+    // Spec case 11: all four passes are idempotent — a second run reports no
     // change, zero diagnostics counts, and a byte-identical model.
     int runIdempotencyTest(const std::filesystem::path &artifactDir)
     {
@@ -745,6 +1097,7 @@ namespace
         const auto q2 = addState(model, "q2", bit, "1'h0");
         const auto h1 = addState(model, "__event_1_0", bit, "0");
         const auto h2 = addState(model, "__event_2_0", bit, "0");
+        const auto h3 = addState(model, "__event_9_0", bit, "0");
         const auto clk = addInputRead(model, "clk");
         const auto rst = addInputRead(model, "rst");
         const auto d = addInputRead(model, "d");
@@ -754,12 +1107,31 @@ namespace
         model.addOperation("core.compute.mux", std::array{rst, d, zero}, std::array{muxed});
         addRegWrite(model, one, d, one, q1, clk, "posedge", h1);
         addRegWrite(model, one, muxed, one, q2, rst, "negedge", h2);
+        // Give every M2b pass real work: an output cone (pass 3), an
+        // event-driven strobe (pass 4 flags) and a free monitor (pass 4
+        // prev-state form).
+        const auto q1v = model.addValue(bit, "q1_value");
+        model.addOperation("core.state.read", {}, std::array{q1v},
+                           std::array{ObjectRef::state(q1)});
+        const auto out = model.addOutput("o", bit);
+        model.addOperation("core.output.write", std::array{q1v}, {},
+                           std::array{ObjectRef::output(out)});
+        const std::array strobeParams{
+            Parameter{model.intern("name"), std::string("strobe")},
+            Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}},
+            Parameter{model.intern("proc_kind"), std::string("always")},
+            Parameter{model.intern("has_timing"), false}};
+        model.addOperation("core.system.task", std::array{one, d, clk}, {},
+                           std::array{ObjectRef::state(h3)}, strobeParams);
+        const std::array monitorParams{
+            Parameter{model.intern("name"), std::string("monitor")},
+            Parameter{model.intern("proc_kind"), std::string("always")},
+            Parameter{model.intern("has_timing"), false}};
+        model.addOperation("core.system.task", std::array{one, q1v}, {}, {}, monitorParams);
         if (!verifies(model)) return fail("idempotent: pre-pass model rejected");
 
         diag::Diagnostics firstDiagnostics;
-        const auto first = runPasses(
-            model, {"grhsim.classify-event-inputs", "grhsim.lower-edge-detect"},
-            firstDiagnostics);
+        const auto first = runLoweringPipeline(model, firstDiagnostics);
         if (!first.success || !first.changed) return fail("idempotent: first run failed");
         std::filesystem::create_directories(artifactDir);
         const auto firstPath = artifactDir / "idempotent_first.json";
@@ -768,9 +1140,7 @@ namespace
             return fail("idempotent: first store failed");
 
         diag::Diagnostics secondDiagnostics;
-        const auto second = runPasses(
-            model, {"grhsim.classify-event-inputs", "grhsim.lower-edge-detect"},
-            secondDiagnostics);
+        const auto second = runLoweringPipeline(model, secondDiagnostics);
         if (!second.success) return fail("idempotent: second run failed");
         if (second.changed) return fail("idempotent: second run reported a change");
         if (!hasInfo(secondDiagnostics, "grhsim.classify-event-inputs", "event_only_inputs=0"))
@@ -779,6 +1149,12 @@ namespace
                      "clusters=0 edge_dets=0 rewritten_ops=0 removed_history_states=0 "
                      "removed_cone_ops=0 prev_init_fallbacks=0"))
             return fail("idempotent: lower second-run counts wrong");
+        if (!hasInfo(secondDiagnostics, "grhsim.extract-output-cones",
+                     "cloned_ops=0 removed_ops=0"))
+            return fail("idempotent: extract second-run counts wrong");
+        if (!hasInfo(secondDiagnostics, "grhsim.migrate-timeslot-tasks",
+                     "migrated_event_tasks=0 migrated_free_tasks=0 timeslot_flags=0"))
+            return fail("idempotent: migrate second-run counts wrong");
         const auto secondPath = artifactDir / "idempotent_second.json";
         diag::Diagnostics secondStoreDiagnostics;
         if (!storeGrhSimModel(model, secondPath, defaultDialectRegistry(),
@@ -903,6 +1279,91 @@ namespace
             edgeDet(model, clk, 0);
             if (verifies(model)) return fail("guard: General reading Event value accepted");
         }
+        // An Output-phase op whose operand is produced outside P_output breaks
+        // output-cone self-containment.
+        {
+            auto model = base("guard_output_cone");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto a = addInputRead(model, "a");
+            const auto b = addInputRead(model, "b");
+            const auto both = model.addValue(bit);
+            model.setOperationPhase(model.addOperation("core.compute.and",
+                                                       std::array{a, b}, std::array{both}),
+                                    SimPhase::Output);
+            if (verifies(model)) return fail("guard: non-self-contained Output cone accepted");
+        }
+        // A General-phase op must not read an Output-phase value.
+        {
+            auto model = base("guard_general_reads_output");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto q = addState(model, "q", bit, "1'h0");
+            const auto one = addConstant(model, bit, "1'b1");
+            const auto outNext = model.addValue(bit);
+            model.setOperationPhase(model.addOperation("core.compute.constant", {},
+                                                       std::array{outNext}, {},
+                                                       std::array{Parameter{
+                                                           model.intern("constValue"),
+                                                           std::string("1'h0")}}),
+                                    SimPhase::Output);
+            model.setOperationPhase(model.addOperation("core.state.regWrite",
+                                                       std::array{one, outNext, one}, {},
+                                                       std::array{ObjectRef::state(q)}),
+                                    SimPhase::General);
+            if (verifies(model)) return fail("guard: General reading Output value accepted");
+        }
+        // A __tslot_prev_* state written by a non-Output latchWrite is rejected.
+        {
+            auto model = base("guard_tslot_prev_write");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto prev = addState(model, "__tslot_prev_2_0", bit, "1'h0");
+            const auto one = addConstant(model, bit, "1'b1");
+            model.setOperationPhase(model.addOperation("core.state.latchWrite",
+                                                       std::array{one, one, one}, {},
+                                                       std::array{ObjectRef::state(prev)}),
+                                    SimPhase::General);
+            if (verifies(model)) return fail("guard: non-Output __tslot_prev write accepted");
+        }
+        // timeslotFlag must be a non-negative int64.
+        {
+            auto model = base("guard_tslot_flag_negative");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto clkPort = model.addInput("clk", bit);
+            const auto clk = model.addValue(bit, "clk");
+            model.setOperationPhase(model.addOperation("core.input.read", {}, std::array{clk},
+                                                       std::array{ObjectRef::input(clkPort)}),
+                                    SimPhase::Event);
+            const auto cond = addConstant(model, bit, "1'b1");
+            const auto *condProducer = producerOf(model, cond);
+            model.setOperationPhase(condProducer->id, SimPhase::Output);
+            const std::array params{
+                Parameter{model.intern("name"), std::string("strobe")},
+                Parameter{model.intern("event_acts"), std::vector<int64_t>{0}},
+                Parameter{model.intern("proc_kind"), std::string("always")},
+                Parameter{model.intern("has_timing"), false},
+                Parameter{model.intern("timeslotFlag"), int64_t{-1}}};
+            model.setOperationPhase(model.addOperation("core.system.task", std::array{cond},
+                                                       {}, {}, params),
+                                    SimPhase::Output);
+            edgeDet(model, clk, 0);
+            if (verifies(model)) return fail("guard: negative timeslotFlag accepted");
+        }
+        // timeslotFlag requires an Output-phase core.system.task with event_acts.
+        {
+            auto model = base("guard_tslot_flag_shape");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto cond = addConstant(model, bit, "1'b1");
+            const auto *condProducer = producerOf(model, cond);
+            model.setOperationPhase(condProducer->id, SimPhase::Output);
+            const std::array params{
+                Parameter{model.intern("name"), std::string("strobe")},
+                Parameter{model.intern("proc_kind"), std::string("always")},
+                Parameter{model.intern("has_timing"), false},
+                Parameter{model.intern("timeslotFlag"), int64_t{0}}};
+            model.setOperationPhase(model.addOperation("core.system.task", std::array{cond},
+                                                       {}, {}, params),
+                                    SimPhase::Output);
+            if (verifies(model)) return fail("guard: event-free timeslotFlag accepted");
+        }
         return 0;
     }
 } // namespace
@@ -924,6 +1385,8 @@ int main()
         if (const int status = runPrevInitEvalTest(); status != 0) return status;
         if (const int status = runMemWriteEventTest(); status != 0) return status;
         if (const int status = runDpiCallEventTest(); status != 0) return status;
+        if (const int status = runEventStrobeTaskTest(artifactDir); status != 0) return status;
+        if (const int status = runFreeTimeslotTaskTest(artifactDir); status != 0) return status;
         if (const int status = runIdempotencyTest(artifactDir); status != 0) return status;
         if (const int status = runVerifierGuardTest(); status != 0) return status;
         return 0;

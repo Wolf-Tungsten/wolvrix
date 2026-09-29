@@ -15,6 +15,8 @@
 #include "grhsim/pass/used_bits.hpp"
 #include "grhsim/pass/classify_event_inputs.hpp"
 #include "grhsim/pass/lower_edge_detect.hpp"
+#include "grhsim/pass/extract_output_cones.hpp"
+#include "grhsim/pass/migrate_timeslot_tasks.hpp"
 #include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
@@ -184,9 +186,12 @@ namespace wolvrix::lib::grhsim
         registerFoldResiduePass(registry);
         registerPackBitRegistersPass(registry);
         registerUsedBitsPass(registry);
-        // M2 six-phase lowering order: classify before edge-detect lowering.
+        // M2 six-phase lowering order: classify before edge-detect lowering,
+        // then the P_output cone extraction and the timeslot-task migration.
         registerClassifyEventInputsPass(registry);
         registerLowerEdgeDetectPass(registry);
+        registerExtractOutputConesPass(registry);
+        registerMigrateTimeslotTasksPass(registry);
         std::string error;
         registry.registerPass(
             "grhsim.verify", PassKind::Analysis,

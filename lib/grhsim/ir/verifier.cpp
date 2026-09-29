@@ -99,6 +99,9 @@ namespace wolvrix::lib::grhsim
         // M1 phase attribution framework: validates the phase of ops that carry
         // one (edgeDet unconditionally). The M2 event-lowering invariants live
         // in verifyEventLowering below; M3 will add total phase coverage.
+        // M2b exception: latchWrite may also carry Output — the timeslot
+        // __tslot_prev_* write-backs live in P_output (verifyOutputLowering
+        // constrains those states to Output-phase latchWrites).
         bool verifyPhaseAttribution(const GrhSimModel &model, diag::Diagnostics &diagnostics)
         {
             bool ok = true;
@@ -109,6 +112,7 @@ namespace wolvrix::lib::grhsim
                 const std::string_view name = model.text(op.opType);
                 std::optional<SimPhase> required;
                 bool unconditional = false;
+                bool latchWrite = false;
                 if (name == "core.event.edgeDet")
                 {
                     required = SimPhase::Event;
@@ -118,9 +122,14 @@ namespace wolvrix::lib::grhsim
                 else if (name == "core.state.memWrite" || name == "core.state.memFill" ||
                          name == "core.state.memAssign" || name == "core.state.memWriteSeq")
                     required = SimPhase::Mem;
-                else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                else if (name == "core.state.regWrite") required = SimPhase::General;
+                else if (name == "core.state.latchWrite")
+                {
                     required = SimPhase::General;
+                    latchWrite = true;
+                }
                 if (!required || (op.phase == SimPhase::None && !unconditional)) continue;
+                if (latchWrite && op.phase == SimPhase::Output) continue;
                 if (op.phase != *required)
                 {
                     diagnostics.error(std::string(name) + " belongs to phase " +
@@ -307,6 +316,134 @@ namespace wolvrix::lib::grhsim
                     {
                         diagnostics.error("General-phase op operand is produced by an "
                                           "Event-phase op",
+                                          context);
+                        ok = false;
+                    }
+                }
+            }
+            return ok;
+        }
+
+        // M2b output-lowering invariants. The __tslot_prev_* write rule and
+        // the timeslotFlag shape rule are unconditional (they vacuously pass
+        // when no such states/ops exist); the P_output cone rules gate on the
+        // presence of any Output-phase op, mirroring the event_acts gate in
+        // verifyEventLowering.
+        bool verifyOutputLowering(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            bool ok = true;
+            bool hasOutput = false;
+            for (const auto &op : model.operations())
+                if (op.phase == SimPhase::Output) hasOutput = true;
+
+            const auto stateWriteType = [](std::string_view name) {
+                return name == "core.state.regWrite" || name == "core.state.latchWrite" ||
+                       name == "core.state.memWrite" || name == "core.state.memFill" ||
+                       name == "core.state.memAssign" || name == "core.state.memWriteSeq";
+            };
+
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                if (!model.strings().valid(op.opType)) continue;
+                const std::string_view name = model.text(op.opType);
+                const std::string context = "operations[" + std::to_string(i) + "]";
+                std::span<const ObjectRef> refs;
+                std::span<const Parameter> parameters;
+                try
+                {
+                    refs = model.objectRefs(op);
+                    parameters = model.parameters(op);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                // A __tslot_prev_* state may only be written by an
+                // Output-phase core.state.latchWrite.
+                if (stateWriteType(name))
+                {
+                    for (const auto ref : refs)
+                    {
+                        if (ref.kind != ObjectKind::State || ref.index == 0 ||
+                            ref.index > model.states().size())
+                            continue;
+                        const auto &state = model.states()[ref.index - 1];
+                        if (!model.strings().valid(state.name) ||
+                            !model.text(state.name).starts_with("__tslot_prev_"))
+                            continue;
+                        if (name != "core.state.latchWrite" || op.phase != SimPhase::Output)
+                        {
+                            diagnostics.error("__tslot_prev_* states may only be written "
+                                              "by an Output-phase core.state.latchWrite",
+                                              context);
+                            ok = false;
+                        }
+                    }
+                }
+                // timeslotFlag is only valid as a non-negative int64 on an
+                // Output-phase core.system.task that carries event_acts.
+                if (const Parameter *flag = findParameter(model, parameters, "timeslotFlag"))
+                {
+                    const auto *value = std::get_if<int64_t>(&flag->value);
+                    if (!value || *value < 0)
+                    {
+                        diagnostics.error("timeslotFlag must be a non-negative int64",
+                                          context);
+                        ok = false;
+                    }
+                    if (name != "core.system.task" || op.phase != SimPhase::Output ||
+                        !findParameter(model, parameters, "event_acts"))
+                    {
+                        diagnostics.error("timeslotFlag requires an Output-phase "
+                                          "core.system.task with event_acts",
+                                          context);
+                        ok = false;
+                    }
+                }
+            }
+            if (!hasOutput) return ok;
+
+            // P_output cone self-containment plus the General/Output barrier.
+            std::vector<uint32_t> producers(model.values().size() + 1, 0);
+            for (const auto &op : model.operations())
+                for (const auto result : model.results(op))
+                    if (result.generation == 0 && result.index < producers.size())
+                        producers[result.index] = op.id.index;
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                if (op.phase != SimPhase::Output && op.phase != SimPhase::General) continue;
+                const std::string context = "operations[" + std::to_string(i) + "]";
+                std::span<const ValueId> operands;
+                try
+                {
+                    operands = model.operands(op);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                for (const auto operand : operands)
+                {
+                    if (operand.generation != 0 || !operand.valid() ||
+                        operand.index >= producers.size())
+                        continue;
+                    const uint32_t producer = producers[operand.index];
+                    if (producer == 0) continue;
+                    const SimPhase producerPhase =
+                        model.operations()[producer - 1].phase;
+                    if (op.phase == SimPhase::Output && producerPhase != SimPhase::Output)
+                    {
+                        diagnostics.error("Output-phase op operand is produced by a "
+                                          "non-Output-phase op",
+                                          context);
+                        ok = false;
+                    }
+                    if (op.phase == SimPhase::General && producerPhase == SimPhase::Output)
+                    {
+                        diagnostics.error("General-phase op operand is produced by an "
+                                          "Output-phase op",
                                           context);
                         ok = false;
                     }
@@ -776,6 +913,7 @@ namespace wolvrix::lib::grhsim
         if (!verifyPhaseAttribution(model, diagnostics)) ok = false;
         if (!verifyEdgeDetUniqueness(model, diagnostics)) ok = false;
         if (!verifyEventLowering(model, diagnostics)) ok = false;
+        if (!verifyOutputLowering(model, diagnostics)) ok = false;
 
         std::vector<uint32_t> initCount(model.states().size(), 0);
         for (std::size_t i = 0; i < model.initRecords().size(); ++i)

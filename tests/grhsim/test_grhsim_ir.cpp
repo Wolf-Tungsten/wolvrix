@@ -1836,7 +1836,11 @@ namespace {
                 std::array{one, one, one, clk}, {}, std::array{ObjectRef::state(memSeq)}, edges()),
                 SimPhase::Mem);
             const auto read = model.addValue(word);
-            model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(q)});
+            // The output cone is self-contained (M2b verifier): the read
+            // feeding an Output-phase output.write must be Output itself.
+            model.setOperationPhase(model.addOperation("core.state.read", {}, std::array{read},
+                                                       std::array{ObjectRef::state(q)}),
+                                    SimPhase::Output);
             const auto out = model.addOutput("o", word);
             model.setOperationPhase(model.addOperation("core.output.write",
                 std::array{read}, {}, std::array{ObjectRef::output(out)}), SimPhase::Output);

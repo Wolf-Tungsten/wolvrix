@@ -193,6 +193,16 @@ core op。
 多个 events 中任意一个命中即可触发该 op。历史状态的初始化必须由 `Init` 中对应的
 `InitSpec` 明确给出（见 [2.1](#21-初始化描述-initspec)）。
 
+> 演进说明（M2）：本节描述的是 GRH 转换直接产出的旧形态。六阶段仿真模型的
+> `grhsim.lower-edge-detect` pass（见 [lower-edge-detect](../passes/lower-edge-detect.md)）
+> 会把它改写为新形态：每个 `(event, edge)` 去重聚类生成一个 6.1 节的
+> `core.event.edgeDet`，事件逻辑锥克隆进 P_event，消费 op 尾部的 event operands 与
+> event-history object refs 摘除、`event_edges` 参数替换为 `event_acts`（int64 数组，
+> 元素为聚类下标、保持原顺序），全部 `__event_*` 历史状态及其 InitRecord 删除。
+> `core.system.task` 改写后不再持有 object refs，`core.dpi.call` 只保留首部 Function
+> 引用；`regWrite`/`system.task`/`dpi.call` 的 phase 置为 `general`，四种 mem 写在 M3
+> 归类前保持无 phase。verifier 在模型出现 `event_acts` 后禁止任何 `event_edges` 残留。
+
 ### 6.1 边沿检测 op `core.event.edgeDet`
 
 `core.event.edgeDet` 是六阶段仿真模型（见 `pdocs/simulation-model-refactor`）中 `P_event`

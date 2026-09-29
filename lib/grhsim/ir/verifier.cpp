@@ -97,9 +97,8 @@ namespace wolvrix::lib::grhsim
         }
 
         // M1 phase attribution framework: validates the phase of ops that carry
-        // one (edgeDet unconditionally). M2/M3 will extend it — the P_general
-        // cone must not reference event operands, copied cones must be
-        // self-contained, and phase coverage becomes total.
+        // one (edgeDet unconditionally). The M2 event-lowering invariants live
+        // in verifyEventLowering below; M3 will add total phase coverage.
         bool verifyPhaseAttribution(const GrhSimModel &model, diag::Diagnostics &diagnostics)
         {
             bool ok = true;
@@ -186,6 +185,131 @@ namespace wolvrix::lib::grhsim
                 {
                     diagnostics.error("core.event.edgeDet (event, edge) cluster is duplicated", context);
                     ok = false;
+                }
+            }
+            return ok;
+        }
+
+        // M2 event-lowering invariants (enabled once the model carries the
+        // lowered event_acts form, i.e. after grhsim.lower-edge-detect ran):
+        // no event_edges may survive; event_acts entries must resolve into the
+        // edgeDet cluster (act) set; rewritten consumers must have their
+        // event-free operand/ref shape; the P_event cone must be
+        // self-contained; and General ops must not read Event-phase values.
+        bool verifyEventLowering(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            std::unordered_set<int64_t> acts;
+            bool lowered = false;
+            for (const auto &op : model.operations())
+            {
+                if (!model.strings().valid(op.opType)) continue;
+                if (model.text(op.opType) == "core.event.edgeDet")
+                {
+                    const Parameter *act = findParameter(model, model.parameters(op), "act");
+                    if (act && std::holds_alternative<int64_t>(act->value))
+                        acts.insert(std::get<int64_t>(act->value));
+                }
+                if (findParameter(model, model.parameters(op), "event_acts")) lowered = true;
+            }
+            if (!lowered) return true;
+
+            bool ok = true;
+            std::vector<uint32_t> producers(model.values().size() + 1, 0);
+            for (const auto &op : model.operations())
+                for (const auto result : model.results(op))
+                    if (result.generation == 0 && result.index < producers.size())
+                        producers[result.index] = op.id.index;
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                const std::string context = "operations[" + std::to_string(i) + "]";
+                std::span<const ValueId> operands;
+                std::span<const ObjectRef> refs;
+                std::span<const Parameter> parameters;
+                try
+                {
+                    operands = model.operands(op);
+                    refs = model.objectRefs(op);
+                    parameters = model.parameters(op);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                if (findParameter(model, parameters, "event_edges"))
+                {
+                    diagnostics.error("event_edges survives the edge-detect lowering",
+                                      context);
+                    ok = false;
+                }
+                const Parameter *eventActs = findParameter(model, parameters, "event_acts");
+                if (eventActs)
+                {
+                    const auto *indices = std::get_if<std::vector<int64_t>>(&eventActs->value);
+                    if (!indices)
+                    {
+                        diagnostics.error("event_acts must be an int64 array", context);
+                        ok = false;
+                    }
+                    else
+                    {
+                        for (const int64_t index : *indices)
+                        {
+                            if (index < 0 || !acts.contains(index))
+                            {
+                                diagnostics.error("event_acts index is not an edgeDet act "
+                                                  "cluster index",
+                                                  context);
+                                ok = false;
+                            }
+                        }
+                    }
+                    const std::string_view name = model.strings().valid(op.opType)
+                                                      ? model.text(op.opType)
+                                                      : std::string_view{};
+                    bool shapeOk = true;
+                    if (name == "core.state.regWrite") shapeOk = operands.size() == 3;
+                    else if (name == "core.state.memWrite") shapeOk = operands.size() == 4;
+                    else if (name == "core.state.memFill" || name == "core.state.memAssign")
+                        shapeOk = operands.size() == 2;
+                    else if (name == "core.state.memWriteSeq")
+                        shapeOk = !operands.empty() && operands.size() % 3 == 0;
+                    else if (name == "core.system.task") shapeOk = refs.empty();
+                    else if (name == "core.dpi.call") shapeOk = refs.size() == 1;
+                    else shapeOk = false;
+                    if (!shapeOk)
+                    {
+                        diagnostics.error(std::string(name) +
+                                              " with event_acts must use its event-free "
+                                              "operand/object-ref shape",
+                                          context);
+                        ok = false;
+                    }
+                }
+                if (op.phase != SimPhase::Event && op.phase != SimPhase::General) continue;
+                for (const auto operand : operands)
+                {
+                    if (operand.generation != 0 || !operand.valid() ||
+                        operand.index >= producers.size())
+                        continue;
+                    const uint32_t producer = producers[operand.index];
+                    if (producer == 0) continue;
+                    const SimPhase producerPhase =
+                        model.operations()[producer - 1].phase;
+                    if (op.phase == SimPhase::Event && producerPhase != SimPhase::Event)
+                    {
+                        diagnostics.error("Event-phase op operand is produced by a "
+                                          "non-Event-phase op",
+                                          context);
+                        ok = false;
+                    }
+                    if (op.phase == SimPhase::General && producerPhase == SimPhase::Event)
+                    {
+                        diagnostics.error("General-phase op operand is produced by an "
+                                          "Event-phase op",
+                                          context);
+                        ok = false;
+                    }
                 }
             }
             return ok;
@@ -651,6 +775,7 @@ namespace wolvrix::lib::grhsim
 
         if (!verifyPhaseAttribution(model, diagnostics)) ok = false;
         if (!verifyEdgeDetUniqueness(model, diagnostics)) ok = false;
+        if (!verifyEventLowering(model, diagnostics)) ok = false;
 
         std::vector<uint32_t> initCount(model.states().size(), 0);
         for (std::size_t i = 0; i < model.initRecords().size(); ++i)

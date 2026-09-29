@@ -137,6 +137,9 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/fold_residue.cpp
     lib/grhsim/pass/used_bits.cpp
     lib/grhsim/pass/pack_bit_registers.cpp
+    lib/grhsim/pass/cone_extract.cpp
+    lib/grhsim/pass/classify_event_inputs.cpp
+    lib/grhsim/pass/lower_edge_detect.cpp
     lib/grhsim/backend/cpu.cpp
     lib/grhsim/backend/cpu_partition.cpp
     lib/grhsim/backend/cpu_layout.cpp
@@ -373,6 +376,11 @@ target_link_libraries(grhsim-reg-to-mem-tests PRIVATE wolvrix-lib)
 target_compile_definitions(grhsim-reg-to-mem-tests PRIVATE
     WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim")
 register_test_exe(grhsim-reg-to-mem-tests)
+add_executable(grhsim-event-lowering-tests tests/grhsim/test_grhsim_event_lowering.cpp)
+target_link_libraries(grhsim-event-lowering-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-event-lowering-tests PRIVATE
+    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim")
+register_test_exe(grhsim-event-lowering-tests)
 target_link_libraries(grhsim-cpu-mapping-tests PRIVATE wolvrix-lib)
 register_test_exe(grhsim-cpu-mapping-tests)
 add_executable(grhsim-cpu-schedule-tests tests/grhsim/test_cpu_schedule.cpp tests/grhsim/test_cpu_schedule_trace.cpp)

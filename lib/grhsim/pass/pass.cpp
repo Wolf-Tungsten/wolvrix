@@ -13,6 +13,8 @@
 #include "grhsim/pass/fold_residue.hpp"
 #include "grhsim/pass/pack_bit_registers.hpp"
 #include "grhsim/pass/used_bits.hpp"
+#include "grhsim/pass/classify_event_inputs.hpp"
+#include "grhsim/pass/lower_edge_detect.hpp"
 #include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
@@ -182,6 +184,9 @@ namespace wolvrix::lib::grhsim
         registerFoldResiduePass(registry);
         registerPackBitRegistersPass(registry);
         registerUsedBitsPass(registry);
+        // M2 six-phase lowering order: classify before edge-detect lowering.
+        registerClassifyEventInputsPass(registry);
+        registerLowerEdgeDetectPass(registry);
         std::string error;
         registry.registerPass(
             "grhsim.verify", PassKind::Analysis,

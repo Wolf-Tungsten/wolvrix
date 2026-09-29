@@ -4,6 +4,7 @@
 #include "grhsim/pass/pass.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <map>
 #include <stdexcept>
@@ -181,6 +182,263 @@ namespace wolvrix::lib::grhsim
         private:
             uint32_t maxOps_;
         };
+        // Six-phase (M3) structural verification for the
+        // SplitPhases..GeneralFunctions stages. The legacy two-phase checks
+        // below do not apply; layout/schedule payloads are not part of the
+        // six-phase pipeline.
+        bool verifyCpuPhases(const GrhSimModel &model, const CpuBackendMapping &cpu,
+                             diag::Diagnostics &diagnostics)
+        {
+            const auto error = [&](std::string message) {
+                diagnostics.error(std::move(message), "cpu.mapping");
+                return false;
+            };
+            if (cpu.dataLayout || cpu.schedule)
+                return error("six-phase CPU mapping must not carry data layout or schedule payloads");
+            const auto &tree = cpu.partitionTree;
+            const auto validPartition = [&](PartitionId id) {
+                return id.generation == 0 && id.index > 0 && id.index <= tree.partitions.size();
+            };
+            if (!validPartition(tree.root)) return error("partition root is invalid");
+            const auto &root = tree.partitions[tree.root.index - 1];
+            const std::array<CpuPhase, 4> phaseOrder{CpuPhase::Event, CpuPhase::General,
+                                                     CpuPhase::Mem, CpuPhase::Output};
+            if (root.parent || root.attrs.kind != CpuPartitionKind::Root || !root.ops.empty() ||
+                root.children.size() != phaseOrder.size())
+                return error("six-phase CPU root must contain exactly four phase branches");
+            for (std::size_t i = 0; i < phaseOrder.size(); ++i)
+            {
+                if (!validPartition(root.children[i])) return error("invalid phase branch");
+                const auto &branch = tree.partitions[root.children[i].index - 1];
+                if (branch.parent != tree.root || branch.attrs.kind != CpuPartitionKind::Phase ||
+                    branch.attrs.phase != phaseOrder[i])
+                    return error("six-phase branch order must be event, general, mem, output");
+            }
+            const auto memWrite = [](std::string_view type) {
+                return type == "core.state.memWrite" || type == "core.state.memFill" ||
+                       type == "core.state.memAssign" || type == "core.state.memWriteSeq";
+            };
+            std::vector<bool> visited(tree.partitions.size() + 1);
+            std::vector<bool> covered(model.operations().size() + 1);
+            std::vector<OpId> eventOps, generalOps, memOps, outputOps;
+            uint32_t eventFunctions = 0, memFunctions = 0, outputFunctions = 0;
+            struct Visit { PartitionId id; CpuPhase phase; };
+            std::vector<Visit> stack{{tree.root, CpuPhase::None}};
+            while (!stack.empty())
+            {
+                auto [id, phase] = stack.back();
+                stack.pop_back();
+                if (!validPartition(id) || visited[id.index]) return error("invalid, repeated or cyclic partition");
+                visited[id.index] = true;
+                const auto &partition = tree.partitions[id.index - 1];
+                const auto &attrs = partition.attrs;
+                if (partition.id != id) return error("partition IDs must be dense and match table order");
+                if (attrs.kind == CpuPartitionKind::Phase)
+                {
+                    if (partition.parent != tree.root || phase != CpuPhase::None)
+                        return error("phase partition is not a root child");
+                    phase = attrs.phase;
+                    if (phase == CpuPhase::General && !partition.ops.empty())
+                        return error("general branch holds its ops in nodes, not on the phase");
+                }
+                else if (attrs.phase != CpuPhase::None)
+                    return error("phase annotation must occur only on phase branches");
+                if (attrs.eventGate || attrs.activeId || attrs.activeWord)
+                    return error("legacy activity annotations are not part of the six-phase mapping");
+                if (attrs.kind == CpuPartitionKind::EventDomain || attrs.kind == CpuPartitionKind::ActiveWord ||
+                    (attrs.kind == CpuPartitionKind::Root && id != tree.root))
+                    return error("legacy partition kinds are not part of the six-phase mapping");
+                const bool generalSupernode = phase == CpuPhase::General &&
+                                              attrs.kind == CpuPartitionKind::Supernode;
+                if (cpu.stage >= CpuMappingStage::GeneralSupernodes)
+                {
+                    if (generalSupernode != attrs.eventActs.has_value())
+                        return error("event act annotations must cover exactly the general supernodes");
+                }
+                else if (attrs.eventActs)
+                    return error("event act annotations require the general-supernode stage");
+                if (!attrs.helperChunks.empty() &&
+                    !(cpu.stage >= CpuMappingStage::GeneralFunctions && generalSupernode))
+                    return error("helper chunks annotate only packed general supernodes");
+                std::optional<CpuPartitionKind> childKind;
+                switch (attrs.kind)
+                {
+                case CpuPartitionKind::Root:
+                    childKind = CpuPartitionKind::Phase;
+                    break;
+                case CpuPartitionKind::Phase:
+                    if (phase == CpuPhase::General)
+                    {
+                        if (cpu.stage >= CpuMappingStage::GeneralFunctions) childKind = CpuPartitionKind::EmitFunction;
+                        else if (cpu.stage >= CpuMappingStage::GeneralSupernodes) childKind = CpuPartitionKind::Supernode;
+                        else if (cpu.stage >= CpuMappingStage::GeneralNodes) childKind = CpuPartitionKind::Node;
+                    }
+                    else if (cpu.stage >= CpuMappingStage::GeneralFunctions)
+                        childKind = CpuPartitionKind::EmitFunction;
+                    break;
+                case CpuPartitionKind::Node:
+                    if (phase != CpuPhase::General || cpu.stage < CpuMappingStage::GeneralNodes ||
+                        partition.ops.empty() || !partition.children.empty())
+                        return error("general node must be a nonempty leaf in the general branch");
+                    {
+                        const auto parentKind = tree.partitions[partition.parent.index - 1].attrs.kind;
+                        const auto expected = cpu.stage == CpuMappingStage::GeneralNodes ?
+                                              CpuPartitionKind::Phase : CpuPartitionKind::Supernode;
+                        if (parentKind != expected)
+                            return error("general node parenting disagrees with the mapping stage");
+                    }
+                    break;
+                case CpuPartitionKind::Supernode:
+                    if (!generalSupernode || cpu.stage < CpuMappingStage::GeneralSupernodes ||
+                        partition.children.empty())
+                        return error("six-phase supernodes exist only in the general branch");
+                    {
+                        const auto parentKind = tree.partitions[partition.parent.index - 1].attrs.kind;
+                        const auto expected = cpu.stage == CpuMappingStage::GeneralSupernodes ?
+                                              CpuPartitionKind::Phase : CpuPartitionKind::EmitFunction;
+                        if (parentKind != expected)
+                            return error("general supernode parenting disagrees with the mapping stage");
+                        uint64_t size = 0;
+                        for (auto child : partition.children)
+                        {
+                            if (!validPartition(child)) return error("invalid general node child");
+                            size += tree.partitions[child.index - 1].ops.size();
+                        }
+                        uint64_t end = 0;
+                        for (auto chunk : attrs.helperChunks)
+                        {
+                            if (chunk.offset != end || chunk.count == 0) return error("invalid helper chunk range");
+                            end += chunk.count;
+                        }
+                        if (!attrs.helperChunks.empty() && end != size)
+                            return error("helper chunks do not cover supernode ops");
+                    }
+                    childKind = CpuPartitionKind::Node;
+                    break;
+                case CpuPartitionKind::EmitFunction:
+                    if (cpu.stage < CpuMappingStage::GeneralFunctions ||
+                        tree.partitions[partition.parent.index - 1].attrs.kind != CpuPartitionKind::Phase)
+                        return error("emit functions require the function-packing stage under a phase branch");
+                    if (phase == CpuPhase::General)
+                    {
+                        if (partition.children.empty())
+                            return error("general emit function requires supernode children");
+                        childKind = CpuPartitionKind::Supernode;
+                    }
+                    else
+                    {
+                        if (!partition.children.empty())
+                            return error("flat emit function must be a leaf");
+                        if (phase == CpuPhase::Event) ++eventFunctions;
+                        else if (phase == CpuPhase::Mem) ++memFunctions;
+                        else if (phase == CpuPhase::Output) ++outputFunctions;
+                    }
+                    break;
+                default: return error("unknown partition kind");
+                }
+                if (!partition.children.empty() && !partition.ops.empty()) return error("non-leaf partition contains ops");
+                if (childKind && !partition.ops.empty()) return error("structural partition must not contain ops");
+                if (!childKind && !partition.children.empty()) return error("leaf partition must not contain children");
+                for (auto it = partition.children.rbegin(); it != partition.children.rend(); ++it)
+                {
+                    const auto child = *it;
+                    if (!validPartition(child) || tree.partitions[child.index - 1].parent != id)
+                        return error("partition parent/child references disagree");
+                    if (childKind && tree.partitions[child.index - 1].attrs.kind != *childKind)
+                        return error("partition child kind disagrees with CPU mapping stage");
+                    stack.push_back({child, phase});
+                }
+                for (auto opId : partition.ops)
+                {
+                    if (opId.generation != 0 || opId.index == 0 || opId.index > model.operations().size() ||
+                        covered[opId.index])
+                        return error("invalid or duplicate op ownership");
+                    covered[opId.index] = true;
+                    const auto &op = model.operations()[opId.index - 1];
+                    if (phase == CpuPhase::None) return error("op outside any phase branch");
+                    const auto required = phase == CpuPhase::Event ? SimPhase::Event :
+                                          phase == CpuPhase::General ? SimPhase::General :
+                                          phase == CpuPhase::Mem ? SimPhase::Mem : SimPhase::Output;
+                    if (op.phase != required) return error("op belongs to the wrong phase branch");
+                    if (phase == CpuPhase::Mem && !memWrite(model.text(op.opType)))
+                        return error("mem branch holds only memory write ops");
+                    (phase == CpuPhase::Event ? eventOps : phase == CpuPhase::General ? generalOps :
+                     phase == CpuPhase::Mem ? memOps : outputOps).push_back(opId);
+                }
+            }
+            if (std::count(visited.begin() + 1, visited.end(), false)) return error("unreachable partitions");
+            for (const auto &op : model.operations())
+                if (op.phase == SimPhase::None)
+                    return error("six-phase mapping requires total phase attribution");
+            if (cpu.stage == CpuMappingStage::SplitPhases)
+            {
+                for (std::size_t i = 1; i < covered.size(); ++i)
+                    if (!covered[i] && model.operations()[i - 1].phase != SimPhase::General)
+                        return error("flat branches do not cover every non-general op");
+            }
+            else if (std::count(covered.begin() + 1, covered.end(), false))
+                return error("partition tree does not cover all ops");
+            if (cpu.stage >= CpuMappingStage::GeneralFunctions &&
+                (eventFunctions != 1 || memFunctions != 1 || outputFunctions != 1))
+                return error("flat branches must each hold exactly one emit function");
+            const auto checkOrder = [&](const std::vector<OpId> &ops, bool detectorsLast,
+                                        const char *message) {
+                std::vector<bool> defined(model.values().size() + 1);
+                bool detectorSeen = false;
+                for (auto opId : ops)
+                {
+                    const auto &op = model.operations()[opId.index - 1];
+                    const bool detector = model.text(op.opType) == "core.event.edgeDet";
+                    if (detectorsLast && detectorSeen && !detector)
+                        return error("event edge detectors must trail the event cone");
+                    detectorSeen = detectorSeen || detector;
+                    for (auto value : model.operands(op))
+                        if (!defined[value.index]) return error(message);
+                    for (auto value : model.results(op)) defined[value.index] = true;
+                }
+                return true;
+            };
+            if (!checkOrder(eventOps, true, "event order uses a value before its definition")) return false;
+            if (!checkOrder(outputOps, false, "output order uses a value before its definition")) return false;
+            if (!checkOrder(generalOps, false, "general order uses a value before its definition")) return false;
+            uint32_t lastMem = 0;
+            for (auto opId : memOps)
+            {
+                if (opId.index <= lastMem) return error("mem write order must follow static op order");
+                lastMem = opId.index;
+            }
+            if (cpu.stage >= CpuMappingStage::GeneralSupernodes)
+            {
+                const auto domainSets = computeCpuEventDomainSets(model);
+                const auto unionInto = [](std::vector<int64_t> &target, const std::vector<int64_t> &source) {
+                    if (source.empty()) return;
+                    const auto middle = target.size();
+                    target.insert(target.end(), source.begin(), source.end());
+                    std::inplace_merge(target.begin(), target.begin() + middle, target.end());
+                    target.erase(std::unique(target.begin(), target.end()), target.end());
+                };
+                for (const auto &partition : tree.partitions)
+                {
+                    if (partition.attrs.kind != CpuPartitionKind::Supernode) continue;
+                    std::vector<int64_t> acts, influence, common;
+                    bool sawEvent = false, uniform = true;
+                    for (auto child : partition.children)
+                        for (auto opId : tree.partitions[child.index - 1].ops)
+                        {
+                            unionInto(influence, domainSets.influence[opId.index]);
+                            if (domainSets.acts[opId.index].empty()) continue;
+                            if (!sawEvent) { common = domainSets.acts[opId.index]; sawEvent = true; }
+                            else if (common != domainSets.acts[opId.index]) uniform = false;
+                            unionInto(acts, domainSets.acts[opId.index]);
+                        }
+                    if (*partition.attrs.eventActs != acts)
+                        return error("general supernode event acts disagree with its ops");
+                    if (sawEvent && (!uniform || influence != acts))
+                        return error("general supernode violates the event domain constraint");
+                }
+            }
+            return true;
+        }
     }
 
     bool verifyCpuMapping(const GrhSimModel &model, const BackendMapping &mapping,
@@ -195,8 +453,10 @@ namespace wolvrix::lib::grhsim
         const auto &cpu = *mapping.cpu;
         if (mapping.complete != (cpu.stage == CpuMappingStage::Schedule))
             return error("CPU mapping completion requires the schedule stage");
-        if (cpu.stage > CpuMappingStage::Schedule)
+        if (cpu.stage > CpuMappingStage::GeneralFunctions)
             return error("unknown CPU mapping stage");
+        if (cpu.stage >= CpuMappingStage::SplitPhases)
+            return verifyCpuPhases(model, cpu, diagnostics);
         const auto &tree = cpu.partitionTree;
         const auto validPartition = [&](PartitionId id) {
             return id.generation == 0 && id.index > 0 && id.index <= tree.partitions.size();

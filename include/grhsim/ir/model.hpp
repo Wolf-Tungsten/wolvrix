@@ -294,11 +294,18 @@ namespace wolvrix::lib::grhsim
         Range steps;
     };
 
-    enum class CpuPhase : uint8_t { None, Compute, Commit };
+    // None/Compute/Commit serve the legacy compute/commit pipeline. The M3
+    // six-phase pipeline (cpu.st.split-phases and followers) appends
+    // Event/General/Mem/Output for its four phase branches; old stages keep
+    // their numeric values.
+    enum class CpuPhase : uint8_t { None, Compute, Commit, Event, General, Mem, Output };
     enum class CpuPartitionKind : uint8_t { Root, Phase, EventDomain, Supernode, Node, ActiveWord, EmitFunction };
     enum class CpuEventSource : uint8_t { Input, Derived };
     enum class CpuEventEdge : uint8_t { Posedge, Negedge };
-    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule };
+    // SplitPhase..Schedule is the legacy pipeline. The M3 six-phase pipeline
+    // appends SplitPhases (four-way split) -> GeneralNodes -> GeneralSupernodes
+    // -> GeneralFunctions; old stages keep their numeric values.
+    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions };
 
     struct CpuEvent
     {
@@ -324,6 +331,11 @@ namespace wolvrix::lib::grhsim
         std::optional<uint32_t> activeWord;
         // Ranges in the supernode's flattened operation order, not model OpIds.
         std::vector<Range> helperChunks;
+        // Optional for old checkpoints. M3 six-phase pipeline: sorted unique
+        // union of the supernode's event_acts cluster indices (engaged, with
+        // an empty array for event-free supernodes, on every General-branch
+        // supernode from the GeneralSupernodes stage on; disengaged elsewhere).
+        std::optional<std::vector<int64_t>> eventActs;
     };
 
     struct CpuPartition

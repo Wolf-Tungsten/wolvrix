@@ -370,3 +370,31 @@ make run_xs_wolf_grhsim_emu XS_GRHSIM_BUILD=build/xs/grhsim \
 - [生成代码回归](../../../tests/grhsim/test_cpu_emit.cpp)
 - [Legacy 活动度调度](../../transform/activity-schedule.md)
 - [Legacy GrhSIM 调度](../../emit/grhsim-scheduling.md)
+
+## 演进（M3）
+
+M3 起新增一套六阶段 CPU mapping 管线，与上文所述旧管线并存（旧管线保持可用，M5
+统一删除旧 pass 并把本文重写为最终序列）。新管线对应 `pdocs/simulation-model-refactor`
+的 P_event/P_general/P_mem/P_output 仿真模型，pass 序列如下：
+
+| 顺序 | pass | stage 前置 → 产出 | 说明文档 |
+| --- | --- | --- | --- |
+| 1 | `cpu.st.split-phases` | （无）→ `SplitPhases` | [split-phases](../passes/split-phases.md) |
+| 2 | `cpu.st.build-general-nodes` | `SplitPhases` → `GeneralNodes` | [build-general-nodes](../passes/build-general-nodes.md) |
+| 3 | `cpu.st.merge-general-supernodes` | `GeneralNodes` → `GeneralSupernodes` | [merge-general-supernodes](../passes/merge-general-supernodes.md) |
+| 4 | `cpu.st.pack-general-functions` | `GeneralSupernodes` → `GeneralFunctions` | [pack-general-functions](../passes/pack-general-functions.md) |
+
+与旧管线的对应关系：`split-phases` 替换 `split-phase`（四分枝 root：Event/General/Mem/
+Output，并完成总相覆盖——全模型不得再有 phase-less op）；`build-general-nodes` 改造
+`build-compute-nodes`（reg/latch write 与 General 相 system.task/dpi.call 作为 node 锚点
+参与锥吸收）；`merge-general-supernodes` 改造 `merge-compute-supernodes`（新增事件域合并
+禁止条件，并为每个 General supernode 记 `eventActs` attr）；`pack-general-functions` 合并
+`pack-active-words`/`pack-emit-functions`（不再产生 ActiveWord 层，Event/Mem/Output 平铺
+分枝各一个 EmitFunction）。
+
+`verifyCpuMapping` 对新 stage 走独立的结构校验：四分枝覆盖全部 op 且不重不漏
+（`SplitPhases` 阶段 General 分枝允许空壳）、各分枝 op 相一致性、Event/Output/General
+序列 use-before-def、Mem 序列 op id 升序、General supernode 的 `eventActs` 与扫 op 重算
+一致且含事件 supernode 满足事件域禁止条件；旧 stage 的校验逻辑不变。六阶段 mapping
+不携带 dataLayout/schedule payload（总相覆盖与 eventActs 校验随新 stage 启用，模型级
+verifyGrhSimModel 的其余 M3 检查留待后续里程碑）。

@@ -741,7 +741,8 @@ namespace wolvrix::lib::grhsim
                     writer.endArray();
                 }
                 writer.endArray();
-                if (partition.attrs.activeId || partition.attrs.activeWord || !partition.attrs.helperChunks.empty())
+                if (partition.attrs.activeId || partition.attrs.activeWord || !partition.attrs.helperChunks.empty() ||
+                    partition.attrs.eventActs)
                 {
                     writer.startArray();
                     writer.startArray();
@@ -754,7 +755,14 @@ namespace wolvrix::lib::grhsim
                         writer.startArray(); writer.value(static_cast<uint64_t>(chunk.offset));
                         writer.value(static_cast<uint64_t>(chunk.count)); writer.endArray();
                     }
-                    writer.endArray(); writer.endArray();
+                    writer.endArray();
+                    if (partition.attrs.eventActs)
+                    {
+                        writer.startArray();
+                        for (const auto act : *partition.attrs.eventActs) writer.value(act);
+                        writer.endArray();
+                    }
+                    writer.endArray();
                 }
                 writer.endArray();
             }
@@ -1000,7 +1008,7 @@ namespace wolvrix::lib::grhsim
         CpuBackendMapping readCpuMapping(StreamReader &reader)
         {
             CpuBackendMapping cpu;
-            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::Schedule);
+            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::GeneralFunctions);
             expectComma(reader); cpu.partitionTree.root = readId<PartitionId>(reader, "partition root");
             expectComma(reader); reader.startArray();
             bool first = true;
@@ -1010,7 +1018,7 @@ namespace wolvrix::lib::grhsim
                 reader.startArray(); partition.id = readId<PartitionId>(reader, "partition ID");
                 expectComma(reader); partition.parent = readId<PartitionId>(reader, "partition parent", true);
                 expectComma(reader); partition.attrs.kind = readCpuEnum(reader, CpuPartitionKind::EmitFunction);
-                expectComma(reader); partition.attrs.phase = readCpuEnum(reader, CpuPhase::Commit);
+                expectComma(reader); partition.attrs.phase = readCpuEnum(reader, CpuPhase::Output);
                 expectComma(reader); partition.children = readIdArray<PartitionId>(reader, "partition child");
                 expectComma(reader); partition.ops = readIdArray<OpId>(reader, "partition op");
                 expectComma(reader); reader.startArray();
@@ -1049,7 +1057,16 @@ namespace wolvrix::lib::grhsim
                         expectComma(reader); const auto count = reader.index("helper count"); reader.endArray();
                         partition.attrs.helperChunks.push_back({offset, count});
                     }
-                    reader.endArray(); reader.endArray();
+                    bool actsTail = false;
+                    if (reader.nextArray(actsTail))
+                    {
+                        std::vector<int64_t> acts;
+                        reader.startArray(); bool actFirst = true;
+                        while (reader.nextArray(actFirst)) acts.push_back(reader.integer());
+                        partition.attrs.eventActs = std::move(acts);
+                        reader.endArray();
+                    }
+                    reader.endArray();
                 }
                 cpu.partitionTree.partitions.push_back(std::move(partition));
             }

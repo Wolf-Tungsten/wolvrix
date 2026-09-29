@@ -12,7 +12,10 @@ namespace wolvrix::lib::grhsim
     class DialectRegistry;
     class GrhSimModel;
 
-    inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v1";
+    // v2 appends the op phase as a ninth operations item and carries the
+    // six-phase model's named store / event bitmap / mem write plan shells as
+    // optional mapping tails; v1 checkpoints are rejected.
+    inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v2";
 
     bool writeGrhSimJson(const GrhSimModel &model,
                          std::ostream &output,

@@ -573,13 +573,36 @@ namespace wolvrix::lib::grhsim
             }
             writer.endArray(); writer.value(layout.objectBytes); writer.value(layout.boundaryBytes);
             writer.value(layout.runtimeBytes);
-            if (layout.helperReadCaches)
+            // Optional trailing fields, positional: helperReadCaches, then
+            // namedStores. A present later field forces the earlier ones to
+            // serialize (possibly as empty arrays).
+            if (layout.helperReadCaches || layout.namedStores)
             {
                 writer.startArray();
-                for (const auto &cache : *layout.helperReadCaches)
+                if (layout.helperReadCaches)
                 {
-                    writer.startArray(); writeId(writer, cache.firstOp);
-                    writeIdArray<ValueId>(writer, cache.values); writer.endArray();
+                    for (const auto &cache : *layout.helperReadCaches)
+                    {
+                        writer.startArray(); writeId(writer, cache.firstOp);
+                        writeIdArray<ValueId>(writer, cache.values); writer.endArray();
+                    }
+                }
+                writer.endArray();
+            }
+            if (layout.namedStores)
+            {
+                writer.startArray();
+                for (const auto &store : *layout.namedStores)
+                {
+                    writer.startArray(); writer.value(toString(store.kind)); writer.startArray();
+                    for (const auto &field : store.fields)
+                    {
+                        writer.startArray(); writeId(writer, field.name); writeId(writer, field.type);
+                        writer.value(field.offset); writeId(writer, field.state);
+                        writeId(writer, field.value); writer.value(static_cast<uint64_t>(field.aux));
+                        writer.endArray();
+                    }
+                    writer.endArray(); writer.value(store.sizeBytes); writer.endArray();
                 }
                 writer.endArray();
             }
@@ -636,19 +659,57 @@ namespace wolvrix::lib::grhsim
             writer.endArray();
             // Optional trailing field: only written when set, so flag-off
             // checkpoints stay byte-compatible with the pre-NO00014 schema.
-            if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion || schedule.foldResidue)
+            const bool eventTail = schedule.eventBitmaps || schedule.memWritePlan;
+            if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion || schedule.foldResidue ||
+                eventTail)
                 writer.value(static_cast<std::uint64_t>(schedule.demonitorRedundant ? 1 : 0));
             // Optional trailing field (NO00015): sorted removal value ids;
             // presence implies the edge-completion post-processing is applied.
             // Written (possibly empty) when NO00016 fold-residue follows so the
             // trailing fields stay positional; an empty array reads back as
             // flag-off (the flag is never set with an empty removal list).
-            if (schedule.demonitorEdgeCompletion || schedule.foldResidue)
+            if (schedule.demonitorEdgeCompletion || schedule.foldResidue || eventTail)
                 writeIdArray<ValueId>(writer, schedule.demonitorEdgeCompletionRemoved);
             // Optional trailing field (NO00016): sorted folded op ids; presence
             // implies the residue-fold post-processing is applied.
-            if (schedule.foldResidue)
+            if (schedule.foldResidue || eventTail)
                 writeIdArray<OpId>(writer, schedule.foldResidueOps);
+            // Optional trailing fields (M1 shells), positional: eventBitmaps,
+            // then memWritePlan; a present memWritePlan forces the bitmaps
+            // array to serialize (possibly empty).
+            if (eventTail)
+            {
+                writer.startArray();
+                if (schedule.eventBitmaps)
+                {
+                    for (const auto &bitmap : *schedule.eventBitmaps)
+                    {
+                        writer.startArray(); writer.value(static_cast<uint64_t>(bitmap.cluster));
+                        writer.startArray();
+                        for (const auto word : bitmap.supernodeWords) writer.value(word);
+                        writer.endArray(); writer.endArray();
+                    }
+                }
+                writer.endArray();
+            }
+            if (schedule.memWritePlan)
+            {
+                writer.startArray();
+                for (const auto &entry : *schedule.memWritePlan)
+                {
+                    writer.startArray(); writeId(writer, entry.writeOp);
+                    writer.value(static_cast<uint64_t>(entry.priority)); writer.value(entry.eventFree);
+                    writer.startArray();
+                    for (const auto &memReader : entry.readers)
+                    {
+                        writer.startArray(); writeId(writer, memReader.owner); writer.startArray();
+                        if (memReader.staticRow) writer.value(*memReader.staticRow);
+                        writer.endArray(); writer.endArray();
+                    }
+                    writer.endArray(); writer.endArray();
+                }
+                writer.endArray();
+            }
             writer.endArray();
         }
 
@@ -782,6 +843,32 @@ namespace wolvrix::lib::grhsim
                     expectComma(reader); auto values = readIdArray<ValueId>(reader, "cached helper value");
                     reader.endArray(); layout.helperReadCaches->push_back({op, std::move(values)});
                 }
+                if (reader.comma())
+                {
+                    layout.namedStores.emplace(); reader.startArray(); first = true;
+                    while (reader.nextArray(first))
+                    {
+                        CpuNamedStore store;
+                        reader.startArray();
+                        const auto kind = parseCpuNamedStoreKind(reader.string());
+                        if (!kind) throw std::runtime_error("unknown CPU named store kind");
+                        store.kind = *kind;
+                        expectComma(reader); reader.startArray(); bool fieldFirst = true;
+                        while (reader.nextArray(fieldFirst))
+                        {
+                            CpuStoreField field;
+                            reader.startArray(); field.name = readId<StringId>(reader, "store field name");
+                            expectComma(reader); field.type = readId<CpuTypeId>(reader, "store field type");
+                            expectComma(reader); field.offset = reader.unsignedInteger();
+                            expectComma(reader); field.state = readId<StateId>(reader, "store field state", true);
+                            expectComma(reader); field.value = readId<ValueId>(reader, "store field value", true);
+                            expectComma(reader); field.aux = reader.index("store field aux", true);
+                            reader.endArray(); store.fields.push_back(field);
+                        }
+                        expectComma(reader); store.sizeBytes = reader.unsignedInteger(); reader.endArray();
+                        layout.namedStores->push_back(std::move(store));
+                    }
+                }
                 reader.endArray();
             }
             else reader.endArray();
@@ -865,6 +952,46 @@ namespace wolvrix::lib::grhsim
             {
                 schedule.foldResidueOps = readIdArray<OpId>(reader, "residue fold ops");
                 schedule.foldResidue = !schedule.foldResidueOps.empty();
+            }
+            if (reader.comma())
+            {
+                schedule.eventBitmaps.emplace(); reader.startArray(); first = true;
+                while (reader.nextArray(first))
+                {
+                    CpuEventBitmap bitmap;
+                    reader.startArray(); bitmap.cluster = reader.index("event bitmap cluster", true);
+                    expectComma(reader); reader.startArray(); bool wordFirst = true;
+                    while (reader.nextArray(wordFirst))
+                        bitmap.supernodeWords.push_back(reader.unsignedInteger());
+                    reader.endArray();
+                    schedule.eventBitmaps->push_back(std::move(bitmap));
+                }
+            }
+            if (reader.comma())
+            {
+                schedule.memWritePlan.emplace(); reader.startArray(); first = true;
+                while (reader.nextArray(first))
+                {
+                    CpuMemWritePlanEntry entry;
+                    reader.startArray(); entry.writeOp = readId<OpId>(reader, "mem write plan op");
+                    expectComma(reader); entry.priority = reader.index("mem write plan priority", true);
+                    expectComma(reader); entry.eventFree = reader.boolean();
+                    expectComma(reader); reader.startArray(); bool readerFirst = true;
+                    while (reader.nextArray(readerFirst))
+                    {
+                        CpuMemReader memReader;
+                        reader.startArray(); memReader.owner = readId<PartitionId>(reader, "mem reader owner");
+                        expectComma(reader); reader.startArray(); bool rowFirst = true;
+                        if (reader.nextArray(rowFirst))
+                        {
+                            memReader.staticRow = reader.unsignedInteger();
+                            reader.endArray();
+                        }
+                        reader.endArray(); entry.readers.push_back(memReader);
+                    }
+                    reader.endArray();
+                    schedule.memWritePlan->push_back(std::move(entry));
+                }
             }
             reader.endArray();
             return schedule;
@@ -1154,7 +1281,7 @@ namespace wolvrix::lib::grhsim
                 writeId(writer, op.name); writeId(writer, op.origin);
                 writeIdArray(writer, model.operands(op)); writeIdArray(writer, model.results(op));
                 writeObjectRefs(writer, model.objectRefs(op)); writeParameterArray(writer, model.parameters(op));
-                writer.endArray();
+                writer.value(toString(op.phase)); writer.endArray();
             }
             writer.endArray();
 
@@ -1375,10 +1502,14 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); auto operands = readIdArray<ValueId>(reader, "operand");
                 expectComma(reader); auto results = readIdArray<ValueId>(reader, "result");
                 expectComma(reader); auto refs = readObjectRefs(reader);
-                expectComma(reader); auto parameters = readParameterArray(reader); reader.endArray();
+                expectComma(reader); auto parameters = readParameterArray(reader);
+                expectComma(reader); const auto phase = parseSimPhase(reader.string());
+                if (!phase) throw std::runtime_error("unknown operation phase");
+                reader.endArray();
                 if (model->addOperation(model->text(opType), operands, results, refs, parameters,
                                         model->text(name), origin) != expected)
                     throw std::runtime_error("operation IDs are not sequential");
+                model->setOperationPhase(expected, *phase);
             }
 
             reader.key("init", false); first = true; reader.startArray();

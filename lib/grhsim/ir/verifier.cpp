@@ -95,6 +95,101 @@ namespace wolvrix::lib::grhsim
             }
             return nullptr;
         }
+
+        // M1 phase attribution framework: validates the phase of ops that carry
+        // one (edgeDet unconditionally). M2/M3 will extend it — the P_general
+        // cone must not reference event operands, copied cones must be
+        // self-contained, and phase coverage becomes total.
+        bool verifyPhaseAttribution(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            bool ok = true;
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                if (!model.strings().valid(op.opType)) continue;
+                const std::string_view name = model.text(op.opType);
+                std::optional<SimPhase> required;
+                bool unconditional = false;
+                if (name == "core.event.edgeDet")
+                {
+                    required = SimPhase::Event;
+                    unconditional = true;
+                }
+                else if (name == "core.output.write") required = SimPhase::Output;
+                else if (name == "core.state.memWrite" || name == "core.state.memFill" ||
+                         name == "core.state.memAssign" || name == "core.state.memWriteSeq")
+                    required = SimPhase::Mem;
+                else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                    required = SimPhase::General;
+                if (!required || (op.phase == SimPhase::None && !unconditional)) continue;
+                if (op.phase != *required)
+                {
+                    diagnostics.error(std::string(name) + " belongs to phase " +
+                                      std::string(toString(*required)) + " but carries phase " +
+                                      std::string(toString(op.phase)),
+                                      "operations[" + std::to_string(i) + "]");
+                    ok = false;
+                }
+            }
+            return ok;
+        }
+
+        // Cross-model edgeDet clustering checks: act/prev are unique indices
+        // into eventActStore/prevEventStore, and (event value, edge) clusters
+        // are deduplicated so every consumer of one cluster shares a detector.
+        bool verifyEdgeDetUniqueness(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            bool ok = true;
+            std::unordered_set<int64_t> acts;
+            std::unordered_set<int64_t> prevs;
+            std::unordered_set<std::string> clusters;
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                if (!model.strings().valid(op.opType) ||
+                    model.text(op.opType) != "core.event.edgeDet") continue;
+                const std::string context = "operations[" + std::to_string(i) + "]";
+                // Malformed signatures are reported by the per-op check; skip.
+                std::span<const ValueId> operands;
+                std::span<const Parameter> parameters;
+                try
+                {
+                    operands = model.operands(op);
+                    parameters = model.parameters(op);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                if (operands.size() != 1) continue;
+                const Parameter *edge = findParameter(model, parameters, "edge");
+                const Parameter *act = findParameter(model, parameters, "act");
+                const Parameter *prev = findParameter(model, parameters, "prev");
+                if (act && std::holds_alternative<int64_t>(act->value) &&
+                    std::get<int64_t>(act->value) >= 0 &&
+                    !acts.insert(std::get<int64_t>(act->value)).second)
+                {
+                    diagnostics.error("core.event.edgeDet act index is not unique", context);
+                    ok = false;
+                }
+                if (prev && std::holds_alternative<int64_t>(prev->value) &&
+                    std::get<int64_t>(prev->value) >= 0 &&
+                    !prevs.insert(std::get<int64_t>(prev->value)).second)
+                {
+                    diagnostics.error("core.event.edgeDet prev index is not unique", context);
+                    ok = false;
+                }
+                if (!edge || !std::holds_alternative<std::string>(edge->value)) continue;
+                const std::string &edgeText = std::get<std::string>(edge->value);
+                if (edgeText != "posedge" && edgeText != "negedge" && edgeText != "both") continue;
+                if (!clusters.insert(std::to_string(operands.front().index) + '\x1f' + edgeText).second)
+                {
+                    diagnostics.error("core.event.edgeDet (event, edge) cluster is duplicated", context);
+                    ok = false;
+                }
+            }
+            return ok;
+        }
     } // namespace
 
     bool verifyGrhSimModel(const GrhSimModel &model,
@@ -499,6 +594,45 @@ namespace wolvrix::lib::grhsim
                     if (!valid) error("core.compute.expr requires one scalar two-state result, scalar two-state leaf operands, a postfix \"tree\" string-array parameter reducing to one value and a \"rk\" string parameter naming the root's original op kind", context());
                 }
 
+                else if (opName == "core.event.edgeDet") {
+                    // P_event edge detector with no data result: executing the op
+                    // compares its prevEventStore slot against the current event
+                    // value, pulses the act bit in eventActStore for the current
+                    // round only, and immediately updates prev. The prev slot
+                    // initializes to prevInit (the event signal's init value), so
+                    // power-up evaluation reports no edge.
+                    bool valid = operands.size() == 1 && results.empty() && refs.empty();
+                    if (valid) {
+                        const ValueId event = operands.front();
+                        if (!validId(event, model.values().size())) valid = false;
+                        else {
+                            const auto typeId = model.values()[event.index - 1].type;
+                            if (!validId(typeId, model.types().size()) ||
+                                model.types()[typeId.index - 1].kind != TypeKind::Logic) valid = false;
+                        }
+                    }
+                    const Parameter *edge = findParameter(model, parameters, "edge");
+                    const Parameter *act = findParameter(model, parameters, "act");
+                    const Parameter *prev = findParameter(model, parameters, "prev");
+                    const Parameter *prevInit = findParameter(model, parameters, "prevInit");
+                    if (parameters.size() != 4 || !edge || !act || !prev || !prevInit) valid = false;
+                    else {
+                        if (!std::holds_alternative<std::string>(edge->value)) valid = false;
+                        else {
+                            const auto &edgeText = std::get<std::string>(edge->value);
+                            if (edgeText != "posedge" && edgeText != "negedge" && edgeText != "both")
+                                valid = false;
+                        }
+                        if (!std::holds_alternative<int64_t>(act->value) ||
+                            std::get<int64_t>(act->value) < 0) valid = false;
+                        if (!std::holds_alternative<int64_t>(prev->value) ||
+                            std::get<int64_t>(prev->value) < 0) valid = false;
+                        if (!std::holds_alternative<std::string>(prevInit->value) ||
+                            std::get<std::string>(prevInit->value).empty()) valid = false;
+                    }
+                    if (!valid) error("core.event.edgeDet requires exactly one logic event operand, no results/object refs and four parameters: edge (posedge|negedge|both string), act/prev (non-negative int64 store indices) and prevInit (non-empty constant literal string)", context());
+                }
+
                 const Parameter *edges = findParameter(model, parameters, "event_edges");
                 if (edges && !std::holds_alternative<std::vector<std::string>>(edges->value))
                     error("event_edges must be a string array", context());
@@ -514,6 +648,9 @@ namespace wolvrix::lib::grhsim
                 error("value must have exactly one producer; observed " +
                       std::to_string(producers[i]), "values[" + std::to_string(i) + "]");
         }
+
+        if (!verifyPhaseAttribution(model, diagnostics)) ok = false;
+        if (!verifyEdgeDetUniqueness(model, diagnostics)) ok = false;
 
         std::vector<uint32_t> initCount(model.states().size(), 0);
         for (std::size_t i = 0; i < model.initRecords().size(); ++i)

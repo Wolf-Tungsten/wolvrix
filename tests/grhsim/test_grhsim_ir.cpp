@@ -138,8 +138,8 @@ namespace
             return fail("grhsim.verify pass failed or reported mutation");
 
         std::filesystem::create_directories(artifactDir);
-        const auto firstPath = artifactDir / "grhsim_v1.json";
-        const auto secondPath = artifactDir / "grhsim_v1_roundtrip.json";
+        const auto firstPath = artifactDir / "grhsim_v2.json";
+        const auto secondPath = artifactDir / "grhsim_v2_roundtrip.json";
         diag::Diagnostics storeDiagnostics;
         if (!grhsim::storeGrhSimModel(*model, firstPath, grhsim::defaultDialectRegistry(),
                                       storeDiagnostics))
@@ -161,15 +161,15 @@ namespace
             return fail("store/load/store did not produce stable bytes");
 
         std::string invalidFormat = readFile(firstPath);
-        const auto formatPos = invalidFormat.find("wolvrix.grhsim.v1");
+        const auto formatPos = invalidFormat.find("wolvrix.grhsim.v2");
         if (formatPos == std::string::npos) return fail("stored format marker is missing");
-        invalidFormat.replace(formatPos, std::string("wolvrix.grhsim.v1").size(), "wolvrix.grhsim.v0");
+        invalidFormat.replace(formatPos, std::string("wolvrix.grhsim.v2").size(), "wolvrix.grhsim.v1");
         const auto invalidFormatPath = artifactDir / "grhsim_invalid_format.json";
         if (!writeFile(invalidFormatPath, invalidFormat)) return fail("failed to write bad format fixture");
         diag::Diagnostics invalidFormatDiagnostics;
         if (grhsim::loadGrhSimModel(invalidFormatPath, grhsim::defaultDialectRegistry(),
                                     invalidFormatDiagnostics) || !invalidFormatDiagnostics.hasError())
-            return fail("loader accepted an unsupported format");
+            return fail("loader accepted a v1-marked checkpoint");
 
         std::string invalidCount = readFile(firstPath);
         const std::string operationCount = "\"operations\":8";
@@ -1006,8 +1006,8 @@ namespace
         if (readFile(firstPath) != readFile(secondPath))
             return fail("declared-symbol store/load/store did not produce stable bytes");
 
-        // (d) A checkpoint without the trailing keys (old format) loads with
-        // empty metadata.
+        // (d) A metadata-free checkpoint serializes without the trailing keys,
+        // and a v1 format marker is rejected: v2 does not accept v1 checkpoints.
         {
             auto legacy = makeDeclaredMetadataDesign();
             diag::Diagnostics legacyDiagnostics;
@@ -1024,13 +1024,15 @@ namespace
                 return fail("legacy-format fixture store failed");
             if (serialized.str().find("\"declaredSymbols\"") != std::string::npos)
                 return fail("metadata-free model should serialize without the trailing keys");
+            std::string v1Marked = serialized.str();
+            const auto markerPos = v1Marked.find("wolvrix.grhsim.v2");
+            if (markerPos == std::string::npos) return fail("stored v2 format marker is missing");
+            v1Marked.replace(markerPos, std::string("wolvrix.grhsim.v2").size(), "wolvrix.grhsim.v1");
+            std::stringstream v1Stream(v1Marked);
             diag::Diagnostics readDiagnostics;
-            auto reloaded = grhsim::readGrhSimJson(serialized, grhsim::defaultDialectRegistry(),
-                                                   readDiagnostics);
-            if (!reloaded || readDiagnostics.hasError())
-                return fail("old-format checkpoint without metadata keys was rejected");
-            if (!reloaded->declaredSymbols().empty() || !reloaded->generateGroups().empty())
-                return fail("old-format checkpoint must load with empty metadata");
+            if (grhsim::readGrhSimJson(v1Stream, grhsim::defaultDialectRegistry(),
+                                       readDiagnostics) || !readDiagnostics.hasError())
+                return fail("v1-marked checkpoint was not rejected");
         }
 
         // (e) clone() preserves both lists.
@@ -1753,6 +1755,289 @@ namespace {
     }
 }
 
+namespace {
+    int runEdgeDetPhaseTest(const std::filesystem::path &artifactDir) {
+        using namespace grhsim;
+        const auto inputBit = [](GrhSimModel &model, const char *name) {
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto port = model.addInput(name, bit);
+            const auto value = model.addValue(bit, name);
+            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
+            return value;
+        };
+        const auto edgeDet = [](GrhSimModel &model, ValueId event, std::string edge,
+                                int64_t act, int64_t prev, SimPhase phase = SimPhase::Event) {
+            const std::array<Parameter, 4> params{Parameter{model.intern("edge"), std::move(edge)},
+                                                  Parameter{model.intern("act"), act},
+                                                  Parameter{model.intern("prev"), prev},
+                                                  Parameter{model.intern("prevInit"), std::string("1'h0")}};
+            const auto op = model.addOperation("core.event.edgeDet", std::array{event}, {}, {}, params);
+            if (phase != SimPhase::None) model.setOperationPhase(op, phase);
+            return op;
+        };
+        const auto verify = [](GrhSimModel &model) {
+            diag::Diagnostics diagnostics;
+            return verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics);
+        };
+        // Positive: deduplicated (event, edge) clusters — two regWrites share
+        // (clk, posedge) while rst carries both edges — plus one op of every
+        // phase-constrained kind; the model verifies and round-trips.
+        {
+            GrhSimModel model("edge_det_phase"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto word = model.logicType(8, false, LogicDomain::TwoState);
+            const auto memType = model.arrayType(bit, 16);
+            const auto clk = inputBit(model, "clk");
+            const auto rst = inputBit(model, "rst");
+            edgeDet(model, clk, "posedge", 0, 0);
+            edgeDet(model, rst, "posedge", 1, 1);
+            edgeDet(model, rst, "negedge", 2, 2);
+            const auto constant = [&](TypeId type, std::string literal) {
+                const auto value = model.addValue(type);
+                const std::array params{Parameter{model.intern("constValue"), std::move(literal)}};
+                model.addOperation("core.compute.constant", {}, std::array{value}, {}, params);
+                return value;
+            };
+            const auto one = constant(bit, "1'h1");
+            const auto next = constant(word, "8'h00");
+            const auto mask = constant(word, "8'hff");
+            const auto row = constant(memType, "16'h0000");
+            const auto state = [&](const char *name, TypeId type) {
+                const auto id = model.addState(name, type);
+                const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+                const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+                model.addInit(id, steps, initParams);
+                return id;
+            };
+            const auto q = state("q", word);
+            const auto lq = state("lq", word);
+            const auto mem = state("mem", memType);
+            const auto memFill = state("mem_fill", memType);
+            const auto memAssign = state("mem_assign", memType);
+            const auto memSeq = state("mem_seq", memType);
+            const auto edges = [&] {
+                return std::array{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+            };
+            model.setOperationPhase(model.addOperation("core.state.regWrite",
+                std::array{one, next, mask, clk}, {}, std::array{ObjectRef::state(q)}, edges()),
+                SimPhase::General);
+            model.setOperationPhase(model.addOperation("core.state.latchWrite",
+                std::array{one, next, mask}, {}, std::array{ObjectRef::state(lq)}), SimPhase::General);
+            model.setOperationPhase(model.addOperation("core.state.memWrite",
+                std::array{one, one, one, one, clk}, {}, std::array{ObjectRef::state(mem)}, edges()),
+                SimPhase::Mem);
+            model.setOperationPhase(model.addOperation("core.state.memFill",
+                std::array{one, one, clk}, {}, std::array{ObjectRef::state(memFill)}, edges()),
+                SimPhase::Mem);
+            model.setOperationPhase(model.addOperation("core.state.memAssign",
+                std::array{one, row, clk}, {}, std::array{ObjectRef::state(memAssign)}, edges()),
+                SimPhase::Mem);
+            model.setOperationPhase(model.addOperation("core.state.memWriteSeq",
+                std::array{one, one, one, clk}, {}, std::array{ObjectRef::state(memSeq)}, edges()),
+                SimPhase::Mem);
+            const auto read = model.addValue(word);
+            model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(q)});
+            const auto out = model.addOutput("o", word);
+            model.setOperationPhase(model.addOperation("core.output.write",
+                std::array{read}, {}, std::array{ObjectRef::output(out)}), SimPhase::Output);
+            if (!verify(model)) return fail("edgeDet/phase fixture was rejected");
+            std::filesystem::create_directories(artifactDir);
+            const auto firstPath = artifactDir / "grhsim_edge_det.json";
+            const auto secondPath = artifactDir / "grhsim_edge_det_roundtrip.json";
+            diag::Diagnostics storeDiagnostics;
+            if (!storeGrhSimModel(model, firstPath, defaultDialectRegistry(), storeDiagnostics))
+                return fail("edgeDet GrhSIM JSON store failed");
+            const auto bytes = readFile(firstPath);
+            if (bytes.find("\"event\"") == std::string::npos ||
+                bytes.find("\"general\"") == std::string::npos ||
+                bytes.find("\"mem\"") == std::string::npos ||
+                bytes.find("\"output\"") == std::string::npos)
+                return fail("serialized operations lost the phase token");
+            diag::Diagnostics loadDiagnostics;
+            auto loaded = loadGrhSimModel(firstPath, defaultDialectRegistry(), loadDiagnostics);
+            if (!loaded || loadDiagnostics.hasError()) return fail("edgeDet GrhSIM JSON load failed");
+            unsigned dets = 0;
+            for (const auto &op : loaded->operations())
+            {
+                if (loaded->text(op.opType) == "core.event.edgeDet") {
+                    ++dets;
+                    if (op.phase != SimPhase::Event) return fail("loaded edgeDet lost its phase");
+                }
+                if (loaded->text(op.opType) == "core.output.write" && op.phase != SimPhase::Output)
+                    return fail("loaded output.write lost its phase");
+            }
+            if (dets != 3) return fail("loaded model lost an edgeDet op");
+            diag::Diagnostics secondStoreDiagnostics;
+            if (!storeGrhSimModel(*loaded, secondPath, defaultDialectRegistry(), secondStoreDiagnostics))
+                return fail("edgeDet round-trip store failed");
+            if (readFile(firstPath) != readFile(secondPath))
+                return fail("edgeDet store/load/store did not produce stable bytes");
+        }
+        // Signature and clustering defects.
+        {
+            GrhSimModel model("edge_det_two_operands"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            const auto rst = inputBit(model, "rst");
+            const std::array<Parameter, 4> params{Parameter{model.intern("edge"), std::string("posedge")},
+                                                  Parameter{model.intern("act"), int64_t{0}},
+                                                  Parameter{model.intern("prev"), int64_t{0}},
+                                                  Parameter{model.intern("prevInit"), std::string("1'h0")}};
+            model.setOperationPhase(model.addOperation("core.event.edgeDet", std::array{clk, rst}, {}, {}, params),
+                                    SimPhase::Event);
+            if (verify(model)) return fail("two-operand edgeDet passed verification");
+        }
+        {
+            GrhSimModel model("edge_det_missing_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            const std::array<Parameter, 3> params{Parameter{model.intern("act"), int64_t{0}},
+                                                  Parameter{model.intern("prev"), int64_t{0}},
+                                                  Parameter{model.intern("prevInit"), std::string("1'h0")}};
+            model.setOperationPhase(model.addOperation("core.event.edgeDet", std::array{clk}, {}, {}, params),
+                                    SimPhase::Event);
+            if (verify(model)) return fail("edgeDet without an edge parameter passed verification");
+        }
+        {
+            GrhSimModel model("edge_det_bad_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            edgeDet(model, clk, "rising", 0, 0);
+            if (verify(model)) return fail("edgeDet with an illegal edge value passed verification");
+        }
+        {
+            GrhSimModel model("edge_det_act_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            const auto rst = inputBit(model, "rst");
+            edgeDet(model, clk, "posedge", 0, 0);
+            edgeDet(model, rst, "posedge", 0, 1);
+            if (verify(model)) return fail("edgeDet with a duplicate act index passed verification");
+        }
+        {
+            GrhSimModel model("edge_det_prev_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            const auto rst = inputBit(model, "rst");
+            edgeDet(model, clk, "posedge", 0, 0);
+            edgeDet(model, rst, "posedge", 1, 0);
+            if (verify(model)) return fail("edgeDet with a duplicate prev index passed verification");
+        }
+        {
+            GrhSimModel model("edge_det_cluster_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            edgeDet(model, clk, "posedge", 0, 0);
+            edgeDet(model, clk, "posedge", 1, 1);
+            if (verify(model)) return fail("edgeDet with a duplicated (event, edge) cluster passed verification");
+        }
+        // Phase attribution defects.
+        {
+            GrhSimModel model("edge_det_phase_none"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            edgeDet(model, clk, "posedge", 0, 0, SimPhase::None);
+            if (verify(model)) return fail("edgeDet without an event phase passed verification");
+        }
+        {
+            GrhSimModel model("edge_det_phase_general"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            edgeDet(model, clk, "posedge", 0, 0, SimPhase::General);
+            if (verify(model)) return fail("edgeDet with a non-event phase passed verification");
+        }
+        {
+            GrhSimModel model("output_write_phase_general"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto clk = inputBit(model, "clk");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto out = model.addOutput("o", bit);
+            model.setOperationPhase(model.addOperation("core.output.write",
+                std::array{clk}, {}, std::array{ObjectRef::output(out)}), SimPhase::General);
+            if (verify(model)) return fail("output.write with a general phase passed verification");
+        }
+        return 0;
+    }
+
+    int runSimRefactorMappingShellTest(const std::filesystem::path &artifactDir) {
+        using namespace grhsim;
+        GrhSimModel model("sim_refactor_shells"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto clkPort = model.addInput("clk", bit);
+        const auto clk = model.addValue(bit, "clk");
+        model.addOperation("core.input.read", {}, std::array{clk}, std::array{ObjectRef::input(clkPort)});
+        const auto constant = [&](TypeId type, std::string literal) {
+            const auto value = model.addValue(type);
+            const std::array params{Parameter{model.intern("constValue"), std::move(literal)}};
+            model.addOperation("core.compute.constant", {}, std::array{value}, {}, params);
+            return value;
+        };
+        const auto one = constant(bit, "1'h1");
+        const auto next = constant(word, "8'h00");
+        const auto mask = constant(word, "8'hff");
+        const auto state = [&](const char *name, TypeId type) {
+            const auto id = model.addState(name, type);
+            const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(id, steps, initParams);
+            return id;
+        };
+        const auto q = state("q", word);
+        const auto history = state("q_clk_history", bit);
+        const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
+        const auto regWrite = model.addOperation("core.state.regWrite",
+            std::array{one, next, mask, clk}, {},
+            std::array{ObjectRef::state(q), ObjectRef::state(history)}, edges);
+        const auto read = model.addValue(word);
+        model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(q)});
+        const auto out = model.addOutput("o", word);
+        model.addOperation("core.output.write", std::array{read}, {}, std::array{ObjectRef::output(out)});
+        PassManager manager(defaultDialectRegistry()); std::string error;
+        for (const char *name : {"cpu.st.split-phase", "cpu.st.form-event-domains",
+                                 "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
+                                 "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
+                                 "cpu.st.layout-data", "cpu.st.build-schedule"})
+            manager.addPass(defaultPassRegistry().create(name, {}, error));
+        diag::Diagnostics diagnostics;
+        if (!manager.run(model, diagnostics).success || diagnostics.hasError())
+            return fail("shell fixture CPU mapping failed");
+        // Fill the M1 shells by hand: one named-store field, one event bitmap
+        // and one mem write plan entry.
+        auto mapping = *model.cpuMapping();
+        CpuNamedStore regStore;
+        regStore.kind = CpuNamedStoreKind::RegLatch;
+        regStore.fields.push_back(CpuStoreField{model.intern("q"), mapping.dataLayout->types.front().id,
+                                                0, q, ValueId{}, 0});
+        regStore.sizeBytes = 8;
+        mapping.dataLayout->namedStores = std::vector<CpuNamedStore>{regStore};
+        mapping.schedule->eventBitmaps = std::vector<CpuEventBitmap>{CpuEventBitmap{0, {0x5}}};
+        CpuMemWritePlanEntry entry;
+        entry.writeOp = regWrite;
+        entry.priority = 1;
+        entry.eventFree = true;
+        entry.readers.push_back(CpuMemReader{mapping.partitionTree.root, uint64_t{7}});
+        entry.readers.push_back(CpuMemReader{mapping.partitionTree.root, std::nullopt});
+        mapping.schedule->memWritePlan = std::vector<CpuMemWritePlanEntry>{entry};
+        model.setCpuMapping(std::move(mapping));
+        if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+            return fail("manually filled M1 shells were rejected");
+        std::filesystem::create_directories(artifactDir);
+        const auto firstPath = artifactDir / "grhsim_sim_refactor_shells.json";
+        const auto secondPath = artifactDir / "grhsim_sim_refactor_shells_roundtrip.json";
+        diag::Diagnostics storeDiagnostics;
+        if (!storeGrhSimModel(model, firstPath, defaultDialectRegistry(), storeDiagnostics))
+            return fail("shell GrhSIM JSON store failed");
+        diag::Diagnostics loadDiagnostics;
+        auto loaded = loadGrhSimModel(firstPath, defaultDialectRegistry(), loadDiagnostics);
+        if (!loaded || loadDiagnostics.hasError()) return fail("shell GrhSIM JSON load failed");
+        const auto *loadedMapping = loaded->cpuMapping();
+        if (!loadedMapping || !loadedMapping->dataLayout || !loadedMapping->schedule)
+            return fail("shell GrhSIM JSON load lost the CPU mapping");
+        if (loadedMapping->dataLayout->namedStores != model.cpuMapping()->dataLayout->namedStores ||
+            loadedMapping->schedule->eventBitmaps != model.cpuMapping()->schedule->eventBitmaps ||
+            loadedMapping->schedule->memWritePlan != model.cpuMapping()->schedule->memWritePlan)
+            return fail("shell fields did not survive the JSON round trip");
+        diag::Diagnostics secondStoreDiagnostics;
+        if (!storeGrhSimModel(*loaded, secondPath, defaultDialectRegistry(), secondStoreDiagnostics))
+            return fail("shell round-trip store failed");
+        if (readFile(firstPath) != readFile(secondPath))
+            return fail("shell store/load/store did not produce stable bytes");
+        return 0;
+    }
+}
+
 #ifndef WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR
 #error "WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR must be defined"
 #endif
@@ -1776,6 +2061,9 @@ int main()
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         if (const int status = runDeclaredSymbolMetadataTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
+            return status;
+        if (const int status = runEdgeDetPhaseTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
+        if (const int status = runSimRefactorMappingShellTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
             return status;
         return runHierarchyRejectionTest();
     }

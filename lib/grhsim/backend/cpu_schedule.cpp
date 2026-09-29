@@ -653,6 +653,10 @@ namespace wolvrix::lib::grhsim
             {
                 schedule.demonitorEdgeCompletionRemoved = mapping.schedule->demonitorEdgeCompletionRemoved;
                 schedule.foldResidueOps = mapping.schedule->foldResidueOps;
+                // M1 shells are opaque to the rebuild until the M4 static-table
+                // passes produce them; replay so checkpoints keep verifying.
+                schedule.eventBitmaps = mapping.schedule->eventBitmaps;
+                schedule.memWritePlan = mapping.schedule->memWritePlan;
             }
             schedule.numaNodes.push_back({0, {{0, {}}}});
             auto &tasks = schedule.numaNodes.front().cores.front().tasks;

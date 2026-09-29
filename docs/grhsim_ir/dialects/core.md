@@ -193,6 +193,60 @@ core op。
 多个 events 中任意一个命中即可触发该 op。历史状态的初始化必须由 `Init` 中对应的
 `InitSpec` 明确给出（见 [2.1](#21-初始化描述-initspec)）。
 
+### 6.1 边沿检测 op `core.event.edgeDet`
+
+`core.event.edgeDet` 是六阶段仿真模型（见 `pdocs/simulation-model-refactor`）中 `P_event`
+阶段的边沿检测原语。它由 lowering pass（`grhsim.lower-edge-detect`）对事件敏感 op 的
+(event, edge) 组合去重聚类后生成；GRH 转换不直接产出该 op。与第 6 节的"历史状态 + 事件
+敏感 op 自判边沿"形态相比，edgeDet 把边沿判定从各消费 op 中剥离出来集中执行，消费 op
+改为读取判定结果。
+
+| op | operands | object refs | parameters | results |
+| --- | --- | --- | --- | --- |
+| `core.event.edgeDet` | `%event`（一个 logic 值） | 无 | `edge`, `act`, `prev`, `prevInit` | 无 |
+
+- `%event` 是事件锥的末端值（P_event 阶段算出的该 event 信号当前值），必须是
+  `core.logic` 类型；edgeDet 不产生任何 data value，也没有 object refs。
+- `edge` 为 string 参数，取值 `posedge`/`negedge`/`both`，编码沿用 `event_edges` 并补
+  `both` 双边沿。
+- `act` 为非负 int64：该聚类在 eventActStore 中的 bit 下标，全模型唯一。
+- `prev` 为非负 int64：该聚类在 prevEventStore 中的历史槽位下标，全模型唯一。同一
+  event 信号可挂多个 edgeDet（例如同一 rst 的不同消费者分别检测上升沿和下降沿），各自
+  独占 prev 槽位、互不干扰。
+- `prevInit` 为 string 参数，书写该 event 信号 init 值的常量字面量（如 `1'h0`），即 prev
+  槽位的初值；上电首个 eval 因此不报边沿。
+
+执行语义：edgeDet 执行即把 prev 槽位与 `%event` 当前值按 `edge` 规则比较，命中则把
+eventActStore 的 `act` bit 写 1——该 bit 是脉冲式的，仅在被检出边沿的当轮有效（每轮
+P_event 覆盖重算，不粘滞）；无论是否命中，prev 都立刻更新为当前值，因此下一轮对同一事件
+看到的是新值-新值，不再重复报边沿。
+
+全模型约束（verifier 强制）：所有 edgeDet 的 `act` 互不相同、`prev` 互不相同，且
+`(%event, edge)` 二元组互不相同（去重聚类的正确性）；edgeDet 的 phase 归属必须为
+`event`。
+
+例：两个 regWrite 共享 `(clk, posedge)` 聚类，另一个 rst 同时有 posedge/negedge 两个
+edgeDet：
+
+```text
+; q1/q2 的 regWrite 都消费 (clk, posedge)，共享一个检测器：
+core.event.edgeDet
+  operands: [%clk_ev]
+  parameters: { edge: posedge, act: 0, prev: 0, prevInit: 1'h0 }
+  results: []
+
+; rst 的上升沿和下降沿各有一个消费者聚类：
+core.event.edgeDet
+  operands: [%rst_ev]
+  parameters: { edge: posedge, act: 1, prev: 1, prevInit: 1'h0 }
+  results: []
+
+core.event.edgeDet
+  operands: [%rst_ev]
+  parameters: { edge: negedge, act: 2, prev: 2, prevInit: 1'h0 }
+  results: []
+```
+
 ## 7. 系统调用与 DPI
 
 系统调用和 DPI 是 GRH 中已有的仿真语义，也由 core 方言直接承接。它们不是 CPU 或其他后端

@@ -367,6 +367,13 @@ namespace wolvrix::lib::grhsim
         return id;
     }
 
+    void GrhSimModel::setOperationPhase(OpId id, SimPhase phase)
+    {
+        if (id.generation != 0 || !id.index || id.index > operations_.size())
+            throw std::out_of_range("setOperationPhase ID is invalid");
+        operations_[id.index - 1].phase = phase;
+    }
+
     void GrhSimModel::addInit(StateId state, std::span<const InitStep> steps,
                               std::span<const Parameter> stepParameters)
     {
@@ -696,6 +703,54 @@ namespace wolvrix::lib::grhsim
         if (text == "input") return DpiDirection::Input;
         if (text == "output") return DpiDirection::Output;
         if (text == "inout") return DpiDirection::Inout;
+        return std::nullopt;
+    }
+
+    std::string_view toString(SimPhase phase) noexcept
+    {
+        switch (phase)
+        {
+        case SimPhase::None: return "none";
+        case SimPhase::Event: return "event";
+        case SimPhase::General: return "general";
+        case SimPhase::Mem: return "mem";
+        case SimPhase::Output: return "output";
+        }
+        return "unknown";
+    }
+
+    std::optional<SimPhase> parseSimPhase(std::string_view text) noexcept
+    {
+        if (text == "none") return SimPhase::None;
+        if (text == "event") return SimPhase::Event;
+        if (text == "general") return SimPhase::General;
+        if (text == "mem") return SimPhase::Mem;
+        if (text == "output") return SimPhase::Output;
+        return std::nullopt;
+    }
+
+    std::string_view toString(CpuNamedStoreKind kind) noexcept
+    {
+        switch (kind)
+        {
+        case CpuNamedStoreKind::RegLatch: return "regLatch";
+        case CpuNamedStoreKind::Mem: return "mem";
+        case CpuNamedStoreKind::Boundary: return "boundary";
+        case CpuNamedStoreKind::PrevEvent: return "prevEvent";
+        case CpuNamedStoreKind::EventAct: return "eventAct";
+        case CpuNamedStoreKind::TimeslotTrigger: return "timeslotTrigger";
+        }
+        return "unknown";
+    }
+
+    std::optional<CpuNamedStoreKind> parseCpuNamedStoreKind(std::string_view text) noexcept
+    {
+        if (text == "regLatch") return CpuNamedStoreKind::RegLatch;
+        if (text == "mem") return CpuNamedStoreKind::Mem;
+        if (text == "boundary") return CpuNamedStoreKind::Boundary;
+        if (text == "prevEvent") return CpuNamedStoreKind::PrevEvent;
+        if (text == "eventAct") return CpuNamedStoreKind::EventAct;
+        if (text == "timeslotTrigger") return CpuNamedStoreKind::TimeslotTrigger;
         return std::nullopt;
     }
 

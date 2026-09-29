@@ -55,6 +55,7 @@ namespace wolvrix::lib::grhsim
         {
             if (!registry.registerOp("core", name, error)) return false;
         }
+        if (!registry.registerOp("core", "core.event.edgeDet", error)) return false;
 
         if (!registry.registerFunctionDecl("core", "core.dpi", error)) return false;
         constexpr std::array<std::string_view, 4> initSteps = {

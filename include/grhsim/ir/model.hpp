@@ -257,6 +257,18 @@ namespace wolvrix::lib::grhsim
         OriginId origin;
     };
 
+    // Six-phase simulation model (P_input/P_event/P_general/P_mem/P_publish/
+    // P_output) op attribution. None means the op is not yet attributed; the
+    // lowering passes assign phases (P_input and P_publish have no ops).
+    enum class SimPhase : uint8_t
+    {
+        None,
+        Event,
+        General,
+        Mem,
+        Output
+    };
+
     struct SimOp
     {
         OpId id;
@@ -267,6 +279,7 @@ namespace wolvrix::lib::grhsim
         Range objectRefs;
         Range parameters;
         OriginId origin;
+        SimPhase phase = SimPhase::None;
     };
 
     struct InitStep
@@ -331,6 +344,7 @@ namespace wolvrix::lib::grhsim
     enum class CpuTypeKind : uint8_t { Bool, UInt, SInt, F32, F64, String, Array };
     enum class CpuStorageKind : uint8_t { Object, PartitionLocal, Boundary };
     enum class CpuRuntimeKind : uint8_t { ActiveWord, DomainArm, EventEdge };
+    enum class CpuNamedStoreKind : uint8_t { RegLatch, Mem, Boundary, PrevEvent, EventAct, TimeslotTrigger };
 
     struct CpuType
     {
@@ -385,6 +399,25 @@ namespace wolvrix::lib::grhsim
         friend bool operator==(const CpuHelperReadCache &, const CpuHelperReadCache &) = default;
     };
 
+    struct CpuStoreField
+    {
+        StringId name; // sanitized, unique across the whole store layout
+        CpuTypeId type;
+        uint64_t offset = 0; // byte offset inside the owning store struct
+        StateId state;       // RegLatch/Mem entries; invalid otherwise
+        ValueId value;       // Boundary/PrevEvent source value; invalid otherwise
+        uint32_t aux = 0;    // (event,edge) cluster index / bit index / pack-word note
+        friend bool operator==(const CpuStoreField &, const CpuStoreField &) = default;
+    };
+
+    struct CpuNamedStore
+    {
+        CpuNamedStoreKind kind = CpuNamedStoreKind::RegLatch;
+        std::vector<CpuStoreField> fields;
+        uint64_t sizeBytes = 0;
+        friend bool operator==(const CpuNamedStore &, const CpuNamedStore &) = default;
+    };
+
     struct CpuDataLayout
     {
         uint32_t pointerBytes = 8;
@@ -400,6 +433,11 @@ namespace wolvrix::lib::grhsim
         // Optional for old checkpoints. Cache stable scalar boundary inputs
         // referenced more than once in the helper beginning at firstOp.
         std::optional<std::vector<CpuHelperReadCache>> helperReadCaches;
+        // Optional for old checkpoints. M1 shell for the six-phase model's
+        // named store layout (regLatchStore/memStore/boundaryValueStore/
+        // prevEventStore/eventActStore/timeslotTriggerFlag); no pass fills it
+        // before the M4 named-store layout rework.
+        std::optional<std::vector<CpuNamedStore>> namedStores;
         friend bool operator==(const CpuDataLayout &, const CpuDataLayout &) = default;
     };
 
@@ -451,6 +489,29 @@ namespace wolvrix::lib::grhsim
         friend bool operator==(const CpuInputShadow &, const CpuInputShadow &) = default;
     };
 
+    struct CpuEventBitmap
+    {
+        uint32_t cluster = 0; // == the edgeDet op's act index
+        std::vector<uint64_t> supernodeWords; // P_general supernode bitmap
+        friend bool operator==(const CpuEventBitmap &, const CpuEventBitmap &) = default;
+    };
+
+    struct CpuMemReader
+    {
+        PartitionId owner;
+        std::optional<uint64_t> staticRow; // engaged => exact static address match
+        friend bool operator==(const CpuMemReader &, const CpuMemReader &) = default;
+    };
+
+    struct CpuMemWritePlanEntry
+    {
+        OpId writeOp;
+        uint32_t priority = 0;
+        bool eventFree = false;
+        std::vector<CpuMemReader> readers;
+        friend bool operator==(const CpuMemWritePlanEntry &, const CpuMemWritePlanEntry &) = default;
+    };
+
     struct CpuSchedulePlan
     {
         std::vector<CpuNumaSchedule> numaNodes;
@@ -487,6 +548,12 @@ namespace wolvrix::lib::grhsim
         // Carried as plan data so verifyCpuSchedule's rebuild replays the plan.
         bool foldResidue = false;
         std::vector<OpId> foldResidueOps;
+        // Optional for old checkpoints. M1 shells for the six-phase model:
+        // (event,edge) cluster -> P_general supernode bitmaps rebuilt by
+        // P_event, and the P_mem write plan (priority order, reader tables,
+        // event-free writes). No pass fills them before M4.
+        std::optional<std::vector<CpuEventBitmap>> eventBitmaps;
+        std::optional<std::vector<CpuMemWritePlanEntry>> memWritePlan;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 
@@ -602,6 +669,8 @@ namespace wolvrix::lib::grhsim
                               std::span<const ValueId> results,
                               std::span<const ObjectRef> objectRefs = {},
                               std::span<const Parameter> parameters = {});
+        // Sets the op's six-phase attribution; revision commits stay with the caller.
+        void setOperationPhase(OpId id, SimPhase phase);
         // Masks include unused slot zero. Removed results must have no retained users.
         // Rebuilds dense IDs/pools and drops mappings; the pass manager commits revision.
         void compact(std::span<const uint8_t> removeOps,
@@ -721,6 +790,10 @@ namespace wolvrix::lib::grhsim
     std::optional<InterfaceDirection> parseInterfaceDirection(std::string_view text) noexcept;
     std::string_view toString(DpiDirection direction) noexcept;
     std::optional<DpiDirection> parseDpiDirection(std::string_view text) noexcept;
+    std::string_view toString(SimPhase phase) noexcept;
+    std::optional<SimPhase> parseSimPhase(std::string_view text) noexcept;
+    std::string_view toString(CpuNamedStoreKind kind) noexcept;
+    std::optional<CpuNamedStoreKind> parseCpuNamedStoreKind(std::string_view text) noexcept;
 
 } // namespace wolvrix::lib::grhsim
 

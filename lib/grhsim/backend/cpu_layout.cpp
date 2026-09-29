@@ -417,11 +417,17 @@ namespace wolvrix::lib::grhsim
         }
         // v1 uses a canonical layout, checking both coverage and every required lifetime boundary.
         const bool readCaches = mapping.dataLayout->helperReadCaches.has_value();
-        if (*mapping.dataLayout == buildLayout(model, mapping.partitionTree, readCaches)) return true;
+        // The M1 named-store shell has no canonical producer until the M4
+        // named-store layout rework; treat it as opaque payload over the rebuild.
+        auto canonical = buildLayout(model, mapping.partitionTree, readCaches);
+        canonical.namedStores = mapping.dataLayout->namedStores;
+        if (*mapping.dataLayout == canonical) return true;
         // Archived checkpoints written before event-gated endpoint boundary
         // inputs were densified keep the legacy canonical form; accept it so
         // re-emit flows can upgrade the mapping by rerunning cpu.st.layout-data.
-        if (*mapping.dataLayout == buildLayout(model, mapping.partitionTree, readCaches, false)) return true;
+        auto legacy = buildLayout(model, mapping.partitionTree, readCaches, false);
+        legacy.namedStores = mapping.dataLayout->namedStores;
+        if (*mapping.dataLayout == legacy) return true;
         diagnostics.error("CPU data layout differs from canonical types, storage or runtime slots", "cpu.layout");
         return false;
     }

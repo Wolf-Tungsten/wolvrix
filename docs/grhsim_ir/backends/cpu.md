@@ -303,7 +303,7 @@ root
 ### 3.2 持久化
 
 CPU mapping 由模型持有，backend 为 `cpu`，schema 为 `cpu.st.v1`。在 streaming
-`wolvrix.grhsim.v1` 的 mapping 行中，第五项为 schema 专属 payload：
+`wolvrix.grhsim.v2` 的 mapping 行中，第五项为 schema 专属 payload：
 
 ```text
 [backend, schema, complete, parameters, [stage, root, partitions, layout?, schedule?]]

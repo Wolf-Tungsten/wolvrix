@@ -104,8 +104,8 @@ namespace
         if (!model || diagnostics.hasError()) return fail("flat GRH lowering failed");
         if (model->inputs().size() != 3 || model->outputs().size() != 1)
             return fail("lowered interface object counts are wrong");
-        if (model->states().size() != 2 || model->initRecords().size() != 2)
-            return fail("register or event-history state was not materialized");
+        if (model->states().size() != 1 || model->initRecords().size() != 1)
+            return fail("register state was not materialized");
         if (model->operations().size() != 8)
             return fail("unexpected lowered operation count");
 
@@ -115,17 +115,22 @@ namespace
             if (model->text(op.opType) != "core.state.regWrite") continue;
             foundRegWrite = true;
             const auto refs = model->objectRefs(op);
-            if (refs.size() != 2 || refs[0].kind != grhsim::ObjectKind::State ||
-                refs[1].kind != grhsim::ObjectKind::State)
-                return fail("register write target/event-history refs are wrong");
+            if (refs.size() != 1 || refs[0].kind != grhsim::ObjectKind::State)
+                return fail("register write target ref is wrong");
             bool foundEdges = false;
             for (const auto &parameter : model->parameters(op))
             {
                 if (model->text(parameter.name) == "event_edges") foundEdges = true;
             }
             if (!foundEdges) return fail("eventEdge was not normalized to event_edges");
+            const auto operands = model->operands(op);
+            if (operands.size() != 4)
+                return fail("register write lost its trailing event operand");
         }
         if (!foundRegWrite) return fail("core.state.regWrite is missing");
+        for (const auto &state : model->states())
+            if (model->text(state.name).starts_with("__event_"))
+                return fail("convert materialized an event-history state");
 
         diag::Diagnostics passDiagnostics;
         std::string passError;
@@ -1472,6 +1477,185 @@ namespace {
                 }
             if (!narrowed) return fail("used-bits concat was not narrowed to 12 bits");
         }
+        // A concat may already truncate its operands. When its result stays
+        // full width, its original high operand must remain available.
+        {
+            GrhSimModel model("used_bits_truncated_concat");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto word = model.logicType(32, false, LogicDomain::TwoState);
+            const auto three = model.logicType(3, false, LogicDomain::TwoState);
+            const auto high = sliceOf(model, inputOf(model, byte), 0, 1);
+            const auto low = inputOf(model, word);
+            const auto joined = model.addValue(three);
+            model.addOperation("core.compute.concat", std::array{high, low}, std::array{joined});
+            outputOf(model, joined, three);
+            const auto result = runPass(model);
+            if (!result.success) return fail("used-bits rejected a truncated concat");
+            bool keptHigh = false, keptConcat = false;
+            for (const auto &op : model.operations())
+            {
+                if (model.text(op.opType) == "core.compute.sliceStatic") keptHigh = true;
+                if (model.text(op.opType) == "core.compute.concat")
+                    keptConcat = model.operands(op).size() == 2;
+            }
+            if (!keptHigh || !keptConcat)
+                return fail("used-bits removed an operand of a surviving truncated concat");
+            if (const auto again = runPass(model); !again.success || again.changed)
+                return fail("used-bits truncated concat is not idempotent");
+        }
+        // Event cone retention: an edgeDet consumes its event value with no
+        // data result; the producer cone must not be swept as dead.
+        {
+            GrhSimModel model("used_bits_event_cone"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto clkPort = model.addInput("clk", bit);
+            const auto clk = model.addValue(bit);
+            model.setOperationPhase(model.addOperation("core.input.read", {}, std::array{clk},
+                                                       std::array{ObjectRef::input(clkPort)}),
+                                    SimPhase::Event);
+            const auto gated = model.addValue(bit);
+            model.setOperationPhase(model.addOperation("core.compute.not", std::array{clk}, std::array{gated}),
+                                    SimPhase::Event);
+            const std::array params{Parameter{model.intern("edge"), std::string("posedge")},
+                                    Parameter{model.intern("act"), int64_t{0}},
+                                    Parameter{model.intern("prev"), int64_t{0}},
+                                    Parameter{model.intern("prevInit"), std::string("1'h0")}};
+            model.setOperationPhase(model.addOperation("core.event.edgeDet", std::array{gated}, {}, {}, params),
+                                    SimPhase::Event);
+            const auto opsBefore = model.operations().size();
+            const auto result = runPass(model);
+            if (!result.success) return fail("used-bits rejected an edgeDet cone");
+            if (model.operations().size() != opsBefore)
+                return fail("used-bits swept the edgeDet event cone");
+            diag::Diagnostics verifyDiagnostics;
+            if (!verifyGrhSimModel(model, defaultDialectRegistry(), verifyDiagnostics))
+                return fail("used-bits broke the edgeDet cone");
+        }
+        // Rebuilt computes and boundary slices stay inside their Event and
+        // Output cones; narrowed register writes keep General-phase adaptors.
+        {
+            GrhSimModel model("used_bits_phase_cones"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto word = model.logicType(16, false, LogicDomain::TwoState);
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto addRead = [&](TypeId type, SimPhase phase) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+                const auto value = model.addValue(type);
+                model.setOperationPhase(model.addOperation("core.input.read", {}, std::array{value},
+                                                       std::array{ObjectRef::input(port)}), phase);
+                return value;
+            };
+            const auto addSlice = [&](ValueId value, uint32_t width, SimPhase phase) {
+                const auto result = model.addValue(model.logicType(width, false, LogicDomain::TwoState));
+                const std::array params{Parameter{model.intern("sliceStart"), int64_t{0}},
+                                        Parameter{model.intern("sliceEnd"), int64_t(width - 1)}};
+                model.setOperationPhase(model.addOperation("core.compute.sliceStatic", std::array{value},
+                                                       std::array{result}, {}, params), phase);
+                return result;
+            };
+            const auto eventInput = addRead(word, SimPhase::Event);
+            const auto eventNot = model.addValue(word);
+            model.setOperationPhase(model.addOperation("core.compute.not", std::array{eventInput},
+                                                   std::array{eventNot}), SimPhase::Event);
+            const auto eventBit = addSlice(eventNot, 1, SimPhase::Event);
+            const std::array edgeParams{Parameter{model.intern("edge"), std::string("posedge")},
+                                        Parameter{model.intern("act"), int64_t{0}},
+                                        Parameter{model.intern("prev"), int64_t{0}},
+                                        Parameter{model.intern("prevInit"), std::string("1'h0")}};
+            model.setOperationPhase(model.addOperation("core.event.edgeDet", std::array{eventBit},
+                                                   {}, {}, edgeParams), SimPhase::Event);
+
+            const auto outputInput = addRead(word, SimPhase::Output);
+            const auto amount = addRead(model.logicType(4, false, LogicDomain::TwoState), SimPhase::Output);
+            const auto shifted = model.addValue(word);
+            model.setOperationPhase(model.addOperation("core.compute.lshr", std::array{outputInput, amount},
+                                                   std::array{shifted}), SimPhase::Output);
+            const auto outputMask = addRead(word, SimPhase::Output);
+            const auto masked = model.addValue(word);
+            model.setOperationPhase(model.addOperation("core.compute.and", std::array{shifted, outputMask},
+                                                   std::array{masked}), SimPhase::Output);
+            const auto outValue = addSlice(masked, 8, SimPhase::Output);
+            const auto outPort = model.addOutput("out", byte);
+            model.setOperationPhase(model.addOperation("core.output.write", std::array{outValue}, {},
+                                                   std::array{ObjectRef::output(outPort)}), SimPhase::Output);
+
+            diag::Diagnostics before;
+            if (!verifyGrhSimModel(model, defaultDialectRegistry(), before))
+                return fail("used-bits phase-cone fixture rejected");
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits failed on phase cones");
+            diag::Diagnostics after;
+            if (!verifyGrhSimModel(model, defaultDialectRegistry(), after))
+                return fail("used-bits crossed the Output phase barrier");
+            std::vector<SimPhase> phases(model.values().size() + 1, SimPhase::None);
+            for (const auto &op : model.operations())
+                for (const auto value : model.results(op)) phases[value.index] = op.phase;
+            bool eventNarrowed = false, outputNarrowed = false, outputBoundary = false;
+            for (const auto &op : model.operations()) {
+                for (const auto value : model.operands(op))
+                    if ((op.phase == SimPhase::Event || op.phase == SimPhase::Output) &&
+                        phases[value.index] != op.phase)
+                        return fail("used-bits created a cross-phase operand");
+                if (model.text(op.opType) == "core.compute.not" && op.phase == SimPhase::Event)
+                    eventNarrowed = widthOf(model, model.results(op)[0]) == 1;
+                if (model.text(op.opType) == "core.compute.and" && op.phase == SimPhase::Output)
+                    outputNarrowed = widthOf(model, model.results(op)[0]) == 8;
+                if (model.text(op.opType) == "core.compute.sliceStatic" && op.phase == SimPhase::Output)
+                    for (const auto operand : model.operands(op))
+                        outputBoundary |= widthOf(model, operand) == 16 &&
+                                          widthOf(model, model.results(op)[0]) == 8;
+            }
+            if (!eventNarrowed || !outputNarrowed || !outputBoundary)
+                return fail("used-bits phase-cone rewrites were not exercised");
+        }
+        {
+            GrhSimModel model("used_bits_phase_state"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto word = model.logicType(16, true, LogicDomain::TwoState);
+            const auto byte = model.logicType(8, true, LogicDomain::TwoState);
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto state = model.addState("q", word);
+            const std::array initParams{Parameter{model.intern("value"), std::string("16'h0")}};
+            const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(state, initSteps, initParams);
+            const auto addGeneralRead = [&](TypeId type) {
+                const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
+                const auto value = model.addValue(type);
+                model.setOperationPhase(model.addOperation("core.input.read", {}, std::array{value},
+                                                       std::array{ObjectRef::input(port)}), SimPhase::General);
+                return value;
+            };
+            const auto enable = addGeneralRead(bit), data = addGeneralRead(word), mask = addGeneralRead(word);
+            model.setOperationPhase(model.addOperation("core.state.regWrite", std::array{enable, data, mask},
+                                                   {}, std::array{ObjectRef::state(state)}), SimPhase::General);
+            const auto read = model.addValue(word);
+            model.setOperationPhase(model.addOperation("core.state.read", {}, std::array{read},
+                                                   std::array{ObjectRef::state(state)}), SimPhase::Output);
+            const auto narrowed = model.addValue(byte);
+            const std::array sliceParams{Parameter{model.intern("sliceStart"), int64_t{0}},
+                                         Parameter{model.intern("sliceEnd"), int64_t{7}}};
+            model.setOperationPhase(model.addOperation("core.compute.sliceStatic", std::array{read},
+                                                   std::array{narrowed}, {}, sliceParams), SimPhase::Output);
+            const auto port = model.addOutput("q_low", byte);
+            model.setOperationPhase(model.addOperation("core.output.write", std::array{narrowed}, {},
+                                                   std::array{ObjectRef::output(port)}), SimPhase::Output);
+            const auto result = runPass(model);
+            if (!result.success || !result.changed) return fail("used-bits failed on phased state narrowing");
+            diag::Diagnostics diagnostics;
+            if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+                return fail("used-bits broke phased state narrowing");
+            bool readOutput = false, writeGeneral = false, generalAdaptor = false;
+            for (const auto &op : model.operations()) {
+                const auto name = model.text(op.opType);
+                if (name == "core.state.read") readOutput |= op.phase == SimPhase::Output;
+                if (name == "core.state.regWrite") writeGeneral |= op.phase == SimPhase::General;
+                if (name == "core.compute.sliceStatic" && op.phase == SimPhase::General &&
+                    widthOf(model, model.results(op)[0]) == 8)
+                    generalAdaptor = true;
+            }
+            if (!readOutput || !writeGeneral || !generalAdaptor)
+                return fail("used-bits lost phases on rebuilt state operations or adaptors");
+        }
         return 0;
     }
 
@@ -1720,19 +1904,6 @@ namespace {
         second.addPass(defaultPassRegistry().create("grhsim.fold-residue", {}, error));
         const auto again = second.run(model, secondDiagnostics);
         if (!again.success || again.changed) return fail("fold-residue is not idempotent");
-        // Emit accepts the fold set (constructor revalidates every folded op).
-        std::filesystem::create_directories(artifactDir);
-        std::filesystem::remove_all(artifactDir / "fold_residue_emit");
-        PassManager emitManager(defaultDialectRegistry());
-        const auto emitDir = (artifactDir / "fold_residue_emit").string();
-        const std::array<std::string_view, 2> emitArgs{"--output", emitDir};
-        emitManager.addPass(defaultPassRegistry().create("cpu.st.emit-cpp", emitArgs, error));
-        diag::Diagnostics emitDiagnostics;
-        if (!emitManager.run(model, emitDiagnostics).success) {
-            for (const auto &message : emitDiagnostics.messages())
-                std::cerr << "[grhsim-ir] emit: " << message.message << '\n';
-            return fail("fold-residue model failed CPU emission");
-        }
         // JSON round-trip stays byte stable with the schedule trailing field.
         const auto foldedPath = artifactDir / "grhsim_fold_residue.json";
         const auto foldedReloadPath = artifactDir / "grhsim_fold_residue_roundtrip.json";
@@ -1751,6 +1922,70 @@ namespace {
             return fail("fold-residue GrhSIM JSON round-trip store failed");
         if (readFile(foldedPath) != readFile(foldedReloadPath))
             return fail("fold-residue store/load/store did not produce stable bytes");
+        return 0;
+    }
+
+    // canonicalize-compute must respect the M1 phase barrier: cone clones and
+    // their unphased twins share structure but serve different phase domains,
+    // so CSE, identity-assign and concat folds must not merge across phases.
+    int runCanonicalizePhaseBarrierTest()
+    {
+        using namespace grhsim;
+        GrhSimModel model("canonicalize_phase_barrier");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto port = model.addInput("a", bit);
+        const auto a = model.addValue(bit);
+        model.addOperation("core.input.read", {}, std::array{a}, std::array{ObjectRef::input(port)});
+        // Unphased twins of the Output-cone ops.
+        const auto oneGeneral = model.addValue(bit);
+        const std::array constParams{Parameter{model.intern("constValue"), std::string("1'h1")}};
+        model.addOperation("core.compute.constant", {}, std::array{oneGeneral}, {}, constParams);
+        const auto notGeneral = model.addValue(bit);
+        model.addOperation("core.compute.not", std::array{a}, std::array{notGeneral});
+        const auto outGeneral = model.addOutput("g", bit);
+        model.addOperation("core.output.write", std::array{notGeneral}, {},
+                           std::array{ObjectRef::output(outGeneral)});
+        // Output cone: cloned input read, a same-literal constant and a not.
+        const auto aOut = model.addValue(bit);
+        model.setOperationPhase(model.addOperation("core.input.read", {}, std::array{aOut},
+                                                   std::array{ObjectRef::input(port)}), SimPhase::Output);
+        const auto oneOut = model.addValue(bit);
+        model.setOperationPhase(model.addOperation("core.compute.constant", {}, std::array{oneOut}, {},
+                                                   constParams), SimPhase::Output);
+        const auto notOut = model.addValue(bit);
+        model.setOperationPhase(model.addOperation("core.compute.not", std::array{aOut},
+                                                   std::array{notOut}), SimPhase::Output);
+        const auto gatedOut = model.addValue(bit);
+        model.setOperationPhase(model.addOperation("core.compute.and", std::array{notOut, oneOut},
+                                                   std::array{gatedOut}), SimPhase::Output);
+        const auto out = model.addOutput("o", bit);
+        model.setOperationPhase(model.addOperation("core.output.write", std::array{gatedOut}, {},
+                                                   std::array{ObjectRef::output(out)}), SimPhase::Output);
+        diag::Diagnostics preDiagnostics;
+        if (!verifyGrhSimModel(model, defaultDialectRegistry(), preDiagnostics))
+            return fail("phase-barrier fixture rejected");
+
+        PassManager manager(defaultDialectRegistry()); std::string error;
+        manager.addPass(defaultPassRegistry().create("grhsim.canonicalize-compute", {}, error));
+        diag::Diagnostics diagnostics;
+        const auto result = manager.run(model, diagnostics);
+        if (!result.success || diagnostics.hasError())
+            return fail("canonicalize-compute failed on the phase-barrier model");
+        if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+            return fail("canonicalize-compute crossed the phase barrier");
+        unsigned constants = 0, outputConstants = 0, nots = 0;
+        for (const auto &op : model.operations())
+        {
+            if (model.text(op.opType) == "core.compute.constant")
+            {
+                ++constants;
+                if (op.phase == SimPhase::Output) ++outputConstants;
+            }
+            if (model.text(op.opType) == "core.compute.not") ++nots;
+        }
+        if (constants != 2 || outputConstants != 1 || nots != 2)
+            return fail("canonicalize-compute merged ops across the phase barrier");
         return 0;
     }
 }
@@ -2062,6 +2297,7 @@ int main()
         if (const int status = runMuxChainFoldTest(); status != 0) return status;
         if (const int status = runFuseExprChainsTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
         if (const int status = runFoldResidueTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
+        if (const int status = runCanonicalizePhaseBarrierTest(); status != 0) return status;
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         if (const int status = runDeclaredSymbolMetadataTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)

@@ -1,5 +1,10 @@
 # GrhSIM CPU 后端
 
+> **状态（M5b）**：本文的 `DataLayout`/`SchedulePlan` 字段细节对应已删除的旧
+> mapping 管线与旧 emit；六阶段管线的 named-stores / phase-schedule 结构以
+> `include/grhsim/backend/cpu.hpp` 与 `ptmp/spec-m5.md` 为准。本文待重写，
+> 重写前仅作为旧设计的历史参考。
+
 本文定义 CPU 后端的映射结构 `CpuBackendMapping`。[GrhSIM IR Overview](../overview.md)
 定义通用模型和后端边界；本文中的三个分量仅属于 CPU 后端，不是其他后端必须采用的结构。
 

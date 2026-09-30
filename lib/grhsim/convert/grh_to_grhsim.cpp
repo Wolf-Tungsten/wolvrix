@@ -618,6 +618,10 @@ namespace wolvrix::lib::grhsim
                                                copyAttribute(entry.value)});
             }
 
+            // Event-sensitive ops carry the raw event annotation for
+            // grhsim.lower-edge-detect: the trailing len(event_edges) operands
+            // are the event values. No __event_* history states are
+            // materialized (removed in M5; the pass derives prevInit itself).
             if (isEventSensitive(op.kind()))
             {
                 const auto edges = attr<std::vector<std::string>>(op, "eventEdge").value_or(
@@ -626,27 +630,6 @@ namespace wolvrix::lib::grhsim
                 {
                     diagnostics.error("event edge count exceeds operation operand count",
                                       std::string(op.symbolText()));
-                }
-                else
-                {
-                    for (std::size_t i = 0; i < edges.size(); ++i)
-                    {
-                        const auto eventValue = operands[operands.size() - edges.size() + i];
-                        const TypeId eventType = model->values()[eventValue.index - 1].type;
-                        const std::string stateName = "__event_" + std::to_string(opId.index) + "_" +
-                                                      std::to_string(i);
-                        const OriginId eventOrigin = makeOrigin(*model, options.keepOrigins,
-                                                                "grh.event", op.symbolText(),
-                                                                opId.index, op.srcLoc());
-                        const StateId history = model->addState(stateName, eventType, eventOrigin);
-                        refs.push_back(ObjectRef::state(history));
-                        std::vector<InitStep> steps;
-                        std::vector<Parameter> initParameters;
-                        appendInitStep(*model, steps, initParameters, "core.init.const",
-                                       {{"value", std::string(options.logicDomain == LogicDomain::TwoState
-                                                                   ? "0" : "x")}});
-                        model->addInit(history, steps, initParameters);
-                    }
                 }
             }
 

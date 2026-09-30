@@ -76,8 +76,7 @@ InitStep =
 core 方言不为缺失的初值指定隐式默认值。`InitSpec` 应用后必须覆盖状态对象的全部内容；GRH 未
 显式给出初值时（如无 `initValue` 的寄存器或锁存器），转换必须按 SV 语义显式补一个全量
 `core.init.const` 步骤（4-state 为全 X）。array 状态的 readmem/fill 步骤只覆盖部分地址时，
-序列必须以这样的全量步骤打底，未覆盖地址按 SV 语义保持全 X。边沿历史状态的初值没有 GRH
-来源，由转换显式选择一个合法值并写入 `InitSpec`。
+序列必须以这样的全量步骤打底，未覆盖地址按 SV 语义保持全 X。
 
 ## 3. Op 命名与公共约定
 
@@ -139,13 +138,13 @@ mux 转为此 op，保留原 producer 求值与依赖。GRH lowering 不直接�
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
 | `core.state.read` | 无 | 一个 `S` 对象 | 无 | 一个与目标状态同类型的值 |
-| `core.state.regWrite` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
+| `core.state.regWrite` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象 | `event_edges` | 无 |
 | `core.state.latchWrite` | `%updateCond, %nextValue, %mask` | 一个 `S` 对象 | 无 | 无 |
 | `core.state.memRead` | `%address` | 一个 `core.array` 类型的 `S` 对象 | 无 | 一个元素类型的值 |
-| `core.state.memWrite` | `%updateCond, %address, %data, %mask, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
-| `core.state.memFill` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
-| `core.state.memAssign` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
-| `core.state.memWriteSeq` | `%updateCond_0, %address_0, %data_0, ..., %updateCond_{N-1}, %address_{N-1}, %data_{N-1}, %events...` | 一个 `core.array` 类型的 `S` 对象及各 event 的历史状态 | `event_edges` | 无 |
+| `core.state.memWrite` | `%updateCond, %address, %data, %mask, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
+| `core.state.memFill` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
+| `core.state.memAssign` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
+| `core.state.memWriteSeq` | `%updateCond_0, %address_0, %data_0, ..., %updateCond_{N-1}, %address_{N-1}, %data_{N-1}, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
 
 `updateCond` 和每个 event 必须是一位 logic。`mask` 与目标状态的 logic 位宽相同；mask 位为
 1 的部分允许更新，其他部分保持原值。
@@ -158,8 +157,10 @@ mux 转为此 op，保留原 producer 求值与依赖。GRH lowering 不直接�
 指定的元素。条件不成立时目标状态保持原值。
 
 `memFill` 在 `%updateCond` 为真且 event 命中时，把 `%data` 广播写入目标状态的全部元素；
-`%data` 必须是元素类型。`memAssign` 在同样条件下把 `%data` 整体赋给目标状态；`%data`
-必须是与目标状态同类型的 `core.array` 值。
+`%data` 通常是元素类型；作为例外，`%data` 可以是 `元素位宽 × 元素个数` 位的打包 logic
+值（packed fill，来自整宽聚合写），此时按行主序切片，第 `i` 个元素取
+`%data[i*元素位宽 +: 元素位宽]`。`memAssign` 在同样条件下把 `%data` 整体赋给目标状态；
+`%data` 必须是与目标状态同类型的 `core.array` 值。
 
 `memWriteSeq` 把对同一 array 状态的一组**有序**条件索引写表达为单个 op。operands 末尾的
 `%events...` 是整个 op 的事件列表，至少一个，不与单个写口关联：任一 event 命中对应边沿即
@@ -176,32 +177,32 @@ GRH/SV 中由 if/else-if 链表达的多端口优先级写：链序对应 operan
 op 的排列顺序不产生覆盖语义。需要有序覆盖的多写口必须收进单个 `memWriteSeq`，由 operand
 顺序表达覆盖关系。
 
-## 6. Event 与边沿历史
+## 6. Event 与边沿标注
 
-`event_edges` 与 event operands 一一对应，每项只能是 `posedge` 或 `negedge`。GRH 转换为每个
-“事件敏感 op + event 位置”创建一个 `S` 对象保存该 event 的上一次取值（称为该 event 的历史
-状态，类型与 event operand 相同），并把它作为同一个 op 的 object ref。事件敏感 op 包括
-register/memory 写口、memory fill/assign、system task 和 DPI call；一个 GRH op 仍只产生一个
-core op。
+`event_edges` 与事件敏感 op 尾部的 event operands 一一对应，每项只能是 `posedge` 或
+`negedge`。事件敏感 op 包括 register/memory 写口、memory fill/assign、system task 和
+DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份原始标注（M5 起不再
+附带每 event 的 `__event_*` 历史状态对象）；边沿判定全部由六阶段 lowering
+（`grhsim.lower-edge-detect`，见 [lower-edge-detect](../passes/lower-edge-detect.md)）
+改写成 `core.event.edgeDet` 后承担。
 
-每次应用 `G` 时，事件敏感 op 都把 event 的当前值写入对应历史状态，不受 `updateCond`
-是否成立影响。边沿由历史状态和当前 event 共同判定：
+边沿定义：
 
 - 对 2-state logic，`posedge` 为 `0 -> 1`，`negedge` 为 `1 -> 0`；
 - 对 4-state logic，边沿集合采用 SystemVerilog 的 `posedge`/`negedge` 规则。
 
-多个 events 中任意一个命中即可触发该 op。历史状态的初始化必须由 `Init` 中对应的
-`InitSpec` 明确给出（见 [2.1](#21-初始化描述-initspec)）。
+多个 events 中任意一个命中即可触发该 op。
 
-> 演进说明（M2）：本节描述的是 GRH 转换直接产出的旧形态。六阶段仿真模型的
-> `grhsim.lower-edge-detect` pass（见 [lower-edge-detect](../passes/lower-edge-detect.md)）
-> 会把它改写为新形态：每个 `(event, edge)` 去重聚类生成一个 6.1 节的
-> `core.event.edgeDet`，事件逻辑锥克隆进 P_event，消费 op 尾部的 event operands 与
-> event-history object refs 摘除、`event_edges` 参数替换为 `event_acts`（int64 数组，
-> 元素为聚类下标、保持原顺序），全部 `__event_*` 历史状态及其 InitRecord 删除。
+> 演进说明（M2/M5）：M2 的 `grhsim.lower-edge-detect` 把事件标注改写为新形态：每个
+> `(event, edge)` 去重聚类生成一个 6.1 节的
+> `core.event.edgeDet`，事件逻辑锥克隆进 P_event，消费 op 尾部的 event operands
+> 摘除、`event_edges` 参数替换为 `event_acts`（int64 数组，
+> 元素为聚类下标、保持原顺序）。
 > `core.system.task` 改写后不再持有 object refs，`core.dpi.call` 只保留首部 Function
 > 引用；`regWrite`/`system.task`/`dpi.call` 的 phase 置为 `general`，四种 mem 写在 M3
 > 归类前保持无 phase。verifier 在模型出现 `event_acts` 后禁止任何 `event_edges` 残留。
+> M5 起 GRH 转换不再产出 `__event_*` 历史状态；lower-edge-detect 会顺带清理
+> M5 前 checkpoint 里残留的此类未引用状态。
 
 ### 6.1 边沿检测 op `core.event.edgeDet`
 
@@ -268,7 +269,7 @@ core.event.edgeDet
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
 | `core.system.function` | `%args...` | 无 | `name`, `has_side_effects`, `proc_kind`, `has_timing` | `%result` |
-| `core.system.task` | `%callCond, %args..., %events...` | 各 event 的历史状态 | `name`, `event_edges`, `proc_kind`, `has_timing` | 无 |
+| `core.system.task` | `%callCond, %args..., %events...` | 无 | `name`, `event_edges`, `proc_kind`, `has_timing` | 无 |
 
 `name` 是不含 `$` 的 SystemVerilog 系统函数或任务名。`has_side_effects` 是必填布尔值；它只用于
 `core.system.function`，明确该函数是否会改变随机数、文件或其他外部状态。`proc_kind` 必须是
@@ -341,10 +342,10 @@ DpiSignature
 
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
-| `core.dpi.call` | `%callCond, %inputArgs..., %inoutArgs..., %events...` | 一个 `F` 对象及各 event 的历史状态 | `event_edges` | `%return?, %outputArgs..., %inoutArgs...` |
+| `core.dpi.call` | `%callCond, %inputArgs..., %inoutArgs..., %events...` | 一个 `F` 对象 | `event_edges` | `%return?, %outputArgs..., %inoutArgs...` |
 
-`core.dpi.call` 的第一个 object ref 是被调用的 `F` 表项（`decl = core.dpi`），其余 object refs
-是各 event 的 event-history。输入和 inout operand 均按 signature 中的声明顺序排列；results
+`core.dpi.call` 的唯一 object ref 是被调用的 `F` 表项（`decl = core.dpi`）。输入和 inout
+operand 均按 signature 中的声明顺序排列；results
 先放可选返回值，再按声明顺序放 output，最后放 inout 的调用后值。参数数量和类型都从目标
 signature 确定，不在 call 中重复保存。最后 `len(event_edges)` 个 operands 是 events，调用条件
 和边沿判定方式与 system task 相同。
@@ -403,7 +404,7 @@ GRH port 的目标 symbol 转换为目标 StateId，operands 保持原顺序，`
 `kRegister` 的 `initValue` 转换为一个 `core.init.const` 步骤，`"$random"` 转换为
 `core.init.random`；缺省时按 SV 语义补全 X 的 const 步骤。`kMemory` 的 `initKind` 数组逐项
 转换为 `core.init.readmem`/`core.init.fill` 步骤，保持原顺序；部分覆盖时在序列开头补全 X 的
-const 步骤。除 event-history 状态对象外，转换不得为了实现端口或调用语义增加新的 op。
+const 步骤。转换不得为了实现端口或调用语义增加新的 op。
 
 ## 9. 写口转换示例
 
@@ -419,13 +420,14 @@ kRegisterWritePort @q
 
 ```text
 core.state.regWrite
-  object_refs: [@S.q, @S.q_event0]
+  object_refs: [@S.q]
   operands: [%enable, %d, %mask, %clk]
   event_edges: [posedge]
 ```
 
-`@S.q_event0` 是新增的 event-history 状态。写口的 enable、data、mask、event 和 edge 均直接
-保留，没有拆成其他图顶点。
+写口的 enable、data、mask、event 和 edge 均直接
+保留，没有拆成其他图顶点；object refs 只有目标状态（M5 起不再附带每 event 的
+`__event_*` 历史状态）。
 
 ## 10. 验证
 
@@ -433,9 +435,8 @@ Core 模型必须满足：
 
 - `memRead`/`memWrite`/`memFill`/`memAssign`/`memWriteSeq` 的目标是 `core.array` 类型的状态；
 - read result、data、mask 和目标状态的类型及位宽匹配；
-- 历史状态的类型与对应 event operand 的类型一致；
-- mem 地址落在目标状态的元素个数范围内；`memFill` 的 `%data` 为元素类型，`memAssign` 的
-  `%data` 与目标状态同类型；
+- mem 地址落在目标状态的元素个数范围内；`memFill` 的 `%data` 为元素类型或整宽打包值
+  （见第 5 节），`memAssign` 的 `%data` 与目标状态同类型；
 - `memWriteSeq` 的 operands 数量减去 event 数后必须能被 3 整除；
 - 同一 array 状态的多个写 op 不会在同一次 `G` 应用中写入同一 bit；
 - system function 有且只有一个 result，system task 的条件、参数和 event 分段合法；
@@ -443,7 +444,7 @@ Core 模型必须满足：
   的方向、顺序和类型一致；
 - 每个 `S` 对象的 `InitSpec` 非空，步骤种类与目标状态的类型匹配（readmem/fill 仅用于
   array 状态），范围和值类型合法，且应用后完整覆盖目标状态的全部内容；
-- 所有事件敏感 op 的 events、`event_edges` 和历史状态数量及类型一致；
+- 所有事件敏感 op 的 events 与 `event_edges` 数量一致、类型为一位 logic；
 - 一个 GRH storage port、system call 或 DPI call 只对应一个 core op。
 
 ## 11. 参考

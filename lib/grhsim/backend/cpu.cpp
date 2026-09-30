@@ -1,5 +1,5 @@
 #include "grhsim/backend/cpu.hpp"
-#include "grhsim/backend/cpu_emit.hpp"
+#include "grhsim/backend/cpu_phase_emit.hpp"
 
 #include "grhsim/pass/pass.hpp"
 
@@ -422,12 +422,20 @@ namespace wolvrix::lib::grhsim
                 {
                     if (partition.attrs.kind != CpuPartitionKind::Supernode) continue;
                     std::vector<int64_t> acts, influence, common;
-                    bool sawEvent = false, uniform = true;
+                    bool sawEvent = false, uniform = true, unboundFree = false;
                     for (auto child : partition.children)
                         for (auto opId : tree.partitions[child.index - 1].ops)
                         {
                             unionInto(influence, domainSets.influence[opId.index]);
-                            if (domainSets.acts[opId.index].empty()) continue;
+                            if (domainSets.acts[opId.index].empty())
+                            {
+                                // An op with no event obligation anywhere (no
+                                // acts, empty downstream closure) is data-driven
+                                // and must not share a supernode with event
+                                // ops — the domain gate would suppress it.
+                                unboundFree = unboundFree || domainSets.influence[opId.index].empty();
+                                continue;
+                            }
                             if (!sawEvent) { common = domainSets.acts[opId.index]; sawEvent = true; }
                             else if (common != domainSets.acts[opId.index]) uniform = false;
                             unionInto(acts, domainSets.acts[opId.index]);
@@ -436,6 +444,8 @@ namespace wolvrix::lib::grhsim
                         return error("general supernode event acts disagree with its ops");
                     if (sawEvent && (!uniform || influence != acts))
                         return error("general supernode violates the event domain constraint");
+                    if (sawEvent && unboundFree)
+                        return error("general supernode mixes event ops with event-free data-driven ops");
                 }
             }
             if (cpu.stage >= CpuMappingStage::LayoutNamedStores)
@@ -636,7 +646,7 @@ namespace wolvrix::lib::grhsim
         registerCpuPartitionPasses(registry);
         registerCpuLayoutPasses(registry);
         registerCpuSchedulePasses(registry);
-        registerCpuEmitPasses(registry);
+        registerCpuPhaseEmitPasses(registry);
         std::string error;
         if (!registry.registerPass("cpu.st.split-phase", PassKind::BackendMapping,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {

@@ -30,7 +30,8 @@ namespace wolvrix::lib::grhsim
                 name == "core.dpi.call" || name == "core.state.memWrite" ||
                 name == "core.state.memFill" || name == "core.state.memWriteSeq" ||
                 name == "core.state.memAssign" || name == "core.state.memRead" ||
-                name == "core.system.function") return UseRule::sinkFull;
+                name == "core.system.function" ||
+                name == "core.event.edgeDet") return UseRule::sinkFull;
             if (name == "core.input.read") return UseRule::inputRead;
             if (name == "core.state.read") return UseRule::stateRead;
             if (name == "core.state.regWrite" || name == "core.state.latchWrite") return UseRule::stateWrite;
@@ -252,6 +253,14 @@ namespace wolvrix::lib::grhsim
                         }
                         case UseRule::concat:
                         {
+                            // A fully used result leaves the original concat intact, even
+                            // when its operands are wider than the result. Keep every
+                            // producer that the surviving op still references.
+                            if (k == widthValue[results[0].index])
+                            {
+                                for (auto value : operands) raiseValue(value, widthValue[value.index]);
+                                break;
+                            }
                             uint32_t offset = 0;
                             for (auto it = operands.rbegin(); it != operands.rend(); ++it)
                             {
@@ -378,6 +387,21 @@ namespace wolvrix::lib::grhsim
                 };
                 const std::size_t originalOps = model.operations().size();
                 const std::size_t originalStates = model.states().size();
+                std::vector<SimPhase> valuePhase(model.values().size() + 1, SimPhase::None);
+                for (const auto &op : model.operations())
+                    for (const auto result : model.results(op)) valuePhase[result.index] = op.phase;
+                const auto addPhasedOperation = [&](SimPhase phase, std::string_view opType,
+                                                    std::span<const ValueId> operands,
+                                                    std::span<const ValueId> results,
+                                                    std::span<const ObjectRef> refs = {},
+                                                    std::span<const Parameter> params = {},
+                                                    std::string_view name = {}, OriginId origin = {}) {
+                    const OpId id = model.addOperation(opType, operands, results, refs, params, name, origin);
+                    model.setOperationPhase(id, phase);
+                    valuePhase.resize(model.values().size() + 1, SimPhase::None);
+                    for (const auto result : results) valuePhase[result.index] = phase;
+                    return id;
+                };
                 UsedBitsStats stats;
                 for (const auto &value : model.values())
                 {
@@ -449,6 +473,8 @@ namespace wolvrix::lib::grhsim
                     const auto narrowed = model.addValue(narrowType, {}, model.values()[result.index - 1].origin);
                     replacement[result.index] = narrowed;
                     rewire[result.index] = narrowed;
+                    valuePhase.resize(model.values().size() + 1, SimPhase::None);
+                    valuePhase[narrowed.index] = op.phase;
                 }
 
                 // Boundary slices for non-rebuildable narrowings; reuse existing
@@ -464,6 +490,7 @@ namespace wolvrix::lib::grhsim
                     const auto *start = findParameter(model, model.parameters(op), "sliceStart");
                     if (!start || std::get<int64_t>(start->value) != 0) continue;
                     if (actions[op.id.index] != static_cast<uint8_t>(Action::none)) continue;
+                    if (op.phase != valuePhase[operands[0].index]) continue;
                     // A reused slice must survive: dead (used == 0) slices are
                     // removed by the dead sweep and cannot serve as replacements.
                     if (analysis.used[results[0].index] != valueWidth(results[0])) continue;
@@ -487,8 +514,8 @@ namespace wolvrix::lib::grhsim
                     const auto sliced = model.addValue(sliceType, {}, model.values()[result.index - 1].origin);
                     const std::array params{Parameter{model.intern("sliceStart"), int64_t(0)},
                                             Parameter{model.intern("sliceEnd"), int64_t(used - 1)}};
-                    model.addOperation("core.compute.sliceStatic", std::array{result}, std::array{sliced},
-                                       {}, params);
+                    addPhasedOperation(valuePhase[result.index], "core.compute.sliceStatic",
+                                       std::array{result}, std::array{sliced}, {}, params);
                     rewire[result.index] = sliced;
                     ++stats.boundarySlices;
                 }
@@ -509,7 +536,8 @@ namespace wolvrix::lib::grhsim
                     {
                         const auto converted = model.addValue(
                             model.logicType(targetWidth, targetSigned, LogicDomain::TwoState));
-                        model.addOperation("core.compute.assign", std::array{value}, std::array{converted});
+                        addPhasedOperation(valuePhase[value.index], "core.compute.assign",
+                                           std::array{value}, std::array{converted});
                         ++stats.adaptSlices;
                         return converted;
                     }
@@ -519,8 +547,8 @@ namespace wolvrix::lib::grhsim
                     const auto sliced = model.addValue(sliceType);
                     const std::array params{Parameter{model.intern("sliceStart"), int64_t(0)},
                                             Parameter{model.intern("sliceEnd"), int64_t(targetWidth - 1)}};
-                    model.addOperation("core.compute.sliceStatic", std::array{value}, std::array{sliced},
-                                       {}, params);
+                    addPhasedOperation(valuePhase[value.index], "core.compute.sliceStatic",
+                                       std::array{value}, std::array{sliced}, {}, params);
                     ++stats.adaptSlices;
                     return sliced;
                 };
@@ -569,7 +597,7 @@ namespace wolvrix::lib::grhsim
                         const ValueId result = model.results(op)[0];
                         if (analysis.used[result.index] == 0) continue; // dead sweep removes it
                         const auto read = model.addValue(newType, {}, model.values()[result.index - 1].origin);
-                        model.addOperation("core.state.read", {}, std::array{read},
+                        addPhasedOperation(op.phase, "core.state.read", {}, std::array{read},
                                            std::array{ObjectRef::state(newState)}, {},
                                            model.text(op.name), op.origin);
                         rewire[result.index] = read;
@@ -603,7 +631,7 @@ namespace wolvrix::lib::grhsim
                         std::vector<ObjectRef> newRefs{ObjectRef::state(newState)};
                         for (std::size_t r = 1; r < refs.size(); ++r) newRefs.push_back(refs[r]);
                         const std::vector<Parameter> params(model.parameters(op).begin(), model.parameters(op).end());
-                        model.addOperation(model.text(op.opType), operands, {}, newRefs, params,
+                        addPhasedOperation(op.phase, model.text(op.opType), operands, {}, newRefs, params,
                                            model.text(op.name), op.origin);
                         removeOps[opIndex] = 1;
                         ++stats.rebuiltWrites;
@@ -633,13 +661,13 @@ namespace wolvrix::lib::grhsim
                     if (kind == "constant")
                     {
                         const std::vector<Parameter> params(model.parameters(op).begin(), model.parameters(op).end());
-                        model.addOperation("core.compute.constant", {}, std::array{narrowedResult}, {}, params,
+                        addPhasedOperation(op.phase, "core.compute.constant", {}, std::array{narrowedResult}, {}, params,
                                            model.text(op.name), op.origin);
                     }
                     else if (kind == "assign" || kind == "not")
                     {
                         const ValueId operand = adaptOrFail(operands[0], true);
-                        if (ok) model.addOperation(model.text(op.opType), std::array{operand},
+                        if (ok) addPhasedOperation(op.phase, model.text(op.opType), std::array{operand},
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                     }
                     else if (kind == "and" || kind == "or" || kind == "xor" || kind == "xnor" ||
@@ -647,20 +675,20 @@ namespace wolvrix::lib::grhsim
                     {
                         const ValueId lhs = adaptOrFail(operands[0], true);
                         const ValueId rhs = adaptOrFail(operands[1], true);
-                        if (ok) model.addOperation(model.text(op.opType), std::array{lhs, rhs},
+                        if (ok) addPhasedOperation(op.phase, model.text(op.opType), std::array{lhs, rhs},
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                     }
                     else if (kind == "shl")
                     {
                         const ValueId data = adaptOrFail(operands[0], true);
-                        if (ok) model.addOperation("core.compute.shl", std::array{data, finalOf(operands[1])},
+                        if (ok) addPhasedOperation(op.phase, "core.compute.shl", std::array{data, finalOf(operands[1])},
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                     }
                     else if (kind == "mux")
                     {
                         const ValueId onTrue = adaptOrFail(operands[1], true);
                         const ValueId onFalse = adaptOrFail(operands[2], true);
-                        if (ok) model.addOperation("core.compute.mux",
+                        if (ok) addPhasedOperation(op.phase, "core.compute.mux",
                                                    std::array{finalOf(operands[0]), onTrue, onFalse},
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                     }
@@ -669,7 +697,7 @@ namespace wolvrix::lib::grhsim
                         const ValueId select = adaptOrFail(operands[0], false);
                         const ValueId onOne = adaptOrFail(operands[1], false);
                         const ValueId onZero = adaptOrFail(operands[2], false);
-                        if (ok) model.addOperation("core.compute.bitSelect", std::array{select, onOne, onZero},
+                        if (ok) addPhasedOperation(op.phase, "core.compute.bitSelect", std::array{select, onOne, onZero},
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                     }
                     else if (kind == "prioritySelect")
@@ -682,7 +710,7 @@ namespace wolvrix::lib::grhsim
                             const ValueId arm = adaptOrFail(operands[a], true);
                             if (ok) args.push_back(arm);
                         }
-                        if (ok) model.addOperation("core.compute.prioritySelect", args,
+                        if (ok) addPhasedOperation(op.phase, "core.compute.prioritySelect", args,
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                     }
                     else if (kind == "concat")
@@ -703,8 +731,8 @@ namespace wolvrix::lib::grhsim
                                     const auto sliced = model.addValue(sliceType);
                                     const std::array sliceParams{Parameter{model.intern("sliceStart"), int64_t(0)},
                                                                  Parameter{model.intern("sliceEnd"), int64_t(need - 1)}};
-                                    model.addOperation("core.compute.sliceStatic", std::array{part},
-                                                       std::array{sliced}, {}, sliceParams);
+                                    addPhasedOperation(valuePhase[part.index], "core.compute.sliceStatic",
+                                                       std::array{part}, std::array{sliced}, {}, sliceParams);
                                     ++stats.adaptSlices;
                                     part = sliced;
                                 }
@@ -717,18 +745,18 @@ namespace wolvrix::lib::grhsim
                         if (ok)
                         {
                             if (msbFirst.size() == 1 && valueWidth(msbFirst[0]) == used)
-                                model.addOperation("core.compute.assign", std::array{msbFirst[0]},
+                                addPhasedOperation(op.phase, "core.compute.assign", std::array{msbFirst[0]},
                                                    std::array{narrowedResult}, {}, {}, model.text(op.name), op.origin);
                             else if (msbFirst.size() == 1)
                             {
                                 const std::array sliceParams{Parameter{model.intern("sliceStart"), int64_t(0)},
                                                              Parameter{model.intern("sliceEnd"), int64_t(used - 1)}};
-                                model.addOperation("core.compute.sliceStatic", std::array{msbFirst[0]},
+                                addPhasedOperation(op.phase, "core.compute.sliceStatic", std::array{msbFirst[0]},
                                                    std::array{narrowedResult}, {}, sliceParams,
                                                    model.text(op.name), op.origin);
                             }
                             else
-                                model.addOperation("core.compute.concat", msbFirst, std::array{narrowedResult},
+                                addPhasedOperation(op.phase, "core.compute.concat", msbFirst, std::array{narrowedResult},
                                                    {}, {}, model.text(op.name), op.origin);
                         }
                     }
@@ -739,7 +767,7 @@ namespace wolvrix::lib::grhsim
                         {
                             const std::array sliceParams{Parameter{model.intern("sliceStart"), int64_t(0)},
                                                          Parameter{model.intern("sliceEnd"), int64_t(used - 1)}};
-                            model.addOperation("core.compute.sliceStatic", std::array{finalOf(operands[0])},
+                            addPhasedOperation(op.phase, "core.compute.sliceStatic", std::array{finalOf(operands[0])},
                                                std::array{narrowedResult}, {}, sliceParams,
                                                model.text(op.name), op.origin);
                         }
@@ -747,7 +775,7 @@ namespace wolvrix::lib::grhsim
                         {
                             const std::array repParams{Parameter{model.intern("rep"),
                                                                  int64_t(used / sourceWidth)}};
-                            model.addOperation("core.compute.replicate", std::array{finalOf(operands[0])},
+                            addPhasedOperation(op.phase, "core.compute.replicate", std::array{finalOf(operands[0])},
                                                std::array{narrowedResult}, {}, repParams,
                                                model.text(op.name), op.origin);
                         }
@@ -760,7 +788,7 @@ namespace wolvrix::lib::grhsim
                         const std::array sliceParams{Parameter{model.intern("sliceStart"), startBit},
                                                      Parameter{model.intern("sliceEnd"),
                                                                startBit + int64_t(used) - 1}};
-                        model.addOperation("core.compute.sliceStatic", std::array{finalOf(operands[0])},
+                        addPhasedOperation(op.phase, "core.compute.sliceStatic", std::array{finalOf(operands[0])},
                                            std::array{narrowedResult}, {}, sliceParams,
                                            model.text(op.name), op.origin);
                     }
@@ -776,7 +804,7 @@ namespace wolvrix::lib::grhsim
                         // a boundary slice on the original full-width result.
                         const std::array params{Parameter{model.intern("sliceStart"), int64_t(0)},
                                                 Parameter{model.intern("sliceEnd"), int64_t(used - 1)}};
-                        model.addOperation("core.compute.sliceStatic", std::array{result},
+                        addPhasedOperation(op.phase, "core.compute.sliceStatic", std::array{result},
                                            std::array{replacement[result.index]}, {}, params);
                         ++stats.boundarySlices;
                     }
@@ -851,8 +879,8 @@ namespace wolvrix::lib::grhsim
                         }
                     }
                 }
-                // States left unreferenced by surviving ops (incl. orphaned event
-                // histories) are unobservable; remove logic two-state ones.
+                // States left unreferenced by surviving ops are unobservable;
+                // remove logic two-state ones.
                 std::vector<uint8_t> referenced(originalStates + 1, 0);
                 for (std::size_t i = 0; i < model.operations().size(); ++i)
                 {

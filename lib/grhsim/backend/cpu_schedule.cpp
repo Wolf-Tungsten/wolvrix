@@ -339,7 +339,8 @@ namespace wolvrix::lib::grhsim
         // is the greatest fixpoint over the profitable set.
         // A completion edge is only as good as the runtime row that carries
         // it: emit aliases eligible core.state.read results onto their state
-        // slot (planReadAliases, cpu_emit.cpp), so such a value's schedule row
+        // slot (planReadAliases, legacy cpu_emit.cpp, removed in M5b), so such
+        // a value's schedule row
         // is dead code and an added activate target would never fire; and a
         // core.dpi.call result's row is live but the vchg profile has no
         // counters at the DPI publish site, so its ch is pricing-blind. Both
@@ -397,7 +398,8 @@ namespace wolvrix::lib::grhsim
                     if (model.text(op.opType) == "core.dpi.call")
                         for (const auto result : model.results(op)) dpiProduced[result.index] = 1;
                 }
-                // Mirror of emit planReadAliases (cpu_emit.cpp): a core.state.read
+                // Mirror of emit planReadAliases (legacy cpu_emit.cpp, removed
+                // in M5b): a core.state.read
                 // result inside a compute unit whose state is quiescence-projected,
                 // which no non-compute op or event gate reads, and whose type
                 // matches the state is emitted as a direct alias of the state
@@ -810,7 +812,9 @@ namespace wolvrix::lib::grhsim
         // cpu.st.build-mem-write-plan: Mem-phase write ops in op-id order
         // (per-mem priority = ascending op id, preserving source order);
         // readers are the target mem's General-phase memReads with their
-        // owning supernode (staticRow engaged when the address is a constant);
+        // owning supernode (staticRow engaged when the address is a constant),
+        // plus the General-phase whole-array state.reads of the target (no
+        // address operand: always dynamic readers, activated on any write);
         // eventFree marks writes without event_acts.
         std::vector<CpuMemWritePlanEntry> buildSixPhaseMemWritePlan(const GrhSimModel &model,
                                                                     const CpuPartitionTree &tree)
@@ -821,10 +825,16 @@ namespace wolvrix::lib::grhsim
             for (const auto &op : model.operations())
             {
                 for (const auto value : model.results(op)) producer[value.index] = op.id;
-                if (op.phase != SimPhase::General || model.text(op.opType) != "core.state.memRead")
-                    continue;
+                if (op.phase != SimPhase::General) continue;
+                const auto opName = model.text(op.opType);
+                // memReads carry an address (staticRow when constant);
+                // whole-array state.reads of the target are always dynamic
+                // readers (any write may change any row).
+                if (opName != "core.state.memRead" && opName != "core.state.read") continue;
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
+                const auto &state = model.states()[refs.front().index - 1];
+                if (model.types()[state.type.index - 1].kind != TypeKind::Array) continue;
                 readersByState[refs.front().index].push_back(op.id);
             }
             std::vector<uint32_t> perMem(model.states().size() + 1, 0);
@@ -843,16 +853,19 @@ namespace wolvrix::lib::grhsim
                     CpuMemReader memReader;
                     memReader.owner = supernodeOf[readerId.index];
                     const auto &reader = model.operations()[readerId.index - 1];
-                    const auto addr = model.operands(reader).front();
-                    const auto source = producer[addr.index];
-                    if (source && model.text(model.operations()[source.index - 1].opType) ==
-                                      "core.compute.constant")
+                    if (model.text(reader.opType) == "core.state.memRead")
                     {
-                        const Parameter *literal = findCpuPhaseParameter(
-                            model, model.parameters(model.operations()[source.index - 1]), "constValue");
-                        if (const auto *text = literal ? std::get_if<std::string>(&literal->value)
-                                                       : nullptr)
-                            memReader.staticRow = parseCpuConstLiteral(*text);
+                        const auto addr = model.operands(reader).front();
+                        const auto source = producer[addr.index];
+                        if (source && model.text(model.operations()[source.index - 1].opType) ==
+                                          "core.compute.constant")
+                        {
+                            const Parameter *literal = findCpuPhaseParameter(
+                                model, model.parameters(model.operations()[source.index - 1]), "constValue");
+                            if (const auto *text = literal ? std::get_if<std::string>(&literal->value)
+                                                           : nullptr)
+                                memReader.staticRow = parseCpuConstLiteral(*text);
+                        }
                     }
                     entry.readers.push_back(memReader);
                 }

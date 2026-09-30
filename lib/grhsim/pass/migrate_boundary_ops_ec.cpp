@@ -56,7 +56,8 @@ namespace wolvrix::lib::grhsim {
         // row is missing while the tree-derived full row is non-empty.
         //
         // New-edge sources must carry a runtime-live row: an emit-aliased
-        // core.state.read result has a dead row (planReadAliases, cpu_emit.cpp)
+        // core.state.read result has a dead row (planReadAliases, legacy
+        // cpu_emit.cpp, removed in M5b)
         // and a core.dpi.call result is change-blind in the vchg profile
         // (unpriceable widen); both are rejected (NO00015 rules, mirrored).
         constexpr int64_t kMigrateEcSaveX4 = 16; // (K_DETECT + K_STORE) * 4
@@ -192,7 +193,8 @@ namespace wolvrix::lib::grhsim {
                         if (!constantValue(operand.index)) closure[operand.index] = 1;
                 }
 
-                // Emit read-alias mirror (cpu_emit.cpp planReadAliases, same as
+                // Emit read-alias mirror (legacy cpu_emit.cpp planReadAliases,
+                // removed in M5b; same as
                 // EdgeCompletionView in cpu_schedule.cpp): an aliased state
                 // read result has a dead schedule row; DPI results are blind
                 // in the vchg profile. Both are rejected as new-edge sources.

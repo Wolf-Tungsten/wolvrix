@@ -257,11 +257,12 @@ namespace wolvrix::lib::grhsim
             const std::vector<OpId> *producers_;
         };
 
-        // grhsim.lower-edge-detect: lowers the legacy event_edges + per-op
-        // __event_* history-state form into the six-phase P_event form — one
-        // deduplicated core.event.edgeDet per (event, edge) cluster plus an
-        // Event-phase clone of the event cone — and rewires every consumer to
-        // the cluster indices (event_acts parameter).
+        // grhsim.lower-edge-detect: lowers the raw event annotation form
+        // (event_edges parameter + trailing event operands, as produced by
+        // GRH lowering) into the six-phase P_event form — one deduplicated
+        // core.event.edgeDet per (event, edge) cluster plus an Event-phase
+        // clone of the event cone — and rewires every consumer to the cluster
+        // indices (event_acts parameter). Object refs carry no event slots.
         class LowerEdgeDetectPass final : public Pass
         {
         public:
@@ -293,11 +294,9 @@ namespace wolvrix::lib::grhsim
                         malformed = true;
                         continue;
                     }
-                    if (list->size() > model.operands(op).size() ||
-                        list->size() > model.objectRefs(op).size())
+                    if (list->size() > model.operands(op).size())
                     {
-                        diagnostics.error("event_edges count exceeds the op's operand or "
-                                          "object-ref count",
+                        diagnostics.error("event_edges count exceeds the op's operand count",
                                           context);
                         malformed = true;
                         continue;
@@ -411,7 +410,8 @@ namespace wolvrix::lib::grhsim
                     model.setOperationPhase(det, SimPhase::Event);
                 }
 
-                // Rewire the consumers to the cluster form.
+                // Rewire the consumers to the cluster form: drop the trailing
+                // event operands; object refs carry no event slots and stay.
                 for (const auto &consumer : consumers)
                 {
                     const auto op = model.operations()[consumer.id.index - 1];
@@ -420,7 +420,7 @@ namespace wolvrix::lib::grhsim
                     const auto params = model.parameters(op);
                     const std::size_t count = consumer.edges.size();
                     std::vector<ValueId> newOperands(operands.begin(), operands.end() - count);
-                    std::vector<ObjectRef> newRefs(refs.begin(), refs.end() - count);
+                    std::vector<ObjectRef> newRefs(refs.begin(), refs.end());
                     std::vector<Parameter> newParams;
                     newParams.reserve(params.size() + 1);
                     for (const auto &parameter : params)
@@ -447,8 +447,9 @@ namespace wolvrix::lib::grhsim
                                                                           : SimPhase::General);
                 }
 
-                // Drop every now-unreferenced __event_* history state (compact
-                // rebuilds the InitRecords) and sweep the dead original cone.
+                // Sweep any unreferenced __event_* history state left by a
+                // pre-M5 checkpoint (compact rebuilds the InitRecords), then
+                // sweep the dead original cone.
                 std::vector<uint8_t> referencedStates(model.states().size() + 1, 0);
                 for (const auto &op : model.operations())
                     for (const auto ref : model.objectRefs(op))

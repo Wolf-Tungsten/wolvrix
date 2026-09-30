@@ -2,7 +2,9 @@
 #include "grhsim/ir/model.hpp"
 #include "slang/numeric/SVInt.h"
 
+#include <map>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 
 namespace wolvrix::lib::grhsim
@@ -152,7 +154,7 @@ namespace wolvrix::lib::grhsim
             for (const auto &state : model.states()) canonical[state.id.index] = state.id;
             std::vector<uint8_t> removeOps(model.operations().size() + 1), removeStates(references.size());
             std::unordered_map<std::string, StateId> groups;
-            std::size_t shared = 0, histories = 0;
+            std::size_t shared = 0;
             for (const auto &op : model.operations())
             {
                 const auto name = model.text(op.opType);
@@ -162,30 +164,28 @@ namespace wolvrix::lib::grhsim
                 const auto &type = model.types()[model.states()[state.index - 1].type.index - 1];
                 if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
                     writers[state.index] != 1 || references[state.index] != allowed[state.index] || initial[state.index].empty()) continue;
-                std::string key = std::to_string(op.opType.index) + ':' + initial[state.index] + ':';
+                // The writer's phase belongs to the key: stores written in
+                // different phases (e.g. a General regWrite vs an Output
+                // __tslot_prev write-back) live in different named stores and
+                // must not coalesce.
+                std::string key = std::to_string(static_cast<unsigned>(op.phase)) + ':' +
+                    std::to_string(op.opType.index) + ':' + initial[state.index] + ':';
                 for (auto operand : model.operands(op)) key += std::to_string(operand.index) + ',';
                 key += ';';
                 if (!parameterKey(model.parameters(op), key)) continue;
-                bool privateHistory = true;
-                for (auto ref : refs.subspan(1))
-                {
-                    if (ref.kind != ObjectKind::State || references[ref.index] != 1 || initial[ref.index].empty())
-                    { privateHistory = false; break; }
-                    key += '/' + initial[ref.index];
-                }
-                if (!privateHistory) continue;
                 const auto [entry, inserted] = groups.emplace(std::move(key), state);
                 if (inserted) continue;
                 canonical[state.index] = entry->second;
                 sharedTargets[entry->second.index] = 1;
                 removeStates[state.index] = removeOps[op.id.index] = 1;
                 ++shared;
-                for (auto ref : refs.subspan(1)) { removeStates[ref.index] = 1; ++histories; }
             }
             if (!shared) return false;
             std::vector<ValueId> values(model.values().size() + 1);
             for (const auto &value : model.values()) values[value.id.index] = value.id;
-            std::unordered_map<uint64_t, ValueId> reads;
+            // Read sharing likewise stays inside one phase: the Event/Output
+            // cone clones of a read must not merge with the original.
+            std::map<std::tuple<uint32_t, uint32_t, unsigned>, ValueId> reads;
             std::size_t sharedReads = 0;
             for (const auto &op : model.operations())
             {
@@ -195,7 +195,7 @@ namespace wolvrix::lib::grhsim
                 const auto state = canonical[model.objectRefs(op)[0].index];
                 if (!sharedTargets[state.index]) continue;
                 const auto type = model.values()[result.index - 1].type;
-                const uint64_t key = (uint64_t(state.index) << 32) | type.index;
+                const std::tuple key{state.index, type.index, static_cast<unsigned>(op.phase)};
                 const auto [entry, inserted] = reads.emplace(key, result);
                 if (inserted) continue;
                 values[result.index] = entry->second;
@@ -223,7 +223,7 @@ namespace wolvrix::lib::grhsim
             }
             model.compact(removeOps, removeStates);
             diagnostics.info("equivalent_states_removed=" + std::to_string(shared) +
-                " private_histories_removed=" + std::to_string(histories) + " state_reads_shared=" + std::to_string(sharedReads),
+                " state_reads_shared=" + std::to_string(sharedReads),
                 "grhsim.canonicalize-compute");
             return true;
         }
@@ -249,6 +249,22 @@ namespace wolvrix::lib::grhsim
             PassResult canonicalize(GrhSimModel &model, diag::Diagnostics &diagnostics)
             {
                 std::vector<ValueId> sources(model.values().size() + 1), canonical(sources.size());
+                std::vector<uint32_t> producer(sources.size());
+                for (const auto &op : model.operations())
+                    for (auto value : model.results(op)) producer[value.index] = op.id.index;
+                const auto phaseOf = [&](ValueId value) {
+                    const auto opIndex = producer[value.index];
+                    return opIndex ? model.operations()[opIndex - 1].phase : SimPhase::None;
+                };
+                // The M1+ cones are sealed by phase: an Event/Output consumer may
+                // only read same-phase values, and General-side consumers never
+                // read cone values. Every substitution below must keep that
+                // barrier or the verifier rejects the rewritten model.
+                const auto phaseCompatible = [](SimPhase consumer, SimPhase source) {
+                    if (consumer == SimPhase::Event) return source == SimPhase::Event;
+                    if (consumer == SimPhase::Output) return source == SimPhase::Output;
+                    return source != SimPhase::Event && source != SimPhase::Output;
+                };
                 for (const auto &op : model.operations())
                 {
                     const auto operands = model.operands(op), results = model.results(op);
@@ -257,7 +273,8 @@ namespace wolvrix::lib::grhsim
                     const auto typeId = model.values()[results[0].index - 1].type;
                     const auto &type = model.types()[typeId.index - 1];
                     if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
-                        typeId == model.values()[operands[0].index - 1].type)
+                        typeId == model.values()[operands[0].index - 1].type &&
+                        phaseCompatible(op.phase, phaseOf(operands[0])))
                         sources[results[0].index] = operands[0];
                 }
                 // Resolve chains independent of operation order. A chain reaching
@@ -296,10 +313,8 @@ namespace wolvrix::lib::grhsim
                         ++count;
                     }
                 }
-                std::vector<uint32_t> producer(sources.size()), pending(removed.size());
+                std::vector<uint32_t> pending(removed.size());
                 std::vector<std::vector<uint32_t>> users(removed.size());
-                for (const auto &op : model.operations())
-                    for (auto value : model.results(op)) producer[value.index] = op.id.index;
                 const auto root = [&](ValueId value) {
                     auto current = value;
                     while (canonical[current.index] != current) current = canonical[current.index];
@@ -363,14 +378,15 @@ namespace wolvrix::lib::grhsim
                         high >= static_cast<int64_t>(sourceType.width) ||
                         high - low + 1 != static_cast<int64_t>(resultType.width)) continue;
                     if (low == 0 && high + 1 == static_cast<int64_t>(sourceType.width) &&
-                        model.values()[source.index - 1].type == resultTypeId)
+                        model.values()[source.index - 1].type == resultTypeId &&
+                        phaseCompatible(op.phase, phaseOf(source)))
                     {
                         canonical[results[0].index] = source;
                         removed[op.id.index] = 1;
                         ++concatIdentity;
                         continue;
                     }
-                    if (resultType.isSigned) continue;
+                    if (resultType.isSigned || !phaseCompatible(op.phase, phaseOf(source))) continue;
                     const std::vector<ValueId> foldOperands{source};
                     const std::vector<ValueId> foldResults(results.begin(), results.end());
                     const std::array foldParams{Parameter{model.intern("sliceStart"), low},
@@ -408,7 +424,8 @@ namespace wolvrix::lib::grhsim
                         if (pure)
                         {
                             constants[results[0].index] = scalarConstant(model, op);
-                            if (const auto replacement = simplify(model, op, operands, constants))
+                            if (const auto replacement = simplify(model, op, operands, constants);
+                                replacement && phaseCompatible(op.phase, phaseOf(replacement)))
                             {
                                 canonical[results[0].index] = replacement;
                                 removed[op.id.index] = 1;
@@ -420,7 +437,11 @@ namespace wolvrix::lib::grhsim
                             model.values()[operands[0].index - 1].type == model.values()[operands[1].index - 1].type &&
                             operands[1].index < operands[0].index)
                             std::swap(operands[0], operands[1]);
-                        std::string key = std::to_string(op.opType.index) + ":" + std::to_string(type.index) + ":";
+                        // The phase seals the CSE domain: structurally identical
+                        // cone clones (e.g. an Output-phase constant and its
+                        // General-side twin) must not merge across the barrier.
+                        std::string key = std::to_string(op.opType.index) + ":" +
+                            std::to_string(static_cast<unsigned>(op.phase)) + ":" + std::to_string(type.index) + ":";
                         for (auto operand : operands) key += std::to_string(operand.index) + ',';
                         key += ';';
                         for (const auto &parameter : model.parameters(op))

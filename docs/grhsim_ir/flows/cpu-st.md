@@ -1,5 +1,12 @@
 # CPU 单线程活动度仿真 Flow
 
+> **状态（M5b）**：本文描述的旧 mapping 管线（`cpu.st.split-phase` → … →
+> `cpu.st.build-schedule`）与旧 emit 实现已在 M5b 删除；生产管线是
+> `scripts/wolvrix_xs_grhsim_ir.py` 的 12-pass 六阶段序列
+> （`grhsim.classify-event-inputs` → … → `cpu.st.build-phase-schedule` →
+> `cpu.st.emit-cpp`，见 `ptmp/spec-m5.md` §5）。本文待按六阶段模型重写，
+> 重写前仅作为旧设计的历史参考。
+
 本文规定 `cpu.st.*` 的端到端流程：从已验证的 `GrhSimModel` 构建 CPU mapping，生成
 C++ 模型，再验证多时钟行为与运行性能。`st` 表示单线程，不表示单时钟。
 

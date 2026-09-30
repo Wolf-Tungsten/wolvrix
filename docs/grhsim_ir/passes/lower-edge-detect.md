@@ -1,12 +1,15 @@
 # Edge-detect lowering into P_event
 
 `grhsim.lower-edge-detect` is the second M2 lowering pass of the six-phase
-simulation model (`pdocs/simulation-model-refactor`). It migrates the legacy
-event form — `event_edges` parameters plus per-op `__event_*` history states —
-into the P_event form: one deduplicated `core.event.edgeDet` per
-`(event, edge)` cluster, an Event-phase clone of the event logic cone, and
-`event_acts` cluster indices on the consumers. Run
-`grhsim.classify-event-inputs` first so pure event inputs are already marked.
+simulation model (`pdocs/simulation-model-refactor`). It migrates the raw
+event annotation form — an `event_edges` string-array parameter whose entries
+match the consumer's trailing event operands one to one — into the P_event
+form: one deduplicated `core.event.edgeDet` per `(event, edge)` cluster, an
+Event-phase clone of the event logic cone, and `event_acts` cluster indices
+on the consumers. Run `grhsim.classify-event-inputs` first so pure event
+inputs are already marked. (Pre-M5 GRH lowering also attached one `__event_*`
+history state per event slot as a trailing object ref; that is gone — refs
+carry no event slots.)
 
 The pass has nine steps, in order:
 
@@ -15,8 +18,7 @@ The pass has nine steps, in order:
    `core.state.memAssign`, `core.state.memWriteSeq`, `core.system.task`,
    `core.dpi.call`; `latchWrite` has no events). Anything else carrying the
    parameter, a non-string-array value, an edge outside
-   `posedge`/`negedge`/`both`, or more edges than operands/object refs fails
-   the pass.
+   `posedge`/`negedge`/`both`, or more edges than operands fails the pass.
 2. Deduplicate `(event value, edge)` pairs into clusters. Ops are scanned in
    ascending id and event slots in operand order; first appearance assigns the
    cluster index, which is both the `act` bit index and the `prev` slot index.
@@ -41,19 +43,19 @@ The pass has nine steps, in order:
    arithmetic, unknown ops) falls back to a same-width zero literal and is
    counted in `prev_init_fallbacks`. Literals render in the `init.const`
    `constValue` style (`1'h0`, `8'h00`).
-6. Rewire each consumer: drop the trailing event operands and the trailing
-   history object refs (`core.system.task` keeps no refs, `core.dpi.call`
-   keeps the leading Function ref, state writes keep the target state), delete
+6. Rewire each consumer: drop the trailing event operands (object refs carry
+   no event slots: `core.system.task` has no refs, `core.dpi.call` keeps the
+   leading Function ref, state writes keep the target state), delete
    the `event_edges` parameter and append `event_acts` (int64 array of cluster
    indices in the original event order). `regWrite`, `system.task` and
    `dpi.call` get phase `general`; the four mem writes stay phase-less (`None`)
    until M3 split-phases attributes them to P_mem.
-7. Delete every now-unreferenced `__event_*` history state together with its
-   InitRecord, and sweep the dead original cone ops to a fixed point
-   (`sweepDeadConeOps`): only `core.compute.*` and the read-only roots
-   `input.read`/`state.read`/`memRead` with no remaining users are removed —
-   dual-use logic whose results still feed live consumers stays put. One
-   `model.compact` rebuilds dense ids.
+7. Sweep any unreferenced `__event_*` history state left over from a pre-M5
+   checkpoint together with its InitRecord, and sweep the dead original cone
+   ops to a fixed point (`sweepDeadConeOps`): only `core.compute.*` and the
+   read-only roots `input.read`/`state.read`/`memRead` with no remaining users
+   are removed — dual-use logic whose results still feed live consumers stays
+   put. One `model.compact` rebuilds dense ids.
 8. The verifier's M2 checks hold on the result: no `event_edges` survives,
    `event_acts` entries resolve into the edgeDet act set, consumers carry
    their event-free shapes, the P_event cone is self-contained, and
@@ -68,7 +70,7 @@ op1 core.input.read -> %clk                 (pure event input)
 op2 core.input.read -> %d
 op4 core.compute.constant -> %one (1'b1)
 op5 core.state.regWrite operands=[%one, %d, %one, %clk]
-    object_refs=[@q, @__event_5_0]  parameters={ event_edges: [posedge] }
+    object_refs=[@q]  parameters={ event_edges: [posedge] }
 ```
 
 becomes
@@ -79,7 +81,7 @@ op7  core.event.edgeDet operands=[%clk.ev]  phase=event
      parameters={ edge: posedge, act: 0, prev: 0, prevInit: 1'h0 }
 op5  core.state.regWrite operands=[%one, %d, %one]  phase=general
      object_refs=[@q]  parameters={ event_acts: [0] }
-; @__event_5_0 and its InitRecord are deleted; op1 is swept.
+; op1 is swept.
 ```
 
 Two consumers of the same `(clk, posedge)` share one detector; one `rst`
@@ -88,6 +90,7 @@ value with independent `act`/`prev` slots. The pass is idempotent: with no
 `event_edges` left, a second run reports all-zero counts and no change.
 
 The pass is a `SemanticTransform`; the pass manager invalidates existing
-backend mappings and increments the semantic revision. GRH lowering keeps
-emitting the legacy history states until M5 (they are this pass's input, and
-they keep the old backend usable as a safety net in the meantime).
+backend mappings and increments the semantic revision. GRH lowering emits the
+raw annotation form directly (the per-op `__event_*` history states were
+removed in M5; only pre-M5 JSON checkpoints still carry them, and the pass
+sweeps any that survive unreferenced).

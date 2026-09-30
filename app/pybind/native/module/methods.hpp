@@ -30,7 +30,6 @@ namespace wolvrix::app::pybind
 
     PyObject *py_session_store_json(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_emit_sv(PyObject *self, PyObject *args, PyObject *kwargs);
-    PyObject *py_session_emit_grhsim_cpp(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_emit_verilator_repcut_package(PyObject *self, PyObject *args, PyObject *kwargs);
 
     PyObject *py_list_passes(PyObject *self, PyObject *args);

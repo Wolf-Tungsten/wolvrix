@@ -23,6 +23,17 @@ treats it as always active.
 ascending): `eventBitmaps[c] = { sn : c ∈ S(sn) }`, with `supernodeWords`
 holding ⌈N/64⌉ words and bit i encoding ordinal i.
 
+The bitmaps drive P_event's per-round rebuild of `eventActiveFlag`. The
+P_general firing gate is narrower than the bitmap: a supernode is
+event-gated only when it *contains* an event-carrying op (`event_acts`
+non-empty); such supernodes satisfy S(sn)==K (the merge rules), so the bitmap
+sets their flag exactly on a domain edge. Supernodes covered only through
+downstream influence (write-operand producers, level-sensitive readers) are
+not event-gated: their firing is data-driven and idempotent, and P_mem's
+reader re-activation (`dataActiveFlagNext`) must be able to fire them within
+the same eval. S(sn)=∅ supernodes appear in no bitmap and fire purely on
+`dataActiveFlag` as before.
+
 The verifier recomputes the bitmaps from the model and partition tree and
 requires an exact match, and the bitmap count to equal the edge detector
 count.

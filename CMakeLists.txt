@@ -110,7 +110,6 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/load.cpp
     lib/core/emit.cpp
     lib/core/toposort.cpp
-    lib/emit/grhsim_cpp.cpp
     lib/emit/grhsim_runtime.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
@@ -146,9 +145,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/backend/cpu_partition.cpp
     lib/grhsim/backend/cpu_layout.cpp
     lib/grhsim/backend/cpu_schedule.cpp
-    lib/grhsim/backend/cpu_emit.cpp
-    lib/grhsim/backend/cpu_block_share.cpp
-    lib/grhsim/backend/cpu_shape_share.cpp
+    lib/grhsim/backend/cpu_phase_emit.cpp
     lib/grhsim/convert/grh_to_grhsim.cpp
     lib/grhsim/io/json.cpp
     lib/transform/activity_schedule.cpp
@@ -395,15 +392,14 @@ add_executable(grhsim-cpu-schedule-tests tests/grhsim/test_cpu_schedule.cpp test
 target_link_libraries(grhsim-cpu-schedule-tests PRIVATE wolvrix-lib)
 register_test_exe(grhsim-cpu-schedule-tests)
 find_program(WOLVRIX_TEST_VERILATOR verilator)
-add_executable(grhsim-cpu-emit-tests tests/grhsim/test_cpu_emit.cpp)
-target_link_libraries(grhsim-cpu-emit-tests PRIVATE wolvrix-lib)
-target_compile_definitions(grhsim-cpu-emit-tests PRIVATE
+add_executable(grhsim-cpu-phase-emit-tests tests/grhsim/test_cpu_phase_emit.cpp)
+target_link_libraries(grhsim-cpu-phase-emit-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-cpu-phase-emit-tests PRIVATE
     WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
     WOLVRIX_GRHSIM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/grhsim/data"
-    WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}"
-    WOLVRIX_TEST_VERILATOR="${WOLVRIX_TEST_VERILATOR}")
-register_test_exe(grhsim-cpu-emit-tests)
-set_tests_properties(grhsim-cpu-emit-tests PROPERTIES SKIP_RETURN_CODE 77)
+    WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}")
+register_test_exe(grhsim-cpu-phase-emit-tests)
+set_tests_properties(grhsim-cpu-phase-emit-tests PROPERTIES SKIP_RETURN_CODE 77)
 
 # core: toposort
 add_executable(core-toposort
@@ -513,38 +509,6 @@ target_compile_definitions(emit-sv-top-reachable
 )
 
 register_test_exe(emit-sv-top-reachable)
-
-add_executable(emit-grhsim-cpp
-    tests/emit/test_emit_grhsim_cpp.cpp
-)
-
-target_link_libraries(emit-grhsim-cpp
-    PRIVATE
-        wolvrix-lib
-)
-
-target_compile_definitions(emit-grhsim-cpp
-    PRIVATE
-        WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
-)
-
-register_test_exe(emit-grhsim-cpp)
-
-add_executable(emit-grhsim-cpp-memory-fill
-    tests/emit/test_emit_grhsim_cpp_memory_fill.cpp
-)
-
-target_link_libraries(emit-grhsim-cpp-memory-fill
-    PRIVATE
-        wolvrix-lib
-)
-
-target_compile_definitions(emit-grhsim-cpp-memory-fill
-    PRIVATE
-        WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
-)
-
-register_test_exe(emit-grhsim-cpp-memory-fill)
 
 add_executable(emit-verilator-repcut-package
     tests/emit/test_emit_verilator_repcut_package.cpp

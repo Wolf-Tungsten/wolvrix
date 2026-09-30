@@ -3,7 +3,7 @@
 #include "grhsim/ir/verifier.hpp"
 #include "grhsim/io/json.hpp"
 #include "grhsim/pass/reg_to_mem.hpp"
-#include "grhsim/backend/cpu_emit.hpp"
+#include "grhsim/backend/cpu_phase_emit.hpp"
 #include "slang/numeric/SVInt.h"
 
 #include <algorithm>
@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -31,7 +32,9 @@ RegToMemOptions semanticOptions() {
 }
 
 // A deliberately small core interpreter: reads always use the old state,
-// while writes and event histories are published together after evaluation.
+// while writes are published together after evaluation. Event edges are
+// detected against the previous step's event value (the harness tracks one
+// prev slot per event value, zero-initialized).
 class Simulation {
 public:
     explicit Simulation(const GrhSimModel &model) : m(model), defs(m.values().size() + 1),
@@ -59,6 +62,7 @@ public:
         calls.clear();
         std::fill(ready.begin(), ready.end(), false);
         auto pending = states;
+        std::unordered_map<uint32_t, uint64_t> nextEvents;
         for (const auto &op : m.operations()) {
             const auto kind = m.text(op.opType);
             if (kind != "core.state.regWrite" && kind != "core.state.memWrite" &&
@@ -66,19 +70,21 @@ public:
                 kind != "core.dpi.call") continue;
             auto args = m.operands(op);
             auto objects = m.objectRefs(op);
-            const auto eventCount=objects.size()-1;
-            check(eventCount>0,"test expects explicit event histories");
             const std::vector<std::string> *edges=nullptr;
             for(const auto &p:m.parameters(op))
                 if(m.text(p.name)=="event_edges") edges=std::get_if<std::vector<std::string>>(&p.value);
-            check(edges && edges->size()==eventCount,"invalid event list");
+            check(edges && !edges->empty(),"test expects an explicit event list");
+            const auto eventCount=edges->size();
+            check(args.size()>=eventCount,"invalid event list");
             bool edge=false;
             for(std::size_t i=0;i<eventCount;++i) {
-                const auto event=eval(args[args.size()-eventCount+i]);
-                const auto previous=states.at(objects[1+i].index).at(0);
+                const auto eventValue=args[args.size()-eventCount+i];
+                const auto event=eval(eventValue);
+                const auto it=prevEvents.find(eventValue.index);
+                const auto previous=it==prevEvents.end()?0:it->second;
                 check((*edges)[i]=="posedge" || (*edges)[i]=="negedge","unsupported test edge");
                 edge |= (*edges)[i]=="posedge"?(!previous && event):(previous && !event);
-                pending.at(objects[1+i].index).at(0)=event;
+                nextEvents[eventValue.index]=event;
             }
             if (!edge) continue;
             if (kind == "core.dpi.call") {
@@ -110,6 +116,7 @@ public:
             }
         }
         states.swap(pending);
+        for (const auto &[value, event] : nextEvents) prevEvents[value] = event;
         std::fill(ready.begin(), ready.end(), false);
     }
 
@@ -190,6 +197,7 @@ private:
     std::vector<std::vector<uint64_t>> states;
     std::vector<uint64_t> values, inputValues;
     std::vector<bool> ready;
+    std::unordered_map<uint32_t, uint64_t> prevEvents;
 };
 
 GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
@@ -228,20 +236,12 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
     const auto lastData = mode==20?compute("core.compute.xor",word,{d0,d1}):ValueId{};
     for (unsigned row = 0; row < rowCount; ++row) {
         auto q = m.addState(opaqueNames?"unrelated_"+std::to_string((row*17+3)%37):"q"+std::to_string(row), word);
-        auto h = m.addState(opaqueNames?"edge_sample_"+std::to_string(rowCount-row):"h"+std::to_string(row), bit);
         const std::array steps{InitStep{m.intern("core.init.const"), {0, 1}}};
         if (mode == 15) {
             m.addInit(q, std::array{InitStep{m.intern("core.init.random"), {0, 1}}},
                 std::array{Parameter{m.intern("seed"), int64_t{row + 1}}});
         } else m.addInit(q, steps, std::array{Parameter{m.intern("value"),
             std::string(mode==19?"1'd":"2'd") + std::to_string(row%(mode==19?2:4))}});
-        m.addInit(h, steps, std::array{Parameter{m.intern("value"), std::string(mode==9 && row==3?"1'b0":"1'b1")}});
-        if(mode==11 && row==0) {
-            const auto historyRead=m.addValue(bit);
-            m.addOperation("core.state.read",{},std::array{historyRead},std::array{ObjectRef::state(h)});
-            const auto historyOutput=m.addOutput("visible-history",bit);
-            m.addOperation("core.output.write",std::array{historyRead},{},std::array{ObjectRef::output(historyOutput)});
-        }
         auto old = m.addValue(word);
         m.addOperation("core.state.read", {}, std::array{old}, std::array{ObjectRef::state(q)});
         auto output = m.addOutput("q" + std::to_string(row), word);
@@ -292,12 +292,9 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
             operands[1]=compute("core.compute.mux",word,{high,d1,old});
             operands[2]=d0;
         }
-        std::vector<ObjectRef> objects{ObjectRef::state(q),ObjectRef::state(h)};
+        std::vector<ObjectRef> objects{ObjectRef::state(q)};
         std::vector<std::string> edges{"posedge"};
         if(mode==12) {
-            auto resetHistory=m.addState("reset-history"+std::to_string(row),bit);
-            m.addInit(resetHistory,steps,std::array{Parameter{m.intern("value"),std::string("1'b0")}});
-            objects.push_back(ObjectRef::state(resetHistory));
             operands.push_back(u);
             edges.push_back("posedge");
         }
@@ -345,10 +342,8 @@ GrhSimModel orFixture(unsigned mode = 0) {
     ValueId feedback;
     for (unsigned row = 1; row <= 4; ++row) {
         const auto q = m.addState("opaque" + std::to_string((row * 17 + 3) % 37), word);
-        const auto history = m.addState("edge" + std::to_string(7 - row), bit);
         const std::array steps{InitStep{m.intern("core.init.const"), {0, 1}}};
         m.addInit(q, steps, std::array{Parameter{m.intern("value"), std::to_string(m.types()[word.index - 1].width) + "'d" + std::to_string(row % (mode == 4 ? 2 : 4))}});
-        m.addInit(history, steps, std::array{Parameter{m.intern("value"), std::string("1'b1")}});
         const auto old = m.addValue(word);
         m.addOperation("core.state.read", {}, std::array{old}, std::array{ObjectRef::state(q)});
         if (!feedback) feedback = old;
@@ -374,7 +369,7 @@ GrhSimModel orFixture(unsigned mode = 0) {
         if (mode == 2) update = compute("core.compute.and", bit, {global, update});
         if (mode == 5) update = compute("core.compute.or", bit, {global, update});
         m.addOperation("core.state.regWrite", std::array{update, next, mask, mode == 10 && row == 4 ? global : clock}, {},
-            std::array{ObjectRef::state(q), ObjectRef::state(history)},
+            std::array{ObjectRef::state(q)},
             std::array{Parameter{m.intern("event_edges"), std::vector<std::string>{"posedge"}}});
     }
     return m;
@@ -423,9 +418,8 @@ void orWriteTests() {
 }
 
 // Observe scalar reads through an event-sensitive side effect with no results.
-// Its history and old-state arguments must survive storage compaction.
+// Its old-state arguments must survive storage compaction.
 void addDpiProbe(GrhSimModel &model) {
-    const auto bit = model.logicType(1, false, LogicDomain::TwoState);
     ValueId enable, event;
     std::vector<ValueId> reads;
     std::vector<DpiArgument> arguments;
@@ -444,14 +438,11 @@ void addDpiProbe(GrhSimModel &model) {
     }
     check(enable && event && reads.size() == 4, "invalid DPI probe fixture");
     const auto function = model.addExternFunction("observe", "core.dpi", "observe", arguments, {});
-    const auto history = model.addState("dpi-history", bit);
-    model.addInit(history, std::array{InitStep{model.intern("core.init.const"), {0, 1}}},
-        std::array{Parameter{model.intern("value"), std::string("1'b0")}});
     std::vector<ValueId> operands{enable};
     operands.insert(operands.end(), reads.begin(), reads.end());
     operands.push_back(event);
     model.addOperation("core.dpi.call", operands, {},
-        std::array{ObjectRef::function(function), ObjectRef::state(history)},
+        std::array{ObjectRef::function(function)},
         std::array{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}});
 }
 
@@ -488,12 +479,10 @@ GrhSimModel readFixture(bool readOnly, bool repeated, unsigned window=0, unsigne
             m.addOperation("core.output.write",std::array{old},{},std::array{ObjectRef::output(out)});
         }
         if(readOnly) continue;
-        const auto h=m.addState("h"+std::to_string(row),bit);
-        m.addInit(h,steps,std::array{Parameter{m.intern("value"),std::string("1'b0")}});
         const auto next=m.addValue(word);
         m.addOperation("core.compute.xor",std::array{old,data},std::array{next});
         m.addOperation("core.state.regWrite",std::array{enable,next,mask,event},{},
-            std::array{ObjectRef::state(q),ObjectRef::state(h)},
+            std::array{ObjectRef::state(q)},
             std::array{Parameter{m.intern("event_edges"),std::vector<std::string>{"posedge"}}});
     }
     std::vector<ValueId> lanes(reads.rbegin(),reads.rend());
@@ -607,7 +596,7 @@ void regToMemSemanticsTests() {
             check(reference.outputs()==candidate.outputs(),"cost-selected rewrite changed semantics");
         }
     }
-    for (unsigned mode : {0u,1u,2u,3u,4u,5u,6u,7u,8u,12u,13u,18u,19u,20u}) {
+    for (unsigned mode : {0u,1u,2u,3u,4u,5u,6u,7u,8u,9u,11u,12u,13u,18u,19u,20u}) {
         auto original = fixture(mode);
         auto rewritten = fixture(mode);
         diag::Diagnostics diagnostics;
@@ -792,7 +781,12 @@ void regToMemSemanticsTests() {
             check(reference.outputs()==candidate.outputs(),"fixed writes lost per-row event or full packed output");
         }
     }
-    for(unsigned mode:{9u,10u,11u,14u,15u,16u,17u}) {
+    // Modes 9 and 11 once rejected through event-history specifics (mismatched
+    // history inits / an externally observed history state); those states no
+    // longer exist, so both are plain mergeable families now. Mode 10 keeps a
+    // partial mask, 14 is four-state, 15 has a random init, 16 mixes events
+    // across the family, 17 is a latch write: all still rejected.
+    for(unsigned mode:{10u,14u,15u,16u,17u}) {
         auto model=fixture(mode);
         diag::Diagnostics diagnostics;
         std::ostringstream before,after;
@@ -1001,16 +995,17 @@ void regToMemEmitChecks(const std::filesystem::path &directory) {
         options.enableRowConstantFill = shape >= 8;
         options.enableOrWriteMerge = shape >= 10;
         manager.addPass(std::make_unique<RegToMemPass>(options));
-        for(auto name:{"cpu.st.split-phase","cpu.st.form-event-domains","cpu.st.build-compute-nodes",
-            "cpu.st.merge-compute-supernodes","cpu.st.pack-active-words","cpu.st.pack-emit-functions",
-            "cpu.st.layout-data","cpu.st.build-schedule"}) {
+        for(auto name:{"grhsim.classify-event-inputs","grhsim.lower-edge-detect","grhsim.extract-output-cones",
+            "grhsim.migrate-timeslot-tasks","cpu.st.split-phases","cpu.st.build-general-nodes",
+            "cpu.st.merge-general-supernodes","cpu.st.pack-general-functions","cpu.st.layout-named-stores",
+            "cpu.st.build-event-bitmaps","cpu.st.build-mem-write-plan","cpu.st.build-phase-schedule"}) {
             std::string error;
             auto pass=defaultPassRegistry().create(name,{},error);
             check(bool(pass),"cannot create CPU mapping pass");
             manager.addPass(std::move(pass));
         }
-        check(manager.run(rewritten,diagnostics).success,"reg-to-mem CPU mapping failed");
-        if(!emitCpuCpp(rewritten,path,diagnostics).success) {
+        check(manager.run(rewritten,diagnostics).success,"six-phase CPU mapping failed");
+        if(!emitSixPhaseCpuCpp(rewritten,path,diagnostics).success) {
             std::string message="reg-to-mem CPU emit failed shape="+std::to_string(shape);
             for(const auto &diagnostic:diagnostics.messages()) message+="\n"+diagnostic.message;
             throw std::runtime_error(message);

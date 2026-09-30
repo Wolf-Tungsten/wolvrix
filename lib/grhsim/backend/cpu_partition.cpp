@@ -61,11 +61,14 @@ namespace wolvrix::lib::grhsim
         // P_general supernode event domain constraint): hasEvent marks the
         // presence of event-carrying ops, uniform tracks rule 1 (all event
         // act sets equal), acts is the common set K, and influence is the
-        // E(.) downstream act closure union.
+        // E(.) downstream act closure union. unboundFree marks the presence of
+        // an op with no event obligations at all (no acts and an empty
+        // downstream closure) — such ops are data-driven by nature.
         struct EventDomainInfo
         {
             bool hasEvent = false;
             bool uniform = true;
+            bool unboundFree = false;
             std::vector<int64_t> acts;
             std::vector<int64_t> influence;
         };
@@ -76,6 +79,7 @@ namespace wolvrix::lib::grhsim
             result.hasEvent = lhs.hasEvent || rhs.hasEvent;
             result.uniform = lhs.uniform && rhs.uniform &&
                              (!lhs.hasEvent || !rhs.hasEvent || lhs.acts == rhs.acts);
+            result.unboundFree = lhs.unboundFree || rhs.unboundFree;
             result.acts = lhs.hasEvent ? lhs.acts : rhs.acts;
             result.influence = lhs.influence;
             unionInto(result.influence, rhs.influence);
@@ -85,10 +89,15 @@ namespace wolvrix::lib::grhsim
         // The merge prohibition: an event-carrying supernode must keep one
         // common act set K (rule 1) whose downstream closure introduces no
         // other acts (rule 2). Pure combinational/latch-only clusters are
-        // exempt from both rules.
+        // exempt from both rules — but an op with no event obligation anywhere
+        // (no acts, empty influence; e.g. an event-free system task or a
+        // level-sensitive read chain) must never land in an event-carrying
+        // supernode: the domain gate would suppress its data-driven execution.
+        // Event-free cone members whose downstream closure is exactly K belong
+        // to the domain and merge freely.
         bool eventDomainAllowed(const EventDomainInfo &info)
         {
-            return !info.hasEvent || (info.uniform && info.influence == info.acts);
+            return !info.hasEvent || (info.uniform && info.influence == info.acts && !info.unboundFree);
         }
 
         std::vector<EventDomainInfo> clusterEventDomains(const Clusters &clusters,
@@ -695,6 +704,7 @@ namespace wolvrix::lib::grhsim
                 {
                     EventDomainInfo info;
                     info.hasEvent = !domainSets.acts[op.index].empty();
+                    info.unboundFree = domainSets.acts[op.index].empty() && domainSets.influence[op.index].empty();
                     info.acts = domainSets.acts[op.index];
                     info.influence = domainSets.influence[op.index];
                     nodeInfos[i] = combineEventDomains(nodeInfos[i], info);

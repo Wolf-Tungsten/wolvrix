@@ -422,67 +422,6 @@ class Session:
             output=output,
         )
 
-    def emit_grhsim_cpp(
-        self,
-        *,
-        design: str,
-        output: str,
-        top: list[str] | None = None,
-        max_cpp_file_bytes: int | None = None,
-        sched_batch_max_ops: int | None = None,
-        sched_batch_max_estimated_lines: int | None = None,
-        sched_batch_target_count: int | None = None,
-        sched_batches_per_cpp: int | None = None,
-        emit_parallelism: int | None = None,
-        perf: str | None = None,
-        input_fullpass_specialization: bool | None = None,
-        posedge_fullpass_specialization: bool | None = None,
-        full_active_word_consume: bool | None = None,
-        **named_args,
-    ) -> list[dict]:
-        self._ensure_open()
-        if (max_cpp_file_bytes is not None or sched_batch_max_ops is not None or
-                sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
-                sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
-                input_fullpass_specialization is not None or posedge_fullpass_specialization is not None or
-                full_active_word_consume is not None):
-            named_args = dict(named_args)
-        if max_cpp_file_bytes is not None:
-            named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
-        if sched_batch_max_ops is not None:
-            named_args["sched_batch_max_ops"] = sched_batch_max_ops
-        if sched_batch_max_estimated_lines is not None:
-            named_args["sched_batch_max_estimated_lines"] = sched_batch_max_estimated_lines
-        if sched_batch_target_count is not None:
-            named_args["sched_batch_target_count"] = sched_batch_target_count
-        if sched_batches_per_cpp is not None:
-            named_args["sched_batches_per_cpp"] = sched_batches_per_cpp
-        if emit_parallelism is not None:
-            named_args["emit_parallelism"] = emit_parallelism
-        if perf is not None:
-            named_args["perf"] = perf
-        if input_fullpass_specialization is not None:
-            named_args["input_fullpass_specialization"] = input_fullpass_specialization
-        if posedge_fullpass_specialization is not None:
-            named_args["posedge_fullpass_specialization"] = posedge_fullpass_specialization
-        if full_active_word_consume is not None:
-            named_args["full_active_word_consume"] = full_active_word_consume
-        _compile_emit_grhsim_cpp_kwargs(named_args)
-        success, diagnostics = _native.session_emit_grhsim_cpp(
-            self._capsule,
-            design=design,
-            output=output,
-            top=top or [],
-            **named_args,
-        )
-        return self._complete_action(
-            "emit_grhsim_cpp",
-            diagnostics,
-            success=bool(success),
-            design=design,
-            output=output,
-        )
-
     def emit_verilator_repcut_package(
         self,
         *,
@@ -761,59 +700,6 @@ def _compile_emit_sv_kwargs(named: dict[str, Any]) -> None:
 def _compile_emit_verilator_repcut_package_kwargs(named: dict[str, Any]) -> None:
     local = dict(named)
     _ensure_no_extra_named("emit_verilator_repcut_package", local)
-
-
-def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
-    local = dict(named)
-    max_cpp_file_bytes = local.pop("max_cpp_file_bytes", None)
-    if max_cpp_file_bytes is not None:
-        if not isinstance(max_cpp_file_bytes, int) or max_cpp_file_bytes < 0:
-            raise ValueError("emit_grhsim_cpp max_cpp_file_bytes must be a non-negative integer")
-    sched_batch_max_ops = local.pop("sched_batch_max_ops", None)
-    if sched_batch_max_ops is not None:
-        if not isinstance(sched_batch_max_ops, int) or sched_batch_max_ops < 0:
-            raise ValueError("emit_grhsim_cpp sched_batch_max_ops must be a non-negative integer")
-    sched_batch_max_estimated_lines = local.pop("sched_batch_max_estimated_lines", None)
-    if sched_batch_max_estimated_lines is not None:
-        if not isinstance(sched_batch_max_estimated_lines, int) or sched_batch_max_estimated_lines < 0:
-            raise ValueError("emit_grhsim_cpp sched_batch_max_estimated_lines must be a non-negative integer")
-    sched_batch_target_count = local.pop("sched_batch_target_count", None)
-    if sched_batch_target_count is not None:
-        if not isinstance(sched_batch_target_count, int) or sched_batch_target_count < 0:
-            raise ValueError("emit_grhsim_cpp sched_batch_target_count must be a non-negative integer")
-    sched_batches_per_cpp = local.pop("sched_batches_per_cpp", None)
-    if sched_batches_per_cpp is not None:
-        if not isinstance(sched_batches_per_cpp, int) or sched_batches_per_cpp < 0:
-            raise ValueError("emit_grhsim_cpp sched_batches_per_cpp must be a non-negative integer")
-    emit_parallelism = local.pop("emit_parallelism", None)
-    if emit_parallelism is not None:
-        if not isinstance(emit_parallelism, int) or emit_parallelism < 0:
-            raise ValueError("emit_grhsim_cpp emit_parallelism must be a non-negative integer")
-    waveform = local.pop("waveform", None)
-    if waveform is not None:
-        if not isinstance(waveform, str):
-            raise ValueError("emit_grhsim_cpp waveform must be a string")
-        if waveform not in {"off", "declared-symbols"}:
-            raise ValueError("emit_grhsim_cpp waveform must be one of: off, declared-symbols")
-    perf = local.pop("perf", None)
-    if perf is not None:
-        if not isinstance(perf, str):
-            raise ValueError("emit_grhsim_cpp perf must be a string")
-        if perf not in {"off", "eval"}:
-            raise ValueError("emit_grhsim_cpp perf must be one of: off, eval")
-    input_fullpass_specialization = local.pop("input_fullpass_specialization", None)
-    if input_fullpass_specialization is not None:
-        if not isinstance(input_fullpass_specialization, bool):
-            raise ValueError("emit_grhsim_cpp input_fullpass_specialization must be a bool")
-    posedge_fullpass_specialization = local.pop("posedge_fullpass_specialization", None)
-    if posedge_fullpass_specialization is not None:
-        if not isinstance(posedge_fullpass_specialization, bool):
-            raise ValueError("emit_grhsim_cpp posedge_fullpass_specialization must be a bool")
-    full_active_word_consume = local.pop("full_active_word_consume", None)
-    if full_active_word_consume is not None:
-        if not isinstance(full_active_word_consume, bool):
-            raise ValueError("emit_grhsim_cpp full_active_word_consume must be a bool")
-    _ensure_no_extra_named("emit_grhsim_cpp", local)
 
 
 def _normalize_diagnostics_print_min_level(level: str) -> str:

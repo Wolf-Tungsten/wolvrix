@@ -9,15 +9,16 @@ For example, with `hit_k(i) = enable_k && address_k == i`:
 ```text
 q_i.next = hit_1(i) ? data_1 : hit_0(i) ? data_0 : q_i
 
-=> core.state.memWriteSeq @table, @history
+=> core.state.memWriteSeq @table
      (enable_0, address_0, data_0, enable_1, address_1, data_1, clock)
      event_edges = ["posedge"]
 ```
 
 Each triple is an enable, element address and element data value. Triples execute in
 low-to-high priority order: different addresses both update; the last enabled write
-to an address wins. All operands use pre-commit state. The final clock operand and
-history object detect the event independently of the write enables.
+to an address wins. All operands use pre-commit state. The trailing clock operand
+carries the raw event annotation (`event_edges`), independently of the write
+enables; `grhsim.lower-edge-detect` later turns it into an edge detector.
 
 The pass preserves a separate `regWrite` update condition unless implication is
 proved. It also preserves uncovered default-value branches. Identical broadcast
@@ -74,7 +75,7 @@ zero mux fallbacks, and an update condition equal to the OR of the mux guards.
 `reduceOr(concat(one-bit guards))` is also recognized. Common global AND terms
 are retained on every port. Extra/missing update disjuncts, priority blockers,
 different address types, and more than 64 ports are rejected. The existing
-event-history, initialization, ownership and cost checks still apply. The cost
+initialization, ownership and cost checks still apply. The cost
 estimate charges the pairwise collision logic; it is not a runtime prediction.
 
 Tables can be discovered from writes without a packed read anchor, or from concat
@@ -92,8 +93,7 @@ Extra scalar read users remain connected through fixed-address memory reads. Whe
 only the indexed read is optimized, original writes remain fixed-address memory writes.
 
 The initial implementation requires two-state element types and constant initializers.
-Each array row retains its original initializer. Eliminating event histories requires
-private histories with matching initial values and event definitions. Unknown state
+Each array row retains its original initializer. Unknown state
 users, unproved priority constraints and unsupported read mappings retain the original
 representation. Mappings exceeding the run budget, windows wider than 64 bits and
 arbitrary masked priority updates remain outside the current read/write compression.
@@ -138,7 +138,7 @@ The playground Makefile provides `test_grhsim_reg_to_mem`, `analyze_grhsim_reg_t
 and `rewrite_grhsim_reg_to_mem`. The last two accept `GRHSIM_AUDIT_MODEL` and
 `GRHSIM_REG_TO_MEM_REPORT`. Tests compare scalar and rewritten state transitions,
 including address collisions, global else-if guards, reset, old-state feedback,
-initial event history, shared/repeated reads and invalid addresses.
+event-driven writes, shared/repeated reads and invalid addresses.
 `test_grhsim_reg_to_mem_generated` compares generated CPU C++ against scalar traces
 with address/undefined-behavior sanitizers, including partial windows and maximal
 64-bit indices.

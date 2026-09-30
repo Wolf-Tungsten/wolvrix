@@ -71,11 +71,9 @@ void updateConditionTest() {
                    std::array{Parameter{m.intern("value"), std::string("1'b1")}});
     for (uint32_t row = 0; row < 2; ++row) {
         const auto q = m.addState("q" + std::to_string(row), bit);
-        const auto history = m.addState("history" + std::to_string(row), bit);
         const std::array initSteps{InitStep{m.intern("core.init.const"), {0, 1}}};
         const std::array initParams{Parameter{m.intern("value"), std::string("1'b0")}};
         m.addInit(q, initSteps, initParams);
-        m.addInit(history, initSteps, initParams);
         const auto old = m.addValue(bit);
         m.addOperation("core.state.read", {}, std::array{old}, std::array<ObjectRef, 1>{ObjectRef::state(q)});
         const auto rowConstant = m.addValue(addrType);
@@ -88,7 +86,7 @@ void updateConditionTest() {
         const auto highNext = m.addValue(bit);
         m.addOperation("core.compute.mux", std::array{hit, data2, lowNext}, std::array{highNext});
         m.addOperation("core.state.regWrite", std::array{update, highNext, mask, event}, {},
-                       std::array<ObjectRef, 2>{ObjectRef::state(q), ObjectRef::state(history)},
+                       std::array<ObjectRef, 1>{ObjectRef::state(q)},
                        std::array{Parameter{m.intern("event_edges"), std::vector<std::string>{"posedge"}}});
     }
     diag::Diagnostics d;
@@ -99,7 +97,7 @@ void updateConditionTest() {
     const auto result = pass.run(m, d);
     require(result.success && result.changed, "reg-to-mem did not rewrite update-guarded rows");
     require(!d.hasError(), "reg-to-mem emitted diagnostics for update-guarded rows");
-    require(m.states().size() == 2, "reg-to-mem did not compact scalar rows and private history");
+    require(m.states().size() == 1, "reg-to-mem did not compact the scalar rows");
     bool foundArray = false, foundWrite = false, foundSequence = false, guardConjoined = false;
     for (const auto &state : m.states())
         foundArray |= m.types()[state.type.index - 1].kind == TypeKind::Array;

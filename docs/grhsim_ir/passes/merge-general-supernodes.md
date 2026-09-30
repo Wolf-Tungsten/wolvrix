@@ -32,16 +32,22 @@ op** must satisfy
 
 1. rule 1 — all its event-carrying ops share the same act set `K`;
 2. rule 2 — its downstream closure introduces no other acts: the union of
-   `E(·)` over all its ops (combinational ones included) equals `K`.
+   `E(·)` over all its ops (combinational ones included) equals `K`;
+3. rule 3 — no member op may be event-obligation-free (`A(op)=∅` and
+   `E(op)=∅`): such an op (an event-free system task/DPI sink, a
+   level-sensitive read chain, an input read feeding only event-free
+   consumers) is data-driven by nature, and the domain gate would suppress
+   its execution when data changes without an edge. Event-free cone members
+   with `E(·)=K` belong to the domain and merge freely.
 
-Violating either rule forbids the merge (coarsen candidates and multi-cluster
+Violating any rule forbids the merge (coarsen candidates and multi-cluster
 DP spans alike; rejected attempts are counted in `event_domain_blocked`).
 Pure combinational / latch-only clusters without event-carrying ops are
 exempt — downstream asymmetry cannot strand a sticky data-activation flag
 when there is no write to lose. Single nodes / single-cluster spans are never
 rejected: node formation already fixed their contents, so a lone
 domain-straddling node still becomes its own supernode and is flagged by the
-verifier (an event-carrying supernode must satisfy both rules) instead of
+verifier (an event-carrying supernode must satisfy all three rules) instead of
 making the model unpartitionable.
 
 Every resulting General supernode records the sorted union of its ops' acts

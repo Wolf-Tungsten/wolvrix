@@ -39,7 +39,6 @@ namespace {
         ValueId mask;
         std::vector<ValueId> events;
         std::vector<std::string> edges;
-        std::vector<StateId> histories;
         std::string key;
         bool orMerge = false;
     };
@@ -260,8 +259,9 @@ namespace {
                 const auto &op=m.operations()[id.index-1]; const auto objects=m.objectRefs(op);
                 if(objects.empty() || objects[0]!=ObjectRef::state(s) ||
                     (kind(op)!="core.state.read" && kind(op)!="core.state.regWrite")) return reject("unknown-state-user");
-                // A storage state cannot also be an event-history operand.
-                if(std::count(objects.begin(),objects.end(),ObjectRef::state(s))!=1) return reject("history-owner");
+                // A storage state must be referenced exactly once per op, in
+                // the primary (target) slot.
+                if(std::count(objects.begin(),objects.end(),ObjectRef::state(s))!=1) return reject("duplicate-ref");
             }
             cached=1;
             return true;
@@ -358,11 +358,10 @@ namespace {
             const auto &op=m.operations()[writers[s.index][0].index-1];
             auto operands=m.operands(op); auto objects=m.objectRefs(op);
             auto edges=param<std::vector<std::string>>(m,m.parameters(op),"event_edges");
-            if(!edges || edges->empty() || operands.size()!=3+edges->size() || objects.size()!=1+edges->size()) return {};
+            if(!edges || edges->empty() || operands.size()!=3+edges->size() || objects.size()!=1) return {};
             RowWrite result; result.op=op.id; result.mask=unwrap(operands[2]); result.edges=*edges;
-            for(std::size_t i=0;i<edges->size();++i) {
-                result.events.push_back(unwrap(operands[3+i])); result.histories.push_back({objects[1+i].index,0});
-            }
+            for(std::size_t i=0;i<edges->size();++i)
+                result.events.push_back(unwrap(operands[3+i]));
             // A regWrite carries a global update condition separately from the
             // mux condition in some lowering forms.  Keep it as part of every
             // effective branch guard; otherwise a false updateCond would still
@@ -609,16 +608,6 @@ namespace {
             for(const auto &w:g.writes) {
                 if(w.key!=first.key) {g.reason="write-family";return false;}
                 if(w.branches.size()!=first.branches.size()) {g.reason="branch-shape";return false;}
-                for(std::size_t i=0;i<w.histories.size();++i) {
-                    auto h=w.histories[i], expected=first.histories[i];
-                    if(refs[h.index].size()!=1 || refs[h.index][0]!=w.op) {g.reason="history-owner";return false;}
-                    const auto *init=inits[h.index], *other=inits[expected.index];
-                    if(!init || !other || m.steps(*init).size()!=1 || m.steps(*other).size()!=1) {g.reason="history-init";return false;}
-                    const auto &a=m.steps(*init)[0], &b=m.steps(*other)[0];
-                    const auto ap=m.parameters(a), bp=m.parameters(b);
-                    if(a.kind!=b.kind || m.text(a.kind)!="core.init.const" || ap.size()!=bp.size()) {g.reason="history-init";return false;}
-                    for(std::size_t j=0;j<ap.size();++j) if(ap[j].name!=bp[j].name || ap[j].value!=bp[j].value) {g.reason="history-init";return false;}
-                }
             }
             const auto n=first.branches.size();
             if (first.orMerge) {
@@ -741,7 +730,6 @@ namespace {
             std::vector<ValueId> sequence;
             ValueId previousAddress;
             std::vector<ObjectRef> objects{ObjectRef::state(table)};
-            for(auto h:first.histories) objects.push_back(ObjectRef::state(h));
             std::vector<Parameter> ps{{m.intern("event_edges"),first.edges}};
             std::map<std::string,std::pair<ValueId,ValueId>> fills;
             std::vector<ValueId> staticFills;
@@ -833,10 +821,8 @@ namespace {
                 (void)key;std::vector<ValueId> a{fill.first,fill.second};a.insert(a.end(),first.events.begin(),first.events.end());
                 m.addOperation("core.state.memFill",a,{},objects,ps);
             }
-            for(const auto &w:g.writes) {
+            for(const auto &w:g.writes)
                 removedOps[w.op.index]=1;
-                if(w.op!=first.op) for(auto h:w.histories) removedStates[h.index]=1;
-            }
         }
         void rewriteAccesses(std::size_t originalOps) {
             std::unordered_map<uint32_t,ValueId> rowConstants;

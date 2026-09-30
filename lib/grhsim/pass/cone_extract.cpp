@@ -1,6 +1,8 @@
 #include "grhsim/pass/cone_extract.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 namespace wolvrix::lib::grhsim
@@ -45,6 +47,14 @@ namespace wolvrix::lib::grhsim
     {
         ConeExtraction extraction;
         const auto producers = producerTable(model);
+        int64_t nextSampleId = static_cast<int64_t>(model.operations().size());
+        for (const auto &op : model.operations())
+            for (const auto &param : model.parameters(op))
+            {
+                if (model.text(param.name) != "sample_id") continue;
+                const auto *sampleId = std::get_if<int64_t>(&param.value);
+                if (sampleId && *sampleId > nextSampleId) nextSampleId = *sampleId;
+            }
         std::vector<uint8_t> inCone(model.operations().size() + 1, 0);
         std::vector<OpId> stack;
         for (const auto sink : sinks)
@@ -103,9 +113,30 @@ namespace wolvrix::lib::grhsim
                 results.push_back(extraction.oldToNewValues[result.index]);
             const std::vector<ObjectRef> refs(model.objectRefs(source).begin(),
                                               model.objectRefs(source).end());
-            const std::vector<Parameter> params(model.parameters(source).begin(),
-                                                model.parameters(source).end());
+            std::vector<Parameter> params(model.parameters(source).begin(),
+                                          model.parameters(source).end());
             const auto opType = std::string(model.text(source.opType));
+            const auto randomFunction = opType == "core.system.function" &&
+                std::any_of(params.begin(), params.end(), [&](const Parameter &param) {
+                    return model.text(param.name) == "name" &&
+                           std::get_if<std::string>(&param.value) &&
+                           *std::get_if<std::string>(&param.value) == "random";
+                });
+            if (randomFunction)
+            {
+                const auto hasSampleId = std::any_of(params.begin(), params.end(), [&](const Parameter &param) {
+                    return model.text(param.name) == "sample_id";
+                });
+                if (!hasSampleId)
+                {
+                    if (nextSampleId == std::numeric_limits<int64_t>::max())
+                        throw std::overflow_error("random sample ID space is exhausted");
+                    params.push_back(Parameter{model.intern("sample_id"), ++nextSampleId});
+                    const std::vector<ValueId> sourceOperands(model.operands(source).begin(), model.operands(source).end());
+                    const std::vector<ValueId> sourceResults(model.results(source).begin(), model.results(source).end());
+                    model.replaceOperation(id, opType, sourceOperands, sourceResults, refs, params);
+                }
+            }
             std::string name;
             if (source.name.valid()) name = std::string(model.text(source.name)) + suffix;
             const auto clone = model.addOperation(opType, operands, results, refs, params,

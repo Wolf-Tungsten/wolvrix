@@ -2,6 +2,7 @@
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/ir/model.hpp"
 #include "grhsim/ir/verifier.hpp"
+#include "grhsim/pass/cone_extract.hpp"
 #include "grhsim/pass/pass.hpp"
 
 #include <array>
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace
@@ -300,6 +302,113 @@ namespace
             step((static_cast<unsigned __int128>(~std::uint64_t(0)) << 64) | ~std::uint64_t(0), 1), // wraps to 0
             step(0xdeadbeefULL, 0x1234567890ULL),
         });
+    }
+
+    void scalarSliceArrayTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_scalar_slice_array");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto word = model.logicType(32, false, LogicDomain::TwoState);
+        const auto indexType = model.logicType(4, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto data = addInputRead(model, "data", word);
+        const auto index = addInputRead(model, "index", indexType);
+        const auto selected = addCompute(model, "core.compute.sliceArray", byte, "selected", {data, index});
+        addOutputWrite(model, "selected", byte, selected);
+        require(verifies(model), "scalar sliceArray fixture rejected");
+        runSixPhasePipeline(model, false);
+        compileAndRun(model, root / "scalar_slice_array", {
+            {{{"data", "UINT32_C(0x44332211)"}, {"index", "0"}}, {{"selected", "0x11"}}},
+            {{{"index", "1"}}, {{"selected", "0x22"}}},
+            {{{"index", "3"}}, {{"selected", "0x44"}}},
+            {{{"index", "4"}}, {{"selected", "0"}}},
+            {{{"index", "15"}}, {{"selected", "0"}}},
+        });
+    }
+
+    void randomSystemFunctionTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_random_function");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto word = model.logicType(32, false, LogicDomain::TwoState);
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        addOutputWrite(model, "echo", bit, addInputRead(model, "input", bit));
+        const auto result = model.addValue(word, "random_value");
+        const std::array params{Parameter{model.intern("name"), std::string("random")},
+                                Parameter{model.intern("has_side_effects"), true}};
+        model.addOperation("core.system.function", {}, std::array{result}, {}, params);
+        addOutputWrite(model, "o", word, result);
+        require(verifies(model), "random system function fixture rejected");
+        runSixPhasePipeline(model, false);
+        std::vector<int64_t> sampleIds;
+        bool sawGeneral = false, sawOutput = false;
+        for (const auto &op : model.operations())
+        {
+            if (model.text(op.opType) != "core.system.function") continue;
+            for (const auto &param : model.parameters(op))
+                if (model.text(param.name) == "sample_id")
+                    sampleIds.push_back(std::get<int64_t>(param.value));
+            sawGeneral |= op.phase == SimPhase::General;
+            sawOutput |= op.phase == SimPhase::Output;
+        }
+        require(sampleIds.size() == 2 && sampleIds[0] == sampleIds[1] && sawGeneral && sawOutput,
+                "output-cone clone must share its random sample with the General producer");
+
+        std::uint64_t rng = UINT64_C(0x6a09e667f3bcc909);
+        const auto next = [&]() {
+            rng += UINT64_C(0x9e3779b97f4a7c15);
+            std::uint64_t value = rng;
+            value = (value ^ (value >> 30u)) * UINT64_C(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 27u)) * UINT64_C(0x94d049bb133111eb);
+            return std::to_string(static_cast<std::uint32_t>(value ^ (value >> 31u)));
+        };
+        compileAndRun(model, root / "random_function", {
+            {{}, {{"o", next()}}},
+            {{}, {{"o", next()}}},
+            {{}, {{"o", next()}}},
+        });
+    }
+
+    void randomSampleIdAfterCompactTest()
+    {
+        GrhSimModel model("phase_random_sample_ids");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto word = model.logicType(32, false, LogicDomain::TwoState);
+        const std::array constParams{Parameter{model.intern("constValue"), std::string("32'd0")}};
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto value = model.addValue(word);
+            model.addOperation("core.compute.constant", {}, std::array{value}, {}, constParams);
+        }
+        const std::array randomParams{Parameter{model.intern("name"), std::string("random")},
+                                      Parameter{model.intern("has_side_effects"), true}};
+        const auto first = model.addValue(word);
+        model.addOperation("core.system.function", {}, std::array{first}, {}, randomParams, "first");
+        const auto second = model.addValue(word);
+        model.addOperation("core.system.function", {}, std::array{second}, {}, randomParams, "second");
+        const std::array firstSink{first};
+        extractCone(model, firstSink, SimPhase::Output);
+
+        std::vector<uint8_t> removeOps(model.operations().size() + 1, 0);
+        removeOps[1] = 1;
+        model.compact(removeOps, std::vector<uint8_t>(model.states().size() + 1, 0));
+        const auto secondAfterCompact = model.results(model.operations()[2]).front();
+        const std::array secondSink{secondAfterCompact};
+        extractCone(model, secondSink, SimPhase::Output);
+
+        std::vector<int64_t> firstIds, secondIds;
+        for (const auto &op : model.operations())
+        {
+            const auto name = model.text(op.name);
+            auto &ids = name.starts_with("first") ? firstIds : secondIds;
+            if (!name.starts_with("first") && !name.starts_with("second")) continue;
+            for (const auto &param : model.parameters(op))
+                if (model.text(param.name) == "sample_id") ids.push_back(std::get<int64_t>(param.value));
+        }
+        require(firstIds.size() == 2 && firstIds[0] == firstIds[1] &&
+                secondIds.size() == 2 && secondIds[0] == secondIds[1] &&
+                firstIds[0] != secondIds[0],
+                "independent random operations share a sample ID after compact");
     }
 
     // (c) multi-output + one-to-many fanout: x = a^b feeds two output cones
@@ -1092,6 +1201,35 @@ namespace
         "extern \"C\" std::uint8_t cpu_test_dbl(std::uint8_t x){return static_cast<std::uint8_t>(x*2);}\n");
     }
 
+    void dpiBitAbiTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_dpi_bit_abi");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto input = addInputRead(model, "input", bit);
+        const std::array args{
+            DpiArgument{model.intern("out"), DpiDirection::Output, bit},
+            DpiArgument{model.intern("in"), DpiDirection::Input, bit}};
+        const auto function = model.addExternFunction("cpu_test_bit_abi", "core.dpi", "cpu_test_bit_abi", args, bit);
+        const auto returned = model.addValue(bit, "returned");
+        const auto output = model.addValue(bit, "output");
+        model.addOperation("core.dpi.call", std::array{one, input}, std::array{returned, output},
+                           std::array{ObjectRef::function(function)});
+        addOutputWrite(model, "returned", bit, returned);
+        addOutputWrite(model, "output", bit, output);
+        require(verifies(model), "1-bit DPI fixture rejected");
+        runSixPhasePipeline(model, false);
+        compileAndRun(model, root / "dpi_bit_abi", {
+            {{{"input", "false"}}, {{"returned", "false"}, {"output", "false"}}},
+            {{{"input", "true"}}, {{"returned", "true"}, {"output", "false"}}},
+        }, false, "extern \"C\" std::uint8_t cpu_test_bit_abi(std::uint8_t* out, std::uint8_t in) { *out = 2; return in ? 3 : 0; }\n");
+        std::ifstream generated(root / "dpi_bit_abi" / "model" / "grhsim_phase_dpi_bit_abi.cpp");
+        const std::string source{std::istreambuf_iterator<char>(generated), std::istreambuf_iterator<char>()};
+        require(source.find("extern \"C\" std::uint8_t cpu_test_bit_abi(std::uint8_t*,std::uint8_t);") !=
+                    std::string::npos, "1-bit DPI declaration does not use the svBit ABI");
+    }
+
     // (15) Perf counters under WOLVRIX_GRHSIM_PERF=1: the 8-field aggregate uses
     // the fixed contract names with new-model semantics (see report table).
     void perfCountersTest(const std::filesystem::path &root)
@@ -1263,6 +1401,9 @@ int main()
         std::filesystem::create_directories(root);
         passthroughTest(root);
         wideAddTest(root);
+        scalarSliceArrayTest(root);
+        randomSystemFunctionTest(root);
+        randomSampleIdAfterCompactTest();
         fanoutTest(root);
         passRegistrationTest(root);
         counterTest(root);
@@ -1279,6 +1420,7 @@ int main()
         monitorFreeTest(root);
         monitorEventTest(root);
         dpiSmokeTest(root);
+        dpiBitAbiTest(root);
         perfCountersTest(root);
         memAssignReadbackTest(root);
         packedFillTest(root);

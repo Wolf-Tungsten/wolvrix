@@ -473,10 +473,20 @@ namespace wolvrix::lib::grhsim
                     stateFanout_[row.source.index] = ordinals(row.targets.activate);
                 activeLocals_.assign(model_.values().size() + 1, 0);
 
+                std::unordered_map<std::string, uint32_t> randomSlots;
                 for (const auto &op : model_.operations())
                 {
                     for (const auto result : model_.results(op)) producers_[result.index] = op.id;
                     const auto name = model_.text(op.opType);
+                    if (name == "core.system.function")
+                    {
+                        const auto *sample = parameter<int64_t>(model_, model_.parameters(op), "sample_id");
+                        const auto key = sample && *sample > 0 ? "sample:" + std::to_string(*sample) :
+                                                              "op:" + std::to_string(op.id.index);
+                        const auto [slot, inserted] = randomSlots.try_emplace(key, randomSampleCount_);
+                        if (inserted) ++randomSampleCount_;
+                        randomFunctions_.emplace(op.id.index, slot->second);
+                    }
                     if (name == "core.compute.constant" && model_.results(op).size() == 1)
                     {
                         const auto &resultType = type(model_.results(op)[0]);
@@ -495,6 +505,9 @@ namespace wolvrix::lib::grhsim
                             onceTasks_.emplace(op.id.index, onceTasks_.size());
                     }
                 }
+                for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
+                    for (const auto opId : supernodeOps_[ordinal])
+                        if (randomFunctions_.contains(opId.index)) randomSupernodes_.insert(ordinal);
                 // Constant-valued boundary fields are preloaded at init() so a
                 // consumer can never observe a stale zero before the producer
                 // supernode fires; the producer's compare-store then never fires.
@@ -579,6 +592,9 @@ namespace wolvrix::lib::grhsim
             std::map<const CpuStoreField *, std::string> constBoundaryInit_;
             bool hasSystemTasks_ = false;
             std::unordered_map<uint32_t, uint32_t> onceTasks_;
+            std::unordered_map<uint32_t, uint32_t> randomFunctions_;
+            std::set<uint32_t> randomSupernodes_;
+            uint32_t randomSampleCount_ = 0;
 
             // Per-function value locals: values with a live cpu_v<index> local in
             // the function currently being emitted.
@@ -659,6 +675,7 @@ namespace wolvrix::lib::grhsim
             // ----- Validation -----
             void validatePort(std::string_view name, std::set<std::string> &names) const;
             void validateSystemTask(const SimOp &op) const;
+            void validateSystemFunction(const SimOp &op) const;
             void validateDpiCall(const SimOp &op) const;
             void validateInit() const;
 
@@ -933,7 +950,7 @@ namespace wolvrix::lib::grhsim
                 }
                 std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, typeOf(1).width);
                 if (kind == "sliceArray")
-                    start = "(" + start + ")>=64/" + std::to_string(width) + "+1?64:" + start + "*" + std::to_string(width) + ")";
+                    start = "((" + start + ")>=64/" + std::to_string(width) + "+1?64:(" + start + ")*" + std::to_string(width) + ")";
                 return "grhsim_slice_dynamic_u64(grhsim_trunc_u64(" + raw(0) + "," + std::to_string(typeOf(0).width) +
                        ")," + start + "," + std::to_string(width) + ")";
             }
@@ -1103,6 +1120,14 @@ namespace wolvrix::lib::grhsim
                 if (!boolean) boolean = parameter<bool>(model_, params, "constValue");
                 if (boolean) return literal(*boolean ? "1" : "0", result);
                 throw std::runtime_error("CPU constant requires value literal");
+            }
+            if (name == "core.system.function")
+            {
+                const auto slot = randomFunctions_.at(op.id.index);
+                return "([&](){if(!cpu_random_sampled[" + std::to_string(slot) + "]){cpu_random_values[" +
+                       std::to_string(slot) + "]=grhsim_random_u64(cpu_rng," + std::to_string(width) +
+                       ");cpu_random_sampled[" + std::to_string(slot) + "]=true;}return cpu_random_values[" +
+                       std::to_string(slot) + "]; }())";
             }
             if (!name.starts_with("core.compute.")) throw std::runtime_error("CPU six-phase emit unsupported operation: " + std::string(name));
             const auto kind = name.substr(13);
@@ -1870,7 +1895,7 @@ namespace wolvrix::lib::grhsim
             const auto &type = model_.types()[id.index - 1];
             if (type.kind == TypeKind::Array)
                 throw std::runtime_error("CPU DPI unpacked array ABI is not implemented");
-            if (type.kind == TypeKind::Logic && type.width == 1) return "bool";
+            if (type.kind == TypeKind::Logic && type.width == 1) return "std::uint8_t";
             return cppType(type);
         }
         std::string SixPhaseEmitter::dpiDeclaration(const ExternFunction &function) const
@@ -1999,6 +2024,7 @@ namespace wolvrix::lib::grhsim
             {
                 const auto opName = model_.text(op.opType);
                 if (opName == "core.system.task") validateSystemTask(op);
+                else if (opName == "core.system.function") validateSystemFunction(op);
                 else if (opName == "core.dpi.call") validateDpiCall(op);
             }
             // Dry-run every body generator so write() cannot fail mid-file.
@@ -2039,6 +2065,16 @@ namespace wolvrix::lib::grhsim
             for (auto operand : model_.operands(op).subspan(1))
                 if (type(operand).kind == TypeKind::Array)
                     throw std::runtime_error("CPU system task array arguments are not implemented");
+        }
+        void SixPhaseEmitter::validateSystemFunction(const SimOp &op) const
+        {
+            const auto *name = parameter<std::string>(model_, model_.parameters(op), "name");
+            const auto results = model_.results(op);
+            if (!name || *name != "random" || !model_.operands(op).empty() || results.size() != 1 ||
+                !model_.objectRefs(op).empty() || !isScalarLogic(type(results[0])) ||
+                type(results[0]).width > 32)
+                throw std::runtime_error("CPU system function is not implemented: " +
+                                         (name ? *name : std::string("<missing>")));
         }
         void SixPhaseEmitter::validateDpiCall(const SimOp &op) const
         {
@@ -2495,6 +2531,9 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             for (const auto &field : activeStore_->fields)
                 out << cppStoreType(field.type) << ' ' << model_.text(field.name) << "{}; // supernodes=" << field.aux << '\n';
             out << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
+            if (randomSampleCount_)
+                out << "std::array<std::uint64_t," << randomSampleCount_ << "> cpu_random_values{};\n"
+                    << "std::array<bool," << randomSampleCount_ << "> cpu_random_sampled{};\n";
             out << "void pInput();\nvoid pEvent();\nvoid pGeneral();\nvoid pMem();\nbool pPublish();\nvoid pOutput();\n";
             for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
                 out << "void " << supernodeName(ordinal) << "();\n";
@@ -2583,6 +2622,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             // their write lands without raising dataActiveFlag (spec §3.3).
             const auto dataActive = model_.text(activeStore_->fields[1].name);
             out << "void " << class_ << "::pInput(){\n";
+            for (const auto ordinal : randomSupernodes_) out << dataActive << '[' << ordinal << "]=1;\n";
             for (const auto &input : model_.inputs())
             {
                 const auto *field = input.id.index < boundaryByInput_.size() ? boundaryByInput_[input.id.index] : nullptr;
@@ -2673,6 +2713,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         {
             out << "void " << class_ << "::eval(){\n"
                 << "GRHSIM_PERF_COUNT(evalCount);\n"
+                << (randomFunctions_.empty() ? "" : "cpu_random_sampled.fill(false);\n")
                 << "pInput();\n"
                 << "bool cpu_converged=false;\n"
                 << "for(std::uint32_t cpu_round=1;cpu_round<=100000;++cpu_round){\n"
@@ -2702,6 +2743,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             const auto dataNext = model_.text(activeStore_->fields[2].name);
             out << eventActive << ".fill(0);\n" << dataActive << ".fill(1);\n" << dataNext << ".fill(0);\n"
                 << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
+            if (!randomFunctions_.empty()) out << "cpu_random_values.fill(0);\ncpu_random_sampled.fill(false);\n";
             initBody(out, 0);
             for (const auto &[field, expr] : constBoundaryInit_)
                 out << "boundaryValueStore." << model_.text(field->name) << '=' << expr << ";\n";

@@ -521,13 +521,15 @@ namespace wolvrix::lib::grhsim
         {
             if (mapping.backend != backend) continue;
             mapping.schema = schema;
-            mapping.complete = cpu.stage == CpuMappingStage::Schedule;
+            mapping.complete = cpu.stage == CpuMappingStage::Schedule ||
+                               cpu.stage == CpuMappingStage::PhaseSchedule;
             mapping.sourceIdentity = identity_;
             mapping.sourceSemanticRevision = semanticRevision_;
             mapping.cpu = std::move(cpu);
             return;
         }
-        addMapping("cpu", "cpu.st.v1", cpu.stage == CpuMappingStage::Schedule);
+        addMapping("cpu", "cpu.st.v1", cpu.stage == CpuMappingStage::Schedule ||
+                                       cpu.stage == CpuMappingStage::PhaseSchedule);
         mappings_.back().cpu = std::move(cpu);
     }
 
@@ -739,6 +741,7 @@ namespace wolvrix::lib::grhsim
         case CpuNamedStoreKind::PrevEvent: return "prevEvent";
         case CpuNamedStoreKind::EventAct: return "eventAct";
         case CpuNamedStoreKind::TimeslotTrigger: return "timeslotTrigger";
+        case CpuNamedStoreKind::ActiveFlags: return "activeFlags";
         }
         return "unknown";
     }
@@ -751,6 +754,7 @@ namespace wolvrix::lib::grhsim
         if (text == "prevEvent") return CpuNamedStoreKind::PrevEvent;
         if (text == "eventAct") return CpuNamedStoreKind::EventAct;
         if (text == "timeslotTrigger") return CpuNamedStoreKind::TimeslotTrigger;
+        if (text == "activeFlags") return CpuNamedStoreKind::ActiveFlags;
         return std::nullopt;
     }
 

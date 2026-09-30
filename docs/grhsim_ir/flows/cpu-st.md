@@ -398,3 +398,43 @@ Output，并完成总相覆盖——全模型不得再有 phase-less op）；`bu
 一致且含事件 supernode 满足事件域禁止条件；旧 stage 的校验逻辑不变。六阶段 mapping
 不携带 dataLayout/schedule payload（总相覆盖与 eventActs 校验随新 stage 启用，模型级
 verifyGrhSimModel 的其余 M3 检查留待后续里程碑）。
+
+## 演进（M4）
+
+M4 在 M3 的 `GeneralFunctions` 之后接上布局/调度四个 pass，六阶段管线由此到达终态
+`PhaseSchedule`——`complete=true` 的另一合法档位（旧管线仍以 `Schedule` 为终态，判定
+不变）。pass 序列：
+
+| 顺序 | pass | stage 前置 → 产出 | 说明文档 |
+| --- | --- | --- | --- |
+| 5 | `cpu.st.layout-named-stores` | `GeneralFunctions` → `LayoutNamedStores` | [layout-named-stores](../passes/layout-named-stores.md) |
+| 6 | `cpu.st.build-event-bitmaps` | `LayoutNamedStores` → `EventBitmaps` | [build-event-bitmaps](../passes/build-event-bitmaps.md) |
+| 7 | `cpu.st.build-mem-write-plan` | `EventBitmaps` → `MemWritePlan` | [build-mem-write-plan](../passes/build-mem-write-plan.md) |
+| 8 | `cpu.st.build-phase-schedule` | `MemWritePlan` → `PhaseSchedule` | [build-phase-schedule](../passes/build-phase-schedule.md) |
+
+各 pass 要点：
+
+- `layout-named-stores` 填充 `dataLayout` 的物理类型表与七个具名 store
+  （regLatch/mem/boundary/prevEvent/eventAct/timeslotTrigger/activeFlags），legacy 布局
+  字段留空；命名推演（declaredSymbol 清洗、全图唯一化、无名值的 op 类别前缀回退）
+  集中在本 pass，emit 只消费。
+- `build-event-bitmaps` 定义 supernode 序号（General 分枝按树序：emit function 子序 →
+  supernode 子序，0..N-1，ActiveFlags 字节数组与位图共用），并复用 M3 的影响图为每个
+  (event,edge) 聚类填 P_general 位图；S(sn)=∅ 的豁免 supernode 不进任何位图。
+- `build-mem-write-plan` 记录 P_mem 写 op 的 per-mem 静态优先级（op id 升序，同地址
+  后写覆盖先写）、General 相 memRead 读者表（常量地址给精确 staticRow，动态地址保守
+  留空）与 event-free 标记。
+- `build-phase-schedule` 填 input/supernode/state 三张 fanout（纯事件输入无条目、
+  mem state 无 stateFanout 行、supernodeFanout 不含 Mem 消费者）、timeslotFlag ×
+  event_acts 的 timeslot 触发映射，以及单核 task 序列：P_event(AlwaysScanCommit) →
+  P_general 各 emit 函数(EventDataGated) → P_mem(AlwaysScanCommit) →
+  P_output(EvalEnd，round 循环外)。
+
+`verifyCpuMapping` 的变化：`SplitPhases..GeneralFunctions` 段继续拒绝
+dataLayout/schedule payload；`LayoutNamedStores` 起按 stage 逐级校验新 payload——
+namedStores 走结构校验（类型表 id 稠密、七 store 定序、字段名全图唯一、偏移对齐不
+重叠且与 sizeBytes 一致、state store 与 state 双射、boundary 值集按图重算、每聚类一
+prevEvent/eventAct 条目、timeslot flag 集匹配、activeFlags 形态），位图、mem 写计划、
+fanout/task/trigger 均按模型与 partition 树重算并要求完全一致；旧 stage 校验不变。
+JSON 仍是 v2 可选尾字段位置化追加：`timeslotTriggers` 位于 `memWritePlan` 之后，新
+存档可被旧读取方按位置截断读取，旧存档缺少尾字段时按缺省处理。

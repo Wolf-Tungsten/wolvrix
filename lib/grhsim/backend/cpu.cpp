@@ -185,7 +185,8 @@ namespace wolvrix::lib::grhsim
         // Six-phase (M3) structural verification for the
         // SplitPhases..GeneralFunctions stages. The legacy two-phase checks
         // below do not apply; layout/schedule payloads are not part of the
-        // six-phase pipeline.
+        // six-phase pipeline until the M4 stages (LayoutNamedStores on),
+        // which hand the payload to verifyCpuDataLayout/verifyCpuSchedule.
         bool verifyCpuPhases(const GrhSimModel &model, const CpuBackendMapping &cpu,
                              diag::Diagnostics &diagnostics)
         {
@@ -193,7 +194,7 @@ namespace wolvrix::lib::grhsim
                 diagnostics.error(std::move(message), "cpu.mapping");
                 return false;
             };
-            if (cpu.dataLayout || cpu.schedule)
+            if (cpu.stage < CpuMappingStage::LayoutNamedStores && (cpu.dataLayout || cpu.schedule))
                 return error("six-phase CPU mapping must not carry data layout or schedule payloads");
             const auto &tree = cpu.partitionTree;
             const auto validPartition = [&](PartitionId id) {
@@ -437,6 +438,8 @@ namespace wolvrix::lib::grhsim
                         return error("general supernode violates the event domain constraint");
                 }
             }
+            if (cpu.stage >= CpuMappingStage::LayoutNamedStores)
+                return verifyCpuDataLayout(model, cpu, diagnostics) && verifyCpuSchedule(model, cpu, diagnostics);
             return true;
         }
     }
@@ -451,9 +454,12 @@ namespace wolvrix::lib::grhsim
         if (model.text(mapping.backend) != "cpu" || model.text(mapping.schema) != "cpu.st.v1" || !mapping.cpu)
             return error("CPU mapping requires a typed cpu.st.v1 payload");
         const auto &cpu = *mapping.cpu;
-        if (mapping.complete != (cpu.stage == CpuMappingStage::Schedule))
+        // The legacy pipeline completes at Schedule, the six-phase pipeline
+        // at PhaseSchedule; both are valid complete terminals.
+        if (mapping.complete != (cpu.stage == CpuMappingStage::Schedule ||
+                                 cpu.stage == CpuMappingStage::PhaseSchedule))
             return error("CPU mapping completion requires the schedule stage");
-        if (cpu.stage > CpuMappingStage::GeneralFunctions)
+        if (cpu.stage > CpuMappingStage::PhaseSchedule)
             return error("unknown CPU mapping stage");
         if (cpu.stage >= CpuMappingStage::SplitPhases)
             return verifyCpuPhases(model, cpu, diagnostics);

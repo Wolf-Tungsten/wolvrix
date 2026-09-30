@@ -657,9 +657,12 @@ namespace wolvrix::lib::grhsim
             writer.value(static_cast<std::uint64_t>(schedule.quiescenceProjection.size())); writer.startArray();
             for (const auto word : projectionWords) writer.value(word);
             writer.endArray();
+            // eventBitmaps/memWritePlan/timeslotTriggers are positional
+            // trailing fields: a present later field forces the earlier ones
+            // to serialize (possibly as empty arrays).
+            const bool eventTail = schedule.eventBitmaps || schedule.memWritePlan || schedule.timeslotTriggers;
             // Optional trailing field: only written when set, so flag-off
             // checkpoints stay byte-compatible with the pre-NO00014 schema.
-            const bool eventTail = schedule.eventBitmaps || schedule.memWritePlan;
             if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion || schedule.foldResidue ||
                 eventTail)
                 writer.value(static_cast<std::uint64_t>(schedule.demonitorRedundant ? 1 : 0));
@@ -675,8 +678,7 @@ namespace wolvrix::lib::grhsim
             if (schedule.foldResidue || eventTail)
                 writeIdArray<OpId>(writer, schedule.foldResidueOps);
             // Optional trailing fields (M1 shells), positional: eventBitmaps,
-            // then memWritePlan; a present memWritePlan forces the bitmaps
-            // array to serialize (possibly empty).
+            // then memWritePlan, then timeslotTriggers (M4).
             if (eventTail)
             {
                 writer.startArray();
@@ -692,21 +694,34 @@ namespace wolvrix::lib::grhsim
                 }
                 writer.endArray();
             }
-            if (schedule.memWritePlan)
+            if (schedule.memWritePlan || schedule.timeslotTriggers)
             {
                 writer.startArray();
-                for (const auto &entry : *schedule.memWritePlan)
+                if (schedule.memWritePlan)
                 {
-                    writer.startArray(); writeId(writer, entry.writeOp);
-                    writer.value(static_cast<uint64_t>(entry.priority)); writer.value(entry.eventFree);
-                    writer.startArray();
-                    for (const auto &memReader : entry.readers)
+                    for (const auto &entry : *schedule.memWritePlan)
                     {
-                        writer.startArray(); writeId(writer, memReader.owner); writer.startArray();
-                        if (memReader.staticRow) writer.value(*memReader.staticRow);
+                        writer.startArray(); writeId(writer, entry.writeOp);
+                        writer.value(static_cast<uint64_t>(entry.priority)); writer.value(entry.eventFree);
+                        writer.startArray();
+                        for (const auto &memReader : entry.readers)
+                        {
+                            writer.startArray(); writeId(writer, memReader.owner); writer.startArray();
+                            if (memReader.staticRow) writer.value(*memReader.staticRow);
+                            writer.endArray(); writer.endArray();
+                        }
                         writer.endArray(); writer.endArray();
                     }
-                    writer.endArray(); writer.endArray();
+                }
+                writer.endArray();
+            }
+            if (schedule.timeslotTriggers)
+            {
+                writer.startArray();
+                for (const auto &trigger : *schedule.timeslotTriggers)
+                {
+                    writer.startArray(); writer.value(static_cast<uint64_t>(trigger.act));
+                    writer.value(static_cast<uint64_t>(trigger.flag)); writer.endArray();
                 }
                 writer.endArray();
             }
@@ -919,7 +934,7 @@ namespace wolvrix::lib::grhsim
                         reader.startArray(); task.id = readId<CpuTaskId>(reader, "task ID");
                         expectComma(reader); task.partition = readId<PartitionId>(reader, "task partition");
                         expectComma(reader); task.waitsFor = readIdArray<CpuTaskId>(reader, "task dependency");
-                        expectComma(reader); task.execution = readCpuEnum(reader, CpuExecution::AlwaysScanCommit);
+                        expectComma(reader); task.execution = readCpuEnum(reader, CpuExecution::EvalEnd);
                         reader.endArray(); core.tasks.push_back(std::move(task));
                     }
                     reader.endArray(); node.cores.push_back(std::move(core));
@@ -940,7 +955,7 @@ namespace wolvrix::lib::grhsim
                 schedule.inputShadows.push_back(shadow);
             }
             expectComma(reader); schedule.inputShadowBytes = reader.unsignedInteger();
-            expectComma(reader); const auto projectionBits = reader.index("quiescence projection bits", false);
+            expectComma(reader); const auto projectionBits = reader.index("quiescence projection bits", true);
             expectComma(reader); schedule.quiescenceProjection.assign(projectionBits, false);
             reader.startArray(); first = true;
             std::size_t bit = 0;
@@ -1001,6 +1016,17 @@ namespace wolvrix::lib::grhsim
                     schedule.memWritePlan->push_back(std::move(entry));
                 }
             }
+            if (reader.comma())
+            {
+                schedule.timeslotTriggers.emplace(); reader.startArray(); first = true;
+                while (reader.nextArray(first))
+                {
+                    CpuTimeslotTrigger trigger;
+                    reader.startArray(); trigger.act = reader.index("timeslot trigger act", true);
+                    expectComma(reader); trigger.flag = reader.index("timeslot trigger flag", true);
+                    reader.endArray(); schedule.timeslotTriggers->push_back(trigger);
+                }
+            }
             reader.endArray();
             return schedule;
         }
@@ -1008,7 +1034,7 @@ namespace wolvrix::lib::grhsim
         CpuBackendMapping readCpuMapping(StreamReader &reader)
         {
             CpuBackendMapping cpu;
-            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::GeneralFunctions);
+            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::PhaseSchedule);
             expectComma(reader); cpu.partitionTree.root = readId<PartitionId>(reader, "partition root");
             expectComma(reader); reader.startArray();
             bool first = true;
@@ -1560,7 +1586,10 @@ namespace wolvrix::lib::grhsim
                     if (model->text(backend) != "cpu" || model->text(schema) != "cpu.st.v1")
                         throw std::runtime_error("unexpected CPU mapping payload or completion flag");
                     auto cpu = readCpuMapping(reader);
-                    if (complete != (cpu.stage == CpuMappingStage::Schedule))
+                    // The six-phase pipeline completes at PhaseSchedule; the
+                    // legacy pipeline completes at Schedule.
+                    if (complete != (cpu.stage == CpuMappingStage::Schedule ||
+                                     cpu.stage == CpuMappingStage::PhaseSchedule))
                         throw std::runtime_error("CPU mapping completion disagrees with stage");
                     model->setCpuMapping(std::move(cpu));
                     reader.endArray();

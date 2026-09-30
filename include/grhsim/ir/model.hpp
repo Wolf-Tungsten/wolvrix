@@ -304,8 +304,10 @@ namespace wolvrix::lib::grhsim
     enum class CpuEventEdge : uint8_t { Posedge, Negedge };
     // SplitPhase..Schedule is the legacy pipeline. The M3 six-phase pipeline
     // appends SplitPhases (four-way split) -> GeneralNodes -> GeneralSupernodes
-    // -> GeneralFunctions; old stages keep their numeric values.
-    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions };
+    // -> GeneralFunctions; the M4 layout/schedule passes append
+    // LayoutNamedStores -> EventBitmaps -> MemWritePlan -> PhaseSchedule
+    // (the six-phase complete terminal); old stages keep their numeric values.
+    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions, LayoutNamedStores, EventBitmaps, MemWritePlan, PhaseSchedule };
 
     struct CpuEvent
     {
@@ -356,7 +358,7 @@ namespace wolvrix::lib::grhsim
     enum class CpuTypeKind : uint8_t { Bool, UInt, SInt, F32, F64, String, Array };
     enum class CpuStorageKind : uint8_t { Object, PartitionLocal, Boundary };
     enum class CpuRuntimeKind : uint8_t { ActiveWord, DomainArm, EventEdge };
-    enum class CpuNamedStoreKind : uint8_t { RegLatch, Mem, Boundary, PrevEvent, EventAct, TimeslotTrigger };
+    enum class CpuNamedStoreKind : uint8_t { RegLatch, Mem, Boundary, PrevEvent, EventAct, TimeslotTrigger, ActiveFlags };
 
     struct CpuType
     {
@@ -447,13 +449,13 @@ namespace wolvrix::lib::grhsim
         std::optional<std::vector<CpuHelperReadCache>> helperReadCaches;
         // Optional for old checkpoints. M1 shell for the six-phase model's
         // named store layout (regLatchStore/memStore/boundaryValueStore/
-        // prevEventStore/eventActStore/timeslotTriggerFlag); no pass fills it
-        // before the M4 named-store layout rework.
+        // prevEventStore/eventActStore/timeslotTriggerFlag/activeFlags),
+        // filled by the M4 cpu.st.layout-named-stores pass.
         std::optional<std::vector<CpuNamedStore>> namedStores;
         friend bool operator==(const CpuDataLayout &, const CpuDataLayout &) = default;
     };
 
-    enum class CpuExecution : uint8_t { ActivityDrivenCompute, DomainGatedCommit, AlwaysScanCommit };
+    enum class CpuExecution : uint8_t { ActivityDrivenCompute, DomainGatedCommit, AlwaysScanCommit, EventDataGated, EvalEnd };
 
     struct CpuActivationTargets
     {
@@ -524,6 +526,16 @@ namespace wolvrix::lib::grhsim
         friend bool operator==(const CpuMemWritePlanEntry &, const CpuMemWritePlanEntry &) = default;
     };
 
+    // M4 timeslot trigger mapping: firing event act cluster `act` sets
+    // timeslot flag `flag` (from the Output-phase timeslot tasks'
+    // timeslotFlag x event_acts Cartesian expansion).
+    struct CpuTimeslotTrigger
+    {
+        uint32_t act = 0;
+        uint32_t flag = 0;
+        friend bool operator==(const CpuTimeslotTrigger &, const CpuTimeslotTrigger &) = default;
+    };
+
     struct CpuSchedulePlan
     {
         std::vector<CpuNumaSchedule> numaNodes;
@@ -563,9 +575,14 @@ namespace wolvrix::lib::grhsim
         // Optional for old checkpoints. M1 shells for the six-phase model:
         // (event,edge) cluster -> P_general supernode bitmaps rebuilt by
         // P_event, and the P_mem write plan (priority order, reader tables,
-        // event-free writes). No pass fills them before M4.
+        // event-free writes). Filled by the M4 cpu.st.build-event-bitmaps /
+        // cpu.st.build-mem-write-plan passes.
         std::optional<std::vector<CpuEventBitmap>> eventBitmaps;
         std::optional<std::vector<CpuMemWritePlanEntry>> memWritePlan;
+        // Optional for old checkpoints. M4 shell (positional JSON tail after
+        // memWritePlan): event act -> timeslot flag triggers collected from
+        // the Output-phase timeslot tasks by cpu.st.build-phase-schedule.
+        std::optional<std::vector<CpuTimeslotTrigger>> timeslotTriggers;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 

@@ -223,6 +223,12 @@ namespace wolvrix::lib::grhsim
                             const auto &type = typeOf(operands[i]);
                             const auto typeId = model.values()[operands[i].index - 1].type;
                             const auto prev = model.addState(base + std::to_string(i), typeId);
+                            // M5d-4 incremental classification: time-slot
+                            // monitoring states are small latch histories and
+                            // commit with the regLatch publish boundary; the
+                            // Output-phase latchWrite timing is unchanged.
+                            if (model.hasStateStoreClassification())
+                                model.setStateStoreClass(prev, StateStoreClass::RegLatch);
                             const std::array initParams{Parameter{
                                 model.intern("value"), hexLiteral(type.width, 0)}};
                             const std::array steps{

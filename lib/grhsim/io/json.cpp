@@ -1280,7 +1280,13 @@ namespace wolvrix::lib::grhsim
             for (const StateObject &object : model.states())
             {
                 writer.startArray(); writeId(writer, object.id); writeId(writer, object.name);
-                writeId(writer, object.type); writeId(writer, object.origin); writer.endArray();
+                writeId(writer, object.type); writeId(writer, object.origin);
+                // Optional fifth element (M5d-4): the state store class,
+                // written only once the model is classified, so unclassified
+                // checkpoints stay byte-compatible with the older schema.
+                if (object.storeClass != StateStoreClass::None)
+                    writer.value(toString(object.storeClass));
+                writer.endArray();
             }
             writer.endArray();
 
@@ -1514,9 +1520,21 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); const StringId name = readId<StringId>(reader, "state name");
                 expectComma(reader); const TypeId type = readId<TypeId>(reader, "state type");
                 expectComma(reader); const OriginId origin = readId<OriginId>(reader, "state origin", true);
-                reader.endArray();
+                // Optional fifth element (M5d-4): the state store class.
+                StateStoreClass storeClass = StateStoreClass::None;
+                bool tailFirst = false;
+                if (reader.nextArray(tailFirst))
+                {
+                    const auto parsed = parseStateStoreClass(reader.string());
+                    if (!parsed || *parsed == StateStoreClass::None)
+                        throw std::runtime_error("unknown state store class");
+                    storeClass = *parsed;
+                    reader.endArray();
+                }
                 if (model->addState(model->text(name), type, origin) != expected)
                     throw std::runtime_error("state IDs are not sequential");
+                if (storeClass != StateStoreClass::None)
+                    model->setStateStoreClass(expected, storeClass);
             }
 
             reader.key("functions", false); first = true; reader.startArray();

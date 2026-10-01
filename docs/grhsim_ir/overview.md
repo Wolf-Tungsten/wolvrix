@@ -294,6 +294,32 @@ JSON checkpoint 中 `declaredSymbols`、`generateGroups`、`declProvenance` 依�
 `mappings` 之后的可选尾键，缺省为空集合；不含这些键的旧格式 checkpoint 可直接读取。
 `declProvenance` 非空时前两个键会一并写出（可能为空数组），保持尾键的位置化编码。
 
+### 3.5 状态存储分类（stateStoreClass）
+
+每个 `StateObject` 携带一个**存储分类**注解（`StateStoreClass`），由
+[`grhsim.select-state-stores`](passes/select-state-stores.md)（A7，唯一分类决策点）
+在全图优化段末尾写入：
+
+```text
+StateStoreClass = none | regLatch | mem
+```
+
+- `none`：模型尚未分类（仅 A7 之前合法；分类一旦出现必须覆盖全部状态）；
+- `regLatch`：零碎/标量状态——写入合并进 next 缓冲，`P_publish` 以整块拷贝提交（NBA）；
+- `mem`：大块连续数组状态——写参数在计算阶段采样，`P_mem` 按优先级原地提交，
+  避免整块拷贝。两类都实现相同的"读旧值、写延迟一轮"NBA 语义，区别只在提交机制与
+  成本结构；逐类的旧值读取、部分写、多写优先级与多轮更新契约见 pass 文档。
+
+分类是**语义层注解**，不是物理布局：字节布局由后端映射（C3 `layout-named-stores`）
+消费该注解后完成；后端与分区 pass 不得仅凭状态的 `TypeKind::Array` 重新推导归属。
+维护契约：分类是 `StateObject` 的字段，`compact()`/`clone()` 随状态自动携带；
+在已分类模型上创建或重建状态的 pass 必须在创建时增量分类（见 pass 文档的增量规则）。
+verifier 强制：分类要么全有要么全无（totality）、`mem` 仅限 `core.array` 状态、
+`mem` 类状态不得被 `regWrite`/`latchWrite` 写（其写口必须是 mem op，由 P_mem 承接提交）。
+
+JSON checkpoint 中分类是 `states` 行的可选第五元素（`[id, name, type, origin, class]`），
+仅在已分类时写出：未分类 checkpoint 与旧模式字节兼容，已分类 checkpoint 字节稳定往返。
+
 ## 4. 执行语义
 
 ### 4.1 单次图状态转移

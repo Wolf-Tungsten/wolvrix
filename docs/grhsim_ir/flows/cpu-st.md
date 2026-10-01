@@ -57,8 +57,11 @@ XiangShan 入口在 lower 成功后先执行全图优化段（M5d-3 起的目标
 [`grhsim.comb-pack`](../passes/comb-pack.md)（全图同构组合 lane 打包）、
 [`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)（bit 寄存器打包，改用原始
 event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全图不动点化简，
-最后 [`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)（保持在最后一次含 CSE 的
-化简之后），再进入下表的 CPU mapping；这些 pass 不修改 GRH。
+接着 [`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)（保持在最后一次含 CSE 的
+化简之后），最后 [`grhsim.select-state-stores`](../passes/select-state-stores.md)（M5d-4，A7）
+完成语义存储分类——每个状态获得 `regLatch`/`mem` 归属与对应 NBA 提交契约（见
+[Overview](../overview.md) 第 3.5 节），再进入下表的 CPU mapping；这些 pass 不修改 GRH。
+分类注解当前不被旧 mapping pass 消费（C3 消费接线属 M5d-6），接入不改变生成代码。
 
 完成首次mapping后，XiangShan入口继续执行
 `grhsim.canonicalize-compute`、
@@ -67,7 +70,10 @@ event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全
 [`grhsim.used-bits`](../passes/used-bits.md) 的既有后置化简序列，并完整重跑 CPU mapping
 （该后置段属既有生产结构，目标 B/C 段改造前保持不变）。
 集成开关为 `XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1` 与
-`XS_WOLF_GRHSIM_IR_COMB_PACK=0/1`（及对应 `*_REPORT` TSV 诊断输出）。
+`XS_WOLF_GRHSIM_IR_COMB_PACK=0/1`（及对应 `*_REPORT` TSV 诊断输出）；
+M5d-4 起另有 `XS_WOLF_GRHSIM_IR_SELECT_STATE_STORES=0/1`、
+`XS_WOLF_GRHSIM_IR_STATE_STORE_REPORT`（逐状态分类 TSV）与
+`XS_WOLF_GRHSIM_IR_MEM_MIN_BYTES`（mem 类最小字节阈值）。
 
 最终 mapping 前运行 [`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)，
 将全部 operand/result 为 unsigned two-state bit 的 mux 转为按位选择 op，

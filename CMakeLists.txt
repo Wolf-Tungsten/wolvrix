@@ -140,6 +140,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/fold_residue.cpp
     lib/grhsim/pass/used_bits.cpp
     lib/grhsim/pass/pack_bit_registers.cpp
+    lib/grhsim/pass/select_state_stores.cpp
     lib/grhsim/pass/cone_extract.cpp
     lib/grhsim/pass/classify_event_inputs.cpp
     lib/grhsim/pass/lower_edge_detect.cpp
@@ -404,6 +405,22 @@ target_compile_definitions(grhsim-whole-opt-tests
 )
 
 register_test_exe(grhsim-whole-opt-tests)
+
+add_executable(grhsim-select-state-stores-tests
+    tests/grhsim/test_grhsim_select_state_stores.cpp
+)
+
+target_link_libraries(grhsim-select-state-stores-tests
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-select-state-stores-tests
+    PRIVATE
+        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
+)
+
+register_test_exe(grhsim-select-state-stores-tests)
 
 add_executable(grhsim-cpu-mapping-tests tests/grhsim/test_cpu_mapping.cpp)
 add_executable(grhsim-reg-to-mem-tests tests/grhsim/test_reg_to_mem.cpp tests/grhsim/test_reg_to_mem_semantics.cpp)

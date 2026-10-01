@@ -542,6 +542,11 @@ namespace wolvrix::lib::grhsim
                     const bool stateSigned = types[state.type.index - 1].isSigned;
                     const auto newType = model.logicType(narrowed, stateSigned, LogicDomain::TwoState);
                     const auto newState = model.addState(model.text(state.name), newType, state.origin);
+                    // M5d-4 incremental classification: the rebuilt state
+                    // inherits the store class of the state it replaces
+                    // (narrowing only applies to scalar two-state logic).
+                    if (state.storeClass != StateStoreClass::None)
+                        model.setStateStoreClass(newState, state.storeClass);
                     newStateOf[s] = newState;
                     newWidthOf[s] = narrowed;
                     newSignOf[s] = stateSigned;

@@ -378,6 +378,20 @@ namespace wolvrix::lib::grhsim
         operations_[id.index - 1].phase = phase;
     }
 
+    void GrhSimModel::setStateStoreClass(StateId id, StateStoreClass storeClass)
+    {
+        if (id.generation != 0 || !id.index || id.index > states_.size())
+            throw std::out_of_range("setStateStoreClass ID is invalid");
+        states_[id.index - 1].storeClass = storeClass;
+    }
+
+    bool GrhSimModel::hasStateStoreClassification() const noexcept
+    {
+        for (const auto &state : states_)
+            if (state.storeClass != StateStoreClass::None) return true;
+        return false;
+    }
+
     void GrhSimModel::addInit(StateId state, std::span<const InitStep> steps,
                               std::span<const Parameter> stepParameters)
     {
@@ -782,6 +796,25 @@ namespace wolvrix::lib::grhsim
         if (text == "general") return SimPhase::General;
         if (text == "mem") return SimPhase::Mem;
         if (text == "output") return SimPhase::Output;
+        return std::nullopt;
+    }
+
+    std::string_view toString(StateStoreClass storeClass) noexcept
+    {
+        switch (storeClass)
+        {
+        case StateStoreClass::None: return "none";
+        case StateStoreClass::RegLatch: return "regLatch";
+        case StateStoreClass::Mem: return "mem";
+        }
+        return "unknown";
+    }
+
+    std::optional<StateStoreClass> parseStateStoreClass(std::string_view text) noexcept
+    {
+        if (text == "none") return StateStoreClass::None;
+        if (text == "regLatch") return StateStoreClass::RegLatch;
+        if (text == "mem") return StateStoreClass::Mem;
         return std::nullopt;
     }
 

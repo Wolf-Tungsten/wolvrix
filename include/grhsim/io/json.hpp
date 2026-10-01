@@ -16,7 +16,8 @@ namespace wolvrix::lib::grhsim
     // six-phase model's named store / event bitmap / mem write plan shells as
     // optional mapping tails; the model-level tail holds the optional
     // declaredSymbols / generateGroups / declProvenance metadata keys in that
-    // order; v1 checkpoints are rejected.
+    // order; a state's store class (M5d-4) is the optional fifth states item,
+    // written only once the model is classified; v1 checkpoints are rejected.
     inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v2";
 
     bool writeGrhSimJson(const GrhSimModel &model,

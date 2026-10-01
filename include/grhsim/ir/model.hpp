@@ -162,12 +162,30 @@ namespace wolvrix::lib::grhsim
         OriginId origin;
     };
 
+    // Semantic store classification (M5d-4, pass grhsim.select-state-stores):
+    // the single decision point that assigns every state its store class.
+    // None means the model predates classification; consumers must reject
+    // None once any state is classified (the verifier enforces totality).
+    // RegLatch states are small/scalar: writes merge into a next buffer and
+    // P_publish commits them with one whole-block copy (NBA). Mem states are
+    // large contiguous arrays: write parameters are sampled before P_mem,
+    // which commits them in place in priority order. The class is a semantic
+    // annotation; backends must consume it instead of re-deriving the
+    // classification from the state's type (e.g. TypeKind::Array).
+    enum class StateStoreClass : uint8_t
+    {
+        None,
+        RegLatch,
+        Mem
+    };
+
     struct StateObject
     {
         StateId id;
         StringId name;
         TypeId type;
         OriginId origin;
+        StateStoreClass storeClass = StateStoreClass::None;
     };
 
     enum class DpiDirection : uint8_t
@@ -753,6 +771,12 @@ namespace wolvrix::lib::grhsim
                               std::span<const Parameter> parameters = {});
         // Sets the op's six-phase attribution; revision commits stay with the caller.
         void setOperationPhase(OpId id, SimPhase phase);
+        // Sets the state's store classification (see StateStoreClass); revision
+        // commits stay with the caller. Passes that create or rebuild states in
+        // an already-classified model (hasStateStoreClassification) must
+        // classify them incrementally to keep the classification total.
+        void setStateStoreClass(StateId id, StateStoreClass storeClass);
+        bool hasStateStoreClassification() const noexcept;
         // Masks include unused slot zero. Removed results must have no retained users.
         // Rebuilds dense IDs/pools and drops mappings; the pass manager commits revision.
         void compact(std::span<const uint8_t> removeOps,
@@ -895,6 +919,8 @@ namespace wolvrix::lib::grhsim
     std::optional<DpiDirection> parseDpiDirection(std::string_view text) noexcept;
     std::string_view toString(SimPhase phase) noexcept;
     std::optional<SimPhase> parseSimPhase(std::string_view text) noexcept;
+    std::string_view toString(StateStoreClass storeClass) noexcept;
+    std::optional<StateStoreClass> parseStateStoreClass(std::string_view text) noexcept;
     std::string_view toString(CpuNamedStoreKind kind) noexcept;
     std::optional<CpuNamedStoreKind> parseCpuNamedStoreKind(std::string_view text) noexcept;
     std::string_view toString(DeclProvenanceKind kind) noexcept;

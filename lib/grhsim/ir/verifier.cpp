@@ -247,9 +247,73 @@ namespace wolvrix::lib::grhsim
             return ok;
         }
 
-        // M1 phase attribution framework: validates the phase of ops that carry
-        // one (edgeDet unconditionally). The M2 event-lowering invariants live
-        // in verifyEventLowering below; M3 will add total phase coverage.
+        // M5d-4 state store classification contract (pass
+        // grhsim.select-state-stores): the classification is the single
+        // decision point for regLatchStore/memStore attribution; consumers
+        // (split-phases, layout, emit) must read the annotation instead of
+        // re-deriving it from the state's type. Structural rules only:
+        // classification is total once present, the mem class requires a
+        // contiguous array state, and a mem-class state's writes must be mem
+        // ops so P_mem can own the in-place commit (regWrite/latchWrite would
+        // bypass it). The per-class NBA contract itself (commit timing,
+        // old-value reads, partial writes, multi-write priority, multi-round
+        // accumulation) is defined by the select-state-stores pass doc.
+        bool verifyStateStores(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            bool ok = true;
+            auto error = [&](const std::string &message, const std::string &context) {
+                diagnostics.error(message, context);
+                ok = false;
+            };
+            std::size_t classified = 0;
+            for (const auto &state : model.states())
+                if (state.storeClass != StateStoreClass::None) ++classified;
+            if (classified == 0) return true;
+            for (std::size_t i = 0; i < model.states().size(); ++i)
+            {
+                const StateObject &state = model.states()[i];
+                const std::string context = "states[" + std::to_string(i) + "]";
+                if (state.storeClass == StateStoreClass::None)
+                {
+                    error("state store classification is not total: state is unclassified "
+                          "while other states carry a class",
+                          context);
+                    continue;
+                }
+                if (state.storeClass == StateStoreClass::Mem)
+                {
+                    if (!validId(state.type, model.types().size())) continue;
+                    if (model.types()[state.type.index - 1].kind != TypeKind::Array)
+                        error("mem store class requires a core.array state", context);
+                }
+            }
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                if (!model.strings().valid(op.opType)) continue;
+                const std::string_view name = model.text(op.opType);
+                if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
+                std::span<const ObjectRef> refs;
+                try
+                {
+                    refs = model.objectRefs(op);
+                }
+                catch (const std::exception &)
+                {
+                    continue; // malformed ranges are reported by the per-op check
+                }
+                if (refs.empty() || refs[0].kind != ObjectKind::State ||
+                    !validId(StateId{refs[0].index, 0}, model.states().size()))
+                    continue;
+                if (model.states()[refs[0].index - 1].storeClass == StateStoreClass::Mem)
+                    error(std::string(name) + " targets a mem-class state; mem states may only "
+                          "be written by core.state.mem* ops so P_mem owns the commit",
+                          "operations[" + std::to_string(i) + "]");
+            }
+            return ok;
+        }
+
+
         // M2b exception: latchWrite may also carry Output — the timeslot
         // __tslot_prev_* write-backs live in P_output (verifyOutputLowering
         // constrains those states to Output-phase latchWrites).
@@ -1119,6 +1183,7 @@ namespace wolvrix::lib::grhsim
                           context + ".symbols[" + std::to_string(j) + "]");
         }
         if (!verifyDeclProvenances(model, diagnostics)) ok = false;
+        if (!verifyStateStores(model, diagnostics)) ok = false;
 
         std::unordered_set<uint32_t> mappingBackends;
         const bool validModel = ok && !diagnostics.hasError();

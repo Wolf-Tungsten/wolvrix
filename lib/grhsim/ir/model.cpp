@@ -563,15 +563,15 @@ namespace wolvrix::lib::grhsim
         {
             if (mapping.backend != backend) continue;
             mapping.schema = schema;
-            mapping.complete = cpu.stage == CpuMappingStage::Schedule ||
-                               cpu.stage == CpuMappingStage::PhaseSchedule;
+            // The six-phase pipeline completes at PhaseSchedule (M5d-6; the
+            // legacy Schedule terminal is gone).
+            mapping.complete = cpu.stage == CpuMappingStage::PhaseSchedule;
             mapping.sourceIdentity = identity_;
             mapping.sourceSemanticRevision = semanticRevision_;
             mapping.cpu = std::move(cpu);
             return;
         }
-        addMapping("cpu", "cpu.st.v1", cpu.stage == CpuMappingStage::Schedule ||
-                                       cpu.stage == CpuMappingStage::PhaseSchedule);
+        addMapping("cpu", "cpu.st.v1", cpu.stage == CpuMappingStage::PhaseSchedule);
         mappings_.back().cpu = std::move(cpu);
     }
 

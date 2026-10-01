@@ -1,15 +1,17 @@
 # Event bitmaps
 
-`cpu.st.build-event-bitmaps` is the sixth pass of the six-phase CPU mapping
-pipeline (the second M4 pass). Requires a `LayoutNamedStores`-stage mapping;
-produces the `EventBitmaps` stage by filling `schedule.eventBitmaps`. Every
-legacy schedule field (roundSeeds/inputShadows/quiescenceProjection/…) stays
-empty on the six-phase pipeline.
+`cpu.st.build-event-bitmaps` is the fourth pass (C4) of the CPU mapping
+C segment. Requires a `LayoutNamedStores`-stage mapping; produces the
+`EventBitmaps` stage by filling `schedule.eventBitmaps`. The legacy schedule
+payload fields (roundSeeds/inputShadows/quiescenceProjection/…) were removed
+in M5d-6.
 
 **Supernode ordinal.** The index space shared by the event bitmaps and the
-ActiveFlags byte arrays: the General branch flattened in tree order — emit
-function child order, then each function's supernode child order — numbered
-0..N-1. Partition ids never reach the emitter.
+ActiveFlags byte arrays is exactly the one fixed by C2: the General branch's
+direct supernode children in partition order, numbered 0..N-1 (see
+[merge-general-supernodes](merge-general-supernodes.md); C6's emit functions
+only record intervals over it and never renumber). Partition ids never reach
+the emitter.
 
 **Act sets.** The pass reuses the M3 `computeCpuEventDomainSets` influence
 graph (op-level value fanout closure over `event_acts`, including the

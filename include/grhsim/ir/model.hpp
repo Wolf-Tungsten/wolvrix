@@ -312,43 +312,53 @@ namespace wolvrix::lib::grhsim
         Range steps;
     };
 
-    // None/Compute/Commit serve the legacy compute/commit pipeline. The M3
-    // six-phase pipeline (cpu.st.split-phases and followers) appends
-    // Event/General/Mem/Output for its four phase branches; old stages keep
-    // their numeric values.
+    // Compute/Commit are the removed legacy compute/commit pipeline's phases
+    // (M5d-6); the six-phase pipeline uses Event/General/Mem/Output for its
+    // four phase branches. Old enum values are kept stable for checkpoint
+    // compatibility.
     enum class CpuPhase : uint8_t { None, Compute, Commit, Event, General, Mem, Output };
+    // EventDomain/ActiveWord are legacy partition kinds (M5d-6 removed the
+    // producers); values kept stable for checkpoint compatibility.
     enum class CpuPartitionKind : uint8_t { Root, Phase, EventDomain, Supernode, Node, ActiveWord, EmitFunction };
-    enum class CpuEventSource : uint8_t { Input, Derived };
-    enum class CpuEventEdge : uint8_t { Posedge, Negedge };
-    // SplitPhase..Schedule is the legacy pipeline. The M3 six-phase pipeline
-    // appends SplitPhases (four-way split) -> GeneralNodes -> GeneralSupernodes
-    // -> GeneralFunctions; the M4 layout/schedule passes append
-    // LayoutNamedStores -> EventBitmaps -> MemWritePlan -> PhaseSchedule
-    // (the six-phase complete terminal); old stages keep their numeric values.
+    // SplitPhase..Schedule was the legacy two-phase pipeline (removed in
+    // M5d-6). The six-phase pipeline appends SplitPhases (four-way split,
+    // no longer produced since M5d-6: cpu.st.build-general-nodes initializes
+    // the mapping at GeneralNodes) -> GeneralNodes -> GeneralSupernodes; the
+    // M4 layout/schedule stages append LayoutNamedStores -> EventBitmaps ->
+    // MemWritePlan -> PhaseSchedule (the complete terminal), and M5d-6 moved
+    // GeneralFunctions (function packing) between MemWritePlan and
+    // PhaseSchedule. Enum VALUES stay stable; the pipeline order is no longer
+    // the numeric order — use cpuMappingStageRank for stage comparisons.
     enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions, LayoutNamedStores, EventBitmaps, MemWritePlan, PhaseSchedule };
 
-    struct CpuEvent
+    // Six-phase pipeline order rank (M5d-6): GeneralNodes < GeneralSupernodes
+    // < LayoutNamedStores < EventBitmaps < MemWritePlan < GeneralFunctions <
+    // PhaseSchedule, with the compat-only SplitPhases at 0. Legacy two-phase
+    // stages (rejected by verifyCpuMapping before any comparison) rank 0 as
+    // well, so rank checks fail closed. Never compare stages numerically.
+    inline unsigned cpuMappingStageRank(CpuMappingStage stage) noexcept
     {
-        ValueId value;
-        CpuEventEdge edge = CpuEventEdge::Posedge;
-        friend bool operator==(const CpuEvent &, const CpuEvent &) = default;
-    };
-
-    struct CpuEventGate
+        switch (stage)
+        {
+        case CpuMappingStage::GeneralNodes: return 1;
+        case CpuMappingStage::GeneralSupernodes: return 2;
+        case CpuMappingStage::LayoutNamedStores: return 3;
+        case CpuMappingStage::EventBitmaps: return 4;
+        case CpuMappingStage::MemWritePlan: return 5;
+        case CpuMappingStage::GeneralFunctions: return 6;
+        case CpuMappingStage::PhaseSchedule: return 7;
+        default: return 0; // SplitPhases and the removed legacy stages
+        }
+    }
+    inline bool cpuMappingStageAtLeast(CpuMappingStage stage, CpuMappingStage required) noexcept
     {
-        CpuEventSource source = CpuEventSource::Derived;
-        std::vector<CpuEvent> events;
-        friend bool operator==(const CpuEventGate &, const CpuEventGate &) = default;
-    };
+        return cpuMappingStageRank(stage) >= cpuMappingStageRank(required);
+    }
 
     struct CpuPartitionAttrs
     {
         CpuPartitionKind kind = CpuPartitionKind::Root;
         CpuPhase phase = CpuPhase::None;
-        // An event-domain partition without a gate is scanned every round.
-        std::optional<CpuEventGate> eventGate;
-        std::optional<uint32_t> activeId;
-        std::optional<uint32_t> activeWord;
         // Ranges in the supernode's flattened operation order, not model OpIds.
         std::vector<Range> helperChunks;
         // Optional for old checkpoints. M3 six-phase pipeline: sorted unique
@@ -356,6 +366,12 @@ namespace wolvrix::lib::grhsim
         // an empty array for event-free supernodes, on every General-branch
         // supernode from the GeneralSupernodes stage on; disengaged elsewhere).
         std::optional<std::vector<int64_t>> eventActs;
+        // M5d-6 (resolution 2): a General-branch EmitFunction is a leaf that
+        // only records the contiguous supernode ordinal interval it holds
+        // (supernodes stay direct General-branch children in C2 order).
+        // Engaged exactly on the General branch's trailing EmitFunction
+        // leaves from the GeneralFunctions stage on.
+        std::optional<Range> supernodeRange;
     };
 
     struct CpuPartition
@@ -374,8 +390,6 @@ namespace wolvrix::lib::grhsim
     };
 
     enum class CpuTypeKind : uint8_t { Bool, UInt, SInt, F32, F64, String, Array };
-    enum class CpuStorageKind : uint8_t { Object, PartitionLocal, Boundary };
-    enum class CpuRuntimeKind : uint8_t { ActiveWord, DomainArm, EventEdge };
     enum class CpuNamedStoreKind : uint8_t { RegLatch, Mem, Boundary, PrevEvent, EventAct, TimeslotTrigger, ActiveFlags };
 
     struct CpuType
@@ -388,47 +402,6 @@ namespace wolvrix::lib::grhsim
         uint64_t size = 0;
         uint32_t alignment = 1;
         friend bool operator==(const CpuType &, const CpuType &) = default;
-    };
-
-    struct CpuDataSlot
-    {
-        CpuTypeId type;
-        CpuStorageKind kind = CpuStorageKind::Object;
-        PartitionId owner;
-        uint64_t offset = 0;
-        friend bool operator==(const CpuDataSlot &, const CpuDataSlot &) = default;
-    };
-
-    struct CpuObjectLayout
-    {
-        ObjectRef object;
-        CpuDataSlot slot;
-        friend bool operator==(const CpuObjectLayout &, const CpuObjectLayout &) = default;
-    };
-
-    struct CpuLocalFrame
-    {
-        PartitionId owner;
-        uint64_t size = 0;
-        uint32_t alignment = 1;
-        friend bool operator==(const CpuLocalFrame &, const CpuLocalFrame &) = default;
-    };
-
-    struct CpuRuntimeSlot
-    {
-        CpuRuntimeKind kind = CpuRuntimeKind::ActiveWord;
-        PartitionId owner;
-        ValueId value;
-        CpuEventEdge edge = CpuEventEdge::Posedge;
-        uint64_t offset = 0;
-        friend bool operator==(const CpuRuntimeSlot &, const CpuRuntimeSlot &) = default;
-    };
-
-    struct CpuHelperReadCache
-    {
-        OpId firstOp;
-        std::vector<ValueId> values;
-        friend bool operator==(const CpuHelperReadCache &, const CpuHelperReadCache &) = default;
     };
 
     struct CpuStoreField
@@ -454,31 +427,23 @@ namespace wolvrix::lib::grhsim
     {
         uint32_t pointerBytes = 8;
         std::vector<CpuType> types;
-        std::vector<CpuObjectLayout> objects;
-        // Dense ValueId order; local offsets refer to the owning supernode frame.
-        std::vector<CpuDataSlot> values;
-        std::vector<CpuLocalFrame> localFrames;
-        std::vector<CpuRuntimeSlot> runtime;
-        uint64_t objectBytes = 0;
-        uint64_t boundaryBytes = 0;
-        uint64_t runtimeBytes = 0;
-        // Optional for old checkpoints. Cache stable scalar boundary inputs
-        // referenced more than once in the helper beginning at firstOp.
-        std::optional<std::vector<CpuHelperReadCache>> helperReadCaches;
-        // Optional for old checkpoints. M1 shell for the six-phase model's
-        // named store layout (regLatchStore/memStore/boundaryValueStore/
-        // prevEventStore/eventActStore/timeslotTriggerFlag/activeFlags),
-        // filled by the M4 cpu.st.layout-named-stores pass.
+        // Six-phase named store layout (regLatchStore/memStore/
+        // boundaryValueStore/prevEventStore/eventActStore/timeslotTriggerFlag/
+        // activeFlags), filled by cpu.st.layout-named-stores (C3). The legacy
+        // object/value/frame/runtime arenas were removed in M5d-6.
         std::optional<std::vector<CpuNamedStore>> namedStores;
         friend bool operator==(const CpuDataLayout &, const CpuDataLayout &) = default;
     };
 
+    // ActivityDrivenCompute/DomainGatedCommit served the removed legacy
+    // schedule (M5d-6); the six-phase tasks use AlwaysScanCommit (Event/Mem
+    // branches), EventDataGated (General emit functions) and EvalEnd
+    // (Output). Old enum values are kept stable for checkpoint compatibility.
     enum class CpuExecution : uint8_t { ActivityDrivenCompute, DomainGatedCommit, AlwaysScanCommit, EventDataGated, EvalEnd };
 
     struct CpuActivationTargets
     {
         std::vector<PartitionId> activate;
-        std::vector<PartitionId> arm;
         friend bool operator==(const CpuActivationTargets &, const CpuActivationTargets &) = default;
     };
 
@@ -511,14 +476,6 @@ namespace wolvrix::lib::grhsim
         uint32_t numaNode = 0;
         std::vector<CpuCoreSchedule> cores;
         friend bool operator==(const CpuNumaSchedule &, const CpuNumaSchedule &) = default;
-    };
-
-    struct CpuInputShadow
-    {
-        ValueId value;
-        CpuTypeId type;
-        uint64_t offset = 0;
-        friend bool operator==(const CpuInputShadow &, const CpuInputShadow &) = default;
     };
 
     struct CpuEventBitmap
@@ -559,54 +516,29 @@ namespace wolvrix::lib::grhsim
         std::vector<CpuNumaSchedule> numaNodes;
         std::vector<CpuFanoutEntry<ValueId>> inputFanout;
         std::vector<CpuFanoutEntry<ValueId>> computeSupernodeFanout;
-        // Commit fanout covers every state read by a compute partition; the key set
-        // is no longer limited to the output/event state dependency closure E.
+        // Commit fanout covers every General-phase state read (regLatch-class
+        // memReads included); the key set is no longer limited to the
+        // output/event state dependency closure E.
         std::vector<CpuFanoutEntry<StateId>> commitStateFanout;
-        // State-indexed bitmap of the closure E: decides a pending record's
-        // convergence flag, not reader arming.
-        std::vector<bool> quiescenceProjection;
-        std::vector<PartitionId> roundSeeds;
-        std::vector<CpuInputShadow> inputShadows;
-        uint64_t inputShadowBytes = 0;
-        // Optional for old checkpoints. NO00014: when true, computeSupernodeFanout
-        // has been post-processed by the redundant de-monitor rule inside
-        // buildSchedule (activation-covered rows removed; writes/stores stay).
-        // Kept as a plan flag so verifyCpuSchedule's rebuild reproduces the plan.
-        bool demonitorRedundant = false;
-        // Optional for old checkpoints. NO00015: edge-completion de-monitoring.
-        // When set, buildSchedule post-processes computeSupernodeFanout by
-        // adding the missing operand->consumer activation edges for each value
-        // in demonitorEdgeCompletionRemoved (sorted, unique) and then removing
-        // that value's fanout row. The selection is computed by the
-        // grhsim.demonitor-edge-completion pass from a dynamic change profile
-        // (pricing only); safety is re-validated statically on application.
-        bool demonitorEdgeCompletion = false;
-        std::vector<ValueId> demonitorEdgeCompletionRemoved;
-        // Optional for old checkpoints. NO00016: post-schedule residue folding.
-        // foldResidueOps (sorted, unique) names pure compute ops with a local,
-        // unpinned result whose unselected consumers were rewired to the fold
-        // source value by the grhsim.fold-residue pass. The ops stay in the
-        // model and partition tables; the CPU emitter skips their statements.
-        // Carried as plan data so verifyCpuSchedule's rebuild replays the plan.
-        bool foldResidue = false;
-        std::vector<OpId> foldResidueOps;
-        // Optional for old checkpoints. M1 shells for the six-phase model:
-        // (event,edge) cluster -> P_general supernode bitmaps rebuilt by
-        // P_event, and the P_mem write plan (priority order, reader tables,
-        // event-free writes). Filled by the M4 cpu.st.build-event-bitmaps /
-        // cpu.st.build-mem-write-plan passes.
+        // Six-phase static tables, filled by cpu.st.build-event-bitmaps (C4)
+        // / cpu.st.build-mem-write-plan (C5) / cpu.st.build-phase-schedule
+        // (C7): (event,edge) cluster -> P_general supernode bitmaps rebuilt by
+        // P_event, the P_mem write plan (priority order, reader tables,
+        // event-free writes), and the event act -> timeslot flag triggers
+        // collected from the Output-phase timeslot tasks. The legacy
+        // quiescence/round-seed/input-shadow/demonitor/fold-residue payloads
+        // were removed in M5d-6.
         std::optional<std::vector<CpuEventBitmap>> eventBitmaps;
         std::optional<std::vector<CpuMemWritePlanEntry>> memWritePlan;
-        // Optional for old checkpoints. M4 shell (positional JSON tail after
-        // memWritePlan): event act -> timeslot flag triggers collected from
-        // the Output-phase timeslot tasks by cpu.st.build-phase-schedule.
         std::optional<std::vector<CpuTimeslotTrigger>> timeslotTriggers;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 
     struct CpuBackendMapping
     {
-        CpuMappingStage stage = CpuMappingStage::SplitPhase;
+        // The six-phase pipeline enters at GeneralNodes (M5d-6: C1
+        // cpu.st.build-general-nodes initializes the mapping).
+        CpuMappingStage stage = CpuMappingStage::GeneralNodes;
         CpuPartitionTree partitionTree;
         std::optional<CpuDataLayout> dataLayout;
         std::optional<CpuSchedulePlan> schedule;

@@ -1,9 +1,10 @@
 # Semantic phase split (B5)
 
 `grhsim.split-phases` completes the six-phase op attribution at the semantic
-layer (M5d-5). It is split out of the legacy `cpu.st.split-phases` mapping
-pass: the model's phase attribution is decided here, once, before any CPU
-mapping exists; the mapping passes only consume `SimOp::phase`.
+layer (M5d-5). The model's phase attribution is decided here, once, before
+any CPU mapping exists; the mapping passes only consume `SimOp::phase`. (It
+was split out of the interim `cpu.st.split-phases` mapping pass, which was
+deleted in M5d-6 — see [split-phases](split-phases.md).)
 
 Position in the target pipeline: after B1-B4
 ([`classify-event-inputs`](classify-event-inputs.md),
@@ -56,17 +57,17 @@ The pass takes no arguments. The info line reports `attributed`,
 `mem_writes_reglatch` (mem writes that took the General path via the class
 rule) and `already_attributed`. A second run is a no-op.
 
-## Legacy backend coexistence (M5d-5 compat)
+## Consumed by the final mapping (M5d-6)
 
-The old M3/M4 six-phase backend still schedules **by op type**: its Mem branch,
-mem write plan, boundary sampling and operand slot naming collect every
-`memWrite/memFill/memAssign/memWriteSeq` regardless of the op's phase, and its
-node formation excludes those types. A regLatch-class mem write therefore still
-commits in the generated P_mem — which is correct under that backend's layout
-(the array physically lives in the single-instance memStore, so the P_mem
-in-place commit *is* its NBA mechanism). The class-aware attribution is the
-semantic contract consumed by the M5d-6 final mapping (C1/C3/C5), which removes
-the compat shims together with the old passes.
+The class-aware attribution is the semantic contract consumed directly by the
+C segment: C1 [`cpu.st.build-general-nodes`](build-general-nodes.md)
+initializes the mapping from it, C3
+[`cpu.st.layout-named-stores`](layout-named-stores.md) and C5
+[`cpu.st.build-mem-write-plan`](build-mem-write-plan.md) follow the same
+class/phase split. The M5d-5 compat shims (by-type Mem-branch seeding, write
+plan collection, boundary sampling and operand slot naming) were removed in
+M5d-6 together with the old passes; everything now keys on `op.phase` and
+`storeClass`.
 
 ## B8 semantic seal
 

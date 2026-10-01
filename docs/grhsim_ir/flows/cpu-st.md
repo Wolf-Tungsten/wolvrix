@@ -1,11 +1,10 @@
 # CPU 单线程活动度仿真 Flow
 
-> **状态（M5b）**：本文描述的旧 mapping 管线（`cpu.st.split-phase` → … →
-> `cpu.st.build-schedule`）与旧 emit 实现已在 M5b 删除；生产管线是
-> `scripts/wolvrix_xs_grhsim_ir.py` 的 12-pass 六阶段序列
-> （`grhsim.classify-event-inputs` → … → `cpu.st.build-phase-schedule` →
-> `cpu.st.emit-cpp`，见 `ptmp/spec-m5.md` §5）。本文待按六阶段模型重写，
-> 重写前仅作为旧设计的历史参考。
+> **状态（M5d-6）**：生产管线是 `scripts/wolvrix_xs_grhsim_ir.py` 的 A/B/C 三段序列；
+> C 段（CPU mapping）是本文第 2 节末尾 C1–C7 的七 pass 序列，在 B8 语义封板后只运行
+> 一次。旧两阶段 mapping 管线（`cpu.st.split-phase` → … → `cpu.st.build-schedule`）、
+> 其六个旧 schedule 消费者 pass 与 `cpu.st.split-phases` 已在 M5d-6 删除（旧 emit 实现
+> 在 M5b 删除）；本文 §2–§5 描述当前形态。
 
 本文规定 `cpu.st.*` 的端到端流程：从已验证的 `GrhSimModel` 构建 CPU mapping，生成
 C++ 模型，再验证多时钟行为与运行性能。`st` 表示单线程，不表示单时钟。
@@ -16,9 +15,10 @@ mapping 字段、默认参数和 emitter 约束以 [CPU 后端](../backends/cpu.
 
 ## 1. 范围与产物
 
-当前路线已实现 compute/commit、活动度传播、输入与派生事件域、数据布局、调度和 C++ emit。
-运行时使用一个 NUMA node、一个 CPU core；调用方改变输入后调用 `eval()`，不要求存在名为
-`clock` 的端口，也不把一次 `eval()` 等同于一个硬件时钟周期。
+当前路线已实现事件/主体/内存写/输出四相位（P_event/P_general/P_mem/P_output）、
+活动度传播、数据布局、调度和 C++ emit。运行时使用一个 NUMA node、一个 CPU core；
+调用方改变输入后调用 `eval()`，不要求存在名为 `clock` 的端口，也不把一次 `eval()`
+等同于一个硬件时钟周期。
 
 输入是包含 `I/O/S/F/G/Init` 的合法模型。`Init` 必须完整定义状态初值；GRH lowering 和
 前置变换在进入本 flow 前完成。产物包括：
@@ -28,7 +28,7 @@ mapping 字段、默认参数和 emitter 约束以 [CPU 后端](../backends/cpu.
 - 与模型、mapping、编译参数和实际可执行文件对应的功能与性能验证记录。
 
 当前 C++ emitter 的主要逻辑路径为 two-state；mapping 支持某种物理类型不等于 emitter
-已支持其全部操作。four-state、`memAssign`、字符串状态等未实现路径必须显式拒绝。
+已支持其全部操作。four-state、字符串状态等未实现路径必须显式拒绝。
 waveform/runtime profile、多线程和 fullpass 不属于本 flow 已验收的能力。
 
 ## 2. 构建流水线
@@ -72,7 +72,8 @@ A7 分类完成类感知相位归属（`mem` 类数组的写归 P_mem，`regLatc
 模型只克隆能消除预测超节点边界的共享计算（归位决议 1），最后
 `grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
 P_mem 操作数产自 P_general）。**B8 之后不再有任何语义改写**：旧管线的"后置化简 +
-第二轮 mapping"往返段已拆除，CPU mapping（下表八个 `cpu.st.*` pass）只运行一次。
+第二轮 mapping"往返段已拆除，CPU mapping（下表 C1–C7 七个 `cpu.st.*` pass）在封板
+模型上只运行一次，单向推进、不回改语义。
 集成开关新增 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1`（B6 调试开关）；`--used-bits` 与
 `--bitwise-predicates` 旋钮随独立调用段的移除而成为空操作（两者都只在
 `grhsim.simplify` 内部固定点中运行）。
@@ -147,168 +148,152 @@ two-state 时把 concat 原 op 就地改写为单个 `sliceStatic(x,lo,hi)`，op
 读改写为 word 切片后产生，故流水线在打包后重跑本 pass。诊断键相应增加
 `concat_identity_folds` 与 `concat_range_folds`。
 
-按下表顺序执行。前八步只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
-最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。
+按下表顺序执行。C1–C7 只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
+最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。C1 是唯一的
+mapping 初始化点：不要求任何前置 mapping，重复运行丢弃并重建；其余 pass 各推进一个
+stage，单向不回退。
 
 | 阶段 | Pass | 主要产物 |
 | --- | --- | --- |
-| 相位 | `cpu.st.split-phase` | root 下唯一的 compute/commit 两枝 |
-| 事件域 | `cpu.st.form-event-domains` | commit 事件域及域内写口 supernode |
-| 计算节点 | `cpu.st.build-compute-nodes` | 拓扑有序的 compute node |
-| 活动度单元 | `cpu.st.merge-compute-supernodes` | coarsen + DP 聚合的 compute supernode |
-| 活动字 | `cpu.st.pack-active-words` | active ID、每字 8 个 supernode、helper ranges |
-| 函数 | `cpu.st.pack-emit-functions` | compute/commit 的生成函数边界 |
-| 布局 | `cpu.st.layout-data` | object、local、boundary 和运行态槽位 |
-| 调度 | `cpu.st.build-schedule` | task 顺序、执行条件、fanout、round seeds、input shadows |
+| C1 | [`cpu.st.build-general-nodes`](../passes/build-general-nodes.md) | 从零初始化 mapping：root + Event/General/Mem/Output 四平铺分枝，General 分枝的 node（锥吸收） |
+| C2 | [`cpu.st.merge-general-supernodes`](../passes/merge-general-supernodes.md) | General 超节点；超节点序号 = General 分枝子节点顺序，就此固定 |
+| C3 | [`cpu.st.layout-named-stores`](../passes/layout-named-stores.md) | 物理类型表与七个具名 store（零分类决策，只消费 A7 `storeClass`） |
+| C4 | [`cpu.st.build-event-bitmaps`](../passes/build-event-bitmaps.md) | 每个 (event,edge) 聚类的 P_general 超节点位图（bit i = C2 序号 i） |
+| C5 | [`cpu.st.build-mem-write-plan`](../passes/build-mem-write-plan.md) | Mem 相写的 per-mem 优先级与 mem 类状态的 General 相读者表 |
+| C6 | [`cpu.st.pack-general-functions`](../passes/pack-general-functions.md) | 超节点 helperChunks；General 分枝尾随 EmitFunction 叶子（只记 `supernodeRange` 区间）；Event/Mem/Output 各塌缩为唯一 EmitFunction |
+| C7 | [`cpu.st.build-phase-schedule`](../passes/build-phase-schedule.md) | 三张 fanout、timeslot 触发映射、单核 task 序列；终态 `PhaseSchedule` |
 | 发射 | `cpu.st.emit-cpp` | C++ 模型与 Makefile，要求输出目录为空 |
 
 最终分区树为：
 
 ```text
 root
-  compute
-    emit_function
-      active_word
-        supernode
-          node -> ops
-  commit
-    event_domain
-      emit_function
-        supernode -> ops
+  phase Event    -> emit_function -> ops         ; 锥拓扑序，edgeDet 殿后
+  phase General  -> supernode+ -> node+ -> ops   ; 超节点直挂 General 分枝，子节点顺序即序号
+                 -> emit_function+               ; 尾随叶子，attrs.supernodeRange 记序号区间
+  phase Mem      -> emit_function -> ops         ; op-id 序
+  phase Output   -> emit_function -> ops         ; 拓扑序
 ```
 
 这些是同一 `PartitionTree` 的层次，不是独立的 Domain/Word/Function graph 实体。
-supernode 决定活动度粒度；函数决定代码组织，不能为了减少函数数而扩大调度粒度。
-TU 归属不进入 mapping；当前 emitter 为每个 task 输出一个源文件，未来 TU 打包仍属 emit 决策。
+supernode 决定活动度粒度；EmitFunction 决定代码组织，不能为了减少函数数而扩大调度粒度。
+归位决议 2：超节点序号在 C2 固定、与函数打包解耦——C6 不再重新挂载超节点，只在区间上
+记录函数边界。TU 归属不进入 mapping；当前 emitter 为每个 task 输出一个源文件，未来 TU
+打包仍属 emit 决策。
 
-只有 Schedule stage 的 mapping 才是 `complete=true`。各阶段校验对应的不变量；
-semantic revision 改变后旧 mapping 失效，必须重新生成，不能只补最后一个 pass。
+只有 `PhaseSchedule` stage 的 mapping 才是 `complete=true`。`CpuMappingStage` 枚举数值保持
+稳定（旧 checkpoint 兼容），但流水线顺序不再是数值顺序——`GeneralFunctions`（数值 11）
+排在 `MemWritePlan`（14）之后、`PhaseSchedule`（15）之前；所有 stage 比较走
+`cpuMappingStageRank`/`cpuMappingStageAtLeast`（`include/grhsim/ir/model.hpp`）。
+`SplitPhases` 枚举仅为旧 checkpoint 解码保留，不再由任何 pass 产生；stage 早于
+`SplitPhases` 的旧 checkpoint 被 verify 拒绝。各阶段校验对应的不变量；semantic revision
+改变后旧 mapping 失效，必须重新生成，不能只补最后一个 pass。
 
-## 3. 相位和事件域
+## 3. 相位与事件
 
-commit 分类包含 `core.state.regWrite`、`latchWrite`、`memWrite`、`memFill`、
-`memAssign`、`memWriteSeq`。分类并不放宽 emitter 的支持范围，例如 `memAssign` 当前仍被拒绝。
-其他 op 属于 compute，包括 `core.system.task` 和 `core.dpi.call`。
+相位归属完全在语义层完成（见 [Overview](../overview.md) 第 3.6 节）：B2–B4 标记
+event/output 锥，[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5）按 A7
+存储分类完成总归属，B8 封板。C 段只消费 `SimOp::phase`，不重新归因；C1 发现 `none`
+op 即报错并指向 B5。
 
-事件域的 canonical key 仅由 `(edge, ValueId)` 集合构成，排序去重后相同的写口归入同域。
-update condition、data、mask 和 history StateId 不进入 key。全部事件值由 input.read 产生
-时 source 为 input，否则为 derived；同时引用输入和派生事件的域也属于 derived。
-无边沿写口和 latch 放入无 event gate 的 general 域。
+写 op 集合为 `core.state.regWrite`、`latchWrite`、`memWrite`、`memFill`、`memAssign`、
+`memWriteSeq`：reg/latch 写与 `regLatch` 类状态（含小数组）上的 mem 写在 General 相，
+`mem` 类数组的写在 Mem 相。其他 op 归 General（含 `core.system.task` 和
+`core.dpi.call`），事件锥与输出锥分别归 Event/Output。
 
-例如一个带异步复位的寄存器写口：
+事件在 B2 已降级为聚类形态：每个 `(event, edge)` 去重聚类对应一个
+`core.event.edgeDet`（P_event，`prevEvent` 保存上一轮事件值），消费 op 以
+`event_acts`（聚类下标数组）引用判定结果；C4 按聚类生成 P_general 超节点位图。写口
+守卫是命中聚类的析取，再与 enable 组合决定是否写数据；即使 enable 为假，prevEvent
+仍逐轮采样。
 
-```text
-operands   = [enable, next, mask, clk, reset]
-objectRefs = [q, clkHistory, resetHistory]
-event_edges = [posedge, posedge]
-```
+不得预设 XiangShan 只有一个事件聚类，也不得假设同一 state 只有一个写口；多个写口完整
+保留，合法性和覆盖规则遵守 core 方言。`memWriteSeq` 的有序三元组在同一个 op 内处理，
+分区或函数打包不得拆散它。
 
-`enable` 是数据更新条件，`next` 是写入数据，`mask` 选择写入位；`clk/reset` 是事件值，
-两个 history 各保存该 op 对应事件的旧值。域 key 只含 `(posedge, clk)` 与
-`(posedge, reset)`；守卫是两个边沿的析取，再与 enable 组合决定是否写数据。
-即使 enable 为假，仍须采样两个 history。
+DPI 保持 `callCond && event guard` 语义：有无返回值不决定其相位，没有结果的调用不能被
+删除，没有 event 时 guard 为真；未触发时结果保持。
 
-不得预设 XiangShan 只有一个边沿域，也不得假设同一 state 只有一个写口。域统计应来自
-实际 IR；多个写口完整保留，合法性和覆盖规则遵守 core 方言。`memWriteSeq` 的有序三元组
-在同一个 op 内处理，分区或函数打包不得拆散它。
-
-DPI 保持 compute 侧的 `callCond && eventGuard`：有无返回值不决定其相位，没有结果的调用
-不能被删除，没有 event 时 event guard 为真。history 采样不受 callCond 限制；未触发时结果保持。
+旧管线的 `cpu.st.split-phase`/`cpu.st.form-event-domains`（compute/commit 两枝与 commit
+事件域分区）已在 M5d-6 删除。
 
 ## 4. 分区、布局和调度的衔接
 
-compute node 由依赖关系和容量边界形成；coarsen/DP 合并后仍须保证展开顺序为合法 DAG。
-word 只存在于 compute 枝，active ID 连续分配。helper ranges 覆盖一个 supernode 的展开 op
-序列，不是模型 OpId 范围，也不是新的调度单元。
+C1 的 node 由依赖关系和容量边界形成；C2 的 coarsen/DP 合并后仍须保证展开顺序为合法
+DAG。超节点序号在 C2 固定（General 分枝子节点顺序），C3–C7 与 emit 共用同一序号空间。
+helper ranges（C6 写入的 `helperChunks`）覆盖一个 supernode 的展开 op 序列，不是模型
+OpId 范围，也不是新的调度单元。
 
-函数打包只能聚合完整 word 或同域 commit supernode。`target_batch_count` 是函数数量的
-软目标，不是编译规模硬保证：当前非零值会按总 ops/lines 除以目标数放大阈值，0 则不启用
-该调整。默认值为 64。改变此参数必须单独记录并重新验证编译，不能仅凭函数数接近 legacy
-就认定 emit 结构或编译成本已一致。
+C6 的函数打包只聚合 C2 序号的连续区间（`supernodeRange`），不重新挂载超节点。
+`target_batch_count` 是函数数量的软目标，不是编译规模硬保证：当前非零值会按总
+ops/lines 除以目标数放大阈值，0 则不启用该调整。默认值为 64。改变此参数必须单独记录
+并重新验证编译，不能仅凭函数数接近 legacy 就认定 emit 结构或编译成本已一致。
 
-DataLayout 在最终分区后生成。跨 supernode、compute 到 commit、事件值和需保持的 DPI 结果
-使用持久存储；其余可用 partition-local 槽。布局完整性不能代替 emitter 的类型支持检查。
+DataLayout 在 C3 生成：状态归 store 只消费 A7 的 `storeClass` 注解（`regLatch`/`mem`），
+未分类状态报错并指向 `grhsim.select-state-stores`。`regLatch` 类状态（含数组）进
+regLatch store（emit 声明 `regLatchStore`/`regLatchStoreNext` 双缓冲，publish 整块
+memcpy 提交），`mem` 类数组进 mem store。输入端口、跨超节点 value 和 General→Mem 写
+参数使用 boundary 持久存储。布局完整性不能代替 emitter 的类型支持检查。
 
-boundary 偏移按三层分配。最前层是事件门控端点输入的致密段：compute（非 EventDomain
-子树的 EmitFunction）中，凡 unit 含带非空 `event_edges` 参数的 `core.system.task` /
-`core.dpi.call`（判据只看 op 名与参数，不看 task 编号或模块名），该 unit 直接引用的
-两态、宽度 ≤8 位的 boundary 值按消费 task 聚成一组，组间按组大小降序（同大小按 task
-分区 id 升序）、组内按 value id 升序从偏移 0 起致密分配；致密段预算 16 KiB，超预算的组
-整组回落到旧层（不拆组）。第二层是每周期被 commit task 读取的 edge-commit 写口 boundary
-操作数，第三层是其余 boundary 值（value id 顺序）。致密化只重排偏移，每个值偏移唯一、
-boundaryBytes 按对齐规则照常累计；生产者写回与消费者读取都经
-`layout.values[v].offset` 取址，天然一致。该集合是模型与分区树的确定函数，是 canonical
-布局的一部分；`verifyCpuDataLayout` 同时接受致密化前的旧 canonical 形式，使旧 checkpoint
-经重跑 `cpu.st.layout-data`（reemit remap 路径）升级，完整 SV 流程产物则始终为致密形式。
-`cpu.st.layout-data` 诊断输出 `densified_boundary_values` / `densified_bytes` /
-`densified_groups` 三个计数。
-
-SchedulePlan 的单核 task 序列先 compute 后 commit，每个函数对应一个 task，`waitsFor` 为空。
-执行条件与激活关系分开表示：
-
-| 执行条件 | 行为 |
-| --- | --- |
-| `ActivityDrivenCompute` | 调用函数后按 word/bit 派发活动 supernode |
-| `DomainGatedCommit` | 域 arm 为真才进入函数，内部仍逐 op 精判 event guard |
-| `AlwaysScanCommit` | general 域每轮进入，保留原写口守卫 |
+C7 的单核 task 序列为：P_event（`AlwaysScanCommit`）→ P_general 各 EmitFunction 叶子
+（`EventDataGated`，任务执行叶子的 `supernodeRange` 区间）→ P_mem（`AlwaysScanCommit`）
+→ P_output（`EvalEnd`，round 循环外）；每个 EmitFunction 叶子对应一个 task，
+`waitsFor` 为空。激活关系由三张 fanout 表表示（目标按 C2 序号排序去重）：
 
 | 激活表 | 触发源与用途 |
 | --- | --- |
-| `inputFanout` | 输入 read value 的任意变化，激活生产者/消费者并 arm 引用它的域 |
-| `computeSupernodeFanout` | compute value 真变化，激活跨 supernode 消费者或 arm 派生事件域 |
-| `commitStateFanout` | E 中的状态最终真变化，激活状态读者及相关 history 消费者，并决定继续迭代 |
+| `inputFanout` | General 相输入 read value 的任意变化，激活所属超节点；纯事件输入无条目（由 P_event 覆盖） |
+| `computeSupernodeFanout` | boundary value 真变化，激活跨超节点消费者（Mem 相写消费者除外，P_mem 每轮运行） |
+| `commitStateFanout` | reg/latch 状态真变化，激活 General 读者超节点并决定继续迭代；General 相、目标为 regLatch 类数组的 memRead 读者同标量一样经本表激活 |
 
-`activate` 只能指向 compute supernode，`arm` 只能指向 commit 事件域。commit 不使用
-per-write/per-supernode 的 compute 活动位，不能将域级门控扩展成稠密的 state × domain 表。
-posedge 域也必须观察下降沿，以便 history 回到 0；不能只在所需边沿方向上传播 arm。
-
-`commitStateFanout` 的 key 集合是从输出和边沿判定反推的状态闭包 E。遍历状态读后还要穿过
-该状态的写口，不能遗漏间接依赖，也不能把所有状态都加入 E。非 E 状态读者和具有外部观察
-语义的 system/DPI 单元通过 `roundSeeds` 保守逐轮执行。`inputShadows` 与输入表逐项对应。
+activate 目标只指向 General 超节点；mem 类数组的读者不在此表，由 C5 写计划的读者表
+激活。posedge 聚类也必须观察下降沿，以便 prevEvent 回到 0；不能只在所需边沿方向上
+做事件判定。
 
 ## 5. 运行时 Flow
 
-初始化应用全部 `Init` 步骤，清除 pending/dirty/read-address 缓存，激活全部 compute 单元，
-并 arm 全部边沿域。每次 `eval()` 固定外部输入，然后执行：
+初始化应用全部 `Init` 步骤（写 regLatchStore 当前值后由 initGlue 同步 next 缓冲），
+激活全部 General 超节点（dataActiveFlag 全 1）。每次 `eval()` 固定外部输入，然后执行：
 
 ```text
 加载并归一化输入
-对 inputFanout 所列输入做差分，更新 shadow，产生 activate / 当前轮 arm
-重复执行 G：
-  注入 roundSeeds
-  compute：按 task、word、supernode 顺序求值并传播变化
-  commit：域级 arm 筛选后精判写口守卫，登记状态更新
-  publish：应用最终更新，比较 E，激活读者并产生下一轮 arm
-  将下一轮 arm 转交当前轮，清空下一轮缓冲
-  若 E 未变化，刷新对外输出并返回
+对 inputFanout 所列输入做差分，置位对应超节点的 dataActiveFlag
+重复执行轮次：
+  P_event：逐轮重建 eventActiveFlag（按 C4 位图），并采样 prevEvent
+  P_general：按 task、C2 序号顺序执行活动超节点并传播变化
+    （regLatch 类写在超节点内 NBA 提交 regLatchStoreNext；memRead 读当前值）
+  P_mem：按 C5 计划逐写原地提交 mem 类数组（同地址后写覆盖先写）
+  P_publish：regLatchStoreNext 整块提交回 regLatchStore；状态真变化经
+    commitStateFanout 把读者激活进 dataActiveFlagNext，并决定是否继续迭代
+  若 E 未变化，退出轮次循环
+P_output：收敛后执行一次（EvalEnd，round 循环外），刷新对外输出
 超过收敛轮数上限则报告错误
 ```
 
-当前 C++ emitter 的收敛保护上限为 100000 轮。活动字中，后序 bit 可以在同字局部 flags 中
-立即激活；当前或前序 bit 留在全局待后续扫描，不能把它们清掉。
+当前 C++ emitter 的收敛保护上限为 100000 轮。
 
-history 是普通状态更新的一部分：每轮 G 的守卫读取该轮旧 history，采样随该轮 publish
-生效，**不是冻结到整个 eval 结束**。当前轮 arm 与下一轮 arm 分开消费，轮末清理不能丢失
-publish 刚产生的唤醒。DPI/system task 在 compute 中登记的 history 也参与同一发布过程。
+prevEvent 是普通状态更新的一部分：每轮 P_event 的边沿判定读取上一轮 prevEvent，采样随
+本轮生效，**不是冻结到整个 eval 结束**。dataActiveFlagNext 与当前轮标志分开消费，轮末
+清理不能丢失 publish 刚产生的唤醒。
 
-例如派生时钟 `g = clk & en` 从 0 变为 1，会在 compute 中 arm 使用 g 的域；该域精判
-`!gHistory && g` 后写状态，并采样 gHistory=1。下一轮 G 看到的是新 history，不会把同一
-电平再次误判为上升沿。随后 g 的下降也须唤醒该域采样 history，为下次上升做好准备。
+例如派生时钟 `g = clk & en` 从 0 变为 1，P_event 判定 posedge 后按位图置位引用该聚类的
+超节点 eventActiveFlag，对应写口在 P_general 精判守卫后写状态；g 的下降沿同样被判定
+（prevEvent 回到 0），不会把同一电平再次误判为上升沿，也为下次上升做好准备。
 
 ## 6. Emit 约束与优化边界
 
-以下优化可以改变 C++ 形态，但不能改变上述 G 转移、E 或调用语义：
+emit 可以改变 C++ 形态，但不能改变上述 G 转移、E 或调用语义。当前 emitter 的关键结构：
 
-- compute-only 的安全 state-read 别名可省去复制，但必须补齐直接消费者的状态激活关系；
-  直接作为 commit operand 的值保留旧快照，例如 `q1 <= d; q2 <= q1` 不得读取提前更新的 q1。
-- 同一 supernode/helper chunk 内相同 fanout 的逻辑结果合并 changed，再统一发布 mask。
-  宽位 helper 沿用 legacy 的指针、调用者 out-buffer 和原地计算，不增加整块旧值快照。
-- 标量 direct commit 只用于经证明不会被其他 commit 观察的私有单写者；其余保留 deferred
-  publication。不能从“通常只有一个写口”推导这一优化。
-- 内存按 cell 暂存和发布，多写口复用同轮该行 shadow，保留 mask 和有序覆盖；fill 与
-  sequence 写也使用同一路径。读端口缓存实际地址，发布时只激活匹配行的读者所属单元。
-- history batching、稳定历史跳过和 inactive-edge sampling 必须保持各 op 独立的 history
-  与守卫；不能用一个代表 history 替代整组状态。
+- General 相 regLatch 类数组写（memWrite/memFill/memAssign/memWriteSeq）在所属超节点内
+  NBA 提交 regLatchStoreNext：merge 基为 next 行（同轮多写口读改写叠加）、对 cur 行做
+  真变化检测，经 commitStateFanout 把读者激活进 dataActiveFlagNext，与标量 reg/latch
+  路径一致；memRead 对 regLatch 类数组读 regLatchStore 当前值；init 写 cur 后由
+  initGlue 同步 next。
+- mem 类数组写在 P_mem 按 C5 优先级原地提交（同地址后写覆盖先写）；常量地址的读者按
+  精确 staticRow 激活，动态地址保守地在任意写时激活。
+- 宽位 helper 沿用 legacy 的指针式、调用者提供 out-buffer 的原地计算 ABI，不增加整块
+  旧值快照。
+- dumpState 对 regLatch 类大数组（count>64）与 memStore 一样走 fnv1a 哈希。
 
 fullpass 不是当前默认路线。只有在功能正确、已有 profile 将差距归因到激活检查/传播后，
 才可单独设计并验证快速路径；不能以忽略多时钟、混合边沿或派生事件来换取单时钟结果。
@@ -317,9 +302,9 @@ fullpass 不是当前默认路线。只有在功能正确、已有 profile 将�
 
 每阶段先验证结构，再验证生成物行为，最后才做性能结论：
 
-1. 检查 phase/event 覆盖、拓扑顺序、supernode/word/function 边界和 helper ranges。
-2. 检查布局、三张 fanout、E 闭包、roundSeeds 和 task 覆盖；fresh-session JSON roundtrip
-   不得依赖旧 session 的隐藏状态。
+1. 检查相位覆盖、拓扑顺序、超节点序号/函数区间边界和 helper ranges。
+2. 检查 named-store 布局、三张 fanout、事件位图、mem 写计划和 task 覆盖；
+   fresh-session JSON roundtrip 不得依赖旧 session 的隐藏状态。
 3. 运行生成 C++ 回归，覆盖 inline/helper、宽窄值、init/reset、DPI、掩码/多写口和读旧写新。
 4. 使用多时钟记分板和 Verilator 对照，覆盖双域同时触发、混合边沿、派生/门控时钟、latch、
    异步复位、重复 eval 和 memory read-before-write。现有 `cpu_cdc`、`cpu_dual_ram` 是此类门禁，
@@ -344,9 +329,9 @@ legacy 是代码结构与性能的参考，不是可以直接套用的规模假�
 mkdir -p ptmp/cpu-st-tmp ptmp/cpu-st-ccache
 export TMPDIR="$PWD/ptmp/cpu-st-tmp"
 export CCACHE_DIR="$PWD/ptmp/cpu-st-ccache"
-make test_grhsim_cpu_mapping
-make test_grhsim_cpu_schedule
-make test_grhsim_cpu_emit
+make test_grhsim_cpu_phases
+make test_grhsim_cpu_stores
+make test_grhsim_cpu_phase_emit
 make py_install
 make run_all_hdlbits_grhsim_ir_tests SKIP_PY_INSTALL=1
 ```
@@ -378,105 +363,47 @@ make run_xs_wolf_grhsim_emu XS_GRHSIM_BUILD=build/xs/grhsim \
 
 ## 9. 实现索引
 
-- [相位和事件域](../../../lib/grhsim/backend/cpu.cpp)
-- [node、supernode、word 和函数打包](../../../lib/grhsim/backend/cpu_partition.cpp)
-- [数据布局](../../../lib/grhsim/backend/cpu_layout.cpp)
-- [调度与激活关系](../../../lib/grhsim/backend/cpu_schedule.cpp)
-- [C++ emitter](../../../lib/grhsim/backend/cpu_emit.cpp)
-- [CPU mapping 回归](../../../tests/grhsim/test_cpu_mapping.cpp)
-- [调度回归](../../../tests/grhsim/test_cpu_schedule.cpp)
-- [生成代码回归](../../../tests/grhsim/test_cpu_emit.cpp)
+- [mapping 校验（verifyCpuMapping）](../../../lib/grhsim/backend/cpu.cpp)
+- [C1/C2/C6：四平分枝初始化、node、超节点与函数区间](../../../lib/grhsim/backend/cpu_partition.cpp)
+- [C3：named-store 布局](../../../lib/grhsim/backend/cpu_layout.cpp)
+- [C4/C5/C7：事件位图、mem 写计划与调度](../../../lib/grhsim/backend/cpu_schedule.cpp)
+- [C++ emitter](../../../lib/grhsim/backend/cpu_phase_emit.cpp)
+- [相位与分区回归](../../../tests/grhsim/test_cpu_phases.cpp)
+- [named-store 回归](../../../tests/grhsim/test_cpu_stores.cpp)
+- [生成代码回归](../../../tests/grhsim/test_cpu_phase_emit.cpp)
 - [Legacy 活动度调度](../../transform/activity-schedule.md)
 - [Legacy GrhSIM 调度](../../emit/grhsim-scheduling.md)
 
-## 演进（M3）
+## 演进（M5d-6）
 
-M3 起新增一套六阶段 CPU mapping 管线，与上文所述旧管线并存（旧管线保持可用，M5
-统一删除旧 pass 并把本文重写为最终序列）。新管线对应 `pdocs/simulation-model-refactor`
-的 P_event/P_general/P_mem/P_output 仿真模型，pass 序列如下：
+M5d-6 把 CPU mapping 定为一次最终 mapping 的 C 段七 pass（第 2 节末表）。删除内容：
 
-| 顺序 | pass | stage 前置 → 产出 | 说明文档 |
-| --- | --- | --- | --- |
-| 1 | `cpu.st.split-phases` | （无）→ `SplitPhases` | [split-phases](../passes/split-phases.md) |
-| 2 | `cpu.st.build-general-nodes` | `SplitPhases` → `GeneralNodes` | [build-general-nodes](../passes/build-general-nodes.md) |
-| 3 | `cpu.st.merge-general-supernodes` | `GeneralNodes` → `GeneralSupernodes` | [merge-general-supernodes](../passes/merge-general-supernodes.md) |
-| 4 | `cpu.st.pack-general-functions` | `GeneralSupernodes` → `GeneralFunctions` | [pack-general-functions](../passes/pack-general-functions.md) |
+- 旧两阶段线的八个 mapping pass（`cpu.st.split-phase`/`form-event-domains`/
+  `build-compute-nodes`/`merge-compute-supernodes`/`pack-active-words`/
+  `pack-emit-functions`/`layout-data`/`build-schedule`）与六个旧 schedule 消费者
+  （`grhsim.demonitor-redundant`/`demonitor-edge-completion`/`migrate-boundary-ops`/
+  `migrate-boundary-ops-ec`/`fuse-expr-chains`/`fold-residue`）；
+- `cpu.st.split-phases`（归因职责由 B5 在语义层完成，mapping 初始化由 C1 承担）及
+  M5d-5 的按 op 类型兼容 shim——Mem 分枝播种、mem 写计划收集、boundary 采样与写参数
+  槽位命名全部回到按 `op.phase == Mem`；
+- `CpuDataLayout`/`CpuSchedulePlan` 的 legacy payload 字段（只留 types/namedStores 与
+  numaNodes/三张 fanout/eventBitmaps/memWritePlan/timeslotTriggers）与
+  `CpuPartitionAttrs` 的 `eventGate`/`activeId`/`activeWord`（新增 `supernodeRange`）。
 
-与旧管线的对应关系：`split-phases` 替换 `split-phase`（四分枝 root：Event/General/Mem/
-Output，并完成总相覆盖——全模型不得再有 phase-less op）；`build-general-nodes` 改造
-`build-compute-nodes`（reg/latch write 与 General 相 system.task/dpi.call 作为 node 锚点
-参与锥吸收）；`merge-general-supernodes` 改造 `merge-compute-supernodes`（新增事件域合并
-禁止条件，并为每个 General supernode 记 `eventActs` attr）；`pack-general-functions` 合并
-`pack-active-words`/`pack-emit-functions`（不再产生 ActiveWord 层，Event/Mem/Output 平铺
-分枝各一个 EmitFunction）。
+关键决议：超节点序号在 C2 固定（General 分枝子节点顺序），与 C6 函数打包解耦
+（归位决议 2）；C6 的 EmitFunction 变为尾随叶子，只以 `supernodeRange` 记录序号区间
+（铺满 [0,N)），Event/Mem/Output 分枝照旧各塌缩成唯一 EmitFunction；C6 移到 C5 之后、
+C7 之前，`CpuMappingStage` 数值不变、顺序以 `cpuMappingStageRank` 为准；C3 前置降为
+`GeneralSupernodes`，零分类决策、只消费 A7 `storeClass`；mem 写调度按相位——General 相
+regLatch 类写经 NBA next 缓冲在超节点内提交，Mem 相 mem 类写在 P_mem 原地提交。
 
-`verifyCpuMapping` 对新 stage 走独立的结构校验：四分枝覆盖全部 op 且不重不漏
-（`SplitPhases` 阶段 General 分枝允许空壳）、各分枝 op 相一致性、Event/Output/General
-序列 use-before-def、Mem 序列 op id 升序、General supernode 的 `eventActs` 与扫 op 重算
-一致且含事件 supernode 满足事件域禁止条件；旧 stage 的校验逻辑不变。六阶段 mapping
-不携带 dataLayout/schedule payload（总相覆盖与 eventActs 校验随新 stage 启用，模型级
-verifyGrhSimModel 的其余 M3 检查留待后续里程碑）。
-
-## 演进（M4）
-
-M4 在 M3 的 `GeneralFunctions` 之后接上布局/调度四个 pass，六阶段管线由此到达终态
-`PhaseSchedule`——`complete=true` 的另一合法档位（旧管线仍以 `Schedule` 为终态，判定
-不变）。pass 序列：
-
-| 顺序 | pass | stage 前置 → 产出 | 说明文档 |
-| --- | --- | --- | --- |
-| 5 | `cpu.st.layout-named-stores` | `GeneralFunctions` → `LayoutNamedStores` | [layout-named-stores](../passes/layout-named-stores.md) |
-| 6 | `cpu.st.build-event-bitmaps` | `LayoutNamedStores` → `EventBitmaps` | [build-event-bitmaps](../passes/build-event-bitmaps.md) |
-| 7 | `cpu.st.build-mem-write-plan` | `EventBitmaps` → `MemWritePlan` | [build-mem-write-plan](../passes/build-mem-write-plan.md) |
-| 8 | `cpu.st.build-phase-schedule` | `MemWritePlan` → `PhaseSchedule` | [build-phase-schedule](../passes/build-phase-schedule.md) |
-
-各 pass 要点：
-
-- `layout-named-stores` 填充 `dataLayout` 的物理类型表与七个具名 store
-  （regLatch/mem/boundary/prevEvent/eventAct/timeslotTrigger/activeFlags），legacy 布局
-  字段留空；命名推演（declaredSymbol 清洗、全图唯一化、无名值的 op 类别前缀回退）
-  集中在本 pass，emit 只消费。
-- `build-event-bitmaps` 定义 supernode 序号（General 分枝按树序：emit function 子序 →
-  supernode 子序，0..N-1，ActiveFlags 字节数组与位图共用），并复用 M3 的影响图为每个
-  (event,edge) 聚类填 P_general 位图；S(sn)=∅ 的豁免 supernode 不进任何位图。
-- `build-mem-write-plan` 记录 P_mem 写 op 的 per-mem 静态优先级（op id 升序，同地址
-  后写覆盖先写）、General 相 memRead 读者表（常量地址给精确 staticRow，动态地址保守
-  留空）与 event-free 标记。
-- `build-phase-schedule` 填 input/supernode/state 三张 fanout（纯事件输入无条目、
-  mem state 无 stateFanout 行、supernodeFanout 不含 Mem 消费者）、timeslotFlag ×
-  event_acts 的 timeslot 触发映射，以及单核 task 序列：P_event(AlwaysScanCommit) →
-  P_general 各 emit 函数(EventDataGated) → P_mem(AlwaysScanCommit) →
-  P_output(EvalEnd，round 循环外)。
-
-`verifyCpuMapping` 的变化：`SplitPhases..GeneralFunctions` 段继续拒绝
-dataLayout/schedule payload；`LayoutNamedStores` 起按 stage 逐级校验新 payload——
-namedStores 走结构校验（类型表 id 稠密、七 store 定序、字段名全图唯一、偏移对齐不
-重叠且与 sizeBytes 一致、state store 与 state 双射、boundary 值集按图重算、每聚类一
-prevEvent/eventAct 条目、timeslot flag 集匹配、activeFlags 形态），位图、mem 写计划、
-fanout/task/trigger 均按模型与 partition 树重算并要求完全一致；旧 stage 校验不变。
-JSON 仍是 v2 可选尾字段位置化追加：`timeslotTriggers` 位于 `memWritePlan` 之后，新
-存档可被旧读取方按位置截断读取，旧存档缺少尾字段时按缺省处理。
-
-## 演进（M5d-5）
-
-M5d-5 把相位归属从 `cpu.st.split-phases` 拆到语义层新 pass
-[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5），并在其后的分区段接
-通 B6（`grhsim.simplify(scope=phase)`）、B7（边界感知
-[`clone-shared-compute`](../passes/clone-shared-compute.md)）与 B8
-（`grhsim.verify --seal semantic` 封板）。B5 是类感知的：`mem` 类数组的写归 `mem` 相，
-`regLatch` 类状态的写（含小数组 mem op）归 `general` 相。
-
-本里程碑内旧六阶段 mapping 继续工作，靠一组**按 op 类型**的兼容 shim（M5d-6 随旧
-pass 一并删除）：Mem 分枝播种、mem 写计划收集、boundary 采样与写参数槽位命名都按
-op 类型而非 `op.phase == Mem` 收集四种 mem 写 op；`build-general-nodes` 把 mem 写类型
-排除在 node 形成之外；`verifyCpuPhases` 容许 Mem 分枝中出现 `general` 相的 mem 写 op。
-由于旧布局仍把全部数组放进单实例 memStore，P_mem 原地提交对这些小数组本就是正确的
-NBA 机制，生成代码行为不变；类感知归属是供给 M5d-6 最终 mapping（C1/C3/C5）的语义
-契约。
+`verifyCpuMapping` 按 rank 逐级校验：四分枝覆盖全部 op 不重不漏、各分枝相一致性、
+Event/Output/General 序列 use-before-def、Mem 序列 op-id 升序、超节点 `eventActs` 与
+扫 op 重算一致；`LayoutNamedStores` 起校验 named stores 结构，位图/写计划/fanout/task/
+trigger 按模型与分区树重算要求完全一致；`GeneralFunctions` 起校验 `supernodeRange`
+区间连续铺满 [0,N)。JSON 保持 v2 可选尾字段的位置化追加。
 
 语义边界预测 helper `predictGeneralBoundaries`
-（`include/grhsim/pass/general_boundaries.hpp`）静态模拟 build-general-nodes 的锥吸收
-规则（单消费者锥吸收、共享值/提交边界断开、规模上限），不建立 mapping 即给出预测
-超节点边界集；C1 改造（M5d-6）将与其共享同一实现。B7 的定向测试
-（`grhsim-split-phases-tests`）在无 `general` 相 mem 写的模型上校验预测边界集与
-build-general-nodes 实际 node 边界完全一致。
+（`include/grhsim/pass/general_boundaries.hpp`）静态模拟 C1 的锥吸收规则，不建立 mapping
+即给出预测边界集，供 B7 `clone-shared-compute` 使用；两者实现保持一致，B7 的定向测试
+（`grhsim-split-phases-tests`）校验预测边界集与 C1 实际 node 边界完全一致。

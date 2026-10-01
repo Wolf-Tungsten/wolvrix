@@ -1048,10 +1048,10 @@ namespace
 
     int testBoundaryPredictionConsistency()
     {
-        // Dedicated fixture without regLatch-class arrays: the compat backend
-        // and the predictor then form nodes over the same General op set (the
-        // predictor's forward rule additionally anchors General-phase mem
-        // writes, which C1 introduces in M5d-6).
+        // Dedicated fixture without regLatch-class arrays: no General-phase
+        // mem writes exist (bigMem is 64 bytes and lands in the mem store
+        // class), so the predictor and C1 form nodes over the same General
+        // op set.
         grhsim::GrhSimModel model("split-phases-predict");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
         const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
@@ -1093,8 +1093,7 @@ namespace
         runPass(model, "grhsim.migrate-timeslot-tasks");
         runPass(model, "grhsim.split-phases");
         runPass(model, "grhsim.simplify", std::array<std::string_view, 2>{"--scope", "phase"});
-        // The legacy backend forms nodes over the sealed General partition.
-        runPass(model, "cpu.st.split-phases");
+        // C1 forms nodes over the sealed General partition (M5d-6).
         runPass(model, "cpu.st.build-general-nodes");
 
         const auto *mapping = model.cpuMapping();
@@ -1115,11 +1114,7 @@ namespace
         std::set<uint32_t> actual;
         for (const auto &op : model.operations())
         {
-            const auto type = model.text(op.opType);
-            const bool memConsumer = type == "core.state.memWrite" ||
-                                     type == "core.state.memFill" ||
-                                     type == "core.state.memAssign" ||
-                                     type == "core.state.memWriteSeq";
+            const bool memConsumer = op.phase == grhsim::SimPhase::Mem;
             for (const auto operand : model.operands(op))
             {
                 const auto source = producer[operand.index];

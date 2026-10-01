@@ -895,13 +895,26 @@ void regToMemSemanticsTests() {
         check(before.str()==after.str(),"analysis changed serialized model");
         PassManager mapping(defaultDialectRegistry());
         std::string error;
-        mapping.addPass(defaultPassRegistry().create("cpu.st.split-phase",{},error));
+        // The six-phase mapping requires self-contained Output cones (B3) and
+        // total phase attribution (B5) before C1 can initialize it.
+        mapping.addPass(defaultPassRegistry().create("grhsim.extract-output-cones",{},error));
+        mapping.addPass(defaultPassRegistry().create("grhsim.split-phases",{},error));
+        mapping.addPass(defaultPassRegistry().create("cpu.st.build-general-nodes",{},error));
         check(error.empty() && mapping.run(model,diagnostics).success && model.cpuMapping(),
             "could not establish mapping for invalidation test");
+        // The semantic mutation must be phase-preserving on an attributed
+        // model: grhsim.simplify folds the fixture's redundant cones under
+        // the phase seal (reg-to-mem is a stage-A pass and never runs on an
+        // attributed model in production).
         PassManager manager(defaultDialectRegistry());
-        manager.addPass(std::make_unique<RegToMemPass>(semanticOptions()));
+        manager.addPass(defaultPassRegistry().create("grhsim.simplify",{},error));
         const auto revision=model.semanticRevision();
-        check(manager.run(model,diagnostics).success,"semantic pass manager failed");
+        const auto firstRun=manager.run(model,diagnostics);
+        if(!firstRun.success){
+            std::string detail="semantic pass manager failed:";
+            for(const auto &m:diagnostics.messages()) detail+=" "+m.context+": "+m.message+";";
+            throw std::runtime_error(detail);
+        }
         check(model.semanticRevision()==revision+1,"semantic revision was not committed once");
         check(!model.cpuMapping() && model.mappings().empty(),"semantic rewrite retained stale backend mappings");
         check(manager.run(model,diagnostics).success && model.semanticRevision()==revision+1,
@@ -996,9 +1009,10 @@ void regToMemEmitChecks(const std::filesystem::path &directory) {
         options.enableOrWriteMerge = shape >= 10;
         manager.addPass(std::make_unique<RegToMemPass>(options));
         for(auto name:{"grhsim.classify-event-inputs","grhsim.lower-edge-detect","grhsim.extract-output-cones",
-            "grhsim.migrate-timeslot-tasks","cpu.st.split-phases","cpu.st.build-general-nodes",
-            "cpu.st.merge-general-supernodes","cpu.st.pack-general-functions","cpu.st.layout-named-stores",
-            "cpu.st.build-event-bitmaps","cpu.st.build-mem-write-plan","cpu.st.build-phase-schedule"}) {
+            "grhsim.migrate-timeslot-tasks","grhsim.split-phases","grhsim.select-state-stores",
+            "cpu.st.build-general-nodes","cpu.st.merge-general-supernodes","cpu.st.layout-named-stores",
+            "cpu.st.build-event-bitmaps","cpu.st.build-mem-write-plan","cpu.st.pack-general-functions",
+            "cpu.st.build-phase-schedule"}) {
             std::string error;
             auto pass=defaultPassRegistry().create(name,{},error);
             check(bool(pass),"cannot create CPU mapping pass");

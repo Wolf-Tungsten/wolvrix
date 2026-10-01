@@ -226,19 +226,20 @@ namespace
         return nullptr;
     }
 
-    // The M4 supernode ordinal: General branch flattened in tree order
-    // (emit-function child order, then supernode child order inside).
+    // The supernode ordinal (M5d-6, resolution 2): the General branch's
+    // Supernode children in tree order — fixed at C2; the trailing
+    // EmitFunction leaves (C6) are skipped.
     uint32_t supernodeOrdinal(const CpuBackendMapping &mapping, PartitionId target)
     {
         const auto &tree = mapping.partitionTree;
         uint32_t ordinal = 0;
-        for (const auto function : branch(mapping, CpuPhase::General).children)
-            for (const auto supernode : tree.partitions[function.index - 1].children)
-            {
-                if (supernode == target) return ordinal;
-                ++ordinal;
-            }
-        throw std::runtime_error("supernode not in the general emit-function order");
+        for (const auto child : branch(mapping, CpuPhase::General).children)
+        {
+            if (tree.partitions[child.index - 1].attrs.kind != CpuPartitionKind::Supernode) continue;
+            if (child == target) return ordinal;
+            ++ordinal;
+        }
+        throw std::runtime_error("supernode not in the general branch order");
     }
 
     bool bitOf(const CpuEventBitmap &bitmap, uint32_t ordinal)
@@ -277,12 +278,15 @@ namespace
         return nullptr;
     }
 
+    // M5d-6 C segment: classify (all arrays mem — these fixtures pin the P_mem
+    // write-plan shape), attribute (B5), then C1 init + C2 merge.
     void runMappingPipeline(GrhSimModel &model)
     {
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores",
+                std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+        runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
-        runPass(model, "cpu.st.pack-general-functions");
     }
 
     void runSchedulePipeline(GrhSimModel &model)
@@ -290,6 +294,7 @@ namespace
         runPass(model, "cpu.st.layout-named-stores");
         runPass(model, "cpu.st.build-event-bitmaps");
         runPass(model, "cpu.st.build-mem-write-plan");
+        runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
     }
 
@@ -434,9 +439,8 @@ namespace
         require(mapping.stage == CpuMappingStage::LayoutNamedStores, "layout: stage wrong");
         require(mapping.dataLayout && mapping.dataLayout->namedStores, "layout: stores missing");
         const auto &layout = *mapping.dataLayout;
-        require(layout.objects.empty() && layout.values.empty() && layout.localFrames.empty() &&
-                layout.runtime.empty() && !layout.helperReadCaches,
-                "layout: legacy payload present");
+        // M5d-6: the layout payload is just the type table plus named stores
+        // (the legacy arenas are gone).
         const std::array<CpuNamedStoreKind, 7> kinds{
             CpuNamedStoreKind::RegLatch, CpuNamedStoreKind::Mem, CpuNamedStoreKind::Boundary,
             CpuNamedStoreKind::PrevEvent, CpuNamedStoreKind::EventAct,
@@ -689,11 +693,11 @@ namespace
                                     {}, refs);
         }
         require(verifies(model), "latch: fixture rejected");
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         const std::array<std::string_view, 2> smallSupernode{"--max-op-in-compute-supernode", "6"};
         runPass(model, "cpu.st.merge-general-supernodes", smallSupernode);
-        runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.layout-named-stores");
         const auto messages = runPass(model, "cpu.st.build-event-bitmaps");
         const auto &mapping = *model.cpuMapping();
@@ -816,6 +820,7 @@ namespace
         runPass(model, "cpu.st.layout-named-stores");
         runPass(model, "cpu.st.build-event-bitmaps");
         runPass(model, "cpu.st.build-mem-write-plan");
+        runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::PhaseSchedule, "schedule: stage wrong");
@@ -857,28 +862,34 @@ namespace
                 "schedule: timeslot triggers wrong");
 
         // Task sequence: P_event -> P_general functions -> P_mem -> P_output.
+        // The General tasks reference the trailing EmitFunction leaves (the
+        // supernodes stay direct branch children in ordinal order, M5d-6).
         const auto &generalBranch = branch(mapping, CpuPhase::General);
-        const auto generalFunctions = generalBranch.children.size();
+        std::vector<PartitionId> generalFunctions;
+        for (const auto child : generalBranch.children)
+            if (mapping.partitionTree.partitions[child.index - 1].attrs.kind ==
+                CpuPartitionKind::EmitFunction)
+                generalFunctions.push_back(child);
         require(schedule.numaNodes.size() == 1 && schedule.numaNodes.front().cores.size() == 1,
                 "schedule: numa/core shape wrong");
         const auto &tasks = schedule.numaNodes.front().cores.front().tasks;
-        require(tasks.size() == generalFunctions + 3, "schedule: task count wrong");
+        require(tasks.size() == generalFunctions.size() + 3, "schedule: task count wrong");
         for (std::size_t i = 0; i < tasks.size(); ++i)
             require(tasks[i].id.index == i + 1 && tasks[i].waitsFor.empty(),
                     "schedule: task ids wrong");
         require(tasks.front().execution == CpuExecution::AlwaysScanCommit &&
                 tasks.front().partition == branch(mapping, CpuPhase::Event).children.front(),
                 "schedule: event task wrong");
-        for (std::size_t i = 0; i < generalFunctions; ++i)
+        for (std::size_t i = 0; i < generalFunctions.size(); ++i)
             require(tasks[i + 1].execution == CpuExecution::EventDataGated &&
-                    tasks[i + 1].partition == generalBranch.children[i],
+                    tasks[i + 1].partition == generalFunctions[i],
                     "schedule: general task wrong");
-        require(tasks[generalFunctions + 1].execution == CpuExecution::AlwaysScanCommit &&
-                tasks[generalFunctions + 1].partition ==
+        require(tasks[generalFunctions.size() + 1].execution == CpuExecution::AlwaysScanCommit &&
+                tasks[generalFunctions.size() + 1].partition ==
                     branch(mapping, CpuPhase::Mem).children.front(),
                 "schedule: mem task wrong");
-        require(tasks[generalFunctions + 2].execution == CpuExecution::EvalEnd &&
-                tasks[generalFunctions + 2].partition ==
+        require(tasks[generalFunctions.size() + 2].execution == CpuExecution::EvalEnd &&
+                tasks[generalFunctions.size() + 2].partition ==
                     branch(mapping, CpuPhase::Output).children.front(),
                 "schedule: output task wrong");
         require(model.mappings().front().complete, "schedule: mapping not complete");
@@ -893,11 +904,12 @@ namespace
         auto &model = fixture.model;
         require(verifies(model), "rejects: fixture rejected");
         runMappingPipeline(model);
-        const auto generalFunctionsMapping = *model.cpuMapping();
+        const auto preLayoutMapping = *model.cpuMapping();
         runPass(model, "cpu.st.layout-named-stores");
         const auto layoutMapping = *model.cpuMapping();
         runPass(model, "cpu.st.build-event-bitmaps");
         runPass(model, "cpu.st.build-mem-write-plan");
+        runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
         const auto &mapping = *model.cpuMapping();
         const auto reject = [&](CpuBackendMapping bad, const char *what) {
@@ -939,15 +951,16 @@ namespace
         }
         // (e) schedule payload before the layout stage.
         {
-            auto bad = generalFunctionsMapping;
+            auto bad = preLayoutMapping;
             bad.schedule = CpuSchedulePlan{};
             reject(std::move(bad), "rejects: verifier accepted an early schedule payload");
         }
-        // (f) legacy layout payload alongside the named stores.
+        // (f) supernodes stripped of their event-act annotations.
         {
             auto bad = layoutMapping;
-            bad.dataLayout->objects.push_back({});
-            reject(std::move(bad), "rejects: verifier accepted legacy layout payload");
+            for (auto &partition : bad.partitionTree.partitions)
+                partition.attrs.eventActs.reset();
+            reject(std::move(bad), "rejects: verifier accepted supernodes without event acts");
         }
         // Missing prerequisites fail cleanly without touching the mapping.
         std::string error;
@@ -970,8 +983,15 @@ namespace
             require(bool(pass), error);
             diag::Diagnostics diagnostics;
             require(!pass->run(wrongStage.model, diagnostics).success &&
-                    wrongStage.model.cpuMapping()->stage == CpuMappingStage::GeneralFunctions,
+                    wrongStage.model.cpuMapping()->stage == CpuMappingStage::GeneralSupernodes,
                     "rejects: bitmap pass accepted a wrong-stage prerequisite");
+            // C6 packs functions only after the mem write plan (M5d-6 order).
+            auto pack = defaultPassRegistry().create("cpu.st.pack-general-functions", {}, error);
+            require(bool(pack), error);
+            diag::Diagnostics packDiagnostics;
+            require(!pack->run(wrongStage.model, packDiagnostics).success &&
+                    wrongStage.model.cpuMapping()->stage == CpuMappingStage::GeneralSupernodes,
+                    "rejects: function packing accepted a pre-mem-plan mapping");
         }
         // Arguments are rejected at creation.
         const std::array<std::string_view, 1> junk{"--x"};
@@ -981,13 +1001,16 @@ namespace
                     std::string(name) + " accepted arguments");
     }
 
-    // An empty model flows through all eight passes; the schedule degenerates
-    // to the three flat phase tasks and a one-byte active-flags array.
+    // An empty model flows through all C-segment passes; the schedule
+    // degenerates to the three flat phase tasks and a one-byte active-flags
+    // array. With no ops and no states there is nothing to attribute or
+    // classify, so C1 initializes the mapping directly.
     void emptyModelTest()
     {
         GrhSimModel model("m4_empty");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        runMappingPipeline(model);
+        runPass(model, "cpu.st.build-general-nodes");
+        runPass(model, "cpu.st.merge-general-supernodes");
         runSchedulePipeline(model);
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::PhaseSchedule, "empty: stage wrong");

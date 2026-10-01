@@ -89,10 +89,9 @@ fills unclassified states unless `--reclassify true` is given.
   `regLatch` states (including mem ops on small arrays) stay on the
   next-buffer path (General phase).
 - **C3 `cpu.st.layout-named-stores`** (M5d-6): pure physical layout — it
-  consumes the annotation and makes zero classification decisions.
-- The legacy M3/M4 passes still classify implicitly by `TypeKind::Array`;
-  they ignore this annotation, so wiring `select-state-stores` into the
-  current production pipeline does not change their behavior.
+  consumes the annotation and makes zero classification decisions. The old
+  implicit `TypeKind::Array` classification lived in the legacy M3/M4 backend
+  passes, which were deleted in M5d-6.
 
 ## Options and diagnostics
 

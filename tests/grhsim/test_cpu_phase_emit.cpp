@@ -51,15 +51,25 @@ namespace
         require(result.success && !model.poisoned(), "six-phase pipeline pass failed: " + std::string(name));
     }
 
-    // The M5 pipeline (spec-m5 §5): four M2 lowering passes, the four M3
-    // partition passes, the four M4 layout/schedule passes.
-    void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes)
+    // The M5d-6 pipeline: four M2 lowering passes, the A7 store
+    // classification and B5 semantic phase attribution, then the C-segment
+    // mapping (C1 build-general-nodes initializes the mapping; C2 merge; C3
+    // layout; C4 bitmaps; C5 mem write plan; C6 function packing; C7 phase
+    // schedule). allMem forces every array into the mem store class for the
+    // P_mem-pinned fixtures; by default small arrays classify regLatch and
+    // their writes become General-phase NBA ops (M5d-6).
+    void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes, bool allMem = false)
     {
         runPass(model, "grhsim.classify-event-inputs");
         runPass(model, "grhsim.lower-edge-detect");
         runPass(model, "grhsim.extract-output-cones");
         runPass(model, "grhsim.migrate-timeslot-tasks");
-        runPass(model, "cpu.st.split-phases");
+        if (allMem)
+            runPass(model, "grhsim.select-state-stores",
+                    std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+        else
+            runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         if (splitSupernodes)
         {
             const std::array<std::string_view, 2> nodeCap{"--max-op-in-compute-node", "1"};
@@ -72,10 +82,10 @@ namespace
             runPass(model, "cpu.st.build-general-nodes");
             runPass(model, "cpu.st.merge-general-supernodes");
         }
-        runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.layout-named-stores");
         runPass(model, "cpu.st.build-event-bitmaps");
         runPass(model, "cpu.st.build-mem-write-plan");
+        runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
         require(model.cpuMapping() && model.cpuMapping()->stage == CpuMappingStage::PhaseSchedule,
                 "six-phase pipeline did not reach the PhaseSchedule stage");
@@ -515,7 +525,8 @@ namespace
             // A pre-PhaseSchedule mapping must fail the emit pass.
             GrhSimModel early = model.clone();
             runPass(early, "grhsim.extract-output-cones");
-            runPass(early, "cpu.st.split-phases");
+            runPass(early, "grhsim.split-phases");
+            runPass(early, "cpu.st.build-general-nodes");
             std::vector<std::string_view> earlyArgs{"--output", "__should_not_exist__"};
             auto pass = defaultPassRegistry().create("cpu.st.emit-cpp", earlyArgs, error);
             require(bool(pass), error);
@@ -871,7 +882,7 @@ namespace
         addOutputWrite(model, "of", word, addMemRead(model, memF, word, raddr, "rf"));
         addOutputWrite(model, "oc", word, addMemRead(model, memC, word, raddr, "rc"));
         require(verifies(model), "mem converge fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, true);
         const auto &mapping = *model.cpuMapping();
         require(mapping.schedule->memWritePlan && mapping.schedule->memWritePlan->size() == 3,
                 "mem converge should have three write plan entries");
@@ -929,7 +940,7 @@ namespace
         // event-free mem-reader/latch chain into one supernode; that supernode
         // holds no event-carrying op, so the emit side gates it on data alone
         // and the P_mem reader re-activation (dataActiveFlagNext) fires it.
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, true);
         const auto &mapping = *model.cpuMapping();
         const auto &plan = *mapping.schedule->memWritePlan;
         require(plan.size() == 1 && !plan[0].eventFree, "mem gating write should be event-gated");
@@ -993,7 +1004,7 @@ namespace
                        mem, {{clk, "posedge"}});
         addOutputWrite(model, "o", word, addMemRead(model, mem, word, raddr, "r"));
         require(verifies(model), "mem priority fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, true);
         const auto &mapping = *model.cpuMapping();
         require(mapping.schedule->memWritePlan->size() == 1, "mem priority should have one write op");
         compileAndRun(model, root / "mem_priority", {
@@ -1300,7 +1311,7 @@ namespace
         addEventWrite(model, "core.state.memAssign", {cen, fRead}, memC, {});
         addOutputWrite(model, "oc", word, addMemRead(model, memC, word, raddr, "rc"));
         require(verifies(model), "memAssign readback fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, true);
         const auto &mapping = *model.cpuMapping();
         const auto &plan = *mapping.schedule->memWritePlan;
         require(plan.size() == 2, "memAssign readback should have two write plan entries");
@@ -1355,7 +1366,7 @@ namespace
         addOutputWrite(model, "w0", byte, addMemRead(model, memW, byte, row0, "w0_r"));
         addOutputWrite(model, "w15", byte, addMemRead(model, memW, byte, row15, "w15_r"));
         require(verifies(model), "packed fill fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, true);
         compileAndRun(model, root / "packed_fill", {
             {{{"clk", "false"}}, {{"s0", "0"}, {"s1", "0"}, {"w0", "0"}, {"w15", "0"}}},
             {{{"clk", "true"}}, {{"s0", "1"}, {"s1", "2"}, {"w0", "0"}, {"w15", "15"}}},
@@ -1391,6 +1402,73 @@ namespace
         require(!std::filesystem::exists(root / "expr_stub" / "Makefile"),
                 "failed emit must not leave artifacts");
     }
+
+    // (M5d-6) General-phase regLatch-class array writes: with the default
+    // classification these small arrays land in the regLatch store and their
+    // writes become General-phase NBA ops inside General supernodes (the P_mem
+    // plan stays empty). Covers memWriteSeq port priority (last triple wins),
+    // masked memWrite (merge into the next buffer), event-free memFill
+    // convergence, and the NBA visibility contract at eval granularity (the
+    // same trace shape as the mem-class equivalents).
+    void regLatchArrayWriteTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_reglatch_write");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto memType = model.arrayType(word, 16); // 16 B: regLatch class
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto enc = addInputRead(model, "enc", bit);
+        const auto bdata = addInputRead(model, "bdata", word);
+        const auto caddr = addInputRead(model, "caddr", addrType);
+        const auto cdata = addInputRead(model, "cdata", word);
+        const auto raddr = addInputRead(model, "raddr", addrType);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto waddr = addInputRead(model, "waddr", addrType);
+        const auto wdata = addInputRead(model, "wdata", word);
+        const auto fen = addInputRead(model, "fen", bit);
+        const auto fdata = addInputRead(model, "fdata", word);
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto three = addConstant(model, addrType, "4'h3");
+        const auto aa = addConstant(model, word, "8'haa");
+        const auto nibble = addConstant(model, word, "8'h0f");
+        const auto tabS = addMemState(model, "tabS", memType, "8'h00");
+        const auto tabM = addMemState(model, "tabM", memType, "8'h00");
+        const auto tabF = addMemState(model, "tabF", memType, "8'h00");
+        // memWriteSeq priority chain (event-gated), a masked memWrite and an
+        // event-free fill — all on regLatch-class arrays.
+        addEventWrite(model, "core.state.memWriteSeq", {one, three, aa, one, three, bdata, enc, caddr, cdata},
+                      tabS, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, nibble}, tabM, {});
+        addEventWrite(model, "core.state.memFill", {fen, fdata}, tabF, {});
+        addOutputWrite(model, "o", word, addMemRead(model, tabS, word, raddr, "rs"));
+        addOutputWrite(model, "om", word, addMemRead(model, tabM, word, raddr, "rm"));
+        addOutputWrite(model, "of", word, addMemRead(model, tabF, word, raddr, "rf"));
+        require(verifies(model), "regLatch write fixture rejected");
+        runSixPhasePipeline(model, false); // default classification: regLatch
+        const auto &mapping = *model.cpuMapping();
+        require(mapping.schedule->memWritePlan && mapping.schedule->memWritePlan->empty(),
+                "regLatch-class writes must not enter the P_mem write plan");
+        compileAndRun(model, root / "reglatch_write", {
+            {{{"clk", "false"}, {"enc", "false"}, {"bdata", "0"}, {"caddr", "0"}, {"cdata", "0"},
+              {"raddr", "3"}, {"wen", "false"}, {"waddr", "0"}, {"wdata", "0"}, {"fen", "false"},
+              {"fdata", "0"}},
+             {{"o", "0"}, {"om", "0"}, {"of", "0"}}},
+            {{{"bdata", "187"}}, {{"o", "0"}}},
+            {{{"clk", "true"}}, {{"o", "187"}}},   // A writes 0xaa, B overwrites 0xbb, C disabled
+            {{{"clk", "false"}}, {{"o", "187"}}},
+            {{{"enc", "true"}, {"caddr", "3"}, {"cdata", "221"}, {"clk", "false"}}, {{"o", "187"}}},
+            {{{"clk", "true"}}, {{"o", "221"}}},   // C (last port) wins row 3
+            // Masked write: low nibble only, merges with the visible row.
+            {{{"wen", "true"}, {"waddr", "5"}, {"wdata", "90"}, {"raddr", "5"}}, {{"om", "10"}}},
+            {{{"wdata", "48"}}, {{"om", "0"}}},    // RMW on the accumulated row: 0x0a&~0x0f | 0x30&0x0f
+            {{{"wen", "false"}}, {{"om", "0"}}},
+            // Event-free fill converges; reads see it after the same eval.
+            {{{"fen", "true"}, {"fdata", "153"}}, {{"of", "153"}}},
+            {{{"fen", "false"}}, {{"of", "153"}}},
+        });
+    }
 }
 
 int main()
@@ -1424,6 +1502,7 @@ int main()
         perfCountersTest(root);
         memAssignReadbackTest(root);
         packedFillTest(root);
+        regLatchArrayWriteTest(root);
         exprPlaceholderTest(root);
         std::cout << "CPU six-phase emit tests passed\n";
         return 0;

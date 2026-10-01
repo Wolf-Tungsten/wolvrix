@@ -355,6 +355,35 @@ verifier 约束（含分区自封，任何中间形态都必须满足）：`edge
 
 JSON checkpoint 中相位随 op 行持久化，字节稳定往返。
 
+### 3.7 CPU mapping 的 C 段（M5d-6）
+
+B8 封板后，CPU 后端只运行**一次最终 mapping**（C 段），单向推进、不回改语义；mapping
+因语义 revision 失效后由 C1 整体重建。七个 pass 的顺序（机制细节见
+[CPU 单线程活动度仿真 Flow](flows/cpu-st.md) 第 2 节与各 pass 文档）：
+
+| 阶段 | pass | 产出 |
+| --- | --- | --- |
+| C1 | `cpu.st.build-general-nodes` | 从零初始化 mapping：四平铺分枝 + General node（锥吸收） |
+| C2 | `cpu.st.merge-general-supernodes` | General 超节点；序号 = 分枝子节点顺序，就此固定 |
+| C3 | `cpu.st.layout-named-stores` | named-store 布局（零分类决策，只消费 A7 `storeClass`） |
+| C4 | `cpu.st.build-event-bitmaps` | (event,edge) 聚类 → 超节点位图（bit i = C2 序号 i） |
+| C5 | `cpu.st.build-mem-write-plan` | Mem 相写计划与 mem 类状态的读者表 |
+| C6 | `cpu.st.pack-general-functions` | EmitFunction 只记超节点序号区间（`supernodeRange`） |
+| C7 | `cpu.st.build-phase-schedule` | fanout/trigger/task；终态 `PhaseSchedule`（complete） |
+
+关键决议：
+
+- **序号解耦**（归位决议 2）：超节点序号在 C2 固定，与 C6 的函数打包解耦；C6 不再
+  重新挂载超节点，EmitFunction 是尾随叶子，只记录连续序号区间（铺满 [0,N)）。
+- **零分类决策**：C3 的状态归 store 只消费第 3.5 节的 `storeClass` 注解，未分类状态
+  报错；后端不得凭 `TypeKind::Array` 重新推导归属。
+- **mem 写按相位调度**：General 相 regLatch 类写（含小数组 mem op）在超节点内经 NBA
+  next 缓冲提交、读者经 `commitStateFanout` 激活；Mem 相 mem 类写由 P_mem 按 C5 优先级
+  原地提交。
+- **枚举兼容**：`CpuMappingStage` 数值保持稳定（旧 checkpoint 解码），但流水线顺序
+  不再是数值顺序，stage 比较走 `cpuMappingStageRank`；stage 早于 `SplitPhases` 的旧
+  checkpoint 被 verify 拒绝，`SplitPhases` 本身不再由任何 pass 产生。
+
 ## 4. 执行语义
 
 ### 4.1 单次图状态转移

@@ -1,12 +1,20 @@
 # General supernode merging with the event-domain constraint
 
-`cpu.st.merge-general-supernodes` is the third pass of the M3 six-phase CPU
-mapping pipeline. It merges the General-branch nodes into supernodes with the
+`cpu.st.merge-general-supernodes` is the second pass (C2) of the CPU mapping
+C segment. It merges the General-branch nodes into supernodes with the
 legacy frame — cluster initialization, the op DAG, three coarsen modes over a
 union-find, the quotient DAG check, and the DP segmentation cost model
 (`--max-op-in-compute-supernode`, default 128) — and adds the P_general
 event-domain merge prohibition. Requires a `GeneralNodes`-stage mapping;
 produces the `GeneralSupernodes` stage.
+
+**Supernode ordinals are fixed here (resolution 2).** The resulting
+supernodes stay direct children of the General branch in cluster
+(partition-result) order, and that child order **is** the final supernode
+ordinal space (0..N-1) consumed by the layout, event bitmaps, mem write
+plan, schedule and emitter. Later passes never renumber or remount the
+supernodes: function packing (C6) only records contiguous ordinal intervals
+over them.
 
 Event-domain definitions:
 
@@ -52,8 +60,8 @@ making the model unpartitionable.
 
 Every resulting General supernode records the sorted union of its ops' acts
 in the `eventActs` partition attribute — engaged, with an empty array for
-event-free supernodes — serialized as the optional fourth element of the
-partition's positional JSON tail (`[[activeId],[activeWord],[chunks],[acts…]]`).
+event-free supernodes — serialized in the partition's positional JSON attr
+tail after the helper-chunk array (`[chunks], [acts…]?, [supernodeRange]?`).
 
 For example (two writes, one shared cone):
 

@@ -1,9 +1,11 @@
 #ifndef WOLVRIX_LIB_GRHSIM_BACKEND_CPU_PHASE_COMMON_HPP
 #define WOLVRIX_LIB_GRHSIM_BACKEND_CPU_PHASE_COMMON_HPP
 
-// Shared helpers for the M4 six-phase layout/schedule passes and their
+// Shared helpers for the six-phase layout/schedule passes and their
 // verifiers (cpu_layout.cpp / cpu_schedule.cpp). Everything here is a pure
-// function of the model plus the GeneralFunctions-stage partition tree.
+// function of the model plus the partition tree. M5d-6: the supernode
+// ordinal is fixed by merge-general-supernodes (C2) as the General branch's
+// child order; function packing (C6) only records intervals over it.
 
 #include "grhsim/ir/model.hpp"
 
@@ -55,10 +57,12 @@ namespace wolvrix::lib::grhsim
                type == "core.state.memAssign" || type == "core.state.memWriteSeq";
     }
 
-    // The M4 supernode ordinal: the General branch flattened in tree order
-    // (emit-function child order, then each function's supernode child order).
-    // Partition ids never reach the emitter; this 0..N-1 sequence indexes the
-    // ActiveFlags byte arrays and the event bitmap words.
+    // The supernode ordinal (M5d-6, resolution 2): the General branch's
+    // Supernode children in tree order — fixed at C2 and untouched by C6's
+    // function packing (EmitFunction leaves trail the supernodes and are
+    // skipped here). Partition ids never reach the emitter; this 0..N-1
+    // sequence indexes the ActiveFlags byte arrays and the event bitmap
+    // words.
     inline std::vector<PartitionId> generalSupernodeOrder(const CpuPartitionTree &tree)
     {
         std::vector<PartitionId> order;
@@ -67,9 +71,9 @@ namespace wolvrix::lib::grhsim
         {
             const auto &branch = tree.partitions[branchId.index - 1];
             if (branch.attrs.phase != CpuPhase::General) continue;
-            for (const auto functionId : branch.children)
-                for (const auto supernodeId : tree.partitions[functionId.index - 1].children)
-                    order.push_back(supernodeId);
+            for (const auto childId : branch.children)
+                if (tree.partitions[childId.index - 1].attrs.kind == CpuPartitionKind::Supernode)
+                    order.push_back(childId);
         }
         return order;
     }
@@ -107,11 +111,12 @@ namespace wolvrix::lib::grhsim
     }
 
     // Boundary-store value set: General-produced values consumed across a
-    // supernode boundary or by a mem write op. Event/Output cones are
-    // self-contained (they read stores), so they never extend the set.
-    // M5d-5 compat: the mem-write sampling rule keys on the op TYPE, not the
-    // op phase — B5 tags regLatch-class writes General while this legacy
-    // backend still schedules every mem write in P_mem.
+    // supernode boundary or sampled by a Mem-phase write op. Event/Output
+    // cones are self-contained (they read stores), so they never extend the
+    // set. M5d-6: General-phase regLatch-class mem writes live inside
+    // General supernodes, so their operands follow the normal
+    // cross-supernode rule; only Mem-phase (mem-class) writes sample
+    // unconditionally.
     inline std::vector<bool> sixPhaseBoundaryValues(const GrhSimModel &model, const CpuPartitionTree &tree,
                                                     std::span<const PartitionId> supernodeOf)
     {
@@ -121,7 +126,7 @@ namespace wolvrix::lib::grhsim
         std::vector<bool> boundary(model.values().size() + 1, false);
         for (const auto &op : model.operations())
         {
-            const bool memConsumer = isCpuPhaseMemWriteOp(model.text(op.opType));
+            const bool memConsumer = op.phase == SimPhase::Mem;
             const auto consumer = supernodeOf[op.id.index];
             for (const auto operand : model.operands(op))
             {

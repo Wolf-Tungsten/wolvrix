@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -248,6 +249,59 @@ namespace
             require(op.phase != SimPhase::None, "split-phases left a phase-less op");
     }
 
+    // M5d-6 mapping entry: the A7 store classification feeds B5's class-aware
+    // attribution and C3's layout; C1 initializes the one final mapping.
+    // allMem forces every array into the mem store class (mem-min-bytes=0) so
+    // mem-write branch tests keep their P_mem shape.
+    void attributeAndInit(GrhSimModel &model, bool allMem = false)
+    {
+        if (allMem)
+            runPass(model, "grhsim.select-state-stores",
+                    std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+        else
+            runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
+        runPass(model, "cpu.st.build-general-nodes");
+    }
+
+    // C3 -> C4 -> C5 -> C6: the mapping advances from GeneralSupernodes to
+    // GeneralFunctions (function packing moved between the mem write plan and
+    // the phase schedule in M5d-6).
+    void advanceToFunctions(GrhSimModel &model)
+    {
+        runPass(model, "cpu.st.layout-named-stores");
+        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-mem-write-plan");
+        runPass(model, "cpu.st.pack-general-functions");
+    }
+
+    // General branch shape from C6 on: supernodes in ordinal order, then the
+    // EmitFunction leaves whose ranges tile [0, supernodeCount).
+    void requirePackedGeneralBranch(const CpuBackendMapping &mapping, const char *tag)
+    {
+        const auto &general = branch(mapping, CpuPhase::General);
+        const auto &tree = mapping.partitionTree;
+        uint32_t supernodeCount = 0, rangeEnd = 0;
+        bool seenFunction = false;
+        for (const auto child : general.children)
+        {
+            const auto &node = tree.partitions[child.index - 1];
+            if (node.attrs.kind == CpuPartitionKind::Supernode)
+            {
+                require(!seenFunction, std::string(tag) + ": supernode trails an emit function");
+                ++supernodeCount;
+                continue;
+            }
+            require(node.attrs.kind == CpuPartitionKind::EmitFunction && node.attrs.supernodeRange,
+                    std::string(tag) + ": general branch holds a non-function leaf");
+            seenFunction = true;
+            require(node.attrs.supernodeRange->offset == rangeEnd && node.attrs.supernodeRange->count != 0,
+                    std::string(tag) + ": emit function range is not contiguous");
+            rangeEnd += node.attrs.supernodeRange->count;
+        }
+        require(rangeEnd == supernodeCount, std::string(tag) +": emit function ranges do not tile");
+    }
+
     struct TwoClockFixture
     {
         GrhSimModel model;
@@ -283,23 +337,21 @@ namespace
         addRegWrite(model, x, d, one, q2, {0});
         require(verifies(model), "f1: fixture rejected");
 
-        const auto split = runPass(model, "cpu.st.split-phases");
-        require(infoValue(split, "cpu.st.split-phases", "event_ops=") == std::optional<uint64_t>(2),
-                "f1: split event op count wrong");
-        require(infoValue(split, "cpu.st.split-phases", "general_ops=") == std::optional<uint64_t>(5),
-                "f1: split general op count wrong");
-        require(infoValue(split, "cpu.st.split-phases", "attributed_general=") == std::optional<uint64_t>(3),
-                "f1: split attribution count wrong");
+        runPass(model, "grhsim.select-state-stores");
+        const auto split = runPass(model, "grhsim.split-phases");
+        require(infoValue(split, "grhsim.split-phases", "attributed=") == std::optional<uint64_t>(3),
+                "f1: semantic split attribution count wrong");
         requirePhases(model);
+        const auto built = runPass(model, "cpu.st.build-general-nodes");
+        require(infoValue(built, "cpu.st.build-general-nodes", "event_ops=") == std::optional<uint64_t>(2),
+                "f1: build event op count wrong");
         const auto &mapping = *model.cpuMapping();
-        require(mapping.stage == CpuMappingStage::SplitPhases, "f1: stage after split wrong");
-        require(mapping.partitionTree.partitions.size() == 5, "f1: split tree shape wrong");
+        require(mapping.stage == CpuMappingStage::GeneralNodes, "f1: stage after node formation wrong");
         require(branch(mapping, CpuPhase::Event).ops.size() == 2, "f1: event branch wrong");
         require(branch(mapping, CpuPhase::General).ops.empty() &&
-                branch(mapping, CpuPhase::General).children.empty(), "f1: general shell not empty");
+                !branch(mapping, CpuPhase::General).children.empty(), "f1: general nodes missing");
         roundTrip(model);
 
-        runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
         const auto &merged = *model.cpuMapping();
         const auto packs = supernodes(merged);
@@ -311,7 +363,7 @@ namespace
                 "f1: supernode eventActs wrong");
         roundTrip(model);
 
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         const auto &packed = *model.cpuMapping();
         require(packed.stage == CpuMappingStage::GeneralFunctions, "f1: final stage wrong");
         require(branch(packed, CpuPhase::Event).children.size() == 1 &&
@@ -320,6 +372,7 @@ namespace
         require(flatOps(packed, branch(packed, CpuPhase::Event).children.front()).size() == 2,
                 "f1: event function ops wrong");
         require(supernodes(packed).size() == 1, "f1: packing lost the supernode");
+        requirePackedGeneralBranch(packed, "f1");
         roundTrip(model);
     }
 
@@ -337,7 +390,8 @@ namespace
         const auto w2 = addRegWrite(model, fixture.one, fixture.d, fixture.one, q2, {0, 1});
         require(verifies(model), "f2: fixture rejected");
 
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
         const auto &mapping = *model.cpuMapping();
@@ -352,7 +406,7 @@ namespace
             require(!(containsOp(mapping, *supernode, w1) && containsOp(mapping, *supernode, w2)),
                     "f2: a supernode holds both writes");
         roundTrip(model);
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         roundTrip(model);
     }
 
@@ -375,7 +429,8 @@ namespace
         const auto w2 = addRegWrite(model, one2, x, one2, q2, {1});
         require(verifies(model), "f3: fixture rejected");
 
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         const auto merged = runPass(model, "cpu.st.merge-general-supernodes");
         const auto blocked = infoValue(merged, "cpu.st.merge-general-supernodes", "event_domain_blocked=");
@@ -400,7 +455,7 @@ namespace
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>{1},
                 "f3: second write supernode eventActs wrong");
         roundTrip(model);
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         roundTrip(model);
     }
 
@@ -419,7 +474,8 @@ namespace
         const auto w2 = addRegWrite(model, fixture.one, b, fixture.one, q2, {1});
         require(verifies(model), "f4: fixture rejected");
 
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         const std::array<std::string_view, 2> singleNode{"--max-op-in-compute-node", "1"};
         runPass(model, "cpu.st.build-general-nodes", singleNode);
         runPass(model, "cpu.st.merge-general-supernodes");
@@ -469,7 +525,8 @@ namespace
         const auto w2 = addRegWrite(model, fixture.one, y, fixture.one, q2, {1});
         require(verifies(model), "f9: fixture rejected");
 
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         const auto merged = runPass(model, "cpu.st.merge-general-supernodes");
         const auto blocked = infoValue(merged, "cpu.st.merge-general-supernodes", "event_domain_blocked=");
@@ -488,7 +545,7 @@ namespace
                 containsOp(mapping, *s2, producerOf(model, y)),
                 "f9: state-read cone did not stay with the reading domain");
         roundTrip(model);
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         roundTrip(model);
     }
 
@@ -544,21 +601,27 @@ namespace
                                             std::array{ms1, one, ms2, ms3, zero, ms4}, {}, memSeqRefs);
         require(verifies(model), "f5: fixture rejected");
 
-        const auto split = runPass(model, "cpu.st.split-phases");
-        require(infoValue(split, "cpu.st.split-phases", "attributed_mem=") == std::optional<uint64_t>(4),
+        // f5 pins the P_mem shape: B5 runs before any classification, so its
+        // unclassified-model fallback attributes every array write to the Mem
+        // phase; the classification forced to all-mem below keeps C3
+        // consistent with that attribution.
+        const auto split = runPass(model, "grhsim.split-phases");
+        require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(4),
                 "f5: mem attribution count wrong");
+        requirePhases(model);
+        runPass(model, "cpu.st.build-general-nodes");
         const auto &mapping = *model.cpuMapping();
         const std::vector<OpId> memOrder{mw, mf, ma, mws};
         require(branch(mapping, CpuPhase::Mem).ops == memOrder, "f5: mem branch is not flat op-id order");
         for (auto opId : memOrder)
             require(model.operations()[opId.index - 1].phase == SimPhase::Mem,
                     "f5: mem write phase wrong");
-        requirePhases(model);
         roundTrip(model);
 
-        runPass(model, "cpu.st.build-general-nodes");
+        runPass(model, "grhsim.select-state-stores",
+                std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
         runPass(model, "cpu.st.merge-general-supernodes");
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         const auto &packed = *model.cpuMapping();
         const auto &memBranch = branch(packed, CpuPhase::Mem);
         require(memBranch.children.size() == 1 && memBranch.ops.empty(), "f5: mem branch shape wrong");
@@ -618,13 +681,19 @@ namespace
         model.setOperationPhase(or_, SimPhase::Output);
         require(verifies(model), "f6: fixture rejected");
 
-        runPass(model, "cpu.st.split-phases");
+        runPass(model, "grhsim.select-state-stores",
+                std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+        const auto split = runPass(model, "grhsim.split-phases");
+        require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(1),
+                "f6: semantic split mem attribution wrong");
+        // C1 initializes the mapping and forms the General nodes in one pass.
+        runPass(model, "cpu.st.build-general-nodes");
         const auto &mapping = *model.cpuMapping();
         require(!model.mappings().front().complete, "f6: six-phase mapping must stay incomplete");
-        require(mapping.partitionTree.partitions.size() == 5, "f6: split tree shape wrong");
         const auto &root = mapping.partitionTree.partitions[mapping.partitionTree.root.index - 1];
         const std::array<CpuPhase, 4> order{CpuPhase::Event, CpuPhase::General,
                                             CpuPhase::Mem, CpuPhase::Output};
+        require(root.children.size() == order.size(), "f6: root branch count wrong");
         for (std::size_t i = 0; i < order.size(); ++i)
         {
             const auto &child = mapping.partitionTree.partitions[root.children[i].index - 1];
@@ -638,12 +707,8 @@ namespace
         require(branch(mapping, CpuPhase::Output).ops == outputOrder,
                 "f6: output branch did not topologically sort the cone");
         require(branch(mapping, CpuPhase::Mem).ops == std::vector<OpId>{mw}, "f6: mem branch wrong");
-        roundTrip(model);
-
-        runPass(model, "cpu.st.build-general-nodes");
-        const auto &noded = *model.cpuMapping();
-        require(noded.stage == CpuMappingStage::GeneralNodes, "f6: node stage wrong");
-        const auto &generalNodes = branch(noded, CpuPhase::General);
+        require(mapping.stage == CpuMappingStage::GeneralNodes, "f6: node stage wrong");
+        const auto &generalNodes = branch(mapping, CpuPhase::General);
         require(!generalNodes.children.empty() && generalNodes.ops.empty(), "f6: general nodes missing");
         roundTrip(model);
 
@@ -654,7 +719,7 @@ namespace
             require(supernode->attrs.eventActs.has_value(), "f6: supernode lost its eventActs annotation");
         roundTrip(model);
 
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         const auto &packed = *model.cpuMapping();
         require(packed.stage == CpuMappingStage::GeneralFunctions, "f6: function stage wrong");
         require(countKind(packed, CpuPartitionKind::ActiveWord) == 0,
@@ -675,12 +740,16 @@ namespace
                 "f6: mem function wrong");
         require(flatOps(packed, branch(packed, CpuPhase::Output).children.front()) == outputOrder,
                 "f6: output function wrong");
+        requirePackedGeneralBranch(packed, "f6");
         roundTrip(model);
 
-        runPass(model, "cpu.st.split-phases");
-        require(model.cpuMapping()->stage == CpuMappingStage::SplitPhases &&
-                model.cpuMapping()->partitionTree.partitions.size() == 5,
-                "f6: split-phases rerun did not reset the tree");
+        // C1 re-runs discard and reinitialize the mapping (the pipeline's
+        // single mapping-init point).
+        runPass(model, "cpu.st.build-general-nodes");
+        require(model.cpuMapping()->stage == CpuMappingStage::GeneralNodes &&
+                branch(*model.cpuMapping(), CpuPhase::General).children.size() ==
+                    branch(mapping, CpuPhase::General).children.size(),
+                "f6: build-general-nodes rerun did not reset the tree");
         roundTrip(model);
     }
 
@@ -698,9 +767,10 @@ namespace
         const auto w1 = addRegWrite(model, fixture.one, x, fixture.one, q1, {0});
         const auto w2 = addRegWrite(model, one2, x, one2, q2, {1});
         require(verifies(model), "f7: fixture rejected");
-        runPass(model, "cpu.st.split-phases");
-        const auto splitMapping = *model.cpuMapping();
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
+        const auto splitMapping = *model.cpuMapping();
         runPass(model, "cpu.st.merge-general-supernodes");
         const auto mergedMapping = *model.cpuMapping();
 
@@ -731,7 +801,8 @@ namespace
             const auto q42 = addState(m4, "q2", bit, "1'b0");
             addRegWrite(m4, f4.one, b4, f4.one, q41, {0});
             addRegWrite(m4, f4.one, b4, f4.one, q42, {1});
-            runPass(m4, "cpu.st.split-phases");
+            runPass(m4, "grhsim.select-state-stores");
+            runPass(m4, "grhsim.split-phases");
             const std::array<std::string_view, 2> singleNode{"--max-op-in-compute-node", "1"};
             runPass(m4, "cpu.st.build-general-nodes", singleNode);
             runPass(m4, "cpu.st.merge-general-supernodes");
@@ -762,7 +833,7 @@ namespace
             require(!verifyGrhSimModel(broken, defaultDialectRegistry(), diagnostics) &&
                     diagnostics.hasError(), "f7: verifier accepted a rule-2 event domain violation");
         }
-        // (c) SplitPhases coverage hole: a flat-branch op dropped.
+        // (c) coverage hole: a flat-branch op dropped from the mapping.
         bad = splitMapping;
         for (auto &partition : bad.partitionTree.partitions)
             if (partition.attrs.kind == CpuPartitionKind::Phase &&
@@ -786,41 +857,60 @@ namespace
             { partition.attrs.eventActs.reset(); break; }
         reject(bad);
 
-        // Missing prerequisites fail cleanly without touching the old mapping.
+        // Missing prerequisites fail cleanly. C1 requires total phase
+        // attribution (B5's job); C2/C6 require their input-stage mappings.
         std::string error;
+        {
+            GrhSimModel unattributed("f7_unattributed");
+            unattributed.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            addInputRead(unattributed, "d");
+            auto pass = defaultPassRegistry().create("cpu.st.build-general-nodes", {}, error);
+            require(bool(pass), error);
+            diag::Diagnostics diagnostics;
+            require(!pass->run(unattributed, diagnostics).success && !unattributed.cpuMapping(),
+                    "build-general-nodes accepted an unattributed model");
+        }
         GrhSimModel fresh("f7_fresh");
         fresh.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        for (auto name : {"cpu.st.build-general-nodes", "cpu.st.merge-general-supernodes",
-                          "cpu.st.pack-general-functions"})
+        for (auto name : {"cpu.st.merge-general-supernodes", "cpu.st.pack-general-functions"})
         {
             auto pass = defaultPassRegistry().create(name, {}, error);
             require(bool(pass), error);
             diag::Diagnostics diagnostics;
             require(!pass->run(fresh, diagnostics).success && !fresh.cpuMapping(),
-                    std::string(name) + " accepted a missing split-phases prerequisite");
+                    std::string(name) + " accepted a missing prerequisite mapping");
         }
-        auto splitModel = model.clone();
+        auto mergeModel = model.clone();
         {
-            CpuBackendMapping mapping = splitMapping;
-            splitModel.setCpuMapping(std::move(mapping));
+            CpuBackendMapping mapping = mergedMapping;
+            mergeModel.setCpuMapping(std::move(mapping));
         }
         auto merge = defaultPassRegistry().create("cpu.st.merge-general-supernodes", {}, error);
         require(bool(merge), error);
         diag::Diagnostics mergeDiagnostics;
-        require(!merge->run(splitModel, mergeDiagnostics).success &&
-                splitModel.cpuMapping()->stage == CpuMappingStage::SplitPhases,
+        require(!merge->run(mergeModel, mergeDiagnostics).success &&
+                mergeModel.cpuMapping()->stage == CpuMappingStage::GeneralSupernodes,
                 "merge accepted a wrong-stage prerequisite");
-        // The new passes also reject legacy-pipeline mappings.
-        GrhSimModel legacy("f7_legacy");
-        legacy.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        addInputRead(legacy, "d");
-        runPass(legacy, "cpu.st.split-phase");
-        auto general = defaultPassRegistry().create("cpu.st.build-general-nodes", {}, error);
-        require(bool(general), error);
-        diag::Diagnostics legacyDiagnostics;
-        require(!general->run(legacy, legacyDiagnostics).success &&
-                legacy.cpuMapping()->stage == CpuMappingStage::SplitPhase,
-                "build-general-nodes accepted a legacy mapping");
+        auto pack = defaultPassRegistry().create("cpu.st.pack-general-functions", {}, error);
+        require(bool(pack), error);
+        diag::Diagnostics packDiagnostics;
+        require(!pack->run(mergeModel, packDiagnostics).success &&
+                mergeModel.cpuMapping()->stage == CpuMappingStage::GeneralSupernodes,
+                "pack-general-functions accepted a pre-mem-plan mapping");
+        // The removed mapping initializers and the legacy two-phase line are
+        // no longer registered (M5d-6).
+        for (auto name : {"cpu.st.split-phases", "cpu.st.split-phase", "cpu.st.form-event-domains",
+                          "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
+                          "cpu.st.pack-active-words", "cpu.st.pack-emit-functions", "cpu.st.layout-data",
+                          "cpu.st.build-schedule", "grhsim.demonitor-redundant",
+                          "grhsim.demonitor-edge-completion", "grhsim.migrate-boundary-ops",
+                          "grhsim.migrate-boundary-ops-ec", "grhsim.fuse-expr-chains",
+                          "grhsim.fold-residue"})
+        {
+            error.clear();
+            require(!defaultPassRegistry().create(name, {}, error),
+                    std::string(name) + " is still registered");
+        }
         // Invalid options are rejected at creation.
         const std::array<std::string_view, 2> zeroLimit{"--max-op-in-compute-node", "0"};
         require(!defaultPassRegistry().create("cpu.st.build-general-nodes", zeroLimit, error),
@@ -834,21 +924,18 @@ namespace
         const std::array<std::string_view, 2> zeroTarget{"--target-batch-count", "0"};
         require(bool(defaultPassRegistry().create("cpu.st.pack-general-functions", zeroTarget, error)),
                 "rejected a zero target batch count");
-        const std::array<std::string_view, 2> splitArgs{"--max-op-in-compute-node", "1"};
-        require(!defaultPassRegistry().create("cpu.st.split-phases", splitArgs, error),
-                "split-phases accepted arguments");
         (void)w1; (void)w2;
     }
 
-    // An empty model flows through all four passes.
+    // An empty model flows through the whole C segment (C1 initializes the
+    // mapping directly — no attribution is needed when there are no ops).
     void emptyModelTest()
     {
         GrhSimModel model("f8_empty");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        runPass(model, "cpu.st.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
-        runPass(model, "cpu.st.pack-general-functions");
+        advanceToFunctions(model);
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::GeneralFunctions, "f8: final stage wrong");
         require(branch(mapping, CpuPhase::General).children.empty(), "f8: general branch not empty");
@@ -858,6 +945,57 @@ namespace
             require(flat.children.size() == 1 &&
                     flatOps(mapping, flat.children.front()).empty(), "f8: flat function missing");
         }
+        roundTrip(model);
+    }
+    // M5d-6 C1 contract: a regLatch-class array's mem writes are General-phase
+    // ops (B5's class-aware attribution), anchor their own nodes inside the
+    // General branch, and leave the flat Mem branch empty — the mapping
+    // verifier accepts them there (op/branch phase agreement is by SimPhase).
+    void regLatchMemWriteTest()
+    {
+        GrhSimModel model("f10_reglatch_mem_write");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto tabType = model.arrayType(bit, 4); // 4 x 1 bit: regLatch class
+        const auto clk = addInputRead(model, "clk", SimPhase::Event);
+        addEdgeDet(model, clk, 0);
+        const auto en = addInputRead(model, "en");
+        const auto addr = addInputRead(model, "addr");
+        const auto data = addInputRead(model, "data");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto tab = addState(model, "tab", tabType, "0");
+        const std::array writeRefs{ObjectRef::state(tab)};
+        const std::array writeParams{Parameter{model.intern("event_acts"), std::vector<int64_t>{0}}};
+        const auto write = model.addOperation("core.state.memWrite", std::array{en, addr, data, one}, {},
+                                              writeRefs, writeParams);
+        require(verifies(model), "f10: fixture rejected");
+
+        runPass(model, "grhsim.select-state-stores");
+        require(model.states()[tab.index - 1].storeClass == StateStoreClass::RegLatch,
+                "f10: small array was not classified regLatch");
+        const auto split = runPass(model, "grhsim.split-phases");
+        require(infoValue(split, "grhsim.split-phases", "mem_writes_reglatch=") == std::optional<uint64_t>(1),
+                "f10: regLatch mem write was not kept on the General path");
+        require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(0),
+                "f10: a mem write leaked into the Mem phase");
+        require(model.operations()[write.index - 1].phase == SimPhase::General,
+                "f10: regLatch mem write phase wrong");
+        runPass(model, "cpu.st.build-general-nodes");
+        const auto &mapping = *model.cpuMapping();
+        require(branch(mapping, CpuPhase::Mem).ops.empty(), "f10: mem branch is not empty");
+        runPass(model, "cpu.st.merge-general-supernodes");
+        const auto &merged = *model.cpuMapping();
+        const auto *pack = supernodeOf(merged, write);
+        require(pack, "f10: regLatch mem write is not inside a general supernode");
+        require(pack->attrs.eventActs && *pack->attrs.eventActs == std::vector<int64_t>{0},
+                "f10: write supernode eventActs wrong");
+        roundTrip(model);
+        advanceToFunctions(model);
+        const auto &packed = *model.cpuMapping();
+        const auto &memBranch = branch(packed, CpuPhase::Mem);
+        require(memBranch.children.size() == 1 &&
+                flatOps(packed, memBranch.children.front()).empty(), "f10: mem function is not empty");
+        requirePackedGeneralBranch(packed, "f10");
         roundTrip(model);
     }
 }
@@ -875,6 +1013,7 @@ int main()
         verifierRejectsTest();
         emptyModelTest();
         crossDomainStateReadTest();
+        regLatchMemWriteTest();
         std::cout << "CPU six-phase mapping tests passed\n";
         return 0;
     }

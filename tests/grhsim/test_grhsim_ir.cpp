@@ -2034,272 +2034,6 @@ namespace {
         return 0;
     }
 
-    int runFuseExprChainsTest(const std::filesystem::path &artifactDir) {
-        using namespace grhsim;
-        const auto inputOf = [](GrhSimModel &model, TypeId type) {
-            const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
-            const auto value = model.addValue(type);
-            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
-            return value;
-        };
-        const auto runMappedFusion = [](GrhSimModel &model, diag::Diagnostics &diagnostics) {
-            PassManager manager(defaultDialectRegistry()); std::string error;
-            for (const char *name : {"cpu.st.split-phase", "cpu.st.form-event-domains",
-                                     "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
-                                     "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
-                                     "cpu.st.layout-data", "cpu.st.build-schedule",
-                                     "grhsim.fuse-expr-chains"})
-                manager.addPass(defaultPassRegistry().create(name, {}, error));
-            return manager.run(model, diagnostics);
-        };
-        // Positive: a three-op single-use chain fuses into one core.compute.expr
-        // whose operands are the chain leaves; intermediates stay in the model;
-        // the pass is idempotent.
-        {
-            GrhSimModel model("fuse_expr_chain"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
-            const auto a = inputOf(model, byte), b = inputOf(model, byte), c = inputOf(model, byte);
-            const auto t1 = model.addValue(byte), t2 = model.addValue(byte), t3 = model.addValue(byte);
-            model.addOperation("core.compute.and", std::array{a, b}, std::array{t1});
-            model.addOperation("core.compute.xor", std::array{t1, c}, std::array{t2});
-            model.addOperation("core.compute.add", std::array{t2, a}, std::array{t3});
-            const auto output = model.addOutput("o", byte);
-            model.addOperation("core.output.write", std::array{t3}, {}, std::array{ObjectRef::output(output)});
-            diag::Diagnostics diagnostics;
-            const auto first = runMappedFusion(model, diagnostics);
-            if (!first.success || !first.changed) return fail("fuse-expr-chains missed a three-op chain");
-            unsigned exprs = 0, plainAdds = 0;
-            const SimOp *expr = nullptr;
-            for (const auto &op : model.operations()) {
-                if (model.text(op.opType) == "core.compute.expr") { ++exprs; expr = &op; }
-                else if (model.text(op.opType) == "core.compute.add") ++plainAdds;
-            }
-            if (exprs != 1 || plainAdds != 0 || !expr) return fail("fuse-expr-chains left a residual chain root");
-            const auto operands = model.operands(*expr);
-            if (operands.size() != 3 || operands[0] != a || operands[1] != b || operands[2] != c)
-                return fail("fuse-expr-chains leaf operand order changed");
-            if (model.results(*expr).size() != 1 || model.results(*expr)[0] != t3)
-                return fail("fuse-expr-chains lost the chain root result");
-            const Parameter *tree = nullptr, *rk = nullptr;
-            for (const auto &param : model.parameters(*expr)) {
-                if (model.text(param.name) == "tree") tree = &param;
-                if (model.text(param.name) == "rk") rk = &param;
-            }
-            if (!tree || !rk || !std::holds_alternative<std::vector<std::string>>(tree->value) ||
-                !std::holds_alternative<std::string>(rk->value) ||
-                std::get<std::string>(rk->value) != "core.compute.add")
-                return fail("fuse-expr-chains wrote malformed expr parameters");
-            const auto &tokens = std::get<std::vector<std::string>>(tree->value);
-            unsigned nodes = 0, leaves = 0;
-            for (const auto &token : tokens) (token.size() > 1 && token[0] == 'n' ? nodes : leaves)++;
-            if (nodes != 3 || leaves != 4 || tokens.back().find("n;add;8;0;2;") != 0)
-                return fail("fuse-expr-chains encoded the wrong tree shape");
-            unsigned ands = 0, xors = 0;
-            for (const auto &op : model.operations()) {
-                ands += model.text(op.opType) == "core.compute.and";
-                xors += model.text(op.opType) == "core.compute.xor";
-            }
-            if (ands != 1 || xors != 1) return fail("fuse-expr-chains dropped intermediate ops");
-            diag::Diagnostics secondDiagnostics;
-            PassManager second(defaultDialectRegistry()); std::string error;
-            second.addPass(defaultPassRegistry().create("grhsim.fuse-expr-chains", {}, error));
-            const auto again = second.run(model, secondDiagnostics);
-            if (!again.success || again.changed) return fail("fuse-expr-chains is not idempotent");
-            // replaceOperation leaves orphaned pool ranges; the fused model must
-            // still round-trip through JSON (header counts describe the serialized
-            // spans, not pool capacity) and re-store byte-identical after loading.
-            std::filesystem::create_directories(artifactDir);
-            const auto fusedPath = artifactDir / "grhsim_fuse_expr.json";
-            const auto fusedReloadPath = artifactDir / "grhsim_fuse_expr_roundtrip.json";
-            diag::Diagnostics storeDiagnostics;
-            if (!storeGrhSimModel(model, fusedPath, defaultDialectRegistry(), storeDiagnostics))
-                return fail("fused GrhSIM JSON store failed");
-            diag::Diagnostics loadDiagnostics;
-            const auto loaded = loadGrhSimModel(fusedPath, defaultDialectRegistry(), loadDiagnostics);
-            if (!loaded || loadDiagnostics.hasError()) return fail("fused GrhSIM JSON load failed");
-            unsigned loadedExprs = 0;
-            for (const auto &op : loaded->operations())
-                loadedExprs += loaded->text(op.opType) == "core.compute.expr";
-            if (loadedExprs != 1) return fail("fused GrhSIM JSON load lost the expr op");
-            diag::Diagnostics reloadStoreDiagnostics;
-            if (!storeGrhSimModel(*loaded, fusedReloadPath, defaultDialectRegistry(), reloadStoreDiagnostics))
-                return fail("fused GrhSIM JSON round-trip store failed");
-            if (readFile(fusedPath) != readFile(fusedReloadPath))
-                return fail("fused store/load/store did not produce stable bytes");
-        }
-        // Guard: a tapped (multi-use) intermediate stays a leaf of the fused tree.
-        {
-            GrhSimModel model("fuse_expr_tap"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
-            const auto a = inputOf(model, byte), b = inputOf(model, byte), c = inputOf(model, byte);
-            const auto t1 = model.addValue(byte), t2 = model.addValue(byte), t3 = model.addValue(byte);
-            model.addOperation("core.compute.and", std::array{a, b}, std::array{t1});
-            model.addOperation("core.compute.xor", std::array{t1, c}, std::array{t2});
-            model.addOperation("core.compute.add", std::array{t2, a}, std::array{t3});
-            const auto tap = model.addOutput("tap", byte);
-            model.addOperation("core.output.write", std::array{t1}, {}, std::array{ObjectRef::output(tap)});
-            const auto output = model.addOutput("o", byte);
-            model.addOperation("core.output.write", std::array{t3}, {}, std::array{ObjectRef::output(output)});
-            diag::Diagnostics diagnostics;
-            const auto result = runMappedFusion(model, diagnostics);
-            if (!result.success || !result.changed) return fail("fuse-expr-chains missed a tapped chain");
-            bool found = false;
-            for (const auto &op : model.operations()) {
-                if (model.text(op.opType) != "core.compute.expr") continue;
-                found = true;
-                const auto operands = model.operands(op);
-                if (operands.size() != 3 || operands[0] != t1 || operands[1] != c || operands[2] != a)
-                    return fail("fuse-expr-chains absorbed a multi-use value");
-            }
-            if (!found) return fail("fuse-expr-chains produced no expr op for a tapped chain");
-        }
-        // The verifier rejects malformed expr trees (stack underflow).
-        {
-            GrhSimModel model("fuse_expr_invalid"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
-            const auto a = inputOf(model, byte);
-            const auto result = model.addValue(byte);
-            const std::vector<std::string> tree{"n;and;8;0;2;1"};
-            const std::array params{Parameter{model.intern("tree"), tree},
-                                    Parameter{model.intern("rk"), std::string("core.compute.and")}};
-            model.addOperation("core.compute.expr", std::array{a}, std::array{result},
-                std::span<const ObjectRef>{}, std::span<const Parameter>(params));
-            diag::Diagnostics diagnostics;
-            if (verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
-                return fail("malformed core.compute.expr passed verification");
-        }
-        return 0;
-    }
-
-    int runFoldResidueTest(const std::filesystem::path &artifactDir) {
-        using namespace grhsim;
-        const auto inputOf = [](GrhSimModel &model, TypeId type) {
-            const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
-            const auto value = model.addValue(type);
-            model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
-            return value;
-        };
-        const auto outputOf = [](GrhSimModel &model, ValueId value, TypeId type) {
-            const auto port = model.addOutput("o" + std::to_string(model.outputs().size()), type);
-            model.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(port)});
-        };
-        const auto constantOf = [](GrhSimModel &model, TypeId type, std::string literal) {
-            const auto value = model.addValue(type);
-            const std::array params{Parameter{model.intern("constValue"), std::move(literal)}};
-            return std::pair{model.addOperation("core.compute.constant", {}, std::array{value}, {}, params), value};
-        };
-        const auto operandsOf = [](const GrhSimModel &model, OpId id) {
-            const auto span = model.operands(model.operations()[id.index - 1]);
-            return std::vector<ValueId>(span.begin(), span.end());
-        };
-        // One mapped model covering every fold class: assign_strict (t_assign),
-        // not_not + dce_cascade (n2, n1), self_eq -> existing 1 constant (r_eq),
-        // const_slice CSE hit (r4) and CSE-miss rejection (r4hi), and a consumer
-        // rule rejection (t_out feeds output.write directly). Expect five folded
-        // ops and rewired consumers.
-        GrhSimModel model("fold_residue"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
-        const auto nibble = model.logicType(4, false, LogicDomain::TwoState);
-        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
-        const auto a = inputOf(model, byte), b = inputOf(model, byte);
-        const auto p = inputOf(model, bit), q = inputOf(model, bit);
-        const auto i4 = inputOf(model, nibble);
-        const auto [k1op, k1] = constantOf(model, byte, "8'hab");
-        const auto [k4op, k4] = constantOf(model, nibble, "4'hb");
-        const auto [k1bitop, k1bit] = constantOf(model, bit, "1'h1");
-        const auto tAssign = model.addValue(byte);
-        const auto assignOp = model.addOperation("core.compute.assign", std::array{a}, std::array{tAssign});
-        const auto tXor = model.addValue(byte);
-        model.addOperation("core.compute.xor", std::array{tAssign, b}, std::array{tXor});
-        outputOf(model, tXor, byte);
-        const auto n1 = model.addValue(bit);
-        const auto not1Op = model.addOperation("core.compute.not", std::array{p}, std::array{n1});
-        const auto n2 = model.addValue(bit);
-        const auto not2Op = model.addOperation("core.compute.not", std::array{n1}, std::array{n2});
-        const auto tAnd = model.addValue(bit);
-        model.addOperation("core.compute.and", std::array{n2, q}, std::array{tAnd});
-        outputOf(model, tAnd, bit);
-        const auto rEq = model.addValue(bit);
-        const auto eqOp = model.addOperation("core.compute.eq", std::array{a, a}, std::array{rEq});
-        const auto tOr = model.addValue(bit);
-        model.addOperation("core.compute.or", std::array{rEq, q}, std::array{tOr});
-        outputOf(model, tOr, bit);
-        const auto r4 = model.addValue(nibble);
-        const std::array lowParams{Parameter{model.intern("sliceStart"), int64_t{0}},
-                                   Parameter{model.intern("sliceEnd"), int64_t{3}}};
-        const auto sliceLowOp = model.addOperation("core.compute.sliceStatic", std::array{k1}, std::array{r4}, {}, lowParams);
-        const auto tAdd = model.addValue(nibble);
-        model.addOperation("core.compute.add", std::array{r4, i4}, std::array{tAdd});
-        outputOf(model, tAdd, nibble);
-        const auto r4hi = model.addValue(nibble);
-        const std::array highParams{Parameter{model.intern("sliceStart"), int64_t{4}},
-                                    Parameter{model.intern("sliceEnd"), int64_t{7}}};
-        model.addOperation("core.compute.sliceStatic", std::array{k1}, std::array{r4hi}, {}, highParams);
-        const auto tAddHi = model.addValue(nibble);
-        model.addOperation("core.compute.add", std::array{r4hi, i4}, std::array{tAddHi});
-        outputOf(model, tAddHi, nibble);
-        const auto tOut = model.addValue(byte);
-        model.addOperation("core.compute.assign", std::array{b}, std::array{tOut});
-        outputOf(model, tOut, byte);
-
-        PassManager manager(defaultDialectRegistry()); std::string error;
-        for (const char *name : {"cpu.st.split-phase", "cpu.st.form-event-domains",
-                                 "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
-                                 "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
-                                 "cpu.st.layout-data", "cpu.st.build-schedule",
-                                 "grhsim.fold-residue"})
-            manager.addPass(defaultPassRegistry().create(name, {}, error));
-        diag::Diagnostics diagnostics;
-        const auto result = manager.run(model, diagnostics);
-        if (!result.success || !result.changed) return fail("fold-residue missed the residue ops");
-        const auto *mapping = model.cpuMapping();
-        if (!mapping || !mapping->schedule || !mapping->schedule->foldResidue)
-            return fail("fold-residue did not mark the schedule plan");
-        const std::vector<OpId> expected{assignOp, not1Op, not2Op, eqOp, sliceLowOp};
-        if (mapping->schedule->foldResidueOps != expected)
-            return fail("fold-residue selected the wrong op set");
-        for (const auto &op : model.operations()) {
-            const auto kind = model.text(op.opType);
-            if (kind == "core.compute.xor" && operandsOf(model, op.id) != std::vector<ValueId>{a, b})
-                return fail("fold-residue did not rewire the assign consumer");
-            if (kind == "core.compute.and" && operandsOf(model, op.id) != std::vector<ValueId>{p, q})
-                return fail("fold-residue did not resolve the not-not chain");
-            if (kind == "core.compute.or" && operandsOf(model, op.id) != std::vector<ValueId>{k1bit, q})
-                return fail("fold-residue did not rewire self-eq to the existing constant");
-            if (kind == "core.compute.add" && model.results(op)[0] == tAdd &&
-                operandsOf(model, op.id) != std::vector<ValueId>{k4, i4})
-                return fail("fold-residue did not rewire const-slice to the existing constant");
-            if (kind == "core.compute.add" && model.results(op)[0] == tAddHi &&
-                operandsOf(model, op.id) != std::vector<ValueId>{r4hi, i4})
-                return fail("fold-residue rewired a CSE-miss const-slice consumer");
-        }
-        // Idempotency: a second run leaves the model unchanged.
-        diag::Diagnostics secondDiagnostics;
-        PassManager second(defaultDialectRegistry());
-        second.addPass(defaultPassRegistry().create("grhsim.fold-residue", {}, error));
-        const auto again = second.run(model, secondDiagnostics);
-        if (!again.success || again.changed) return fail("fold-residue is not idempotent");
-        // JSON round-trip stays byte stable with the schedule trailing field.
-        const auto foldedPath = artifactDir / "grhsim_fold_residue.json";
-        const auto foldedReloadPath = artifactDir / "grhsim_fold_residue_roundtrip.json";
-        diag::Diagnostics storeDiagnostics;
-        if (!storeGrhSimModel(model, foldedPath, defaultDialectRegistry(), storeDiagnostics))
-            return fail("fold-residue GrhSIM JSON store failed");
-        diag::Diagnostics loadDiagnostics;
-        const auto loaded = loadGrhSimModel(foldedPath, defaultDialectRegistry(), loadDiagnostics);
-        if (!loaded || loadDiagnostics.hasError()) return fail("fold-residue GrhSIM JSON load failed");
-        const auto *loadedMapping = loaded->cpuMapping();
-        if (!loadedMapping || !loadedMapping->schedule || !loadedMapping->schedule->foldResidue ||
-            loadedMapping->schedule->foldResidueOps != expected)
-            return fail("fold-residue JSON load lost the schedule fold set");
-        diag::Diagnostics reloadStoreDiagnostics;
-        if (!storeGrhSimModel(*loaded, foldedReloadPath, defaultDialectRegistry(), reloadStoreDiagnostics))
-            return fail("fold-residue GrhSIM JSON round-trip store failed");
-        if (readFile(foldedPath) != readFile(foldedReloadPath))
-            return fail("fold-residue store/load/store did not produce stable bytes");
-        return 0;
-    }
-
     // canonicalize-compute must respect the M1 phase barrier: cone clones and
     // their unphased twins share structure but serve different phase domains,
     // so CSE, identity-assign and concat folds must not merge across phases.
@@ -2564,6 +2298,9 @@ namespace {
         return 0;
     }
 
+    // Run the M5d-6 six-phase CPU mapping pipeline end to end and check that the
+    // produced namedStores/eventBitmaps/memWritePlan shells survive a JSON
+    // store/load/store round trip byte-identically.
     int runSimRefactorMappingShellTest(const std::filesystem::path &artifactDir) {
         using namespace grhsim;
         GrhSimModel model("sim_refactor_shells"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -2591,7 +2328,7 @@ namespace {
         const auto q = state("q", word);
         const auto history = state("q_clk_history", bit);
         const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
-        const auto regWrite = model.addOperation("core.state.regWrite",
+        model.addOperation("core.state.regWrite",
             std::array{one, next, mask, clk}, {},
             std::array{ObjectRef::state(q), ObjectRef::state(history)}, edges);
         const auto read = model.addValue(word);
@@ -2599,34 +2336,26 @@ namespace {
         const auto out = model.addOutput("o", word);
         model.addOperation("core.output.write", std::array{read}, {}, std::array{ObjectRef::output(out)});
         PassManager manager(defaultDialectRegistry()); std::string error;
-        for (const char *name : {"cpu.st.split-phase", "cpu.st.form-event-domains",
-                                 "cpu.st.build-compute-nodes", "cpu.st.merge-compute-supernodes",
-                                 "cpu.st.pack-active-words", "cpu.st.pack-emit-functions",
-                                 "cpu.st.layout-data", "cpu.st.build-schedule"})
+        // extract-output-cones clones the output cone into the Output phase
+        // (six-phase cones are self-contained); the rest is the M5d-6
+        // attribution + C-segment mapping chain.
+        for (const char *name : {"grhsim.extract-output-cones",
+                                 "grhsim.split-phases", "grhsim.select-state-stores",
+                                 "cpu.st.build-general-nodes", "cpu.st.merge-general-supernodes",
+                                 "cpu.st.layout-named-stores", "cpu.st.build-event-bitmaps",
+                                 "cpu.st.build-mem-write-plan", "cpu.st.pack-general-functions",
+                                 "cpu.st.build-phase-schedule"})
             manager.addPass(defaultPassRegistry().create(name, {}, error));
         diag::Diagnostics diagnostics;
         if (!manager.run(model, diagnostics).success || diagnostics.hasError())
-            return fail("shell fixture CPU mapping failed");
-        // Fill the M1 shells by hand: one named-store field, one event bitmap
-        // and one mem write plan entry.
-        auto mapping = *model.cpuMapping();
-        CpuNamedStore regStore;
-        regStore.kind = CpuNamedStoreKind::RegLatch;
-        regStore.fields.push_back(CpuStoreField{model.intern("q"), mapping.dataLayout->types.front().id,
-                                                0, q, ValueId{}, 0});
-        regStore.sizeBytes = 8;
-        mapping.dataLayout->namedStores = std::vector<CpuNamedStore>{regStore};
-        mapping.schedule->eventBitmaps = std::vector<CpuEventBitmap>{CpuEventBitmap{0, {0x5}}};
-        CpuMemWritePlanEntry entry;
-        entry.writeOp = regWrite;
-        entry.priority = 1;
-        entry.eventFree = true;
-        entry.readers.push_back(CpuMemReader{mapping.partitionTree.root, uint64_t{7}});
-        entry.readers.push_back(CpuMemReader{mapping.partitionTree.root, std::nullopt});
-        mapping.schedule->memWritePlan = std::vector<CpuMemWritePlanEntry>{entry};
-        model.setCpuMapping(std::move(mapping));
+            return fail("shell fixture six-phase CPU mapping failed");
+        const auto *mapping = model.cpuMapping();
+        if (!mapping || mapping->stage != CpuMappingStage::PhaseSchedule)
+            return fail("six-phase pipeline did not reach the phase-schedule stage");
+        if (!mapping->dataLayout || !mapping->dataLayout->namedStores || !mapping->schedule)
+            return fail("six-phase pipeline left the mapping shells incomplete");
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
-            return fail("manually filled M1 shells were rejected");
+            return fail("six-phase pipeline mapping was rejected");
         std::filesystem::create_directories(artifactDir);
         const auto firstPath = artifactDir / "grhsim_sim_refactor_shells.json";
         const auto secondPath = artifactDir / "grhsim_sim_refactor_shells_roundtrip.json";
@@ -2670,8 +2399,6 @@ int main()
         if (const int status = runBitwisePredicatesTest(); status != 0) return status;
         if (const int status = runBitwiseMuxGuardsTest(); status != 0) return status;
         if (const int status = runMuxChainFoldTest(); status != 0) return status;
-        if (const int status = runFuseExprChainsTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
-        if (const int status = runFoldResidueTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
         if (const int status = runCanonicalizePhaseBarrierTest(); status != 0) return status;
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;

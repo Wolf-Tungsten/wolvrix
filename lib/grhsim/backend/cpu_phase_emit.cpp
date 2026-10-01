@@ -659,6 +659,9 @@ namespace wolvrix::lib::grhsim
             void emitEdgeDet(std::ostream &out, const SimOp &op) const;
             void emitRegWrite(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitMemWrite(std::ostream &out, const SimOp &op, const CpuMemWritePlanEntry &plan) const;
+            // General-phase regLatch-class array writes (M5d-6): NBA merge
+            // into regLatchStoreNext inside the owning supernode.
+            void emitGeneralMemWrite(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitSystemTask(std::ostream &out, const SimOp &op) const;
             void emitOutputTask(std::ostream &out, const SimOp &op) const;
             std::string sideCallExtras(const SimOp &op) const;
@@ -1079,12 +1082,18 @@ namespace wolvrix::lib::grhsim
                 const auto refs = model_.objectRefs(op);
                 if (refs.size() != 1 || refs[0].kind != ObjectKind::State)
                     throw std::runtime_error("CPU memory read requires one array state reference");
-                if (refs[0].index >= memFieldByState_.size() || !memFieldByState_[refs[0].index])
-                    throw std::runtime_error("CPU six-phase emit mem read has no named-store field");
                 if (operands.size() != 1)
                     throw std::runtime_error("CPU memory read requires one index operand");
-                return "memStore." + std::string(model_.text(memFieldByState_[refs[0].index]->name)) +
-                       "[static_cast<std::size_t>(" + raw(0) + ")]";
+                // mem-class arrays live in the single memStore; regLatch-class
+                // arrays (M5d-6) read the currently visible regLatch row (NBA:
+                // same-round writes are not visible until P_publish).
+                if (refs[0].index < memFieldByState_.size() && memFieldByState_[refs[0].index])
+                    return "memStore." + std::string(model_.text(memFieldByState_[refs[0].index]->name)) +
+                           "[static_cast<std::size_t>(" + raw(0) + ")]";
+                if (refs[0].index < regFieldByState_.size() && regFieldByState_[refs[0].index])
+                    return "regLatchStore." + std::string(model_.text(regFieldByState_[refs[0].index]->name)) +
+                           "[static_cast<std::size_t>(" + raw(0) + ")]";
+                throw std::runtime_error("CPU six-phase emit mem read has no named-store field");
             }
             if (name == "core.compute.constant")
             {
@@ -1277,6 +1286,9 @@ namespace wolvrix::lib::grhsim
             if (name == "core.system.task") { emitSystemTask(out, op); return; }
             if (name == "core.dpi.call") { emitDpiCall(out, op, current); return; }
             if (name == "core.state.regWrite" || name == "core.state.latchWrite") { emitRegWrite(out, op, current); return; }
+            if (name == "core.state.memWrite" || name == "core.state.memFill" ||
+                name == "core.state.memAssign" || name == "core.state.memWriteSeq")
+            { emitGeneralMemWrite(out, op, current); return; }
             if (model_.results(op).size() != 1)
                 throw std::runtime_error("CPU six-phase emit unsupported result arity: " + std::string(name));
             const auto result = model_.results(op)[0];
@@ -1734,6 +1746,163 @@ namespace wolvrix::lib::grhsim
                 }
             }
             else throw std::runtime_error("CPU six-phase emit unsupported mem write op: " + std::string(name));
+            if (guard != "true") out << "}\n";
+        }
+        // General-phase regLatch-class array writes (M5d-6): the write lives
+        // inside its General supernode and commits NBA-style into
+        // regLatchStoreNext. The merge base is the NEXT row (read-modify-write
+        // across same-round writers, in op order), while the fanout compare
+        // runs against the currently visible regLatchStore row so stateFanout
+        // readers fire (next round, after P_publish) only on a true change —
+        // the same activation contract as emitRegWrite, per row.
+        void SixPhaseEmitter::emitGeneralMemWrite(std::ostream &out, const SimOp &op, uint32_t current) const
+        {
+            const auto name = model_.text(op.opType);
+            const auto operands = model_.operands(op);
+            const auto refs = model_.objectRefs(op);
+            if (refs.empty() || refs[0].kind != ObjectKind::State)
+                throw std::runtime_error("CPU six-phase emit general mem write requires a state target");
+            const StateId target{refs[0].index, 0};
+            const auto &array = stateType(target);
+            if (array.kind != TypeKind::Array)
+                throw std::runtime_error("CPU six-phase emit general mem write target is not an array");
+            const auto &element = model_.types()[array.elementType.index - 1];
+            const auto *field = target.index < regFieldByState_.size() ? regFieldByState_[target.index] : nullptr;
+            if (!field)
+                throw std::runtime_error("CPU six-phase emit general mem write target is not a "
+                                         "regLatch-class state");
+            const std::string nextArray = "regLatchStoreNext." + std::string(model_.text(field->name));
+            const std::string curArray = "regLatchStore." + std::string(model_.text(field->name));
+            const std::string guard = actGuard(op);
+            (void)current; // state fanout always queues into dataActiveFlagNext
+            const auto activateState = [&] {
+                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[2].name));
+                out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
+            };
+            const auto writeCell = [&](const std::string &rowText, std::optional<uint64_t> constRow,
+                                       const std::string &data, const std::string *mask) {
+                (void)constRow;
+                const std::string nextCell = nextArray + "[" + rowText + "]";
+                const std::string curCell = curArray + "[" + rowText + "]";
+                if (isScalarLogic(element))
+                {
+                    const std::string merged = mask
+                        ? normalize("(static_cast<std::uint64_t>(" + nextCell + ")&~static_cast<std::uint64_t>(" + *mask +
+                                    "))|(static_cast<std::uint64_t>(" + data + ")&static_cast<std::uint64_t>(" + *mask + "))",
+                                    element)
+                        : normalize(data, element);
+                    out << "{const auto cpu_merged=" << merged << ";if(" << nextCell << "!=cpu_merged){if("
+                        << curCell << "!=cpu_merged){\n";
+                    activateState();
+                    out << "}" << nextCell << "=cpu_merged;}}\n";
+                    return;
+                }
+                if (element.kind == TypeKind::Logic && element.domain == LogicDomain::TwoState)
+                {
+                    if (mask)
+                        out << "{const auto cpu_merged=grhsim_merge_words_masked(" << nextCell << ',' << data << ','
+                            << *mask << ',' << element.width << ");if(" << nextCell << "!=cpu_merged){if(" << curCell
+                            << "!=cpu_merged){\n";
+                    else
+                        out << "{if(" << nextCell << "!=" << data << "){if(" << curCell << "!=" << data << "){\n";
+                    activateState();
+                    if (mask) out << "}" << nextCell << "=cpu_merged;}}\n";
+                    else out << "}" << nextCell << '=' << data << ";}}\n";
+                    return;
+                }
+                throw std::runtime_error("CPU six-phase emit general mem write element type is not two-state logic");
+            };
+            const auto rowOf = [&](ValueId address, std::string &rowText, std::optional<uint64_t> &constRow) {
+                rowText = read(address);
+                if (const auto constantRow = scalarConstantValue(address))
+                {
+                    rowText = std::to_string(*constantRow);
+                    if (*constantRow < array.count) constRow = *constantRow;
+                    else return false; // statically out of bounds: dead write
+                }
+                return true;
+            };
+            if (guard != "true") out << "if(" << guard << "){\n";
+            if (name == "core.state.memWrite")
+            {
+                if (operands.size() != 4) throw std::runtime_error("CPU memory write has invalid arity");
+                const std::string maskText = read(operands[3]);
+                std::string rowText; std::optional<uint64_t> constRow;
+                if (!rowOf(operands[1], rowText, constRow))
+                    out << "// cpu_mem_write_dead row=" << read(operands[1]) << "\n";
+                else
+                {
+                    out << "if(" << read(operands[0]);
+                    if (!constRow) out << "&&static_cast<std::size_t>(" << rowText << ")<" << array.count;
+                    out << "){\n";
+                    writeCell(rowText, constRow, read(operands[2]), &maskText);
+                    out << "}\n";
+                }
+            }
+            else if (name == "core.state.memFill" || name == "core.state.memAssign")
+            {
+                if (operands.size() != 2) throw std::runtime_error("CPU memory fill/assign has invalid arity");
+                const bool assign = name == "core.state.memAssign";
+                // memAssign's data is a whole-array value indexed per row; a
+                // whole packed-array memFill carries the packed row-major
+                // value (element.width * count bits) and is sliced per row.
+                const std::string data = read(operands[1]);
+                const auto &dataType = type(operands[1]);
+                const uint64_t packedWidth = static_cast<uint64_t>(element.width) * array.count;
+                const bool packedFill = !assign && dataType.kind == TypeKind::Logic &&
+                                        element.kind == TypeKind::Logic &&
+                                        dataType.width == packedWidth && packedWidth != element.width;
+                out << "if(" << read(operands[0]) << "){\n"
+                    << "for(std::size_t cpu_row=0;cpu_row<" << array.count << ";++cpu_row){\n";
+                if (!packedFill)
+                    writeCell("cpu_row", std::nullopt, assign ? data + "[cpu_row]" : data, nullptr);
+                else if (dataType.width <= 64)
+                    writeCell("cpu_row", std::nullopt,
+                              "grhsim_slice_dynamic_u64(static_cast<std::uint64_t>(" + data +
+                                  "),cpu_row*" + std::to_string(element.width) + "u," +
+                                  std::to_string(element.width) + "u)",
+                              nullptr);
+                else if (isScalarLogic(element))
+                    writeCell("cpu_row", std::nullopt,
+                              "grhsim_slice_words_u64<" + std::to_string((dataType.width + 63u) / 64u) +
+                                  ">((" + data + "),cpu_row*" + std::to_string(element.width) + "u," +
+                                  std::to_string(element.width) + "u)",
+                              nullptr);
+                else
+                {
+                    const auto elementWords = (element.width + 63u) / 64u;
+                    out << "{std::array<std::uint64_t," << elementWords << "> cpu_fill_slice;\n"
+                        << "grhsim_slice_words((" << data << ").data()," << (packedWidth + 63u) / 64u
+                        << ",cpu_row*" << element.width << "u," << element.width << ",cpu_fill_slice.data(),"
+                        << elementWords << ");\n";
+                    writeCell("cpu_row", std::nullopt, "cpu_fill_slice", nullptr);
+                    out << "}\n";
+                }
+                out << "}\n}\n";
+            }
+            else if (name == "core.state.memWriteSeq")
+            {
+                if (operands.empty() || operands.size() % 3 != 0)
+                    throw std::runtime_error("CPU sequential memory write operands are not triples");
+                // Port order is the priority order: the last triple wins an
+                // address collision, reproduced exactly by sequential
+                // next-buffer application (each triple RMWs the NEXT row).
+                for (std::size_t i = 0; i < operands.size(); i += 3)
+                {
+                    std::string rowText; std::optional<uint64_t> constRow;
+                    if (!rowOf(operands[i + 1], rowText, constRow))
+                    {
+                        out << "// cpu_mem_write_dead row=" << read(operands[i + 1]) << "\n";
+                        continue;
+                    }
+                    out << "if(" << read(operands[i]);
+                    if (!constRow) out << "&&static_cast<std::size_t>(" << rowText << ")<" << array.count;
+                    out << "){\n";
+                    writeCell(rowText, constRow, read(operands[i + 2]), nullptr);
+                    out << "}\n";
+                }
+            }
+            else throw std::runtime_error("CPU six-phase emit unsupported general mem write op: " + std::string(name));
             if (guard != "true") out << "}\n";
         }
         void SixPhaseEmitter::emitSystemTask(std::ostream &out, const SimOp &op) const
@@ -2238,10 +2407,15 @@ namespace wolvrix::lib::grhsim
                 throw std::runtime_error("CPU initializer currently requires two-state logic or an array of two-state logic");
             const auto kind = model_.text(step.kind);
             const auto params = model_.parameters(step);
-            const auto *field = array ? (id.index < memFieldByState_.size() ? memFieldByState_[id.index] : nullptr)
-                                      : (id.index < regFieldByState_.size() ? regFieldByState_[id.index] : nullptr);
+            // The store follows the state's classification (M5d-6): regLatch
+            // covers scalars and regLatch-class arrays, mem the mem-class
+            // arrays. Initializers write the current buffer; initGlue syncs
+            // regLatchStoreNext afterwards.
+            const bool inRegLatch = id.index < regFieldByState_.size() && regFieldByState_[id.index];
+            const auto *field = inRegLatch ? regFieldByState_[id.index]
+                                           : (id.index < memFieldByState_.size() ? memFieldByState_[id.index] : nullptr);
             if (!field) throw std::runtime_error("CPU six-phase emit state has no named-store field");
-            const std::string slot = (array ? "memStore." : "regLatchStore.") + std::string(model_.text(field->name));
+            const std::string slot = (inRegLatch ? "regLatchStore." : "memStore.") + std::string(model_.text(field->name));
             const bool elide = initZeroElidable(step);
             if (!elide) out << "{\n";
             if (!array)
@@ -2766,18 +2940,23 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             };
             for (const auto &input : model_.inputs()) portLine(model_.text(input.name));
             for (const auto &output : model_.outputs()) portLine(model_.text(output.name));
-            for (const auto &field : regLatchStore_->fields) dumpStateField(out, "regLatchStore", field);
-            for (const auto &field : memStore_->fields)
-            {
+            // Large arrays dump as an fnv1a hash in any store (regLatch-class
+            // arrays joined the regLatch store in M5d-6).
+            const auto storeField = [&](std::string_view store, const CpuStoreField &field) {
                 const auto &type = layout_.types[field.type.index - 1];
                 if (type.kind == CpuTypeKind::Array && type.count > 64)
-                    out << "std::fprintf(stream,\"memStore." << model_.text(field.name) << "=\");"
-                        << "{std::uint64_t cpu_h=UINT64_C(14695981039346656037);const auto *cpu_p=reinterpret_cast<const unsigned char*>(memStore."
-                        << model_.text(field.name) << ".data());for(std::size_t cpu_i=0;cpu_i<sizeof(memStore." << model_.text(field.name)
+                {
+                    out << "std::fprintf(stream,\"" << store << "." << model_.text(field.name) << "=\");"
+                        << "{std::uint64_t cpu_h=UINT64_C(14695981039346656037);const auto *cpu_p=reinterpret_cast<const unsigned char*>("
+                        << store << "." << model_.text(field.name) << ".data());for(std::size_t cpu_i=0;cpu_i<sizeof("
+                        << store << "." << model_.text(field.name)
                         << ");++cpu_i)cpu_h=(cpu_h^cpu_p[cpu_i])*UINT64_C(1099511628211);std::fprintf(stream,\"fnv1a:%016llx\",static_cast<unsigned long long>(cpu_h));}"
                         << "std::fputc('\\n',stream);\n";
-                else dumpStateField(out, "memStore", field);
-            }
+                }
+                else dumpStateField(out, store, field);
+            };
+            for (const auto &field : regLatchStore_->fields) storeField("regLatchStore", field);
+            for (const auto &field : memStore_->fields) storeField("memStore", field);
             for (const auto &field : boundaryStore_->fields) dumpStateField(out, "boundaryValueStore", field);
             for (const auto &field : prevEventStore_->fields) dumpStateField(out, "prevEventStore", field);
             for (const auto &field : eventActStore_->fields)

@@ -531,15 +531,10 @@ namespace wolvrix::lib::grhsim
 
         void expectComma(StreamReader &reader) { reader.expect(','); }
 
-        void writeCpuSlot(StreamWriter &writer, const CpuDataSlot &slot)
-        {
-            writer.startArray(); writeId(writer, slot.type);
-            writer.value(static_cast<uint64_t>(slot.kind)); writeId(writer, slot.owner);
-            writer.value(slot.offset); writer.endArray();
-        }
-
         void writeCpuLayout(StreamWriter &writer, const CpuDataLayout &layout)
         {
+            // M5d-6 shape: [pointerBytes, [types...], [namedStores...]?]. The
+            // legacy object/value/frame/runtime arenas are gone.
             writer.startArray(); writer.value(static_cast<uint64_t>(layout.pointerBytes));
             writer.startArray();
             for (const auto &type : layout.types)
@@ -549,46 +544,7 @@ namespace wolvrix::lib::grhsim
                 writeId(writer, type.elementType); writer.value(type.count); writer.value(type.size);
                 writer.value(static_cast<uint64_t>(type.alignment)); writer.endArray();
             }
-            writer.endArray(); writer.startArray();
-            for (const auto &entry : layout.objects)
-            {
-                writer.startArray(); writer.value(static_cast<uint64_t>(entry.object.kind));
-                writer.value(static_cast<uint64_t>(entry.object.index)); writeCpuSlot(writer, entry.slot);
-                writer.endArray();
-            }
-            writer.endArray(); writer.startArray();
-            for (const auto &slot : layout.values) writeCpuSlot(writer, slot);
-            writer.endArray(); writer.startArray();
-            for (const auto &frame : layout.localFrames)
-            {
-                writer.startArray(); writeId(writer, frame.owner); writer.value(frame.size);
-                writer.value(static_cast<uint64_t>(frame.alignment)); writer.endArray();
-            }
-            writer.endArray(); writer.startArray();
-            for (const auto &slot : layout.runtime)
-            {
-                writer.startArray(); writer.value(static_cast<uint64_t>(slot.kind)); writeId(writer, slot.owner);
-                writeId(writer, slot.value); writer.value(static_cast<uint64_t>(slot.edge));
-                writer.value(slot.offset); writer.endArray();
-            }
-            writer.endArray(); writer.value(layout.objectBytes); writer.value(layout.boundaryBytes);
-            writer.value(layout.runtimeBytes);
-            // Optional trailing fields, positional: helperReadCaches, then
-            // namedStores. A present later field forces the earlier ones to
-            // serialize (possibly as empty arrays).
-            if (layout.helperReadCaches || layout.namedStores)
-            {
-                writer.startArray();
-                if (layout.helperReadCaches)
-                {
-                    for (const auto &cache : *layout.helperReadCaches)
-                    {
-                        writer.startArray(); writeId(writer, cache.firstOp);
-                        writeIdArray<ValueId>(writer, cache.values); writer.endArray();
-                    }
-                }
-                writer.endArray();
-            }
+            writer.endArray();
             if (layout.namedStores)
             {
                 writer.startArray();
@@ -616,14 +572,19 @@ namespace wolvrix::lib::grhsim
             for (const auto &row : rows)
             {
                 writer.startArray(); writeId(writer, row.source);
-                writeIdArray<PartitionId>(writer, row.targets.activate);
-                writeIdArray<PartitionId>(writer, row.targets.arm); writer.endArray();
+                writeIdArray<PartitionId>(writer, row.targets.activate); writer.endArray();
             }
             writer.endArray();
         }
 
         void writeCpuSchedule(StreamWriter &writer, const CpuSchedulePlan &schedule)
         {
+            // M5d-6 shape: [numaNodes, inputFanout, supernodeFanout,
+            // stateFanout, eventBitmaps?, memWritePlan?, timeslotTriggers?] —
+            // the last three stay positional: a present later field forces the
+            // earlier ones to serialize (possibly as empty arrays). The legacy
+            // round-seed/input-shadow/quiescence/demonitor/fold-residue
+            // payloads are gone.
             writer.startArray(); writer.startArray();
             for (const auto &node : schedule.numaNodes)
             {
@@ -643,43 +604,8 @@ namespace wolvrix::lib::grhsim
             }
             writer.endArray();
             writeCpuFanout(writer, schedule.inputFanout); writeCpuFanout(writer, schedule.computeSupernodeFanout);
-            writeCpuFanout(writer, schedule.commitStateFanout); writeIdArray<PartitionId>(writer, schedule.roundSeeds);
-            writer.startArray();
-            for (const auto &shadow : schedule.inputShadows)
-            {
-                writer.startArray(); writeId(writer, shadow.value); writeId(writer, shadow.type);
-                writer.value(shadow.offset); writer.endArray();
-            }
-            writer.endArray(); writer.value(schedule.inputShadowBytes);
-            std::vector<std::uint64_t> projectionWords((schedule.quiescenceProjection.size() + 63) / 64);
-            for (std::size_t bit = 0; bit < schedule.quiescenceProjection.size(); ++bit)
-                if (schedule.quiescenceProjection[bit]) projectionWords[bit / 64] |= std::uint64_t(1) << (bit % 64);
-            writer.value(static_cast<std::uint64_t>(schedule.quiescenceProjection.size())); writer.startArray();
-            for (const auto word : projectionWords) writer.value(word);
-            writer.endArray();
-            // eventBitmaps/memWritePlan/timeslotTriggers are positional
-            // trailing fields: a present later field forces the earlier ones
-            // to serialize (possibly as empty arrays).
-            const bool eventTail = schedule.eventBitmaps || schedule.memWritePlan || schedule.timeslotTriggers;
-            // Optional trailing field: only written when set, so flag-off
-            // checkpoints stay byte-compatible with the pre-NO00014 schema.
-            if (schedule.demonitorRedundant || schedule.demonitorEdgeCompletion || schedule.foldResidue ||
-                eventTail)
-                writer.value(static_cast<std::uint64_t>(schedule.demonitorRedundant ? 1 : 0));
-            // Optional trailing field (NO00015): sorted removal value ids;
-            // presence implies the edge-completion post-processing is applied.
-            // Written (possibly empty) when NO00016 fold-residue follows so the
-            // trailing fields stay positional; an empty array reads back as
-            // flag-off (the flag is never set with an empty removal list).
-            if (schedule.demonitorEdgeCompletion || schedule.foldResidue || eventTail)
-                writeIdArray<ValueId>(writer, schedule.demonitorEdgeCompletionRemoved);
-            // Optional trailing field (NO00016): sorted folded op ids; presence
-            // implies the residue-fold post-processing is applied.
-            if (schedule.foldResidue || eventTail)
-                writeIdArray<OpId>(writer, schedule.foldResidueOps);
-            // Optional trailing fields (M1 shells), positional: eventBitmaps,
-            // then memWritePlan, then timeslotTriggers (M4).
-            if (eventTail)
+            writeCpuFanout(writer, schedule.commitStateFanout);
+            if (schedule.eventBitmaps || schedule.memWritePlan || schedule.timeslotTriggers)
             {
                 writer.startArray();
                 if (schedule.eventBitmaps)
@@ -742,42 +668,34 @@ namespace wolvrix::lib::grhsim
                 writer.value(static_cast<uint64_t>(partition.attrs.phase));
                 writeIdArray<PartitionId>(writer, partition.children);
                 writeIdArray<OpId>(writer, partition.ops);
-                writer.startArray();
-                if (partition.attrs.eventGate)
-                {
-                    const auto &gate = *partition.attrs.eventGate;
-                    writer.value(static_cast<uint64_t>(gate.source));
-                    writer.startArray();
-                    for (const auto &event : gate.events)
-                    {
-                        writer.startArray(); writeId(writer, event.value);
-                        writer.value(static_cast<uint64_t>(event.edge)); writer.endArray();
-                    }
-                    writer.endArray();
-                }
-                writer.endArray();
-                if (partition.attrs.activeId || partition.attrs.activeWord || !partition.attrs.helperChunks.empty() ||
-                    partition.attrs.eventActs)
+                // Attr tail (M5d-6 shape): [helperChunks...], then an optional
+                // [eventActs...], then an optional [supernodeRange offset,count].
+                // A present later field forces the earlier ones to serialize
+                // (possibly as empty arrays).
+                if (!partition.attrs.helperChunks.empty() || partition.attrs.eventActs ||
+                    partition.attrs.supernodeRange)
                 {
                     writer.startArray();
-                    writer.startArray();
-                    if (partition.attrs.activeId) writer.value(static_cast<uint64_t>(*partition.attrs.activeId));
-                    writer.endArray(); writer.startArray();
-                    if (partition.attrs.activeWord) writer.value(static_cast<uint64_t>(*partition.attrs.activeWord));
-                    writer.endArray(); writer.startArray();
                     for (auto chunk : partition.attrs.helperChunks)
                     {
                         writer.startArray(); writer.value(static_cast<uint64_t>(chunk.offset));
                         writer.value(static_cast<uint64_t>(chunk.count)); writer.endArray();
                     }
                     writer.endArray();
-                    if (partition.attrs.eventActs)
+                    if (partition.attrs.eventActs || partition.attrs.supernodeRange)
                     {
                         writer.startArray();
-                        for (const auto act : *partition.attrs.eventActs) writer.value(act);
+                        if (partition.attrs.eventActs)
+                            for (const auto act : *partition.attrs.eventActs) writer.value(act);
                         writer.endArray();
                     }
-                    writer.endArray();
+                    if (partition.attrs.supernodeRange)
+                    {
+                        writer.startArray();
+                        writer.value(static_cast<uint64_t>(partition.attrs.supernodeRange->offset));
+                        writer.value(static_cast<uint64_t>(partition.attrs.supernodeRange->count));
+                        writer.endArray();
+                    }
                 }
                 writer.endArray();
             }
@@ -796,18 +714,9 @@ namespace wolvrix::lib::grhsim
             return static_cast<Enum>(value);
         }
 
-        CpuDataSlot readCpuSlot(StreamReader &reader)
-        {
-            CpuDataSlot slot;
-            reader.startArray(); slot.type = readId<CpuTypeId>(reader, "CPU type");
-            expectComma(reader); slot.kind = readCpuEnum(reader, CpuStorageKind::Boundary);
-            expectComma(reader); slot.owner = readId<PartitionId>(reader, "storage owner", true);
-            expectComma(reader); slot.offset = reader.unsignedInteger(); reader.endArray();
-            return slot;
-        }
-
         CpuDataLayout readCpuLayout(StreamReader &reader)
         {
+            // M5d-6 shape: [pointerBytes, [types...], [namedStores...]?].
             CpuDataLayout layout;
             reader.startArray(); layout.pointerBytes = reader.index("pointer bytes");
             expectComma(reader); reader.startArray(); bool first = true;
@@ -823,78 +732,33 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); type.alignment = reader.index("CPU alignment"); reader.endArray();
                 layout.types.push_back(type);
             }
-            expectComma(reader); reader.startArray(); first = true;
-            while (reader.nextArray(first))
-            {
-                CpuObjectLayout entry;
-                reader.startArray(); entry.object.kind = readCpuEnum(reader, ObjectKind::Function);
-                expectComma(reader); entry.object.index = reader.index("CPU object index");
-                expectComma(reader); entry.slot = readCpuSlot(reader); reader.endArray();
-                layout.objects.push_back(entry);
-            }
-            expectComma(reader); reader.startArray(); first = true;
-            while (reader.nextArray(first)) layout.values.push_back(readCpuSlot(reader));
-            expectComma(reader); reader.startArray(); first = true;
-            while (reader.nextArray(first))
-            {
-                CpuLocalFrame frame;
-                reader.startArray(); frame.owner = readId<PartitionId>(reader, "frame owner");
-                expectComma(reader); frame.size = reader.unsignedInteger();
-                expectComma(reader); frame.alignment = reader.index("frame alignment"); reader.endArray();
-                layout.localFrames.push_back(frame);
-            }
-            expectComma(reader); reader.startArray(); first = true;
-            while (reader.nextArray(first))
-            {
-                CpuRuntimeSlot slot;
-                reader.startArray(); slot.kind = readCpuEnum(reader, CpuRuntimeKind::EventEdge);
-                expectComma(reader); slot.owner = readId<PartitionId>(reader, "runtime owner");
-                expectComma(reader); slot.value = readId<ValueId>(reader, "runtime event value", true);
-                expectComma(reader); slot.edge = readCpuEnum(reader, CpuEventEdge::Negedge);
-                expectComma(reader); slot.offset = reader.unsignedInteger(); reader.endArray();
-                layout.runtime.push_back(slot);
-            }
-            expectComma(reader); layout.objectBytes = reader.unsignedInteger();
-            expectComma(reader); layout.boundaryBytes = reader.unsignedInteger();
-            expectComma(reader); layout.runtimeBytes = reader.unsignedInteger();
             if (reader.comma())
             {
-                layout.helperReadCaches.emplace(); reader.startArray(); first = true;
+                layout.namedStores.emplace(); reader.startArray(); first = true;
                 while (reader.nextArray(first))
                 {
-                    reader.startArray(); const auto op = readId<OpId>(reader, "cached helper first op");
-                    expectComma(reader); auto values = readIdArray<ValueId>(reader, "cached helper value");
-                    reader.endArray(); layout.helperReadCaches->push_back({op, std::move(values)});
-                }
-                if (reader.comma())
-                {
-                    layout.namedStores.emplace(); reader.startArray(); first = true;
-                    while (reader.nextArray(first))
+                    CpuNamedStore store;
+                    reader.startArray();
+                    const auto kind = parseCpuNamedStoreKind(reader.string());
+                    if (!kind) throw std::runtime_error("unknown CPU named store kind");
+                    store.kind = *kind;
+                    expectComma(reader); reader.startArray(); bool fieldFirst = true;
+                    while (reader.nextArray(fieldFirst))
                     {
-                        CpuNamedStore store;
-                        reader.startArray();
-                        const auto kind = parseCpuNamedStoreKind(reader.string());
-                        if (!kind) throw std::runtime_error("unknown CPU named store kind");
-                        store.kind = *kind;
-                        expectComma(reader); reader.startArray(); bool fieldFirst = true;
-                        while (reader.nextArray(fieldFirst))
-                        {
-                            CpuStoreField field;
-                            reader.startArray(); field.name = readId<StringId>(reader, "store field name");
-                            expectComma(reader); field.type = readId<CpuTypeId>(reader, "store field type");
-                            expectComma(reader); field.offset = reader.unsignedInteger();
-                            expectComma(reader); field.state = readId<StateId>(reader, "store field state", true);
-                            expectComma(reader); field.value = readId<ValueId>(reader, "store field value", true);
-                            expectComma(reader); field.aux = reader.index("store field aux", true);
-                            reader.endArray(); store.fields.push_back(field);
-                        }
-                        expectComma(reader); store.sizeBytes = reader.unsignedInteger(); reader.endArray();
-                        layout.namedStores->push_back(std::move(store));
+                        CpuStoreField field;
+                        reader.startArray(); field.name = readId<StringId>(reader, "store field name");
+                        expectComma(reader); field.type = readId<CpuTypeId>(reader, "store field type");
+                        expectComma(reader); field.offset = reader.unsignedInteger();
+                        expectComma(reader); field.state = readId<StateId>(reader, "store field state", true);
+                        expectComma(reader); field.value = readId<ValueId>(reader, "store field value", true);
+                        expectComma(reader); field.aux = reader.index("store field aux", true);
+                        reader.endArray(); store.fields.push_back(field);
                     }
+                    expectComma(reader); store.sizeBytes = reader.unsignedInteger(); reader.endArray();
+                    layout.namedStores->push_back(std::move(store));
                 }
-                reader.endArray();
             }
-            else reader.endArray();
+            reader.endArray();
             return layout;
         }
 
@@ -908,7 +772,6 @@ namespace wolvrix::lib::grhsim
                 CpuFanoutEntry<SourceId> row;
                 reader.startArray(); row.source = readId<SourceId>(reader, "fanout source");
                 expectComma(reader); row.targets.activate = readIdArray<PartitionId>(reader, "activation target");
-                expectComma(reader); row.targets.arm = readIdArray<PartitionId>(reader, "arm target");
                 reader.endArray(); rows.push_back(std::move(row));
             }
             return rows;
@@ -944,38 +807,9 @@ namespace wolvrix::lib::grhsim
             expectComma(reader); schedule.inputFanout = readCpuFanout<ValueId>(reader);
             expectComma(reader); schedule.computeSupernodeFanout = readCpuFanout<ValueId>(reader);
             expectComma(reader); schedule.commitStateFanout = readCpuFanout<StateId>(reader);
-            expectComma(reader); schedule.roundSeeds = readIdArray<PartitionId>(reader, "round seed");
-            expectComma(reader); reader.startArray(); first = true;
-            while (reader.nextArray(first))
-            {
-                CpuInputShadow shadow;
-                reader.startArray(); shadow.value = readId<ValueId>(reader, "shadow value");
-                expectComma(reader); shadow.type = readId<CpuTypeId>(reader, "shadow type");
-                expectComma(reader); shadow.offset = reader.unsignedInteger(); reader.endArray();
-                schedule.inputShadows.push_back(shadow);
-            }
-            expectComma(reader); schedule.inputShadowBytes = reader.unsignedInteger();
-            expectComma(reader); const auto projectionBits = reader.index("quiescence projection bits", true);
-            expectComma(reader); schedule.quiescenceProjection.assign(projectionBits, false);
-            reader.startArray(); first = true;
-            std::size_t bit = 0;
-            while (reader.nextArray(first))
-            {
-                const auto word = reader.unsignedInteger();
-                for (std::size_t i = 0; i < 64 && bit < projectionBits; ++i, ++bit)
-                    if ((word >> i) & 1) schedule.quiescenceProjection[bit] = true;
-            }
-            if (reader.comma()) schedule.demonitorRedundant = reader.unsignedInteger() != 0;
-            if (reader.comma())
-            {
-                schedule.demonitorEdgeCompletionRemoved = readIdArray<ValueId>(reader, "edge-completion removal");
-                schedule.demonitorEdgeCompletion = !schedule.demonitorEdgeCompletionRemoved.empty();
-            }
-            if (reader.comma())
-            {
-                schedule.foldResidueOps = readIdArray<OpId>(reader, "residue fold ops");
-                schedule.foldResidue = !schedule.foldResidueOps.empty();
-            }
+            // M5d-6 shape: the legacy round-seed/input-shadow/quiescence/
+            // demonitor/fold-residue fields are gone; eventBitmaps,
+            // memWritePlan and timeslotTriggers remain positional tails.
             if (reader.comma())
             {
                 schedule.eventBitmaps.emplace(); reader.startArray(); first = true;
@@ -1047,50 +881,41 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); partition.attrs.phase = readCpuEnum(reader, CpuPhase::Output);
                 expectComma(reader); partition.children = readIdArray<PartitionId>(reader, "partition child");
                 expectComma(reader); partition.ops = readIdArray<OpId>(reader, "partition op");
-                expectComma(reader); reader.startArray();
-                bool gateFirst = true;
-                if (reader.nextArray(gateFirst))
-                {
-                    CpuEventGate gate;
-                    gate.source = readCpuEnum(reader, CpuEventSource::Derived);
-                    expectComma(reader); reader.startArray();
-                    bool eventFirst = true;
-                    while (reader.nextArray(eventFirst))
-                    {
-                        CpuEvent event;
-                        reader.startArray(); event.value = readId<ValueId>(reader, "event value");
-                        expectComma(reader); event.edge = readCpuEnum(reader, CpuEventEdge::Negedge);
-                        reader.endArray(); gate.events.push_back(event);
-                    }
-                    reader.endArray(); partition.attrs.eventGate = std::move(gate);
-                }
+                // Attr tail (M5d-6 shape): optional [helperChunks...], then
+                // optional [eventActs...], then optional [supernodeRange
+                // offset,count] — positional elements of the partition array.
                 bool tailFirst = false;
                 if (reader.nextArray(tailFirst))
                 {
                     reader.startArray();
-                    const auto optionalIndex = [&]() -> std::optional<uint32_t> {
-                        reader.startArray(); bool first = true;
-                        if (!reader.nextArray(first)) return {};
-                        const auto value = reader.index("activity index", true); reader.endArray();
-                        return value;
-                    };
-                    partition.attrs.activeId = optionalIndex(); expectComma(reader);
-                    partition.attrs.activeWord = optionalIndex(); expectComma(reader);
-                    reader.startArray(); bool first = true;
+                    bool first = true;
                     while (reader.nextArray(first))
                     {
                         reader.startArray(); const auto offset = reader.index("helper offset", true);
                         expectComma(reader); const auto count = reader.index("helper count"); reader.endArray();
                         partition.attrs.helperChunks.push_back({offset, count});
                     }
-                    bool actsTail = false;
-                    if (reader.nextArray(actsTail))
+                    if (reader.comma())
                     {
                         std::vector<int64_t> acts;
                         reader.startArray(); bool actFirst = true;
                         while (reader.nextArray(actFirst)) acts.push_back(reader.integer());
                         partition.attrs.eventActs = std::move(acts);
+                    }
+                    if (reader.comma())
+                    {
+                        reader.startArray();
+                        const auto offset = reader.index("supernode range offset", true);
+                        expectComma(reader); const auto count = reader.index("supernode range count", true);
                         reader.endArray();
+                        partition.attrs.supernodeRange = Range{offset, count};
+                        // The empty event-acts element written before a range
+                        // is a positional placeholder, not an engaged empty
+                        // annotation (that combination never occurs on a valid
+                        // mapping: acts annotate supernodes, ranges annotate
+                        // emit functions).
+                        if (partition.attrs.eventActs && partition.attrs.eventActs->empty())
+                            partition.attrs.eventActs.reset();
                     }
                     reader.endArray();
                 }
@@ -1636,10 +1461,9 @@ namespace wolvrix::lib::grhsim
                     if (model->text(backend) != "cpu" || model->text(schema) != "cpu.st.v1")
                         throw std::runtime_error("unexpected CPU mapping payload or completion flag");
                     auto cpu = readCpuMapping(reader);
-                    // The six-phase pipeline completes at PhaseSchedule; the
-                    // legacy pipeline completes at Schedule.
-                    if (complete != (cpu.stage == CpuMappingStage::Schedule ||
-                                     cpu.stage == CpuMappingStage::PhaseSchedule))
+                    // The six-phase pipeline completes at PhaseSchedule (the
+                    // legacy Schedule terminal was removed in M5d-6).
+                    if (complete != (cpu.stage == CpuMappingStage::PhaseSchedule))
                         throw std::runtime_error("CPU mapping completion disagrees with stage");
                     model->setCpuMapping(std::move(cpu));
                     reader.endArray();

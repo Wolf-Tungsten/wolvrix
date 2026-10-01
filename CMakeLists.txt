@@ -132,12 +132,6 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/bitwise_predicates.cpp
     lib/grhsim/pass/bitwise_muxes.cpp
     lib/grhsim/pass/mux_chain_fold.cpp
-    lib/grhsim/pass/fuse_expr_chains.cpp
-    lib/grhsim/pass/migrate_boundary_ops.cpp
-    lib/grhsim/pass/demonitor_redundant.cpp
-    lib/grhsim/pass/demonitor_edge_completion.cpp
-    lib/grhsim/pass/migrate_boundary_ops_ec.cpp
-    lib/grhsim/pass/fold_residue.cpp
     lib/grhsim/pass/used_bits.cpp
     lib/grhsim/pass/pack_bit_registers.cpp
     lib/grhsim/pass/select_state_stores.cpp
@@ -440,7 +434,6 @@ target_compile_definitions(grhsim-split-phases-tests
 
 register_test_exe(grhsim-split-phases-tests)
 
-add_executable(grhsim-cpu-mapping-tests tests/grhsim/test_cpu_mapping.cpp)
 add_executable(grhsim-reg-to-mem-tests tests/grhsim/test_reg_to_mem.cpp tests/grhsim/test_reg_to_mem_semantics.cpp)
 target_link_libraries(grhsim-reg-to-mem-tests PRIVATE wolvrix-lib)
 target_compile_definitions(grhsim-reg-to-mem-tests PRIVATE
@@ -457,11 +450,6 @@ register_test_exe(grhsim-cpu-phases-tests)
 add_executable(grhsim-cpu-stores-tests tests/grhsim/test_cpu_stores.cpp)
 target_link_libraries(grhsim-cpu-stores-tests PRIVATE wolvrix-lib)
 register_test_exe(grhsim-cpu-stores-tests)
-target_link_libraries(grhsim-cpu-mapping-tests PRIVATE wolvrix-lib)
-register_test_exe(grhsim-cpu-mapping-tests)
-add_executable(grhsim-cpu-schedule-tests tests/grhsim/test_cpu_schedule.cpp tests/grhsim/test_cpu_schedule_trace.cpp)
-target_link_libraries(grhsim-cpu-schedule-tests PRIVATE wolvrix-lib)
-register_test_exe(grhsim-cpu-schedule-tests)
 find_program(WOLVRIX_TEST_VERILATOR verilator)
 add_executable(grhsim-cpu-phase-emit-tests tests/grhsim/test_cpu_phase_emit.cpp)
 target_link_libraries(grhsim-cpu-phase-emit-tests PRIVATE wolvrix-lib)

@@ -7,6 +7,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -25,12 +26,6 @@ namespace wolvrix::lib::grhsim
             for (const auto &parameter : parameters)
                 if (model.text(parameter.name) == name) return &parameter;
             return nullptr;
-        }
-
-        bool isMemWriteOp(std::string_view type) noexcept
-        {
-            return type == "core.state.memWrite" || type == "core.state.memFill" ||
-                   type == "core.state.memAssign" || type == "core.state.memWriteSeq";
         }
 
         // The op's event act set A(op): its event_acts cluster indices,
@@ -327,170 +322,10 @@ namespace wolvrix::lib::grhsim
             return {sizes.size(), edges.size()};
         }
 
-        void buildNodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
-                        diag::Diagnostics &diagnostics)
-        {
-            auto &tree = mapping.partitionTree;
-            const auto phase = phasePartition(tree, CpuPhase::Compute);
-            auto ops = std::move(tree.partitions[phase.index - 1].ops);
-            const auto stats = formNodes(model, tree, phase, std::move(ops), maxOps);
-            diagnostics.info("compute_nodes=" + std::to_string(stats.nodes) +
-                             " boundary_value_targets=" + std::to_string(stats.boundaryEdges), "cpu.st.build-compute-nodes");
-        }
-
-        // Six-phase variant (cpu.st.build-general-nodes): the General branch is
-        // an empty shell after split-phases, so node formation works on the
-        // model's General-phase op list. reg/latch write ops and General-phase
-        // system.task/dpi.call are mergeable sinks: they anchor nodes (they
-        // are never absorbed) while their single-consumer operand cones absorb
-        // into the sink's node.
-        // M5d-5 compat: mem write op types stay out of node formation even
-        // when B5's class-aware attribution tags a regLatch-class write
-        // General — this legacy backend schedules every mem write in P_mem
-        // (see cpu.st.split-phases); M5d-6 forms nodes over them.
-        void buildGeneralNodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
-                               diag::Diagnostics &diagnostics)
-        {
-            auto &tree = mapping.partitionTree;
-            const auto phase = phasePartition(tree, CpuPhase::General);
-            std::vector<OpId> ops;
-            for (const auto &op : model.operations())
-                if (op.phase == SimPhase::General && !isMemWriteOp(model.text(op.opType)))
-                    ops.push_back(op.id);
-            const auto stats = formNodes(model, tree, phase, std::move(ops), maxOps);
-            diagnostics.info("general_nodes=" + std::to_string(stats.nodes) +
-                             " boundary_value_targets=" + std::to_string(stats.boundaryEdges), "cpu.st.build-general-nodes");
-        }
-
         uint64_t clusterSize(const std::vector<uint32_t> &cluster, std::span<const uint32_t> sizes)
         {
             uint64_t result = 0;
             for (auto node : cluster) result += sizes[node];
-            return result;
-        }
-
-        bool coarsen(Clusters &clusters, std::span<const Edge> edges, std::span<const uint32_t> sizes,
-                     uint32_t maxOps, unsigned mode)
-        {
-            ClusterGraph graph(clusters, edges, sizes.size());
-            std::vector<uint32_t> parent(clusters.size());
-            std::iota(parent.begin(), parent.end(), 0);
-            std::vector<uint64_t> weights;
-            for (const auto &cluster : clusters) weights.push_back(clusterSize(cluster, sizes));
-            const auto find = [&](uint32_t id) {
-                while (parent[id] != id) { parent[id] = parent[parent[id]]; id = parent[id]; }
-                return id;
-            };
-            bool changed = false;
-            const auto merge = [&](uint32_t a, uint32_t b) {
-                a = find(a); b = find(b);
-                if (a == b || weights[a] + weights[b] > maxOps) return false;
-                if (a > b) std::swap(a, b);
-                parent[b] = a; weights[a] += weights[b]; changed = true;
-                return true;
-            };
-            if (mode == 2)
-            {
-                std::map<std::vector<uint32_t>, uint32_t> anchors;
-                for (uint32_t i = 0; i < clusters.size(); ++i)
-                {
-                    if (graph.predecessors[i].empty()) continue;
-                    auto [it, inserted] = anchors.emplace(graph.predecessors[i], i);
-                    if (!inserted && !merge(it->second, i)) it->second = i;
-                }
-            }
-            else
-            {
-                struct Candidate { uint32_t source, target, weight; };
-                std::vector<Candidate> candidates;
-                for (auto edge : graph.edges)
-                {
-                    if (mode == 0 ? graph.successors[edge.source].size() != 1 : graph.predecessors[edge.target].size() != 1)
-                        continue;
-                    if (!candidates.empty() && candidates.back().source == edge.source && candidates.back().target == edge.target)
-                        ++candidates.back().weight;
-                    else candidates.push_back({edge.source, edge.target, 1});
-                }
-                std::sort(candidates.begin(), candidates.end(), [](auto a, auto b) {
-                    if (a.weight != b.weight) return a.weight > b.weight;
-                    return std::tie(a.source, a.target) < std::tie(b.source, b.target);
-                });
-                for (auto candidate : candidates) merge(candidate.source, candidate.target);
-            }
-            if (!changed) return false;
-            Clusters result;
-            std::vector<uint32_t> index(clusters.size(), absent);
-            for (uint32_t i = 0; i < clusters.size(); ++i)
-            {
-                const auto root = find(i);
-                if (index[root] == absent) { index[root] = result.size(); result.emplace_back(); }
-                auto &members = result[index[root]];
-                members.insert(members.end(), clusters[i].begin(), clusters[i].end());
-            }
-            for (auto &members : result) std::sort(members.begin(), members.end());
-            // Batch contractions are accepted only when the quotient remains a DAG.
-            if (!orderClusters(result, edges, sizes.size())) return false;
-            clusters = std::move(result);
-            return true;
-        }
-
-        Clusters segment(const Clusters &clusters, const ClusterGraph &graph,
-                         std::span<const uint32_t> sizes, std::size_t valueCount, uint32_t maxOps)
-        {
-            std::vector<std::vector<uint32_t>> sources(clusters.size()), targets(clusters.size());
-            std::vector<uint32_t> sourceOfValue(valueCount + 1, absent);
-            for (auto edge : graph.edges)
-            {
-                sources[edge.source].push_back(edge.value);
-                targets[edge.target].push_back(edge.value);
-                sourceOfValue[edge.value] = edge.source;
-            }
-            for (auto *table : {&sources, &targets})
-                for (auto &row : *table)
-                {
-                    std::sort(row.begin(), row.end()); row.erase(std::unique(row.begin(), row.end()), row.end());
-                }
-            std::vector<uint64_t> prefix(clusters.size() + 1);
-            for (std::size_t i = 0; i < clusters.size(); ++i) prefix[i + 1] = prefix[i] + clusterSize(clusters[i], sizes);
-            const auto infinity = std::numeric_limits<uint64_t>::max();
-            std::vector<uint64_t> cost(clusters.size() + 1, infinity);
-            std::vector<uint32_t> previous(clusters.size() + 1), seen(valueCount + 1), counted(valueCount + 1);
-            cost[0] = 0;
-            // Legacy's uniform-weight objective: distinct incoming activation values + one per segment.
-            for (uint32_t end = 1; end <= clusters.size(); ++end)
-            {
-                uint64_t incoming = 0;
-                for (uint32_t begin = end; begin > 0;)
-                {
-                    --begin;
-                    if (prefix[end] - prefix[begin] > maxOps)
-                    {
-                        if (begin + 1 == end) continue;
-                        break;
-                    }
-                    for (auto value : targets[begin])
-                    {
-                        if (seen[value] == end) continue;
-                        seen[value] = end;
-                        if (sourceOfValue[value] < begin) { counted[value] = end; ++incoming; }
-                    }
-                    for (auto value : sources[begin])
-                        if (counted[value] == end) { counted[value] = 0; --incoming; }
-                    const auto candidate = cost[begin] + incoming + 1;
-                    if (candidate <= cost[end]) { cost[end] = candidate; previous[end] = begin; }
-                }
-                if (cost[end] == infinity) { cost[end] = cost[end - 1] + 1; previous[end] = end - 1; }
-            }
-            Clusters result;
-            for (uint32_t end = clusters.size(); end > 0;)
-            {
-                const auto begin = previous[end];
-                std::vector<uint32_t> members;
-                for (uint32_t i = begin; i < end; ++i) members.insert(members.end(), clusters[i].begin(), clusters[i].end());
-                std::sort(members.begin(), members.end());
-                result.push_back(std::move(members)); end = begin;
-            }
-            std::reverse(result.begin(), result.end());
             return result;
         }
 
@@ -639,52 +474,15 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
-        void mergeSupernodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
-                             diag::Diagnostics &diagnostics)
-        {
-            auto &tree = mapping.partitionTree;
-            const auto phase = phasePartition(tree, CpuPhase::Compute);
-            const auto nodes = tree.partitions[phase.index - 1].children;
-            const auto ops = partitionOps(tree, phase);
-            ComputeGraph graph(model, ops);
-            std::vector<uint32_t> owner(model.operations().size() + 1, absent), sizes;
-            Clusters clusters(nodes.size());
-            for (uint32_t i = 0; i < nodes.size(); ++i)
-            {
-                const auto &partition = tree.partitions[nodes[i].index - 1];
-                sizes.push_back(partition.ops.size()); clusters[i].push_back(i);
-                for (auto op : partition.ops) owner[op.index] = i;
-            }
-            const auto edges = nodeEdges(model, graph, owner);
-            unsigned tail = 0, iterations = 0;
-            while (!clusters.empty())
-            {
-                const auto before = clusters.size();
-                for (unsigned mode = 0; mode < 3; ++mode) coarsen(clusters, edges, sizes, maxOps, mode);
-                ++iterations;
-                if (clusters.size() == before) break;
-                tail = before >= 100000 && before - clusters.size() < 1024 ? tail + 1 : 0;
-                if (tail == 3) break;
-            }
-            const auto coarsened = clusters.size();
-            clusters = segment(clusters, ClusterGraph(clusters, edges, sizes.size()), sizes, model.values().size(), maxOps);
-            tree.partitions[phase.index - 1].children.clear();
-            for (const auto &cluster : clusters)
-            {
-                const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
-                for (auto node : cluster) attach(tree, supernode, nodes[node]);
-            }
-            const auto finalEdges = ClusterGraph(clusters, edges, sizes.size()).edges.size();
-            diagnostics.info("coarsen_iterations=" + std::to_string(iterations) + " coarsened_clusters=" + std::to_string(coarsened) +
-                             " compute_supernodes=" + std::to_string(clusters.size()) +
-                             " boundary_value_targets=" + std::to_string(finalEdges), "cpu.st.merge-compute-supernodes");
-        }
-
-        // Six-phase variant (cpu.st.merge-general-supernodes): same
-        // coarsen+DP frame as mergeSupernodes, plus the event-domain merge
-        // prohibition from the P_general spec. Every resulting General
-        // supernode records its event act union in attrs.eventActs (engaged,
-        // empty array for event-free supernodes).
+        // cpu.st.merge-general-supernodes (C2): the coarsen+DP frame plus the
+        // event-domain merge prohibition from the P_general spec. Every
+        // resulting General supernode records its event act union in
+        // attrs.eventActs (engaged, empty array for event-free supernodes).
+        // M5d-6 (resolution 2): the supernodes stay direct children of the
+        // General branch in cluster (partition-result) order — that child
+        // order IS the final supernode ordinal space consumed by the layout,
+        // event bitmaps, schedule and emitter; function packing (C6) only
+        // records intervals over it.
         void mergeGeneralSupernodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
                                     diag::Diagnostics &diagnostics)
         {
@@ -757,73 +555,16 @@ namespace wolvrix::lib::grhsim
             return lines;
         }
 
-        void packWords(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t helperLines)
-        {
-            auto &tree = mapping.partitionTree;
-            const auto phase = phasePartition(tree, CpuPhase::Compute);
-            const auto supernodes = std::move(tree.partitions[phase.index - 1].children);
-            PartitionId word;
-            for (uint32_t active = 0; active < supernodes.size(); ++active)
-            {
-                if (active % 8 == 0)
-                {
-                    word = addPartition(tree, phase, CpuPartitionKind::ActiveWord);
-                    tree.partitions[word.index - 1].attrs.activeWord = active / 8;
-                }
-                const auto id = supernodes[active];
-                attach(tree, word, id);
-                auto &attrs = tree.partitions[id.index - 1].attrs;
-                attrs.activeId = active;
-                const auto ops = partitionOps(tree, id);
-                uint64_t lines = 0;
-                uint32_t begin = 0;
-                for (uint32_t i = 0; i < ops.size(); ++i)
-                {
-                    const auto estimate = estimatedLines(model, ops[i]);
-                    if (i > begin && lines + estimate > helperLines)
-                    { attrs.helperChunks.push_back({begin, i - begin}); begin = i; lines = 0; }
-                    lines += estimate;
-                }
-                if (!attrs.helperChunks.empty() || lines > helperLines)
-                    attrs.helperChunks.push_back({begin, static_cast<uint32_t>(ops.size()) - begin});
-            }
-        }
-
-        void packFunctions(const GrhSimModel &model, CpuBackendMapping &mapping,
-                           uint32_t maxOps, uint32_t maxLines, uint32_t targetCount)
-        {
-            auto &tree = mapping.partitionTree;
-            std::vector<PartitionId> parents{phasePartition(tree, CpuPhase::Compute)};
-            const auto commit = phasePartition(tree, CpuPhase::Commit);
-            const auto &domains = tree.partitions[commit.index - 1].children;
-            parents.insert(parents.end(), domains.begin(), domains.end());
-            uint64_t totalOps = model.operations().size(), totalLines = 0;
-            for (const auto &op : model.operations()) totalLines += estimatedLines(model, op.id);
-            const auto effectiveOps = targetCount ? std::max(uint64_t(maxOps), totalOps / targetCount) : maxOps;
-            const auto effectiveLines = targetCount ? std::max(uint64_t(maxLines), totalLines / targetCount) : maxLines;
-            for (auto parent : parents)
-            {
-                const auto children = std::move(tree.partitions[parent.index - 1].children);
-                PartitionId function;
-                uint64_t functionOps = 0, functionLines = 0;
-                for (auto child : children)
-                {
-                    const auto ops = partitionOps(tree, child);
-                    uint64_t lines = 0;
-                    for (auto op : ops) lines += estimatedLines(model, op);
-                    if (!function || functionOps + ops.size() > effectiveOps || functionLines + lines > effectiveLines)
-                    { function = addPartition(tree, parent, CpuPartitionKind::EmitFunction); functionOps = 0; functionLines = 0; }
-                    attach(tree, function, child);
-                    functionOps += ops.size(); functionLines += lines;
-                }
-            }
-        }
-
-        // Six-phase variant (cpu.st.pack-general-functions): helper chunks on
-        // General supernodes (no ActiveWord layer — the six-phase model gates
-        // whole supernodes), then emit-function batching on the General
-        // branch only. The flat Event/Mem/Output branches each collapse into
-        // a single emit function holding the branch's ops (single task).
+        // cpu.st.pack-general-functions (C6, M5d-6 position: after
+        // build-mem-write-plan, before build-phase-schedule): helper chunks
+        // on General supernodes (the six-phase model gates whole
+        // supernodes), then emit-function batching. Resolution 2: the
+        // supernodes stay direct General-branch children in C2 ordinal
+        // order; each EmitFunction is a leaf appended after them that only
+        // records the contiguous supernode ordinal interval it holds
+        // (attrs.supernodeRange). The flat Event/Mem/Output branches each
+        // collapse into a single emit function holding the branch's ops
+        // (single task).
         void packGeneralFunctions(const GrhSimModel &model, CpuBackendMapping &mapping,
                                   uint32_t helperLines, uint32_t maxOps, uint32_t maxLines, uint32_t targetCount)
         {
@@ -851,19 +592,30 @@ namespace wolvrix::lib::grhsim
             }
             const auto effectiveOps = targetCount ? std::max(uint64_t(maxOps), totalOps / targetCount) : maxOps;
             const auto effectiveLines = targetCount ? std::max(uint64_t(maxLines), totalLines / targetCount) : maxLines;
-            const auto children = std::move(tree.partitions[general.index - 1].children);
             PartitionId function;
             uint64_t functionOps = 0, functionLines = 0;
-            for (auto child : children)
+            uint32_t rangeBegin = 0;
+            const auto closeFunction = [&](uint32_t ordinal) {
+                if (function)
+                    tree.partitions[function.index - 1].attrs.supernodeRange = Range{rangeBegin, ordinal - rangeBegin};
+            };
+            for (uint32_t ordinal = 0; ordinal < supernodes.size(); ++ordinal)
             {
-                const auto ops = partitionOps(tree, child);
+                const auto ops = partitionOps(tree, supernodes[ordinal]);
                 uint64_t lines = 0;
                 for (auto op : ops) lines += estimatedLines(model, op);
                 if (!function || functionOps + ops.size() > effectiveOps || functionLines + lines > effectiveLines)
-                { function = addPartition(tree, general, CpuPartitionKind::EmitFunction); functionOps = 0; functionLines = 0; }
-                attach(tree, function, child);
-                functionOps += ops.size(); functionLines += lines;
+                {
+                    closeFunction(ordinal);
+                    function = addPartition(tree, general, CpuPartitionKind::EmitFunction);
+                    rangeBegin = ordinal;
+                    functionOps = 0;
+                    functionLines = 0;
+                }
+                functionOps += ops.size();
+                functionLines += lines;
             }
+            closeFunction(static_cast<uint32_t>(supernodes.size()));
             for (auto branchPhase : {CpuPhase::Event, CpuPhase::Mem, CpuPhase::Output})
             {
                 const auto branch = phasePartition(tree, branchPhase);
@@ -926,71 +678,34 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
-        class PartitionPass final : public Pass
+        // cpu.st.build-general-nodes (C1, M5d-6): initializes the one final
+        // CPU mapping from the sealed semantic model. The semantic pipeline
+        // (B5 grhsim.split-phases + B8 seal) has completed the class-aware
+        // phase attribution, so this pass only consumes SimPhase: it builds
+        // the four-branch root (flat Event in cone topo order with edgeDets
+        // last, flat Mem in op-id order — the static priority seed, flat
+        // Output in topo order), then forms General nodes over ALL
+        // General-phase ops. reg/latch write ops, General-phase
+        // system.task/dpi.call and the General-phase regLatch-class mem
+        // writes are mergeable sinks: they anchor nodes (never absorbed)
+        // while their single-consumer operand cones absorb into the sink's
+        // node. Any previous mapping is discarded: this is the pipeline's
+        // single mapping initialization point.
+        class BuildGeneralNodesPass final : public Pass
         {
         public:
-            PartitionPass(std::string name, CpuMappingStage inputStage, std::vector<uint32_t> options)
-                : Pass(std::move(name), PassKind::BackendMapping), inputStage_(inputStage), options_(std::move(options)) {}
+            explicit BuildGeneralNodesPass(uint32_t maxOps)
+                : Pass("cpu.st.build-general-nodes", PassKind::BackendMapping), maxOps_(maxOps) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
-                const auto *previous = model.cpuMapping();
-                if (!previous || previous->stage != inputStage_)
-                { diagnostics.error("CPU partition pass prerequisites are not satisfied", name()); return {false, false, {}}; }
-                CpuBackendMapping mapping = *previous;
-                switch (inputStage_)
-                {
-                case CpuMappingStage::EventDomains: buildNodes(model, mapping, options_[0], diagnostics); break;
-                case CpuMappingStage::ComputeNodes: mergeSupernodes(model, mapping, options_[0], diagnostics); break;
-                case CpuMappingStage::ComputeSupernodes: packWords(model, mapping, options_[0]); break;
-                case CpuMappingStage::ActiveWords: packFunctions(model, mapping, options_[0], options_[1], options_[2]); break;
-                default: throw std::logic_error("invalid CPU partition pass stage");
-                }
-                mapping.stage = static_cast<CpuMappingStage>(static_cast<unsigned>(inputStage_) + 1);
-                diagnostics.info("partitions=" + std::to_string(mapping.partitionTree.partitions.size()), name());
-                model.setCpuMapping(std::move(mapping));
-                return {true, true, {}};
-            }
-
-        private:
-            CpuMappingStage inputStage_;
-            std::vector<uint32_t> options_;
-        };
-
-        // cpu.st.split-phases: builds the four-branch root from the model's
-        // phase attribution: flat Event (cone topo order, edgeDets last),
-        // empty General shell, flat Mem in op-id order (static priority
-        // seed), flat Output in topo order.
-        //
-        // M5d-5 compat: production phase attribution moved to the semantic
-        // pass grhsim.split-phases (B5), which is class-aware — mem writes on
-        // regLatch-class states carry SimPhase::General there. This legacy
-        // backend keeps scheduling by op TYPE: the fallback attribution loop
-        // below only fires on models that never ran B5 (unit tests), and the
-        // Mem branch collects every mem write op regardless of phase, so the
-        // emitted P_mem behavior is unchanged. The whole pass is replaced by
-        // cpu.st.build-general-nodes' mapping init in M5d-6.
-        class SplitPhasesPass final : public Pass
-        {
-        public:
-            SplitPhasesPass() : Pass("cpu.st.split-phases", PassKind::BackendMapping) {}
-
-            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            {
-                uint64_t attributedMem = 0, attributedOutput = 0, attributedGeneral = 0;
                 for (const auto &op : model.operations())
-                {
-                    if (op.phase != SimPhase::None) continue;
-                    const auto type = model.text(op.opType);
-                    SimPhase phase = SimPhase::General;
-                    if (isMemWriteOp(type)) { phase = SimPhase::Mem; ++attributedMem; }
-                    else if (type == "core.output.write") { phase = SimPhase::Output; ++attributedOutput; }
-                    else ++attributedGeneral;
-                    model.setOperationPhase(op.id, phase);
-                }
-                uint64_t generalOps = 0;
-                for (const auto &op : model.operations())
-                    if (op.phase == SimPhase::General) ++generalOps;
+                    if (op.phase == SimPhase::None)
+                    {
+                        diagnostics.error("cpu.st.build-general-nodes requires total phase attribution "
+                                          "(run grhsim.split-phases first)", name());
+                        return {false, false, {}};
+                    }
                 CpuBackendMapping mapping;
                 auto &tree = mapping.partitionTree;
                 tree.root = addPartition(tree, {}, CpuPartitionKind::Root);
@@ -1007,30 +722,41 @@ namespace wolvrix::lib::grhsim
                 event.ops = orderFlatPhaseOps(model, SimPhase::Event, true);
                 auto &mem = tree.partitions[branches[2].index - 1];
                 for (const auto &op : model.operations())
-                    if (isMemWriteOp(model.text(op.opType))) mem.ops.push_back(op.id);
+                    if (op.phase == SimPhase::Mem) mem.ops.push_back(op.id);
                 auto &output = tree.partitions[branches[3].index - 1];
                 output.ops = orderFlatPhaseOps(model, SimPhase::Output, false);
-                mapping.stage = CpuMappingStage::SplitPhases;
-                diagnostics.info("event_ops=" + std::to_string(event.ops.size()) +
-                                 " general_ops=" + std::to_string(generalOps) +
-                                 " mem_ops=" + std::to_string(mem.ops.size()) +
-                                 " output_ops=" + std::to_string(output.ops.size()) +
-                                 " attributed_mem=" + std::to_string(attributedMem) +
-                                 " attributed_output=" + std::to_string(attributedOutput) +
-                                 " attributed_general=" + std::to_string(attributedGeneral), name());
+                std::vector<OpId> generalOps;
+                for (const auto &op : model.operations())
+                    if (op.phase == SimPhase::General) generalOps.push_back(op.id);
+                const auto stats = formNodes(model, tree, branches[1], std::move(generalOps), maxOps_);
+                mapping.stage = CpuMappingStage::GeneralNodes;
+                // formNodes grows the partition table, so the branch reads go
+                // through fresh id lookups (no dangling references).
+                diagnostics.info("event_ops=" + std::to_string(tree.partitions[branches[0].index - 1].ops.size()) +
+                                 " general_nodes=" + std::to_string(stats.nodes) +
+                                 " mem_ops=" + std::to_string(tree.partitions[branches[2].index - 1].ops.size()) +
+                                 " output_ops=" + std::to_string(tree.partitions[branches[3].index - 1].ops.size()) +
+                                 " boundary_value_targets=" + std::to_string(stats.boundaryEdges), name());
                 model.setCpuMapping(std::move(mapping));
                 return {true, true, {}};
             }
+
+        private:
+            uint32_t maxOps_;
         };
 
-        // Six-phase counterpart of PartitionPass: GeneralNodes /
-        // GeneralSupernodes / GeneralFunctions stage transitions on the
-        // four-branch tree produced by cpu.st.split-phases.
+        // C2 (cpu.st.merge-general-supernodes, GeneralNodes ->
+        // GeneralSupernodes) and C6 (cpu.st.pack-general-functions,
+        // MemWritePlan -> GeneralFunctions): stage transitions on the
+        // four-branch tree produced by C1. The output stage is explicit —
+        // the M5d-6 pipeline order is not the enum's numeric order.
         class PhasePartitionPass final : public Pass
         {
         public:
-            PhasePartitionPass(std::string name, CpuMappingStage inputStage, std::vector<uint32_t> options)
-                : Pass(std::move(name), PassKind::BackendMapping), inputStage_(inputStage), options_(std::move(options)) {}
+            PhasePartitionPass(std::string name, CpuMappingStage inputStage, CpuMappingStage outputStage,
+                               std::vector<uint32_t> options)
+                : Pass(std::move(name), PassKind::BackendMapping), inputStage_(inputStage),
+                  outputStage_(outputStage), options_(std::move(options)) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
@@ -1040,13 +766,12 @@ namespace wolvrix::lib::grhsim
                 CpuBackendMapping mapping = *previous;
                 switch (inputStage_)
                 {
-                case CpuMappingStage::SplitPhases: buildGeneralNodes(model, mapping, options_[0], diagnostics); break;
                 case CpuMappingStage::GeneralNodes: mergeGeneralSupernodes(model, mapping, options_[0], diagnostics); break;
-                case CpuMappingStage::GeneralSupernodes:
+                case CpuMappingStage::MemWritePlan:
                     packGeneralFunctions(model, mapping, options_[0], options_[1], options_[2], options_[3]); break;
                 default: throw std::logic_error("invalid CPU partition pass stage");
                 }
-                mapping.stage = static_cast<CpuMappingStage>(static_cast<unsigned>(inputStage_) + 1);
+                mapping.stage = outputStage_;
                 diagnostics.info("partitions=" + std::to_string(mapping.partitionTree.partitions.size()), name());
                 model.setCpuMapping(std::move(mapping));
                 return {true, true, {}};
@@ -1054,6 +779,7 @@ namespace wolvrix::lib::grhsim
 
         private:
             CpuMappingStage inputStage_;
+            CpuMappingStage outputStage_;
             std::vector<uint32_t> options_;
         };
     }
@@ -1131,12 +857,16 @@ namespace wolvrix::lib::grhsim
 
     void registerCpuPartitionPasses(PassRegistry &registry)
     {
-        const auto add = [&](std::string name, CpuMappingStage stage,
-                             std::vector<std::string> keys, std::vector<uint32_t> defaults,
-                             bool sixPhase = false) {
+        // The M5d-6 C-segment partition passes: C1 build-general-nodes
+        // (initializes the mapping), C2 merge-general-supernodes, C6
+        // pack-general-functions. The legacy two-phase passes and the
+        // cpu.st.split-phases initializer were removed in M5d-6.
+        const auto add = [&](std::string name, std::optional<CpuMappingStage> inputStage,
+                             CpuMappingStage outputStage,
+                             std::vector<std::string> keys, std::vector<uint32_t> defaults) {
             std::string error;
-            const auto factory = [name, stage, keys, defaults, sixPhase](std::span<const std::string_view> args,
-                                                                         std::string &error) -> std::unique_ptr<Pass> {
+            const auto factory = [name, inputStage, outputStage, keys, defaults](std::span<const std::string_view> args,
+                                                                                 std::string &error) -> std::unique_ptr<Pass> {
                 auto options = defaults;
                 std::vector<bool> seen(keys.size());
                 if (args.size() % 2 != 0) { error = "CPU partition options require a value"; return {}; }
@@ -1153,26 +883,17 @@ namespace wolvrix::lib::grhsim
                         (options[index] == 0 && keys[index] != "--target-batch-count"))
                     { error = "CPU partition limit must be a positive 32-bit integer"; return {}; }
                 }
-                if (sixPhase) return std::make_unique<PhasePartitionPass>(name, stage, std::move(options));
-                return std::make_unique<PartitionPass>(name, stage, std::move(options));
+                if (!inputStage) return std::unique_ptr<Pass>(std::make_unique<BuildGeneralNodesPass>(options[0]));
+                return std::unique_ptr<Pass>(std::make_unique<PhasePartitionPass>(name, *inputStage, outputStage,
+                                                                                  std::move(options)));
             };
             if (!registry.registerPass(name, PassKind::BackendMapping, factory, error)) throw std::logic_error(error);
         };
-        add("cpu.st.build-compute-nodes", CpuMappingStage::EventDomains, {"--max-op-in-compute-node"}, {128});
-        add("cpu.st.merge-compute-supernodes", CpuMappingStage::ComputeNodes, {"--max-op-in-compute-supernode"}, {128});
-        add("cpu.st.pack-active-words", CpuMappingStage::ComputeSupernodes, {"--helper-max-estimated-lines"}, {2048});
-        add("cpu.st.pack-emit-functions", CpuMappingStage::ActiveWords,
-            {"--batch-max-ops", "--batch-max-estimated-lines", "--target-batch-count"}, {2048, 8192, 64});
-        add("cpu.st.build-general-nodes", CpuMappingStage::SplitPhases, {"--max-op-in-compute-node"}, {128}, true);
-        add("cpu.st.merge-general-supernodes", CpuMappingStage::GeneralNodes, {"--max-op-in-compute-supernode"}, {128}, true);
-        add("cpu.st.pack-general-functions", CpuMappingStage::GeneralSupernodes,
+        add("cpu.st.build-general-nodes", std::nullopt, CpuMappingStage::GeneralNodes, {"--max-op-in-compute-node"}, {128});
+        add("cpu.st.merge-general-supernodes", CpuMappingStage::GeneralNodes, CpuMappingStage::GeneralSupernodes,
+            {"--max-op-in-compute-supernode"}, {128});
+        add("cpu.st.pack-general-functions", CpuMappingStage::MemWritePlan, CpuMappingStage::GeneralFunctions,
             {"--helper-max-estimated-lines", "--batch-max-ops", "--batch-max-estimated-lines", "--target-batch-count"},
-            {2048, 2048, 8192, 64}, true);
-        std::string error;
-        if (!registry.registerPass("cpu.st.split-phases", PassKind::BackendMapping,
-            [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
-                if (!args.empty()) { error = "cpu.st.split-phases does not accept arguments"; return {}; }
-                return std::make_unique<SplitPhasesPass>();
-            }, error)) throw std::logic_error(error);
+            {2048, 2048, 8192, 64});
     }
 }

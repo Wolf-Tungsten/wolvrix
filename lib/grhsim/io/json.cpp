@@ -1350,14 +1350,17 @@ namespace wolvrix::lib::grhsim
                 writer.endArray();
             }
             writer.endArray();
-            // Optional trailing keys, positional: declaredSymbols then
-            // generateGroups. Only written when non-empty, so metadata-free
-            // checkpoints stay byte-compatible with the pre-metadata schema.
-            if (!model.declaredSymbols().empty() || !model.generateGroups().empty())
+            // Optional trailing keys, positional: declaredSymbols, then
+            // generateGroups, then declProvenance. Only written when non-empty
+            // (a later key drags the earlier ones out as possibly empty
+            // arrays), so metadata-free checkpoints stay byte-compatible with
+            // the pre-metadata schema.
+            const bool hasProvenance = !model.declProvenances().empty();
+            if (!model.declaredSymbols().empty() || !model.generateGroups().empty() || hasProvenance)
             {
                 writer.key("declaredSymbols");
                 writeIdArray<StringId>(writer, model.declaredSymbols());
-                if (!model.generateGroups().empty())
+                if (!model.generateGroups().empty() || hasProvenance)
                 {
                     writer.key("generateGroups");
                     writer.startArray();
@@ -1366,6 +1369,35 @@ namespace wolvrix::lib::grhsim
                         writer.startArray();
                         writeId(writer, group.scope); writeId(writer, group.name);
                         writeIdArray<StringId>(writer, group.symbols);
+                        writer.endArray();
+                    }
+                    writer.endArray();
+                }
+                if (hasProvenance)
+                {
+                    writer.key("declProvenance");
+                    writer.startArray();
+                    for (const DeclProvenance &record : model.declProvenances())
+                    {
+                        writer.startArray();
+                        writeId(writer, record.symbol); writeId(writer, record.origin);
+                        writer.value(record.width);
+                        writer.startArray();
+                        for (const uint64_t dim : record.shape) writer.value(dim);
+                        writer.endArray();
+                        writer.startArray();
+                        for (const DeclProvenanceSlice &slice : record.slices)
+                        {
+                            writer.startArray();
+                            writer.value(toString(slice.kind));
+                            writer.value(toString(slice.target));
+                            writer.value(static_cast<uint64_t>(slice.targetIndex));
+                            writer.value(slice.targetOffset);
+                            writer.value(slice.declOffset);
+                            writer.value(slice.width);
+                            writer.endArray();
+                        }
+                        writer.endArray();
                         writer.endArray();
                     }
                     writer.endArray();
@@ -1598,7 +1630,9 @@ namespace wolvrix::lib::grhsim
 
             // Optional trailing keys (absent in old checkpoints): a
             // "declaredSymbols" string-id array, then a "generateGroups" array
-            // of [scope, name, [symbol ids]] entries.
+            // of [scope, name, [symbol ids]] entries, then a "declProvenance"
+            // array of [symbol, origin, width, [shape], [[kind, target kind,
+            // target index, target offset, decl offset, width]]] records.
             if (reader.comma())
             {
                 if (reader.string() != "declaredSymbols")
@@ -1625,6 +1659,58 @@ namespace wolvrix::lib::grhsim
                         const std::size_t group = model->addGenerateGroup(scope, name);
                         for (const StringId symbol : symbols)
                             model->addGenerateGroupSymbol(group, symbol);
+                    }
+                    if (reader.comma())
+                    {
+                        if (reader.string() != "declProvenance")
+                            throw std::runtime_error("expected property 'declProvenance'");
+                        reader.expect(':');
+                        bool recordFirst = true;
+                        reader.startArray();
+                        while (reader.nextArray(recordFirst))
+                        {
+                            reader.startArray();
+                            DeclProvenance record;
+                            record.symbol = readId<StringId>(reader, "provenance symbol");
+                            expectComma(reader);
+                            record.origin = readId<OriginId>(reader, "provenance origin", true);
+                            expectComma(reader);
+                            record.width = reader.unsignedInteger();
+                            expectComma(reader);
+                            bool dimFirst = true;
+                            reader.startArray();
+                            while (reader.nextArray(dimFirst))
+                                record.shape.push_back(reader.unsignedInteger());
+                            expectComma(reader);
+                            bool sliceFirst = true;
+                            reader.startArray();
+                            while (reader.nextArray(sliceFirst))
+                            {
+                                reader.startArray();
+                                DeclProvenanceSlice slice;
+                                const auto kind = parseDeclProvenanceKind(reader.string());
+                                if (!kind)
+                                    throw std::runtime_error("unknown provenance slice kind");
+                                slice.kind = *kind;
+                                expectComma(reader);
+                                const auto target = parseDeclProvenanceTarget(reader.string());
+                                if (!target)
+                                    throw std::runtime_error("unknown provenance slice target");
+                                slice.target = *target;
+                                expectComma(reader);
+                                slice.targetIndex = reader.index("provenance slice target");
+                                expectComma(reader);
+                                slice.targetOffset = reader.unsignedInteger();
+                                expectComma(reader);
+                                slice.declOffset = reader.unsignedInteger();
+                                expectComma(reader);
+                                slice.width = reader.unsignedInteger();
+                                reader.endArray();
+                                record.slices.push_back(slice);
+                            }
+                            reader.endArray();
+                            model->upsertDeclProvenance(std::move(record));
+                        }
                     }
                 }
             }

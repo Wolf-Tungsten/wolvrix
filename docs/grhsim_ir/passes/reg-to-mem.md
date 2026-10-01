@@ -134,6 +134,32 @@ The semantic pass invalidates backend mappings through the pass manager. Rejecte
 candidates leave the model unchanged. Model compaction remaps surviving operation,
 value, state and initialization references, retaining origins and external interfaces.
 
+Declaration provenance is maintained for every merged row: before cleanup's
+compaction drops the scalar row states, each row declaration's slices are
+re-targeted to the row's element slice of the new table state with kind `Merged`
+(`targetOffset` = `row * elementWidth`, `width` = element width), via the shared
+`mergeProvenanceStateSlices` helper. Rows without provenance slices merge
+structurally as before. Whole-object markers are dropped by the helper, as a
+merged row is realized by an element slice, never by the whole table. The info
+diagnostics report `provenance_records` (records re-targeted).
+
+When every row of a merged family is a declared symbol whose hierarchical names
+differ only in `_`-separated numeric tokens, the pass recovers the declared
+family shape: the numeric token positions must sweep a complete rectangular grid
+starting at zero, and the group's row order (decode addresses) must equal the
+row-major linearization of the indices. A family `tbl_0..tbl_63` reports shape
+`64`; a family `mat_0_0..mat_1_3` with decode order `(0,0),(0,1),...` reports
+`2x4`. The new table state is then named `__reg_to_mem_<pattern>__<firstRowId>`
+with `@` at the varying token positions (for example
+`__reg_to_mem_cpu$rob$robEntries_@_vls__12345`); otherwise the name stays
+`__reg_to_mem_<firstRowId>`. The shape only annotates naming and reporting — the
+table type stays a flat one-dimensional array whose element order is the
+row-major linearization of the declaration grid, matching the declProvenance
+linearization convention. Diagnostics report `declared_families` and
+`max_array_dims`; the TSV report carries a trailing `shape` column (`-` when no
+pattern holds). Earlier columns are unchanged.
+
+
 The playground Makefile provides `test_grhsim_reg_to_mem`, `analyze_grhsim_reg_to_mem`
 and `rewrite_grhsim_reg_to_mem`. The last two accept `GRHSIM_AUDIT_MODEL` and
 `GRHSIM_REG_TO_MEM_REPORT`. Tests compare scalar and rewritten state transitions,

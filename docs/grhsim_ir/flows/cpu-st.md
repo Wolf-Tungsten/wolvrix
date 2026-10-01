@@ -44,24 +44,30 @@ value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认
 
 lower 还把 GRH 图的 `declaredSymbols` 与 `generateGroups` 原样携带为模型的只读
 metadata（见 [Overview](../overview.md) 第 3.4 节；`keep_declared_symbols=False` 可关闭，
-与 `keep_origins` 独立）。两者是来源注解，不参与仿真语义，cpu.st 各 pass 与
-`compact()` 对它们没有维护义务；checkpoint 往返保持不变。
+与 `keep_origins` 独立），并为每个能解析到存活 value/state/function 的声明建立
+`declProvenance` 记录（direct 全覆盖 slice，数组声明保留形状；见 Overview 第 3.4.1 节）。
+名字清单是来源注解，不参与仿真语义，cpu.st 各 pass 对它们没有维护义务；
+`declProvenance` 持有实体下标，`compact()` 会重映射并丢弃已删除目标的 slice，
+改写被声明实体的 pass 负责在删除前重定向。checkpoint 往返对两者保持不变。
+生产流程（XS/HDLBits 入口脚本）一律显式启用 `keep_origins` 与
+`keep_declared_symbols`，不得以关闭声明保留换取优化。
 
-XiangShan 入口在 lower 成功后执行 GrhSIM IR 侧 `grhsim.reg-to-mem`、
-`grhsim.canonicalize-compute` 和
-[`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)、
-[`grhsim.bitwise-predicates`](../passes/bitwise-predicates.md)，再进入下表的 CPU mapping；这些 pass 不修改 GRH。
+XiangShan 入口在 lower 成功后先执行全图优化段（M5d-3 起的目标 A 段顺序）：
+`grhsim.canonicalize-compute`（归一化）、`grhsim.reg-to-mem`（恢复标量化表/数组）、
+[`grhsim.comb-pack`](../passes/comb-pack.md)（全图同构组合 lane 打包）、
+[`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)（bit 寄存器打包，改用原始
+event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全图不动点化简，
+最后 [`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)（保持在最后一次含 CSE 的
+化简之后），再进入下表的 CPU mapping；这些 pass 不修改 GRH。
 
-完成首次mapping后，XiangShan入口执行
-[`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)，依据同enable/mask、
-event/history初值和quiescence投影类别把普通单写口bit寄存器打包为至多64位word。
-该语义变换会使mapping失效。打包把原逐bit `core.state.read` 改写为
-`core.compute.sliceStatic(packed, bit, bit)`，原 IR 中对这些bit的
-`core.compute.concat` gather 因此退化为同一源值的连续切片拼接；随后立即重跑
-`grhsim.canonicalize-compute`，将全覆盖顺序拼接折叠回源值、连续区间拼接就地改写为
-单个 `sliceStatic`（详见下文该 pass 的代数规则），再完整重跑八个CPU mapping pass。
-集成开关为 `XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1`。读slice继续提供commit旧快照，
-CPU emitter使用现有标量concat/read/slice/write路径；打包收益须由性能实测判断。
+完成首次mapping后，XiangShan入口继续执行
+`grhsim.canonicalize-compute`、
+[`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)、
+[`grhsim.mux-chain-fold`](../passes/mux-chain-fold.md)、
+[`grhsim.used-bits`](../passes/used-bits.md) 的既有后置化简序列，并完整重跑 CPU mapping
+（该后置段属既有生产结构，目标 B/C 段改造前保持不变）。
+集成开关为 `XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1` 与
+`XS_WOLF_GRHSIM_IR_COMB_PACK=0/1`（及对应 `*_REPORT` TSV 诊断输出）。
 
 最终 mapping 前运行 [`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)，
 将全部 operand/result 为 unsigned two-state bit 的 mux 转为按位选择 op，
@@ -75,6 +81,12 @@ mux 链折叠之后、第二轮 mapping 之前运行
 状态本体），并把只被低 `[0,k)` 位观测的 op 锥与寄存器收窄到实际宽度（宽值跨越 64 位线时
 从多字 helper 路径降级为标量路径）。sink（输出、DPI/system、memory 端口、事件）按全宽
 保守处理；语义保持论证见 pass 文档。
+
+M5d-2 起，上述化简 pass（及新增的 [`grhsim.const-fold`](../passes/const-fold.md)）也可经
+统一入口 [`grhsim.simplify`](../passes/simplify.md) 以固定子序列迭代至不动点的方式执行，
+支持 whole/phase 两种 scope（phase 模式保留分区接口、禁止跨阶段 CSE、共享状态位需求取
+全分区并集）。M5d-3 起生产流程的全图优化段已接线 `grhsim.simplify(scope=whole)`；
+分区 scope 的接线属 M5d-5。
 
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有
 消费者。`core.compute.assign` 唯一 operand 是源值，唯一 result 是赋值结果；

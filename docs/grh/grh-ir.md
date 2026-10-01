@@ -507,6 +507,13 @@ Graph 额外维护 **Generate Group** 列表（`generateGroups()`），作为 De
 - 同一模块的多实例产生各自独立的组（`scope` 前缀不同）；成员符号在内联中被丢弃时（如子图端口名被父图名取代）相应地从组中移除；组变空则不写入主图。
 - flatten 对已展平图是幂等的：前缀只在内联 `kInstance` 时叠加，而实例 op 随内联被删除，重复执行不会二次加前缀。
 
+**lower 到 GrhSIM IR 后的去向**：
+
+`lower_grhsim`（`keep_declared_symbols=True`，默认）把 declaredSymbols 与 generateGroups
+原样携带为模型的只读 metadata，并为每个能解析到存活 value/state/function 的声明建立
+`declProvenance` 记录（direct 全覆盖 slice，数组声明保留形状），供 GrhSIM 侧优化与调试
+反查。表示、更新规则与 JSON 编码见 `docs/grhsim_ir/overview.md` 第 3.4.1 节。
+
 ---
 
 # 5. Design 详解

@@ -1,5 +1,8 @@
 #include "grhsim/pass/pass.hpp"
 #include "grhsim/pass/reg_to_mem.hpp"
+#include "grhsim/pass/comb_pack.hpp"
+#include "grhsim/pass/const_fold.hpp"
+#include "grhsim/pass/simplify.hpp"
 #include "grhsim/pass/canonicalize_compute.hpp"
 #include "grhsim/pass/clone_shared_compute.hpp"
 #include "grhsim/pass/bitwise_predicates.hpp"
@@ -172,7 +175,10 @@ namespace wolvrix::lib::grhsim
     {
         PassRegistry registry;
         registerCpuPasses(registry);
+        registerConstFoldPass(registry);
+        registerSimplifyPass(registry);
         registerRegToMemPass(registry);
+        registerCombPackPass(registry);
         registerCanonicalizeComputePass(registry);
         registerCloneSharedComputePass(registry);
         registerBitwisePredicatesPass(registry);

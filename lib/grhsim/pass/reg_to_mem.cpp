@@ -1,5 +1,6 @@
 #include "grhsim/pass/reg_to_mem.hpp"
 
+#include "simplify_internal.hpp"
 #include "grhsim/ir/model.hpp"
 #include "slang/numeric/SVInt.h"
 
@@ -54,6 +55,8 @@ namespace {
         std::vector<std::size_t> order; // Low to high.
         std::string reason;
         std::string detail;
+        std::string shape;     // Declared family dimensions, "64" / "16x4"; empty when none.
+        std::string tableName; // Declared-pattern table name; empty falls back to the index name.
     };
     struct PackedSlice {
         OpId op;
@@ -160,6 +163,84 @@ namespace {
         bool ones(ValueId v) {
             auto n=literal(v); if (!n || n->hasUnknown()) return false;
             return n->countOnes()==type(v).width;
+        }
+        // Declared-family shape recovery: every row state must be a declared
+        // symbol whose hierarchical name shares all '_' tokens except K
+        // positions that are numeric in every row, vary, and sweep a complete
+        // rectangular grid whose row-major linearization matches the group
+        // row order. Returns the name pattern (varying tokens replaced by
+        // '@') and the K dimensions; dims empty when no pattern holds.
+        std::pair<std::string,std::vector<uint64_t>> declaredShape(const Group &g) {
+            std::vector<std::vector<std::string_view>> tokens;
+            tokens.reserve(g.rows.size());
+            for (const auto row : g.rows) {
+                const auto &state = m.states()[row.index-1];
+                if (!m.isDeclaredSymbol(state.name)) return {};
+                const std::string_view name = m.text(state.name);
+                std::vector<std::string_view> parts;
+                std::size_t begin = 0;
+                for (std::size_t i = 0; i <= name.size(); ++i)
+                    if (i == name.size() || name[i] == '_') {
+                        parts.push_back(name.substr(begin, i-begin));
+                        begin = i+1;
+                    }
+                if (!tokens.empty() && parts.size() != tokens.front().size()) return {};
+                tokens.push_back(std::move(parts));
+            }
+            const std::size_t columns = tokens.front().size();
+            const auto numeric = [](std::string_view token, uint64_t &out) {
+                if (token.empty() || token.size() > 18) return false;
+                out = 0;
+                for (const char c : token) {
+                    if (c < '0' || c > '9') return false;
+                    out = out*10 + uint64_t(c-'0');
+                }
+                return true;
+            };
+            std::vector<std::size_t> varying;
+            std::vector<std::vector<uint64_t>> indices; // per row, per varying column
+            indices.resize(tokens.size());
+            for (std::size_t column = 0; column < columns; ++column) {
+                uint64_t number = 0;
+                const bool allNumeric = std::all_of(tokens.begin(), tokens.end(),
+                    [&](const auto &parts){ return numeric(parts[column], number); });
+                const bool constant = std::all_of(tokens.begin(), tokens.end(),
+                    [&](const auto &parts){ return parts[column] == tokens.front()[column]; });
+                if (constant) continue;
+                if (!allNumeric) return {};
+                varying.push_back(column);
+                for (std::size_t row = 0; row < tokens.size(); ++row) {
+                    numeric(tokens[row][column], number);
+                    indices[row].push_back(number);
+                }
+            }
+            if (varying.empty()) return {};
+            std::vector<uint64_t> dims(varying.size());
+            uint64_t total = 1;
+            for (std::size_t d = 0; d < dims.size(); ++d) {
+                uint64_t low = std::numeric_limits<uint64_t>::max(), high = 0;
+                for (const auto &tuple : indices) {
+                    low = std::min(low, tuple[d]);
+                    high = std::max(high, tuple[d]);
+                }
+                if (low != 0) return {};
+                dims[d] = high+1;
+                if (dims[d] == 0 || total > std::numeric_limits<uint64_t>::max()/dims[d]) return {};
+                total *= dims[d];
+            }
+            if (total != g.rows.size()) return {};
+            for (std::size_t row = 0; row < indices.size(); ++row) {
+                uint64_t flat = 0;
+                for (std::size_t d = 0; d < dims.size(); ++d) flat = flat*dims[d] + indices[row][d];
+                if (flat != row) return {};
+            }
+            std::string pattern;
+            for (std::size_t column = 0; column < columns; ++column) {
+                if (column) pattern += '_';
+                const auto it = std::find(varying.begin(), varying.end(), column);
+                pattern += it == varying.end() ? tokens.front()[column] : "@";
+            }
+            return {std::move(pattern), std::move(dims)};
         }
         std::string key(ValueId v) {
             v=unwrap(v);
@@ -707,11 +788,13 @@ namespace {
         void rewriteGroup(Group &g, bool merge) {
             const auto element=m.states()[g.rows[0].index-1].type;
             const auto origin=m.states()[g.rows[0].index-1].origin;
-            const auto name="__reg_to_mem_"+std::to_string(g.rows[0].index);
+            const auto name=g.tableName.empty() ? "__reg_to_mem_"+std::to_string(g.rows[0].index) : g.tableName;
             auto table=m.addState(name,m.arrayType(element,g.rows.size()),origin);
+            const auto elementWidth=m.types()[element.index-1].width;
             std::vector<InitStep> steps;std::vector<Parameter> parameters;
             for(std::size_t row=0;row<g.rows.size();++row) {
-                const auto old=g.rows[row]; rowMap[old.index]={table,row}; removedStates[old.index]=1;
+                const auto old=g.rows[row]; rowMap[old.index]={table,row}; rowBase[old.index]=row*elementWidth;
+                removedStates[old.index]=1;
                 const auto &init=m.steps(*inits[old.index])[0];
                 auto value=*param<std::string>(m,m.parameters(init),"value");
                 const auto offset=static_cast<uint32_t>(parameters.size());
@@ -1108,7 +1191,8 @@ namespace {
         }
         std::size_t apply() {
             const auto oldOps=m.operations().size();
-            removedOps.resize(oldOps+1);removedStates.resize(m.states().size()+1);rowMap.resize(m.states().size()+1);
+            removedOps.resize(oldOps+1);removedStates.resize(m.states().size()+1);
+            rowMap.resize(m.states().size()+1);rowBase.resize(m.states().size()+1);
             std::size_t count=0;
             for(auto &g:groups) {
                 if(!g.selected) continue;
@@ -1117,9 +1201,22 @@ namespace {
                     bit=m.logicType(1,false,LogicDomain::TwoState);
                     indexType=m.logicType(32,false,LogicDomain::TwoState);
                 }
+                auto [pattern,dims]=declaredShape(g);
+                if(!dims.empty()) {
+                    g.tableName="__reg_to_mem_"+pattern+"__"+std::to_string(g.rows[0].index);
+                    g.shape=std::to_string(dims[0]);
+                    for(std::size_t d=1;d<dims.size();++d) g.shape+="x"+std::to_string(dims[d]);
+                    ++shapedFamilies; maxDims=std::max(maxDims,dims.size());
+                }
                 rewriteGroup(g,g.mergeWrites);g.reason=g.mergeWrites?"merged":"indexed-read";++count;
             }
             if(count) {
+                // Declarations of merged rows re-target to their element slice
+                // of the new table state (kind=Merged) before cleanup()'s
+                // compact() drops the old states.
+                std::vector<StateId> mergeTarget(rowMap.size());
+                for(std::size_t i=1;i<rowMap.size();++i) mergeTarget[i]=rowMap[i].first;
+                provenanceRecords=mergeProvenanceStateSlices(m,mergeTarget,rowBase,DeclProvenanceKind::Merged);
                 rewriteAccesses(oldOps);
                 if(options.enableReadRewrite) rewritePackedReads();
                 cleanup();
@@ -1147,6 +1244,8 @@ namespace {
         TypeId bit,indexType;
         std::vector<uint8_t> removedOps,removedStates;
         std::vector<std::pair<StateId,uint32_t>> rowMap;
+        std::vector<uint64_t> rowBase; // Per-row linear bit offset inside the new table state.
+        std::size_t provenanceRecords=0, shapedFamilies=0, maxDims=0;
     };
 }
 
@@ -1169,20 +1268,24 @@ PassResult RegToMemPass::run(GrhSimModel &model, diag::Diagnostics &diagnostics)
         return {false,engine.mutationStarted,{}};
     }
     std::ostringstream report;
-    report<<"source\trows\tbase\twrites\tstatus\tfirst_state\tdetail\twrite_savings\tread_savings\tcombined_savings\n";
+    report<<"source\trows\tbase\twrites\tstatus\tfirst_state\tdetail\twrite_savings\tread_savings\tcombined_savings\tshape\n";
     for(const auto &g:engine.groups) report<<(g.writeSource?"write":"read")<<'\t'<<g.rows.size()<<'\t'<<g.base<<'\t'
         <<(g.writes.empty()?0:g.writes[0].branches.size())<<'\t'<<g.reason<<'\t'<<names[g.rows[0].index]<<'\t'<<g.detail
-        <<'\t'<<g.writeSavings<<'\t'<<g.readSavings<<'\t'<<g.combinedSavings<<'\n';
+        <<'\t'<<g.writeSavings<<'\t'<<g.readSavings<<'\t'<<g.combinedSavings<<'\t'
+        <<(g.shape.empty()?"-":g.shape)<<'\n';
     for(const auto &[reason,entry]:engine.excludedStates)
         report<<"excluded-state\t"<<entry.first<<"\t0\t0\t"<<reason<<'\t'<<entry.second
-            <<"\tstate exclusions before candidate discovery; rows is a state count\t0\t0\t0\n";
+            <<"\tstate exclusions before candidate discovery; rows is a state count\t0\t0\t0\t-\n";
     if(!options_.report.empty()) {
         std::ofstream out(options_.report); if(!out) {diagnostics.error("cannot open reg-to-mem report");return {false,changed!=0,{}};}
         out<<report.str(); if(!out) {diagnostics.error("cannot write reg-to-mem report");return {false,changed!=0,{}};}
     }
     diagnostics.info("reg-to-mem candidates="+std::to_string(engine.groups.size())+" transformed="+std::to_string(changed)+
         " states="+std::to_string(oldStates)+"->"+std::to_string(model.states().size())+
-        " operations="+std::to_string(oldOps)+"->"+std::to_string(model.operations().size()));
+        " operations="+std::to_string(oldOps)+"->"+std::to_string(model.operations().size())+
+        " provenance_records="+std::to_string(engine.provenanceRecords)+
+        " declared_families="+std::to_string(engine.shapedFamilies)+
+        " max_array_dims="+std::to_string(engine.maxDims));
     return {true,changed!=0,{}};
 }
 

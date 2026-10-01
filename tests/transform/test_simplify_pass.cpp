@@ -588,5 +588,147 @@ int main()
         }
     }
 
+    // Case 10: simplify keeps declared symbols resolvable — const-fold
+    // materializes a declared value's folded constant, redundant-elim never
+    // merges a declared alias away, and DCE treats declared storage as a
+    // liveness root. The same graph with retention off folds the declared
+    // value away entirely.
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g10");
+        const auto c0 = makeConst(graph, "c0d", "c0d_op", 4, false, "4'h3");
+        const auto c1 = makeConst(graph, "c1d", "c1d_op", 4, false, "4'h1");
+
+        const auto folded = graph.createValue(graph.internSymbol("folded_sum"), 4, false);
+        const auto add = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd,
+                                               graph.internSymbol("add_d"));
+        graph.addOperand(add, c0);
+        graph.addOperand(add, c1);
+        graph.addResult(add, folded);
+
+        const auto alias = graph.createValue(graph.internSymbol("alias_wire"), 4, false);
+        const auto assign = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                  graph.internSymbol("assign_d"));
+        graph.addOperand(assign, folded);
+        graph.addResult(assign, alias);
+
+        const auto out = graph.createValue(graph.internSymbol("out"), 4, false);
+        graph.bindOutputPort("out", out);
+        const auto assignOut = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                     graph.internSymbol("assign_out"));
+        graph.addOperand(assignOut, alias);
+        graph.addResult(assignOut, out);
+
+        // Declared register with a write port but no readers: a DCE root.
+        const auto held = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                graph.internSymbol("held_q"));
+        graph.setAttr(held, "width", int64_t{4});
+        graph.setAttr(held, "isSigned", false);
+        graph.setAttr(held, "initValue", std::string("4'h0"));
+        const auto heldWrite = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol("held_q_write"));
+        graph.setAttr(heldWrite, "regSymbol", std::string("held_q"));
+        graph.setAttr(heldWrite, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto heldMask = makeConst(graph, "held_mask", "held_mask_op", 4, false, "4'hf");
+        const auto heldEn = graph.createValue(graph.internSymbol("held_en"), 1, false);
+        graph.bindInputPort("held_en", heldEn);
+        const auto heldClk = graph.createValue(graph.internSymbol("held_clk"), 1, false);
+        graph.bindInputPort("held_clk", heldClk);
+        graph.addOperand(heldWrite, heldEn);
+        graph.addOperand(heldWrite, alias);
+        graph.addOperand(heldWrite, heldMask);
+        graph.addOperand(heldWrite, heldClk);
+
+        graph.addDeclaredSymbol(graph.lookupSymbol("folded_sum"));
+        graph.addDeclaredSymbol(graph.lookupSymbol("alias_wire"));
+        graph.addDeclaredSymbol(graph.lookupSymbol("held_q"));
+
+        PassManager manager; // keepDeclaredSymbols defaults to true
+        manager.addPass(std::make_unique<SimplifyPass>());
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during declared-preservation run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected declared-preservation simplify to succeed");
+        }
+        if (!graph.validateDeclaredSymbols().empty())
+        {
+            return fail("simplify left unresolvable declared symbols");
+        }
+        const auto foldedAfter = graph.findValue("folded_sum");
+        if (!foldedAfter.valid() || !graph.isDeclaredSymbol(graph.lookupSymbol("folded_sum")))
+        {
+            return fail("declared folded value lost its entity or membership");
+        }
+        const auto foldedDef = graph.getValue(foldedAfter).definingOp();
+        if (!foldedDef.valid() ||
+            graph.getOperation(foldedDef).kind() != wolvrix::lib::grh::OperationKind::kConstant)
+        {
+            return fail("declared folded value was not materialized as a constant");
+        }
+        if (!graph.findValue("alias_wire").valid() ||
+            !graph.isDeclaredSymbol(graph.lookupSymbol("alias_wire")))
+        {
+            return fail("declared alias wire was merged away");
+        }
+        if (!graph.findOperation("held_q").valid())
+        {
+            return fail("declared unread register was eliminated");
+        }
+    }
+
+    // Case 11: control — with retention off, the folded declared value is
+    // replaced and erased like any other value.
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g11");
+        const auto c0 = makeConst(graph, "c0x", "c0x_op", 4, false, "4'h3");
+        const auto c1 = makeConst(graph, "c1x", "c1x_op", 4, false, "4'h1");
+        const auto folded = graph.createValue(graph.internSymbol("folded_sum"), 4, false);
+        const auto add = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd,
+                                               graph.internSymbol("add_x"));
+        graph.addOperand(add, c0);
+        graph.addOperand(add, c1);
+        graph.addResult(add, folded);
+        const auto out = graph.createValue(graph.internSymbol("out"), 4, false);
+        graph.bindOutputPort("out", out);
+        const auto assignOut = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                     graph.internSymbol("assign_out"));
+        graph.addOperand(assignOut, folded);
+        graph.addResult(assignOut, out);
+        graph.addDeclaredSymbol(graph.lookupSymbol("folded_sum"));
+
+        PassManager manager;
+        manager.options().keepDeclaredSymbols = false;
+        manager.addPass(std::make_unique<SimplifyPass>());
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during declared-off control run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected declared-off control simplify to succeed");
+        }
+        if (graph.findValue("folded_sum").valid() ||
+            graph.isDeclaredSymbol(graph.lookupSymbol("folded_sum")))
+        {
+            return fail("declared-off control should fold and erase the value");
+        }
+    }
+
     return 0;
 }

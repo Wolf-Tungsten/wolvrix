@@ -14,7 +14,9 @@ namespace wolvrix::lib::grhsim
 
     // v2 appends the op phase as a ninth operations item and carries the
     // six-phase model's named store / event bitmap / mem write plan shells as
-    // optional mapping tails; v1 checkpoints are rejected.
+    // optional mapping tails; the model-level tail holds the optional
+    // declaredSymbols / generateGroups / declProvenance metadata keys in that
+    // order; v1 checkpoints are rejected.
     inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v2";
 
     bool writeGrhSimJson(const GrhSimModel &model,

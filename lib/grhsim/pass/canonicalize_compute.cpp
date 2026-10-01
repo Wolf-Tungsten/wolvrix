@@ -1,5 +1,8 @@
 #include "grhsim/pass/canonicalize_compute.hpp"
+
 #include "grhsim/ir/model.hpp"
+#include "simplify_internal.hpp"
+
 #include "slang/numeric/SVInt.h"
 
 #include <map>
@@ -128,10 +131,26 @@ namespace wolvrix::lib::grhsim
             return true;
         }
 
-        bool shareEquivalentStates(GrhSimModel &model, diag::Diagnostics &diagnostics)
+        struct CanonicalizeStats
+        {
+            uint64_t assigns = 0, algebraic = 0, common = 0;
+            uint64_t concatIdentity = 0, concatRange = 0, uses = 0;
+            uint64_t sharedStates = 0, sharedReads = 0;
+            bool changed() const
+            {
+                return assigns || algebraic || common || concatIdentity || concatRange ||
+                       sharedStates || sharedReads;
+            }
+        };
+
+        bool shareEquivalentStates(GrhSimModel &model, const SimplifyScope &scope,
+                                   CanonicalizeStats &stats)
         {
             std::vector<uint32_t> references(model.states().size() + 1), allowed(references.size()), writers(references.size());
             std::vector<std::string> initial(references.size());
+            // Phase scope: a state referenced by any out-of-scope op is part of
+            // the partition interface and must not coalesce.
+            std::vector<uint8_t> local(references.size(), 1);
             for (auto ref : model.objectRefPool())
                 if (ref.kind == ObjectKind::State) ++references[ref.index];
             for (const auto &record : model.initRecords())
@@ -145,6 +164,9 @@ namespace wolvrix::lib::grhsim
             {
                 const auto name = model.text(op.opType);
                 const auto refs = model.objectRefs(op);
+                if (!scope.inScope(op.phase))
+                    for (auto ref : refs)
+                        if (ref.kind == ObjectKind::State) local[ref.index] = 0;
                 if (name == "core.state.read") ++allowed[refs[0].index];
                 else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
                 { ++allowed[refs[0].index]; ++writers[refs[0].index]; }
@@ -157,13 +179,15 @@ namespace wolvrix::lib::grhsim
             std::size_t shared = 0;
             for (const auto &op : model.operations())
             {
+                if (!scope.inScope(op.phase)) continue;
                 const auto name = model.text(op.opType);
                 if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
                 const auto refs = model.objectRefs(op);
                 const StateId state{refs[0].index, 0};
                 const auto &type = model.types()[model.states()[state.index - 1].type.index - 1];
                 if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
-                    writers[state.index] != 1 || references[state.index] != allowed[state.index] || initial[state.index].empty()) continue;
+                    writers[state.index] != 1 || references[state.index] != allowed[state.index] ||
+                    initial[state.index].empty() || !local[state.index]) continue;
                 // The writer's phase belongs to the key: stores written in
                 // different phases (e.g. a General regWrite vs an Output
                 // __tslot_prev write-back) live in different named stores and
@@ -189,6 +213,7 @@ namespace wolvrix::lib::grhsim
             std::size_t sharedReads = 0;
             for (const auto &op : model.operations())
             {
+                if (!scope.inScope(op.phase)) continue;
                 if (model.text(op.opType) != "core.state.read" || model.results(op).size() != 1 ||
                     !model.operands(op).empty() || !model.parameters(op).empty()) continue;
                 const auto result = model.results(op)[0];
@@ -205,6 +230,7 @@ namespace wolvrix::lib::grhsim
             for (const auto &op : model.operations())
             {
                 if (removeOps[op.id.index]) continue;
+                if (!scope.inScope(op.phase)) continue;
                 const auto args = model.operands(op), results = model.results(op);
                 const auto refSpan = model.objectRefs(op);
                 const auto paramSpan = model.parameters(op);
@@ -221,33 +247,33 @@ namespace wolvrix::lib::grhsim
                 const std::vector<Parameter> params(paramSpan.begin(), paramSpan.end());
                 model.replaceOperation(op.id, model.text(op.opType), operands, out, refs, params);
             }
+            // Provenance: merged states redirect to the surviving canonical
+            // state (Direct -> Merged); removed shared reads alias the
+            // surviving read value (Direct -> Alias).
+            for (std::size_t index = 0; index < canonical.size(); ++index)
+                if (!removeStates[index]) canonical[index] = StateId::invalid();
+            redirectProvenanceStateSlices(model, canonical, DeclProvenanceKind::Merged);
+            // values[i] still maps to itself unless the value was a removed
+            // shared read; reduce the map to exactly those redirects.
+            for (std::size_t index = 0; index < values.size(); ++index)
+                if (values[index] == ValueId{static_cast<uint32_t>(index), 0})
+                    values[index] = ValueId::invalid();
+            redirectProvenanceValueSlices(model, values, DeclProvenanceKind::Alias);
             model.compact(removeOps, removeStates);
-            diagnostics.info("equivalent_states_removed=" + std::to_string(shared) +
-                " state_reads_shared=" + std::to_string(sharedReads),
-                "grhsim.canonicalize-compute");
+            stats.sharedStates += shared;
+            stats.sharedReads += sharedReads;
             return true;
         }
+    } // namespace
 
-        class CanonicalizeComputePass final : public Pass
+    SimplifyStepReport simplifyStepCanonicalizeCompute(GrhSimModel &model,
+                                                       diag::Diagnostics &diagnostics,
+                                                       SimplifyScope scope)
+    {
+        (void)diagnostics;
+        CanonicalizeStats stats;
         {
-        public:
-            CanonicalizeComputePass() : Pass("grhsim.canonicalize-compute", PassKind::SemanticTransform) {}
-
-            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            {
-                bool changed = false;
-                while (true)
-                {
-                    changed = canonicalize(model, diagnostics).changed || changed;
-                    if (!shareEquivalentStates(model, diagnostics)) break;
-                    changed = true;
-                }
-                return {true, changed, {}};
-            }
-
-        private:
-            PassResult canonicalize(GrhSimModel &model, diag::Diagnostics &diagnostics)
-            {
+            auto canonicalizeOnce = [&] {
                 std::vector<ValueId> sources(model.values().size() + 1), canonical(sources.size());
                 std::vector<uint32_t> producer(sources.size());
                 for (const auto &op : model.operations())
@@ -267,6 +293,7 @@ namespace wolvrix::lib::grhsim
                 };
                 for (const auto &op : model.operations())
                 {
+                    if (!scope.inScope(op.phase)) continue;
                     const auto operands = model.operands(op), results = model.results(op);
                     if (model.text(op.opType) != "core.compute.assign" || operands.size() != 1 || results.size() != 1 ||
                         !model.objectRefs(op).empty() || !model.parameters(op).empty()) continue;
@@ -335,7 +362,8 @@ namespace wolvrix::lib::grhsim
                 for (std::size_t index = 0; index < model.operations().size(); ++index)
                 {
                     const auto &op = model.operations()[index];
-                    if (removed[op.id.index] || model.text(op.opType) != "core.compute.concat") continue;
+                    if (removed[op.id.index] || !scope.inScope(op.phase) ||
+                        model.text(op.opType) != "core.compute.concat") continue;
                     const auto args = model.operands(op), results = model.results(op);
                     if (args.size() < 2 || results.size() != 1 || !model.objectRefs(op).empty() ||
                         !model.parameters(op).empty()) continue;
@@ -423,44 +451,52 @@ namespace wolvrix::lib::grhsim
                         for (auto operand : model.operands(op)) operands.push_back(root(operand));
                         if (pure)
                         {
+                            // Constants stay readable from any scope; only
+                            // in-scope ops may be rewritten or removed.
                             constants[results[0].index] = scalarConstant(model, op);
-                            if (const auto replacement = simplify(model, op, operands, constants);
-                                replacement && phaseCompatible(op.phase, phaseOf(replacement)))
+                            if (scope.inScope(op.phase))
                             {
-                                canonical[results[0].index] = replacement;
-                                removed[op.id.index] = 1;
-                                ++algebraic;
-                                pure = false;
+                                if (const auto replacement = simplify(model, op, operands, constants);
+                                    replacement && phaseCompatible(op.phase, phaseOf(replacement)))
+                                {
+                                    canonical[results[0].index] = replacement;
+                                    removed[op.id.index] = 1;
+                                    ++algebraic;
+                                    pure = false;
+                                }
                             }
                         }
-                        if (pure && operands.size() == 2 && commutative(model.text(op.opType)) &&
-                            model.values()[operands[0].index - 1].type == model.values()[operands[1].index - 1].type &&
-                            operands[1].index < operands[0].index)
-                            std::swap(operands[0], operands[1]);
-                        // The phase seals the CSE domain: structurally identical
-                        // cone clones (e.g. an Output-phase constant and its
-                        // General-side twin) must not merge across the barrier.
-                        std::string key = std::to_string(op.opType.index) + ":" +
-                            std::to_string(static_cast<unsigned>(op.phase)) + ":" + std::to_string(type.index) + ":";
-                        for (auto operand : operands) key += std::to_string(operand.index) + ',';
-                        key += ';';
-                        for (const auto &parameter : model.parameters(op))
+                        if (pure && scope.inScope(op.phase))
                         {
-                            key += std::to_string(parameter.name.index) + ':' + std::to_string(parameter.value.index()) + ':';
-                            if (const auto *integer = std::get_if<int64_t>(&parameter.value)) key += std::to_string(*integer) + ';';
-                            else if (const auto *boolean = std::get_if<bool>(&parameter.value)) key += *boolean ? "1;" : "0;";
-                            else if (const auto *text = std::get_if<std::string>(&parameter.value))
-                                key += std::to_string(text->size()) + ':' + *text + ';';
-                            else pure = false;
-                        }
-                        if (pure)
-                        {
-                            const auto [entry, inserted] = expressions.emplace(std::move(key), results[0]);
-                            if (!inserted)
+                            if (operands.size() == 2 && commutative(model.text(op.opType)) &&
+                                model.values()[operands[0].index - 1].type == model.values()[operands[1].index - 1].type &&
+                                operands[1].index < operands[0].index)
+                                std::swap(operands[0], operands[1]);
+                            // The phase seals the CSE domain: structurally identical
+                            // cone clones (e.g. an Output-phase constant and its
+                            // General-side twin) must not merge across the barrier.
+                            std::string key = std::to_string(op.opType.index) + ":" +
+                                std::to_string(static_cast<unsigned>(op.phase)) + ":" + std::to_string(type.index) + ":";
+                            for (auto operand : operands) key += std::to_string(operand.index) + ',';
+                            key += ';';
+                            for (const auto &parameter : model.parameters(op))
                             {
-                                canonical[results[0].index] = entry->second;
-                                removed[op.id.index] = 1;
-                                ++common;
+                                key += std::to_string(parameter.name.index) + ':' + std::to_string(parameter.value.index()) + ':';
+                                if (const auto *integer = std::get_if<int64_t>(&parameter.value)) key += std::to_string(*integer) + ';';
+                                else if (const auto *boolean = std::get_if<bool>(&parameter.value)) key += *boolean ? "1;" : "0;";
+                                else if (const auto *text = std::get_if<std::string>(&parameter.value))
+                                    key += std::to_string(text->size()) + ':' + *text + ';';
+                                else pure = false;
+                            }
+                            if (pure)
+                            {
+                                const auto [entry, inserted] = expressions.emplace(std::move(key), results[0]);
+                                if (!inserted)
+                                {
+                                    canonical[results[0].index] = entry->second;
+                                    removed[op.id.index] = 1;
+                                    ++common;
+                                }
                             }
                         }
                     }
@@ -470,11 +506,25 @@ namespace wolvrix::lib::grhsim
                 for (const auto &value : model.values()) canonical[value.id.index] = root(value.id);
                 const auto assigns = count;
                 count += common + algebraic + concatIdentity + concatRange;
+                stats.assigns += assigns;
+                stats.algebraic += algebraic;
+                stats.common += common;
+                stats.concatIdentity += concatIdentity;
+                stats.concatRange += concatRange;
                 if (count)
                 {
+                    // Provenance: values folded away here have an equivalent
+                    // survivor; redirect their slices (Direct -> Alias) before
+                    // compact() drops the removed entities.
+                    std::vector<ValueId> redirect(model.values().size() + 1);
+                    for (const auto &value : model.values())
+                        if (canonical[value.id.index] != value.id)
+                            redirect[value.id.index] = canonical[value.id.index];
+                    redirectProvenanceValueSlices(model, redirect, DeclProvenanceKind::Alias);
                     for (const auto &op : model.operations())
                     {
                         if (removed[op.id.index]) continue;
+                        if (!scope.inScope(op.phase)) continue;
                         const auto args = model.operands(op);
                         std::vector<ValueId> operands(args.begin(), args.end());
                         bool changed = false;
@@ -494,18 +544,55 @@ namespace wolvrix::lib::grhsim
                         const std::vector<Parameter> params(paramSpan.begin(), paramSpan.end());
                         model.replaceOperation(op.id, model.text(op.opType), operands, results, refs, params);
                     }
+                    stats.uses += uses;
                     model.compact(removed, std::vector<uint8_t>(model.states().size() + 1));
                 }
-                diagnostics.info("identity_assigns_removed=" + std::to_string(assigns) +
-                                 " algebraic_identities_removed=" + std::to_string(algebraic) +
-                                 " common_expressions_removed=" + std::to_string(common) +
-                                 " concat_identity_folds=" + std::to_string(concatIdentity) +
-                                 " concat_range_folds=" + std::to_string(concatRange) +
-                                 " rewritten_uses=" + std::to_string(uses), name());
-                return {true, count != 0, {}};
+            };
+            // Same iteration contract as the standalone pass has always had:
+            // canonicalize re-enters only after an equivalent-state merge.
+            while (true)
+            {
+                canonicalizeOnce();
+                if (!shareEquivalentStates(model, scope, stats)) break;
+            }
+        }
+        SimplifyStepReport report;
+        report.changed = stats.changed();
+        report.counters = {
+            {"identity_assigns_removed", stats.assigns},
+            {"algebraic_identities_removed", stats.algebraic},
+            {"common_expressions_removed", stats.common},
+            {"concat_identity_folds", stats.concatIdentity},
+            {"concat_range_folds", stats.concatRange},
+            {"rewritten_uses", stats.uses},
+            {"equivalent_states_removed", stats.sharedStates},
+            {"state_reads_shared", stats.sharedReads},
+        };
+        return report;
+    }
+
+    namespace
+    {
+        class CanonicalizeComputePass final : public Pass
+        {
+        public:
+            CanonicalizeComputePass() : Pass("grhsim.canonicalize-compute", PassKind::SemanticTransform) {}
+
+            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
+            {
+                const auto report = simplifyStepCanonicalizeCompute(model, diagnostics,
+                                                                    SimplifyScope::whole());
+                std::string message;
+                for (const auto &[key, count] : report.counters)
+                {
+                    if (!message.empty()) message += ' ';
+                    message += std::string(key) + '=' + std::to_string(count);
+                }
+                diagnostics.info(std::move(message), name());
+                return {true, report.changed, {}};
             }
         };
-    }
+    } // namespace
 
     void registerCanonicalizeComputePass(PassRegistry &registry)
     {

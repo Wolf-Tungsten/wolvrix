@@ -1,5 +1,7 @@
 #include "grhsim/pass/used_bits.hpp"
+
 #include "grhsim/ir/model.hpp"
+#include "simplify_internal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,7 +23,12 @@ namespace wolvrix::lib::grhsim
         {
             none, sinkFull, inputRead, stateRead, stateWrite,
             assign, transparent, fullUse, shl, mux, bitSelect,
-            prioritySelect, concat, replicate, sliceStatic
+            prioritySelect, concat, replicate, sliceStatic,
+            // Phase-scope barrier: an out-of-scope op is an opaque sink. Its
+            // operands and results are fully used and any state it references
+            // is fully demanded, so the transform never has to rewrite it and
+            // cross-partition references are preserved exactly.
+            opaque
         };
 
         UseRule ruleFor(std::string_view name)
@@ -77,7 +84,7 @@ namespace wolvrix::lib::grhsim
             std::vector<uint8_t> stateEligible;
             std::vector<std::vector<uint32_t>> opsByState;
 
-            void run(const GrhSimModel &model)
+            void run(const GrhSimModel &model, SimplifyScope scope = SimplifyScope::whole())
             {
                 const auto &types = model.types();
                 const auto &ops = model.operations();
@@ -105,6 +112,8 @@ namespace wolvrix::lib::grhsim
                 for (const auto &op : ops)
                 {
                     rules[op.id.index] = static_cast<uint8_t>(ruleFor(model.text(op.opType)));
+                    if (!scope.inScope(op.phase))
+                        rules[op.id.index] = static_cast<uint8_t>(UseRule::opaque);
                     for (auto result : model.results(op)) producer[result.index] = op.id.index;
                     for (auto ref : model.objectRefs(op))
                         if (ref.kind == ObjectKind::State) opsByState[ref.index].push_back(op.id.index);
@@ -128,6 +137,14 @@ namespace wolvrix::lib::grhsim
                         for (const uint32_t opIndex : opsByState[state.id.index])
                         {
                             const auto &op = ops[opIndex - 1];
+                            // Phase scope: a state shared with out-of-scope ops
+                            // is a partition interface — never narrowed or
+                            // removed, and its write ports keep full demand.
+                            if (!scope.inScope(op.phase))
+                            {
+                                eligible = false;
+                                break;
+                            }
                             const auto refs = model.objectRefs(op);
                             if (refs.empty() || refs[0].index != state.id.index)
                             {
@@ -185,6 +202,13 @@ namespace wolvrix::lib::grhsim
                     switch (rule)
                     {
                     case UseRule::none:
+                        break;
+                    case UseRule::opaque:
+                        for (auto value : operands) raiseValue(value, widthValue[value.index]);
+                        for (auto result : results) raiseValue(result, widthValue[result.index]);
+                        for (auto ref : refs)
+                            if (ref.kind == ObjectKind::State)
+                                raiseState(ref.index, widthState[ref.index]);
                         break;
                     case UseRule::sinkFull:
                         for (auto value : operands) raiseValue(value, widthValue[value.index]);
@@ -313,71 +337,10 @@ namespace wolvrix::lib::grhsim
             return nullptr;
         }
 
-        class UsedBitsPass final : public Pass
+        SimplifyStepReport transformUsedBits(GrhSimModel &model, const UsedBitsAnalysis &analysis,
+                                             diag::Diagnostics &diagnostics, SimplifyScope scope)
         {
-        public:
-            explicit UsedBitsPass(bool analysisOnly)
-                : Pass(analysisOnly ? "grhsim.used-bits-analyze" : "grhsim.used-bits",
-                       analysisOnly ? PassKind::Analysis : PassKind::SemanticTransform),
-                  analysisOnly_(analysisOnly) {}
-
-            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
-            {
-                UsedBitsAnalysis analysis;
-                analysis.run(model);
-                if (analysisOnly_)
-                {
-                    uint64_t dead = 0, narrowable = 0, downgrades = 0, wideBefore = 0, wideAfter = 0;
-                    uint64_t statesDead = 0, statesNarrowed = 0, stateDowngrades = 0;
-                    for (const auto &value : model.values())
-                    {
-                        const uint32_t width = analysis.widthValue[value.id.index];
-                        if (!width) continue;
-                        const uint32_t used = analysis.used[value.id.index];
-                        if (width > 64)
-                        {
-                            wideBefore += (width + 63) / 64;
-                            if (used > 64) wideAfter += (used + 63) / 64;
-                        }
-                        if (used == 0) { ++dead; continue; }
-                        if (used < width)
-                        {
-                            ++narrowable;
-                            if (width > 64 && used <= 64) ++downgrades;
-                        }
-                    }
-                    for (const auto &state : model.states())
-                    {
-                        const uint32_t width = analysis.widthState[state.id.index];
-                        if (!width) continue;
-                        const uint32_t used = analysis.usedState[state.id.index];
-                        if (used == 0) { ++statesDead; continue; }
-                        if (used < width)
-                        {
-                            ++statesNarrowed;
-                            if (width > 64 && used <= 64) ++stateDowngrades;
-                        }
-                    }
-                    diagnostics.info("dead_values=" + std::to_string(dead) +
-                                     " narrowable_values=" + std::to_string(narrowable) +
-                                     " downgrades=" + std::to_string(downgrades) +
-                                     " wide_words_before=" + std::to_string(wideBefore) +
-                                     " wide_words_after=" + std::to_string(wideAfter) +
-                                     " dead_states=" + std::to_string(statesDead) +
-                                     " narrowable_states=" + std::to_string(statesNarrowed) +
-                                     " state_downgrades=" + std::to_string(stateDowngrades), name());
-                    return {true, false, {}};
-                }
-                const bool changed = transform(model, analysis, diagnostics);
-                return {true, changed, {}};
-            }
-
-        private:
-            bool analysisOnly_;
-
-            bool transform(GrhSimModel &model, const UsedBitsAnalysis &analysis,
-                           diag::Diagnostics &diagnostics)
-            {
+                (void)diagnostics; // diagnostics stay with the registered wrappers
                 const auto &types = model.types();
                 const auto valueWidth = [&](ValueId value) -> uint32_t {
                     return types[model.values()[value.index - 1].type.index - 1].width;
@@ -432,12 +395,23 @@ namespace wolvrix::lib::grhsim
 
                 enum class Action : uint8_t { none, rebuild, boundary, handled };
                 std::vector<uint8_t> actions(originalOps + 1, 0);
+                // Phase scope: a value consumed by any out-of-scope op keeps its
+                // full width (the opaque analysis rule already pins it, this is
+                // the transform-side guard), and only in-scope producers narrow.
+                std::vector<uint8_t> outOfScopeConsumer(model.values().size() + 1, 0);
+                if (!scope.wholeGraph)
+                    for (const auto &op : model.operations())
+                        if (!scope.inScope(op.phase))
+                            for (auto operand : model.operands(op))
+                                outOfScopeConsumer[operand.index] = 1;
                 for (std::size_t i = 0; i < originalOps; ++i)
                 {
                     const auto &op = model.operations()[i];
+                    if (!scope.inScope(op.phase)) continue;
                     const auto results = model.results(op);
                     if (results.size() != 1) continue;
                     const ValueId result = results[0];
+                    if (outOfScopeConsumer[result.index]) continue;
                     const uint32_t width = analysis.widthValue[result.index];
                     const uint32_t used = analysis.used[result.index];
                     if (!width || used == 0 || used == width) continue;
@@ -817,6 +791,7 @@ namespace wolvrix::lib::grhsim
                 {
                     if (removeOps[i + 1] || skipRewire[i + 1]) continue;
                     const auto op = model.operations()[i];
+                    if (!scope.inScope(op.phase)) continue;
                     // Copy every span before adapt() appends to the pools.
                     const std::vector<ValueId> results(model.results(op).begin(), model.results(op).end());
                     if (results.empty()) continue;
@@ -846,11 +821,13 @@ namespace wolvrix::lib::grhsim
                 }
 
                 // Dead cone: side-effect-free ops whose results are all unused, and
-                // writes to states no live reader observes.
+                // writes to states no live reader observes. Phase scope removes
+                // only in-scope ops; out-of-scope ops are opaque full-use sinks.
                 for (std::size_t i = 0; i < originalOps; ++i)
                 {
                     if (removeOps[i + 1]) continue;
                     const auto &op = model.operations()[i];
+                    if (!scope.inScope(op.phase)) continue;
                     const auto name = model.text(op.opType);
                     const auto results = model.results(op);
                     // Only two-state logic results participate in used-bits;
@@ -902,6 +879,27 @@ namespace wolvrix::lib::grhsim
                                      stats.boundarySlices || stats.narrowedStates;
                 if (changed)
                 {
+                    // Provenance (M5d-1 contract): values/states rebuilt
+                    // narrower redirect their slices onto the replacement,
+                    // clamped to the surviving prefix; dead removals fall to
+                    // the compact() safety net below.
+                    if (!model.declProvenances().empty())
+                    {
+                        std::vector<ValueId> valueReplacement(model.values().size() + 1);
+                        std::vector<uint32_t> valueWidthMap(model.values().size() + 1, 0);
+                        for (std::size_t i = 0; i < originalOps; ++i)
+                        {
+                            if (!removeOps[i + 1]) continue;
+                            const auto results = model.results(model.operations()[i]);
+                            if (results.size() != 1) continue;
+                            const ValueId target = rewire[results[0].index];
+                            if (!target.valid()) continue;
+                            valueReplacement[results[0].index] = target;
+                            valueWidthMap[results[0].index] = valueWidth(target);
+                        }
+                        clampProvenanceValueSlices(model, valueReplacement, valueWidthMap);
+                        clampProvenanceStateSlices(model, newStateOf, newWidthOf);
+                    }
                     // Diagnose dangling references before compact throws opaque.
                     std::vector<uint8_t> removedValues(model.values().size() + 1, 0);
                     for (std::size_t i = 0; i < model.operations().size(); ++i)
@@ -925,21 +923,102 @@ namespace wolvrix::lib::grhsim
                     }
                     model.compact(removeOps, removeStates);
                 }
-                diagnostics.info("dead_ops_removed=" + std::to_string(stats.deadOps) +
-                                 " dead_states_removed=" + std::to_string(stats.deadStates) +
-                                 " narrowed_values=" + std::to_string(stats.narrowedValues) +
-                                 " downgraded_values=" + std::to_string(stats.downgradedValues) +
-                                 " rebuilt_ops=" + std::to_string(stats.rebuiltOps) +
-                                 " boundary_slices=" + std::to_string(stats.boundarySlices) +
-                                 " adapt_slices=" + std::to_string(stats.adaptSlices) +
-                                 " narrowed_states=" + std::to_string(stats.narrowedStates) +
-                                 " rebuilt_reads=" + std::to_string(stats.rebuiltReads) +
-                                 " rebuilt_writes=" + std::to_string(stats.rebuiltWrites) +
-                                 " wide_words_before=" + std::to_string(stats.wideWordsBefore) +
-                                 " wide_words_after=" + std::to_string(stats.wideWordsAfter), name());
-                return changed;
+                SimplifyStepReport report;
+                report.changed = changed;
+                report.counters = {
+                    {"dead_ops_removed", stats.deadOps},
+                    {"dead_states_removed", stats.deadStates},
+                    {"narrowed_values", stats.narrowedValues},
+                    {"downgraded_values", stats.downgradedValues},
+                    {"rebuilt_ops", stats.rebuiltOps},
+                    {"boundary_slices", stats.boundarySlices},
+                    {"adapt_slices", stats.adaptSlices},
+                    {"narrowed_states", stats.narrowedStates},
+                    {"rebuilt_reads", stats.rebuiltReads},
+                    {"rebuilt_writes", stats.rebuiltWrites},
+                    {"wide_words_before", stats.wideWordsBefore},
+                    {"wide_words_after", stats.wideWordsAfter},
+                };
+                return report;
             }
+
+        class UsedBitsPass final : public Pass
+        {
+        public:
+            explicit UsedBitsPass(bool analysisOnly)
+                : Pass(analysisOnly ? "grhsim.used-bits-analyze" : "grhsim.used-bits",
+                       analysisOnly ? PassKind::Analysis : PassKind::SemanticTransform),
+                  analysisOnly_(analysisOnly) {}
+
+            PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
+            {
+                if (analysisOnly_)
+                {
+                    UsedBitsAnalysis analysis;
+                    analysis.run(model);
+                    uint64_t dead = 0, narrowable = 0, downgrades = 0, wideBefore = 0, wideAfter = 0;
+                    uint64_t statesDead = 0, statesNarrowed = 0, stateDowngrades = 0;
+                    for (const auto &value : model.values())
+                    {
+                        const uint32_t width = analysis.widthValue[value.id.index];
+                        if (!width) continue;
+                        const uint32_t used = analysis.used[value.id.index];
+                        if (width > 64)
+                        {
+                            wideBefore += (width + 63) / 64;
+                            if (used > 64) wideAfter += (used + 63) / 64;
+                        }
+                        if (used == 0) { ++dead; continue; }
+                        if (used < width)
+                        {
+                            ++narrowable;
+                            if (width > 64 && used <= 64) ++downgrades;
+                        }
+                    }
+                    for (const auto &state : model.states())
+                    {
+                        const uint32_t width = analysis.widthState[state.id.index];
+                        if (!width) continue;
+                        const uint32_t used = analysis.usedState[state.id.index];
+                        if (used == 0) { ++statesDead; continue; }
+                        if (used < width)
+                        {
+                            ++statesNarrowed;
+                            if (width > 64 && used <= 64) ++stateDowngrades;
+                        }
+                    }
+                    diagnostics.info("dead_values=" + std::to_string(dead) +
+                                     " narrowable_values=" + std::to_string(narrowable) +
+                                     " downgrades=" + std::to_string(downgrades) +
+                                     " wide_words_before=" + std::to_string(wideBefore) +
+                                     " wide_words_after=" + std::to_string(wideAfter) +
+                                     " dead_states=" + std::to_string(statesDead) +
+                                     " narrowable_states=" + std::to_string(statesNarrowed) +
+                                     " state_downgrades=" + std::to_string(stateDowngrades), name());
+                    return {true, false, {}};
+                }
+                const auto report = simplifyStepUsedBits(model, diagnostics, SimplifyScope::whole());
+                std::string message;
+                for (const auto &[key, count] : report.counters)
+                {
+                    if (!message.empty()) message += ' ';
+                    message += std::string(key) + '=' + std::to_string(count);
+                }
+                diagnostics.info(std::move(message), name());
+                return {true, report.changed, {}};
+            }
+
+        private:
+            bool analysisOnly_;
         };
+    }
+
+    SimplifyStepReport simplifyStepUsedBits(GrhSimModel &model, diag::Diagnostics &diagnostics,
+                                            SimplifyScope scope)
+    {
+        UsedBitsAnalysis analysis;
+        analysis.run(model, scope);
+        return transformUsedBits(model, analysis, diagnostics, scope);
     }
 
     void registerUsedBitsPass(PassRegistry &registry)

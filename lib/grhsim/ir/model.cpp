@@ -176,6 +176,8 @@ namespace wolvrix::lib::grhsim
         result.declaredSymbols_ = declaredSymbols_;
         result.declaredSymbolSet_ = declaredSymbolSet_;
         result.generateGroups_ = generateGroups_;
+        result.declProvenances_ = declProvenances_;
+        result.declProvenanceBySymbol_ = declProvenanceBySymbol_;
         result.poisoned_ = poisoned_;
         for (auto &mapping : result.mappings_)
         {
@@ -213,6 +215,8 @@ namespace wolvrix::lib::grhsim
         declaredSymbols_.reserve(counts.declaredSymbols);
         declaredSymbolSet_.reserve(counts.declaredSymbols);
         generateGroups_.reserve(counts.generateGroups);
+        declProvenances_.reserve(counts.declProvenances);
+        declProvenanceBySymbol_.reserve(counts.declProvenances);
     }
 
     void GrhSimModel::commitSemanticMutation()
@@ -495,6 +499,30 @@ namespace wolvrix::lib::grhsim
         operandPool_.swap(newOperands); resultPool_.swap(newResults);
         objectRefPool_.swap(newRefs); parameterPool_.swap(newParameters);
         initRecords_.swap(newInits); initSteps_.swap(newSteps); initParameterPool_.swap(newInitParameters);
+        // Remap declaration provenance slices onto the renumbered entities.
+        // Slices whose target was removed are dropped: the record stays as the
+        // declaration anchor with its shape, now currently unrealized.
+        for (auto &record : declProvenances_)
+        {
+            std::size_t kept = 0;
+            for (auto slice : record.slices)
+            {
+                if (slice.target == DeclProvenanceTarget::Value)
+                {
+                    if (slice.targetIndex >= valueMap.size() || !valueMap[slice.targetIndex].valid())
+                        continue;
+                    slice.targetIndex = valueMap[slice.targetIndex].index;
+                }
+                else if (slice.target == DeclProvenanceTarget::State)
+                {
+                    if (slice.targetIndex >= stateMap.size() || !stateMap[slice.targetIndex].valid())
+                        continue;
+                    slice.targetIndex = stateMap[slice.targetIndex].index;
+                }
+                record.slices[kept++] = slice;
+            }
+            record.slices.resize(kept);
+        }
         mappings_.clear(); mappingParameterPool_.clear();
     }
 
@@ -561,6 +589,32 @@ namespace wolvrix::lib::grhsim
         if (!strings_.valid(symbol))
             throw std::out_of_range("generate group symbol is not a valid model string");
         generateGroups_[group].symbols.push_back(symbol);
+    }
+
+    void GrhSimModel::upsertDeclProvenance(DeclProvenance record)
+    {
+        if (!strings_.valid(record.symbol))
+            throw std::out_of_range("declaration provenance symbol is not a valid model string");
+        if (!isDeclaredSymbol(record.symbol))
+            throw std::invalid_argument("declaration provenance symbol is not a declared symbol");
+        if (record.origin.valid() &&
+            (record.origin.generation != 0 || record.origin.index > origins_.size()))
+            throw std::out_of_range("declaration provenance origin is out of range");
+        if (auto it = declProvenanceBySymbol_.find(record.symbol.index);
+            it != declProvenanceBySymbol_.end())
+        {
+            declProvenances_[it->second] = std::move(record);
+            return;
+        }
+        declProvenanceBySymbol_.emplace(record.symbol.index, declProvenances_.size());
+        declProvenances_.push_back(std::move(record));
+    }
+
+    const DeclProvenance *GrhSimModel::findDeclProvenance(StringId symbol) const noexcept
+    {
+        if (!symbol.valid()) return nullptr;
+        const auto it = declProvenanceBySymbol_.find(symbol.index);
+        return it == declProvenanceBySymbol_.end() ? nullptr : &declProvenances_[it->second];
     }
 
     std::span<const ValueId> GrhSimModel::operands(const SimOp &op) const
@@ -755,6 +809,44 @@ namespace wolvrix::lib::grhsim
         if (text == "eventAct") return CpuNamedStoreKind::EventAct;
         if (text == "timeslotTrigger") return CpuNamedStoreKind::TimeslotTrigger;
         if (text == "activeFlags") return CpuNamedStoreKind::ActiveFlags;
+        return std::nullopt;
+    }
+
+    std::string_view toString(DeclProvenanceKind kind) noexcept
+    {
+        switch (kind)
+        {
+        case DeclProvenanceKind::Direct: return "direct";
+        case DeclProvenanceKind::Alias: return "alias";
+        case DeclProvenanceKind::Merged: return "merged";
+        }
+        return "unknown";
+    }
+
+    std::optional<DeclProvenanceKind> parseDeclProvenanceKind(std::string_view text) noexcept
+    {
+        if (text == "direct") return DeclProvenanceKind::Direct;
+        if (text == "alias") return DeclProvenanceKind::Alias;
+        if (text == "merged") return DeclProvenanceKind::Merged;
+        return std::nullopt;
+    }
+
+    std::string_view toString(DeclProvenanceTarget target) noexcept
+    {
+        switch (target)
+        {
+        case DeclProvenanceTarget::Value: return "value";
+        case DeclProvenanceTarget::State: return "state";
+        case DeclProvenanceTarget::Function: return "function";
+        }
+        return "unknown";
+    }
+
+    std::optional<DeclProvenanceTarget> parseDeclProvenanceTarget(std::string_view text) noexcept
+    {
+        if (text == "value") return DeclProvenanceTarget::Value;
+        if (text == "state") return DeclProvenanceTarget::State;
+        if (text == "function") return DeclProvenanceTarget::Function;
         return std::nullopt;
     }
 

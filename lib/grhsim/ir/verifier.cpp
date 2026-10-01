@@ -4,7 +4,9 @@
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/ir/model.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <variant>
@@ -94,6 +96,155 @@ namespace wolvrix::lib::grhsim
                 if (model.text(parameter.name) == name) return &parameter;
             }
             return nullptr;
+        }
+
+        // Linear bit size of a type: arrays flatten row-major (element stride =
+        // element size), non-logic scalars have no bits. Returns false on an
+        // invalid type reference or a 64-bit overflow.
+        bool linearBitSize(const GrhSimModel &model, TypeId typeId, uint64_t &out)
+        {
+            if (!validId(typeId, model.types().size())) return false;
+            const Type &type = model.types()[typeId.index - 1];
+            switch (type.kind)
+            {
+            case TypeKind::Logic:
+                out = type.width;
+                return true;
+            case TypeKind::Real:
+            case TypeKind::String:
+                out = 0;
+                return true;
+            case TypeKind::Array:
+            {
+                uint64_t element = 0;
+                if (!linearBitSize(model, type.elementType, element)) return false;
+                if (type.count != 0 &&
+                    element > std::numeric_limits<uint64_t>::max() / type.count)
+                    return false;
+                out = type.count * element;
+                return true;
+            }
+            }
+            return false;
+        }
+
+        // M5d-1 declaration provenance contract: records anchor declared
+        // symbols to the entities that currently realize them. Structural
+        // rules only — whether a fold/merge/split redirection is semantically
+        // justified belongs to the pass that performs it.
+        bool verifyDeclProvenances(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            bool ok = true;
+            auto error = [&](const std::string &message, const std::string &context) {
+                diagnostics.error(message, context);
+                ok = false;
+            };
+            for (std::size_t i = 0; i < model.declProvenances().size(); ++i)
+            {
+                const DeclProvenance &record = model.declProvenances()[i];
+                const std::string context = "declProvenances[" + std::to_string(i) + "]";
+                if (!model.strings().valid(record.symbol))
+                {
+                    error("declaration provenance has an invalid symbol StringId", context);
+                    continue;
+                }
+                if (!model.isDeclaredSymbol(record.symbol))
+                    error("declaration provenance symbol is not a declared symbol", context);
+                if (record.origin.valid() && !validId(record.origin, model.origins().size()))
+                    error("declaration provenance origin is out of range", context);
+                uint64_t declLinear = record.width;
+                bool declOverflow = false;
+                for (const uint64_t dim : record.shape)
+                {
+                    if (dim == 0)
+                    {
+                        error("declaration provenance shape has a zero dimension", context);
+                        declOverflow = true;
+                        break;
+                    }
+                    if (declLinear > std::numeric_limits<uint64_t>::max() / dim)
+                    {
+                        error("declaration provenance shape overflows the 64-bit linear size",
+                              context);
+                        declOverflow = true;
+                        break;
+                    }
+                    declLinear *= dim;
+                }
+                std::vector<std::pair<uint64_t, uint64_t>> declRanges;
+                for (std::size_t j = 0; j < record.slices.size(); ++j)
+                {
+                    const DeclProvenanceSlice &slice = record.slices[j];
+                    const std::string sliceContext = context + ".slices[" + std::to_string(j) + "]";
+                    if (slice.target == DeclProvenanceTarget::Function)
+                    {
+                        if (!validId(FuncId{slice.targetIndex, 0}, model.functions().size()))
+                        {
+                            error("provenance slice function target is out of range", sliceContext);
+                            continue;
+                        }
+                        if (slice.width != 0 || slice.targetOffset != 0 || slice.declOffset != 0)
+                            error("provenance slice on a function must be a whole-object marker",
+                                  sliceContext);
+                        continue;
+                    }
+                    TypeId targetType;
+                    if (slice.target == DeclProvenanceTarget::Value)
+                    {
+                        if (!validId(ValueId{slice.targetIndex, 0}, model.values().size()))
+                        {
+                            error("provenance slice value target is out of range", sliceContext);
+                            continue;
+                        }
+                        targetType = model.values()[slice.targetIndex - 1].type;
+                    }
+                    else
+                    {
+                        if (!validId(StateId{slice.targetIndex, 0}, model.states().size()))
+                        {
+                            error("provenance slice state target is out of range", sliceContext);
+                            continue;
+                        }
+                        targetType = model.states()[slice.targetIndex - 1].type;
+                    }
+                    uint64_t targetLinear = 0;
+                    if (!linearBitSize(model, targetType, targetLinear))
+                    {
+                        error("provenance slice target type is invalid or overflows", sliceContext);
+                        continue;
+                    }
+                    if (slice.width == 0)
+                    {
+                        // Whole-object marker: only meaningful for bit-less
+                        // declarations/targets; bit-carrying slices name a range.
+                        if (slice.targetOffset != 0 || slice.declOffset != 0)
+                            error("whole-object provenance slice must have zero offsets",
+                                  sliceContext);
+                        if (targetLinear != 0 && declLinear != 0)
+                            error("whole-object provenance slice on bit-carrying declaration and "
+                                  "target",
+                                  sliceContext);
+                        continue;
+                    }
+                    if (declOverflow) continue;
+                    if (targetLinear == 0)
+                        error("provenance slice carries bits but its target has none", sliceContext);
+                    else if (slice.width > targetLinear || slice.targetOffset > targetLinear - slice.width)
+                        error("provenance slice range exceeds the target", sliceContext);
+                    if (declLinear == 0)
+                        error("provenance slice carries bits but its declaration has none",
+                              sliceContext);
+                    else if (slice.width > declLinear || slice.declOffset > declLinear - slice.width)
+                        error("provenance slice range exceeds the declaration", sliceContext);
+                    else
+                        declRanges.emplace_back(slice.declOffset, slice.width);
+                }
+                std::sort(declRanges.begin(), declRanges.end());
+                for (std::size_t j = 1; j < declRanges.size(); ++j)
+                    if (declRanges[j].first < declRanges[j - 1].first + declRanges[j - 1].second)
+                        error("provenance slices overlap within the declaration", context);
+            }
+            return ok;
         }
 
         // M1 phase attribution framework: validates the phase of ops that carry
@@ -967,6 +1118,7 @@ namespace wolvrix::lib::grhsim
                     error("generate group member has an invalid StringId",
                           context + ".symbols[" + std::to_string(j) + "]");
         }
+        if (!verifyDeclProvenances(model, diagnostics)) ok = false;
 
         std::unordered_set<uint32_t> mappingBackends;
         const bool validModel = ok && !diagnostics.hasError();

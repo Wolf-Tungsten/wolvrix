@@ -122,7 +122,11 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/dialect/core.cpp
     lib/grhsim/dialect/cpu.cpp
     lib/grhsim/pass/pass.cpp
+    lib/grhsim/pass/simplify_internal.cpp
+    lib/grhsim/pass/const_fold.cpp
+    lib/grhsim/pass/simplify.cpp
     lib/grhsim/pass/reg_to_mem.cpp
+    lib/grhsim/pass/comb_pack.cpp
     lib/grhsim/pass/canonicalize_compute.cpp
     lib/grhsim/pass/clone_shared_compute.cpp
     lib/grhsim/pass/bitwise_predicates.cpp
@@ -368,6 +372,38 @@ target_compile_definitions(grhsim-ir-tests
 )
 
 register_test_exe(grhsim-ir-tests)
+
+add_executable(grhsim-simplify-tests
+    tests/grhsim/test_grhsim_simplify.cpp
+)
+
+target_link_libraries(grhsim-simplify-tests
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-simplify-tests
+    PRIVATE
+        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
+)
+
+register_test_exe(grhsim-simplify-tests)
+
+add_executable(grhsim-whole-opt-tests
+    tests/grhsim/test_grhsim_whole_opt.cpp
+)
+
+target_link_libraries(grhsim-whole-opt-tests
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-whole-opt-tests
+    PRIVATE
+        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
+)
+
+register_test_exe(grhsim-whole-opt-tests)
 
 add_executable(grhsim-cpu-mapping-tests tests/grhsim/test_cpu_mapping.cpp)
 add_executable(grhsim-reg-to-mem-tests tests/grhsim/test_reg_to_mem.cpp tests/grhsim/test_reg_to_mem_semantics.cpp)

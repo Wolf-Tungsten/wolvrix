@@ -352,7 +352,8 @@ namespace wolvrix::lib::grhsim
             .initParameters = graph->operations().size() / 8,
             .origins = options.keepOrigins ? graph->values().size() + graph->operations().size() : 0,
             .declaredSymbols = options.keepDeclaredSymbols ? graph->declaredSymbols().size() : 0,
-            .generateGroups = options.keepDeclaredSymbols ? graph->generateGroups().size() : 0});
+            .generateGroups = options.keepDeclaredSymbols ? graph->generateGroups().size() : 0,
+            .declProvenances = options.keepDeclaredSymbols ? graph->declaredSymbols().size() : 0});
 
         std::vector<grhsim::ValueId> valueMap(static_cast<std::size_t>(maxValueIndex) + 1);
         for (grh::ValueId valueId : graph->values())
@@ -697,6 +698,79 @@ namespace wolvrix::lib::grhsim
                     if (text.empty()) continue;
                     model->addGenerateGroupSymbol(index, model->intern(text));
                 }
+            }
+
+            // Maintainable declaration provenance: resolve every declared
+            // symbol to the entity the lowering just created for it and record
+            // one Direct full-range slice. Symbols that do not resolve to a
+            // live value/state/function stay as bare anchors in declaredSymbols
+            // (see DeclProvenance's contract).
+            const auto declarationShape = [&](TypeId type, std::vector<uint64_t> &shape) -> uint64_t {
+                const Type *node = &model->types()[static_cast<std::size_t>(type.index) - 1];
+                while (node->kind == TypeKind::Array)
+                {
+                    shape.push_back(node->count);
+                    node = &model->types()[static_cast<std::size_t>(node->elementType.index) - 1];
+                }
+                return node->kind == TypeKind::Logic ? node->width : 0;
+            };
+            for (const grh::SymbolId symbol : graph->declaredSymbols())
+            {
+                const std::string_view text = graph->symbolText(symbol);
+                if (text.empty()) continue;
+                DeclProvenance record;
+                record.symbol = model->intern(text);
+                if (const grh::ValueId valueId = graph->findValue(symbol); valueId.valid())
+                {
+                    if (valueId.index >= valueMap.size() || !valueMap[valueId.index].valid())
+                        continue; // detached declared value skipped by the value lowering
+                    const grhsim::ValueId target = valueMap[valueId.index];
+                    const SimValue &value = model->values()[static_cast<std::size_t>(target.index) - 1];
+                    record.origin = value.origin;
+                    record.width = declarationShape(value.type, record.shape);
+                    record.slices.push_back(DeclProvenanceSlice{DeclProvenanceKind::Direct,
+                                                                DeclProvenanceTarget::Value,
+                                                                target.index, 0, 0, record.width});
+                }
+                else if (const grh::OperationId opId = graph->findOperation(symbol); opId.valid())
+                {
+                    const Operation op = graph->getOperation(opId);
+                    if (op.kind() == OperationKind::kRegister || op.kind() == OperationKind::kLatch ||
+                        op.kind() == OperationKind::kMemory)
+                    {
+                        const auto stateIt = statesBySymbol.find(std::string(text));
+                        if (stateIt == statesBySymbol.end()) continue;
+                        const StateObject &state =
+                            model->states()[static_cast<std::size_t>(stateIt->second.index) - 1];
+                        record.origin = state.origin;
+                        record.width = declarationShape(state.type, record.shape);
+                        uint64_t linearWidth = record.width;
+                        for (const uint64_t dim : record.shape) linearWidth *= dim;
+                        record.slices.push_back(DeclProvenanceSlice{DeclProvenanceKind::Direct,
+                                                                    DeclProvenanceTarget::State,
+                                                                    stateIt->second.index, 0, 0,
+                                                                    linearWidth});
+                    }
+                    else if (op.kind() == OperationKind::kDpicImport)
+                    {
+                        const auto funcIt = functionsBySymbol.find(std::string(text));
+                        if (funcIt == functionsBySymbol.end()) continue;
+                        record.origin =
+                            model->functions()[static_cast<std::size_t>(funcIt->second.index) - 1].origin;
+                        record.slices.push_back(DeclProvenanceSlice{DeclProvenanceKind::Direct,
+                                                                    DeclProvenanceTarget::Function,
+                                                                    funcIt->second.index, 0, 0, 0});
+                    }
+                    else
+                    {
+                        continue; // only storage and DPI import declarations carry provenance
+                    }
+                }
+                else
+                {
+                    continue;
+                }
+                model->upsertDeclProvenance(std::move(record));
             }
         }
 

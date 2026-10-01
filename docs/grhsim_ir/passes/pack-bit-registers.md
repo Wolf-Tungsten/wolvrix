@@ -1,10 +1,37 @@
 # Pack bit registers
 
 `grhsim.pack-bit-registers` combines groups of two to 64 ordinary unsigned,
-two-state, one-bit registers into scalar words. It requires a completed CPU
-schedule so it can separate states by quiescence projection membership. The
-semantic transform invalidates that schedule; run all eight CPU mapping passes
-again before emission. It does not match object names.
+two-state, one-bit registers into scalar words. Since M5d-3 the pass runs on the
+un-partitioned whole graph (pipeline stage A5, before `grhsim.lower-edge-detect`
+and any CPU mapping) and decides purely from the raw `event_edges` annotation
+plus read/write reference analysis. It no longer reads a CPU schedule, a
+quiescence projection, or private per-event history states — none of those exist
+on the whole graph. It does not match object names.
+
+Each candidate target must be an unsigned two-state one-bit logic state with
+exactly one `core.state.regWrite` writer and at least one ordinary,
+parameterless `core.state.read` of the exact state type. No other references to
+the target are allowed (a state used anywhere except those plain reads and its
+one write is rejected). The writer must have no results, exactly one object ref
+(the target), operands `enable, data, mask` followed by one value per event, all
+one-bit two-state unsigned, and `event_edges` as its only parameter (non-empty,
+entries limited to `posedge`/`negedge`). Target initialization must be a single
+`core.init.const` with a known two-state scalar literal.
+
+The grouping key comprises the enable and mask ValueIds, the op phase, and the
+ordered `(event ValueId, edge kind)` sequence. Data and target initial bits may
+differ. Lanes of one group therefore share their control signature and update in
+lockstep on the same event edges, which is what makes the merge
+semantics-preserving; the write mask and enable apply to the whole word because
+every lane shares them. A group's original write order assigns bits from low to
+high; groups are chunked into words of at most 64 lanes.
+
+Candidates that cannot merge are rejected explicitly and counted per reason in
+the info diagnostics as `pack_bits_rejected_target_type` / `_init` /
+`_multi_writer` / `_extra_refs` / `_no_reads` / `_write_shape` / `_write_params`;
+safe candidates whose control signature has no partner are counted separately as
+`pack_bits_singleton`. Rejection counters count write ports (a multi-written
+state rejects each of its writers).
 
 `--report <path>` is an optional diagnostic dump, disabled by default. When
 enabled, the pass finishes by writing a tab-separated membership list with the
@@ -16,50 +43,39 @@ compaction rebuilds dense state IDs; the dump is read-only on the model. A
 failure to open or write the file is a diagnostics error. Without the option
 the pass performs no I/O and behaves exactly as before.
 
-Each candidate must have one `core.state.regWrite` and at least one ordinary,
-parameterless `core.state.read` of the exact state type. No other references to
-the target are allowed. Each event history must be an unsigned two-state bit,
-referenced only by that write. Target and history initialization must each be a
-single `core.init.const` with a known scalar string literal. Random or unknown
-initialization, shared/observed histories, multiple writers, signed and four-state
-types are excluded.
-
-The grouping key comprises enable and mask ValueIds, ordered event ValueIds,
-edge kinds, corresponding history initial bits and target projection membership.
-Data and target initial bits may differ. Both bit enable and bit mask must have
-the exact unsigned two-state type. A group's original write order assigns bits
-from low to high; a single remaining bit stays unchanged.
-
 For example, two registers with initial values `q0=0`, `q1=1`:
 
 ```text
-regWrite(en, d0, mask, clk), refs=[q0,h0], event_edges=[posedge]
-regWrite(en, d1, mask, clk), refs=[q1,h1], event_edges=[posedge]
+regWrite(en, d0, mask, clk), refs=[q0], event_edges=[posedge]
+regWrite(en, d1, mask, clk), refs=[q1], event_edges=[posedge]
 
 => initial packed = 2'd2
    data = concat(d1,d0)
    masks = replicate(mask, rep=2)
-   regWrite(en, data, masks, clk), refs=[packed,h0], event_edges=[posedge]
+   regWrite(en, data, masks, clk), refs=[packed], event_edges=[posedge]
    read(q0) => sliceStatic(read(packed), sliceStart=0, sliceEnd=0)
    read(q1) => sliceStatic(read(packed), sliceStart=1, sliceEnd=1)
 ```
 
 `regWrite` operands are enable, new data, write mask, then one value per event;
-references are the target followed by one history per event. An event edge is
-tested against its old history, regardless of enable. Every history is sampled
-on the same rounds before and after packing, so identical private histories can
-share the first representative. `concat` operands run from most to least
+the object ref is the target. `concat` operands run from most to least
 significant; `replicate` repeats its only operand; slice bounds are inclusive.
+All new ops inherit the phase of the grouped writers (always `none` at the A5
+position).
 
-The CPU emitter consumes the existing concat, scalar read, slice and masked-write
-operations. Slice results used by commit retain compute-phase snapshots; the
-packed read can use the existing compute-only state alias. All data bits are
-computed before any commit. Packing does not introduce wide return-value helpers
-or alter the caller-provided-buffer ABI. A packed change wakes the union of bit
-readers, which can trade fewer commits for more compute work; benchmark this
-tradeoff on the target workload.
+Declaration provenance is maintained: before compaction drops the member
+states, each member declaration's slices are re-targeted to its bit slice of
+the packed word with kind `Merged` (`targetOffset` = bit index, `width` = 1),
+via the shared `mergeProvenanceStateSlices` helper. Whole-object markers are
+dropped by that rule, as a packed declaration is realized by a bit slice, never
+by the whole word.
 
-Compaction removes replaced states, writes and redundant histories, remapping
-all remaining references. Reapplying after remapping is idempotent: produced
-words have widths greater than one. Diagnostics report `packed_register_bits`
-and `packed_register_words`.
+Compaction removes the replaced states and writes, remapping all remaining
+references. Reapplying the pass is idempotent: produced words have widths
+greater than one. Diagnostics report `packed_register_bits` and
+`packed_register_words` plus the rejection counters above.
+
+The CPU emitter consumes the existing concat, scalar read, slice and
+masked-write operations. A packed change wakes the union of bit readers, which
+can trade fewer commits for more compute work; benchmark this tradeoff on the
+target workload.

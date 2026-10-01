@@ -17,7 +17,10 @@ namespace wolvrix::lib::grhsim
         LogicDomain logicDomain = LogicDomain::FourState;
         bool keepOrigins = true;
         // Carry GRH declaredSymbols/generateGroups into the model as read-only
-        // metadata. Independent of keepOrigins: the name lists are small.
+        // metadata, and resolve every declared symbol that lowers to a live
+        // value/state/function into a DeclProvenance record (Direct full-range
+        // slice; array declarations keep their shape). Independent of
+        // keepOrigins: the name lists and the association are small.
         bool keepDeclaredSymbols = true;
     };
 

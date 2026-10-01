@@ -1051,6 +1051,318 @@ namespace
         }
         return 0;
     }
+
+    grh::Design makeDeclProvenanceDesign()
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("top");
+        const auto enableSym = graph.internSymbol("enable");
+        const auto dataSym = graph.internSymbol("data");
+        const auto sig0Sym = graph.internSymbol("gen_loop$0$sig");
+        const auto sig1Sym = graph.internSymbol("gen_loop$1$sig");
+        const auto qSym = graph.internSymbol("q");
+        const auto memSym = graph.internSymbol("mem");
+        const auto dpiSym = graph.internSymbol("dpi_inc");
+        const auto danglingSym = graph.internSymbol("dangling");
+
+        const auto enable = graph.createValue(enableSym, 1, false);
+        graph.bindInputPort("enable", enable);
+        const auto data = graph.createValue(dataSym, 8, false);
+        const auto dataConst = graph.createOperation(grh::OperationKind::kConstant,
+                                                     graph.internSymbol("data_const"));
+        graph.setAttr(dataConst, "constValue", std::string("8'h00"));
+        graph.addResult(dataConst, data);
+        graph.bindOutputPort("data", data);
+
+        const auto sig0 = graph.createValue(sig0Sym, 4, false);
+        const auto sig0Const = graph.createOperation(grh::OperationKind::kConstant,
+                                                     graph.internSymbol("sig0_const"));
+        graph.setAttr(sig0Const, "constValue", std::string("4'h0"));
+        graph.addResult(sig0Const, sig0);
+        const auto sig1 = graph.createValue(sig1Sym, 4, false);
+        const auto sig1Const = graph.createOperation(grh::OperationKind::kConstant,
+                                                     graph.internSymbol("sig1_const"));
+        graph.setAttr(sig1Const, "constValue", std::string("4'h1"));
+        graph.addResult(sig1Const, sig1);
+
+        const auto q = graph.createOperation(grh::OperationKind::kRegister, qSym);
+        graph.setAttr(q, "width", int64_t{8});
+        graph.setAttr(q, "isSigned", false);
+        graph.setAttr(q, "initValue", std::string("8'h01"));
+        const auto mem = graph.createOperation(grh::OperationKind::kMemory, memSym);
+        graph.setAttr(mem, "width", int64_t{8});
+        graph.setAttr(mem, "row", int64_t{4});
+        graph.setAttr(mem, "isSigned", false);
+        graph.createOperation(grh::OperationKind::kDpicImport, dpiSym);
+        // Declared but detached (no producer, no users, not a port): the value
+        // lowering skips it, so it stays a bare anchor without a record.
+        graph.createValue(danglingSym, 8, false);
+
+        for (const auto sym : {enableSym, dataSym, sig0Sym, sig1Sym, qSym, memSym, dpiSym,
+                               danglingSym})
+            graph.addDeclaredSymbol(sym);
+        const std::size_t group = graph.addGenerateGroup(graph.internSymbol("gen_loop"),
+                                                         graph.internSymbol("sig"));
+        graph.addGenerateGroupSymbol(group, sig0Sym);
+        graph.addGenerateGroupSymbol(group, sig1Sym);
+        design.markAsTop("top");
+        return design;
+    }
+
+    const grhsim::DeclProvenance *findProvenance(const grhsim::GrhSimModel &model,
+                                                 std::string_view name)
+    {
+        return model.findDeclProvenance(model.strings().lookup(name));
+    }
+
+    bool provenanceSlicesEqual(const grhsim::DeclProvenance &lhs,
+                               const grhsim::DeclProvenance &rhs)
+    {
+        return lhs.width == rhs.width && lhs.shape == rhs.shape && lhs.slices == rhs.slices;
+    }
+
+    int runDeclProvenanceTest(const std::filesystem::path &artifactDir)
+    {
+        // (a) Lowering resolves every declared symbol to a Direct full-range slice.
+        auto design = makeDeclProvenanceDesign();
+        diag::Diagnostics diagnostics;
+        grhsim::GrhToGrhSimOptions options;
+        options.top = "top";
+        options.logicDomain = grhsim::LogicDomain::TwoState;
+        auto model = grhsim::lowerGrhToGrhSim(design, options, diagnostics);
+        if (!model || diagnostics.hasError()) return fail("provenance GRH lowering failed");
+        for (const auto symbol : model->declaredSymbols())
+        {
+            if (model->text(symbol) == "dangling") continue;
+            if (!model->findDeclProvenance(symbol))
+                return fail("lowered model lost the provenance of a declared symbol");
+        }
+        if (model->declProvenances().size() != 7)
+            return fail("unexpected lowered provenance record count");
+        const grhsim::DeclProvenance *enable = findProvenance(*model, "enable");
+        if (!enable || enable->width != 1 || !enable->shape.empty() || enable->slices.size() != 1 ||
+            enable->slices[0].kind != grhsim::DeclProvenanceKind::Direct ||
+            enable->slices[0].target != grhsim::DeclProvenanceTarget::Value ||
+            enable->slices[0].width != 1 || !enable->origin.valid())
+            return fail("input port provenance is wrong");
+        const auto &enableValue = model->values()[enable->slices[0].targetIndex - 1];
+        if (model->text(enableValue.name) != "enable")
+            return fail("input port provenance does not resolve to the port value");
+        const grhsim::DeclProvenance *data = findProvenance(*model, "data");
+        if (!data || data->width != 8 || data->slices.size() != 1 ||
+            data->slices[0].target != grhsim::DeclProvenanceTarget::Value ||
+            data->slices[0].width != 8)
+            return fail("declared wire provenance is wrong");
+        const grhsim::DeclProvenance *q = findProvenance(*model, "q");
+        if (!q || q->width != 8 || !q->shape.empty() || q->slices.size() != 1 ||
+            q->slices[0].target != grhsim::DeclProvenanceTarget::State ||
+            q->slices[0].width != 8)
+            return fail("register provenance is wrong");
+        if (model->text(model->states()[q->slices[0].targetIndex - 1].name) != "q")
+            return fail("register provenance does not resolve to the register state");
+        const grhsim::DeclProvenance *mem = findProvenance(*model, "mem");
+        if (!mem || mem->width != 8 || mem->shape != std::vector<uint64_t>{4} ||
+            mem->slices.size() != 1 ||
+            mem->slices[0].target != grhsim::DeclProvenanceTarget::State ||
+            mem->slices[0].width != 32)
+            return fail("memory provenance lost its array shape");
+        const grhsim::DeclProvenance *dpi = findProvenance(*model, "dpi_inc");
+        if (!dpi || dpi->width != 0 || !dpi->shape.empty() || dpi->slices.size() != 1 ||
+            dpi->slices[0].target != grhsim::DeclProvenanceTarget::Function ||
+            dpi->slices[0].width != 0)
+            return fail("DPI import provenance is wrong");
+        // Generate-group membership joins with provenance records by name.
+        for (const auto &group : model->generateGroups())
+            for (const auto member : group.symbols)
+                if (!model->findDeclProvenance(member))
+                    return fail("generate group member has no provenance record");
+        // The detached declared value keeps its anchor but has no record.
+        if (!model->isDeclaredSymbol(model->strings().lookup("dangling")) ||
+            findProvenance(*model, "dangling") != nullptr)
+            return fail("detached declared value should stay a bare anchor");
+
+        // (b) keepDeclaredSymbols=false drops the provenance records as well.
+        {
+            auto stripped = makeDeclProvenanceDesign();
+            diag::Diagnostics stripDiagnostics;
+            grhsim::GrhToGrhSimOptions stripOptions;
+            stripOptions.top = "top";
+            stripOptions.logicDomain = grhsim::LogicDomain::TwoState;
+            stripOptions.keepDeclaredSymbols = false;
+            auto strippedModel = grhsim::lowerGrhToGrhSim(stripped, stripOptions, stripDiagnostics);
+            if (!strippedModel || stripDiagnostics.hasError())
+                return fail("keepDeclaredSymbols=false provenance lowering failed");
+            if (!strippedModel->declProvenances().empty())
+                return fail("keepDeclaredSymbols=false retained provenance records");
+        }
+
+        // (c) JSON round trip preserves the records and stays byte stable.
+        std::filesystem::create_directories(artifactDir);
+        const auto firstPath = artifactDir / "grhsim_decl_provenance.json";
+        const auto secondPath = artifactDir / "grhsim_decl_provenance_roundtrip.json";
+        diag::Diagnostics storeDiagnostics;
+        if (!grhsim::storeGrhSimModel(*model, firstPath, grhsim::defaultDialectRegistry(),
+                                      storeDiagnostics))
+            return fail("provenance GrhSIM JSON store failed");
+        if (readFile(firstPath).find("\"declProvenance\"") == std::string::npos)
+            return fail("serialized JSON is missing the declProvenance key");
+        diag::Diagnostics loadDiagnostics;
+        auto loaded = grhsim::loadGrhSimModel(firstPath, grhsim::defaultDialectRegistry(),
+                                              loadDiagnostics);
+        if (!loaded || loadDiagnostics.hasError()) return fail("provenance JSON load failed");
+        if (loaded->declProvenances().size() != model->declProvenances().size())
+            return fail("JSON round trip changed the provenance record count");
+        for (const auto &record : model->declProvenances())
+        {
+            const grhsim::DeclProvenance *other =
+                loaded->findDeclProvenance(loaded->strings().lookup(model->text(record.symbol)));
+            if (!other || !provenanceSlicesEqual(record, *other))
+                return fail("JSON round trip changed a provenance record");
+        }
+        diag::Diagnostics secondStoreDiagnostics;
+        if (!grhsim::storeGrhSimModel(*loaded, secondPath, grhsim::defaultDialectRegistry(),
+                                      secondStoreDiagnostics))
+            return fail("provenance round-trip store failed");
+        if (readFile(firstPath) != readFile(secondPath))
+            return fail("provenance store/load/store did not produce stable bytes");
+
+        // (d) clone() preserves the records.
+        {
+            auto copy = model->clone();
+            if (copy.declProvenances().size() != model->declProvenances().size())
+                return fail("clone() dropped provenance records");
+            const grhsim::DeclProvenance *copied = findProvenance(copy, "mem");
+            if (!copied || !provenanceSlicesEqual(*copied, *mem))
+                return fail("clone() changed a provenance record");
+        }
+
+        // (e) compact() remaps slice targets and drops slices whose target was
+        // removed; verifier rejects corrupt records. Hand-built model: two
+        // states + one DPI function, all declared.
+        {
+            grhsim::GrhSimModel hand("prov_model");
+            hand.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto logic8 = hand.logicType(8, false, grhsim::LogicDomain::TwoState);
+            const auto s1 = hand.addState("s1", logic8);
+            const auto s2 = hand.addState("s2", logic8);
+            const auto func = hand.addExternFunction("dpi_f", "core.dpi", "dpi_f", {}, {});
+            for (const auto state : {s1, s2})
+            {
+                const std::array steps{grhsim::InitStep{hand.intern("core.init.const"), {0, 1}}};
+                const std::array params{grhsim::Parameter{hand.intern("value"),
+                                                          std::string("8'h0")}};
+                hand.addInit(state, steps, params);
+            }
+            hand.addDeclaredSymbol(hand.strings().lookup("s1"));
+            hand.addDeclaredSymbol(hand.strings().lookup("s2"));
+            hand.addDeclaredSymbol(hand.strings().lookup("dpi_f"));
+            auto directState = [](grhsim::StringId symbol, uint32_t target) {
+                grhsim::DeclProvenance record;
+                record.symbol = symbol;
+                record.width = 8;
+                record.slices.push_back(grhsim::DeclProvenanceSlice{
+                    grhsim::DeclProvenanceKind::Direct, grhsim::DeclProvenanceTarget::State,
+                    target, 0, 0, 8});
+                return record;
+            };
+            hand.upsertDeclProvenance(directState(hand.strings().lookup("s1"), s1.index));
+            hand.upsertDeclProvenance(directState(hand.strings().lookup("s2"), s2.index));
+            {
+                grhsim::DeclProvenance record;
+                record.symbol = hand.strings().lookup("dpi_f");
+                record.slices.push_back(grhsim::DeclProvenanceSlice{
+                    grhsim::DeclProvenanceKind::Direct, grhsim::DeclProvenanceTarget::Function,
+                    func.index, 0, 0, 0});
+                hand.upsertDeclProvenance(std::move(record));
+            }
+            diag::Diagnostics handDiagnostics;
+            if (!grhsim::verifyGrhSimModel(hand, grhsim::defaultDialectRegistry(), handDiagnostics))
+                return fail("hand-built provenance model did not verify");
+
+            // compact removes s1: its slice is dropped, s2 is renumbered to 1.
+            std::vector<uint8_t> removeOps(hand.operations().size() + 1, 0);
+            std::vector<uint8_t> removeStates(hand.states().size() + 1, 0);
+            removeStates[s1.index] = 1;
+            hand.compact(removeOps, removeStates);
+            const grhsim::DeclProvenance *dropped = findProvenance(hand, "s1");
+            const grhsim::DeclProvenance *remapped = findProvenance(hand, "s2");
+            if (!dropped || !dropped->slices.empty())
+                return fail("compact() did not drop the removed state's slice");
+            if (!remapped || remapped->slices.size() != 1 || remapped->slices[0].targetIndex != 1)
+                return fail("compact() did not remap the surviving state's slice");
+            diag::Diagnostics compactDiagnostics;
+            if (!grhsim::verifyGrhSimModel(hand, grhsim::defaultDialectRegistry(),
+                                           compactDiagnostics))
+                return fail("compacted provenance model did not verify");
+
+            auto expectRejected = [&](const grhsim::DeclProvenance &record,
+                                      const char *message) {
+                hand.upsertDeclProvenance(record);
+                diag::Diagnostics corruptDiagnostics;
+                if (grhsim::verifyGrhSimModel(hand, grhsim::defaultDialectRegistry(),
+                                              corruptDiagnostics))
+                    return fail(message);
+                hand.upsertDeclProvenance(directState(hand.strings().lookup("s2"), 1));
+                return 0;
+            };
+            // Out-of-range target.
+            if (const int status = expectRejected(
+                    directState(hand.strings().lookup("s2"), 999),
+                    "verifier accepted an out-of-range provenance target"))
+                return status;
+            // Slice range exceeds the target.
+            {
+                auto record = directState(hand.strings().lookup("s2"), 1);
+                record.slices[0].targetOffset = 4;
+                if (const int status =
+                        expectRejected(record, "verifier accepted an overflowing target range"))
+                    return status;
+            }
+            // Slice range exceeds the declaration.
+            {
+                auto record = directState(hand.strings().lookup("s2"), 1);
+                record.slices[0].declOffset = 4;
+                if (const int status = expectRejected(
+                        record, "verifier accepted an overflowing declaration range"))
+                    return status;
+            }
+            // Overlapping split ranges within one declaration.
+            {
+                auto record = directState(hand.strings().lookup("s2"), 1);
+                record.slices[0].width = 4;
+                record.slices.push_back(grhsim::DeclProvenanceSlice{
+                    grhsim::DeclProvenanceKind::Direct, grhsim::DeclProvenanceTarget::State,
+                    1, 4, 2, 4});
+                if (const int status = expectRejected(
+                        record, "verifier accepted overlapping declaration ranges"))
+                    return status;
+            }
+            // Whole-object marker on a bit-carrying declaration and target.
+            {
+                auto record = directState(hand.strings().lookup("s2"), 1);
+                record.slices[0].width = 0;
+                if (const int status = expectRejected(
+                        record, "verifier accepted a whole-object slice on bit-carrying entities"))
+                    return status;
+            }
+            // A record for an undeclared symbol is rejected at the API.
+            {
+                grhsim::DeclProvenance record;
+                record.symbol = hand.intern("ghost");
+                bool thrown = false;
+                try
+                {
+                    hand.upsertDeclProvenance(std::move(record));
+                }
+                catch (const std::invalid_argument &)
+                {
+                    thrown = true;
+                }
+                if (!thrown) return fail("upsert accepted a provenance for an undeclared symbol");
+            }
+        }
+        return 0;
+    }
 }
 
 namespace {
@@ -2301,6 +2613,8 @@ int main()
         if (const int status = runUsedBitsTest(); status != 0) return status;
         if (const int status = runCloneSharedComputeTest(); status != 0) return status;
         if (const int status = runDeclaredSymbolMetadataTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
+            return status;
+        if (const int status = runDeclProvenanceTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
             return status;
         if (const int status = runEdgeDetPhaseTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
         if (const int status = runSimRefactorMappingShellTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)

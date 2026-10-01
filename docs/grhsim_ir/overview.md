@@ -226,8 +226,73 @@ metadata 的共同契约：
   无法再解析到存活 value，属预期行为；
 - 等价性判断必须由语义验证兜底，不得以名字文本匹配作为优化触发条件。
 
-JSON checkpoint 中 `declaredSymbols` 与 `generateGroups` 是 `mappings` 之后的可选尾键，
-缺省为空集合；旧格式 checkpoint 不含这两键，可直接读取。
+#### 3.4.1 声明来源关联（declProvenance）
+
+只读名字清单回答"源码声明了哪些符号"，但不回答"这个声明现在由谁实现"。
+`declProvenance` 是后者：一份**可维护**的声明 → 实体关联，供全图优化识别同族状态、
+恢复数组维度、指导打包，以及调试时从生成字段反查原声明。
+
+```text
+declProvenance: DeclProvenance[]     # 每个 declaredSymbols 成员至多一条记录
+
+DeclProvenance
+  symbol: String                     # 声明符号名（必须是 declaredSymbols 成员）
+  origin: OriginId                   # 声明位置，可空
+  width:  UInt64                     # 标量位宽（数组声明为元素位宽）；非 logic 声明为 0
+  shape:  UInt64[]                   # 数组维度，最外层在前；空 = 标量
+  slices: DeclProvenanceSlice[]      # 当前实现；空 = 该声明当前未实现（已被优化消除）
+
+DeclProvenanceSlice
+  kind:         direct | alias | merged   # direct=本体；alias=折叠/别名重定向；merged=与他人合并打包
+  target:       value | state | function  # 目标实体类别
+  targetIndex:  UInt32                    # ValueId/StateId/FuncId 下标
+  targetOffset: UInt64                    # 目标内线性位偏移
+  declOffset:   UInt64                    # 声明内线性位偏移
+  width:        UInt64                    # 覆盖位数；0 = 整体关联（非 logic 目标/函数专用，两偏移须为 0）
+```
+
+位偏移一律线性化：数组按行主序展开，`元素(i, j, ...) 的第 b 位` 的线性地址是
+`flatIndex * elementWidth + b`；`shape` 保留了把线性地址还原成各维下标所需的维度。
+三种改写形态在表示上的样子（也是各优化 pass 的维护规则）：
+
+```text
+折叠别名（alias）：wire a = b + 1 被常量/别名折叠后，
+  a 的记录: slices = [{kind=alias, target=value(b+1 的存活 value), declOffset=0, width=W}]
+
+合并来源（merged）：declared 的 a[3:0]、b[3:0] 打包进同一个 state pack 后，
+  a 的记录: slices=[{kind=merged, target=state(pack), targetOffset=0, declOffset=0, width=4}]
+  b 的记录: slices=[{kind=merged, target=state(pack), targetOffset=4, declOffset=0, width=4}]
+
+拆分范围（direct 多 slice）：wire [7:0] c 的 [3:0] 与 [7:4] 拆到两个 value 后，
+  c 的记录: slices=[{target=value(lo), declOffset=0, width=4},
+                    {target=value(hi), declOffset=4, width=4}]
+```
+
+维护契约（与上面的只读清单不同，此表持有实体下标，**必须**保持有效）：
+
+- lower 为每个能解析到存活 value/state/function 的声明写入一条 direct 全覆盖 slice；
+  解析不到（如已脱离图的悬挂名字）的声明只留在 `declaredSymbols` 名单里，没有记录；
+- 折叠/合并/拆分某个被声明实体的 pass，在旧实体消失前用 `upsertDeclProvenance`
+  重定向或重切 slice（alias/merged/多 slice）；不做语义改写的 pass 无需触碰。
+  `grhsim.simplify` 的全部子 pass 已按此维护（就地改写零维护、折叠重定向为
+  alias、等价状态合并为 merged、窄化截断为部分覆盖，细则见
+  [simplify pass 文档](passes/simplify.md)）；全图优化段（M5d-3）的
+  `grhsim.reg-to-mem`、`grhsim.comb-pack`、`grhsim.pack-bit-registers` 通过共享的
+  `mergeProvenance{Value,State}Slices` helper 把被合并行/成员/lane 的 slice 重定向为
+  目标实体内的偏移位段（kind=merged，targetOffset 按 lane/行/bit 线性偏移），细则见各
+  pass 文档；
+- `compact()` 把 slice 目标重映射到重编号后的实体，并丢弃目标已被删除的 slice
+  （记录保留，slices 可能变空，表示"声明已知、当前未实现"）——这是 pass 未主动
+  维护时的安全网，不是免维护许可；
+- verifier 始终校验结构合法性：symbol 必须是 declared 成员、目标下标在界内、
+  slice 范围不越过声明与目标的线性大小、同一记录内各 slice 的声明区间不重叠；
+  结构合法不代表语义正确——重定向的等价性仍由执行该改写的 pass 负责论证；
+- 编辑本表是 metadata mutation（不使后端映射失效）；generateGroups 与本表按符号名
+  自然连接（成员名 = 记录 symbol）。
+
+JSON checkpoint 中 `declaredSymbols`、`generateGroups`、`declProvenance` 依次是
+`mappings` 之后的可选尾键，缺省为空集合；不含这些键的旧格式 checkpoint 可直接读取。
+`declProvenance` 非空时前两个键会一并写出（可能为空数组），保持尾键的位置化编码。
 
 ## 4. 执行语义
 

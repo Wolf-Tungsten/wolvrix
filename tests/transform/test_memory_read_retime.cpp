@@ -278,5 +278,76 @@ int main()
         }
     }
 
+    // The ROM retime erases the address register, so a declared address
+    // register must block the rewrite instead of silently losing the anchor.
+    {
+        Design design;
+        Graph &graph = buildBaseReadPath(design, false, false);
+        const OperationId addrReg = graph.findOperation("addr_q");
+        if (!addrReg.valid())
+        {
+            return fail("fixture is missing the address register");
+        }
+        graph.addDeclaredSymbol(graph.getOperation(addrReg).symbol());
+
+        PassManager manager;
+        manager.addPass(std::make_unique<MemoryReadRetimePass>());
+        PassDiagnostics diags;
+        PassManagerResult result = manager.run(design, diags);
+
+        if (!result.success || diags.hasError())
+        {
+            return fail("declared ROM case should succeed");
+        }
+        if (result.changed)
+        {
+            return fail("declared address register must block the ROM retime");
+        }
+        if (!graph.findOperation("addr_q").valid())
+        {
+            return fail("declared address register was erased");
+        }
+        if (!graph.validateDeclaredSymbols().empty())
+        {
+            return fail("declared ROM case broke declared symbol resolution");
+        }
+    }
+
+    // Control: with declaration retention off, the same graph retimes and the
+    // erased register leaves the declared set (no dangling anchor).
+    {
+        Design design;
+        Graph &graph = buildBaseReadPath(design, false, false);
+        const OperationId addrReg = graph.findOperation("addr_q");
+        if (!addrReg.valid())
+        {
+            return fail("control fixture is missing the address register");
+        }
+        graph.addDeclaredSymbol(graph.getOperation(addrReg).symbol());
+
+        PassManager manager;
+        manager.options().keepDeclaredSymbols = false;
+        manager.addPass(std::make_unique<MemoryReadRetimePass>());
+        PassDiagnostics diags;
+        PassManagerResult result = manager.run(design, diags);
+
+        if (!result.success || diags.hasError())
+        {
+            return fail("declared-off ROM control case should succeed");
+        }
+        if (!result.changed)
+        {
+            return fail("declared-off control case should retime");
+        }
+        if (graph.findOperation("addr_q").valid())
+        {
+            return fail("declared-off control case should erase the address register");
+        }
+        if (!graph.validateDeclaredSymbols().empty())
+        {
+            return fail("erasing the declared register left a dangling anchor");
+        }
+    }
+
     return 0;
 }

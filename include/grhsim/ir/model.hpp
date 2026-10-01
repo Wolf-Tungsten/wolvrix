@@ -616,6 +616,58 @@ namespace wolvrix::lib::grhsim
         std::vector<StringId> symbols; // per-round copy symbols, index = generate-for round
     };
 
+    // How one slice of a declaration is realized by the current model.
+    enum class DeclProvenanceKind : uint8_t
+    {
+        Direct, // the target slice holds the declaration range itself
+        Alias,  // the declaration was folded/aliased; the target holds an equivalent value
+        Merged  // the declaration is packed into the target together with other declarations
+    };
+
+    enum class DeclProvenanceTarget : uint8_t
+    {
+        Value,
+        State,
+        Function
+    };
+
+    // Bit offsets are linear: for an array target (or array declaration) the
+    // address of element (i, j, ...) is (flatElementIndex * elementWidth +
+    // bitInElement), with the shape flattened row-major (outermost first).
+    // width == 0 marks a whole-object association and is the only valid form
+    // for non-logic targets (real/string values, DPI functions); both offsets
+    // must be zero then.
+    struct DeclProvenanceSlice
+    {
+        DeclProvenanceKind kind = DeclProvenanceKind::Direct;
+        DeclProvenanceTarget target = DeclProvenanceTarget::Value;
+        uint32_t targetIndex = 0;  // ValueId/StateId/FuncId index (generation is always 0)
+        uint64_t targetOffset = 0; // linear bit offset within the target
+        uint64_t declOffset = 0;   // linear bit offset within the declaration
+        uint64_t width = 0;        // bits covered; 0 = whole object
+        friend bool operator==(const DeclProvenanceSlice &, const DeclProvenanceSlice &) = default;
+    };
+
+    // Maintainable association between one source declaration and the model
+    // entities that currently realize it. One record per declared symbol;
+    // `shape`/`width` describe the declaration itself (shape empty = scalar),
+    // `slices` the current realization: a folded alias redirects the slice to
+    // the surviving value, a merge points multiple records at slices of one
+    // shared target, a split gives one record several slices with disjoint
+    // declOffset ranges. A record with no slices names a declaration that is
+    // currently not realized (optimized away); the name list entry in
+    // declaredSymbols still anchors it. Generate-group membership joins by
+    // symbol name against GenerateGroup::symbols.
+    struct DeclProvenance
+    {
+        StringId symbol;             // member of GrhSimModel::declaredSymbols
+        OriginId origin;             // declaration site; may be invalid
+        uint64_t width = 0;          // scalar / array-element bit width; 0 for non-logic
+        std::vector<uint64_t> shape; // array dimensions, outermost first; empty = scalar
+        std::vector<DeclProvenanceSlice> slices;
+        friend bool operator==(const DeclProvenance &, const DeclProvenance &) = default;
+    };
+
     struct ModelReserve
     {
         std::size_t strings = 0;
@@ -641,6 +693,7 @@ namespace wolvrix::lib::grhsim
         std::size_t origins = 0;
         std::size_t declaredSymbols = 0;
         std::size_t generateGroups = 0;
+        std::size_t declProvenances = 0;
     };
 
     class GrhSimModel
@@ -727,6 +780,25 @@ namespace wolvrix::lib::grhsim
         void addGenerateGroupSymbol(std::size_t group, StringId symbol);
         const std::vector<GenerateGroup> &generateGroups() const noexcept { return generateGroups_; }
 
+        // Declaration provenance: the maintainable association from a declared
+        // symbol to the values/states/functions that currently realize it (see
+        // DeclProvenance). Unlike the pure name lists above, slices hold entity
+        // indices, so structural mutations must keep them valid:
+        // - the GRH lowering populates one Direct full-range slice per resolved
+        //   declaration;
+        // - a pass that folds/aliases, merges or splits a declared entity
+        //   redirects or re-slices the record via upsertDeclProvenance before
+        //   the old entity disappears;
+        // - compact() remaps slice targets to the renumbered entities and drops
+        //   slices whose target was removed, leaving a possibly empty record;
+        // - edits are metadata mutations (commitMetadataMutation, never
+        //   semantic); compact() performs its remap inside the rebuild.
+        // upsertDeclProvenance requires the symbol to be a declared member and
+        // replaces any existing record for it.
+        void upsertDeclProvenance(DeclProvenance record);
+        const DeclProvenance *findDeclProvenance(StringId symbol) const noexcept;
+        const std::vector<DeclProvenance> &declProvenances() const noexcept { return declProvenances_; }
+
         const std::vector<DialectUse> &dialects() const noexcept { return dialects_; }
         const std::vector<Type> &types() const noexcept { return types_; }
         const std::vector<InterfacePort> &interfacePorts() const noexcept { return interfacePorts_; }
@@ -807,6 +879,8 @@ namespace wolvrix::lib::grhsim
         std::vector<StringId> declaredSymbols_;
         std::unordered_set<uint32_t> declaredSymbolSet_;
         std::vector<GenerateGroup> generateGroups_;
+        std::vector<DeclProvenance> declProvenances_;
+        std::unordered_map<uint32_t, std::size_t> declProvenanceBySymbol_;
     };
 
     std::string_view toString(LogicDomain domain) noexcept;
@@ -823,6 +897,10 @@ namespace wolvrix::lib::grhsim
     std::optional<SimPhase> parseSimPhase(std::string_view text) noexcept;
     std::string_view toString(CpuNamedStoreKind kind) noexcept;
     std::optional<CpuNamedStoreKind> parseCpuNamedStoreKind(std::string_view text) noexcept;
+    std::string_view toString(DeclProvenanceKind kind) noexcept;
+    std::optional<DeclProvenanceKind> parseDeclProvenanceKind(std::string_view text) noexcept;
+    std::string_view toString(DeclProvenanceTarget target) noexcept;
+    std::optional<DeclProvenanceTarget> parseDeclProvenanceTarget(std::string_view text) noexcept;
 
 } // namespace wolvrix::lib::grhsim
 

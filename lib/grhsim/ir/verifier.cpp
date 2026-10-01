@@ -317,9 +317,18 @@ namespace wolvrix::lib::grhsim
         // M2b exception: latchWrite may also carry Output — the timeslot
         // __tslot_prev_* write-backs live in P_output (verifyOutputLowering
         // constrains those states to Output-phase latchWrites).
+        //
+        // M5d-5 class-aware P_mem duty (pass grhsim.split-phases): on a
+        // classified model a mem write's phase follows the target state's
+        // store class — mem-class arrays commit in P_mem, regLatch-class
+        // states (including small arrays) take the General next-buffer path.
+        // Unclassified models keep the legacy all-Mem attribution, and an
+        // unresolvable target ref falls back to it too (the structural checks
+        // report the malformed ref separately).
         bool verifyPhaseAttribution(const GrhSimModel &model, diag::Diagnostics &diagnostics)
         {
             bool ok = true;
+            const bool classified = model.hasStateStoreClassification();
             for (std::size_t i = 0; i < model.operations().size(); ++i)
             {
                 const SimOp &op = model.operations()[i];
@@ -336,7 +345,25 @@ namespace wolvrix::lib::grhsim
                 else if (name == "core.output.write") required = SimPhase::Output;
                 else if (name == "core.state.memWrite" || name == "core.state.memFill" ||
                          name == "core.state.memAssign" || name == "core.state.memWriteSeq")
+                {
                     required = SimPhase::Mem;
+                    if (classified)
+                    {
+                        std::span<const ObjectRef> refs;
+                        try
+                        {
+                            refs = model.objectRefs(op);
+                        }
+                        catch (const std::exception &)
+                        {
+                            refs = {};
+                        }
+                        if (!refs.empty() && refs[0].kind == ObjectKind::State &&
+                            validId(StateId{refs[0].index, 0}, model.states().size()) &&
+                            model.states()[refs[0].index - 1].storeClass == StateStoreClass::RegLatch)
+                            required = SimPhase::General;
+                    }
+                }
                 else if (name == "core.state.regWrite") required = SimPhase::General;
                 else if (name == "core.state.latchWrite")
                 {
@@ -352,6 +379,72 @@ namespace wolvrix::lib::grhsim
                                       std::string(toString(op.phase)),
                                       "operations[" + std::to_string(i) + "]");
                     ok = false;
+                }
+            }
+            return ok;
+        }
+
+        // M5d-5 semantic seal (B8, grhsim.verify --seal semantic): certifies
+        // that the partition stage has completed and the semantic layer is
+        // final. On top of the standing checks (which tolerate a partially
+        // attributed mid-pipeline model) the seal requires:
+        //  - total phase attribution (grhsim.split-phases has run);
+        //  - no surviving raw event_edges parameters (grhsim.lower-edge-detect
+        //    has lowered every event consumer to the event_acts form);
+        //  - every Mem-phase write operand produced by a General-phase op, so
+        //    P_mem only samples values that exist before it in a round
+        //    (Event cone values never leave P_event; Output runs after the
+        //    round loop).
+        bool verifySemanticSeal(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+        {
+            bool ok = true;
+            auto error = [&](const std::string &message, const std::string &context) {
+                diagnostics.error(message, context);
+                ok = false;
+            };
+            std::vector<OpId> producer(model.values().size() + 1);
+            for (const auto &op : model.operations())
+                for (auto value : model.results(op)) producer[value.index] = op.id;
+            for (std::size_t i = 0; i < model.operations().size(); ++i)
+            {
+                const SimOp &op = model.operations()[i];
+                const std::string context = "operations[" + std::to_string(i) + "]";
+                if (op.phase == SimPhase::None)
+                    error("semantic seal requires total phase attribution "
+                          "(grhsim.split-phases)", context);
+                if (!model.strings().valid(op.opType)) continue;
+                const std::string_view name = model.text(op.opType);
+                std::span<const Parameter> params;
+                std::span<const ValueId> operands;
+                try
+                {
+                    params = model.parameters(op);
+                    operands = model.operands(op);
+                }
+                catch (const std::exception &)
+                {
+                    continue; // malformed ranges are reported by the per-op check
+                }
+                for (const auto &param : params)
+                    if (model.strings().valid(param.name) &&
+                        model.text(param.name) == "event_edges")
+                        error("semantic seal requires the lowered event_acts form; "
+                              "event_edges survived (grhsim.lower-edge-detect)", context);
+                if (op.phase != SimPhase::Mem) continue;
+                for (const auto operand : operands)
+                {
+                    if (operand.generation != 0 || !operand.valid() ||
+                        operand.index >= producer.size())
+                        continue; // dangling operands are reported structurally
+                    const auto source = producer[operand.index];
+                    if (!source) continue;
+                    const auto sourcePhase = model.operations()[source.index - 1].phase;
+                    if (sourcePhase != SimPhase::General)
+                        error(std::string(name) +
+                                  " operand is not produced in P_general; P_mem samples "
+                                  "General-phase values (producer carries phase " +
+                                  std::string(toString(sourcePhase)) + ")",
+                              context);
                 }
             }
             return ok;
@@ -1212,6 +1305,11 @@ namespace wolvrix::lib::grhsim
         }
 
         return ok && !diagnostics.hasError();
+    }
+
+    bool verifyGrhSimSemanticSeal(const GrhSimModel &model, diag::Diagnostics &diagnostics)
+    {
+        return verifySemanticSeal(model, diagnostics);
     }
 
 } // namespace wolvrix::lib::grhsim

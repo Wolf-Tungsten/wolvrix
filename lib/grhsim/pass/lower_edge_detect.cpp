@@ -441,8 +441,9 @@ namespace wolvrix::lib::grhsim
                                                        model.results(op).end());
                     const auto opType = std::string(model.text(op.opType));
                     model.replaceOperation(op.id, opType, newOperands, results, newRefs, newParams);
-                    // The four mem writes keep phase None for M3 split-phases;
-                    // every other consumer joins P_general.
+                    // The four mem writes keep phase None for the B5 semantic
+                    // split (grhsim.split-phases, class-aware); every other
+                    // consumer joins P_general.
                     model.setOperationPhase(op.id, isMemWriteType(opType) ? SimPhase::None
                                                                           : SimPhase::General);
                 }

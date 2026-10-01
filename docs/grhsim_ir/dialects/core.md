@@ -201,6 +201,9 @@ DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份�
 > `core.system.task` 改写后不再持有 object refs，`core.dpi.call` 只保留首部 Function
 > 引用；`regWrite`/`system.task`/`dpi.call` 的 phase 置为 `general`，四种 mem 写在 M3
 > 归类前保持无 phase。verifier 在模型出现 `event_acts` 后禁止任何 `event_edges` 残留。
+> M5d-5 起四种 mem 写由语义层 `grhsim.split-phases`（B5）归类：按目标状态的存储分类，
+> `mem` 类数组的写归 `mem` 相、`regLatch` 类状态的写归 `general` 相（见
+> [grhsim.split-phases](../passes/grhsim-split-phases.md)）。
 > M5 起 GRH 转换不再产出 `__event_*` 历史状态；lower-edge-detect 会顺带清理
 > M5 前 checkpoint 里残留的此类未引用状态。
 

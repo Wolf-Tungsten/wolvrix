@@ -703,6 +703,18 @@ namespace
     int runCloneSharedComputeTest()
     {
         using namespace grhsim;
+        // M5d-5 (B7): the boundary-aware cost model decides from the
+        // predicted General node partition, so every fixture is sealed with
+        // grhsim.split-phases first (unattributed models are a documented
+        // no-op). Sinks are state writes: an output.write sink would move to
+        // P_output and seal the cone away from the General partition.
+        const auto attribute = [&](GrhSimModel &model, diag::Diagnostics &diagnostics) {
+            std::string error;
+            PassManager splitter(defaultDialectRegistry());
+            splitter.addPass(defaultPassRegistry().create("grhsim.split-phases", {}, error));
+            const auto result = splitter.run(model, diagnostics);
+            if (!result.success) throw std::runtime_error("grhsim.split-phases failed");
+        };
         GrhSimModel model("clone_shared_compute");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
@@ -713,23 +725,38 @@ namespace
             return value;
         };
         const auto source = inputValue("source");
-        const auto left = inputValue("left");
-        const auto right = inputValue("right");
+        inputValue("left");
+        inputValue("right");
+        const auto oneBit = model.addValue(bit);
+        {
+            const std::array literal{Parameter{model.intern("constValue"), std::string("1'b1")}};
+            model.addOperation("core.compute.constant", {}, std::array{oneBit}, {}, literal);
+        }
+        const auto stateBit = [&](std::string_view name) {
+            const auto state = model.addState(name, bit);
+            const std::array params{Parameter{model.intern("value"), std::string("1'b0")}};
+            const std::array steps{InitStep{model.intern("core.init.const"), {0, 1}}};
+            model.addInit(state, steps, params);
+            return state;
+        };
+        const auto q1 = stateBit("q1");
+        const auto q2 = stateBit("q2");
         const auto shared = model.addValue(bit, "shared");
         model.addOperation("core.compute.not", std::array{source}, std::array{shared}, {}, {}, "shared.not");
         const auto leftResult = model.addValue(bit, "left_result");
         model.addOperation("core.compute.and", std::array{shared, shared}, std::array{leftResult}, {}, {}, "left.and");
+        model.addOperation("core.state.regWrite", std::array{oneBit, leftResult, oneBit}, {},
+                           std::array{ObjectRef::state(q1)});
         const auto rightResult = model.addValue(bit, "right_result");
         model.addOperation("core.compute.or", std::array{shared, source}, std::array{rightResult}, {}, {}, "right.or");
-        const auto leftOutput = model.addOutput("left_output", bit);
-        model.addOperation("core.output.write", std::array{leftResult}, {}, std::array{ObjectRef::output(leftOutput)});
-        const auto rightOutput = model.addOutput("right_output", bit);
-        model.addOperation("core.output.write", std::array{rightResult}, {}, std::array{ObjectRef::output(rightOutput)});
+        model.addOperation("core.state.regWrite", std::array{oneBit, rightResult, oneBit}, {},
+                           std::array{ObjectRef::state(q2)});
 
+        diag::Diagnostics diagnostics;
+        attribute(model, diagnostics);
         PassManager manager(defaultDialectRegistry());
         std::string error;
         manager.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute", {}, error));
-        diag::Diagnostics diagnostics;
         const auto result = manager.run(model, diagnostics);
         if (!result.success || !result.changed || diagnostics.hasError())
         {
@@ -741,7 +768,12 @@ namespace
         for (const auto &op : model.operations())
         {
             const auto name = model.text(op.name);
-            if (name.find(".local") != std::string_view::npos && model.text(op.opType) == "core.compute.not") ++localNots;
+            if (name.find(".local") != std::string_view::npos && model.text(op.opType) == "core.compute.not")
+            {
+                ++localNots;
+                if (op.phase != SimPhase::General)
+                    return fail("shared compute clone lost the source phase");
+            }
         }
         if (localNots != 2)
             return fail("shared compute localization did not clone the scalar producer per consumer");
@@ -752,7 +784,7 @@ namespace
         for (const auto &op : model.operations())
             if (model.text(op.opType) == "core.compute.and" && model.operands(op)[0] != model.operands(op)[1])
                 return fail("repeated consumer operand did not reuse its clone");
-        if (model.inputs().size() != 3 || model.operations().size() != 9)
+        if (model.inputs().size() != 3 || model.operations().size() != 10)
             return fail("localization removed an unrelated read or retained a dead root");
         diag::Diagnostics verifyDiagnostics;
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), verifyDiagnostics))
@@ -771,12 +803,30 @@ namespace
         {
             GrhSimModel chain("clone_chain"); chain.addDialect("core", "1", "wolvrix.grhsim.core.v1");
             const auto byte = chain.logicType(8, false, LogicDomain::TwoState);
+            const auto chainBit = chain.logicType(1, false, LogicDomain::TwoState);
             const auto port = chain.addInput("x", byte);
             const auto x = chain.addValue(byte), five = chain.addValue(byte);
             const auto t = chain.addValue(byte), u = chain.addValue(byte);
             chain.addOperation("core.input.read", {}, std::array{x}, std::array{ObjectRef::input(port)});
             const std::array literal{Parameter{chain.intern("value"), std::string("5")}};
             chain.addOperation("core.compute.constant", {}, std::array{five}, {}, literal);
+            const auto chainOne = chain.addValue(chainBit);
+            {
+                const std::array oneLit{Parameter{chain.intern("constValue"), std::string("1'b1")}};
+                chain.addOperation("core.compute.constant", {}, std::array{chainOne}, {}, oneLit);
+            }
+            const auto chainMask = chain.addValue(byte);
+            {
+                const std::array maskLit{Parameter{chain.intern("constValue"), std::string("8'hff")}};
+                chain.addOperation("core.compute.constant", {}, std::array{chainMask}, {}, maskLit);
+            }
+            const auto chainState = [&](unsigned i) {
+                const auto state = chain.addState("q" + std::to_string(i), byte);
+                const std::array params{Parameter{chain.intern("value"), std::string("8'h00")}};
+                const std::array steps{InitStep{chain.intern("core.init.const"), {0, 1}}};
+                chain.addInit(state, steps, params);
+                return state;
+            };
             const auto addNot = [&] {
                 chain.addOperation("core.compute.not", std::array{x}, std::array{t}, {}, {}, "shared.not");
             };
@@ -788,9 +838,10 @@ namespace
                 const auto y = chain.addValue(byte);
                 chain.addOperation(i == 2 ? "core.compute.xor" : "core.compute.and",
                     std::array{i == 0 ? t : u, x}, std::array{y});
-                const auto output = chain.addOutput("y" + std::to_string(i), byte);
-                chain.addOperation("core.output.write", std::array{y}, {}, std::array{ObjectRef::output(output)});
+                chain.addOperation("core.state.regWrite", std::array{chainOne, y, chainMask}, {},
+                                   std::array{ObjectRef::state(chainState(i))});
             }
+            attribute(chain, diagnostics);
             const std::array<std::string_view, 2> budget{"--max-clones", "4"}, fanout{"--max-fanout", "2"};
             PassManager chains(defaultDialectRegistry());
             chains.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute",
@@ -832,11 +883,21 @@ namespace
         const auto cycleA = cycle.addValue(cycleBit), cycleB = cycle.addValue(cycleBit);
         cycle.addOperation("core.compute.not", std::array{cycleB}, std::array{cycleA});
         cycle.addOperation("core.compute.not", std::array{cycleA}, std::array{cycleB});
-        for (const auto value : {cycleA, cycleB})
         {
-            const auto output = cycle.addOutput("y" + std::to_string(value.index), cycleBit);
-            cycle.addOperation("core.output.write", std::array{value}, {}, std::array{ObjectRef::output(output)});
+            const auto cycleOne = cycle.addValue(cycleBit);
+            const std::array oneLit{Parameter{cycle.intern("constValue"), std::string("1'b1")}};
+            cycle.addOperation("core.compute.constant", {}, std::array{cycleOne}, {}, oneLit);
+            for (const auto value : {cycleA, cycleB})
+            {
+                const auto state = cycle.addState("q" + std::to_string(value.index), cycleBit);
+                const std::array params{Parameter{cycle.intern("value"), std::string("1'b0")}};
+                const std::array steps{InitStep{cycle.intern("core.init.const"), {0, 1}}};
+                cycle.addInit(state, steps, params);
+                cycle.addOperation("core.state.regWrite", std::array{cycleOne, value, cycleOne}, {},
+                                   std::array{ObjectRef::state(state)});
+            }
         }
+        attribute(cycle, diagnostics);
         const auto cycleResult = second.run(cycle, diagnostics);
         if (!cycleResult.success || cycleResult.changed) return fail("localization did not preserve a candidate cycle");
 
@@ -852,8 +913,9 @@ namespace
             guards.addOperation("core.input.read", {}, std::array{x}, std::array{ObjectRef::input(port)});
             if (scenario != 7)
             {
-                const auto output = guards.addOutput("source", type);
-                guards.addOperation("core.output.write", std::array{x}, {}, std::array{ObjectRef::output(output)});
+                // A second consumer keeps the bijection's source shared.
+                const auto spare = guards.addValue(type);
+                guards.addOperation("core.compute.and", std::array{x, x}, std::array{spare});
             }
             const std::array params{Parameter{guards.intern("extension"), true}};
             if (scenario == 6)
@@ -867,6 +929,7 @@ namespace
                 const auto y = guards.addValue(resultType);
                 guards.addOperation("core.compute.and", std::array{root, root}, std::array{y});
             }
+            attribute(guards, diagnostics);
             const std::array<std::string_view, 2> fanout{"--max-fanout", "2"}, budget{"--max-clones", "2"};
             PassManager guarded(defaultDialectRegistry());
             guarded.addPass(defaultPassRegistry().create("grhsim.clone-shared-compute",

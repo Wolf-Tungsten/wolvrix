@@ -320,6 +320,41 @@ verifier 强制：分类要么全有要么全无（totality）、`mem` 仅限 `c
 JSON checkpoint 中分类是 `states` 行的可选第五元素（`[id, name, type, origin, class]`），
 仅在已分类时写出：未分类 checkpoint 与旧模式字节兼容，已分类 checkpoint 字节稳定往返。
 
+### 3.6 计算分区与相位归属（SimPhase）
+
+每个 `SimOp` 携带一个六阶段相位归属（`SimPhase`），由语义层 pass 写入：
+
+```text
+SimPhase = none | event | general | mem | output
+```
+
+三个**计算分区**是 `event`（P_event 事件锥）、`general`（P_general 主体）、`output`
+（P_output 输出锥与 time-slot 任务）；`mem` 归属表示该写 op 由 P_mem 承接提交。运行时的
+P_input/P_publish 没有 op（输入装载与 NBA 发布是运行时动作）。分区由第一轮分解建立：
+
+- `grhsim.lower-edge-detect`（B2）克隆事件锥并标记 `event`，把事件消费者的
+  `event_edges` 改写为 `event_acts` 并把非 mem 写的消费者归入 `general`；
+- `grhsim.extract-output-cones`（B3）与 `grhsim.migrate-timeslot-tasks`（B4）克隆输出锥、
+  迁移 time-slot 任务并标记 `output`；
+- [`grhsim.split-phases`](passes/grhsim-split-phases.md)（B5，M5d-5）完成总归属——
+  剩余 `none` op 全部归类，其中 mem 写 op 按**目标状态的存储分类**确定 P_mem 写入职责：
+  `mem` 类数组的写归 `mem` 相（采样后在 P_mem 原地提交），`regLatch` 类状态（含小数组）
+  的写归 `general` 相（并入超节点、走 next 缓冲 NBA 路径）。未分类模型保持旧的全 `mem`
+  兜底归因。
+
+verifier 约束（含分区自封，任何中间形态都必须满足）：`edgeDet` 恒为 `event`；
+`output.write` 恒为 `output`；事件锥/输出锥自包含（`event`/`output` op 只读同相位值，
+`general` op 不读锥内值）；`__tslot_prev_*` 状态只能被 `output` 相 `latchWrite` 写；
+已分类模型上相位与分类一致（`mem` 类状态的写口必须归 `mem` 相，`regLatch` 类状态的
+写口必须归 `general` 相）。
+
+分区阶段的封板校验是 `grhsim.verify --seal semantic`（B8）：在既有校验之上要求
+**相位归属全覆盖**（无 `none` op）、**无 `event_edges` 残留**（事件已降为 `event_acts`
+形态）、**P_mem 采样局部性**（`mem` 相写 op 的 operand 全部由 `general` 相 op 产生）。
+封板后语义层不再有任何改写；CPU mapping（C 段）只消费归属结果。
+
+JSON checkpoint 中相位随 op 行持久化，字节稳定往返。
+
 ## 4. 执行语义
 
 ### 4.1 单次图状态转移

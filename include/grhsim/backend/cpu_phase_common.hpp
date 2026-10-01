@@ -107,8 +107,11 @@ namespace wolvrix::lib::grhsim
     }
 
     // Boundary-store value set: General-produced values consumed across a
-    // supernode boundary or by a Mem-phase write op. Event/Output cones are
+    // supernode boundary or by a mem write op. Event/Output cones are
     // self-contained (they read stores), so they never extend the set.
+    // M5d-5 compat: the mem-write sampling rule keys on the op TYPE, not the
+    // op phase — B5 tags regLatch-class writes General while this legacy
+    // backend still schedules every mem write in P_mem.
     inline std::vector<bool> sixPhaseBoundaryValues(const GrhSimModel &model, const CpuPartitionTree &tree,
                                                     std::span<const PartitionId> supernodeOf)
     {
@@ -118,7 +121,7 @@ namespace wolvrix::lib::grhsim
         std::vector<bool> boundary(model.values().size() + 1, false);
         for (const auto &op : model.operations())
         {
-            const bool memConsumer = op.phase == SimPhase::Mem;
+            const bool memConsumer = isCpuPhaseMemWriteOp(model.text(op.opType));
             const auto consumer = supernodeOf[op.id.index];
             for (const auto operand : model.operands(op))
             {

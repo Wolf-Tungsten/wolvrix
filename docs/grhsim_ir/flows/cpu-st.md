@@ -57,42 +57,35 @@ XiangShan 入口在 lower 成功后先执行全图优化段（M5d-3 起的目标
 [`grhsim.comb-pack`](../passes/comb-pack.md)（全图同构组合 lane 打包）、
 [`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)（bit 寄存器打包，改用原始
 event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全图不动点化简，
-接着 [`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)（保持在最后一次含 CSE 的
-化简之后），最后 [`grhsim.select-state-stores`](../passes/select-state-stores.md)（M5d-4，A7）
+最后 [`grhsim.select-state-stores`](../passes/select-state-stores.md)（M5d-4，A7）
 完成语义存储分类——每个状态获得 `regLatch`/`mem` 归属与对应 NBA 提交契约（见
-[Overview](../overview.md) 第 3.5 节），再进入下表的 CPU mapping；这些 pass 不修改 GRH。
-分类注解当前不被旧 mapping pass 消费（C3 消费接线属 M5d-6），接入不改变生成代码。
+[Overview](../overview.md) 第 3.5 节）；这些 pass 不修改 GRH。
 
-完成首次mapping后，XiangShan入口继续执行
-`grhsim.canonicalize-compute`、
-[`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)、
-[`grhsim.mux-chain-fold`](../passes/mux-chain-fold.md)、
-[`grhsim.used-bits`](../passes/used-bits.md) 的既有后置化简序列，并完整重跑 CPU mapping
-（该后置段属既有生产结构，目标 B/C 段改造前保持不变）。
-集成开关为 `XS_WOLF_GRHSIM_IR_PACK_BIT_REGISTERS=0/1` 与
-`XS_WOLF_GRHSIM_IR_COMB_PACK=0/1`（及对应 `*_REPORT` TSV 诊断输出）；
-M5d-4 起另有 `XS_WOLF_GRHSIM_IR_SELECT_STATE_STORES=0/1`、
-`XS_WOLF_GRHSIM_IR_STATE_STORE_REPORT`（逐状态分类 TSV）与
-`XS_WOLF_GRHSIM_IR_MEM_MIN_BYTES`（mem 类最小字节阈值）。
+随后是分区段 B（M5d-5 起接线，仍为纯语义层，不建立任何 CPU mapping）：
+`grhsim.classify-event-inputs`（B1）、`grhsim.lower-edge-detect`（B2）、
+`grhsim.extract-output-cones`（B3）、`grhsim.migrate-timeslot-tasks`（B4）完成事件/输出/
+time-slot 结构降级；[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5）按
+A7 分类完成类感知相位归属（`mem` 类数组的写归 P_mem，`regLatch` 类状态的写——含小数组
+上的 mem op——归 P_general），`grhsim.simplify(scope=phase)`（B6）逐分区独立化简
+（保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），
+[`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)（B7）按边界感知成本
+模型只克隆能消除预测超节点边界的共享计算（归位决议 1），最后
+`grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
+P_mem 操作数产自 P_general）。**B8 之后不再有任何语义改写**：旧管线的"后置化简 +
+第二轮 mapping"往返段已拆除，CPU mapping（下表八个 `cpu.st.*` pass）只运行一次。
+集成开关新增 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1`（B6 调试开关）；`--used-bits` 与
+`--bitwise-predicates` 旋钮随独立调用段的移除而成为空操作（两者都只在
+`grhsim.simplify` 内部固定点中运行）。
 
-最终 mapping 前运行 [`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)，
-将全部 operand/result 为 unsigned two-state bit 的 mux 转为按位选择 op，
-让 emitter 使用按位算术表达已经求值的数据选择。禁用 bit 寄存器打包时，
-此 pass 在 semantic pipeline 末尾执行。它保留 producers、依赖与共享关系，
-不改变 state/commit/DPI 的执行条件。
-
-mux 链折叠之后、第二轮 mapping 之前运行
-[`grhsim.used-bits`](../passes/used-bits.md)：对全部二态 logic 值与寄存器状态做反向
-"实际使用位"不动点分析，删除结果不可观测的死锥（纯计算/读 op、无活读者状态的写口与
-状态本体），并把只被低 `[0,k)` 位观测的 op 锥与寄存器收窄到实际宽度（宽值跨越 64 位线时
-从多字 helper 路径降级为标量路径）。sink（输出、DPI/system、memory 端口、事件）按全宽
-保守处理；语义保持论证见 pass 文档。
-
-M5d-2 起，上述化简 pass（及新增的 [`grhsim.const-fold`](../passes/const-fold.md)）也可经
-统一入口 [`grhsim.simplify`](../passes/simplify.md) 以固定子序列迭代至不动点的方式执行，
-支持 whole/phase 两种 scope（phase 模式保留分区接口、禁止跨阶段 CSE、共享状态位需求取
-全分区并集）。M5d-3 起生产流程的全图优化段已接线 `grhsim.simplify(scope=whole)`；
-分区 scope 的接线属 M5d-5。
+既有化简子 pass 经统一入口 [`grhsim.simplify`](../passes/simplify.md) 以固定子序列
+迭代至不动点（A6 全图 + B6 分区），支持 whole/phase 两种 scope。子序列包含
+[`grhsim.const-fold`](../passes/const-fold.md)、`grhsim.canonicalize-compute`、
+`grhsim.bitwise-predicates`、[`grhsim.bitwise-muxes`](../passes/bitwise-muxes.md)、
+[`grhsim.mux-chain-fold`](../passes/mux-chain-fold.md) 与
+[`grhsim.used-bits`](../passes/used-bits.md)（位需求分析、窄化及死锥清理）；各子 pass
+的匹配与拒绝规则见其各自文档。phase scope 下 canonicalize-compute 不删除结果被分区外
+op 消费的 op（越界消费者永不重接，删除会使其悬空），mem 写参数等分区接口值由此保持
+完整。
 
 `grhsim.canonicalize-compute` 删除同完整 TypeId 的两态 logic 赋值链并重接所有
 消费者。`core.compute.assign` 唯一 operand 是源值，唯一 result 是赋值结果；
@@ -463,3 +456,27 @@ prevEvent/eventAct 条目、timeslot flag 集匹配、activeFlags 形态），�
 fanout/task/trigger 均按模型与 partition 树重算并要求完全一致；旧 stage 校验不变。
 JSON 仍是 v2 可选尾字段位置化追加：`timeslotTriggers` 位于 `memWritePlan` 之后，新
 存档可被旧读取方按位置截断读取，旧存档缺少尾字段时按缺省处理。
+
+## 演进（M5d-5）
+
+M5d-5 把相位归属从 `cpu.st.split-phases` 拆到语义层新 pass
+[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5），并在其后的分区段接
+通 B6（`grhsim.simplify(scope=phase)`）、B7（边界感知
+[`clone-shared-compute`](../passes/clone-shared-compute.md)）与 B8
+（`grhsim.verify --seal semantic` 封板）。B5 是类感知的：`mem` 类数组的写归 `mem` 相，
+`regLatch` 类状态的写（含小数组 mem op）归 `general` 相。
+
+本里程碑内旧六阶段 mapping 继续工作，靠一组**按 op 类型**的兼容 shim（M5d-6 随旧
+pass 一并删除）：Mem 分枝播种、mem 写计划收集、boundary 采样与写参数槽位命名都按
+op 类型而非 `op.phase == Mem` 收集四种 mem 写 op；`build-general-nodes` 把 mem 写类型
+排除在 node 形成之外；`verifyCpuPhases` 容许 Mem 分枝中出现 `general` 相的 mem 写 op。
+由于旧布局仍把全部数组放进单实例 memStore，P_mem 原地提交对这些小数组本就是正确的
+NBA 机制，生成代码行为不变；类感知归属是供给 M5d-6 最终 mapping（C1/C3/C5）的语义
+契约。
+
+语义边界预测 helper `predictGeneralBoundaries`
+（`include/grhsim/pass/general_boundaries.hpp`）静态模拟 build-general-nodes 的锥吸收
+规则（单消费者锥吸收、共享值/提交边界断开、规模上限），不建立 mapping 即给出预测
+超节点边界集；C1 改造（M5d-6）将与其共享同一实现。B7 的定向测试
+（`grhsim-split-phases-tests`）在无 `general` 相 mem 写的模型上校验预测边界集与
+build-general-nodes 实际 node 边界完全一致。

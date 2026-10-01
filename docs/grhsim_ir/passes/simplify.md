@@ -29,6 +29,9 @@ grhsim.used-bits              # 位需求分析、窄化及死锥清理
 - `phase`：每轮按 Event -> General -> Mem -> Output 逐分区执行子流程，各分区只改写本
   分区的 op。`--phase` 进一步限定单一分区（定向调试用）。
 
+生产接线（M5d-5）：A6 以 `--scope whole` 运行于全图优化段；B6 以 `--scope phase` 运行于
+分区段（`grhsim.split-phases` 之后、`clone-shared-compute` 之前）。
+
 ## scope 边界（phase 模式的保留规则）
 
 phase 模式保留分区接口、副作用根和跨分区引用，禁止跨阶段 CSE：
@@ -40,6 +43,8 @@ phase 模式保留分区接口、副作用根和跨分区引用，禁止跨阶�
 - used-bits 分析始终全图运行，共享状态的位需求天然取**所有分区需求的并集**；分区外
   op 被视为 opaque 全使用汇（operand/result 全宽、引用的状态全宽），局部需求因此永远不
   能单独窄化或删除共享状态。
+- canonicalize-compute 不删除结果被分区外 op 消费的 op（越界消费者永不重接，删除会使
+  其悬空）；mem 写参数等分区接口值由此完整保留（M5d-5 补齐的相位作用域护栏）。
 
 ## 终止条件与变化汇总
 

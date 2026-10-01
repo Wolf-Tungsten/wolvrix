@@ -575,7 +575,9 @@ namespace wolvrix::lib::grhsim
                 std::vector<uint32_t> perMem(model.states().size() + 1, 0);
                 for (const auto &op : model.operations())
                 {
-                    if (op.phase != SimPhase::Mem) continue;
+                    // M5d-5 compat: mem write operand slots key on the op
+                    // TYPE, not the op phase (B5 tags regLatch-class writes
+                    // General; this backend still commits them in P_mem).
                     const auto type = model.text(op.opType);
                     if (!isCpuPhaseMemWriteOp(type)) continue;
                     const auto refs = model.objectRefs(op);

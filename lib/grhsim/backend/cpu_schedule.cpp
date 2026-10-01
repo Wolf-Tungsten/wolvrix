@@ -809,13 +809,16 @@ namespace wolvrix::lib::grhsim
             return bitmaps;
         }
 
-        // cpu.st.build-mem-write-plan: Mem-phase write ops in op-id order
-        // (per-mem priority = ascending op id, preserving source order);
-        // readers are the target mem's General-phase memReads with their
-        // owning supernode (staticRow engaged when the address is a constant),
-        // plus the General-phase whole-array state.reads of the target (no
-        // address operand: always dynamic readers, activated on any write);
+        // cpu.st.build-mem-write-plan: mem write ops in op-id order (per-mem
+        // priority = ascending op id, preserving source order); readers are
+        // the target mem's General-phase memReads with their owning
+        // supernode (staticRow engaged when the address is a constant), plus
+        // the General-phase whole-array state.reads of the target (no address
+        // operand: always dynamic readers, activated on any write);
         // eventFree marks writes without event_acts.
+        // M5d-5 compat: writes are collected by op TYPE, not op phase — B5's
+        // class-aware attribution tags regLatch-class writes General while
+        // this legacy backend still commits every mem write in P_mem.
         std::vector<CpuMemWritePlanEntry> buildSixPhaseMemWritePlan(const GrhSimModel &model,
                                                                     const CpuPartitionTree &tree)
         {
@@ -841,7 +844,7 @@ namespace wolvrix::lib::grhsim
             std::vector<CpuMemWritePlanEntry> plan;
             for (const auto &op : model.operations())
             {
-                if (op.phase != SimPhase::Mem || !isCpuPhaseMemWriteOp(model.text(op.opType))) continue;
+                if (!isCpuPhaseMemWriteOp(model.text(op.opType))) continue;
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
                 CpuMemWritePlanEntry entry;

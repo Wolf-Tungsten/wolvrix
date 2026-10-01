@@ -83,10 +83,11 @@ fills unclassified states unless `--reclassify true` is given.
 
 ## Consumers
 
-- **B5 `grhsim.split-phases`** (M5d-5): the first consumer. A write op's
-  P_mem responsibility is decided by the *target state's class* — mem ops on
-  `mem`-class states go to P_mem; writes on `regLatch` states (including mem
-  ops on small arrays) stay on the next-buffer path.
+- **B5 [`grhsim.split-phases`](grhsim-split-phases.md)** (M5d-5, wired): the
+  first consumer. A write op's P_mem responsibility is decided by the *target
+  state's class* — mem ops on `mem`-class states go to P_mem; writes on
+  `regLatch` states (including mem ops on small arrays) stay on the
+  next-buffer path (General phase).
 - **C3 `cpu.st.layout-named-stores`** (M5d-6): pure physical layout — it
   consumes the annotation and makes zero classification decisions.
 - The legacy M3/M4 passes still classify implicitly by `TypeKind::Array`;
@@ -119,8 +120,9 @@ With any classification present, `verifyGrhSimModel` enforces:
 
 The phase consistency between the classification and the six-phase write
 attribution (mem ops on `mem` states carry P_mem, writes on `regLatch`
-states carry P_general) is validated after phase assignment, i.e. by the B8
-seal in M5d-5.
+states carry P_general) is enforced for every attributed op by the
+class-aware `verifyPhaseAttribution` (M5d-5), and the partition stage seals
+with `grhsim.verify --seal semantic` (B8).
 
 JSON: the class is the optional fifth element of a `states` row
 (`[id, name, type, origin, class]`); it is written only once classified, so

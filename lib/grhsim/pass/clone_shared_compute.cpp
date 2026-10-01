@@ -1,5 +1,42 @@
+// grhsim.clone-shared-compute (B7, boundary-aware rework per plan 归位决议 1,
+// M5d-5): clones cheap shared bijection producers per compute consumer when —
+// and only when — the clone eliminates a predicted P_general supernode
+// boundary. The pass reduces supernode boundaries (boundaryValueStore slots,
+// change detection and activation notifications), not partition boundaries:
+// the Event/Output cones are self-contained, so no cross-partition shared
+// compute exists.
+//
+// Two hard constraints pin the pass to the end of the semantic layer: it is
+// a semantic rewrite, so it must run before the single final CPU mapping (no
+// "mapping -> semantic rewrite -> mapping" round trip), and it must follow
+// the last CSE-bearing simplify (B6, scope=phase) or the clones would be
+// re-merged.
+//
+// Cost model: the candidate definition is unchanged (scalar two-state
+// bijection producers — not / 1-bit logicNot / xor / add / sub with exactly
+// one constant operand — whose varying input is itself shared, so deleting
+// the shared instance cannot merely move the boundary to a local input).
+// The blind "fanout >= 2" trigger is replaced by boundary awareness: the
+// predicted General node boundaries come from predictGeneralBoundaries
+// (general_boundaries.hpp), the helper that statically simulates
+// cpu.st.build-general-nodes' cone absorption and is shared with C1. A
+// candidate is cloned only when its result is a predicted boundary AND every
+// live consumer is a same-phase core.compute.* op — moving all consumers
+// onto local clones eliminates the boundary value outright (a survivor
+// consumer, e.g. a Mem-phase write sampling the value, would keep the
+// boundary and the clone would buy nothing). DPI calls, random sampling and
+// side-effecting system tasks are never cloned: they are not compute ops,
+// so they neither qualify as candidates nor move to clones.
+//
+// Clones inherit the source op's SimPhase. On a model without phase
+// attribution (grhsim.split-phases has not run) the predicted General op set
+// is empty and the pass is a no-op; the idle reason and the boundary
+// reduction counters are reported either way.
+
 #include "grhsim/pass/clone_shared_compute.hpp"
+
 #include "grhsim/ir/model.hpp"
+#include "grhsim/pass/general_boundaries.hpp"
 
 #include <algorithm>
 #include <array>
@@ -15,6 +52,7 @@ namespace wolvrix::lib::grhsim
         {
             uint32_t maxFanout = 8;
             uint32_t maxClones = 250000;
+            uint32_t maxOpsPerNode = 128;
         };
 
         const Type &valueType(const GrhSimModel &model, ValueId value)
@@ -76,6 +114,11 @@ namespace wolvrix::lib::grhsim
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
                 const auto originalCount = model.operations().size();
+                const GeneralBoundaryPrediction prediction =
+                    predictGeneralBoundaries(model, options_.maxOpsPerNode);
+                uint64_t predictedBoundaries = 0;
+                for (const auto marked : prediction.boundaryValue) predictedBoundaries += marked;
+
                 std::vector<OpId> producers(model.values().size() + 1);
                 std::vector<std::vector<OpId>> users(model.values().size() + 1);
                 for (const auto &op : model.operations())
@@ -93,7 +136,7 @@ namespace wolvrix::lib::grhsim
                 // downstream roots first so their clones become the live users
                 // of upstream roots, independent of operation insertion order.
                 std::vector<ValueId> sources(originalCount + 1);
-                uint32_t candidates = 0, skipped = 0, cloned = 0, dead = 0;
+                uint32_t candidates = 0;
                 for (std::size_t i = 0; i < originalCount; ++i)
                 {
                     const auto &source = model.operations()[i];
@@ -121,6 +164,8 @@ namespace wolvrix::lib::grhsim
                     if (sources[source.id.index] && children[source.id.index] == 0) ready.push_back(source.id);
 
                 std::vector<uint8_t> removeOps(originalCount + 1);
+                uint32_t cloned = 0, dead = 0, boundaryHits = 0;
+                uint32_t skippedFanout = 0, skippedNonCompute = 0, skippedLocal = 0, skippedBudget = 0;
                 for (std::size_t cursor = 0; cursor < ready.size(); ++cursor)
                 {
                     const auto root = ready[cursor];
@@ -129,9 +174,11 @@ namespace wolvrix::lib::grhsim
                     // Copy IDs/ranges before appending; operation/value/pool
                     // vectors and the string interner can move during insertion.
                     const auto source = model.operations()[root.index - 1];
+                    const auto sourcePhase = source.phase;
                     const auto result = model.results(source)[0];
                     std::vector<OpId> computeUsers;
                     std::size_t consumers = 0;
+                    bool nonComputeConsumer = false;
                     for (auto user : users[result.index])
                     {
                         if (removeOps[user.index]) continue;
@@ -139,14 +186,36 @@ namespace wolvrix::lib::grhsim
                         const auto operands = model.operands(op);
                         if (std::find(operands.begin(), operands.end(), result) == operands.end()) continue;
                         ++consumers;
-                        if (model.text(op.opType).starts_with("core.compute."))
+                        // Only same-phase compute consumers move to a clone;
+                        // anything else (a Mem-phase write sampling the value,
+                        // a read, a side-effecting op, a cross-phase consumer)
+                        // keeps the boundary alive and blocks the clone.
+                        if (op.phase == sourcePhase &&
+                            model.text(op.opType).starts_with("core.compute."))
                             computeUsers.push_back(user);
+                        else nonComputeConsumer = true;
                     }
-                    if (computeUsers.empty()) continue;
-                    if (consumers < 2 || consumers > options_.maxFanout ||
-                        computeUsers.size() > options_.maxClones - cloned)
+                    if (consumers == 0) continue;
+                    if (consumers < 2 || consumers > options_.maxFanout)
                     {
-                        ++skipped;
+                        ++skippedFanout;
+                        continue;
+                    }
+                    if (nonComputeConsumer || computeUsers.size() != consumers)
+                    {
+                        ++skippedNonCompute;
+                        continue;
+                    }
+                    if (result.index >= prediction.boundaryValue.size() ||
+                        !prediction.boundaryValue[result.index])
+                    {
+                        ++skippedLocal;
+                        continue;
+                    }
+                    ++boundaryHits;
+                    if (computeUsers.size() > options_.maxClones - cloned)
+                    {
+                        ++skippedBudget;
                         continue;
                     }
 
@@ -160,6 +229,9 @@ namespace wolvrix::lib::grhsim
                                           "." + std::to_string(source.id.index);
                         const auto local = model.addValue(value.type, name, value.origin);
                         const auto clone = model.addOperation(opType, operands, std::array{local}, {}, {}, name, source.origin);
+                        // Clones stay in the source's partition: they are
+                        // absorbed into the consumer's predicted node.
+                        model.setOperationPhase(clone, sourcePhase);
                         removeOps.push_back(0);
                         users.resize(model.values().size() + 1);
                         for (auto operand : operands)
@@ -178,26 +250,45 @@ namespace wolvrix::lib::grhsim
                         model.replaceOperation(op.id, userType, inputs, results, refs, params);
                         ++cloned;
                     }
-                    if (consumers == computeUsers.size())
-                    {
-                        removeOps[root.index] = 1;
-                        ++dead;
-                    }
+                    // Every consumer moved to a clone: the shared source is
+                    // dead and its predicted boundary is eliminated.
+                    removeOps[root.index] = 1;
+                    ++dead;
                 }
 
                 if (cloned != 0)
                 {
-                    // Non-compute users retain the original producer. No reads,
-                    // state objects, effects, or unrelated dead operations vanish.
-                    // Repack replaced operand ranges even when a commit user keeps
-                    // every root alive; serialized pool counts must stay exact.
+                    // The strict consumer rule moved every consumer to a
+                    // clone, so every visited root is removed; no reads, state
+                    // objects, effects, or unrelated dead operations vanish.
+                    // Repack replaced operand ranges; serialized pool counts
+                    // must stay exact.
                     model.compact(removeOps, std::vector<uint8_t>(model.states().size() + 1));
                 }
+                std::string idleReason = "none";
+                if (cloned == 0)
+                {
+                    if (prediction.nodeCount == 0)
+                        idleReason = "no_general_ops";
+                    else if (candidates == 0)
+                        idleReason = "no_candidates";
+                    else if (boundaryHits == 0)
+                        idleReason = "no_boundary_candidates";
+                    else
+                        idleReason = "budget_exhausted";
+                }
                 diagnostics.info("shared_compute_candidates=" + std::to_string(candidates) +
+                                 " boundary_values_predicted=" + std::to_string(predictedBoundaries) +
+                                 " boundary_hits=" + std::to_string(boundaryHits) +
                                  " cloned=" + std::to_string(cloned) +
+                                 " boundary_values_eliminated=" + std::to_string(dead) +
                                  " dead_sources_removed=" + std::to_string(dead) +
-                                 " skipped=" + std::to_string(skipped) +
-                                 " cyclic=" + std::to_string(candidates - ready.size()), name());
+                                 " skipped_fanout=" + std::to_string(skippedFanout) +
+                                 " skipped_non_compute_consumer=" + std::to_string(skippedNonCompute) +
+                                 " skipped_local=" + std::to_string(skippedLocal) +
+                                 " skipped_budget=" + std::to_string(skippedBudget) +
+                                 " cyclic=" + std::to_string(candidates - ready.size()) +
+                                 " idle_reason=" + idleReason, name());
                 return {true, cloned != 0, {}};
             }
 
@@ -237,6 +328,7 @@ namespace wolvrix::lib::grhsim
                     }
                     if (args[i] == "--max-fanout") options.maxFanout = value;
                     else if (args[i] == "--max-clones") options.maxClones = value;
+                    else if (args[i] == "--max-op-in-compute-node") options.maxOpsPerNode = value;
                     else
                     {
                         factoryError = "unknown option: " + std::string(args[i]);

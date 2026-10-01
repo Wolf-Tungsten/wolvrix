@@ -49,7 +49,9 @@ The pass has nine steps, in order:
    the `event_edges` parameter and append `event_acts` (int64 array of cluster
    indices in the original event order). `regWrite`, `system.task` and
    `dpi.call` get phase `general`; the four mem writes stay phase-less (`None`)
-   until M3 split-phases attributes them to P_mem.
+   until the semantic split ([`grhsim.split-phases`](grhsim-split-phases.md), B5,
+   M5d-5) attributes them class-aware — P_mem for `mem`-class targets, P_general
+   for `regLatch`-class targets.
 7. Sweep any unreferenced `__event_*` history state left over from a pre-M5
    checkpoint together with its InitRecord, and sweep the dead original cone
    ops to a fixed point (`sweepDeadConeOps`): only `core.compute.*` and the

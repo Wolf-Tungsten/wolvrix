@@ -344,6 +344,10 @@ namespace wolvrix::lib::grhsim
         // system.task/dpi.call are mergeable sinks: they anchor nodes (they
         // are never absorbed) while their single-consumer operand cones absorb
         // into the sink's node.
+        // M5d-5 compat: mem write op types stay out of node formation even
+        // when B5's class-aware attribution tags a regLatch-class write
+        // General — this legacy backend schedules every mem write in P_mem
+        // (see cpu.st.split-phases); M5d-6 forms nodes over them.
         void buildGeneralNodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
                                diag::Diagnostics &diagnostics)
         {
@@ -351,7 +355,8 @@ namespace wolvrix::lib::grhsim
             const auto phase = phasePartition(tree, CpuPhase::General);
             std::vector<OpId> ops;
             for (const auto &op : model.operations())
-                if (op.phase == SimPhase::General) ops.push_back(op.id);
+                if (op.phase == SimPhase::General && !isMemWriteOp(model.text(op.opType)))
+                    ops.push_back(op.id);
             const auto stats = formNodes(model, tree, phase, std::move(ops), maxOps);
             diagnostics.info("general_nodes=" + std::to_string(stats.nodes) +
                              " boundary_value_targets=" + std::to_string(stats.boundaryEdges), "cpu.st.build-general-nodes");
@@ -952,11 +957,19 @@ namespace wolvrix::lib::grhsim
             std::vector<uint32_t> options_;
         };
 
-        // cpu.st.split-phases: completes the M2 phase attribution (None mem
-        // writes -> Mem, None output.write -> Output, every other None op ->
-        // General), then builds the four-branch root: flat Event (cone topo
-        // order, edgeDets last), empty General shell, flat Mem in op-id order
-        // (static priority seed), flat Output in topo order.
+        // cpu.st.split-phases: builds the four-branch root from the model's
+        // phase attribution: flat Event (cone topo order, edgeDets last),
+        // empty General shell, flat Mem in op-id order (static priority
+        // seed), flat Output in topo order.
+        //
+        // M5d-5 compat: production phase attribution moved to the semantic
+        // pass grhsim.split-phases (B5), which is class-aware — mem writes on
+        // regLatch-class states carry SimPhase::General there. This legacy
+        // backend keeps scheduling by op TYPE: the fallback attribution loop
+        // below only fires on models that never ran B5 (unit tests), and the
+        // Mem branch collects every mem write op regardless of phase, so the
+        // emitted P_mem behavior is unchanged. The whole pass is replaced by
+        // cpu.st.build-general-nodes' mapping init in M5d-6.
         class SplitPhasesPass final : public Pass
         {
         public:
@@ -994,7 +1007,7 @@ namespace wolvrix::lib::grhsim
                 event.ops = orderFlatPhaseOps(model, SimPhase::Event, true);
                 auto &mem = tree.partitions[branches[2].index - 1];
                 for (const auto &op : model.operations())
-                    if (op.phase == SimPhase::Mem) mem.ops.push_back(op.id);
+                    if (isMemWriteOp(model.text(op.opType))) mem.ops.push_back(op.id);
                 auto &output = tree.partitions[branches[3].index - 1];
                 output.ops = orderFlatPhaseOps(model, SimPhase::Output, false);
                 mapping.stage = CpuMappingStage::SplitPhases;

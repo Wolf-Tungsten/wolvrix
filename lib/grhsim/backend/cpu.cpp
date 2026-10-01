@@ -360,7 +360,13 @@ namespace wolvrix::lib::grhsim
                     const auto required = phase == CpuPhase::Event ? SimPhase::Event :
                                           phase == CpuPhase::General ? SimPhase::General :
                                           phase == CpuPhase::Mem ? SimPhase::Mem : SimPhase::Output;
-                    if (op.phase != required) return error("op belongs to the wrong phase branch");
+                    // M5d-5 compat: the Mem branch schedules by op type, so a
+                    // regLatch-class mem write (B5 tags it General) is
+                    // allowed here; every other op must match its branch.
+                    if (op.phase != required &&
+                        !(phase == CpuPhase::Mem && op.phase == SimPhase::General &&
+                          memWrite(model.text(op.opType))))
+                        return error("op belongs to the wrong phase branch");
                     if (phase == CpuPhase::Mem && !memWrite(model.text(op.opType)))
                         return error("mem branch holds only memory write ops");
                     (phase == CpuPhase::Event ? eventOps : phase == CpuPhase::General ? generalOps :

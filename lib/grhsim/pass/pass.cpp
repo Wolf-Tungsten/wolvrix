@@ -21,6 +21,7 @@
 #include "grhsim/pass/lower_edge_detect.hpp"
 #include "grhsim/pass/extract_output_cones.hpp"
 #include "grhsim/pass/migrate_timeslot_tasks.hpp"
+#include "grhsim/pass/split_phases.hpp"
 #include "grhsim/backend/cpu.hpp"
 
 #include "grhsim/dialect/registry.hpp"
@@ -38,13 +39,22 @@ namespace wolvrix::lib::grhsim
         class VerifyPass final : public Pass
         {
         public:
-            VerifyPass() : Pass("grhsim.verify", PassKind::Analysis) {}
+            explicit VerifyPass(bool seal) : Pass("grhsim.verify", PassKind::Analysis), seal_(seal) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
-                return PassResult{verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics),
-                                  false, {}};
+                // B8 semantic seal (M5d-5): the partition stage ends with
+                // `grhsim.verify --seal semantic`; after it no semantic
+                // rewrite may follow (the CPU mapping stage is next).
+                if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
+                    return PassResult{false, false, {}};
+                if (seal_ && !verifyGrhSimSemanticSeal(model, diagnostics))
+                    return PassResult{false, false, {}};
+                return PassResult{true, false, {}};
             }
+
+        private:
+            bool seal_;
         };
 
     } // namespace
@@ -200,16 +210,31 @@ namespace wolvrix::lib::grhsim
         registerLowerEdgeDetectPass(registry);
         registerExtractOutputConesPass(registry);
         registerMigrateTimeslotTasksPass(registry);
+        // M5d-5 B5: the semantic-layer phase attribution follows the M2
+        // lowering passes; the B6 phase simplify and B7 boundary-aware clone
+        // run after it (see flows/cpu-st.md).
+        registerSplitPhasesPass(registry);
         std::string error;
         registry.registerPass(
             "grhsim.verify", PassKind::Analysis,
             [](std::span<const std::string_view> args, std::string &factoryError) {
-                if (!args.empty())
+                bool seal = false;
+                if (args.size() % 2 != 0)
                 {
-                    factoryError = "grhsim.verify does not accept arguments";
+                    factoryError = "grhsim.verify options must be --key value pairs";
                     return std::unique_ptr<Pass>{};
                 }
-                return std::unique_ptr<Pass>(std::make_unique<VerifyPass>());
+                for (std::size_t i = 0; i < args.size(); i += 2)
+                {
+                    if (args[i] == "--seal" && args[i + 1] == "semantic") seal = true;
+                    else
+                    {
+                        factoryError = "unknown grhsim.verify option: " + std::string(args[i]) +
+                                       (args[i] == "--seal" ? " " + std::string(args[i + 1]) : "");
+                        return std::unique_ptr<Pass>{};
+                    }
+                }
+                return std::unique_ptr<Pass>(std::make_unique<VerifyPass>(seal));
             }, error);
         return registry;
     }

@@ -146,6 +146,8 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/lower_edge_detect.cpp
     lib/grhsim/pass/extract_output_cones.cpp
     lib/grhsim/pass/migrate_timeslot_tasks.cpp
+    lib/grhsim/pass/split_phases.cpp
+    lib/grhsim/pass/general_boundaries.cpp
     lib/grhsim/backend/cpu.cpp
     lib/grhsim/backend/cpu_partition.cpp
     lib/grhsim/backend/cpu_layout.cpp
@@ -421,6 +423,22 @@ target_compile_definitions(grhsim-select-state-stores-tests
 )
 
 register_test_exe(grhsim-select-state-stores-tests)
+
+add_executable(grhsim-split-phases-tests
+    tests/grhsim/test_grhsim_split_phases.cpp
+)
+
+target_link_libraries(grhsim-split-phases-tests
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-split-phases-tests
+    PRIVATE
+        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
+)
+
+register_test_exe(grhsim-split-phases-tests)
 
 add_executable(grhsim-cpu-mapping-tests tests/grhsim/test_cpu_mapping.cpp)
 add_executable(grhsim-reg-to-mem-tests tests/grhsim/test_reg_to_mem.cpp tests/grhsim/test_reg_to_mem_semantics.cpp)

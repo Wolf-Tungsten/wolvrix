@@ -278,6 +278,19 @@ namespace wolvrix::lib::grhsim
                 std::vector<uint32_t> producer(sources.size());
                 for (const auto &op : model.operations())
                     for (auto value : model.results(op)) producer[value.index] = op.id.index;
+                // Phase scope: a value consumed by an out-of-scope op is part
+                // of the partition interface. Such a value's producer must
+                // never be removed below — the consumer is not rewired (the
+                // rewire loop skips out-of-scope ops), so removing the
+                // producer would leave a dangling reference (compact throws).
+                // The only legal cross-phase consumer relation is a Mem write
+                // sampling a General value.
+                std::vector<uint8_t> outOfScopeConsumer(sources.size(), 0);
+                if (!scope.wholeGraph)
+                    for (const auto &op : model.operations())
+                        if (!scope.inScope(op.phase))
+                            for (auto operand : model.operands(op))
+                                outOfScopeConsumer[operand.index] = 1;
                 const auto phaseOf = [&](ValueId value) {
                     const auto opIndex = producer[value.index];
                     return opIndex ? model.operations()[opIndex - 1].phase : SimPhase::None;
@@ -301,6 +314,7 @@ namespace wolvrix::lib::grhsim
                     const auto &type = model.types()[typeId.index - 1];
                     if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
                         typeId == model.values()[operands[0].index - 1].type &&
+                        !outOfScopeConsumer[results[0].index] &&
                         phaseCompatible(op.phase, phaseOf(operands[0])))
                         sources[results[0].index] = operands[0];
                 }
@@ -407,6 +421,7 @@ namespace wolvrix::lib::grhsim
                         high - low + 1 != static_cast<int64_t>(resultType.width)) continue;
                     if (low == 0 && high + 1 == static_cast<int64_t>(sourceType.width) &&
                         model.values()[source.index - 1].type == resultTypeId &&
+                        !outOfScopeConsumer[results[0].index] &&
                         phaseCompatible(op.phase, phaseOf(source)))
                     {
                         canonical[results[0].index] = source;
@@ -457,7 +472,8 @@ namespace wolvrix::lib::grhsim
                             if (scope.inScope(op.phase))
                             {
                                 if (const auto replacement = simplify(model, op, operands, constants);
-                                    replacement && phaseCompatible(op.phase, phaseOf(replacement)))
+                                    replacement && !outOfScopeConsumer[results[0].index] &&
+                                    phaseCompatible(op.phase, phaseOf(replacement)))
                                 {
                                     canonical[results[0].index] = replacement;
                                     removed[op.id.index] = 1;
@@ -491,7 +507,7 @@ namespace wolvrix::lib::grhsim
                             if (pure)
                             {
                                 const auto [entry, inserted] = expressions.emplace(std::move(key), results[0]);
-                                if (!inserted)
+                                if (!inserted && !outOfScopeConsumer[results[0].index])
                                 {
                                     canonical[results[0].index] = entry->second;
                                     removed[op.id.index] = 1;

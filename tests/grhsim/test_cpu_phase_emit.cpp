@@ -55,10 +55,12 @@ namespace
     // classification and B5 semantic phase attribution, then the C-segment
     // mapping (C1 build-general-nodes initializes the mapping; C2 merge; C3
     // layout; C4 bitmaps; C5 mem write plan; C6 function packing; C7 phase
-    // schedule). allMem forces every array into the mem store class for the
-    // P_mem-pinned fixtures; by default small arrays classify regLatch and
-    // their writes become General-phase NBA ops (M5d-6).
-    void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes, bool allMem = false)
+    // schedule), closed by the M5d-7 C8 TU planning. allMem forces every
+    // array into the mem store class for the P_mem-pinned fixtures; by
+    // default small arrays classify regLatch and their writes become
+    // General-phase NBA ops (M5d-6). tinyTu shrinks the C6/C8 size caps so a
+    // small model still exercises chunked functions and multi-TU emit.
+    void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes, bool allMem = false, bool tinyTu = false)
     {
         runPass(model, "grhsim.classify-event-inputs");
         runPass(model, "grhsim.lower-edge-detect");
@@ -85,10 +87,20 @@ namespace
         runPass(model, "cpu.st.layout-named-stores");
         runPass(model, "cpu.st.build-event-bitmaps");
         runPass(model, "cpu.st.build-mem-write-plan");
-        runPass(model, "cpu.st.pack-general-functions");
+        if (tinyTu)
+            runPass(model, "cpu.st.pack-general-functions",
+                    std::array<std::string_view, 2>{"--helper-max-estimated-lines", "32"});
+        else
+            runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
-        require(model.cpuMapping() && model.cpuMapping()->stage == CpuMappingStage::PhaseSchedule,
-                "six-phase pipeline did not reach the PhaseSchedule stage");
+        if (tinyTu)
+            runPass(model, "cpu.st.plan-translation-units",
+                    std::array<std::string_view, 4>{"--chunk-max-estimated-lines", "24",
+                                                    "--unit-max-estimated-lines", "64"});
+        else
+            runPass(model, "cpu.st.plan-translation-units");
+        require(model.cpuMapping() && model.cpuMapping()->stage == CpuMappingStage::TranslationUnits,
+                "six-phase pipeline did not reach the TranslationUnits stage");
     }
 
     bool verifies(const GrhSimModel &model)
@@ -221,9 +233,11 @@ namespace
     // End-to-end: emit the mapped model, build it with the emitted Makefile,
     // compile a driver against the static library, run it. Returns the captured
     // task stdout when captureStdout is set (the driver freopens stdout).
+    // expectMultiTu (M5d-7) additionally checks the emit produced several
+    // translation units and that the generated Makefile lists exactly them.
     std::string compileAndRun(const GrhSimModel &model, const std::filesystem::path &directory,
                               const std::vector<DriveStep> &steps, bool captureStdout = false,
-                              std::string_view prelude = {})
+                              std::string_view prelude = {}, bool expectMultiTu = false)
     {
         const auto top = std::string(model.text(model.name()));
         std::filesystem::remove_all(directory);
@@ -233,6 +247,18 @@ namespace
         for (const auto &message : diagnostics.messages())
             std::cout << message.context << ": " << message.message << '\n';
         require(result.success && !result.artifacts.empty(), "six-phase emit failed");
+        if (expectMultiTu)
+        {
+            std::vector<std::string> sources;
+            for (const auto &entry : std::filesystem::directory_iterator(directory / "model"))
+                if (entry.path().extension() == ".cpp") sources.push_back(entry.path().filename().string());
+            require(sources.size() > 1, "multi-TU emit produced a single translation unit");
+            std::ifstream makefile(directory / "model" / "Makefile");
+            const std::string text{std::istreambuf_iterator<char>(makefile), std::istreambuf_iterator<char>()};
+            for (const auto &source : sources)
+                require(text.find(source) != std::string::npos,
+                        "generated Makefile misses TU source " + source);
+        }
         {
             std::ofstream driver(directory / "driver.cpp");
             driver << driverSource(top, steps, captureStdout, prelude);
@@ -261,6 +287,23 @@ namespace
         std::istringstream stream(text);
         for (std::string line; std::getline(stream, line);) lines.push_back(line);
         return lines;
+    }
+
+    // M5d-7: the emit writes one .cpp per translation unit; source-text
+    // assertions read them all concatenated.
+    std::string concatModelSources(const std::filesystem::path &modelDir)
+    {
+        std::vector<std::filesystem::path> sources;
+        for (const auto &entry : std::filesystem::directory_iterator(modelDir))
+            if (entry.path().extension() == ".cpp") sources.push_back(entry.path());
+        std::sort(sources.begin(), sources.end());
+        std::string text;
+        for (const auto &path : sources)
+        {
+            std::ifstream stream(path);
+            text += std::string{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+        }
+        return text;
     }
 
     // (a) input -> output passthrough: the whole cone extracts into P_output;
@@ -336,7 +379,7 @@ namespace
         });
     }
 
-    void randomSystemFunctionTest(const std::filesystem::path &root)
+    void randomSystemFunctionTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_random_function");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -349,7 +392,7 @@ namespace
         model.addOperation("core.system.function", {}, std::array{result}, {}, params);
         addOutputWrite(model, "o", word, result);
         require(verifies(model), "random system function fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, false, tinyTu);
         std::vector<int64_t> sampleIds;
         bool sawGeneral = false, sawOutput = false;
         for (const auto &op : model.operations())
@@ -372,11 +415,11 @@ namespace
             value = (value ^ (value >> 27u)) * UINT64_C(0x94d049bb133111eb);
             return std::to_string(static_cast<std::uint32_t>(value ^ (value >> 31u)));
         };
-        compileAndRun(model, root / "random_function", {
+        compileAndRun(model, root / (tinyTu ? "random_function_tu" : "random_function"), {
             {{}, {{"o", next()}}},
             {{}, {{"o", next()}}},
             {{}, {{"o", next()}}},
-        });
+        }, false, {}, tinyTu);
     }
 
     void randomSampleIdAfterCompactTest()
@@ -499,7 +542,7 @@ namespace
     }
 
     // The registered pass rejects removed legacy options and models that did
-    // not reach the PhaseSchedule stage.
+    // not reach the TranslationUnits stage.
     void passRegistrationTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_pass_registration");
@@ -544,7 +587,7 @@ namespace
             require(bool(pass), error);
             diag::Diagnostics diagnostics;
             const auto result = pass->run(model, diagnostics);
-            require(result.success, "emit-phase-cpp failed on a PhaseSchedule mapping");
+            require(result.success, "emit-phase-cpp failed on a TranslationUnits mapping");
             require(diagnostics.messages().size() >= 2, "emit-phase-cpp omitted option diagnostics");
             require(std::filesystem::exists(outDir / "grhsim_phase_pass_registration.hpp"),
                     "emit-phase-cpp wrote no header");
@@ -556,7 +599,7 @@ namespace
     // prev without firing (so the next posedge is seen). A second register
     // toggles on *both* clk edges (same signal, two clusters), which pins the
     // edge-direction encoding: negedges fire the both-edge detector only.
-    void counterTest(const std::filesystem::path &root)
+    void counterTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_counter");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -577,7 +620,7 @@ namespace
         addOutputWrite(model, "o", byte, cntRead);
         addOutputWrite(model, "ot", bit, tRead);
         require(verifies(model), "counter fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, false, tinyTu);
         const auto &mapping = *model.cpuMapping();
         const auto &stores = *mapping.dataLayout->namedStores;
         require(stores[3].fields.size() == 2, "counter should have two prevEvent slots");
@@ -587,7 +630,7 @@ namespace
         require(bitmaps.size() == 2 && bitmapBits(bitmaps[0]) == 2 && bitmapBits(bitmaps[1]) == 2 &&
                     bitmaps[0].supernodeWords != bitmaps[1].supernodeWords,
                 "counter bitmaps should cover the two write supernodes separately");
-        compileAndRun(model, root / "counter", {
+        compileAndRun(model, root / (tinyTu ? "counter_tu" : "counter"), {
             {{{"clk", "false"}}, {{"o", "0"}, {"ot", "false"}}},   // no edge at init
             {{{"clk", "true"}}, {{"o", "1"}, {"ot", "true"}}},     // posedge fires both detectors
             {{{"clk", "true"}}, {{"o", "1"}, {"ot", "true"}}},     // no input change, no re-fire
@@ -599,7 +642,7 @@ namespace
             {{{"clk", "true"}}, {{"o", "4"}, {"ot", "true"}}},
             {{{"clk", "false"}}, {{"o", "4"}, {"ot", "false"}}},
             {{{"clk", "true"}}, {{"o", "5"}, {"ot", "true"}}},
-        });
+        }, false, {}, tinyTu);
     }
 
     // (2) A -> B NBA chain: at posedge clk, A <= in and B <= A in the same
@@ -764,7 +807,7 @@ namespace
     // d one round after q rises, inside the same eval as the clk edge. The
     // driver-side half (逐 eval 边沿判定与 prev 更新) toggles clk across evals:
     // negedges never fire the posedge detectors but still refresh prev.
-    void glitchClockTest(const std::filesystem::path &root)
+    void glitchClockTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_glitch_clock");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -781,10 +824,10 @@ namespace
         addOutputWrite(model, "oq", bit, qRead);
         addOutputWrite(model, "oq2", bit, addStateRead(model, q2, "q2_r"));
         require(verifies(model), "glitch clock fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, false, tinyTu);
         const auto &mapping = *model.cpuMapping();
         require(mapping.schedule->eventBitmaps->size() == 2, "glitch clock should have two clusters");
-        compileAndRun(model, root / "glitch_clock", {
+        compileAndRun(model, root / (tinyTu ? "glitch_clock_tu" : "glitch_clock"), {
             {{{"d", "true"}, {"clk", "false"}}, {{"oq", "false"}, {"oq2", "false"}}},
             {{{"clk", "true"}}, {{"oq", "true"}, {"oq2", "true"}}},    // q rises; q2 samples d=1 in round 2
             {{{"clk", "false"}}, {{"oq", "true"}, {"oq2", "true"}}},
@@ -795,7 +838,7 @@ namespace
             {{{"clk", "true"}}, {{"oq", "false"}, {"oq2", "false"}}},  // q falls again
             {{{"d", "true"}, {"clk", "false"}}, {{"oq", "false"}, {"oq2", "false"}}},
             {{{"clk", "true"}}, {{"oq", "true"}, {"oq2", "true"}}},    // q2 <= d=1
-        });
+        }, false, {}, tinyTu);
     }
 
     StateId addMemState(GrhSimModel &model, std::string_view name, TypeId arrayType, std::string fillLiteral)
@@ -963,12 +1006,11 @@ namespace
             {{{"waddr", "3"}, {"wdata", "51"}, {"raddr", "3"}}, {{"os", "17"}, {"od", "17"}}},  // raddr 5->3 re-reads mem[3]=17
             {{{"clk", "true"}}, {{"os", "51"}, {"od", "51"}}},    // hit row 3 again
         });
-        std::ifstream source(root / "mem_gating" / "model" / "grhsim_phase_mem_gating.cpp");
-        const std::string text{std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
-        // Two reader activations in the P_mem body: one guarded (static row 3),
-        // one unconditional (dynamic address).
-        const auto pMemAt = text.find("::pMem()");
-        require(pMemAt != std::string::npos, "pMem body missing");
+        const std::string text = concatModelSources(root / "mem_gating" / "model");
+        // Two reader activations in the P_mem write chunk: one guarded (static
+        // row 3), one unconditional (dynamic address).
+        const auto pMemAt = text.find("::pMem_c0()");
+        require(pMemAt != std::string::npos, "pMem chunk body missing");
         const auto pMemEnd = text.find("::pPublish()", pMemAt);
         const std::string pMem = text.substr(pMemAt, pMemEnd == std::string::npos ? pMemEnd : pMemEnd - pMemAt);
         require(pMem.find("==3)dataActiveFlagNext[") != std::string::npos,
@@ -982,7 +1024,7 @@ namespace
     // triple wins an address collision (core.md: the chain head sits last).
     // Three ports: A writes row 3 a constant 0xaa, B overwrites row 3 with
     // input data, C (highest) writes input address/data under an enable.
-    void memPriorityTest(const std::filesystem::path &root)
+    void memPriorityTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_mem_priority");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1004,10 +1046,10 @@ namespace
                        mem, {{clk, "posedge"}});
         addOutputWrite(model, "o", word, addMemRead(model, mem, word, raddr, "r"));
         require(verifies(model), "mem priority fixture rejected");
-        runSixPhasePipeline(model, false, true);
+        runSixPhasePipeline(model, false, true, tinyTu);
         const auto &mapping = *model.cpuMapping();
         require(mapping.schedule->memWritePlan->size() == 1, "mem priority should have one write op");
-        compileAndRun(model, root / "mem_priority", {
+        compileAndRun(model, root / (tinyTu ? "mem_priority_tu" : "mem_priority"), {
             {{{"clk", "false"}, {"enc", "false"}, {"bdata", "0"}, {"caddr", "0"}, {"cdata", "0"}, {"raddr", "3"}},
              {{"o", "0"}}},
             {{{"bdata", "187"}}, {{"o", "0"}}},
@@ -1021,7 +1063,7 @@ namespace
             {{{"raddr", "3"}}, {{"o", "204"}}},    // row 3 got B's value again this edge (C hit row 7)
             {{{"enc", "false"}, {"clk", "false"}}, {{"o", "204"}}},
             {{{"clk", "true"}}, {{"o", "204"}}},
-        });
+        }, false, {}, tinyTu);
     }
 
     // (11) General-phase $display: an event-free task prints on every firing of
@@ -1123,7 +1165,7 @@ namespace
     // (13) Event-driven timeslot task ($strobe on posedge clk): P_event sets
     // the eval-sticky timeslotTriggerFlag on the edge; P_output consumes and
     // clears it. The flag is data-independent, so every posedge reports.
-    void monitorEventTest(const std::filesystem::path &root)
+    void monitorEventTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_monitor_event");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1138,13 +1180,13 @@ namespace
         model.addOperation("core.system.task", std::array{one, a, clk}, {},
                            {}, params);
         require(verifies(model), "strobe fixture rejected");
-        runSixPhasePipeline(model, false);
+        runSixPhasePipeline(model, false, false, tinyTu);
         const auto &mapping = *model.cpuMapping();
         const auto &timeslot = (*mapping.dataLayout->namedStores)[5];
         require(timeslot.fields.size() == 1, "event strobe should hold one timeslot flag");
         require(mapping.schedule->timeslotTriggers && !mapping.schedule->timeslotTriggers->empty(),
                 "event strobe should have a trigger mapping");
-        const std::string text = compileAndRun(model, root / "monitor_event", {
+        const std::string text = compileAndRun(model, root / (tinyTu ? "monitor_event_tu" : "monitor_event"), {
             {{{"a", "false"}, {"clk", "false"}}, {}},
             {{{"a", "true"}}, {}},
             {{{"clk", "true"}}, {}},    // posedge: print "1"
@@ -1154,7 +1196,7 @@ namespace
             {{{"clk", "true"}}, {}},    // posedge: print "0"
             {{{"clk", "false"}}, {}},
             {{{"clk", "true"}}, {}},    // posedge: print "0" again (data-independent flag)
-        }, true);
+        }, true, {}, tinyTu);
         const auto lines = linesOf(text);
         const std::vector<std::string> expected{"1", "0", "0"};
         require(lines == expected, "strobe output mismatch: got [" + std::string([&] {
@@ -1164,7 +1206,7 @@ namespace
     // (14) DPI smoke: an event-free import call (result republished through a
     // boundary field into a latch) and a posedge-gated import call. The driver
     // supplies the extern "C" definitions.
-    void dpiSmokeTest(const std::filesystem::path &root)
+    void dpiSmokeTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_dpi_smoke");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1197,8 +1239,8 @@ namespace
         require(verifies(model), "dpi fixture rejected");
         // Default merge keeps the event-free call out of the gated call's
         // supernode (same merge prohibition as the display test).
-        runSixPhasePipeline(model, false);
-        compileAndRun(model, root / "dpi_smoke", {
+        runSixPhasePipeline(model, false, false, tinyTu);
+        compileAndRun(model, root / (tinyTu ? "dpi_smoke_tu" : "dpi_smoke"), {
             {{{"a", "0"}, {"d", "0"}, {"clk", "false"}}, {{"o", "1"}, {"o2", "0"}}},
             {{{"a", "1"}}, {{"o", "2"}, {"o2", "0"}}},
             {{{"d", "3"}}, {{"o", "2"}, {"o2", "0"}}},    // no edge: gated call skipped
@@ -1209,7 +1251,7 @@ namespace
             {{{"a", "255"}}, {{"o", "0"}, {"o2", "8"}}},  // wraps
         }, false,
         "extern \"C\" std::uint8_t cpu_test_inc(std::uint8_t x){return static_cast<std::uint8_t>(x+1);}\n"
-        "extern \"C\" std::uint8_t cpu_test_dbl(std::uint8_t x){return static_cast<std::uint8_t>(x*2);}\n");
+        "extern \"C\" std::uint8_t cpu_test_dbl(std::uint8_t x){return static_cast<std::uint8_t>(x*2);}\n", tinyTu);
     }
 
     void dpiBitAbiTest(const std::filesystem::path &root)
@@ -1235,8 +1277,9 @@ namespace
             {{{"input", "false"}}, {{"returned", "false"}, {"output", "false"}}},
             {{{"input", "true"}}, {{"returned", "true"}, {"output", "false"}}},
         }, false, "extern \"C\" std::uint8_t cpu_test_bit_abi(std::uint8_t* out, std::uint8_t in) { *out = 2; return in ? 3 : 0; }\n");
-        std::ifstream generated(root / "dpi_bit_abi" / "model" / "grhsim_phase_dpi_bit_abi.cpp");
-        const std::string source{std::istreambuf_iterator<char>(generated), std::istreambuf_iterator<char>()};
+        // M5d-7: DPI import declarations are per-TU (never in the public
+        // header); the concatenated sources carry the referenced import.
+        const std::string source = concatModelSources(root / "dpi_bit_abi" / "model");
         require(source.find("extern \"C\" std::uint8_t cpu_test_bit_abi(std::uint8_t*,std::uint8_t);") !=
                     std::string::npos, "1-bit DPI declaration does not use the svBit ABI");
     }
@@ -1410,7 +1453,7 @@ namespace
     // masked memWrite (merge into the next buffer), event-free memFill
     // convergence, and the NBA visibility contract at eval granularity (the
     // same trace shape as the mem-class equivalents).
-    void regLatchArrayWriteTest(const std::filesystem::path &root)
+    void regLatchArrayWriteTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_reglatch_write");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -1446,11 +1489,11 @@ namespace
         addOutputWrite(model, "om", word, addMemRead(model, tabM, word, raddr, "rm"));
         addOutputWrite(model, "of", word, addMemRead(model, tabF, word, raddr, "rf"));
         require(verifies(model), "regLatch write fixture rejected");
-        runSixPhasePipeline(model, false); // default classification: regLatch
+        runSixPhasePipeline(model, false, false, tinyTu); // default classification: regLatch
         const auto &mapping = *model.cpuMapping();
         require(mapping.schedule->memWritePlan && mapping.schedule->memWritePlan->empty(),
                 "regLatch-class writes must not enter the P_mem write plan");
-        compileAndRun(model, root / "reglatch_write", {
+        compileAndRun(model, root / (tinyTu ? "reglatch_write_tu" : "reglatch_write"), {
             {{{"clk", "false"}, {"enc", "false"}, {"bdata", "0"}, {"caddr", "0"}, {"cdata", "0"},
               {"raddr", "3"}, {"wen", "false"}, {"waddr", "0"}, {"wdata", "0"}, {"fen", "false"},
               {"fdata", "0"}},
@@ -1467,7 +1510,103 @@ namespace
             // Event-free fill converges; reads see it after the same eval.
             {{{"fen", "true"}, {"fdata", "153"}}, {{"of", "153"}}},
             {{{"fen", "false"}}, {{"of", "153"}}},
-        });
+        }, false, {}, tinyTu);
+    }
+
+    // M5d-7 multi-TU emit: a 128-bit combinational add chain (one big
+    // supernode, split into helper chunks by the tiny C6 cap; the chain
+    // values cross chunk boundaries through the spill frame), a 12-deep NBA
+    // register chain and an array state (init/dump chunks), plus an event
+    // cone. Tiny C8 caps force several translation units; the run checks the
+    // chunk ABI end to end (frame struct, chunk members, generated Makefile
+    // source list) and the simulated values.
+    void multiTuTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_multi_tu");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto word = model.logicType(128, false, LogicDomain::TwoState);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto d = addInputRead(model, "d", byte);
+        // 128-bit add chain: x_{i+1} = x_i + i. x23 = d + sum(0..23) = d+276.
+        const auto wideD = addCompute(model, "core.compute.concat", word, "wide_d", {
+            addConstant(model, model.logicType(120, false, LogicDomain::TwoState), "120'h0"), d});
+        ValueId prev = wideD;
+        for (uint32_t i = 0; i < 24; ++i)
+            prev = addCompute(model, "core.compute.add", word, "x" + std::to_string(i),
+                              {prev, addConstant(model, word, std::to_string(i))});
+        // NBA register capturing the chain tail at posedge clk.
+        const auto q = addState(model, "q", word, "128'h0");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto ones128 = addConstant(model, word, "128'hffffffffffffffffffffffffffffffff");
+        addEventRegWrite(model, one, prev, ones128, q, {{clk, "posedge"}});
+        // 12-deep byte register chain: s_{i+1} <= s_i + 1 at the same edge.
+        const auto one8 = addConstant(model, byte, "8'h01");
+        const auto mask8 = addConstant(model, byte, "8'hff");
+        std::vector<StateId> chain;
+        for (uint32_t i = 0; i < 12; ++i) chain.push_back(addState(model, "s" + std::to_string(i), byte, "8'h00"));
+        for (uint32_t i = 0; i + 1 < chain.size(); ++i)
+        {
+            const auto read = addStateRead(model, chain[i], "sr" + std::to_string(i));
+            const auto next = addCompute(model, "core.compute.add", byte, "sn" + std::to_string(i), {read, one8});
+            addEventRegWrite(model, one, next, mask8, chain[i + 1], {{clk, "posedge"}});
+        }
+        // Small array state (const init) to populate the init/dump streams.
+        const auto tab = addMemState(model, "tab", model.arrayType(byte, 4), "8'h00");
+        (void)tab;
+        addOutputWrite(model, "o", byte, [&] {
+            // Only the low byte is observable (the driver compares scalars).
+            const auto sliced = model.addValue(byte, "o_byte");
+            const std::array params{Parameter{model.intern("sliceStart"), int64_t{0}},
+                                    Parameter{model.intern("sliceEnd"), int64_t{7}}};
+            model.addOperation("core.compute.sliceStatic", std::array{addStateRead(model, q, "q_r")},
+                               std::array{sliced}, {}, params);
+            return sliced;
+        }());
+        addOutputWrite(model, "os3", byte, addStateRead(model, chain[3], "s3_r"));
+        addOutputWrite(model, "os11", byte, addStateRead(model, chain[11], "s11_r"));
+        require(verifies(model), "multi-TU fixture rejected");
+        runSixPhasePipeline(model, false, false, true);
+        const auto &mapping = *model.cpuMapping();
+        require(mapping.translationUnits.has_value(), "TU plan missing after plan-translation-units");
+        const auto &plan = *mapping.translationUnits;
+        require(plan.units.size() >= 3, "tiny caps should split the emit into several units");
+        require(plan.chunkMaxEstimatedLines == 24 && plan.unitMaxEstimatedLines == 64,
+                "TU plan should record the caps");
+        require(verifies(model), "mapped multi-TU model rejected");
+        compileAndRun(model, root / "multi_tu", {
+            {{{"clk", "false"}, {"d", "0"}}, {{"o", "0"}, {"os3", "0"}, {"os11", "0"}}},
+            // s_i = min(posedge count, i): the chain samples pre-publish values.
+            // o is the low byte of q (276 = 0x114, 277 = 0x115).
+            {{{"clk", "true"}}, {{"o", "20"}, {"os3", "1"}, {"os11", "1"}}},    // q <= 0+276
+            {{{"clk", "false"}}, {{"o", "20"}, {"os3", "1"}, {"os11", "1"}}},
+            {{{"d", "1"}}, {{"o", "20"}, {"os3", "1"}, {"os11", "1"}}},         // no edge
+            {{{"clk", "true"}}, {{"o", "21"}, {"os3", "2"}, {"os11", "2"}}},    // q <= 1+276
+            {{{"clk", "false"}}, {{"o", "21"}, {"os3", "2"}, {"os11", "2"}}},
+            {{{"clk", "true"}}, {{"o", "21"}, {"os3", "3"}, {"os11", "3"}}},
+            {{{"clk", "false"}}, {{"o", "21"}, {"os3", "3"}, {"os11", "3"}}},
+            {{{"clk", "true"}}, {{"o", "21"}, {"os3", "3"}, {"os11", "4"}}},    // s3 saturated
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            {{{"clk", "false"}}, {}}, {{{"clk", "true"}}, {}},
+            // Twelve posedges in total: s3 = 3, s11 = 11.
+            {{{"clk", "false"}}, {{"o", "21"}, {"os3", "3"}, {"os11", "11"}}},
+        }, false, {}, true);
+        // The spill frame and the chunk members must appear in the header; the
+        // emitted sources are all listed in the generated Makefile (checked by
+        // compileAndRun's expectMultiTu).
+        std::ifstream header(root / "multi_tu" / "model" / "grhsim_phase_multi_tu.hpp");
+        const std::string text{std::istreambuf_iterator<char>(header), std::istreambuf_iterator<char>()};
+        require(text.find("SnFrame") != std::string::npos, "chunked supernode should emit a spill frame");
+        require(text.find("__c0(") != std::string::npos, "chunked supernode should emit chunk members");
+        require(text.find("cpu_init_") != std::string::npos, "init chunks missing from the header");
+        require(text.find("cpu_dump_") != std::string::npos, "dump chunks missing from the header");
     }
 }
 
@@ -1481,28 +1620,39 @@ int main()
         wideAddTest(root);
         scalarSliceArrayTest(root);
         randomSystemFunctionTest(root);
+        randomSystemFunctionTest(root, true);
         randomSampleIdAfterCompactTest();
         fanoutTest(root);
         passRegistrationTest(root);
+        // M5d-7: the deferred M5d-3..M5d-6 runtime diffs (state/NBA, events,
+        // DPI, timeslot) also run under tiny C8 caps so they exercise the
+        // multi-TU emit (chunk functions + spill frames + parallel build).
         counterTest(root);
+        counterTest(root, true);
         nbaChainTest(root);
         powerOnTest(root);
         asyncResetTest(root);
         dualClockTest(root);
         glitchClockTest(root);
+        glitchClockTest(root, true);
         latchRingTest(root);
         memConvergeTest(root);
         memReaderGatingTest(root);
         memPriorityTest(root);
+        memPriorityTest(root, true);
         generalDisplayTest(root);
         monitorFreeTest(root);
         monitorEventTest(root);
+        monitorEventTest(root, true);
         dpiSmokeTest(root);
+        dpiSmokeTest(root, true);
         dpiBitAbiTest(root);
         perfCountersTest(root);
         memAssignReadbackTest(root);
         packedFillTest(root);
         regLatchArrayWriteTest(root);
+        regLatchArrayWriteTest(root, true);
+        multiTuTest(root);
         exprPlaceholderTest(root);
         std::cout << "CPU six-phase emit tests passed\n";
         return 0;

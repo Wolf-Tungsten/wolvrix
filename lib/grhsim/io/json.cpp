@@ -654,6 +654,31 @@ namespace wolvrix::lib::grhsim
             writer.endArray();
         }
 
+        void writeCpuTranslationUnits(StreamWriter &writer, const CpuTranslationUnitPlan &plan)
+        {
+            // M5d-7 shape: [chunkCap, unitCap, [units...]]; a unit is
+            // [name, estimatedLines, [[kind, offset, count, estimatedLines]...]].
+            writer.startArray();
+            writer.value(plan.chunkMaxEstimatedLines); writer.value(plan.unitMaxEstimatedLines);
+            writer.startArray();
+            for (const auto &unit : plan.units)
+            {
+                writer.startArray(); writer.value(unit.name); writer.value(unit.estimatedLines);
+                writer.startArray();
+                for (const auto &chunk : unit.chunks)
+                {
+                    writer.startArray();
+                    writer.value(static_cast<uint64_t>(chunk.kind));
+                    writer.value(static_cast<uint64_t>(chunk.offset));
+                    writer.value(static_cast<uint64_t>(chunk.count));
+                    writer.value(chunk.estimatedLines);
+                    writer.endArray();
+                }
+                writer.endArray(); writer.endArray();
+            }
+            writer.endArray(); writer.endArray();
+        }
+
         void writeCpuMapping(StreamWriter &writer, const CpuBackendMapping &cpu)
         {
             writer.startArray();
@@ -702,6 +727,7 @@ namespace wolvrix::lib::grhsim
             writer.endArray();
             if (cpu.dataLayout) writeCpuLayout(writer, *cpu.dataLayout);
             if (cpu.schedule) writeCpuSchedule(writer, *cpu.schedule);
+            if (cpu.translationUnits) writeCpuTranslationUnits(writer, *cpu.translationUnits);
             writer.endArray();
         }
 
@@ -865,10 +891,41 @@ namespace wolvrix::lib::grhsim
             return schedule;
         }
 
+        CpuTranslationUnitPlan readCpuTranslationUnits(StreamReader &reader)
+        {
+            // M5d-7 shape: [chunkCap, unitCap, [[name, estimatedLines,
+            // [[kind, offset, count, estimatedLines]...]]...]].
+            CpuTranslationUnitPlan plan;
+            reader.startArray();
+            plan.chunkMaxEstimatedLines = reader.unsignedInteger();
+            expectComma(reader); plan.unitMaxEstimatedLines = reader.unsignedInteger();
+            expectComma(reader); reader.startArray(); bool first = true;
+            while (reader.nextArray(first))
+            {
+                CpuTranslationUnit unit;
+                reader.startArray(); unit.name = reader.string();
+                expectComma(reader); unit.estimatedLines = reader.unsignedInteger();
+                expectComma(reader); reader.startArray(); bool chunkFirst = true;
+                while (reader.nextArray(chunkFirst))
+                {
+                    CpuEmitChunk chunk;
+                    reader.startArray();
+                    chunk.kind = readCpuEnum(reader, CpuEmitChunkKind::Dump);
+                    expectComma(reader); chunk.offset = reader.index("TU chunk offset", true);
+                    expectComma(reader); chunk.count = reader.index("TU chunk count", true);
+                    expectComma(reader); chunk.estimatedLines = reader.unsignedInteger();
+                    reader.endArray(); unit.chunks.push_back(chunk);
+                }
+                reader.endArray(); plan.units.push_back(std::move(unit));
+            }
+            reader.endArray();
+            return plan;
+        }
+
         CpuBackendMapping readCpuMapping(StreamReader &reader)
         {
             CpuBackendMapping cpu;
-            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::PhaseSchedule);
+            reader.startArray(); cpu.stage = readCpuEnum(reader, CpuMappingStage::TranslationUnits);
             expectComma(reader); cpu.partitionTree.root = readId<PartitionId>(reader, "partition root");
             expectComma(reader); reader.startArray();
             bool first = true;
@@ -928,7 +985,11 @@ namespace wolvrix::lib::grhsim
                 if (reader.nextArray(tailFirst))
                 {
                     cpu.schedule = readCpuSchedule(reader);
-                    reader.endArray();
+                    if (reader.nextArray(tailFirst))
+                    {
+                        cpu.translationUnits = readCpuTranslationUnits(reader);
+                        reader.endArray();
+                    }
                 }
             }
             return cpu;
@@ -1461,9 +1522,12 @@ namespace wolvrix::lib::grhsim
                     if (model->text(backend) != "cpu" || model->text(schema) != "cpu.st.v1")
                         throw std::runtime_error("unexpected CPU mapping payload or completion flag");
                     auto cpu = readCpuMapping(reader);
-                    // The six-phase pipeline completes at PhaseSchedule (the
-                    // legacy Schedule terminal was removed in M5d-6).
-                    if (complete != (cpu.stage == CpuMappingStage::PhaseSchedule))
+                    // The six-phase pipeline completes at PhaseSchedule and
+                    // stays complete through TranslationUnits (M5d-7); the
+                    // legacy Schedule terminal was removed in M5d-6.
+                    const bool terminal = cpu.stage == CpuMappingStage::PhaseSchedule ||
+                                          cpu.stage == CpuMappingStage::TranslationUnits;
+                    if (complete != terminal)
                         throw std::runtime_error("CPU mapping completion disagrees with stage");
                     model->setCpuMapping(std::move(cpu));
                     reader.endArray();

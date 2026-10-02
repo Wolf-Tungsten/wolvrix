@@ -330,18 +330,21 @@ namespace wolvrix::lib::grhsim
             bool failed_ = false;
         };
 
-        // M5a six-phase emitter. Consumes the PhaseSchedule-stage mapping
-        // (named stores, event bitmaps, mem write plan, fanout tables, phase
-        // task sequence) and generates the P_input/P_event/P_general/P_mem/
-        // P_publish/P_output C++ model. Only the "evaluation" code generation
-        // is ported from the legacy emitter; every activation/commit decision
-        // is new code driven by the M4 static tables.
+        // M5 six-phase emitter (M5d-7 multi-TU). Consumes the
+        // TranslationUnits-stage mapping (named stores, event bitmaps, mem
+        // write plan, fanout tables, phase task sequence, the C8 TU plan) and
+        // generates the P_input/P_event/P_general/P_mem/P_publish/P_output C++
+        // model as one shared header plus one .cpp per planned unit. Only the
+        // "evaluation" code generation is ported from the legacy emitter;
+        // every activation/commit decision is new code driven by the M4 static
+        // tables.
         class SixPhaseEmitter
         {
         public:
             explicit SixPhaseEmitter(const GrhSimModel &model)
                 : model_(model), mapping_(*model.cpuMapping()), tree_(mapping_.partitionTree),
                   layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule), stores_(*layout_.namedStores),
+                  tuPlan_(*mapping_.translationUnits),
                   prefix_("grhsim_" + identifier(model.text(model.name()))),
                   class_("GrhSIM_" + identifier(model.text(model.name()))),
                   ordinalOf_(tree_.partitions.size() + 1, ~0u),
@@ -458,6 +461,13 @@ namespace wolvrix::lib::grhsim
                 {
                     if (field.value) boundaryByValue_[field.value.index] = &field;
                     else if (field.aux < model_.inputs().size()) boundaryByInput_[field.aux + 1] = &field;
+                    // M5d-7: string-typed boundary fields live in the separate
+                    // boundaryStrings array so the store struct stays trivially
+                    // copyable (memset reset in init); a 684k-field struct
+                    // value-initializing one std::string member never
+                    // finishes -O1 compilation (measured on XS).
+                    if (layout_.types[field.type.index - 1].kind == CpuTypeKind::String)
+                        boundaryStringSlot_[&field] = boundaryStringCount_++;
                 }
                 const auto ordinals = [&](std::span<const PartitionId> targets) {
                     std::vector<uint32_t> result;
@@ -538,6 +548,88 @@ namespace wolvrix::lib::grhsim
                         if (std::find(targets.begin(), targets.end(), ordinal) == targets.end())
                             targets.push_back(ordinal);
                 }
+                // M5d-7: the emit TU plan drives the multi-file output. Chunk
+                // vectors per kind in plan order; the index inside the vector
+                // is the chunk function suffix (pEvent_c<i> etc.). Supernode
+                // chunks carry their ordinal in offset.
+                for (const auto &unit : tuPlan_.units)
+                    for (const auto &chunk : unit.chunks)
+                    {
+                        const auto key = (uint64_t(static_cast<unsigned>(chunk.kind)) << 32) | chunk.offset;
+                        switch (chunk.kind)
+                        {
+                        case CpuEmitChunkKind::Core: ++coreChunks_; break;
+                        case CpuEmitChunkKind::Init: chunkIds_[key] = initChunks_.size(); initChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::Event: chunkIds_[key] = eventChunks_.size(); eventChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::GeneralScan: chunkIds_[key] = scanChunks_.size(); scanChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::Supernode: supernodeChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::Mem: chunkIds_[key] = memChunks_.size(); memChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::Output: chunkIds_[key] = outputChunks_.size(); outputChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::Dump: chunkIds_[key] = dumpChunks_.size(); dumpChunks_.push_back(chunk); break;
+                        }
+                    }
+                if (coreChunks_ != 1)
+                    throw std::runtime_error("CPU six-phase emit TU plan holds " +
+                                             std::to_string(coreChunks_) + " core chunks");
+                {
+                    std::vector<char> seen(supernodeCount_, 0);
+                    for (const auto &chunk : supernodeChunks_)
+                    {
+                        if (chunk.count != 1 || chunk.offset >= supernodeCount_ || seen[chunk.offset])
+                            throw std::runtime_error("CPU six-phase emit TU plan mis-covers the general supernodes");
+                        seen[chunk.offset] = 1;
+                    }
+                    if (supernodeChunks_.size() != supernodeCount_)
+                        throw std::runtime_error("CPU six-phase emit TU plan mis-covers the general supernodes");
+                }
+                // Init stream metadata (the cpu_init_<k> chunks iterate it by
+                // position): flattened steps, then the constant-boundary
+                // preloads in store offset order, then the prevEvent inits in
+                // act order, then the regLatchStoreNext sync.
+                for (const auto &record : model_.initRecords())
+                    for (const auto &step : model_.steps(record))
+                        initSteps_.push_back({record.state, &step});
+                for (const auto &[field, expr] : constBoundaryInit_) constBoundaryFields_.push_back(field);
+                std::sort(constBoundaryFields_.begin(), constBoundaryFields_.end(),
+                          [](const CpuStoreField *a, const CpuStoreField *b) { return a->offset < b->offset; });
+                for (const auto &[act, det] : detByAct_) detActs_.push_back(act);
+                const auto streamTotal = initSteps_.size() + constBoundaryFields_.size() + detActs_.size() + 1;
+                checkChunkStream("init", initChunks_, streamTotal);
+                checkChunkStream("event", eventChunks_, eventOps_.size());
+                checkChunkStream("mem", memChunks_,
+                                 schedule_.memWritePlan ? schedule_.memWritePlan->size() : 0);
+                checkChunkStream("output", outputChunks_, outputOps_.size());
+                checkChunkStream("dump", dumpChunks_, cpuDumpItemCount(model_, stores_));
+                {
+                    uint32_t covered = 0;
+                    for (const auto &chunk : scanChunks_)
+                    {
+                        if (chunk.offset != covered || chunk.count == 0 ||
+                            chunk.offset + chunk.count > supernodeCount_)
+                            throw std::runtime_error("CPU six-phase emit TU plan scan chunks do not tile the supernodes");
+                        covered += chunk.count;
+                    }
+                    if (covered != supernodeCount_)
+                        throw std::runtime_error("CPU six-phase emit TU plan scan chunks do not tile the supernodes");
+                }
+                // Spill frames: values produced in one chunk of an op list and
+                // consumed in another (or at the output commit point) become
+                // fields of a frame struct the driver passes to the chunks.
+                supernodeFrames_.resize(supernodeCount_);
+                for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
+                {
+                    const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+                    if (attrs.helperChunks.size() < 2) continue;
+                    supernodeFrames_[ordinal] = computeFrameFields(supernodeOps_[ordinal], attrs.helperChunks, false);
+                }
+                if (eventChunks_.size() > 1)
+                    eventFrame_ = computeFrameFields(eventOps_, eventChunks_, false);
+                // The latchWrite commit point sits in the driver after every
+                // chunk, so the output frame engages whenever cone-produced
+                // latchWrite operands exist — even for a single-chunk cone.
+                outputFrame_ = computeFrameFields(outputOps_, outputChunks_, true);
+                crossingLocals_.assign(model_.values().size() + 1, 0);
+                precomputeStagedOutputWrites();
             }
 
             // Emission entry points (emitSixPhaseCpuCpp drives these).
@@ -559,6 +651,8 @@ namespace wolvrix::lib::grhsim
             const CpuDataLayout &layout_;
             const CpuSchedulePlan &schedule_;
             const std::vector<CpuNamedStore> &stores_;
+            // M5d-7: the multi-TU emit plan (C8), required by the emit gate.
+            const CpuTranslationUnitPlan &tuPlan_;
             std::string prefix_, class_;
 
             const CpuNamedStore *regLatchStore_ = nullptr;
@@ -583,7 +677,32 @@ namespace wolvrix::lib::grhsim
             std::vector<std::vector<uint32_t>> triggersByAct_;
             uint32_t maxAct_ = 0, maxTimeslotFlag_ = 0;
 
+            // ----- M5d-7 multi-TU emit plan consumption -----
+            uint32_t coreChunks_ = 0;
+            std::vector<CpuEmitChunk> initChunks_, eventChunks_, scanChunks_, supernodeChunks_,
+                memChunks_, outputChunks_, dumpChunks_;
+            // (kind, offset) -> the chunk's global per-kind index, which is the
+            // chunk function suffix (cpu_init_<i>, pEvent_c<i>, ...).
+            std::unordered_map<uint64_t, uint32_t> chunkIds_;
+            // Init stream: flattened (state, step) pairs, then constant-boundary
+            // preloads (store offset order), then prevEvent inits (act order),
+            // then the regLatchStoreNext sync line.
+            std::vector<std::pair<StateId, const InitStep *>> initSteps_;
+            std::vector<const CpuStoreField *> constBoundaryFields_;
+            std::vector<uint32_t> detActs_;
+            // Spill frames (values crossing chunk boundaries): per chunked
+            // supernode (indexed by ordinal), plus the Event/Output cone frames.
+            std::vector<std::vector<uint32_t>> supernodeFrames_;
+            std::vector<uint32_t> eventFrame_, outputFrame_;
+            // Scratch: values spilled to the frame of the chunk list currently
+            // being emitted (their cpu_v local becomes the cpu_f.v field).
+            mutable std::vector<char> crossingLocals_;
+
             std::vector<std::vector<uint32_t>> inputFanout_, supernodeFanout_, stateFanout_;
+            // String-typed boundary fields hoisted out of the (trivially
+            // copyable) BoundaryValueStore struct into boundaryStrings.
+            std::map<const CpuStoreField *, uint32_t> boundaryStringSlot_;
+            uint32_t boundaryStringCount_ = 0;
             // Input port index (1-based InputId) -> fanout ordinals, derived
             // from inputFanout_ rows through the producing input.read op.
             std::vector<std::vector<uint32_t>> inputPortFanout_;
@@ -672,7 +791,6 @@ namespace wolvrix::lib::grhsim
             std::string dpiType(TypeId id) const;
             std::string dpiDeclaration(const ExternFunction &function) const;
             void emitOutputWrite(std::ostream &out, const SimOp &op) const;
-            void emitOutputLatchWrite(std::ostream &out, const SimOp &op) const;
             void commitStagedOutputWrites(std::ostream &out) const;
 
             // ----- Validation -----
@@ -688,16 +806,55 @@ namespace wolvrix::lib::grhsim
             const InitRows &readmemRows(const InitStep &step, const Type &element, uint64_t first,
                                         uint64_t end) const;
             void initStep(std::ostream &out, StateId id, const InitStep &step) const;
-            std::size_t initChunkCount() const;
+
+            // ----- M5d-7 chunking support -----
+            // Light emit-side sanity: the kind's chunk ranges tile [0, total).
+            static void checkChunkStream(std::string_view kind, const std::vector<CpuEmitChunk> &chunks,
+                                         uint64_t total);
+            // Values produced inside `ops` that are consumed in a different
+            // chunk (ranges tile the op list) — the spill frame fields. With
+            // commitUse, latchWrite operands count as consumed at the trailing
+            // commit point (the P_output driver, after every chunk ran).
+            std::vector<uint32_t> computeFrameFields(const std::vector<OpId> &ops,
+                                                     std::span<const Range> chunks, bool commitUse) const;
+            std::vector<uint32_t> computeFrameFields(const std::vector<OpId> &ops,
+                                                     const std::vector<CpuEmitChunk> &chunks, bool commitUse) const;
+            // Captures the latchWrite staged texts with the final local/frame
+            // resolution (the commit runs after all output chunks).
+            void precomputeStagedOutputWrites();
+            void activateCrossing(const std::vector<uint32_t> &frame) const;
+            void deactivateCrossing(const std::vector<uint32_t> &frame) const;
+            // cpu_v<index> or cpu_f.v<index> when the value is frame-spilled.
+            std::string localRef(ValueId value) const;
+            // Boundary field storage reference: boundaryValueStore.<name>, or
+            // boundaryStrings[<i>] for hoisted string fields.
+            std::string boundaryRef(const CpuStoreField *field) const;
+            void frameStruct(std::ostream &out, std::string_view name,
+                             const std::vector<uint32_t> &fields) const;
 
             // ----- File bodies -----
             void header(std::ostream &out) const;
             // Supernode member function name: sn_<ordinal>[_<first op name>].
             std::string supernodeName(uint32_t ordinal) const;
+            bool storeTriviallyResettable(const CpuNamedStore &store) const;
             void storeStruct(std::ostream &out, std::string_view structName,
                              const CpuNamedStore &store) const;
-            void mainCpp(std::ostream &out) const;
+            // Per-unit source body: the unit's chunks in plan order.
+            void unitCpp(std::ostream &out, const CpuTranslationUnit &unit) const;
+            void coreChunk(std::ostream &out) const;
             void supernodeBody(std::ostream &out, uint32_t ordinal) const;
+            void supernodeChunkFns(std::ostream &out, uint32_t ordinal) const;
+            void emitOpListRange(std::ostream &out, const std::vector<OpId> &ops, uint32_t offset,
+                                 uint32_t count, const std::vector<uint32_t> &frame, bool outputPhase) const;
+            void initChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const;
+            void initStreamItem(std::ostream &out, uint64_t position) const;
+            void eventChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const;
+            void scanChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const;
+            void scanRange(std::ostream &out, uint32_t begin, uint32_t end) const;
+            void memChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const;
+            void outputChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const;
+            void dumpChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const;
+            void dumpStreamItem(std::ostream &out, uint64_t position) const;
             void pInputBody(std::ostream &out) const;
             void pEventBody(std::ostream &out) const;
             void pGeneralBody(std::ostream &out) const;
@@ -709,8 +866,6 @@ namespace wolvrix::lib::grhsim
             void dumpStateBody(std::ostream &out) const;
             void dumpStateField(std::ostream &out, std::string_view store, const CpuStoreField &field) const;
             void systemTaskDriver(std::ostream &out) const;
-            void initBody(std::ostream &out, std::size_t chunk) const;
-            void taskCpp(std::ostream &out, const CpuScheduledTask &task) const;
 
             // Supernode ordinal whose function is being emitted (~0 = none).
             mutable std::map<const InitStep *, InitRows> readmemRows_;
@@ -719,6 +874,141 @@ namespace wolvrix::lib::grhsim
         };
 
         // M5A_APPEND
+        // ----- M5d-7 chunking support -----
+        void SixPhaseEmitter::checkChunkStream(std::string_view kind, const std::vector<CpuEmitChunk> &chunks,
+                                               uint64_t total)
+        {
+            uint64_t covered = 0;
+            for (const auto &chunk : chunks)
+            {
+                if (chunk.offset != covered || chunk.count == 0 || chunk.offset + chunk.count > total)
+                    throw std::runtime_error("CPU six-phase emit TU plan " + std::string(kind) +
+                                             " chunks do not tile their stream");
+                covered += chunk.count;
+            }
+            if (covered != total)
+                throw std::runtime_error("CPU six-phase emit TU plan " + std::string(kind) +
+                                         " chunks do not tile their stream");
+        }
+        std::vector<uint32_t> SixPhaseEmitter::computeFrameFields(const std::vector<OpId> &ops,
+                                                                  std::span<const Range> chunks,
+                                                                  bool commitUse) const
+        {
+            std::vector<uint32_t> fields;
+            if (chunks.size() < 2 && !commitUse) return fields;
+            std::vector<uint32_t> positionOf(model_.operations().size() + 1, ~0u);
+            for (uint32_t i = 0; i < ops.size(); ++i) positionOf[ops[i].index] = i;
+            std::vector<uint32_t> chunkOf(ops.size());
+            uint32_t chunkIndex = 0, chunkEnd = chunks.empty() ? 0 : chunks[0].offset + chunks[0].count;
+            for (uint32_t i = 0; i < ops.size(); ++i)
+            {
+                while (i >= chunkEnd && chunkIndex + 1 < chunks.size())
+                {
+                    ++chunkIndex;
+                    chunkEnd = chunks[chunkIndex].offset + chunks[chunkIndex].count;
+                }
+                chunkOf[i] = chunkIndex;
+            }
+            // Only values whose producer creates an irreplaceable local need a
+            // frame slot. Constants fold into use sites; input.read/state.read
+            // results re-read their store field in any chunk (the port boundary
+            // fields and regLatchStore/memStore are stable across a chunk
+            // sequence). memRead results are NOT freely re-readable: the
+            // re-expression re-reads the address operand, whose local may be
+            // dead — so memRead results spill like compute values. The commit
+            // point (P_output driver) additionally frames state reads: a store
+            // re-read there could observe an earlier staged commit.
+            const auto localBearing = [&](ValueId value, bool forCommit) {
+                const auto producer = producers_[value.index];
+                if (!producer || positionOf[producer.index] == ~0u) return false;
+                if (boundaryByValue_[value.index] || staticScalars_.contains(value.index) ||
+                    staticStrings_.contains(value.index))
+                    return false;
+                const auto opName = model_.text(model_.operations()[producer.index - 1].opType);
+                if (opName == "core.input.read" || opName == "core.compute.constant") return false;
+                if (!forCommit && opName == "core.state.read") return false;
+                return true;
+            };
+            std::vector<char> mark(model_.values().size() + 1, 0);
+            for (uint32_t q = 0; q < ops.size(); ++q)
+            {
+                const auto &op = model_.operations()[ops[q].index - 1];
+                const bool commit = commitUse && model_.text(op.opType) == "core.state.latchWrite";
+                for (const auto operand : model_.operands(op))
+                {
+                    if (!localBearing(operand, commit)) continue;
+                    const auto p = positionOf[producers_[operand.index].index];
+                    if (commit || chunkOf[p] != chunkOf[q]) mark[operand.index] = 1;
+                }
+            }
+            for (uint32_t index = 1; index < mark.size(); ++index)
+                if (mark[index]) fields.push_back(index);
+            return fields;
+        }
+        std::vector<uint32_t> SixPhaseEmitter::computeFrameFields(const std::vector<OpId> &ops,
+                                                                  const std::vector<CpuEmitChunk> &chunks,
+                                                                  bool commitUse) const
+        {
+            std::vector<Range> ranges;
+            ranges.reserve(chunks.size());
+            for (const auto &chunk : chunks) ranges.push_back({chunk.offset, chunk.count});
+            return computeFrameFields(ops, ranges, commitUse);
+        }
+        void SixPhaseEmitter::activateCrossing(const std::vector<uint32_t> &frame) const
+        { for (const auto index : frame) crossingLocals_[index] = 1; }
+        void SixPhaseEmitter::deactivateCrossing(const std::vector<uint32_t> &frame) const
+        { for (const auto index : frame) crossingLocals_[index] = 0; }
+        std::string SixPhaseEmitter::localRef(ValueId value) const
+        {
+            return (crossingLocals_[value.index] ? "cpu_f.v" : "cpu_v") + std::to_string(value.index);
+        }
+        std::string SixPhaseEmitter::boundaryRef(const CpuStoreField *field) const
+        {
+            if (const auto it = boundaryStringSlot_.find(field); it != boundaryStringSlot_.end())
+                return "boundaryStrings[" + std::to_string(it->second) + ']';
+            return "boundaryValueStore." + std::string(model_.text(field->name));
+        }
+        void SixPhaseEmitter::frameStruct(std::ostream &out, std::string_view name,
+                                          const std::vector<uint32_t> &fields) const
+        {
+            out << "struct " << name << "{\n";
+            for (const auto index : fields)
+                out << cppType(type(ValueId{index, 0})) << " v" << index << "{};\n";
+            out << "};\n";
+        }
+        void SixPhaseEmitter::precomputeStagedOutputWrites()
+        {
+            // Runs once at construction. The commit (P_output driver) executes
+            // after every chunk's locals died, so the captured texts must be
+            // commit-safe: frame fields (every cone-produced latchWrite operand
+            // is spilled), boundary/state store reads, or constants. No local
+            // is ever live at the commit point, so none is marked here.
+            stagedOutputWrites_.clear();
+            activateCrossing(outputFrame_);
+            std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
+            for (const auto opId : outputOps_)
+            {
+                const auto &op = model_.operations()[opId.index - 1];
+                if (model_.text(op.opType) != "core.state.latchWrite") continue;
+                const auto operands = model_.operands(op);
+                const auto refs = model_.objectRefs(op);
+                if (refs.empty() || refs[0].kind != ObjectKind::State || operands.size() != 3)
+                    throw std::runtime_error("CPU six-phase emit malformed output latchWrite");
+                const auto *field =
+                    refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
+                if (!field)
+                    throw std::runtime_error("CPU six-phase emit output latchWrite target is not a regLatch state");
+                StagedOutputWrite staged;
+                staged.field = field;
+                staged.enable = read(operands[0]);
+                staged.data = read(operands[1]);
+                staged.mask = read(operands[2]);
+                stagedOutputWrites_.push_back(std::move(staged));
+            }
+            deactivateCrossing(outputFrame_);
+            std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
+        }
+
         // ----- Semantic type/value helpers -----
         const Type &SixPhaseEmitter::type(ValueId value) const
         { return model_.types()[model_.values()[value.index - 1].type.index - 1]; }
@@ -830,9 +1120,12 @@ namespace wolvrix::lib::grhsim
             if (const auto it = staticScalars_.find(value.index); it != staticScalars_.end()) return it->second;
             if (type(value).kind == TypeKind::String)
                 if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
-            if (activeLocals_[value.index]) return "cpu_v" + std::to_string(value.index);
+            // Frame-spilled (M5d-7) values resolve through the chunk driver's
+            // frame in every chunk; plain locals only live in one function.
+            if (crossingLocals_[value.index]) return localRef(value);
+            if (activeLocals_[value.index]) return localRef(value);
             if (const auto *field = boundaryByValue_[value.index])
-                return "boundaryValueStore." + std::string(model_.text(field->name));
+                return boundaryRef(field);
             const auto producer = producers_[value.index];
             if (!producer)
                 throw std::runtime_error("CPU six-phase emit value has no producer: v" + std::to_string(value.index));
@@ -842,10 +1135,18 @@ namespace wolvrix::lib::grhsim
                 name == "core.compute.constant")
                 return expression(op);
             throw std::runtime_error("CPU six-phase emit value is not readable: v" + std::to_string(value.index) +
-                                     " produced by " + std::string(name));
+                                     " produced by " + std::string(name) + " (op " +
+                                     std::to_string(producer.index) + ")");
         }
         void SixPhaseEmitter::declareLocal(std::ostream &out, ValueId result, const std::string &expr) const
         {
+            // Frame-spilled values assign their pre-declared frame field; the
+            // driver value-initializes the frame before the first chunk runs.
+            if (crossingLocals_[result.index])
+            {
+                out << localRef(result) << '=' << expr << ";\n";
+                return;
+            }
             out << "const " << cppType(type(result)) << " cpu_v" << result.index << '=' << expr << ";\n";
             activeLocals_[result.index] = 1;
         }
@@ -1273,7 +1574,7 @@ namespace wolvrix::lib::grhsim
         {
             const auto *field = boundaryByValue_[result.index];
             if (!field) { declareLocal(out, result, expr); return; }
-            const auto slot = "boundaryValueStore." + std::string(model_.text(field->name));
+            const auto slot = boundaryRef(field);
             out << "{const auto cpu_value=" << expr << ";if(" << slot << "!=cpu_value){" << slot << "=cpu_value;\n";
             activateFanout(out, supernodeFanout_[result.index], current);
             out << "}}\n";
@@ -1313,12 +1614,15 @@ namespace wolvrix::lib::grhsim
                 const auto words = (resultType.width + 63u) / 64u;
                 const auto *field = boundaryByValue_[result.index];
                 std::string dst;
-                if (field) dst = "boundaryValueStore." + std::string(model_.text(field->name));
+                if (field) dst = boundaryRef(field);
                 else
                 {
-                    dst = "cpu_v" + std::to_string(result.index);
-                    out << cppType(resultType) << ' ' << dst << ";\n";
-                    activeLocals_[result.index] = 1;
+                    dst = localRef(result);
+                    if (!crossingLocals_[result.index])
+                    {
+                        out << cppType(resultType) << ' ' << dst << ";\n";
+                        activeLocals_[result.index] = 1;
+                    }
                 }
                 if (kind == "concat")
                 {
@@ -1993,8 +2297,10 @@ namespace wolvrix::lib::grhsim
             // Result locals are declared before the guard so same-supernode
             // consumers can read them; a guard-missed call leaves them zeroed
             // (the IR gives no defined value to a consumer of a skipped call).
+            // Frame-spilled results (M5d-7) skip the declaration: the driver
+            // value-initializes the frame field.
             for (const auto result : results)
-                if (!boundaryByValue_[result.index])
+                if (!boundaryByValue_[result.index] && !crossingLocals_[result.index])
                 {
                     out << cppType(type(result)) << " cpu_v" << result.index << "{};\n";
                     activeLocals_[result.index] = 1;
@@ -2050,12 +2356,12 @@ namespace wolvrix::lib::grhsim
             }
             if (const auto *field = boundaryByValue_[result.index])
             {
-                const auto slot = "boundaryValueStore." + std::string(model_.text(field->name));
+                const auto slot = boundaryRef(field);
                 out << "if(" << slot << "!=" << source << "){" << slot << "=std::move(" << source << ");\n";
                 activateFanout(out, supernodeFanout_[result.index], current);
                 out << "}\n";
             }
-            else out << "cpu_v" << result.index << "=std::move(" << source << ");\n";
+            else out << localRef(result) << "=std::move(" << source << ");\n";
             out << "}\n";
         }
         std::string SixPhaseEmitter::dpiType(TypeId id) const
@@ -2094,21 +2400,6 @@ namespace wolvrix::lib::grhsim
                 throw std::runtime_error("CPU six-phase emit malformed output write");
             const auto &output = model_.outputs()[refs[0].index - 1];
             out << "this->" << identifier(model_.text(output.name)) << '=' << read(operands[0]) << ";\n";
-        }
-        void SixPhaseEmitter::emitOutputLatchWrite(std::ostream &, const SimOp &op) const
-        {
-            const auto operands = model_.operands(op);
-            const auto refs = model_.objectRefs(op);
-            if (refs.empty() || refs[0].kind != ObjectKind::State || operands.size() != 3)
-                throw std::runtime_error("CPU six-phase emit malformed output latchWrite");
-            const auto *field = refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
-            if (!field) throw std::runtime_error("CPU six-phase emit output latchWrite target is not a regLatch state");
-            StagedOutputWrite staged;
-            staged.field = field;
-            staged.enable = read(operands[0]);
-            staged.data = read(operands[1]);
-            staged.mask = read(operands[2]);
-            stagedOutputWrites_.push_back(std::move(staged));
         }
         void SixPhaseEmitter::commitStagedOutputWrites(std::ostream &out) const
         {
@@ -2159,11 +2450,35 @@ namespace wolvrix::lib::grhsim
                 "pGeneral", "pMem", "pPublish", "pOutput",
                 "regLatchStore", "regLatchStoreNext", "memStore", "boundaryValueStore", "prevEventStore",
                 "eventActStore", "timeslotTriggerFlag", "cpu_rng", "perf_", "RegLatchStore", "MemStore",
-                "BoundaryValueStore", "PrevEventStore"};
+                "BoundaryValueStore", "PrevEventStore", "boundaryStrings"};
+            // M5d-7 chunk members and spill frame types share the class scope;
+            // register them with duplicate detection so a pathological op name
+            // (e.g. one that makes sn_12_c0 collide with a chunk name) fails
+            // validation instead of silently breaking the generated code.
+            const auto claim = [&names](const std::string &name) {
+                if (!names.insert(name).second)
+                    throw std::runtime_error("CPU generated member name collides: " + name);
+            };
+            for (uint32_t i = 0; i < initChunks_.size(); ++i) claim("cpu_init_" + std::to_string(i));
+            for (uint32_t i = 0; i < eventChunks_.size(); ++i) claim("pEvent_c" + std::to_string(i));
+            for (uint32_t i = 0; i < scanChunks_.size(); ++i) claim("pGeneral_c" + std::to_string(i));
+            for (uint32_t i = 0; i < memChunks_.size(); ++i) claim("pMem_c" + std::to_string(i));
+            for (uint32_t i = 0; i < outputChunks_.size(); ++i) claim("pOutput_c" + std::to_string(i));
+            for (uint32_t i = 0; i < dumpChunks_.size(); ++i) claim("cpu_dump_" + std::to_string(i));
+            if (!eventFrame_.empty()) claim("EventFrame");
+            if (!outputFrame_.empty()) claim("OutputFrame");
             if (hasSystemTasks_)
                 for (const auto *name : {"cpu_first_eval", "cpu_system_done", "cpu_system_task"}) names.insert(name);
             for (const auto &field : activeStore_->fields) names.insert(std::string(model_.text(field.name)));
-            for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal) names.insert(supernodeName(ordinal));
+            for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
+            {
+                claim(supernodeName(ordinal));
+                const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+                if (attrs.helperChunks.size() < 2) continue;
+                if (!supernodeFrames_[ordinal].empty()) claim("SnFrame" + std::to_string(ordinal));
+                for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
+                    claim(supernodeName(ordinal) + "__c" + std::to_string(i));
+            }
             const auto checkPortType = [&](TypeId id) {
                 const auto &type = model_.types()[id.index - 1];
                 if (type.kind != TypeKind::Logic)
@@ -2203,15 +2518,8 @@ namespace wolvrix::lib::grhsim
                 int_type overflow(int_type ch) override { return traits_type::not_eof(ch); }
             } buffer;
             std::ostream discard(&buffer);
-            initGlue(discard);
-            pInputBody(discard);
-            pEventBody(discard);
-            pGeneralBody(discard);
-            pMemBody(discard);
-            pOutputBody(discard);
-            evalBody(discard);
-            for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal) supernodeBody(discard, ordinal);
-            dumpStateBody(discard);
+            header(discard);
+            for (const auto &unit : tuPlan_.units) unitCpp(discard, unit);
         }
         void SixPhaseEmitter::validatePort(std::string_view name, std::set<std::string> &names) const
         {
@@ -2497,12 +2805,6 @@ namespace wolvrix::lib::grhsim
             else throw std::runtime_error("CPU six-phase emit unsupported array initializer: " + std::string(kind));
             if (!elide) out << "}\n";
         }
-        std::size_t SixPhaseEmitter::initChunkCount() const
-        {
-            std::size_t steps = 0;
-            for (const auto &record : model_.initRecords()) steps += model_.steps(record).size();
-            return steps == 0 ? 0 : 1;
-        }
 
         // ----- File bodies -----
         std::string SixPhaseEmitter::supernodeName(uint32_t ordinal) const
@@ -2518,7 +2820,7 @@ namespace wolvrix::lib::grhsim
         }
         void SixPhaseEmitter::header(std::ostream &out) const
         {
-            out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n";
+            out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
             // Optional perf/waveform build knobs (XS difftest hooks): default
             // off; counters are only compiled in a WOLVRIX_GRHSIM_PERF build.
             out << "#ifndef WOLVRIX_GRHSIM_PERF\n#define WOLVRIX_GRHSIM_PERF 0\n#endif\n"
@@ -2668,6 +2970,22 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             out << "template<std::size_t N> inline std::array<std::uint64_t,N> grhsim_concat_wide_scalar(std::uint64_t lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
             out << "template<std::size_t N> inline std::array<std::uint64_t,N> grhsim_concat_scalar_scalar_wide(std::uint64_t lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
             out << "template<std::size_t N,std::size_t R> inline std::array<std::uint64_t,N> grhsim_concat_scalar_wide(std::uint64_t lhs,std::size_t lhsWidth,const std::array<std::uint64_t,R>& rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_words(out,0,rhs,std::min(rhsWidth,totalWidth));if(rhsWidth<totalWidth)grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
+            // M5d-7 multi-TU: every unit includes this header, so the shared
+            // pieces live here — the dump value printers (the port section
+            // matches the trace shim: bool -> 0/1, integral -> zero-padded
+            // hex, arrays MS word first). DPI import declarations stay out of
+            // the public header (testbenches define their own extern "C"
+            // copies); each unit .cpp redeclares the imports it references.
+            out << "namespace " << prefix_ << "_dump {\n"
+                << "inline void grhsim_dump_value(std::FILE *stream,bool value){std::fprintf(stream,\"%u\",value?1u:0u);}\n"
+                << "template<typename T> inline void grhsim_dump_value(std::FILE *stream,const T &value){\n"
+                << "if constexpr(std::is_same_v<T,double>){std::uint64_t bits=0;std::memcpy(&bits,&value,sizeof(bits));std::fprintf(stream,\"%016llx\",static_cast<unsigned long long>(bits));}\n"
+                << "else if constexpr(std::is_same_v<T,float>){std::uint32_t bits=0;std::memcpy(&bits,&value,sizeof(bits));std::fprintf(stream,\"%08x\",bits);}\n"
+                << "else if constexpr(std::is_same_v<T,std::string>){std::fprintf(stream,\"%s\",value.c_str());}\n"
+                << "else{using U=std::make_unsigned_t<T>;std::fprintf(stream,\"%0*llx\",static_cast<int>(sizeof(T))*2,static_cast<unsigned long long>(static_cast<U>(value)));}\n"
+                << "}\n"
+                << "template<typename T,std::size_t N> inline void grhsim_dump_value(std::FILE *stream,const std::array<T,N> &value){for(std::size_t i=N;i-->0;)grhsim_dump_value(stream,value[i]);}\n"
+                << "}\n";
             // Contract §1.2: the interface port members open the class body (the
             // first public block's leading run of member declarations).
             out << "class " << class_ << " {\npublic:\n";
@@ -2691,13 +3009,15 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 out << "bool cpu_first_eval=true;\nstd::array<bool," << onceTasks_.size() << "> cpu_system_done{};\n"
                     << "void cpu_system_task(std::string_view,std::span<const grhsim_task_arg>);\n";
             storeStruct(out, "RegLatchStore", *regLatchStore_);
-            out << "RegLatchStore regLatchStore{};\nRegLatchStore regLatchStoreNext{};\n";
+            out << "RegLatchStore regLatchStore;\nRegLatchStore regLatchStoreNext;\n";
             storeStruct(out, "MemStore", *memStore_);
-            out << "MemStore memStore{};\n";
+            out << "MemStore memStore;\n";
             storeStruct(out, "BoundaryValueStore", *boundaryStore_);
-            out << "BoundaryValueStore boundaryValueStore{};\n";
+            out << "BoundaryValueStore boundaryValueStore;\n";
+            if (boundaryStringCount_)
+                out << "std::array<std::string," << boundaryStringCount_ << "> boundaryStrings; // hoisted string boundary fields\n";
             storeStruct(out, "PrevEventStore", *prevEventStore_);
-            out << "PrevEventStore prevEventStore{};\n";
+            out << "PrevEventStore prevEventStore;\n";
             // eventAct is byte-packed (bit act%8 of byte act/8 per field);
             // timeslot flags are one byte per task, index == the flag index.
             out << "std::array<std::uint8_t," << std::max<uint64_t>(eventActStore_->sizeBytes, 1) << "> eventActStore{};\n";
@@ -2709,17 +3029,69 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 out << "std::array<std::uint64_t," << randomSampleCount_ << "> cpu_random_values{};\n"
                     << "std::array<bool," << randomSampleCount_ << "> cpu_random_sampled{};\n";
             out << "void pInput();\nvoid pEvent();\nvoid pGeneral();\nvoid pMem();\nbool pPublish();\nvoid pOutput();\n";
+            // M5d-7 multi-TU: spill frame structs (cross-chunk locals) and the
+            // chunk member declarations. Frame structs nest inside the class;
+            // chunk functions live in the unit .cpp the C8 plan assigned.
             for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
+                if (!supernodeFrames_[ordinal].empty())
+                    frameStruct(out, "SnFrame" + std::to_string(ordinal), supernodeFrames_[ordinal]);
+            if (!eventFrame_.empty()) frameStruct(out, "EventFrame", eventFrame_);
+            if (!outputFrame_.empty()) frameStruct(out, "OutputFrame", outputFrame_);
+            for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
+            {
                 out << "void " << supernodeName(ordinal) << "();\n";
+                const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+                if (attrs.helperChunks.size() < 2) continue;
+                for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
+                {
+                    out << "void " << supernodeName(ordinal) << "__c" << i << '(';
+                    if (!supernodeFrames_[ordinal].empty()) out << "SnFrame" << ordinal << " &";
+                    out << ");\n";
+                }
+            }
+            for (uint32_t i = 0; i < initChunks_.size(); ++i) out << "void cpu_init_" << i << "();\n";
+            for (uint32_t i = 0; i < eventChunks_.size(); ++i)
+            {
+                out << "void pEvent_c" << i << '(';
+                if (!eventFrame_.empty()) out << "EventFrame &";
+                out << ");\n";
+            }
+            for (uint32_t i = 0; i < scanChunks_.size(); ++i) out << "void pGeneral_c" << i << "();\n";
+            for (uint32_t i = 0; i < memChunks_.size(); ++i) out << "void pMem_c" << i << "();\n";
+            for (uint32_t i = 0; i < outputChunks_.size(); ++i)
+            {
+                out << "void pOutput_c" << i << '(';
+                if (!outputFrame_.empty()) out << "OutputFrame &";
+                out << ");\n";
+            }
+            for (uint32_t i = 0; i < dumpChunks_.size(); ++i) out << "void cpu_dump_" << i << "(std::FILE *) const;\n";
             out << "};\n";
+        }
+        // M5d-7: a store can be reset with memset when every field is
+        // trivially copyable (std::string fields forbid it).
+        bool SixPhaseEmitter::storeTriviallyResettable(const CpuNamedStore &store) const
+        {
+            const auto trivial = [&](CpuTypeId id) {
+                const CpuType *type = &layout_.types[id.index - 1];
+                while (type->kind == CpuTypeKind::Array) type = &layout_.types[type->elementType.index - 1];
+                return type->kind != CpuTypeKind::String;
+            };
+            for (const auto &field : store.fields)
+                if (!trivial(field.type) && !boundaryStringSlot_.contains(&field)) return false;
+            return true;
         }
         void SixPhaseEmitter::storeStruct(std::ostream &out, std::string_view structName,
                                           const CpuNamedStore &store) const
         {
+            // M5d-7: no per-field initializers — a value-initialized
+            // 100k-field aggregate forces the compiler to materialize a giant
+            // ctor; init() memsets the stores instead (see initGlue).
             out << "struct " << structName << "{\n";
             for (const auto &field : store.fields)
             {
-                out << cppStoreType(field.type) << ' ' << model_.text(field.name) << "{};";
+                // Hoisted string boundary fields live in boundaryStrings.
+                if (boundaryStringSlot_.contains(&field)) continue;
+                out << cppStoreType(field.type) << ' ' << model_.text(field.name) << ";";
                 switch (store.kind)
                 {
                 case CpuNamedStoreKind::RegLatch:
@@ -2747,28 +3119,64 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             }
             out << "};\n";
         }
-        void SixPhaseEmitter::mainCpp(std::ostream &out) const
+        void SixPhaseEmitter::unitCpp(std::ostream &out, const CpuTranslationUnit &unit) const
         {
-            out << "#include \"" << prefix_ << ".hpp\"\n#include <cstdio>\n#include <cstring>\n#include <type_traits>\n";
-            // DPI import declarations (single TU: one copy of each signature).
+            out << "#include \"" << prefix_ << ".hpp\"\n";
+            out << "// TU " << unit.name << ": " << unit.chunks.size() << " chunks, ~" << unit.estimatedLines
+                << " estimated lines (C8 plan)\n";
+            // DPI import declarations are per-unit (never in the public
+            // header): only the imports this unit's chunks reference.
             {
-                std::set<std::string> declared;
-                for (const auto &function : model_.functions())
-                    if (declared.insert(identifier(model_.text(function.symbol))).second)
-                        out << dpiDeclaration(function) << '\n';
+                std::set<uint32_t> used;
+                const auto scan = [&](const std::vector<OpId> &ops) {
+                    for (const auto opId : ops)
+                    {
+                        const auto &op = model_.operations()[opId.index - 1];
+                        if (model_.text(op.opType) != "core.dpi.call") continue;
+                        used.insert(model_.objectRefs(op)[0].index);
+                    }
+                };
+                for (const auto &chunk : unit.chunks)
+                {
+                    if (chunk.kind == CpuEmitChunkKind::Supernode) scan(supernodeOps_[chunk.offset]);
+                    else if (chunk.kind == CpuEmitChunkKind::Output)
+                        scan(std::vector<OpId>(outputOps_.begin() + chunk.offset,
+                                               outputOps_.begin() + chunk.offset + chunk.count));
+                    else if (chunk.kind == CpuEmitChunkKind::Event)
+                        scan(std::vector<OpId>(eventOps_.begin() + chunk.offset,
+                                               eventOps_.begin() + chunk.offset + chunk.count));
+                }
+                if (!used.empty())
+                {
+                    std::set<std::string> declared;
+                    for (const auto &function : model_.functions())
+                        if (used.contains(function.id.index) &&
+                            declared.insert(identifier(model_.text(function.symbol))).second)
+                            out << dpiDeclaration(function) << '\n';
+                }
             }
-            // dumpState value printers: the port section matches the trace shim
-            // (bool -> 0/1, integral -> zero-padded hex, arrays MS word first).
-            out << "namespace {\n"
-                << "void grhsim_dump_value(std::FILE *stream,bool value){std::fprintf(stream,\"%u\",value?1u:0u);}\n"
-                << "template<typename T> void grhsim_dump_value(std::FILE *stream,const T &value){\n"
-                << "if constexpr(std::is_same_v<T,double>){std::uint64_t bits=0;std::memcpy(&bits,&value,sizeof(bits));std::fprintf(stream,\"%016llx\",static_cast<unsigned long long>(bits));}\n"
-                << "else if constexpr(std::is_same_v<T,float>){std::uint32_t bits=0;std::memcpy(&bits,&value,sizeof(bits));std::fprintf(stream,\"%08x\",bits);}\n"
-                << "else if constexpr(std::is_same_v<T,std::string>){std::fprintf(stream,\"%s\",value.c_str());}\n"
-                << "else{using U=std::make_unsigned_t<T>;std::fprintf(stream,\"%0*llx\",static_cast<int>(sizeof(T))*2,static_cast<unsigned long long>(static_cast<U>(value)));}\n"
-                << "}\n"
-                << "template<typename T,std::size_t N> void grhsim_dump_value(std::FILE *stream,const std::array<T,N> &value){for(std::size_t i=N;i-->0;)grhsim_dump_value(stream,value[i]);}\n"
-                << "}\n";
+            const auto chunkId = [&](const CpuEmitChunk &chunk) {
+                const auto key = (uint64_t(static_cast<unsigned>(chunk.kind)) << 32) | chunk.offset;
+                return chunkIds_.at(key);
+            };
+            for (const auto &chunk : unit.chunks)
+                switch (chunk.kind)
+                {
+                case CpuEmitChunkKind::Core: coreChunk(out); break;
+                case CpuEmitChunkKind::Init: initChunkFn(out, chunkId(chunk), chunk); break;
+                case CpuEmitChunkKind::Event: eventChunkFn(out, chunkId(chunk), chunk); break;
+                case CpuEmitChunkKind::GeneralScan: scanChunkFn(out, chunkId(chunk), chunk); break;
+                case CpuEmitChunkKind::Supernode: supernodeChunkFns(out, chunk.offset); break;
+                case CpuEmitChunkKind::Mem: memChunkFn(out, chunkId(chunk), chunk); break;
+                case CpuEmitChunkKind::Output: outputChunkFn(out, chunkId(chunk), chunk); break;
+                case CpuEmitChunkKind::Dump: dumpChunkFn(out, chunkId(chunk), chunk); break;
+                }
+        }
+        void SixPhaseEmitter::coreChunk(std::ostream &out) const
+        {
+            // The fixed small core: init() driver, phase drivers, eval, the
+            // dumpState driver and the system-task driver. Everything sizable
+            // lives in the chunk functions these call.
             initGlue(out);
             pInputBody(out);
             pEventBody(out);
@@ -2777,7 +3185,6 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             pPublishBody(out);
             pOutputBody(out);
             evalBody(out);
-            for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal) supernodeBody(out, ordinal);
             dumpStateBody(out);
             systemTaskDriver(out);
         }
@@ -2788,6 +3195,232 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             for (const auto opId : supernodeOps_[ordinal])
                 emitCompute(out, model_.operations()[opId.index - 1], ordinal);
             out << "}\n";
+        }
+        void SixPhaseEmitter::supernodeChunkFns(std::ostream &out, uint32_t ordinal) const
+        {
+            const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+            const auto &frame = supernodeFrames_[ordinal];
+            if (attrs.helperChunks.size() < 2) { supernodeBody(out, ordinal); return; }
+            // Chunked supernode (M5d-7): the driver value-initializes the spill
+            // frame on its stack and calls the C6 helper chunk members in
+            // order; cross-chunk locals live in the frame (cpu_f.v<index>).
+            out << "void " << class_ << "::" << supernodeName(ordinal) << "(){\n";
+            if (!frame.empty()) out << "SnFrame" << ordinal << " cpu_f{};\n";
+            for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
+                out << supernodeName(ordinal) << "__c" << i << '(' << (frame.empty() ? "" : "cpu_f") << ");\n";
+            out << "}\n";
+            for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
+            {
+                const auto range = attrs.helperChunks[i];
+                out << "void " << class_ << "::" << supernodeName(ordinal) << "__c" << i << '(';
+                if (!frame.empty()) out << "SnFrame" << ordinal << " &cpu_f";
+                out << "){\n";
+                std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
+                activateCrossing(frame);
+                for (uint32_t i2 = 0; i2 < range.count; ++i2)
+                {
+                    const auto opId = supernodeOps_[ordinal][range.offset + i2];
+                    emitCompute(out, model_.operations()[opId.index - 1], ordinal);
+                }
+                deactivateCrossing(frame);
+                out << "}\n";
+            }
+        }
+        void SixPhaseEmitter::emitOpListRange(std::ostream &out, const std::vector<OpId> &ops, uint32_t offset,
+                                              uint32_t count, const std::vector<uint32_t> &frame,
+                                              bool outputPhase) const
+        {
+            std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
+            activateCrossing(frame);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const auto &op = model_.operations()[ops[offset + i].index - 1];
+                const auto name = model_.text(op.opType);
+                if (!outputPhase && name == "core.event.edgeDet") { emitEdgeDet(out, op); continue; }
+                if (outputPhase && name == "core.output.write") { emitOutputWrite(out, op); continue; }
+                // latchWrite is pre-staged (precomputeStagedOutputWrites); the
+                // driver commits it after every output chunk ran.
+                if (outputPhase && name == "core.state.latchWrite") continue;
+                if (outputPhase && name == "core.system.task") { emitOutputTask(out, op); continue; }
+                emitCompute(out, op, ~0u);
+            }
+            deactivateCrossing(frame);
+        }
+        void SixPhaseEmitter::initChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
+        {
+            out << "void " << class_ << "::cpu_init_" << id << "(){\n";
+            for (uint64_t position = chunk.offset; position < uint64_t(chunk.offset) + chunk.count; ++position)
+                initStreamItem(out, position);
+            out << "}\n";
+        }
+        void SixPhaseEmitter::initStreamItem(std::ostream &out, uint64_t position) const
+        {
+            if (position < initSteps_.size())
+            {
+                const auto &[state, step] = initSteps_[position];
+                initStep(out, state, *step);
+                return;
+            }
+            position -= initSteps_.size();
+            if (position < constBoundaryFields_.size())
+            {
+                const auto *field = constBoundaryFields_[position];
+                out << boundaryRef(field) << '='
+                    << constBoundaryInit_.find(field)->second << ";\n";
+                return;
+            }
+            position -= constBoundaryFields_.size();
+            if (position < detActs_.size())
+            {
+                const auto &det = detByAct_.at(detActs_[position]);
+                out << "prevEventStore." << model_.text(prevByAct_[det.act]->name) << '='
+                    << initLiteral(det.prevInit, type(det.event)) << ";\n";
+                return;
+            }
+            out << "regLatchStoreNext=regLatchStore;\n";
+        }
+        void SixPhaseEmitter::eventChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
+        {
+            out << "void " << class_ << "::pEvent_c" << id << '(';
+            if (!eventFrame_.empty()) out << "EventFrame &cpu_f";
+            out << "){\n";
+            emitOpListRange(out, eventOps_, chunk.offset, chunk.count, eventFrame_, false);
+            out << "}\n";
+        }
+        void SixPhaseEmitter::scanRange(std::ostream &out, uint32_t begin, uint32_t end) const
+        {
+            const auto eventActive = model_.text(activeStore_->fields[0].name);
+            const auto dataActive = model_.text(activeStore_->fields[1].name);
+            for (uint32_t ordinal = begin; ordinal < end; ++ordinal)
+            {
+                if (eventGated_[ordinal])
+                    out << "if(" << eventActive << '[' << ordinal << "]&&" << dataActive << '[' << ordinal << "]){"
+                        << eventActive << '[' << ordinal << "]=0;" << dataActive << '[' << ordinal << "]=0;\n"
+                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
+                        << supernodeName(ordinal) << "();\n}\n";
+                else
+                    out << "if(" << dataActive << '[' << ordinal << "]){" << dataActive << '[' << ordinal << "]=0;\n"
+                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
+                        << supernodeName(ordinal) << "();\n}\n";
+            }
+        }
+        void SixPhaseEmitter::scanChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
+        {
+            out << "void " << class_ << "::pGeneral_c" << id << "(){\n";
+            scanRange(out, chunk.offset, chunk.offset + chunk.count);
+            out << "}\n";
+        }
+        void SixPhaseEmitter::memChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
+        {
+            out << "void " << class_ << "::pMem_c" << id << "(){\n";
+            if (schedule_.memWritePlan)
+                for (uint32_t i = 0; i < chunk.count; ++i)
+                {
+                    const auto &entry = (*schedule_.memWritePlan)[chunk.offset + i];
+                    emitMemWrite(out, model_.operations()[entry.writeOp.index - 1], entry);
+                }
+            out << "}\n";
+        }
+        void SixPhaseEmitter::outputChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
+        {
+            out << "void " << class_ << "::pOutput_c" << id << '(';
+            if (!outputFrame_.empty()) out << "OutputFrame &cpu_f";
+            out << "){\n";
+            emitOpListRange(out, outputOps_, chunk.offset, chunk.count, outputFrame_, true);
+            out << "}\n";
+        }
+        void SixPhaseEmitter::dumpChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
+        {
+            out << "void " << class_ << "::cpu_dump_" << id << "(std::FILE *stream) const{\n";
+            for (uint64_t position = chunk.offset; position < uint64_t(chunk.offset) + chunk.count; ++position)
+                dumpStreamItem(out, position);
+            out << "}\n";
+        }
+        void SixPhaseEmitter::dumpStreamItem(std::ostream &out, uint64_t position) const
+        {
+            // Canonical dump item order (C8 contract): input ports, output
+            // ports, then the named-store fields in store order.
+            const auto dumpPrinter = prefix_ + "_dump::grhsim_dump_value";
+            const auto portLine = [&](const std::string &name) {
+                out << "std::fprintf(stream,\"" << name << "=\");" << dumpPrinter << "(stream,this->" << identifier(name)
+                    << ");std::fputc('\\n',stream);\n";
+            };
+            if (position < model_.inputs().size())
+            {
+                portLine(std::string(model_.text(model_.inputs()[position].name)));
+                return;
+            }
+            position -= model_.inputs().size();
+            if (position < model_.outputs().size())
+            {
+                portLine(std::string(model_.text(model_.outputs()[position].name)));
+                return;
+            }
+            position -= model_.outputs().size();
+            for (const auto *store : {regLatchStore_, memStore_, boundaryStore_, prevEventStore_,
+                                      eventActStore_, timeslotStore_, activeStore_})
+            {
+                if (position >= store->fields.size())
+                {
+                    position -= store->fields.size();
+                    continue;
+                }
+                const auto &field = store->fields[position];
+                if (store == regLatchStore_ || store == memStore_)
+                {
+                    // Large arrays dump as an fnv1a hash in any store
+                    // (regLatch-class arrays joined the regLatch store in
+                    // M5d-6).
+                    const auto storeName = store == regLatchStore_ ? "regLatchStore" : "memStore";
+                    const auto &type = layout_.types[field.type.index - 1];
+                    if (type.kind == CpuTypeKind::Array && type.count > 64)
+                    {
+                        out << "std::fprintf(stream,\"" << storeName << "." << model_.text(field.name) << "=\");"
+                            << "{std::uint64_t cpu_h=UINT64_C(14695981039346656037);const auto *cpu_p=reinterpret_cast<const unsigned char*>("
+                            << storeName << "." << model_.text(field.name)
+                            << ".data());for(std::size_t cpu_i=0;cpu_i<sizeof(" << storeName << "."
+                            << model_.text(field.name)
+                            << ");++cpu_i)cpu_h=(cpu_h^cpu_p[cpu_i])*UINT64_C(1099511628211);std::fprintf(stream,\"fnv1a:%016llx\",static_cast<unsigned long long>(cpu_h));}"
+                            << "std::fputc('\\n',stream);\n";
+                    }
+                    else dumpStateField(out, storeName, field);
+                    return;
+                }
+                if (store == boundaryStore_)
+                {
+                    // The dump label keeps the store field name (trace
+                    // consumers parse it); hoisted strings print from
+                    // boundaryStrings.
+                    out << "std::fprintf(stream,\"boundaryValueStore." << model_.text(field.name) << "=\");" << prefix_
+                        << "_dump::grhsim_dump_value(stream," << boundaryRef(&field)
+                        << ");std::fputc('\\n',stream);\n";
+                    return;
+                }
+                if (store == prevEventStore_)
+                {
+                    dumpStateField(out, "prevEventStore", field);
+                    return;
+                }
+                if (store == eventActStore_)
+                {
+                    out << "std::fprintf(stream,\"eventActStore." << model_.text(field.name)
+                        << "=%u\",static_cast<unsigned>((eventActStore[" << field.offset << "]>>"
+                        << (field.aux % 8) << ")&1));std::fputc('\\n',stream);\n";
+                    return;
+                }
+                if (store == timeslotStore_)
+                {
+                    out << "std::fprintf(stream,\"timeslotTriggerFlag." << model_.text(field.name)
+                        << "=%u\",static_cast<unsigned>(timeslotTriggerFlag[" << field.aux
+                        << "]));std::fputc('\\n',stream);\n";
+                    return;
+                }
+                out << "std::fprintf(stream,\"" << model_.text(field.name) << "=\");" << prefix_
+                    << "_dump::grhsim_dump_value(stream,"
+                    << model_.text(field.name) << ");std::fputc('\\n',stream);\n";
+                return;
+            }
+            throw std::runtime_error("CPU six-phase emit dump chunk position is out of range");
         }
         void SixPhaseEmitter::pInputBody(std::ostream &out) const
         {
@@ -2814,13 +3447,11 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             const auto eventActive = model_.text(activeStore_->fields[0].name);
             out << "void " << class_ << "::pEvent(){\n"
                 << "eventActStore.fill(0);\n" << eventActive << ".fill(0);\n";
-            std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
-            for (const auto opId : eventOps_)
-            {
-                const auto &op = model_.operations()[opId.index - 1];
-                if (model_.text(op.opType) == "core.event.edgeDet") { emitEdgeDet(out, op); continue; }
-                emitCompute(out, op, ~0u);
-            }
+            // M5d-7: the cone+edgeDet op list runs in the pEvent_c<k> chunk
+            // members (EventFrame spills cross-chunk locals).
+            if (!eventFrame_.empty()) out << "EventFrame cpu_f{};\n";
+            for (uint32_t i = 0; i < eventChunks_.size(); ++i)
+                out << "pEvent_c" << i << '(' << (eventFrame_.empty() ? "" : "cpu_f") << ");\n";
             // act -> timeslot trigger mapping (spec §3.4; eval-level sticky).
             for (uint32_t act = 0; act < triggersByAct_.size(); ++act)
                 for (const auto flag : triggersByAct_[act])
@@ -2829,29 +3460,14 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         }
         void SixPhaseEmitter::pGeneralBody(std::ostream &out) const
         {
-            const auto eventActive = model_.text(activeStore_->fields[0].name);
-            const auto dataActive = model_.text(activeStore_->fields[1].name);
             out << "void " << class_ << "::pGeneral(){\n";
-            for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
-            {
-                if (eventGated_[ordinal])
-                    out << "if(" << eventActive << '[' << ordinal << "]&&" << dataActive << '[' << ordinal << "]){"
-                        << eventActive << '[' << ordinal << "]=0;" << dataActive << '[' << ordinal << "]=0;\n"
-                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
-                        << supernodeName(ordinal) << "();\n}\n";
-                else
-                    out << "if(" << dataActive << '[' << ordinal << "]){" << dataActive << '[' << ordinal << "]=0;\n"
-                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
-                        << supernodeName(ordinal) << "();\n}\n";
-            }
+            for (uint32_t i = 0; i < scanChunks_.size(); ++i) out << "pGeneral_c" << i << "();\n";
             out << "}\n";
         }
         void SixPhaseEmitter::pMemBody(std::ostream &out) const
         {
             out << "void " << class_ << "::pMem(){\n";
-            if (schedule_.memWritePlan)
-                for (const auto &entry : *schedule_.memWritePlan)
-                    emitMemWrite(out, model_.operations()[entry.writeOp.index - 1], entry);
+            for (uint32_t i = 0; i < memChunks_.size(); ++i) out << "pMem_c" << i << "();\n";
             out << "}\n";
         }
         void SixPhaseEmitter::pPublishBody(std::ostream &out) const
@@ -2867,19 +3483,14 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         }
         void SixPhaseEmitter::pOutputBody(std::ostream &out) const
         {
+            // M5d-7: the output cone runs in the pOutput_c<k> chunk members
+            // (OutputFrame spills cross-chunk locals); the staged latchWrite
+            // commit trails every chunk so its ne comparisons all observed the
+            // previous eval's values.
             out << "void " << class_ << "::pOutput(){\n";
-            std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
-            stagedOutputWrites_.clear();
-            for (const auto opId : outputOps_)
-            {
-                const auto &op = model_.operations()[opId.index - 1];
-                const auto name = model_.text(op.opType);
-                if (name == "core.output.write") { emitOutputWrite(out, op); continue; }
-                if (name == "core.state.latchWrite") { emitOutputLatchWrite(out, op); continue; }
-                if (name == "core.system.task") { emitOutputTask(out, op); continue; }
-                if (name == "core.dpi.call") { emitDpiCall(out, op, ~0u); continue; }
-                emitCompute(out, op, ~0u);
-            }
+            if (!outputFrame_.empty()) out << "OutputFrame cpu_f{};\n";
+            for (uint32_t i = 0; i < outputChunks_.size(); ++i)
+                out << "pOutput_c" << i << '(' << (outputFrame_.empty() ? "" : "cpu_f") << ");\n";
             commitStagedOutputWrites(out);
             out << "}\n";
         }
@@ -2909,70 +3520,47 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 out << "this->" << identifier(model_.text(input.name)) << '=' << cppType(model_.types()[input.type.index - 1]) << "{};\n";
             for (const auto &output : model_.outputs())
                 out << "this->" << identifier(model_.text(output.name)) << '=' << cppType(model_.types()[output.type.index - 1]) << "{};\n";
-            out << "regLatchStore=RegLatchStore{};\nregLatchStoreNext=RegLatchStore{};\n"
-                << "memStore=MemStore{};\nboundaryValueStore=BoundaryValueStore{};\nprevEventStore=PrevEventStore{};\n"
-                << "eventActStore.fill(0);\ntimeslotTriggerFlag.fill(0);\n";
+            // M5d-7: memset the (trivially copyable) stores — a value-init of
+            // a 100k-field aggregate makes the compiler materialize a giant
+            // ctor (measured: clang -O1 never finishes on the XS boundary
+            // store). A string-carrying boundary store keeps the value-init
+            // form (memset would be UB on std::string).
+            const auto resetStore = [&](std::string_view member, std::string_view structName,
+                                        const CpuNamedStore &store) {
+                if (storeTriviallyResettable(store))
+                    out << "std::memset(&" << member << ",0,sizeof(" << member << "));\n";
+                else
+                    out << member << '=' << structName << "{};\n";
+            };
+            resetStore("regLatchStore", "RegLatchStore", *regLatchStore_);
+            resetStore("regLatchStoreNext", "RegLatchStore", *regLatchStore_);
+            resetStore("memStore", "MemStore", *memStore_);
+            resetStore("boundaryValueStore", "BoundaryValueStore", *boundaryStore_);
+            resetStore("prevEventStore", "PrevEventStore", *prevEventStore_);
+            out << "eventActStore.fill(0);\ntimeslotTriggerFlag.fill(0);\n";
             const auto eventActive = model_.text(activeStore_->fields[0].name);
             const auto dataActive = model_.text(activeStore_->fields[1].name);
             const auto dataNext = model_.text(activeStore_->fields[2].name);
             out << eventActive << ".fill(0);\n" << dataActive << ".fill(1);\n" << dataNext << ".fill(0);\n"
                 << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
             if (!randomFunctions_.empty()) out << "cpu_random_values.fill(0);\ncpu_random_sampled.fill(false);\n";
-            initBody(out, 0);
-            for (const auto &[field, expr] : constBoundaryInit_)
-                out << "boundaryValueStore." << model_.text(field->name) << '=' << expr << ";\n";
-            for (const auto &[act, det] : detByAct_)
-            {
-                if (act >= prevByAct_.size() || !prevByAct_[act])
-                    throw std::runtime_error("CPU six-phase emit edgeDet act has no prevEvent field");
-                out << "prevEventStore." << model_.text(prevByAct_[act]->name) << '=' << initLiteral(det.prevInit, type(det.event)) << ";\n";
-            }
-            out << "regLatchStoreNext=regLatchStore;\n"
-                << "}\n";
+            // M5d-7: the init stream (steps, constant-boundary preloads,
+            // prevEvent inits, regLatchStoreNext sync) runs in the
+            // cpu_init_<k> chunk members.
+            for (uint32_t i = 0; i < initChunks_.size(); ++i) out << "cpu_init_" << i << "();\n";
+            out << "}\n";
         }
         void SixPhaseEmitter::dumpStateBody(std::ostream &out) const
         {
             out << "void " << class_ << "::dumpState(std::FILE *stream) const{\n"
                 << "if(!stream)return;\n";
-            const auto portLine = [&](std::string_view name) {
-                out << "std::fprintf(stream,\"" << name << "=\");grhsim_dump_value(stream,this->" << identifier(name)
-                    << ");std::fputc('\\n',stream);\n";
-            };
-            for (const auto &input : model_.inputs()) portLine(model_.text(input.name));
-            for (const auto &output : model_.outputs()) portLine(model_.text(output.name));
-            // Large arrays dump as an fnv1a hash in any store (regLatch-class
-            // arrays joined the regLatch store in M5d-6).
-            const auto storeField = [&](std::string_view store, const CpuStoreField &field) {
-                const auto &type = layout_.types[field.type.index - 1];
-                if (type.kind == CpuTypeKind::Array && type.count > 64)
-                {
-                    out << "std::fprintf(stream,\"" << store << "." << model_.text(field.name) << "=\");"
-                        << "{std::uint64_t cpu_h=UINT64_C(14695981039346656037);const auto *cpu_p=reinterpret_cast<const unsigned char*>("
-                        << store << "." << model_.text(field.name) << ".data());for(std::size_t cpu_i=0;cpu_i<sizeof("
-                        << store << "." << model_.text(field.name)
-                        << ");++cpu_i)cpu_h=(cpu_h^cpu_p[cpu_i])*UINT64_C(1099511628211);std::fprintf(stream,\"fnv1a:%016llx\",static_cast<unsigned long long>(cpu_h));}"
-                        << "std::fputc('\\n',stream);\n";
-                }
-                else dumpStateField(out, store, field);
-            };
-            for (const auto &field : regLatchStore_->fields) storeField("regLatchStore", field);
-            for (const auto &field : memStore_->fields) storeField("memStore", field);
-            for (const auto &field : boundaryStore_->fields) dumpStateField(out, "boundaryValueStore", field);
-            for (const auto &field : prevEventStore_->fields) dumpStateField(out, "prevEventStore", field);
-            for (const auto &field : eventActStore_->fields)
-                out << "std::fprintf(stream,\"eventActStore." << model_.text(field.name) << "=%u\",static_cast<unsigned>((eventActStore["
-                    << field.offset << "]>>" << (field.aux % 8) << ")&1));std::fputc('\\n',stream);\n";
-            for (const auto &field : timeslotStore_->fields)
-                out << "std::fprintf(stream,\"timeslotTriggerFlag." << model_.text(field.name) << "=%u\",static_cast<unsigned>(timeslotTriggerFlag["
-                    << field.aux << "]));std::fputc('\\n',stream);\n";
-            for (const auto &field : activeStore_->fields)
-                out << "std::fprintf(stream,\"" << model_.text(field.name) << "=\");grhsim_dump_value(stream," << model_.text(field.name)
-                    << ");std::fputc('\\n',stream);\n";
+            for (uint32_t i = 0; i < dumpChunks_.size(); ++i) out << "cpu_dump_" << i << "(stream);\n";
             out << "}\n";
         }
         void SixPhaseEmitter::dumpStateField(std::ostream &out, std::string_view store, const CpuStoreField &field) const
         {
-            out << "std::fprintf(stream,\"" << store << '.' << model_.text(field.name) << "=\");grhsim_dump_value(stream,"
+            out << "std::fprintf(stream,\"" << store << '.' << model_.text(field.name) << "=\");" << prefix_
+                << "_dump::grhsim_dump_value(stream,"
                 << store << '.' << model_.text(field.name) << ");std::fputc('\\n',stream);\n";
         }
         void SixPhaseEmitter::systemTaskDriver(std::ostream &out) const
@@ -3007,15 +3595,6 @@ if(terminal){
 }
 )CPP";
         }
-        void SixPhaseEmitter::initBody(std::ostream &out, std::size_t chunk) const
-        {
-            (void)chunk; // single-TU init: every step lands in init()
-            for (const auto &record : model_.initRecords())
-                for (const auto &step : model_.steps(record))
-                    initStep(out, record.state, step);
-        }
-        void SixPhaseEmitter::taskCpp(std::ostream &, const CpuScheduledTask &) const
-        { throw std::runtime_error("M5a后续切片: multi-TU task split is not implemented"); }
         PassResult SixPhaseEmitter::write(const std::filesystem::path &directory)
         {
             if (std::filesystem::exists(directory) && !std::filesystem::is_empty(directory))
@@ -3045,8 +3624,15 @@ if(terminal){
             };
             file(prefix_ + "_runtime.hpp", [&](auto &out) { emit::writeGrhSimRuntime(out, {.systemTasks = hasSystemTasks_}); });
             file(prefix_ + ".hpp", [&](auto &out) { header(out); });
-            const auto main = prefix_ + ".cpp"; sources.push_back(main);
-            file(main, [&](auto &out) { mainCpp(out); });
+            // M5d-7: one .cpp per planned translation unit; the generated
+            // Makefile lists them all, so `make -j` compiles the units in
+            // parallel and archives one static library.
+            for (const auto &unit : tuPlan_.units)
+            {
+                const auto source = prefix_ + "_" + unit.name + ".cpp";
+                sources.push_back(source);
+                file(source, [&](auto &out) { unitCpp(out, unit); });
+            }
             file("Makefile", [&](auto &out) {
                 out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\nSOURCES :=";
                 for (const auto &source : sources) out << ' ' << source;
@@ -3078,9 +3664,10 @@ if(terminal){
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         const auto *mapping = model.cpuMapping();
-        if (!mapping || mapping->stage != CpuMappingStage::PhaseSchedule)
+        if (!mapping || mapping->stage != CpuMappingStage::TranslationUnits || !mapping->translationUnits)
         {
-            diagnostics.error("CPU six-phase emit requires a PhaseSchedule-stage cpu mapping", "cpu.st.emit-cpp");
+            diagnostics.error("CPU six-phase emit requires a TranslationUnits-stage cpu mapping "
+                              "(run cpu.st.plan-translation-units)", "cpu.st.emit-cpp");
             return {false, false, {}};
         }
         if (!mapping->dataLayout || !mapping->dataLayout->namedStores || !mapping->schedule)

@@ -144,6 +144,76 @@ namespace wolvrix::lib::grhsim
         return boundary;
     }
 
+    // Emitted-line estimate for one op, shared by the C6 function packing and
+    // the C8 TU planning heuristics (M5d-7). A heuristic, not a contract: it
+    // only steers chunk sizes, never correctness.
+    inline uint64_t estimatedCpuOpLines(const GrhSimModel &model, OpId id)
+    {
+        const auto &op = model.operations()[id.index - 1];
+        uint64_t lines = 4 + op.operands.count + op.results.count;
+        for (auto value : model.results(op))
+        {
+            const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];
+            if (type.kind == TypeKind::Logic) lines += (uint64_t(type.width) + 63) / 64;
+        }
+        return lines;
+    }
+
+    // Flat op list of an Event/Output phase branch (its single EmitFunction
+    // leaf's ops, M5d-6 tree shape). Empty when the branch holds no leaf.
+    inline std::vector<OpId> cpuFlatBranchOps(const CpuPartitionTree &tree, CpuPhase phase)
+    {
+        const auto &root = tree.partitions[tree.root.index - 1];
+        for (const auto branchId : root.children)
+        {
+            const auto &branch = tree.partitions[branchId.index - 1];
+            if (branch.attrs.phase != phase || branch.children.empty()) continue;
+            return tree.partitions[branch.children.front().index - 1].ops;
+        }
+        return {};
+    }
+
+    // The init stream emitted by init() and its cpu_init_<k> chunks (M5d-7):
+    // flattened init steps, then one constant-boundary preload per boundary
+    // field whose producer is a constant, then one prevEvent init per edgeDet
+    // op, then the final regLatchStoreNext sync line.
+    struct CpuInitStreamTotals
+    {
+        uint64_t steps = 0;
+        uint64_t boundaryPreloads = 0;
+        uint64_t prevEvents = 0;
+        uint64_t total() const { return steps + boundaryPreloads + prevEvents + 1; }
+    };
+
+    inline CpuInitStreamTotals cpuInitStreamTotals(const GrhSimModel &model, const CpuNamedStore &boundaryStore)
+    {
+        CpuInitStreamTotals totals;
+        std::vector<OpId> producer(model.values().size() + 1);
+        for (const auto &op : model.operations())
+        {
+            for (const auto value : model.results(op)) producer[value.index] = op.id;
+            if (model.text(op.opType) == "core.event.edgeDet") ++totals.prevEvents;
+        }
+        for (const auto &record : model.initRecords()) totals.steps += model.steps(record).size();
+        for (const auto &field : boundaryStore.fields)
+        {
+            if (!field.value) continue;
+            const auto source = producer[field.value.index];
+            if (source && model.text(model.operations()[source.index - 1].opType) == "core.compute.constant")
+                ++totals.boundaryPreloads;
+        }
+        return totals;
+    }
+
+    // The canonical dump item list (dumpState and its cpu_dump_<k> chunks):
+    // input ports, output ports, then the named-store fields in store order.
+    inline uint64_t cpuDumpItemCount(const GrhSimModel &model, std::span<const CpuNamedStore> stores)
+    {
+        uint64_t count = model.inputs().size() + model.outputs().size();
+        for (const auto &store : stores) count += store.fields.size();
+        return count;
+    }
+
     // Parses a core.compute.constant constValue literal ("4'h5", "1'b1",
     // "16'h0000", plain decimal). Returns nullopt for x/z digits or overflow.
     inline std::optional<uint64_t> parseCpuConstLiteral(std::string_view text)

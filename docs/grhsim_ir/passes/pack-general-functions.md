@@ -13,8 +13,11 @@ Two steps:
 1. Helper chunks: every General supernode gets `helperChunks` ranges split by
    the legacy `estimatedLines` heuristic against
    `--helper-max-estimated-lines` (default 2048). Ranges index into the
-   supernode's flattened op order and must cover it contiguously. The
-   six-phase model gates whole supernodes through the ActiveFlags byte
+   supernode's flattened op order and must cover it contiguously. M5d-7: the
+   ranges drive the emit-side chunk members (`sn_<i>__c<j>`) — one per chunk,
+   with cross-chunk locals spilled through the supernode's `SnFrame<i>` frame
+   struct; the C8 TU plan keeps a supernode's chunks in one translation unit.
+   The six-phase model gates whole supernodes through the ActiveFlags byte
    arrays; the partition tree never contains `ActiveWord` (or `EventDomain`)
    partitions.
 2. Emit functions: the General branch's supernodes are **not** remounted

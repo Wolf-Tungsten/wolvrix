@@ -1,4 +1,5 @@
 #include "grhsim/backend/cpu.hpp"
+#include "grhsim/backend/cpu_phase_common.hpp"
 #include "grhsim/pass/pass.hpp"
 
 #include <algorithm>
@@ -543,18 +544,6 @@ namespace wolvrix::lib::grhsim
                              " event_domain_blocked=" + std::to_string(blocked), "cpu.st.merge-general-supernodes");
         }
 
-        uint64_t estimatedLines(const GrhSimModel &model, OpId id)
-        {
-            const auto &op = model.operations()[id.index - 1];
-            uint64_t lines = 4 + op.operands.count + op.results.count;
-            for (auto value : model.results(op))
-            {
-                const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];
-                if (type.kind == TypeKind::Logic) lines += (uint64_t(type.width) + 63) / 64;
-            }
-            return lines;
-        }
-
         // cpu.st.pack-general-functions (C6, M5d-6 position: after
         // build-mem-write-plan, before build-phase-schedule): helper chunks
         // on General supernodes (the six-phase model gates whole
@@ -581,7 +570,7 @@ namespace wolvrix::lib::grhsim
                 uint32_t begin = 0;
                 for (uint32_t i = 0; i < ops.size(); ++i)
                 {
-                    const auto estimate = estimatedLines(model, ops[i]);
+                    const auto estimate = estimatedCpuOpLines(model, ops[i]);
                     totalLines += estimate;
                     if (i > begin && lines + estimate > helperLines)
                     { attrs.helperChunks.push_back({begin, i - begin}); begin = i; lines = 0; }
@@ -603,7 +592,7 @@ namespace wolvrix::lib::grhsim
             {
                 const auto ops = partitionOps(tree, supernodes[ordinal]);
                 uint64_t lines = 0;
-                for (auto op : ops) lines += estimatedLines(model, op);
+                for (auto op : ops) lines += estimatedCpuOpLines(model, op);
                 if (!function || functionOps + ops.size() > effectiveOps || functionLines + lines > effectiveLines)
                 {
                     closeFunction(ordinal);

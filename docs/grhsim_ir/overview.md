@@ -355,10 +355,10 @@ verifier 约束（含分区自封，任何中间形态都必须满足）：`edge
 
 JSON checkpoint 中相位随 op 行持久化，字节稳定往返。
 
-### 3.7 CPU mapping 的 C 段（M5d-6）
+### 3.7 CPU mapping 的 C 段（M5d-6，C8 追加于 M5d-7）
 
 B8 封板后，CPU 后端只运行**一次最终 mapping**（C 段），单向推进、不回改语义；mapping
-因语义 revision 失效后由 C1 整体重建。七个 pass 的顺序（机制细节见
+因语义 revision 失效后由 C1 整体重建。八个 pass 的顺序（机制细节见
 [CPU 单线程活动度仿真 Flow](flows/cpu-st.md) 第 2 节与各 pass 文档）：
 
 | 阶段 | pass | 产出 |
@@ -369,7 +369,8 @@ B8 封板后，CPU 后端只运行**一次最终 mapping**（C 段），单向�
 | C4 | `cpu.st.build-event-bitmaps` | (event,edge) 聚类 → 超节点位图（bit i = C2 序号 i） |
 | C5 | `cpu.st.build-mem-write-plan` | Mem 相写计划与 mem 类状态的读者表 |
 | C6 | `cpu.st.pack-general-functions` | EmitFunction 只记超节点序号区间（`supernodeRange`） |
-| C7 | `cpu.st.build-phase-schedule` | fanout/trigger/task；终态 `PhaseSchedule`（complete） |
+| C7 | `cpu.st.build-phase-schedule` | fanout/trigger/task；`PhaseSchedule`（complete） |
+| C8 | `cpu.st.plan-translation-units` | emit TU 计划（规模受控块流装箱）；终态 `TranslationUnits`（complete） |
 
 关键决议：
 

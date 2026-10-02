@@ -325,17 +325,20 @@ namespace wolvrix::lib::grhsim
     // no longer produced since M5d-6: cpu.st.build-general-nodes initializes
     // the mapping at GeneralNodes) -> GeneralNodes -> GeneralSupernodes; the
     // M4 layout/schedule stages append LayoutNamedStores -> EventBitmaps ->
-    // MemWritePlan -> PhaseSchedule (the complete terminal), and M5d-6 moved
-    // GeneralFunctions (function packing) between MemWritePlan and
-    // PhaseSchedule. Enum VALUES stay stable; the pipeline order is no longer
-    // the numeric order — use cpuMappingStageRank for stage comparisons.
-    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions, LayoutNamedStores, EventBitmaps, MemWritePlan, PhaseSchedule };
+    // MemWritePlan -> PhaseSchedule, and M5d-6 moved GeneralFunctions
+    // (function packing) between MemWritePlan and PhaseSchedule. M5d-7
+    // appends TranslationUnits (C8 TU planning) as the terminal stage.
+    // Enum VALUES stay stable; the pipeline order is no longer the numeric
+    // order — use cpuMappingStageRank for stage comparisons.
+    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions, LayoutNamedStores, EventBitmaps, MemWritePlan, PhaseSchedule, TranslationUnits };
 
     // Six-phase pipeline order rank (M5d-6): GeneralNodes < GeneralSupernodes
     // < LayoutNamedStores < EventBitmaps < MemWritePlan < GeneralFunctions <
-    // PhaseSchedule, with the compat-only SplitPhases at 0. Legacy two-phase
-    // stages (rejected by verifyCpuMapping before any comparison) rank 0 as
-    // well, so rank checks fail closed. Never compare stages numerically.
+    // PhaseSchedule, with the compat-only SplitPhases at 0. M5d-7 appends
+    // TranslationUnits (C8 cpu.st.plan-translation-units) as the terminal
+    // emit-planning stage. Legacy two-phase stages (rejected by
+    // verifyCpuMapping before any comparison) rank 0 as well, so rank checks
+    // fail closed. Never compare stages numerically.
     inline unsigned cpuMappingStageRank(CpuMappingStage stage) noexcept
     {
         switch (stage)
@@ -347,6 +350,7 @@ namespace wolvrix::lib::grhsim
         case CpuMappingStage::MemWritePlan: return 5;
         case CpuMappingStage::GeneralFunctions: return 6;
         case CpuMappingStage::PhaseSchedule: return 7;
+        case CpuMappingStage::TranslationUnits: return 8;
         default: return 0; // SplitPhases and the removed legacy stages
         }
     }
@@ -534,14 +538,68 @@ namespace wolvrix::lib::grhsim
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;
     };
 
+    // ----- M5d-7 multi-TU emit plan (C8 cpu.st.plan-translation-units) -----
+
+    // One emitted function (or one small fixed group) inside a generated
+    // translation unit. Ranges index the kind's canonical stream:
+    //   Core       — the fixed small core: eval, pInput, pPublish, the phase
+    //                drivers, the system-task driver (exactly one chunk).
+    //   Init       — init() chunk over the init stream: flattened init steps,
+    //                then constant-boundary preloads, then prevEvent inits,
+    //                then the regLatchStoreNext sync (offset/count in items).
+    //   Event      — pEvent cone chunk: range of the Event branch's flat ops.
+    //   GeneralScan— pGeneral scan chunk: supernode ordinal range, aligned to
+    //                the C6 EmitFunction intervals unless one interval alone
+    //                exceeds the chunk cap.
+    //   Supernode  — one General supernode (offset = ordinal, count = 1):
+    //                its sn_<ordinal> driver plus the C6 helperChunks member
+    //                functions all live in this unit.
+    //   Mem        — pMem chunk: range of the memWritePlan entries.
+    //   Output     — pOutput chunk: range of the Output branch's flat ops.
+    //   Dump       — dumpState chunk: range of the canonical dump item list
+    //                (inputs, outputs, then the named-store fields in store
+    //                order: regLatch, mem, boundary, prevEvent, eventAct,
+    //                timeslot, activeFlags).
+    enum class CpuEmitChunkKind : uint8_t { Core, Init, Event, GeneralScan, Supernode, Mem, Output, Dump };
+
+    struct CpuEmitChunk
+    {
+        CpuEmitChunkKind kind = CpuEmitChunkKind::Core;
+        uint32_t offset = 0;          // range begin in the kind's stream (Supernode: ordinal)
+        uint32_t count = 0;           // range length (Supernode: 1, Core: 0)
+        uint64_t estimatedLines = 0;  // C8 size heuristic
+        friend bool operator==(const CpuEmitChunk &, const CpuEmitChunk &) = default;
+    };
+
+    struct CpuTranslationUnit
+    {
+        std::string name; // file base name suffix; emit writes <prefix>_<name>.cpp
+        std::vector<CpuEmitChunk> chunks;
+        uint64_t estimatedLines = 0;
+        friend bool operator==(const CpuTranslationUnit &, const CpuTranslationUnit &) = default;
+    };
+
+    struct CpuTranslationUnitPlan
+    {
+        // Caps recorded so verification replans deterministically.
+        uint64_t chunkMaxEstimatedLines = 0;
+        uint64_t unitMaxEstimatedLines = 0;
+        std::vector<CpuTranslationUnit> units;
+        friend bool operator==(const CpuTranslationUnitPlan &, const CpuTranslationUnitPlan &) = default;
+    };
+
     struct CpuBackendMapping
     {
         // The six-phase pipeline enters at GeneralNodes (M5d-6: C1
-        // cpu.st.build-general-nodes initializes the mapping).
+        // cpu.st.build-general-nodes initializes the mapping) and terminates
+        // at TranslationUnits (M5d-7: C8 records the emit TU plan).
         CpuMappingStage stage = CpuMappingStage::GeneralNodes;
         CpuPartitionTree partitionTree;
         std::optional<CpuDataLayout> dataLayout;
         std::optional<CpuSchedulePlan> schedule;
+        // Engaged exactly at the TranslationUnits stage (C8): the emit-side
+        // translation-unit plan consumed by cpu.st.emit-cpp.
+        std::optional<CpuTranslationUnitPlan> translationUnits;
     };
 
     struct BackendMapping

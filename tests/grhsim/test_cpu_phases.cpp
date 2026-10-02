@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -998,6 +999,144 @@ namespace
         requirePackedGeneralBranch(packed, "f10");
         roundTrip(model);
     }
+
+    // M5d-7 (C8): plan-translation-units closes the mapping at the
+    // TranslationUnits stage with a verifiable TU plan: one Core chunk, chunk
+    // streams tiling their ranges, scan chunks tiling [0, supernodeCount),
+    // every supernode assigned exactly once. Tiny caps split more units; the
+    // plan survives the JSON round trip; the verifier replans with the
+    // recorded caps and catches corruption.
+    void translationUnitsTest()
+    {
+        GrhSimModel model("f11_translation_units");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto clk = addInputRead(model, "clk", SimPhase::Event);
+        addEdgeDet(model, clk, 0);
+        const auto d = addInputRead(model, "d");
+        const auto x = addNot(model, d, "x");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto q = addState(model, "q", bit, "1'b0");
+        addRegWrite(model, one, x, one, q, {0});
+        const auto memType = model.arrayType(bit, 16);
+        const auto mem = addState(model, "mem", memType, "0");
+        model.addOperation("core.state.memWrite", std::array{one, one, d, one}, {},
+                           std::array{ObjectRef::state(mem)});
+        const auto outPort = model.addOutput("o", bit);
+        const auto os = addState(model, "os", bit, "1'b0");
+        const auto ov = model.addValue(bit, "ov");
+        const auto readOp = model.addOperation("core.state.read", {}, std::array{ov},
+                                               std::array{ObjectRef::state(os)});
+        model.setOperationPhase(readOp, SimPhase::Output);
+        const auto writeOp = model.addOperation("core.output.write", std::array{ov}, {},
+                                                std::array{ObjectRef::output(outPort)});
+        model.setOperationPhase(writeOp, SimPhase::Output);
+        require(verifies(model), "f11: fixture rejected");
+
+        attributeAndInit(model, true);
+        runPass(model, "cpu.st.merge-general-supernodes");
+        advanceToFunctions(model);
+        // C8 rejects a pre-PhaseSchedule mapping.
+        {
+            auto early = model.clone();
+            std::string error;
+            auto pass = defaultPassRegistry().create("cpu.st.plan-translation-units", {}, error);
+            require(bool(pass), error);
+            diag::Diagnostics diagnostics;
+            require(!pass->run(early, diagnostics).success &&
+                    early.cpuMapping()->stage == CpuMappingStage::GeneralFunctions,
+                    "f11: plan-translation-units accepted a pre-schedule mapping");
+        }
+        runPass(model, "cpu.st.build-phase-schedule");
+        require(model.cpuMapping()->stage == CpuMappingStage::PhaseSchedule, "f11: schedule stage wrong");
+        require(model.mappings().front().complete, "f11: the phase-schedule stage completes the mapping");
+        auto scheduled = model.clone();
+
+        runPass(model, "cpu.st.plan-translation-units");
+        const auto &mapping = *model.cpuMapping();
+        require(mapping.stage == CpuMappingStage::TranslationUnits, "f11: TU stage wrong");
+        require(model.mappings().front().complete, "f11: the terminal mapping must stay complete");
+        require(mapping.translationUnits.has_value(), "f11: TU plan missing");
+        const auto &plan = *mapping.translationUnits;
+        require(plan.chunkMaxEstimatedLines == 2048 && plan.unitMaxEstimatedLines == 32768,
+                "f11: default caps wrong");
+        require(!plan.units.empty(), "f11: TU plan holds no units");
+        const auto supernodeCount = supernodes(mapping).size();
+        uint32_t coreChunks = 0, supernodeChunks = 0, scanEnd = 0;
+        std::set<std::string> unitNames;
+        std::vector<char> covered(supernodeCount);
+        for (const auto &unit : plan.units)
+        {
+            require(unitNames.insert(unit.name).second, "f11: duplicate TU name");
+            uint64_t lines = 0;
+            for (const auto &chunk : unit.chunks) lines += chunk.estimatedLines;
+            require(lines == unit.estimatedLines, "f11: unit size is not the chunk sum");
+            for (const auto &chunk : unit.chunks)
+            {
+                if (chunk.kind == CpuEmitChunkKind::Core) ++coreChunks;
+                if (chunk.kind == CpuEmitChunkKind::GeneralScan)
+                {
+                    require(chunk.offset == scanEnd, "f11: scan chunks do not tile");
+                    scanEnd += chunk.count;
+                }
+                if (chunk.kind == CpuEmitChunkKind::Supernode)
+                {
+                    require(chunk.count == 1 && chunk.offset < supernodeCount && !covered[chunk.offset],
+                            "f11: supernode chunk mis-covers");
+                    covered[chunk.offset] = 1;
+                    ++supernodeChunks;
+                }
+            }
+        }
+        require(coreChunks == 1, "f11: plan must hold exactly one core chunk");
+        require(scanEnd == supernodeCount, "f11: scan chunks do not cover the supernodes");
+        require(supernodeChunks == supernodeCount, "f11: supernode chunks do not cover the supernodes");
+        roundTrip(model);
+
+        // Tiny caps split the same model into strictly more units.
+        const std::array<std::string_view, 4> tiny{"--chunk-max-estimated-lines", "8",
+                                                   "--unit-max-estimated-lines", "32"};
+        runPass(scheduled, "cpu.st.plan-translation-units", tiny);
+        const auto &tinyPlan = *scheduled.cpuMapping()->translationUnits;
+        require(tinyPlan.chunkMaxEstimatedLines == 8 && tinyPlan.unitMaxEstimatedLines == 32,
+                "f11: tiny caps not recorded");
+        require(tinyPlan.units.size() > plan.units.size(), "f11: tiny caps did not split the emit");
+        roundTrip(scheduled);
+        // C8 replans deterministically on an already-planned mapping (the C1
+        // rebuild semantics) — re-running with the tiny caps on the planned
+        // model yields exactly the tiny plan.
+        runPass(model, "cpu.st.plan-translation-units", tiny);
+        require(model.cpuMapping()->stage == CpuMappingStage::TranslationUnits,
+                "f11: replan left the terminal stage");
+        require(*model.cpuMapping()->translationUnits == tinyPlan, "f11: replan is not deterministic");
+
+        // The verifier replans with the recorded caps and catches corruption.
+        {
+            auto bad = mapping;
+            auto &planRef = bad.translationUnits;
+            bool corruptedChunk = false;
+            for (auto &unit : planRef->units)
+                for (auto &chunk : unit.chunks)
+                    if (!corruptedChunk && chunk.count > 1) { ++chunk.count; corruptedChunk = true; }
+            if (!corruptedChunk) planRef->units.back().estimatedLines += 1;
+            auto broken = model.clone();
+            broken.setCpuMapping(std::move(bad));
+            diag::Diagnostics diagnostics;
+            require(!verifyGrhSimModel(broken, defaultDialectRegistry(), diagnostics) &&
+                    diagnostics.hasError(), "f11: verifier accepted a corrupted TU plan");
+        }
+        // Invalid options are rejected at creation.
+        std::string error;
+        const std::array<std::string_view, 1> oddArgs{"--chunk-max-estimated-lines"};
+        require(!defaultPassRegistry().create("cpu.st.plan-translation-units", oddArgs, error),
+                "f11: accepted a value-less option");
+        const std::array<std::string_view, 2> zeroCap{"--unit-max-estimated-lines", "0"};
+        require(!defaultPassRegistry().create("cpu.st.plan-translation-units", zeroCap, error),
+                "f11: accepted a zero unit cap");
+        const std::array<std::string_view, 2> unknownKey{"--tu-count", "4"};
+        require(!defaultPassRegistry().create("cpu.st.plan-translation-units", unknownKey, error),
+                "f11: accepted an unknown option");
+    }
 }
 
 int main()
@@ -1014,6 +1153,7 @@ int main()
         emptyModelTest();
         crossDomainStateReadTest();
         regLatchMemWriteTest();
+        translationUnitsTest();
         std::cout << "CPU six-phase mapping tests passed\n";
         return 0;
     }

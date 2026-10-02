@@ -1,9 +1,11 @@
 # Phase schedule
 
-`cpu.st.build-phase-schedule` is the seventh and final pass (C7) of the CPU
-mapping C segment. Requires a `GeneralFunctions`-stage mapping (M5d-6 moved
-function packing ahead of scheduling); produces the `PhaseSchedule` stage —
-the terminal stage of the pipeline, at which the mapping becomes `complete`.
+`cpu.st.build-phase-schedule` is the seventh pass (C7) of the CPU mapping C
+segment. Requires a `GeneralFunctions`-stage mapping (M5d-6 moved function
+packing ahead of scheduling); produces the `PhaseSchedule` stage — a terminal
+stage at which the mapping becomes `complete` (M5d-7 appends C8
+[`plan-translation-units`](plan-translation-units.md) → `TranslationUnits`,
+also `complete`; emit accepts only the latter).
 
 Fanout tables (targets sorted by the C2 supernode ordinal, deduplicated):
 

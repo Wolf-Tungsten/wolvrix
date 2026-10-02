@@ -32,7 +32,7 @@ namespace wolvrix::lib::grhsim
             const auto atLeast = [&](CpuMappingStage stage) {
                 return cpuMappingStageAtLeast(cpu.stage, stage);
             };
-            if (!atLeast(CpuMappingStage::LayoutNamedStores) && (cpu.dataLayout || cpu.schedule))
+            if (!atLeast(CpuMappingStage::LayoutNamedStores) && (cpu.dataLayout || cpu.schedule || cpu.translationUnits))
                 return error("six-phase CPU mapping must not carry data layout or schedule payloads");
             const auto &tree = cpu.partitionTree;
             const auto validPartition = [&](PartitionId id) {
@@ -327,8 +327,19 @@ namespace wolvrix::lib::grhsim
                         return error("general supernode mixes event ops with event-free data-driven ops");
                 }
             }
-            if (atLeast(CpuMappingStage::LayoutNamedStores))
-                return verifyCpuDataLayout(model, cpu, diagnostics) && verifyCpuSchedule(model, cpu, diagnostics);
+            if (atLeast(CpuMappingStage::LayoutNamedStores) &&
+                !(verifyCpuDataLayout(model, cpu, diagnostics) && verifyCpuSchedule(model, cpu, diagnostics)))
+                return false;
+            // M5d-7: the emit TU plan is engaged exactly at the terminal
+            // TranslationUnits stage.
+            if (cpu.stage == CpuMappingStage::TranslationUnits)
+            {
+                if (!cpu.translationUnits)
+                    return error("translation-units stage requires the emit TU plan");
+                return verifyCpuTranslationUnits(model, cpu, diagnostics);
+            }
+            if (cpu.translationUnits)
+                return error("emit TU plan requires the translation-units stage");
             return true;
         }
     }
@@ -343,12 +354,15 @@ namespace wolvrix::lib::grhsim
         if (model.text(mapping.backend) != "cpu" || model.text(mapping.schema) != "cpu.st.v1" || !mapping.cpu)
             return error("CPU mapping requires a typed cpu.st.v1 payload");
         const auto &cpu = *mapping.cpu;
-        // The six-phase pipeline completes at PhaseSchedule; the legacy
-        // two-phase pipeline (terminal Schedule) was removed in M5d-6 and its
-        // checkpoints are no longer accepted.
-        if (mapping.complete != (cpu.stage == CpuMappingStage::PhaseSchedule))
-            return error("CPU mapping completion requires the phase-schedule stage");
-        if (cpu.stage > CpuMappingStage::PhaseSchedule)
+        // The six-phase pipeline completes at PhaseSchedule and stays
+        // complete through the TranslationUnits emit-planning stage (M5d-7);
+        // the legacy two-phase pipeline (terminal Schedule) was removed in
+        // M5d-6 and its checkpoints are no longer accepted.
+        const bool terminal = cpu.stage == CpuMappingStage::PhaseSchedule ||
+                              cpu.stage == CpuMappingStage::TranslationUnits;
+        if (mapping.complete != terminal)
+            return error("CPU mapping completion requires a terminal six-phase stage");
+        if (cpu.stage > CpuMappingStage::TranslationUnits)
             return error("unknown CPU mapping stage");
         if (cpu.stage < CpuMappingStage::SplitPhases)
             return error("legacy two-phase CPU mappings are no longer supported (M5d-6)");
@@ -360,6 +374,7 @@ namespace wolvrix::lib::grhsim
         registerCpuPartitionPasses(registry);
         registerCpuLayoutPasses(registry);
         registerCpuSchedulePasses(registry);
+        registerCpuEmitPlanPasses(registry);
         registerCpuPhaseEmitPasses(registry);
     }
 }

@@ -2344,15 +2344,16 @@ namespace {
                                  "cpu.st.build-general-nodes", "cpu.st.merge-general-supernodes",
                                  "cpu.st.layout-named-stores", "cpu.st.build-event-bitmaps",
                                  "cpu.st.build-mem-write-plan", "cpu.st.pack-general-functions",
-                                 "cpu.st.build-phase-schedule"})
+                                 "cpu.st.build-phase-schedule", "cpu.st.plan-translation-units"})
             manager.addPass(defaultPassRegistry().create(name, {}, error));
         diag::Diagnostics diagnostics;
         if (!manager.run(model, diagnostics).success || diagnostics.hasError())
             return fail("shell fixture six-phase CPU mapping failed");
         const auto *mapping = model.cpuMapping();
-        if (!mapping || mapping->stage != CpuMappingStage::PhaseSchedule)
-            return fail("six-phase pipeline did not reach the phase-schedule stage");
-        if (!mapping->dataLayout || !mapping->dataLayout->namedStores || !mapping->schedule)
+        if (!mapping || mapping->stage != CpuMappingStage::TranslationUnits)
+            return fail("six-phase pipeline did not reach the translation-units stage");
+        if (!mapping->dataLayout || !mapping->dataLayout->namedStores || !mapping->schedule ||
+            !mapping->translationUnits)
             return fail("six-phase pipeline left the mapping shells incomplete");
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics))
             return fail("six-phase pipeline mapping was rejected");
@@ -2366,11 +2367,13 @@ namespace {
         auto loaded = loadGrhSimModel(firstPath, defaultDialectRegistry(), loadDiagnostics);
         if (!loaded || loadDiagnostics.hasError()) return fail("shell GrhSIM JSON load failed");
         const auto *loadedMapping = loaded->cpuMapping();
-        if (!loadedMapping || !loadedMapping->dataLayout || !loadedMapping->schedule)
+        if (!loadedMapping || !loadedMapping->dataLayout || !loadedMapping->schedule ||
+            !loadedMapping->translationUnits)
             return fail("shell GrhSIM JSON load lost the CPU mapping");
         if (loadedMapping->dataLayout->namedStores != model.cpuMapping()->dataLayout->namedStores ||
             loadedMapping->schedule->eventBitmaps != model.cpuMapping()->schedule->eventBitmaps ||
-            loadedMapping->schedule->memWritePlan != model.cpuMapping()->schedule->memWritePlan)
+            loadedMapping->schedule->memWritePlan != model.cpuMapping()->schedule->memWritePlan ||
+            loadedMapping->translationUnits != model.cpuMapping()->translationUnits)
             return fail("shell fields did not survive the JSON round trip");
         diag::Diagnostics secondStoreDiagnostics;
         if (!storeGrhSimModel(*loaded, secondPath, defaultDialectRegistry(), secondStoreDiagnostics))

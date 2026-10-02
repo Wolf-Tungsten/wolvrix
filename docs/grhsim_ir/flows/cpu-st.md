@@ -1,10 +1,11 @@
 # CPU 单线程活动度仿真 Flow
 
-> **状态（M5d-6）**：生产管线是 `scripts/wolvrix_xs_grhsim_ir.py` 的 A/B/C 三段序列；
-> C 段（CPU mapping）是本文第 2 节末尾 C1–C7 的七 pass 序列，在 B8 语义封板后只运行
-> 一次。旧两阶段 mapping 管线（`cpu.st.split-phase` → … → `cpu.st.build-schedule`）、
-> 其六个旧 schedule 消费者 pass 与 `cpu.st.split-phases` 已在 M5d-6 删除（旧 emit 实现
-> 在 M5b 删除）；本文 §2–§5 描述当前形态。
+> **状态（M5d-7）**：生产管线是 `scripts/wolvrix_xs_grhsim_ir.py` 的 A/B/C 三段序列；
+> C 段（CPU mapping）是本文第 2 节末尾 C1–C8 的八 pass 序列，在 B8 语义封板后只运行
+> 一次；C8 的 TU 计划让 `cpu.st.emit-cpp` 输出规模受控的多翻译单元（并行编译）。旧两
+> 阶段 mapping 管线（`cpu.st.split-phase` → … → `cpu.st.build-schedule`）、其六个旧
+> schedule 消费者 pass 与 `cpu.st.split-phases` 已在 M5d-6 删除（旧 emit 实现在 M5b
+> 删除）；本文 §2–§5 描述当前形态。
 
 本文规定 `cpu.st.*` 的端到端流程：从已验证的 `GrhSimModel` 构建 CPU mapping，生成
 C++ 模型，再验证多时钟行为与运行性能。`st` 表示单线程，不表示单时钟。
@@ -72,7 +73,7 @@ A7 分类完成类感知相位归属（`mem` 类数组的写归 P_mem，`regLatc
 模型只克隆能消除预测超节点边界的共享计算（归位决议 1），最后
 `grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
 P_mem 操作数产自 P_general）。**B8 之后不再有任何语义改写**：旧管线的"后置化简 +
-第二轮 mapping"往返段已拆除，CPU mapping（下表 C1–C7 七个 `cpu.st.*` pass）在封板
+第二轮 mapping"往返段已拆除，CPU mapping（下表 C1–C8 八个 `cpu.st.*` pass）在封板
 模型上只运行一次，单向推进、不回改语义。
 集成开关新增 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1`（B6 调试开关）；`--used-bits` 与
 `--bitwise-predicates` 旋钮随独立调用段的移除而成为空操作（两者都只在
@@ -148,7 +149,7 @@ two-state 时把 concat 原 op 就地改写为单个 `sliceStatic(x,lo,hi)`，op
 读改写为 word 切片后产生，故流水线在打包后重跑本 pass。诊断键相应增加
 `concat_identity_folds` 与 `concat_range_folds`。
 
-按下表顺序执行。C1–C7 只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
+按下表顺序执行。C1–C8 只生成或推进 CPU mapping，不改写语义 op、value 或 `Init`；
 最后一步只读消费完整 mapping。不得通过 session 隐藏状态传递后端决策。C1 是唯一的
 mapping 初始化点：不要求任何前置 mapping，重复运行丢弃并重建；其余 pass 各推进一个
 stage，单向不回退。
@@ -161,8 +162,9 @@ stage，单向不回退。
 | C4 | [`cpu.st.build-event-bitmaps`](../passes/build-event-bitmaps.md) | 每个 (event,edge) 聚类的 P_general 超节点位图（bit i = C2 序号 i） |
 | C5 | [`cpu.st.build-mem-write-plan`](../passes/build-mem-write-plan.md) | Mem 相写的 per-mem 优先级与 mem 类状态的 General 相读者表 |
 | C6 | [`cpu.st.pack-general-functions`](../passes/pack-general-functions.md) | 超节点 helperChunks；General 分枝尾随 EmitFunction 叶子（只记 `supernodeRange` 区间）；Event/Mem/Output 各塌缩为唯一 EmitFunction |
-| C7 | [`cpu.st.build-phase-schedule`](../passes/build-phase-schedule.md) | 三张 fanout、timeslot 触发映射、单核 task 序列；终态 `PhaseSchedule` |
-| 发射 | `cpu.st.emit-cpp` | C++ 模型与 Makefile，要求输出目录为空 |
+| C7 | [`cpu.st.build-phase-schedule`](../passes/build-phase-schedule.md) | 三张 fanout、timeslot 触发映射、单核 task 序列 |
+| C8 | [`cpu.st.plan-translation-units`](../passes/plan-translation-units.md) | emit TU 计划（块流 + 单元装箱，记录规模上限）；终态 `TranslationUnits` |
+| 发射 | `cpu.st.emit-cpp` | 每单元一个 .cpp + 共享头 + 多源 Makefile，要求输出目录为空 |
 
 最终分区树为：
 
@@ -178,16 +180,19 @@ root
 这些是同一 `PartitionTree` 的层次，不是独立的 Domain/Word/Function graph 实体。
 supernode 决定活动度粒度；EmitFunction 决定代码组织，不能为了减少函数数而扩大调度粒度。
 归位决议 2：超节点序号在 C2 固定、与函数打包解耦——C6 不再重新挂载超节点，只在区间上
-记录函数边界。TU 归属不进入 mapping；当前 emitter 为每个 task 输出一个源文件，未来 TU
-打包仍属 emit 决策。
+记录函数边界。TU 归属由 C8 的 `translationUnits` 计划承载（M5d-7）：块流（Core/Init/
+Event/GeneralScan/Supernode/Mem/Output/Dump）按估计行数装箱为规模受控的单元，emit
+逐单元输出一个源文件，生成的 Makefile 承载完整源文件清单（`make -j` 即并行编译）。
 
-只有 `PhaseSchedule` stage 的 mapping 才是 `complete=true`。`CpuMappingStage` 枚举数值保持
-稳定（旧 checkpoint 兼容），但流水线顺序不再是数值顺序——`GeneralFunctions`（数值 11）
-排在 `MemWritePlan`（14）之后、`PhaseSchedule`（15）之前；所有 stage 比较走
-`cpuMappingStageRank`/`cpuMappingStageAtLeast`（`include/grhsim/ir/model.hpp`）。
-`SplitPhases` 枚举仅为旧 checkpoint 解码保留，不再由任何 pass 产生；stage 早于
-`SplitPhases` 的旧 checkpoint 被 verify 拒绝。各阶段校验对应的不变量；semantic revision
-改变后旧 mapping 失效，必须重新生成，不能只补最后一个 pass。
+`PhaseSchedule`（C7 后）与 `TranslationUnits`（C8 后）都是 `complete=true` 的终态；
+emit 只接受 `TranslationUnits`。`CpuMappingStage` 枚举数值保持稳定（旧 checkpoint
+兼容），但流水线顺序不再是数值顺序——`GeneralFunctions`（数值 11）排在
+`MemWritePlan`（14）之后、`PhaseSchedule`（15）之前，`TranslationUnits`（16）为终态；
+所有 stage 比较走 `cpuMappingStageRank`/`cpuMappingStageAtLeast`
+（`include/grhsim/ir/model.hpp`）。`SplitPhases` 枚举仅为旧 checkpoint 解码保留，不再
+由任何 pass 产生；stage 早于 `SplitPhases` 的旧 checkpoint 被 verify 拒绝。各阶段校验
+对应的不变量；semantic revision 改变后旧 mapping 失效，必须重新生成，不能只补最后一个
+pass。
 
 ## 3. 相位与事件
 
@@ -294,6 +299,12 @@ emit 可以改变 C++ 形态，但不能改变上述 G 转移、E 或调用语�
 - 宽位 helper 沿用 legacy 的指针式、调用者提供 out-buffer 的原地计算 ABI，不增加整块
   旧值快照。
 - dumpState 对 regLatch 类大数组（count>64）与 memStore 一样走 fnv1a 哈希。
+- M5d-7 多 TU：emit 按 C8 计划把块函数分配到多个 .cpp；超过规模的函数再拆块成员
+  （超节点 `sn_<i>__c<j>` 用 C6 helperChunks；相位/init/dump/扫描各有块函数），跨块
+  局部值经类内嵌套 spill 帧（`SnFrame<i>`/`EventFrame`/`OutputFrame`）按引用传递
+  （driver 栈上分配，调用方提供缓冲）；相位 driver 与 eval 的执行顺序不变——并行的是
+  C++ 编译，不是模拟器执行。DPI import 声明不进公共头，由引用它的单元各自声明
+  （测试台可自由提供 extern "C" 定义）。
 
 fullpass 不是当前默认路线。只有在功能正确、已有 profile 将差距归因到激活检查/传播后，
 才可单独设计并验证快速路径；不能以忽略多时钟、混合边沿或派生事件来换取单时钟结果。
@@ -367,6 +378,7 @@ make run_xs_wolf_grhsim_emu XS_GRHSIM_BUILD=build/xs/grhsim \
 - [C1/C2/C6：四平分枝初始化、node、超节点与函数区间](../../../lib/grhsim/backend/cpu_partition.cpp)
 - [C3：named-store 布局](../../../lib/grhsim/backend/cpu_layout.cpp)
 - [C4/C5/C7：事件位图、mem 写计划与调度](../../../lib/grhsim/backend/cpu_schedule.cpp)
+- [C8：TU 计划](../../../lib/grhsim/backend/cpu_emit_plan.cpp)
 - [C++ emitter](../../../lib/grhsim/backend/cpu_phase_emit.cpp)
 - [相位与分区回归](../../../tests/grhsim/test_cpu_phases.cpp)
 - [named-store 回归](../../../tests/grhsim/test_cpu_stores.cpp)
@@ -374,7 +386,7 @@ make run_xs_wolf_grhsim_emu XS_GRHSIM_BUILD=build/xs/grhsim \
 - [Legacy 活动度调度](../../transform/activity-schedule.md)
 - [Legacy GrhSIM 调度](../../emit/grhsim-scheduling.md)
 
-## 演进（M5d-6）
+## 演进（M5d-6；M5d-7 追加 C8）
 
 M5d-6 把 CPU mapping 定为一次最终 mapping 的 C 段七 pass（第 2 节末表）。删除内容：
 
@@ -397,11 +409,16 @@ C7 之前，`CpuMappingStage` 数值不变、顺序以 `cpuMappingStageRank` 为
 `GeneralSupernodes`，零分类决策、只消费 A7 `storeClass`；mem 写调度按相位——General 相
 regLatch 类写经 NBA next 缓冲在超节点内提交，Mem 相 mem 类写在 P_mem 原地提交。
 
+M5d-7 追加 C8 与多 TU emit（第 4.2 节）：TU 归属进入 mapping（`translationUnits`
+payload），emit 从单源文件改为按单元输出，头文件只含声明（含帧结构与块函数声明），
+生成的 Makefile 承载源文件清单支持并行编译。
+
 `verifyCpuMapping` 按 rank 逐级校验：四分枝覆盖全部 op 不重不漏、各分枝相一致性、
 Event/Output/General 序列 use-before-def、Mem 序列 op-id 升序、超节点 `eventActs` 与
 扫 op 重算一致；`LayoutNamedStores` 起校验 named stores 结构，位图/写计划/fanout/task/
 trigger 按模型与分区树重算要求完全一致；`GeneralFunctions` 起校验 `supernodeRange`
-区间连续铺满 [0,N)。JSON 保持 v2 可选尾字段的位置化追加。
+区间连续铺满 [0,N)；`TranslationUnits` 起按记录的规模上限重放 TU 计划并要求完全一致。
+JSON 保持 v2 可选尾字段的位置化追加（TU 计划是 mapping 行的第六项）。
 
 语义边界预测 helper `predictGeneralBoundaries`
 （`include/grhsim/pass/general_boundaries.hpp`）静态模拟 C1 的锥吸收规则，不建立 mapping

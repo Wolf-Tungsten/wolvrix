@@ -213,11 +213,14 @@ root
 
 `kind` 标注树层次的用途，不增加独立的域、word 或函数实体。`CpuBackendMapping.stage`
 依次为 `GeneralNodes / GeneralSupernodes / LayoutNamedStores / EventBitmaps /
-MemWritePlan / GeneralFunctions / PhaseSchedule`；流水线顺序由 `cpuMappingStageRank`
-给出（`GeneralFunctions` 的枚举数值在 `MemWritePlan` 之前，但排在它之后）。每个 pass
-只推进一个 stage：DataLayout 由第 2.1 节的 C3 生成，SchedulePlan 由第 4.1 节的 C7
-生成。只有 `PhaseSchedule` stage 的 mapping 为 `complete=true`，表示映射数据齐全；
-`cpu.st.emit-cpp` 消费完整映射生成模型，但完整映射本身不能替代生成代码的运行验收。
+MemWritePlan / GeneralFunctions / PhaseSchedule / TranslationUnits`（M5d-7 追加终态）；
+流水线顺序由 `cpuMappingStageRank` 给出（`GeneralFunctions` 的枚举数值在
+`MemWritePlan` 之前，但排在它之后）。每个 pass 只推进一个 stage：DataLayout 由第
+2.1 节的 C3 生成，SchedulePlan 由第 4.1 节的 C7 生成，TU 计划由 C8
+（[plan-translation-units](../passes/plan-translation-units.md)）生成。`PhaseSchedule`
+与 `TranslationUnits` 两个终态的 mapping 均为 `complete=true`，表示映射数据齐全；
+`cpu.st.emit-cpp` 只消费 `TranslationUnits` 映射生成模型，但完整映射本身不能替代
+生成代码的运行验收。
 
 历史注记：旧两阶段线的分区 pass（compute/commit 两枝、commit 事件域、active word 层）
 已在 M5d-6 删除；其逆拓扑锥吸收、out1/in1/sibling coarsen + 商图检查 + DP 分段与事件域
@@ -231,7 +234,7 @@ CPU mapping 由模型持有，backend 为 `cpu`，schema 为 `cpu.st.v1`。在 s
 `wolvrix.grhsim.v2` 的 mapping 行中，第五项为 schema 专属 payload：
 
 ```text
-[backend, schema, complete, parameters, [stage, root, partitions, layout?, schedule?]]
+[backend, schema, complete, parameters, [stage, root, partitions, layout?, schedule?, tu_plan?]]
 partition = [id, parent, kind, phase, children, ops]
           | [id, parent, kind, phase, children, ops, attr_tail]
 attr_tail = [[helper_offset, helper_count], ...]   -- helperChunks
@@ -240,6 +243,8 @@ attr_tail = [[helper_offset, helper_count], ...]   -- helperChunks
 layout    = [pointer_bytes, [type, ...], [named_store, ...]?]
 schedule  = [numa_nodes, input_fanout, supernode_fanout, state_fanout,
              event_bitmaps?, mem_write_plan?, timeslot_triggers?]
+tu_plan   = [chunk_max_lines, unit_max_lines, [tu, ...]]        -- M5d-7（C8 起）
+tu        = [name, estimated_lines, [[kind, offset, count, estimated_lines], ...]]
 ```
 
 attr_tail 与 schedule 尾部保持位置化追加：靠后的字段存在时，靠前的可选字段以空数组
@@ -339,9 +344,46 @@ stage 之后生成：一个 NUMA node 0、core 0，task ID 从 1 开始，序列
 3. dataActiveFlagNext 与当前轮标志分开消费；轮末不能清掉刚由 state fanout 产生的激活。
 4. 所有超节点初始激活；写口 event guard 精判完整保留。
 
-`PhaseSchedule` stage 要求外层 complete 为 true，其余阶段要求 false；stage、payload 和
-complete 不一致会被拒绝。完整 JSON、clone 和 semantic mutation 保持既有 identity/revision
-约束。
+### 4.2 当前 `cpu.st.plan-translation-units`（C8）与多 TU emit（M5d-7）
+
+`TranslationUnitPlan` 由 C8
+[`cpu.st.plan-translation-units`](../passes/plan-translation-units.md) 在
+`PhaseSchedule` stage 之后生成，挂为 mapping 的 `translationUnits` payload，stage 推进到
+终态 `TranslationUnits`：
+
+```text
+TranslationUnitPlan
+  chunk_max_estimated_lines: UInt64     # 记录的下限/上限，verify 按其重放计划
+  unit_max_estimated_lines: UInt64
+  units: [{name, estimated_lines, chunks: [{kind, offset, count, estimated_lines}]}]
+```
+
+块流顺序固定为 Core → Init → Event → GeneralScan → Supernode → Mem → Output → Dump；
+各 kind 的 `offset/count` 索引其规范流（定义见 pass 文档）。`GeneralScan` 区间对齐 C6 的
+EmitFunction 边界（区间单独超上限时按序号细分）；`Supernode` 块恰好一个超节点，其 C6
+`helperChunks` 成员函数同单元。verify 按记录的上限重放计划并要求完全一致。
+
+`cpu.st.emit-cpp` 按单元输出 `<prefix>_<name>.cpp` 与一个共享 `<prefix>.hpp`（端口、
+store、全部成员与块函数声明、spill 帧结构、dump 打印助手），外加不变的
+`<prefix>_runtime.hpp` 与多源 `Makefile`（`SOURCES` 承载完整清单，`make -j` 即并行编译，
+链接为单一静态库 `lib<prefix>.a`——下游 difftest/hdlbits/xs-bugcase 接线不变）。块函数的
+跨块局部值经类内嵌套的 spill 帧结构（`SnFrame<i>`/`EventFrame`/`OutputFrame`）传递：
+driver 在栈上值初始化帧并按序调用块函数（调用方提供缓冲、无大临时拷贝）。常量、
+`input.read`/`state.read`/`memRead` 结果在任意块内可重读，不进帧；Output 锥额外把每个
+锥内生产的 latchWrite 操作数进帧，使暂存提交观察到提交前值。DPI import 声明不进公共头
+（测试台自定义同名 extern "C" 定义）；每个引用它们的单元在文件头自行声明。C++
+编译并行由 Makefile 的源文件清单给出；模拟器执行顺序（相位/轮次/块序）不变。
+
+公共头体积实测（XS 整核，M5d-7）：共享头 94.7MB（约 84.4 万行，含 boundary 68.4 万、
+regLatch 10.5 万字段与 4.5 万超节点声明）；clang++ 每 TU 头解析约 2s（约占编译 CPU
+19%），PCH 按实测暂不启用；g++ 13 解析该头超线性病态（单 TU >9min 未完成），本项目
+工具链固定 clang++（根 Makefile 导出 `CXX`，difftest grhsim.mk 继承）。store 结构体不
+带字段初始化器，init() 以 memset 复位（含 string 的 boundary 字段移入独立
+`boundaryStrings` 数组成员），避免巨型聚合体的值初始化临时量撑爆 -O1+。
+
+`PhaseSchedule` 与 `TranslationUnits` 两个终态要求外层 complete 为 true，其余阶段要求
+false；stage、payload 和 complete 不一致会被拒绝。完整 JSON、clone 和 semantic mutation
+保持既有 identity/revision 约束。
 
 ## 5. 验证
 

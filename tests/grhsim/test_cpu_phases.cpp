@@ -8,6 +8,7 @@
 #include <array>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -1196,6 +1197,89 @@ namespace
                 "f11: accepted an unknown option");
     }
 
+    // V3-M2: a supernode whose estimate exceeds the unit cap splits into a
+    // wrapper-only Supernode chunk plus SupernodePart chunks that tile its
+    // helperChunks (part index space) and spread over at least two units.
+    void translationUnitsSplitTest()
+    {
+        GrhSimModel model("f13_tu_split");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto d = addInputRead(model, "d");
+        // 24-deep compute cone -> one non-sink supernode well over the tiny
+        // unit cap; the sink regWrite stays a separate singleton supernode.
+        ValueId cur = d;
+        for (int i = 0; i < 24; ++i) cur = addNot(model, cur, "x" + std::to_string(i));
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto q = addState(model, "q", bit, "1'b0");
+        addRegWrite(model, one, cur, one, q, {});
+        require(verifies(model), "f13: fixture rejected");
+
+        attributeAndInit(model);
+        runPass(model, "cpu.st.merge-general-supernodes");
+        runPass(model, "cpu.st.layout-named-stores");
+        runPass(model, "cpu.st.build-event-activation-map");
+        runPass(model, "cpu.st.build-mem-write-plan");
+        runPass(model, "cpu.st.pack-general-functions",
+                std::array<std::string_view, 2>{"--helper-max-estimated-lines", "32"});
+        runPass(model, "cpu.st.build-phase-schedule");
+        runPass(model, "cpu.st.plan-translation-units",
+                std::array<std::string_view, 2>{"--unit-max-estimated-lines", "64"});
+        require(verifies(model), "f13: split plan rejected");
+        const auto &mapping = *model.cpuMapping();
+        const auto &plan = *mapping.translationUnits;
+        const auto supernodeCount = supernodes(mapping).size();
+
+        std::map<uint32_t, std::vector<uint32_t>> partIndices;
+        std::map<uint32_t, std::set<std::string>> partUnits;
+        std::set<uint32_t> wrappers;
+        for (const auto &unit : plan.units)
+            for (const auto &chunk : unit.chunks)
+            {
+                if (chunk.kind == CpuEmitChunkKind::Supernode)
+                {
+                    require(chunk.count == 1 && chunk.offset < supernodeCount,
+                            "f13: supernode chunk mis-covers");
+                    wrappers.insert(chunk.offset);
+                }
+                if (chunk.kind == CpuEmitChunkKind::SupernodePart)
+                {
+                    require(chunk.offset < supernodeCount, "f13: part without a supernode");
+                    partIndices[chunk.offset].push_back(chunk.count);
+                    partUnits[chunk.offset].insert(unit.name);
+                }
+            }
+        require(wrappers.size() == supernodeCount, "f13: wrapper chunks do not cover the supernodes");
+        require(!partIndices.empty(), "f13: the oversized supernode did not split");
+        for (const auto &[ordinal, indices] : partIndices)
+        {
+            require(indices.size() >= 2, "f13: split supernode has too few parts");
+            std::vector<uint32_t> sorted = indices;
+            std::sort(sorted.begin(), sorted.end());
+            for (uint32_t i = 0; i < sorted.size(); ++i)
+                require(sorted[i] == i, "f13: supernode parts do not tile the part index space");
+            require(partUnits[ordinal].size() >= 2, "f13: supernode parts stayed in one unit");
+        }
+        roundTrip(model);
+
+        // The verifier replans deterministically and rejects a corrupted part.
+        {
+            auto bad = model.clone();
+            auto tampered = *bad.cpuMapping();
+            bool corrupted = false;
+            for (auto &unit : tampered.translationUnits->units)
+                for (auto &chunk : unit.chunks)
+                    if (!corrupted && chunk.kind == CpuEmitChunkKind::SupernodePart)
+                    {
+                        chunk.offset = supernodeCount;
+                        corrupted = true;
+                    }
+            require(corrupted, "f13: no supernode part to corrupt");
+            bad.setCpuMapping(std::move(tampered));
+            require(!verifies(bad), "f13: verifier accepted a corrupted supernode part");
+        }
+    }
+
     // V2-M1 acceptance: a ClockGate latch-ICG shape (CASE_025 isomorphic).
     // rcgE = rckEn | wckEn feeds a data-gated latch write (the ICG enable —
     // no event acts, hence the escape sink class), the latched gated clock
@@ -1281,6 +1365,7 @@ int main()
         crossDomainStateReadTest();
         regLatchMemWriteTest();
         translationUnitsTest();
+        translationUnitsSplitTest();
         latchIcgShapeTest();
         std::cout << "CPU six-phase mapping tests passed\n";
         return 0;

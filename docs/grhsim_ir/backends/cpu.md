@@ -375,10 +375,14 @@ TranslationUnitPlan
   units: [{name, estimated_lines, chunks: [{kind, offset, count, estimated_lines}]}]
 ```
 
-块流顺序固定为 Core → Init → Event → GeneralScan → Supernode → Mem → Output → Dump；
+块流顺序固定为 Core → Init → Event → GeneralScan → Supernode → Mem → Output → Dump
+（V3-M2 起拆分超节点的 SupernodePart 块紧随其 Supernode wrapper 块）；
 各 kind 的 `offset/count` 索引其规范流（定义见 pass 文档）。`GeneralScan` 区间对齐 C6 的
 EmitFunction 边界（区间单独超上限时按序号细分）；`Supernode` 块恰好一个超节点，其 C6
-`helperChunks` 成员函数同单元。verify 按记录的上限重放计划并要求完全一致。
+`helperChunks` 成员函数同单元——估算超 unit 上限且 helperChunks≥2 的超节点例外（V3-M2）：
+该块只 emit `sn_<i>` 驱动（wrapper），helper 函数由紧随的若干 `SupernodePart` 块
+（offset=序号、count=part 序号，part→helper 区间经 `cpuSupernodePartRanges` 以 unit 上限
+确定性重放）分摊到多个 TU，消除单 TU 体积上限对 sink 巨簇的约束。verify 按记录的上限重放计划并要求完全一致。
 
 `cpu.st.emit-cpp` 按单元输出 `<prefix>_<name>.cpp` 与一个共享 `<prefix>.hpp`（端口、
 store、全部成员与块函数声明、spill 帧结构、dump 打印助手），外加不变的

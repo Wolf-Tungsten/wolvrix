@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1766,6 +1768,35 @@ namespace
         require(plan.units.size() >= 3, "tiny caps should split the emit into several units");
         require(plan.chunkMaxEstimatedLines == 24 && plan.unitMaxEstimatedLines == 64,
                 "TU plan should record the caps");
+        // V3-M2: the oversized add-chain supernode (est > unit cap 64) splits
+        // into a wrapper-only chunk plus SupernodePart chunks that tile the
+        // part index space across at least two units.
+        {
+            std::map<uint32_t, std::vector<uint32_t>> partIndices;
+            std::map<uint32_t, std::set<std::string>> partUnits;
+            std::set<uint32_t> wrappers;
+            for (const auto &unit : plan.units)
+                for (const auto &chunk : unit.chunks)
+                {
+                    if (chunk.kind == CpuEmitChunkKind::Supernode) wrappers.insert(chunk.offset);
+                    if (chunk.kind == CpuEmitChunkKind::SupernodePart)
+                    {
+                        partIndices[chunk.offset].push_back(chunk.count);
+                        partUnits[chunk.offset].insert(unit.name);
+                    }
+                }
+            require(!partIndices.empty(), "multi-TU: the oversized supernode should split");
+            for (const auto &[ordinal, indices] : partIndices)
+            {
+                require(wrappers.contains(ordinal), "multi-TU: split supernode lost its wrapper chunk");
+                require(indices.size() >= 2, "multi-TU: split supernode has too few parts");
+                std::vector<uint32_t> sorted = indices;
+                std::sort(sorted.begin(), sorted.end());
+                for (uint32_t i = 0; i < sorted.size(); ++i)
+                    require(sorted[i] == i, "multi-TU: supernode parts do not tile");
+                require(partUnits[ordinal].size() >= 2, "multi-TU: supernode parts stayed in one unit");
+            }
+        }
         require(verifies(model), "mapped multi-TU model rejected");
         compileAndRun(model, root / "multi_tu", {
             {{{"clk", "false"}, {"d", "0"}}, {{"o", "0"}, {"os3", "0"}, {"os11", "0"}}},

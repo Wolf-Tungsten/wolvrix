@@ -106,7 +106,7 @@ namespace wolvrix::lib::grhsim
                 out.push_back(CpuEmitChunk{kind, begin, static_cast<uint32_t>(itemLines.size()) - begin, lines});
         }
 
-        std::vector<CpuEmitChunk> buildChunks(const PlanContext &ctx, uint64_t chunkCap)
+        std::vector<CpuEmitChunk> buildChunks(const PlanContext &ctx, uint64_t chunkCap, uint64_t unitCap)
         {
             const auto &model = ctx.model;
             std::vector<CpuEmitChunk> chunks;
@@ -195,11 +195,29 @@ namespace wolvrix::lib::grhsim
                     chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::GeneralScan, begin, cursor - begin, lines});
             }
 
-            // Supernodes: one chunk per ordinal (driver plus its helper chunk
-            // functions stay in one unit).
+            // Supernodes: one chunk per ordinal. A supernode whose estimate
+            // exceeds the unit cap (and has C6 helperChunks to split along)
+            // emits a small wrapper chunk plus SupernodePart chunks, so the
+            // unit packer can spread its helper functions across TUs
+            // (V3-M2); everything else keeps the whole-supernode chunk.
             for (uint32_t ordinal = 0; ordinal < ctx.supernodeOrder.size(); ++ordinal)
-                chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::Supernode, ordinal, 1,
-                                              estimateSupernodeLines(model, ctx.tree, ctx.supernodeOrder[ordinal])});
+            {
+                const auto supernode = ctx.supernodeOrder[ordinal];
+                const auto &attrs = ctx.tree.partitions[supernode.index - 1].attrs;
+                const auto estimate = estimateSupernodeLines(model, ctx.tree, supernode);
+                if (estimate > unitCap && attrs.helperChunks.size() >= 2)
+                {
+                    chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::Supernode, ordinal, 1,
+                                                  4 + 2 * attrs.helperChunks.size()});
+                    uint32_t part = 0;
+                    for (const auto &[range, lines] : cpuSupernodePartRanges(model, ctx.tree, supernode, unitCap))
+                        chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::SupernodePart, ordinal, part++, lines});
+                }
+                else
+                {
+                    chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::Supernode, ordinal, 1, estimate});
+                }
+            }
 
             // Mem write plan entries (each entry emits its write plus one
             // reader-activation line per reader).
@@ -258,7 +276,7 @@ namespace wolvrix::lib::grhsim
             CpuTranslationUnitPlan plan;
             plan.chunkMaxEstimatedLines = chunkCap;
             plan.unitMaxEstimatedLines = unitCap;
-            const auto chunks = buildChunks(ctx, chunkCap);
+            const auto chunks = buildChunks(ctx, chunkCap, unitCap);
             uint64_t unitLines = 0;
             for (const auto &chunk : chunks)
             {

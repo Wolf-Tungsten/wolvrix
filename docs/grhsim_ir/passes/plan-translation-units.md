@@ -19,7 +19,8 @@ indexes the kind's canonical stream:
 | `Init` | flattened init steps, then the constant-boundary preloads (store offset order), then the prevEvent inits (act order), then the `regLatchStoreNext` sync | `cpu_init_<k>()` |
 | `Event` | the Event branch's flat op list | `pEvent_c<k>(EventFrame &)` |
 | `GeneralScan` | supernode ordinal ranges, aligned to the C6 EmitFunction intervals (an interval that alone exceeds the chunk cap splits at ordinal granularity) | `pGeneral_c<k>()` |
-| `Supernode` | one chunk per General supernode (`offset` = C2 ordinal, `count` = 1); the driver and its C6 `helperChunks` member functions share the unit | `sn_<i>()` + `sn_<i>__c<j>(SnFrame<i> &)` |
+| `Supernode` | one chunk per General supernode (`offset` = C2 ordinal, `count` = 1). Unsplit supernodes hold the driver and all their C6 `helperChunks` member functions in the unit; a supernode whose estimate exceeds the unit cap (and has at least two helperChunks) splits (V3-M2): the chunk emits only the `sn_<i>` driver (wrapper) and the helpers go to `SupernodePart` chunks | `sn_<i>()` (+ `sn_<i>__c<j>(SnFrame<i> &)` when unsplit) |
+| `SupernodePart` | V3-M2: one helperChunks slice of a split supernode (`offset` = ordinal, `count` = part index). Parts of one supernode tile its helperChunks in order; the part index -> helper range mapping is recomputed deterministically from the C6 helperChunks and the unit cap (`cpuSupernodePartRanges`, shared with the emitter) | `sn_<i>__c<j>(SnFrame<i> &)` for the slice's j range |
 | `Mem` | the memWritePlan entries | `pMem_c<k>()` |
 | `Output` | the Output branch's flat op list | `pOutput_c<k>(OutputFrame &)` |
 | `Dump` | the dump item list (input ports, output ports, then the named-store fields in store order) | `cpu_dump_<k>(std::FILE *) const` |

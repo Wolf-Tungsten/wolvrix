@@ -925,7 +925,7 @@ namespace wolvrix::lib::grhsim
                 {
                     CpuEmitChunk chunk;
                     reader.startArray();
-                    chunk.kind = readCpuEnum(reader, CpuEmitChunkKind::Dump);
+                    chunk.kind = readCpuEnum(reader, CpuEmitChunkKind::SupernodePart);
                     expectComma(reader); chunk.offset = reader.index("TU chunk offset", true);
                     expectComma(reader); chunk.count = reader.index("TU chunk count", true);
                     expectComma(reader); chunk.estimatedLines = reader.unsignedInteger();

@@ -569,6 +569,7 @@ namespace wolvrix::lib::grhsim
                         case CpuEmitChunkKind::Event: chunkIds_[key] = eventChunks_.size(); eventChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::GeneralScan: chunkIds_[key] = scanChunks_.size(); scanChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Supernode: supernodeChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::SupernodePart: supernodePartChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Mem: chunkIds_[key] = memChunks_.size(); memChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Output: chunkIds_[key] = outputChunks_.size(); outputChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Dump: chunkIds_[key] = dumpChunks_.size(); dumpChunks_.push_back(chunk); break;
@@ -587,6 +588,33 @@ namespace wolvrix::lib::grhsim
                     }
                     if (supernodeChunks_.size() != supernodeCount_)
                         throw std::runtime_error("CPU six-phase emit TU plan mis-covers the general supernodes");
+                    // V3-M2: SupernodePart chunks trail a split supernode's
+                    // wrapper. Each part index must appear exactly once per
+                    // ordinal, and the recomputed part ranges (same unit cap
+                    // as C8) must tile the supernode's helperChunks — this is
+                    // what lets the emitter map part index -> helper range.
+                    std::map<uint32_t, std::vector<uint32_t>> partsByOrdinal;
+                    for (const auto &chunk : supernodePartChunks_)
+                    {
+                        if (chunk.offset >= supernodeCount_ || !seen[chunk.offset])
+                            throw std::runtime_error("CPU six-phase emit TU plan supernode part without its wrapper");
+                        partsByOrdinal[chunk.offset].push_back(chunk.count);
+                    }
+                    for (const auto &[ordinal, indices] : partsByOrdinal)
+                    {
+                        const auto ranges = cpuSupernodePartRanges(model_, tree_, order_[ordinal],
+                                                                   tuPlan_.unitMaxEstimatedLines);
+                        std::vector<char> partSeen(ranges.size(), 0);
+                        for (const auto index : indices)
+                        {
+                            if (index >= ranges.size() || partSeen[index])
+                                throw std::runtime_error("CPU six-phase emit TU plan mis-covers a split supernode");
+                            partSeen[index] = 1;
+                        }
+                        if (indices.size() != ranges.size())
+                            throw std::runtime_error("CPU six-phase emit TU plan mis-covers a split supernode");
+                        splitSupernodes_.insert(ordinal);
+                    }
                 }
                 // Init stream metadata (the cpu_init_<k> chunks iterate it by
                 // position): flattened steps, then the constant-boundary
@@ -694,6 +722,11 @@ namespace wolvrix::lib::grhsim
             uint32_t coreChunks_ = 0;
             std::vector<CpuEmitChunk> initChunks_, eventChunks_, scanChunks_, supernodeChunks_,
                 memChunks_, outputChunks_, dumpChunks_;
+            // V3-M2: SupernodePart chunks (offset = ordinal, count = part
+            // index) and the ordinals whose Supernode chunk is a wrapper-only
+            // chunk for a split supernode.
+            std::vector<CpuEmitChunk> supernodePartChunks_;
+            std::set<uint32_t> splitSupernodes_;
             // (kind, offset) -> the chunk's global per-kind index, which is the
             // chunk function suffix (cpu_init_<i>, pEvent_c<i>, ...).
             std::unordered_map<uint64_t, uint32_t> chunkIds_;
@@ -889,6 +922,8 @@ namespace wolvrix::lib::grhsim
             void unitCpp(std::ostream &out, const CpuTranslationUnit &unit) const;
             void coreChunk(std::ostream &out) const;
             void supernodeBody(std::ostream &out, uint32_t ordinal) const;
+            void supernodeWrapper(std::ostream &out, uint32_t ordinal) const;
+            void supernodeHelperRange(std::ostream &out, uint32_t ordinal, uint32_t begin, uint32_t end) const;
             void supernodeChunkFns(std::ostream &out, uint32_t ordinal) const;
             void emitOpListRange(std::ostream &out, const std::vector<OpId> &ops, uint32_t offset,
                                  uint32_t count, const std::vector<uint32_t> &frame, bool outputPhase) const;
@@ -3243,7 +3278,26 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 };
                 for (const auto &chunk : unit.chunks)
                 {
-                    if (chunk.kind == CpuEmitChunkKind::Supernode) scan(supernodeOps_[chunk.offset]);
+                    if (chunk.kind == CpuEmitChunkKind::Supernode)
+                    {
+                        // V3-M2: a split supernode's chunk is wrapper-only and
+                        // references no DPI; its parts scan their own slices.
+                        if (splitSupernodes_.contains(chunk.offset)) continue;
+                        scan(supernodeOps_[chunk.offset]);
+                    }
+                    else if (chunk.kind == CpuEmitChunkKind::SupernodePart)
+                    {
+                        const auto &attrs = tree_.partitions[order_[chunk.offset].index - 1].attrs;
+                        const auto ranges = cpuSupernodePartRanges(model_, tree_, order_[chunk.offset],
+                                                                   tuPlan_.unitMaxEstimatedLines);
+                        const auto range = ranges[chunk.count].first;
+                        for (uint32_t helper = range.offset; helper < range.offset + range.count; ++helper)
+                        {
+                            const auto opRange = attrs.helperChunks[helper];
+                            scan(std::vector<OpId>(supernodeOps_[chunk.offset].begin() + opRange.offset,
+                                                   supernodeOps_[chunk.offset].begin() + opRange.offset + opRange.count));
+                        }
+                    }
                     else if (chunk.kind == CpuEmitChunkKind::Output)
                         scan(std::vector<OpId>(outputOps_.begin() + chunk.offset,
                                                outputOps_.begin() + chunk.offset + chunk.count));
@@ -3271,7 +3325,20 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 case CpuEmitChunkKind::Init: initChunkFn(out, chunkId(chunk), chunk); break;
                 case CpuEmitChunkKind::Event: eventChunkFn(out, chunkId(chunk), chunk); break;
                 case CpuEmitChunkKind::GeneralScan: scanChunkFn(out, chunkId(chunk), chunk); break;
-                case CpuEmitChunkKind::Supernode: supernodeChunkFns(out, chunk.offset); break;
+                case CpuEmitChunkKind::Supernode:
+                    if (splitSupernodes_.contains(chunk.offset)) supernodeWrapper(out, chunk.offset);
+                    else supernodeChunkFns(out, chunk.offset);
+                    break;
+                case CpuEmitChunkKind::SupernodePart:
+                {
+                    // Part index -> helper range, recomputed with the same
+                    // deterministic packing C8 used (validated at setup).
+                    const auto ranges = cpuSupernodePartRanges(model_, tree_, order_[chunk.offset],
+                                                               tuPlan_.unitMaxEstimatedLines);
+                    const auto range = ranges[chunk.count].first;
+                    supernodeHelperRange(out, chunk.offset, range.offset, range.offset + range.count);
+                    break;
+                }
                 case CpuEmitChunkKind::Mem: memChunkFn(out, chunkId(chunk), chunk); break;
                 case CpuEmitChunkKind::Output: outputChunkFn(out, chunkId(chunk), chunk); break;
                 case CpuEmitChunkKind::Dump: dumpChunkFn(out, chunkId(chunk), chunk); break;
@@ -3302,20 +3369,28 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 emitCompute(out, model_.operations()[opId.index - 1], ordinal);
             out << "}\n";
         }
-        void SixPhaseEmitter::supernodeChunkFns(std::ostream &out, uint32_t ordinal) const
+        // V3-M2: the sn_<ordinal> driver (wrapper) alone — emitted by the
+        // Supernode chunk of a split supernode; the __c<i> helpers live in
+        // the SupernodePart chunks' units.
+        void SixPhaseEmitter::supernodeWrapper(std::ostream &out, uint32_t ordinal) const
         {
             const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
             const auto &frame = supernodeFrames_[ordinal];
-            if (attrs.helperChunks.size() < 2) { supernodeBody(out, ordinal); return; }
-            // Chunked supernode (M5d-7): the driver value-initializes the spill
-            // frame on its stack and calls the C6 helper chunk members in
-            // order; cross-chunk locals live in the frame (cpu_f.v<index>).
             out << "void " << class_ << "::" << supernodeName(ordinal) << "(){\n";
             if (!frame.empty()) out << "SnFrame" << ordinal << " cpu_f{};\n";
             for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
                 out << supernodeName(ordinal) << "__c" << i << '(' << (frame.empty() ? "" : "cpu_f") << ");\n";
             out << "}\n";
-            for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
+        }
+        // The __c<begin..end-1> helper definitions of a chunked supernode —
+        // emitted by SupernodePart chunks (a part slice) or by an unsplit
+        // Supernode chunk (the whole range).
+        void SixPhaseEmitter::supernodeHelperRange(std::ostream &out, uint32_t ordinal, uint32_t begin,
+                                                   uint32_t end) const
+        {
+            const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+            const auto &frame = supernodeFrames_[ordinal];
+            for (std::size_t i = begin; i < end; ++i)
             {
                 const auto range = attrs.helperChunks[i];
                 out << "void " << class_ << "::" << supernodeName(ordinal) << "__c" << i << '(';
@@ -3331,6 +3406,19 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 deactivateCrossing(frame);
                 out << "}\n";
             }
+        }
+        void SixPhaseEmitter::supernodeChunkFns(std::ostream &out, uint32_t ordinal) const
+        {
+            const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+            if (attrs.helperChunks.size() < 2) { supernodeBody(out, ordinal); return; }
+            // Chunked supernode (M5d-7): the driver value-initializes the spill
+            // frame on its stack and calls the C6 helper chunk members in
+            // order; cross-chunk locals live in the frame (cpu_f.v<index>).
+            // Unsplit supernodes emit wrapper and helpers into one unit here;
+            // split supernodes (V3-M2) get the wrapper from the Supernode
+            // chunk and each helper range from its SupernodePart chunk.
+            supernodeWrapper(out, ordinal);
+            supernodeHelperRange(out, ordinal, 0, attrs.helperChunks.size());
         }
         void SixPhaseEmitter::emitOpListRange(std::ostream &out, const std::vector<OpId> &ops, uint32_t offset,
                                               uint32_t count, const std::vector<uint32_t> &frame,

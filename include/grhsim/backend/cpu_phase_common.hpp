@@ -173,6 +173,48 @@ namespace wolvrix::lib::grhsim
         return {};
     }
 
+    // V3-M2: deterministic C6 helperChunks -> SupernodePart ranges for a split
+    // supernode. C8 uses it to size and number the SupernodePart chunks; the
+    // emitter re-runs it with the same unit cap to map a chunk's part index
+    // back to its helper range — both sides must stay bit-identical. Greedy:
+    // a part closes when the next helper would push it past the cap (a lone
+    // helper may exceed the cap). The returned ranges tile
+    // attrs.helperChunks in order; each carries its estimated lines.
+    inline std::vector<std::pair<Range, uint64_t>> cpuSupernodePartRanges(const GrhSimModel &model,
+                                                                          const CpuPartitionTree &tree,
+                                                                          PartitionId supernode,
+                                                                          uint64_t cap)
+    {
+        const auto &partition = tree.partitions[supernode.index - 1];
+        std::vector<OpId> ops;
+        for (const auto node : partition.children)
+            for (const auto op : tree.partitions[node.index - 1].ops) ops.push_back(op);
+        std::vector<uint64_t> helperLines;
+        helperLines.reserve(partition.attrs.helperChunks.size());
+        for (const auto range : partition.attrs.helperChunks)
+        {
+            uint64_t lines = 2;
+            for (uint32_t i = 0; i < range.count; ++i) lines += estimatedCpuOpLines(model, ops[range.offset + i]);
+            helperLines.push_back(lines);
+        }
+        std::vector<std::pair<Range, uint64_t>> parts;
+        uint32_t begin = 0;
+        uint64_t lines = 0;
+        for (uint32_t i = 0; i < helperLines.size(); ++i)
+        {
+            if (lines > 0 && lines + helperLines[i] > cap)
+            {
+                parts.push_back({Range{begin, i - begin}, lines});
+                begin = i;
+                lines = 0;
+            }
+            lines += helperLines[i];
+        }
+        if (begin < helperLines.size())
+            parts.push_back({Range{begin, static_cast<uint32_t>(helperLines.size()) - begin}, lines});
+        return parts;
+    }
+
     // The init stream emitted by init() and its cpu_init_<k> chunks (M5d-7):
     // flattened init steps, then one constant-boundary preload per boundary
     // field whose producer is a constant, then one prevEvent init per edgeDet

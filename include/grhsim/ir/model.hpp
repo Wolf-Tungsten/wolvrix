@@ -576,22 +576,32 @@ namespace wolvrix::lib::grhsim
     //   GeneralScan— pGeneral scan chunk: supernode ordinal range, aligned to
     //                the C6 EmitFunction intervals unless one interval alone
     //                exceeds the chunk cap.
-    //   Supernode  — one General supernode (offset = ordinal, count = 1):
-    //                its sn_<ordinal> driver plus the C6 helperChunks member
-    //                functions all live in this unit.
+    //   Supernode  — one General supernode (offset = ordinal, count = 1): its
+    //                sn_<ordinal> driver. Unsplit supernodes also hold all
+    //                their C6 helperChunks member functions in this unit;
+    //                a supernode whose estimate exceeds the unit cap splits:
+    //                this chunk then emits only the sn_<ordinal> driver
+    //                (wrapper) and the helperChunks functions go to the
+    //                SupernodePart chunks trailing it.
+    //   SupernodePart — V3-M2: one helperChunks slice of a split supernode
+    //                (offset = ordinal, count = part index). Parts of one
+    //                supernode tile its helperChunks in order; the
+    //                partIndex -> helper-range mapping is recomputed
+    //                deterministically from the C6 helperChunks and the unit
+    //                cap (cpuSupernodePartRanges).
     //   Mem        — pMem chunk: range of the memWritePlan entries.
     //   Output     — pOutput chunk: range of the Output branch's flat ops.
     //   Dump       — dumpState chunk: range of the canonical dump item list
     //                (inputs, outputs, then the named-store fields in store
     //                order: regLatch, mem, boundary, prevEvent, eventAct,
     //                timeslot, activeFlags).
-    enum class CpuEmitChunkKind : uint8_t { Core, Init, Event, GeneralScan, Supernode, Mem, Output, Dump };
+    enum class CpuEmitChunkKind : uint8_t { Core, Init, Event, GeneralScan, Supernode, Mem, Output, Dump, SupernodePart };
 
     struct CpuEmitChunk
     {
         CpuEmitChunkKind kind = CpuEmitChunkKind::Core;
-        uint32_t offset = 0;          // range begin in the kind's stream (Supernode: ordinal)
-        uint32_t count = 0;           // range length (Supernode: 1, Core: 0)
+        uint32_t offset = 0;          // range begin in the kind's stream (Supernode/Part: ordinal)
+        uint32_t count = 0;           // range length (Supernode: 1, SupernodePart: part index, Core: 0)
         uint64_t estimatedLines = 0;  // C8 size heuristic
         friend bool operator==(const CpuEmitChunk &, const CpuEmitChunk &) = default;
     };

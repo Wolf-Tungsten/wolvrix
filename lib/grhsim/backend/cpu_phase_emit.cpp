@@ -781,6 +781,10 @@ namespace wolvrix::lib::grhsim
             // OR of the op's event_acts bits in eventActStore; "true" when event-free.
             std::string actBitsGuard(std::span<const int64_t> acts) const;
             std::string actGuard(const SimOp &op) const;
+            // Per-op guard inside a P_general supernode body (V2-M3): sink
+            // bodies drop it (the call-site gate already covers every op),
+            // non-sink bodies keep it.
+            std::string bodyGuard(const SimOp &op, uint32_t current) const;
             std::string callCondition(ValueId condition) const;
             // Fanout activation statements. When a firing supernode ordinal is
             // given, later ordinals raise dataActiveFlag directly (same-round
@@ -803,7 +807,7 @@ namespace wolvrix::lib::grhsim
             // General-phase regLatch-class array writes (M5d-6): NBA merge
             // into regLatchStoreNext inside the owning supernode.
             void emitGeneralMemWrite(std::ostream &out, const SimOp &op, uint32_t current) const;
-            void emitSystemTask(std::ostream &out, const SimOp &op) const;
+            void emitSystemTask(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitOutputTask(std::ostream &out, const SimOp &op) const;
             std::string sideCallExtras(const SimOp &op) const;
             void systemTaskBody(std::ostream &out, const SimOp &op) const;
@@ -1573,6 +1577,20 @@ namespace wolvrix::lib::grhsim
             if (acts.empty()) return "true";
             return actBitsGuard(acts);
         }
+        // V2-M3 boundary rule: inside a sink supernode body the scanRange
+        // call-site gate already covers every op — SinkEvent ops all carry
+        // the supernode signature (structural, cpu.st.merge-general-supernodes)
+        // and SinkEscape ops are event-free — so the per-op event guard is
+        // redundant and dropped. Non-sink bodies mix event and event-free
+        // ops and keep the per-op guard; P_mem and the P_event/P_output op
+        // lists (current == ~0u) always guard.
+        std::string SixPhaseEmitter::bodyGuard(const SimOp &op, uint32_t current) const
+        {
+            if (current != ~0u &&
+                *tree_.partitions[order_[current].index - 1].attrs.supernodeCategory != CpuSupernodeCategory::NonSink)
+                return "true";
+            return actGuard(op);
+        }
         std::string SixPhaseEmitter::callCondition(ValueId condition) const
         {
             const auto &target = type(condition);
@@ -1611,7 +1629,7 @@ namespace wolvrix::lib::grhsim
         void SixPhaseEmitter::emitCompute(std::ostream &out, const SimOp &op, uint32_t current) const
         {
             const auto name = model_.text(op.opType);
-            if (name == "core.system.task") { emitSystemTask(out, op); return; }
+            if (name == "core.system.task") { emitSystemTask(out, op, current); return; }
             if (name == "core.dpi.call") { emitDpiCall(out, op, current); return; }
             if (name == "core.state.regWrite" || name == "core.state.latchWrite") { emitRegWrite(out, op, current); return; }
             if (name == "core.state.memWrite" || name == "core.state.memFill" ||
@@ -1885,14 +1903,13 @@ namespace wolvrix::lib::grhsim
             const auto refs = model_.objectRefs(op);
             if (refs.empty() || refs[0].kind != ObjectKind::State || operands.size() != 3)
                 throw std::runtime_error("CPU six-phase emit malformed reg/latch write");
-            const std::string guard = actGuard(op);
+            const std::string guard = bodyGuard(op, current);
             const auto *field = refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
             if (!field) throw std::runtime_error("CPU six-phase emit reg/latch write target is not a regLatch state");
             const StateId target{refs[0].index, 0};
             const auto &targetType = stateType(target);
             const std::string nextSlot = "regLatchStoreNext." + std::string(model_.text(field->name));
             const std::string curSlot = "regLatchStore." + std::string(model_.text(field->name));
-            (void)current;
             // Merge base is regLatchStoreNext (read-modify-write across same-round
             // writers); the fanout compare runs against the currently visible
             // regLatchStore value so readers fire only on a true change.
@@ -2105,8 +2122,8 @@ namespace wolvrix::lib::grhsim
                                          "regLatch-class state");
             const std::string nextArray = "regLatchStoreNext." + std::string(model_.text(field->name));
             const std::string curArray = "regLatchStore." + std::string(model_.text(field->name));
-            const std::string guard = actGuard(op);
-            (void)current; // state fanout always queues into dataActiveFlagNext
+            const std::string guard = bodyGuard(op, current);
+            // State fanout always queues into dataActiveFlagNext.
             const auto activateState = [&] {
                 activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
@@ -2237,14 +2254,16 @@ namespace wolvrix::lib::grhsim
             else throw std::runtime_error("CPU six-phase emit unsupported general mem write op: " + std::string(name));
             if (guard != "true") out << "}\n";
         }
-        void SixPhaseEmitter::emitSystemTask(std::ostream &out, const SimOp &op) const
+        void SixPhaseEmitter::emitSystemTask(std::ostream &out, const SimOp &op, uint32_t current) const
         {
             const auto operands = model_.operands(op);
             if (operands.empty()) throw std::runtime_error("CPU system task requires a call condition operand");
             // Event guard from the act bits (P_event owns edge detection);
-            // event-free tasks run whenever their supernode fires.
+            // event-free tasks run whenever their supernode fires. Sink
+            // bodies drop it (bodyGuard): the call-site gate already covers
+            // the signature.
             std::string cond = callCondition(operands[0]);
-            const std::string guard = actGuard(op);
+            const std::string guard = bodyGuard(op, current);
             if (guard != "true") cond += "&&(" + guard + ")";
             cond += sideCallExtras(op);
             out << "if(" << cond << "){\n";
@@ -2335,7 +2354,7 @@ namespace wolvrix::lib::grhsim
                 }
             std::vector<std::pair<ValueId, std::string>> produced;
             std::string cond = callCondition(operands[0]);
-            const std::string guard = actGuard(op);
+            const std::string guard = bodyGuard(op, current);
             if (guard != "true") cond += "&&(" + guard + ")";
             cond += sideCallExtras(op);
             out << "if(" << cond << "){\n";

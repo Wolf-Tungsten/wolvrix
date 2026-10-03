@@ -271,8 +271,9 @@ activate 目标只指向 General 超节点；mem 类数组的读者不在此表�
     命中 act 的非 sink 超节点置位 dataActiveFlag（V2-M2 起无 eventActiveFlag）
   P_general：按 task、C2 序号顺序，按超节点类别点火并传播变化
     （非 sink：dataActiveFlag 点火并清零；SinkEvent 簇：eventActStore 签名
-    组合门控；SinkEscape 簇：每轮无条件；regLatch 类写在超节点内 NBA 提交
-    regLatchStoreNext；memRead 读当前值）
+    组合门控；SinkEscape 簇：每轮无条件；sink 簇体内不再重复判断事件——
+    V2-M3，非 sink 体内事件 op 与 P_mem 写口保留逐 op guard；regLatch 类写
+    在超节点内 NBA 提交 regLatchStoreNext；memRead 读当前值）
   P_mem：按 C5 计划逐写原地提交 mem 类数组（同地址后写覆盖先写）
   P_publish：regLatchStoreNext 整块提交回 regLatchStore；状态真变化经
     commitStateFanout 把读者激活进 dataActiveFlagNext，并决定是否继续迭代

@@ -35,7 +35,9 @@ Every resulting General supernode records two annotations:
 
 - `eventActs` (engaged, possibly empty): the sorted union of its ops' acts.
   On a sink supernode this **is** the event signature (all member ops share
-  it exactly; empty for the escape class).
+  it exactly; empty for the escape class). Because the sharing is exact, the
+  emitter gates a `SinkEvent` supernode once at the call site and drops the
+  per-op event guards inside its body (V2-M3).
 - `supernodeCategory` (engaged): `NonSink`, `SinkEscape` or `SinkEvent`.
 
 The verifier replays the classification: sink supernodes must hold only

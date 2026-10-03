@@ -296,8 +296,10 @@ ScheduledTask
 （`DataGated`，执行其 `supernodeRange` 区间内的活动超节点；V2-M2 前名为
 `EventDataGated`）→ P_mem（`AlwaysScanCommit`）→ P_output（`EvalEnd`，round 循环外）；
 P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEvent 查 eventActStore
-签名，SinkEscape 每轮无条件），体内写口的 event guard 精判（V2-M3 前）始终负责最终
-语义判断。
+签名，SinkEscape 每轮无条件）。V2-M3 起 sink 超节点体内不再保留逐 op event guard
+（SinkEvent 全体 op 与超节点签名同集，调用点门控已覆盖；en、地址等数据条件保留）；
+非 sink 超节点内的事件 op 与 P_mem 写口仍保留逐 op event guard 精判，负责最终语义
+判断。
 
 三张 fanout 表分别在输入差分、超节点 value 写站点、状态 publish 处消费。`activate` 只
 指向 General 超节点，且 V2-M2 起一律收窄为非 sink 超节点（sink 超节点不经
@@ -350,7 +352,9 @@ stage 之后生成：一个 NUMA node 0、core 0，task ID 从 1 开始，序列
 2. publish 以 regLatchStoreNext 整块提交回 regLatchStore，E 的真变化决定是否继续迭代；
    prevEvent 采样随本轮生效，不能冻结到 eval 结束。
 3. dataActiveFlagNext 与当前轮标志分开消费；轮末不能清掉刚由 state fanout 产生的激活。
-4. 所有超节点初始激活；写口 event guard 精判完整保留。
+4. 所有超节点初始激活（sink 序号的标志位无人读取，见 flows/cpu-st 运行时契约）；事件
+   op 的逐 op event guard 在非 sink 体内与 P_mem 保留，sink 体内由调用点签名门控替代
+   （V2-M3）。
 
 ### 4.2 当前 `cpu.st.plan-translation-units`（C8）与多 TU emit（M5d-7）
 

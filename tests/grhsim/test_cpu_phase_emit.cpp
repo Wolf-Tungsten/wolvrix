@@ -967,6 +967,95 @@ namespace
         });
     }
 
+    // (7b) V2-M3 ICG shape (isomorphic to CASE_025 / XS SRAMTemplate): a
+    // transparent-low latch captures the request enable while clk is low,
+    // gclk = clk & EN, and the macro registers plus the Memory write are
+    // clocked by posedge gclk. The latch write is the event-free sink
+    // (SinkEscape, fires every round); the three posedge-gclk writes cluster
+    // into one SinkEvent supernode whose scan call site gates on the
+    // signature act and whose body carries NO per-op eventActStore guard
+    // (V2-M3 guard drop; the memWrite's reqWrite data condition survives).
+    // Functional core: the enable must publish while clk is low so gclk can
+    // rise — the pre-v2 activation deadlock held every macro register at its
+    // init value forever.
+    void icgGatedSramTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_icg_sram");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto memType = model.arrayType(word, 16); // 16 B: regLatch class
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto reqRead = addInputRead(model, "reqRead", bit);
+        const auto reqWrite = addInputRead(model, "reqWrite", bit);
+        const auto waddr = addInputRead(model, "waddr", addrType);
+        const auto wdata = addInputRead(model, "wdata", word);
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto mask4 = addConstant(model, addrType, "4'hf");
+        const auto mask8 = addConstant(model, word, "8'hff");
+        const auto en = addCompute(model, "core.compute.or", bit, "en", {reqRead, reqWrite});
+        const auto notClk = addCompute(model, "core.compute.not", bit, "not_clk", {clk});
+        const auto EN = addState(model, "EN", bit, "1'b0");
+        const auto raddrD = addState(model, "raddr_d", addrType, "4'h0");
+        const auto renD = addState(model, "ren_d", bit, "1'b0");
+        const auto mem = addMemState(model, "Memory", memType, "8'h00");
+        const auto gclk = addCompute(model, "core.compute.and", bit, "gclk",
+                                     {clk, addStateRead(model, EN, "EN_r")});
+        model.addOperation("core.state.latchWrite", std::array{notClk, en, one}, {},
+                           std::array{ObjectRef::state(EN)});
+        addEventRegWrite(model, one, waddr, mask4, raddrD, {{gclk, "posedge"}});
+        addEventRegWrite(model, one, en, one, renD, {{gclk, "posedge"}});
+        addEventWrite(model, "core.state.memWrite", {reqWrite, waddr, wdata, mask8}, mem,
+                      {{gclk, "posedge"}});
+        addOutputWrite(model, "o", word,
+                       addMemRead(model, mem, word, addStateRead(model, raddrD, "raddr_r"), "mread"));
+        addOutputWrite(model, "oren", bit, addStateRead(model, renD, "ren_r"));
+        require(verifies(model), "ICG fixture rejected");
+        runSixPhasePipeline(model, false);
+        const auto &mapping = *model.cpuMapping();
+        // regLatch-class write: the mem write lives in the sink supernode
+        // body (the P_mem plan stays empty), where the guard drop applies.
+        require(mapping.schedule->memWritePlan && mapping.schedule->memWritePlan->empty(),
+                "ICG fixture writes must stay out of the P_mem write plan");
+        // No non-sink op carries an event here: the activation map is empty
+        // and the edge reaches the sink cluster purely through its gate.
+        require(mapping.schedule->eventActivation && mapping.schedule->eventActivation->empty(),
+                "ICG fixture should have no non-sink event carriers");
+        compileAndRun(model, root / "icg_sram", {
+            // Write 0x5a -> Memory[3] (one clk low/high pair per request).
+            {{{"clk", "false"}, {"reqRead", "false"}, {"reqWrite", "false"}, {"waddr", "0"},
+              {"wdata", "0"}}, {{"o", "0"}, {"oren", "false"}}},
+            {{{"reqWrite", "true"}, {"waddr", "3"}, {"wdata", "90"}}, {{"o", "0"}, {"oren", "false"}}},
+            {{{"clk", "true"}}, {{"o", "90"}, {"oren", "true"}}},  // posedge gclk: the deadlock repro
+            {{{"clk", "false"}}, {{"o", "90"}, {"oren", "true"}}},
+            {{{"reqWrite", "false"}}, {{"o", "90"}, {"oren", "true"}}},
+            {{{"clk", "true"}}, {{"o", "90"}, {"oren", "true"}}},  // gated: EN=0, no posedge
+            {{{"clk", "false"}, {"reqRead", "true"}, {"waddr", "5"}}, {{"o", "90"}, {"oren", "true"}}},
+            {{{"clk", "true"}}, {{"o", "0"}, {"oren", "true"}}},   // read cycle: raddr_d<=5, no write
+            {{{"clk", "false"}, {"reqRead", "false"}}, {{"o", "0"}, {"oren", "true"}}},
+            {{{"clk", "true"}}, {{"o", "0"}, {"oren", "true"}}},   // EN=0: no posedge
+            {{{"reqRead", "true"}, {"waddr", "3"}}, {{"o", "0"}, {"oren", "true"}}}, // en high at clk high: latch closed
+            {{{"clk", "false"}}, {{"o", "0"}, {"oren", "true"}}},  // latch opens: EN=1
+            {{{"clk", "true"}}, {{"o", "90"}, {"oren", "true"}}},  // posedge: raddr_d<=3, mem[3] kept
+        });
+        // V2-M3 source pin: exactly one guard-shaped actBitsGuard text
+        // remains — the SinkEvent scan gate. Pre-M3 the three in-body op
+        // guards added three more; the dumpState print shares the bit-read
+        // text and is excluded by its static_cast prefix.
+        const auto source = concatModelSources(root / "icg_sram" / "model");
+        const auto countOf = [&source](const std::string &needle) {
+            std::size_t count = 0;
+            for (std::size_t at = 0; (at = source.find(needle, at)) != std::string::npos; at += needle.size())
+                ++count;
+            return count;
+        };
+        const auto guards = countOf("((eventActStore[") - countOf("static_cast<unsigned>((eventActStore[");
+        require(guards == 1,
+                "ICG fixture: expected exactly the sink-cluster call-site gate, got " +
+                std::to_string(guards) + " eventActStore guard texts");
+    }
+
     // (8) Event-free mem writes converge via cell change detection: memWrite
     // (single cell), memFill (broadcast), memAssign (whole-array copy from an
     // initialized source). Every write re-runs every round while enabled, so
@@ -1722,6 +1811,7 @@ int main()
         glitchClockTest(root);
         glitchClockTest(root, true);
         latchRingTest(root);
+        icgGatedSramTest(root);
         memConvergeTest(root);
         memReaderGatingTest(root);
         memPriorityTest(root);

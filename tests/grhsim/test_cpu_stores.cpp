@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -242,9 +243,9 @@ namespace
         throw std::runtime_error("supernode not in the general branch order");
     }
 
-    bool bitOf(const CpuEventBitmap &bitmap, uint32_t ordinal)
+    bool bitOf(const CpuEventActivation &entry, uint32_t ordinal)
     {
-        return (bitmap.supernodeWords[ordinal / 64] >> (ordinal % 64)) & uint64_t{1};
+        return (entry.supernodeWords[ordinal / 64] >> (ordinal % 64)) & uint64_t{1};
     }
 
     const CpuNamedStore &store(const CpuBackendMapping &mapping, CpuNamedStoreKind kind)
@@ -292,7 +293,7 @@ namespace
     void runSchedulePipeline(GrhSimModel &model)
     {
         runPass(model, "cpu.st.layout-named-stores");
-        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-event-activation-map");
         runPass(model, "cpu.st.build-mem-write-plan");
         runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
@@ -466,10 +467,13 @@ namespace
         require(layout.types[m1Field->type.index - 1].kind == CpuTypeKind::Array &&
                 layout.types[m1Field->type.index - 1].count == 16, "layout: mem field type wrong");
 
-        // boundary: seven input ports (aux = port index) plus the
+        // boundary: six input ports (aux = port index) plus the
         // cross-supernode / mem-operand value set with dedicated slot names.
+        // V2-M1: sink operands cross supernode boundaries by construction
+        // (writes sit in their own sink supernodes), so the write cones'
+        // enable/data/mask values hold boundary slots too.
         const auto &boundary = store(mapping, CpuNamedStoreKind::Boundary);
-        require(boundary.fields.size() == 15, "layout: boundary field count wrong");
+        require(boundary.fields.size() == 25, "layout: boundary field count wrong");
         const std::array<std::string_view, 6> ports{"clk0", "clk1", "rst", "d1", "dsh", "md"};
         for (uint32_t i = 0; i < ports.size(); ++i)
         {
@@ -481,6 +485,8 @@ namespace
                                  "m1__w0__mask", "m1__w1__enable", "m1__w1__addr",
                                  "m1__w1__data", "m1__w1__mask"})
             require(findField(model, boundary, name), "layout: boundary value field missing");
+        for (const char *name : {"c0", "x1g", "mrv0", "mrv1", "y"})
+            require(findField(model, boundary, name), "layout: sink operand boundary field missing");
         require(findField(model, boundary, "m1__w0__data")->value == fixture.mdv,
                 "layout: mem data slot value wrong");
         require(findField(model, boundary, "m1__w0__addr")->value == fixture.row3,
@@ -527,12 +533,12 @@ namespace
                 model.text(timeslot.fields.front().name) == "strobe",
                 "layout: timeslot trigger field wrong");
 
-        // activeFlags: three byte arrays with one byte per General supernode.
+        // activeFlags: two byte arrays with one byte per General supernode
+        // (V2-M2 removed eventActiveFlag).
         const auto supernodeCount = supernodes(mapping).size();
         require(supernodeCount > 0, "layout: no supernodes");
         const auto &active = store(mapping, CpuNamedStoreKind::ActiveFlags);
-        const std::array<std::string_view, 3> activeNames{"eventActiveFlag", "dataActiveFlag",
-                                                          "dataActiveFlagNext"};
+        const std::array<std::string_view, 2> activeNames{"dataActiveFlag", "dataActiveFlagNext"};
         require(active.fields.size() == activeNames.size(), "layout: active flags count wrong");
         for (std::size_t i = 0; i < activeNames.size(); ++i)
         {
@@ -544,7 +550,7 @@ namespace
             require(type.kind == CpuTypeKind::Array && type.count == supernodeCount,
                     "layout: active flags field type wrong");
         }
-        require(active.sizeBytes == 3 * supernodeCount, "layout: active flags size wrong");
+        require(active.sizeBytes == 2 * supernodeCount, "layout: active flags size wrong");
         roundTrip(model);
     }
 
@@ -623,52 +629,38 @@ namespace
         roundTrip(model);
     }
 
-    // cpu.st.build-event-bitmaps: exact two-domain bitmaps and the shared
-    // cross-domain cone firing on both domains.
-    void eventBitmapsTest()
+    // cpu.st.build-event-activation-map (V2-M2): the map covers only non-sink
+    // supernodes holding event-carrying ops. In the MainFixture every event
+    // carrier is a sink op (the {0,2}/{1} reg writes anchor SinkEvent
+    // clusters; the {0} mem write is a Mem-phase op outside the supernode
+    // space), so the map is empty — sink supernodes gate on their own
+    // eventActStore signatures and need no P_event activation.
+    void eventActivationMapTest()
     {
         MainFixture fixture;
         auto &model = fixture.model;
-        require(verifies(model), "bitmaps: fixture rejected");
+        require(verifies(model), "activation: fixture rejected");
         runMappingPipeline(model);
         runPass(model, "cpu.st.layout-named-stores");
-        const auto messages = runPass(model, "cpu.st.build-event-bitmaps");
+        const auto messages = runPass(model, "cpu.st.build-event-activation-map");
         const auto &mapping = *model.cpuMapping();
-        require(mapping.stage == CpuMappingStage::EventBitmaps, "bitmaps: stage wrong");
-        require(mapping.schedule && mapping.schedule->eventBitmaps, "bitmaps: payload missing");
-        require(!mapping.schedule->memWritePlan, "bitmaps: mem plan filled too early");
-        const auto &bitmaps = *mapping.schedule->eventBitmaps;
-        require(bitmaps.size() == 3, "bitmaps: cluster count wrong");
-        require(bitmaps[0].cluster == 0 && bitmaps[1].cluster == 1 && bitmaps[2].cluster == 2,
-                "bitmaps: cluster ids wrong");
-        const auto words = (supernodes(mapping).size() + 63) / 64;
-        for (const auto &bitmap : bitmaps)
-            require(bitmap.supernodeWords.size() == words, "bitmaps: word count wrong");
-        const auto ordinalOf = [&](OpId op) {
-            const auto *supernode = supernodeOf(mapping, op);
-            require(bool(supernode), "bitmaps: op has no supernode");
-            return supernodeOrdinal(mapping, supernode->id);
-        };
-        const auto sa = ordinalOf(fixture.w0), sb = ordinalOf(fixture.w1);
-        const auto ssh = ordinalOf(producerOf(model, fixture.shnv));
-        // Domain split: the {0,2} write fires on clk0 and rst, the {1} write on clk1.
-        require(bitOf(bitmaps[0], sa) && bitOf(bitmaps[2], sa) && !bitOf(bitmaps[1], sa),
-                "bitmaps: domain {0,2} supernode mapped wrong");
-        require(!bitOf(bitmaps[0], sb) && bitOf(bitmaps[1], sb) && !bitOf(bitmaps[2], sb),
-                "bitmaps: domain {1} supernode mapped wrong");
-        // The shared cross-domain cone fires on both domains.
-        require(bitOf(bitmaps[0], ssh) && bitOf(bitmaps[1], ssh),
-                "bitmaps: shared cone missing from a domain bitmap");
-        require(infoValue(messages, "cpu.st.build-event-bitmaps", "event_clusters=") ==
-                std::optional<uint64_t>(3), "bitmaps: cluster diagnostic wrong");
+        require(mapping.stage == CpuMappingStage::EventActivationMap, "activation: stage wrong");
+        require(mapping.schedule && mapping.schedule->eventActivation, "activation: payload missing");
+        require(!mapping.schedule->memWritePlan, "activation: mem plan filled too early");
+        require(mapping.schedule->eventActivation->empty(),
+                "activation: sink-only event carriers must produce an empty map");
+        require(infoValue(messages, "cpu.st.build-event-activation-map", "event_acts=") ==
+                std::optional<uint64_t>(0), "activation: act diagnostic wrong");
+        require(infoValue(messages, "cpu.st.build-event-activation-map", "mapped_supernodes=") ==
+                std::optional<uint64_t>(0), "activation: mapped diagnostic wrong");
         roundTrip(model);
     }
 
-    // A latch cone carries no event_acts: with the supernode size cap below
-    // the combined cone sizes it stays a standalone supernode whose act set
-    // is empty (exempt, emit treats it as always active) and appears in no
-    // bitmap.
-    void latchConeExemptTest()
+    // An event-free latch write anchors a SinkEscape supernode: it fires
+    // unconditionally every round and appears in no activation entry. The
+    // same fixture's {0} reg write is a SinkEvent sink, so the map stays
+    // empty even though an edgeDet cluster exists.
+    void latchEscapeTest()
     {
         GrhSimModel model("m4_latch");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -699,72 +691,113 @@ namespace
         const std::array<std::string_view, 2> smallSupernode{"--max-op-in-compute-supernode", "6"};
         runPass(model, "cpu.st.merge-general-supernodes", smallSupernode);
         runPass(model, "cpu.st.layout-named-stores");
-        const auto messages = runPass(model, "cpu.st.build-event-bitmaps");
+        const auto messages = runPass(model, "cpu.st.build-event-activation-map");
         const auto &mapping = *model.cpuMapping();
-        const auto &bitmaps = *mapping.schedule->eventBitmaps;
-        require(bitmaps.size() == 1 && bitmaps.front().cluster == 0,
-                "latch: cluster shape wrong");
         const auto *latchSupernode = supernodeOf(mapping, wl);
         require(bool(latchSupernode), "latch: write has no supernode");
-        const auto latchOrdinal = supernodeOrdinal(mapping, latchSupernode->id);
-        require(!bitOf(bitmaps.front(), latchOrdinal), "latch: latch cone not exempt");
-        require(infoValue(messages, "cpu.st.build-event-bitmaps", "exempt_supernodes=") ==
-                std::optional<uint64_t>(1), "latch: exempt count wrong");
+        require(latchSupernode->attrs.supernodeCategory == CpuSupernodeCategory::SinkEscape,
+                "latch: event-free write is not in the escape class");
+        require(mapping.schedule->eventActivation->empty(),
+                "latch: escape/sink-only carriers must leave the map empty");
+        require(infoValue(messages, "cpu.st.build-event-activation-map", "mapped_supernodes=") ==
+                std::optional<uint64_t>(0), "latch: mapped diagnostic wrong");
         roundTrip(model);
     }
 
-    // The General->P_mem operand sink edge activates the mem-write data
-    // producer's supernode on the write's event domain.
-    void memSinkBitmapTest()
+    // Activation-map coverage (V2-M2 acceptance): an event-carrying NON-SINK
+    // op (a posedge-gated DPI call with a return value) must be covered by
+    // its act's entry — a missed mapping would leave the call unexecuted on
+    // its edge round. Sink supernodes (the {1} reg writes, the escape latch
+    // write) and the Mem-phase {0} mem write must NOT appear: sink clusters
+    // self-gate on their signatures and Mem writes run every round.
+    void eventActivationCoverageTest()
     {
-        GrhSimModel model("m4_mem_sink");
+        GrhSimModel model("m4_event_activation");
         model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto memType = model.arrayType(bit, 16);
-        const auto clk = model.addInput("clk", bit);
-        const auto clkB = model.addInput("clkB", bit);
+        const auto clk0 = model.addInput("clk0", bit);
+        const auto clk1 = model.addInput("clk1", bit);
         const auto d1 = model.addInput("d1", bit);
+        const auto dl = model.addInput("dl", bit);
         const auto md = model.addInput("md", bit);
-        const auto clkv = addReadOp(model, clk, "clk", SimPhase::Event, true);
-        addEdgeDet(model, clkv, 0);
-        const auto clkv1 = addReadOp(model, clkB, "clkB", SimPhase::Event, true);
-        addEdgeDet(model, clkv1, 1);
+        const auto clk0v = addReadOp(model, clk0, "clk0", SimPhase::Event, true);
+        addEdgeDet(model, clk0v, 0);
+        const auto clk1v = addReadOp(model, clk1, "clk1", SimPhase::Event, true);
+        addEdgeDet(model, clk1v, 1);
         const auto d1v = addReadOp(model, d1, "d1", SimPhase::None, false);
+        const auto dlv = addReadOp(model, dl, "dl", SimPhase::None, false);
         const auto mdv = addReadOp(model, md, "md", SimPhase::None, false);
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto one2 = addConstant(model, bit, "1'b1");
+        const auto oneL = addConstant(model, bit, "1'b1");
         const auto row3 = addConstant(model, model.logicType(4, false, LogicDomain::TwoState),
                                       "4'h3");
         const auto q1 = addState(model, "q1", bit, "1'b0");
+        const auto q2 = addState(model, "q2", byte, "8'h00");
+        const auto ql = addState(model, "ql", bit, "1'b0");
         const auto m1 = addState(model, "m1", memType, "0");
-        // No event-free constants in the {1} cone: an event-free cluster with
-        // a {1} influence could otherwise batch with the data producer and
-        // pull it into the wrong bitmap.
+        // SinkEvent {1}: a posedge-clk1 register write.
         const auto w1 = addRegWrite(model, d1v, d1v, d1v, q1, {1});
-        OpId mw0;
+        // Non-sink carrier of act 1: a gated DPI call with a return value
+        // (lowered shape: event-free operands/refs plus event_acts).
+        const std::array dblArgs{DpiArgument{model.intern("x"), DpiDirection::Input, byte}};
+        const auto dbl = model.addExternFunction("cpu_test_dbl", "core.dpi", "cpu_test_dbl",
+                                                 dblArgs, byte);
+        const auto z = model.addValue(byte, "z");
+        OpId dpi;
+        {
+            const std::array refs{ObjectRef::function(dbl)};
+            const std::array params{
+                Parameter{model.intern("event_acts"), std::vector<int64_t>{1}}};
+            dpi = model.addOperation("core.dpi.call", std::array{one, mdv}, std::array{z},
+                                     refs, params);
+        }
+        // SinkEvent {1} consumer of the DPI result (keeps z live).
+        const auto w2 = addRegWrite(model, one2, z, one2, q2, {1});
+        // SinkEscape: an event-free latch write.
+        const auto ln = addNot(model, dlv, "ln");
+        OpId wl;
+        {
+            const std::array refs{ObjectRef::state(ql)};
+            wl = model.addOperation("core.state.latchWrite", std::array{ln, dlv, oneL},
+                                    {}, refs);
+        }
+        // Mem-phase carrier of act 0: outside the supernode space entirely.
         {
             const std::array refs{ObjectRef::state(m1)};
             const std::array params{
                 Parameter{model.intern("event_acts"), std::vector<int64_t>{0}}};
-            mw0 = model.addOperation("core.state.memWrite", std::array{mdv, row3, mdv, mdv},
-                                     {}, refs, params);
+            model.addOperation("core.state.memWrite", std::array{mdv, row3, mdv, mdv},
+                               {}, refs, params);
         }
-        require(verifies(model), "mem sink: fixture rejected");
+        require(verifies(model), "coverage: fixture rejected");
         runMappingPipeline(model);
         runPass(model, "cpu.st.layout-named-stores");
-        runPass(model, "cpu.st.build-event-bitmaps");
+        const auto messages = runPass(model, "cpu.st.build-event-activation-map");
         const auto &mapping = *model.cpuMapping();
-        const auto &bitmaps = *mapping.schedule->eventBitmaps;
-        require(bitmaps.size() == 2, "mem sink: cluster count wrong");
-        const auto *writeSupernode = supernodeOf(mapping, w1);
-        const auto *dataSupernode = supernodeOf(mapping, producerOf(model, mdv));
-        require(writeSupernode && dataSupernode, "mem sink: supernodes missing");
-        const auto writeOrdinal = supernodeOrdinal(mapping, writeSupernode->id);
-        const auto dataOrdinal = supernodeOrdinal(mapping, dataSupernode->id);
-        require(dataSupernode != writeSupernode, "mem sink: producer merged with the {1} write");
-        require(bitOf(bitmaps[0], dataOrdinal) && !bitOf(bitmaps[1], dataOrdinal),
-                "mem sink: sink edge did not reach the producer supernode");
-        require(!bitOf(bitmaps[0], writeOrdinal) && bitOf(bitmaps[1], writeOrdinal),
-                "mem sink: domain {1} write mapped wrong");
-        (void)mw0;
+        const auto &entries = *mapping.schedule->eventActivation;
+        require(entries.size() == 1 && entries.front().act == 1,
+                "coverage: the map must hold exactly the non-sink carrier's act");
+        const auto ordinalOf = [&](OpId op) {
+            const auto *supernode = supernodeOf(mapping, op);
+            require(bool(supernode), "coverage: op has no supernode");
+            return supernodeOrdinal(mapping, supernode->id);
+        };
+        const auto dpiOrdinal = ordinalOf(dpi);
+        const auto &words = entries.front().supernodeWords;
+        require(bitOf(entries.front(), dpiOrdinal), "coverage: non-sink carrier not mapped");
+        uint32_t bits = 0;
+        for (const auto word : words) bits += std::popcount(word);
+        require(bits == 1, "coverage: the entry must cover only the carrier's supernode");
+        require(!bitOf(entries.front(), ordinalOf(w1)) && !bitOf(entries.front(), ordinalOf(w2)) &&
+                !bitOf(entries.front(), ordinalOf(wl)),
+                "coverage: a sink supernode leaked into the activation map");
+        require(infoValue(messages, "cpu.st.build-event-activation-map", "event_acts=") ==
+                std::optional<uint64_t>(1), "coverage: act diagnostic wrong");
+        require(infoValue(messages, "cpu.st.build-event-activation-map", "mapped_supernodes=") ==
+                std::optional<uint64_t>(1), "coverage: mapped diagnostic wrong");
         roundTrip(model);
     }
 
@@ -777,7 +810,7 @@ namespace
         require(verifies(model), "mem plan: fixture rejected");
         runMappingPipeline(model);
         runPass(model, "cpu.st.layout-named-stores");
-        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-event-activation-map");
         runPass(model, "cpu.st.build-mem-write-plan");
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::MemWritePlan, "mem plan: stage wrong");
@@ -791,7 +824,10 @@ namespace
                 "mem plan: second entry wrong");
         const auto staticOwner = supernodeOf(mapping, fixture.mr0)->id;
         const auto dynamicOwner = supernodeOf(mapping, fixture.mr1)->id;
-        require(staticOwner != dynamicOwner, "mem plan: readers merged unexpectedly");
+        // V2-M1: the event-free mem readers share one non-sink supernode
+        // (the merge frame no longer carries an event-domain prohibition);
+        // the reader table still distinguishes them by staticRow.
+        require(staticOwner == dynamicOwner, "mem plan: event-free readers must share the non-sink frame");
         for (const auto &entry : plan)
         {
             require(entry.readers.size() == 2, "mem plan: reader count wrong");
@@ -818,7 +854,7 @@ namespace
         require(verifies(model), "schedule: fixture rejected");
         runMappingPipeline(model);
         runPass(model, "cpu.st.layout-named-stores");
-        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-event-activation-map");
         runPass(model, "cpu.st.build-mem-write-plan");
         runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
@@ -836,18 +872,12 @@ namespace
         for (const auto value : {fixture.clk0v, fixture.clk1v, fixture.rstEv, fixture.clk1Gv})
             require(!findValueFanout(schedule.inputFanout, value),
                     "schedule: event-only input fanned out");
-        // supernodeFanout: the shared cone value reaches both write supernodes.
-        const auto *shEntry = findValueFanout(schedule.computeSupernodeFanout, fixture.shnv);
-        require(shEntry, "schedule: shared cone fanout missing");
-        {
-            auto expected = std::vector<PartitionId>{supernodeOf(mapping, fixture.w0)->id,
-                                                     supernodeOf(mapping, fixture.w1)->id};
-            auto actual = shEntry->targets.activate;
-            const auto byIndex = [](PartitionId a, PartitionId b) { return a.index < b.index; };
-            std::sort(expected.begin(), expected.end(), byIndex);
-            std::sort(actual.begin(), actual.end(), byIndex);
-            require(actual == expected, "schedule: shared cone fanout targets wrong");
-        }
+        // supernodeFanout: V2-M2 narrowing (boundary 2) — every
+        // cross-supernode consumer in this fixture is a sink supernode (the
+        // w0/w1 write clusters), so no fanout row survives: sink supernodes
+        // gate on their signatures and are never data-activated.
+        require(schedule.computeSupernodeFanout.empty(),
+                "schedule: sink supernodes must not appear as fanout targets");
         // stateFanout: q0 covers its general reader; mem/latch states have none.
         const auto *q0Entry = findStateFanout(schedule.commitStateFanout, fixture.q0);
         require(q0Entry && q0Entry->targets.activate.size() == 1 &&
@@ -881,7 +911,7 @@ namespace
                 tasks.front().partition == branch(mapping, CpuPhase::Event).children.front(),
                 "schedule: event task wrong");
         for (std::size_t i = 0; i < generalFunctions.size(); ++i)
-            require(tasks[i + 1].execution == CpuExecution::EventDataGated &&
+            require(tasks[i + 1].execution == CpuExecution::DataGated &&
                     tasks[i + 1].partition == generalFunctions[i],
                     "schedule: general task wrong");
         require(tasks[generalFunctions.size() + 1].execution == CpuExecution::AlwaysScanCommit &&
@@ -907,7 +937,7 @@ namespace
         const auto preLayoutMapping = *model.cpuMapping();
         runPass(model, "cpu.st.layout-named-stores");
         const auto layoutMapping = *model.cpuMapping();
-        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-event-activation-map");
         runPass(model, "cpu.st.build-mem-write-plan");
         runPass(model, "cpu.st.pack-general-functions");
         runPass(model, "cpu.st.build-phase-schedule");
@@ -926,11 +956,13 @@ namespace
             fields[1].name = fields[0].name;
             reject(std::move(bad), "rejects: verifier accepted a duplicated store field name");
         }
-        // (b) flipped event bitmap bit.
+        // (b) a spurious activation-map entry (the MainFixture's map is
+        // legitimately empty — sink-only carriers — so any entry disagrees
+        // with the recomputed non-sink coverage).
         {
             auto bad = mapping;
-            bad.schedule->eventBitmaps->front().supernodeWords.front() ^= uint64_t{1};
-            reject(std::move(bad), "rejects: verifier accepted a flipped event bitmap");
+            bad.schedule->eventActivation->push_back(CpuEventActivation{0, {uint64_t{1}}});
+            reject(std::move(bad), "rejects: verifier accepted a spurious activation entry");
         }
         // (c) dropped state fanout entry.
         {
@@ -966,7 +998,7 @@ namespace
         std::string error;
         GrhSimModel fresh("m4_fresh");
         fresh.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        for (auto name : {"cpu.st.layout-named-stores", "cpu.st.build-event-bitmaps",
+        for (auto name : {"cpu.st.layout-named-stores", "cpu.st.build-event-activation-map",
                           "cpu.st.build-mem-write-plan", "cpu.st.build-phase-schedule"})
         {
             auto pass = defaultPassRegistry().create(name, {}, error);
@@ -975,11 +1007,11 @@ namespace
             require(!pass->run(fresh, diagnostics).success && !fresh.cpuMapping(),
                     std::string(name) + " accepted a missing prerequisite");
         }
-        // Wrong-stage prerequisite: the bitmap pass requires the layout stage.
+        // Wrong-stage prerequisite: the activation-map pass requires the layout stage.
         {
             MainFixture wrongStage;
             runMappingPipeline(wrongStage.model);
-            auto pass = defaultPassRegistry().create("cpu.st.build-event-bitmaps", {}, error);
+            auto pass = defaultPassRegistry().create("cpu.st.build-event-activation-map", {}, error);
             require(bool(pass), error);
             diag::Diagnostics diagnostics;
             require(!pass->run(wrongStage.model, diagnostics).success &&
@@ -995,15 +1027,15 @@ namespace
         }
         // Arguments are rejected at creation.
         const std::array<std::string_view, 1> junk{"--x"};
-        for (auto name : {"cpu.st.layout-named-stores", "cpu.st.build-event-bitmaps",
+        for (auto name : {"cpu.st.layout-named-stores", "cpu.st.build-event-activation-map",
                           "cpu.st.build-mem-write-plan", "cpu.st.build-phase-schedule"})
             require(!defaultPassRegistry().create(name, junk, error),
                     std::string(name) + " accepted arguments");
     }
 
     // An empty model flows through all C-segment passes; the schedule
-    // degenerates to the three flat phase tasks and a one-byte active-flags
-    // array. With no ops and no states there is nothing to attribute or
+    // degenerates to the three flat phase tasks and a two-field active-flags
+    // store. With no ops and no states there is nothing to attribute or
     // classify, so C1 initializes the mapping directly.
     void emptyModelTest()
     {
@@ -1016,7 +1048,7 @@ namespace
         require(mapping.stage == CpuMappingStage::PhaseSchedule, "empty: stage wrong");
         const auto &layout = *mapping.dataLayout;
         const auto &active = store(mapping, CpuNamedStoreKind::ActiveFlags);
-        require(active.fields.size() == 3 && active.sizeBytes == 3,
+        require(active.fields.size() == 2 && active.sizeBytes == 2,
                 "empty: active flags shape wrong");
         for (const auto &field : active.fields)
         {
@@ -1035,7 +1067,7 @@ namespace
                 store(mapping, CpuNamedStoreKind::PrevEvent).fields.empty(),
                 "empty: stores not empty");
         const auto &schedule = *mapping.schedule;
-        require(schedule.eventBitmaps->empty() && schedule.memWritePlan->empty() &&
+        require(schedule.eventActivation->empty() && schedule.memWritePlan->empty() &&
                 schedule.timeslotTriggers->empty() && schedule.inputFanout.empty() &&
                 schedule.computeSupernodeFanout.empty() && schedule.commitStateFanout.empty(),
                 "empty: schedule tables not empty");
@@ -1055,9 +1087,9 @@ int main()
     {
         namedStoreLayoutTest();
         namingRulesTest();
-        eventBitmapsTest();
-        latchConeExemptTest();
-        memSinkBitmapTest();
+        eventActivationMapTest();
+        latchEscapeTest();
+        eventActivationCoverageTest();
         memWritePlanTest();
         phaseScheduleTest();
         verifierRejectsTest();

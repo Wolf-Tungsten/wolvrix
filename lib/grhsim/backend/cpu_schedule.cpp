@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <tuple>
 
@@ -15,50 +16,52 @@ namespace wolvrix::lib::grhsim
     {
         // ===== Six-phase static tables (C4/C5/C7 passes) =====
 
-        // S(sn) per General supernode: the union of member-op influence from
-        // the M3 event-domain sets (value-fanout graph, General->Mem write
-        // operand sink edges included, state edges excluded).
-        std::vector<std::vector<int64_t>> supernodeActSets(const GrhSimModel &model,
-                                                           const CpuPartitionTree &tree)
+        // V2 (M2): fanout targets and the activation map cover NON-SINK
+        // supernodes only (boundary 2) — sink supernodes fire on their
+        // eventActStore signature (SinkEvent) or unconditionally every round
+        // (SinkEscape), never on dataActiveFlag.
+        bool isNonSinkSupernode(const CpuPartitionTree &tree, PartitionId id)
         {
-            const auto order = generalSupernodeOrder(tree);
-            const auto supernodeOf = generalSupernodeOf(model, tree);
-            const auto domainSets = computeCpuEventDomainSets(model);
-            std::vector<uint32_t> ordinal(tree.partitions.size() + 1, ~0u);
-            for (uint32_t i = 0; i < order.size(); ++i) ordinal[order[i].index] = i;
-            std::vector<std::vector<int64_t>> sets(order.size());
-            for (const auto &op : model.operations())
-            {
-                const auto owner = supernodeOf[op.id.index];
-                if (owner) unionCpuPhaseActs(sets[ordinal[owner.index]], domainSets.influence[op.id.index]);
-            }
-            return sets;
+            const auto &attrs = tree.partitions[id.index - 1].attrs;
+            return attrs.kind == CpuPartitionKind::Supernode &&
+                   attrs.supernodeCategory == CpuSupernodeCategory::NonSink;
         }
 
-        // cpu.st.build-event-bitmaps: per (event,edge) cluster, the bitmap of
-        // General supernodes whose act set contains it (bit i = supernode
-        // ordinal i). S(sn)=empty supernodes appear in no bitmap (exempt).
-        std::vector<CpuEventBitmap> buildSixPhaseEventBitmaps(const GrhSimModel &model,
-                                                              const CpuPartitionTree &tree)
+        // cpu.st.build-event-activation-map (V2-M2; the pre-v2
+        // build-event-bitmaps produced sink-facing bitmaps over the M3
+        // influence closure, both gone with eventActiveFlag): per event act,
+        // the bitmap of non-sink General supernodes holding an op that
+        // carries the act (bit i = supernode ordinal i), sourced from the
+        // supernodes' eventActs annotations. P_event ORs the fired acts'
+        // words into dataActiveFlag. Acts with no non-sink carrier get no
+        // entry; sink supernodes never appear (see above).
+        std::vector<CpuEventActivation> buildSixPhaseEventActivation(const CpuPartitionTree &tree)
         {
             const auto order = generalSupernodeOrder(tree);
-            const auto sets = supernodeActSets(model, tree);
-            uint32_t edgeDetCount = 0;
-            const auto acts = eventClusterActs(model, edgeDetCount);
-            std::vector<CpuEventBitmap> bitmaps;
-            for (const auto act : acts)
+            std::map<uint32_t, uint32_t> entryOfAct;
+            std::vector<CpuEventActivation> entries;
+            for (uint32_t i = 0; i < order.size(); ++i)
             {
-                if (act > std::numeric_limits<uint32_t>::max())
-                    throw std::runtime_error("event act index exceeds 32 bits");
-                CpuEventBitmap bitmap;
-                bitmap.cluster = static_cast<uint32_t>(act);
-                bitmap.supernodeWords.assign((order.size() + 63) / 64, 0);
-                for (uint32_t i = 0; i < sets.size(); ++i)
-                    if (std::binary_search(sets[i].begin(), sets[i].end(), act))
-                        bitmap.supernodeWords[i / 64] |= uint64_t(1) << (i % 64);
-                bitmaps.push_back(std::move(bitmap));
+                const auto &attrs = tree.partitions[order[i].index - 1].attrs;
+                if (attrs.supernodeCategory != CpuSupernodeCategory::NonSink || !attrs.eventActs)
+                    continue;
+                for (const auto act : *attrs.eventActs)
+                {
+                    if (act < 0 || act > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+                        throw std::runtime_error("event act index exceeds 32 bits");
+                    auto [it, inserted] = entryOfAct.try_emplace(static_cast<uint32_t>(act),
+                                                                 static_cast<uint32_t>(entries.size()));
+                    if (inserted)
+                    {
+                        CpuEventActivation entry;
+                        entry.act = static_cast<uint32_t>(act);
+                        entry.supernodeWords.assign((order.size() + 63) / 64, 0);
+                        entries.push_back(std::move(entry));
+                    }
+                    entries[it->second].supernodeWords[i / 64] |= uint64_t(1) << (i % 64);
+                }
             }
-            return bitmaps;
+            return entries;
         }
 
         // cpu.st.build-mem-write-plan (C5): Mem-phase write ops in op-id
@@ -147,7 +150,9 @@ namespace wolvrix::lib::grhsim
         // supernodeFanout: boundary value -> consumer supernodes (Mem-phase
         // write consumers excluded: P_mem runs every round). stateFanout:
         // reg/latch state -> General reader supernodes (regLatch-class array
-        // memReads included; mem-class states use the write plan).
+        // memReads included; mem-class states use the write plan). V2 (M2):
+        // every table's targets are filtered to non-sink supernodes — sink
+        // consumers are never data-activated (boundary 2).
         SixPhaseFanouts buildSixPhaseFanouts(const GrhSimModel &model, const CpuPartitionTree &tree)
         {
             const auto order = generalSupernodeOrder(tree);
@@ -171,8 +176,10 @@ namespace wolvrix::lib::grhsim
                 const Parameter *mark = findCpuPhaseParameter(model, model.parameters(op), "event_only");
                 if (const auto *flag = mark ? std::get_if<bool>(&mark->value) : nullptr)
                     if (*flag) continue;
+                const auto owner = supernodeOf[op.id.index];
+                if (!owner || !isNonSinkSupernode(tree, owner)) continue;
                 for (const auto value : model.results(op))
-                    inputTargets[value.index].push_back(supernodeOf[op.id.index]);
+                    inputTargets[value.index].push_back(owner);
             }
             for (uint32_t i = 1; i < inputTargets.size(); ++i)
             {
@@ -185,7 +192,7 @@ namespace wolvrix::lib::grhsim
             for (const auto &op : model.operations())
             {
                 const auto consumer = supernodeOf[op.id.index];
-                if (!consumer) continue;
+                if (!consumer || !isNonSinkSupernode(tree, consumer)) continue;
                 for (const auto operand : model.operands(op))
                 {
                     if (!boundary[operand.index]) continue;
@@ -217,7 +224,9 @@ namespace wolvrix::lib::grhsim
                 const auto &state = model.states()[refs.front().index - 1];
                 if (opName == "core.state.memRead" && state.storeClass != StateStoreClass::RegLatch)
                     continue;
-                stateTargets[refs.front().index].push_back(supernodeOf[op.id.index]);
+                const auto owner = supernodeOf[op.id.index];
+                if (!owner || !isNonSinkSupernode(tree, owner)) continue;
+                stateTargets[refs.front().index].push_back(owner);
             }
             for (uint32_t i = 1; i < stateTargets.size(); ++i)
             {
@@ -254,7 +263,9 @@ namespace wolvrix::lib::grhsim
         }
 
         // Single-core phase task sequence: P_event (every round) -> P_general
-        // emit functions (event && data dual-gated; the General branch's
+        // emit functions (data-gated, V2-M2: the eventActiveFlag half of the
+        // pre-v2 dual gate is gone; sink supernodes self-gate on their
+        // eventActStore signatures inside the scan. The General branch's
         // trailing EmitFunction leaves, each holding a supernode ordinal
         // interval) -> P_mem (every round), with P_output outside the round
         // loop (once per eval).
@@ -274,7 +285,7 @@ namespace wolvrix::lib::grhsim
                 {
                     for (const auto child : branch.children)
                         if (tree.partitions[child.index - 1].attrs.kind == CpuPartitionKind::EmitFunction)
-                            addTask(child, CpuExecution::EventDataGated);
+                            addTask(child, CpuExecution::DataGated);
                 }
                 else if (branch.attrs.phase == CpuPhase::Event || branch.attrs.phase == CpuPhase::Mem)
                     addTask(branch.children.front(), CpuExecution::AlwaysScanCommit);
@@ -284,10 +295,10 @@ namespace wolvrix::lib::grhsim
             return {node};
         }
 
-        class BuildEventBitmapsPass final : public Pass
+        class BuildEventActivationMapPass final : public Pass
         {
         public:
-            BuildEventBitmapsPass() : Pass("cpu.st.build-event-bitmaps", PassKind::BackendMapping) {}
+            BuildEventActivationMapPass() : Pass("cpu.st.build-event-activation-map", PassKind::BackendMapping) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
@@ -299,16 +310,21 @@ namespace wolvrix::lib::grhsim
                 }
                 CpuBackendMapping mapping = *previous;
                 CpuSchedulePlan schedule;
-                schedule.eventBitmaps = buildSixPhaseEventBitmaps(model, mapping.partitionTree);
-                const auto sets = supernodeActSets(model, mapping.partitionTree);
-                uint64_t exempt = 0;
-                for (const auto &set : sets)
-                    if (set.empty()) ++exempt;
-                diagnostics.info("event_clusters=" + std::to_string(schedule.eventBitmaps->size()) +
-                                 " supernodes=" + std::to_string(sets.size()) +
-                                 " exempt_supernodes=" + std::to_string(exempt), name());
+                schedule.eventActivation = buildSixPhaseEventActivation(mapping.partitionTree);
+                uint64_t mapped = 0, supernodes = 0;
+                for (const auto &partition : mapping.partitionTree.partitions)
+                {
+                    if (partition.attrs.kind != CpuPartitionKind::Supernode) continue;
+                    ++supernodes;
+                    if (partition.attrs.supernodeCategory == CpuSupernodeCategory::NonSink &&
+                        partition.attrs.eventActs && !partition.attrs.eventActs->empty())
+                        ++mapped;
+                }
+                diagnostics.info("event_acts=" + std::to_string(schedule.eventActivation->size()) +
+                                 " supernodes=" + std::to_string(supernodes) +
+                                 " mapped_supernodes=" + std::to_string(mapped), name());
                 mapping.schedule = std::move(schedule);
-                mapping.stage = CpuMappingStage::EventBitmaps;
+                mapping.stage = CpuMappingStage::EventActivationMap;
                 model.setCpuMapping(std::move(mapping));
                 return {true, true, {}};
             }
@@ -322,9 +338,9 @@ namespace wolvrix::lib::grhsim
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
                 const auto *previous = model.cpuMapping();
-                if (!previous || previous->stage != CpuMappingStage::EventBitmaps || !previous->schedule)
+                if (!previous || previous->stage != CpuMappingStage::EventActivationMap || !previous->schedule)
                 {
-                    diagnostics.error("requires cpu.st.build-event-bitmaps output", name());
+                    diagnostics.error("requires cpu.st.build-event-activation-map output", name());
                     return {false, false, {}};
                 }
                 CpuBackendMapping mapping = *previous;
@@ -386,7 +402,7 @@ namespace wolvrix::lib::grhsim
     {
         // Six-phase only (M5d-6 removed the legacy rebuild path): stage-by-stage
         // payload checks recomputed from the model and partition tree, in rank
-        // order (LayoutNamedStores < EventBitmaps < MemWritePlan <
+        // order (LayoutNamedStores < EventActivationMap < MemWritePlan <
         // GeneralFunctions < PhaseSchedule).
         const auto atLeast = [&](CpuMappingStage stage) {
             return cpuMappingStageAtLeast(mapping.stage, stage);
@@ -398,23 +414,24 @@ namespace wolvrix::lib::grhsim
         if (mapping.stage == CpuMappingStage::LayoutNamedStores)
         {
             if (mapping.schedule)
-                return error("six-phase schedule payload requires the event-bitmap stage");
+                return error("six-phase schedule payload requires the event-activation-map stage");
             return true;
         }
         if (!mapping.schedule) return error("six-phase CPU mapping requires the schedule payload");
         const auto &schedule = *mapping.schedule;
-        if (atLeast(CpuMappingStage::EventBitmaps))
+        if (atLeast(CpuMappingStage::EventActivationMap))
         {
-            if (!schedule.eventBitmaps) return error("six-phase schedule requires the event bitmaps");
-            uint32_t edgeDetCount = 0;
-            (void)eventClusterActs(model, edgeDetCount);
-            if (schedule.eventBitmaps->size() != edgeDetCount)
-                return error("event bitmap count disagrees with the edge detector count");
-            if (*schedule.eventBitmaps != buildSixPhaseEventBitmaps(model, mapping.partitionTree))
-                return error("event bitmaps disagree with the supernode act sets");
+            // V2 (M2): the recompute-and-compare IS the coverage check — the
+            // map must cover exactly the non-sink supernodes holding
+            // event-carrying ops (a missed mapping would leave such an op
+            // unexecuted on its edge round), and no sink supernode may
+            // appear.
+            if (!schedule.eventActivation) return error("six-phase schedule requires the event activation map");
+            if (*schedule.eventActivation != buildSixPhaseEventActivation(mapping.partitionTree))
+                return error("event activation map disagrees with the non-sink supernode act sets");
         }
-        else if (schedule.eventBitmaps)
-            return error("event bitmaps require the event-bitmap stage");
+        else if (schedule.eventActivation)
+            return error("event activation map requires the event-activation-map stage");
         if (atLeast(CpuMappingStage::MemWritePlan))
         {
             if (!schedule.memWritePlan) return error("six-phase schedule requires the mem write plan");
@@ -449,10 +466,10 @@ namespace wolvrix::lib::grhsim
     void registerCpuSchedulePasses(PassRegistry &registry)
     {
         std::string error;
-        if (!registry.registerPass("cpu.st.build-event-bitmaps", PassKind::BackendMapping,
+        if (!registry.registerPass("cpu.st.build-event-activation-map", PassKind::BackendMapping,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
-                if (!args.empty()) { error = "cpu.st.build-event-bitmaps does not accept arguments"; return {}; }
-                return std::make_unique<BuildEventBitmapsPass>();
+                if (!args.empty()) { error = "cpu.st.build-event-activation-map does not accept arguments"; return {}; }
+                return std::make_unique<BuildEventActivationMapPass>();
             }, error)) throw std::logic_error(error);
         if (!registry.registerPass("cpu.st.build-mem-write-plan", PassKind::BackendMapping,
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {

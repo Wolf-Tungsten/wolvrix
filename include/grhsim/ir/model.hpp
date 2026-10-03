@@ -320,23 +320,32 @@ namespace wolvrix::lib::grhsim
     // EventDomain/ActiveWord are legacy partition kinds (M5d-6 removed the
     // producers); values kept stable for checkpoint compatibility.
     enum class CpuPartitionKind : uint8_t { Root, Phase, EventDomain, Supernode, Node, ActiveWord, EmitFunction };
+    // V2 (M1) supernode classification: NonSink supernodes hold only
+    // value-producing ops and stay in the merge framework; SinkEvent
+    // supernodes hold only no-result (sink) ops sharing one nonempty event
+    // signature; SinkEscape supernodes hold only event-free sink ops and fire
+    // unconditionally every round. Enum values stay stable for checkpoints.
+    enum class CpuSupernodeCategory : uint8_t { NonSink, SinkEscape, SinkEvent };
     // SplitPhase..Schedule was the legacy two-phase pipeline (removed in
     // M5d-6). The six-phase pipeline appends SplitPhases (four-way split,
     // no longer produced since M5d-6: cpu.st.build-general-nodes initializes
     // the mapping at GeneralNodes) -> GeneralNodes -> GeneralSupernodes; the
-    // M4 layout/schedule stages append LayoutNamedStores -> EventBitmaps ->
-    // MemWritePlan -> PhaseSchedule, and M5d-6 moved GeneralFunctions
-    // (function packing) between MemWritePlan and PhaseSchedule. M5d-7
-    // appends TranslationUnits (C8 TU planning) as the terminal stage.
+    // M4 layout/schedule stages append LayoutNamedStores -> EventActivationMap
+    // (the pre-v2 EventBitmaps stage, renamed in V2-M2 when its payload
+    // changed from sink-facing event bitmaps to the P_event non-sink
+    // activation map) -> MemWritePlan -> PhaseSchedule, and M5d-6 moved
+    // GeneralFunctions (function packing) between MemWritePlan and
+    // PhaseSchedule. M5d-7 appends TranslationUnits (C8 TU planning) as the
+    // terminal stage.
     // Enum VALUES stay stable; the pipeline order is no longer the numeric
     // order — use cpuMappingStageRank for stage comparisons.
-    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions, LayoutNamedStores, EventBitmaps, MemWritePlan, PhaseSchedule, TranslationUnits };
+    enum class CpuMappingStage : uint8_t { SplitPhase, EventDomains, ComputeNodes, ComputeSupernodes, ActiveWords, EmitFunctions, DataLayout, Schedule, SplitPhases, GeneralNodes, GeneralSupernodes, GeneralFunctions, LayoutNamedStores, EventActivationMap, MemWritePlan, PhaseSchedule, TranslationUnits };
 
     // Six-phase pipeline order rank (M5d-6): GeneralNodes < GeneralSupernodes
-    // < LayoutNamedStores < EventBitmaps < MemWritePlan < GeneralFunctions <
-    // PhaseSchedule, with the compat-only SplitPhases at 0. M5d-7 appends
-    // TranslationUnits (C8 cpu.st.plan-translation-units) as the terminal
-    // emit-planning stage. Legacy two-phase stages (rejected by
+    // < LayoutNamedStores < EventActivationMap < MemWritePlan <
+    // GeneralFunctions < PhaseSchedule, with the compat-only SplitPhases at
+    // 0. M5d-7 appends TranslationUnits (C8 cpu.st.plan-translation-units) as
+    // the terminal emit-planning stage. Legacy two-phase stages (rejected by
     // verifyCpuMapping before any comparison) rank 0 as well, so rank checks
     // fail closed. Never compare stages numerically.
     inline unsigned cpuMappingStageRank(CpuMappingStage stage) noexcept
@@ -346,7 +355,7 @@ namespace wolvrix::lib::grhsim
         case CpuMappingStage::GeneralNodes: return 1;
         case CpuMappingStage::GeneralSupernodes: return 2;
         case CpuMappingStage::LayoutNamedStores: return 3;
-        case CpuMappingStage::EventBitmaps: return 4;
+        case CpuMappingStage::EventActivationMap: return 4;
         case CpuMappingStage::MemWritePlan: return 5;
         case CpuMappingStage::GeneralFunctions: return 6;
         case CpuMappingStage::PhaseSchedule: return 7;
@@ -376,6 +385,11 @@ namespace wolvrix::lib::grhsim
         // Engaged exactly on the General branch's trailing EmitFunction
         // leaves from the GeneralFunctions stage on.
         std::optional<Range> supernodeRange;
+        // V2 (M1): the supernode's sink classification. Engaged exactly on
+        // the General-branch supernodes from the GeneralSupernodes stage on.
+        // For sink supernodes attrs.eventActs doubles as the event signature
+        // (empty for SinkEscape, the common nonempty act set for SinkEvent).
+        std::optional<CpuSupernodeCategory> supernodeCategory;
     };
 
     struct CpuPartition
@@ -441,9 +455,11 @@ namespace wolvrix::lib::grhsim
 
     // ActivityDrivenCompute/DomainGatedCommit served the removed legacy
     // schedule (M5d-6); the six-phase tasks use AlwaysScanCommit (Event/Mem
-    // branches), EventDataGated (General emit functions) and EvalEnd
-    // (Output). Old enum values are kept stable for checkpoint compatibility.
-    enum class CpuExecution : uint8_t { ActivityDrivenCompute, DomainGatedCommit, AlwaysScanCommit, EventDataGated, EvalEnd };
+    // branches), DataGated (General emit functions — the pre-v2 name was
+    // EventDataGated, renamed in V2-M2 when the eventActiveFlag half of the
+    // dual gate was removed) and EvalEnd (Output). Old enum values are kept
+    // stable for checkpoint compatibility.
+    enum class CpuExecution : uint8_t { ActivityDrivenCompute, DomainGatedCommit, AlwaysScanCommit, DataGated, EvalEnd };
 
     struct CpuActivationTargets
     {
@@ -482,11 +498,17 @@ namespace wolvrix::lib::grhsim
         friend bool operator==(const CpuNumaSchedule &, const CpuNumaSchedule &) = default;
     };
 
-    struct CpuEventBitmap
+    // V2 (M2): one P_event static activation entry — firing event act `act`
+    // (the edgeDet op's act index) raises dataActiveFlag on the NON-SINK
+    // supernodes that hold an op carrying that act (bit i = supernode
+    // ordinal i). Sink supernodes never appear: a SinkEvent supernode gates
+    // directly on its eventActStore signature and a SinkEscape supernode
+    // fires unconditionally every round.
+    struct CpuEventActivation
     {
-        uint32_t cluster = 0; // == the edgeDet op's act index
-        std::vector<uint64_t> supernodeWords; // P_general supernode bitmap
-        friend bool operator==(const CpuEventBitmap &, const CpuEventBitmap &) = default;
+        uint32_t act = 0;
+        std::vector<uint64_t> supernodeWords;
+        friend bool operator==(const CpuEventActivation &, const CpuEventActivation &) = default;
     };
 
     struct CpuMemReader
@@ -522,17 +544,20 @@ namespace wolvrix::lib::grhsim
         std::vector<CpuFanoutEntry<ValueId>> computeSupernodeFanout;
         // Commit fanout covers every General-phase state read (regLatch-class
         // memReads included); the key set is no longer limited to the
-        // output/event state dependency closure E.
+        // output/event state dependency closure E. V2 (M2): all three fanout
+        // tables target NON-SINK supernodes only — sink supernodes fire on
+        // their eventActStore signature (SinkEvent) or unconditionally
+        // (SinkEscape), never on dataActiveFlag.
         std::vector<CpuFanoutEntry<StateId>> commitStateFanout;
-        // Six-phase static tables, filled by cpu.st.build-event-bitmaps (C4)
-        // / cpu.st.build-mem-write-plan (C5) / cpu.st.build-phase-schedule
-        // (C7): (event,edge) cluster -> P_general supernode bitmaps rebuilt by
-        // P_event, the P_mem write plan (priority order, reader tables,
-        // event-free writes), and the event act -> timeslot flag triggers
-        // collected from the Output-phase timeslot tasks. The legacy
-        // quiescence/round-seed/input-shadow/demonitor/fold-residue payloads
-        // were removed in M5d-6.
-        std::optional<std::vector<CpuEventBitmap>> eventBitmaps;
+        // Six-phase static tables, filled by cpu.st.build-event-activation-map
+        // (C4, the pre-v2 build-event-bitmaps) / cpu.st.build-mem-write-plan
+        // (C5) / cpu.st.build-phase-schedule (C7): the event act -> non-sink
+        // supernode activation map applied by P_event, the P_mem write plan
+        // (priority order, reader tables, event-free writes), and the event
+        // act -> timeslot flag triggers collected from the Output-phase
+        // timeslot tasks. The legacy quiescence/round-seed/input-shadow/
+        // demonitor/fold-residue payloads were removed in M5d-6.
+        std::optional<std::vector<CpuEventActivation>> eventActivation;
         std::optional<std::vector<CpuMemWritePlanEntry>> memWritePlan;
         std::optional<std::vector<CpuTimeslotTrigger>> timeslotTriggers;
         friend bool operator==(const CpuSchedulePlan &, const CpuSchedulePlan &) = default;

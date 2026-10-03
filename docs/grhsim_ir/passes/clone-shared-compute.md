@@ -19,8 +19,10 @@ The predicted boundaries come from `predictGeneralBoundaries`
 `cpu.st.build-general-nodes`' cone absorption that needs no CPU mapping:
 absorbable ops (`core.compute.*`, `core.input.read`, `core.state.read`,
 `core.state.memRead`) join the single agreed node of their results' users;
-shared values and commit-boundary consumers force a fresh node; a General
-value crossing two predicted nodes — or sampled by a `Mem`-phase write — is a
+shared values and commit-boundary consumers force a fresh node; no-result
+sink ops never enter absorption (each anchors a predicted singleton node, so
+sink operand values are predicted boundaries, V2-M1); a General value
+crossing two predicted nodes — or sampled by a `Mem`-phase write — is a
 predicted boundary. The helper is shared with the C1 rework (M5d-6) so both
 passes apply one rule; the Event/Output cones are self-contained by
 construction (copy + strip), so no cross-partition shared compute exists and

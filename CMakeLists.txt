@@ -457,6 +457,7 @@ target_link_libraries(grhsim-cpu-phase-emit-tests PRIVATE wolvrix-lib)
 target_compile_definitions(grhsim-cpu-phase-emit-tests PRIVATE
     WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
     WOLVRIX_GRHSIM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/grhsim/data"
+    WOLVRIX_TEST_LIBFST_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/external/libfst/src"
     WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}")
 register_test_exe(grhsim-cpu-phase-emit-tests)
 set_tests_properties(grhsim-cpu-phase-emit-tests PROPERTIES SKIP_RETURN_CODE 77)

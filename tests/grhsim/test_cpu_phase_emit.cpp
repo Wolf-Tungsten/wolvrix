@@ -85,7 +85,7 @@ namespace
             runPass(model, "cpu.st.merge-general-supernodes");
         }
         runPass(model, "cpu.st.layout-named-stores");
-        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-event-activation-map");
         runPass(model, "cpu.st.build-mem-write-plan");
         if (tinyTu)
             runPass(model, "cpu.st.pack-general-functions",
@@ -184,10 +184,10 @@ namespace
                           std::initializer_list<std::pair<ValueId, const char *>> events)
     { addEventWrite(model, "core.state.regWrite", {cond, next, mask}, target, events); }
 
-    unsigned bitmapBits(const CpuEventBitmap &bitmap)
+    unsigned activationBits(const CpuEventActivation &entry)
     {
         unsigned count = 0;
-        for (const auto word : bitmap.supernodeWords) count += static_cast<unsigned>(__builtin_popcountll(word));
+        for (const auto word : entry.supernodeWords) count += static_cast<unsigned>(__builtin_popcountll(word));
         return count;
     }
 
@@ -318,7 +318,7 @@ namespace
         runSixPhasePipeline(model, false);
         const auto &mapping = *model.cpuMapping();
         const auto &active = (*mapping.dataLayout->namedStores)[6];
-        require(active.fields.size() == 3 && active.fields[0].aux == 0, "passthrough should have no supernodes");
+        require(active.fields.size() == 2 && active.fields[0].aux == 0, "passthrough should have no supernodes");
         require(mapping.schedule->inputFanout.empty(), "passthrough should have no input fanout rows");
         compileAndRun(model, root / "passthrough", {
             {{{"a", "false"}}, {{"o", "false"}}},
@@ -504,10 +504,10 @@ namespace
         require(hasBoundaryField("x"), "shared intermediate lost its boundary field");
         require(hasBoundaryField("a") && hasBoundaryField("b"), "input boundary fields missing");
         const auto &active = stores[6];
-        require(active.fields.size() == 3 && active.fields[0].aux >= 3, "fanout model should have several supernodes");
+        require(active.fields.size() == 2 && active.fields[0].aux >= 3, "fanout model should have several supernodes");
         require(!mapping.schedule->computeSupernodeFanout.empty(), "fanout model should have supernode fanout rows");
-        require(!mapping.schedule->eventBitmaps || mapping.schedule->eventBitmaps->empty(),
-                "pure combinational model should have no event bitmaps");
+        require(!mapping.schedule->eventActivation || mapping.schedule->eventActivation->empty(),
+                "pure combinational model should have no event activation entries");
         const std::vector<DriveStep> steps{
             {{{"a", "true"}, {"b", "false"}}, {{"o1", "true"}, {"o2", "true"}, {"o3", "true"}, {"o4", "true"}}},
             {{{"a", "false"}}, {{"o1", "false"}, {"o2", "false"}, {"o3", "false"}, {"o4", "false"}}},
@@ -578,8 +578,13 @@ namespace
         }
         runSixPhasePipeline(model, false);
         {
-            // With the terminal stage, supported options emit the model and
-            // report build-time limitations.
+            const std::array<std::string_view, 4> badWave{"--output", "x", "--waveform", "bogus"};
+            require(!defaultPassRegistry().create("cpu.st.emit-cpp", badWave, error),
+                    "emit-phase-cpp accepted an unknown waveform mode");
+        }
+        {
+            // With the terminal stage, supported options emit the model
+            // (declared-symbols waveform is a real emit mode since M5d-8).
             const std::string out = outDir.string();
             const std::array<std::string_view, 6> args{"--output", out, "--waveform", "declared-symbols",
                                                        "--perf", "eval"};
@@ -588,7 +593,6 @@ namespace
             diag::Diagnostics diagnostics;
             const auto result = pass->run(model, diagnostics);
             require(result.success, "emit-phase-cpp failed on a TranslationUnits mapping");
-            require(diagnostics.messages().size() >= 2, "emit-phase-cpp omitted option diagnostics");
             require(std::filesystem::exists(outDir / "grhsim_phase_pass_registration.hpp"),
                     "emit-phase-cpp wrote no header");
         }
@@ -624,12 +628,11 @@ namespace
         const auto &mapping = *model.cpuMapping();
         const auto &stores = *mapping.dataLayout->namedStores;
         require(stores[3].fields.size() == 2, "counter should have two prevEvent slots");
-        const auto &bitmaps = *mapping.schedule->eventBitmaps;
-        // Each write supernode is private to its clock's bitmap; the shared
-        // constant supernode (influence {0,1}) appears in both.
-        require(bitmaps.size() == 2 && bitmapBits(bitmaps[0]) == 2 && bitmapBits(bitmaps[1]) == 2 &&
-                    bitmaps[0].supernodeWords != bitmaps[1].supernodeWords,
-                "counter bitmaps should cover the two write supernodes separately");
+        // V2 (M2): both writes are SinkEvent sinks (self-gated on their
+        // signatures), so no non-sink carrier exists and the P_event
+        // activation map is empty.
+        require(mapping.schedule->eventActivation->empty(),
+                "counter: sink-only event carriers must produce an empty activation map");
         compileAndRun(model, root / (tinyTu ? "counter_tu" : "counter"), {
             {{{"clk", "false"}}, {{"o", "0"}, {"ot", "false"}}},   // no edge at init
             {{{"clk", "true"}}, {{"o", "1"}, {"ot", "true"}}},     // posedge fires both detectors
@@ -643,6 +646,78 @@ namespace
             {{{"clk", "false"}}, {{"o", "4"}, {"ot", "false"}}},
             {{{"clk", "true"}}, {{"o", "5"}, {"ot", "true"}}},
         }, false, {}, tinyTu);
+    }
+
+    // FST waveform (declared-symbols mode): emit with waveform on, build the
+    // model (the generated Makefile compiles the vendored libfst C sources),
+    // run a driver that captures several evals, then check the capture file.
+    void waveformTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_wave");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto wide = model.logicType(128, false, LogicDomain::TwoState);
+        const auto clk = addInputRead(model, "clk", bit);
+        addInputRead(model, "a", wide);
+        const auto cnt = addState(model, "cnt", byte, "8'h00");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto one8 = addConstant(model, byte, "8'h01");
+        const auto mask8 = addConstant(model, byte, "8'hff");
+        const auto cntRead = addStateRead(model, cnt, "cnt_r");
+        const auto sum = addCompute(model, "core.compute.add", byte, "sum", {cntRead, one8});
+        addEventRegWrite(model, one, sum, mask8, cnt, {{clk, "posedge"}});
+        addOutputWrite(model, "o", byte, cntRead);
+        for (const char *symbol : {"clk", "a", "cnt", "sum", "o", "ghost"})
+            model.addDeclaredSymbol(model.intern(symbol));
+        require(verifies(model), "waveform fixture rejected");
+        // 1-op supernodes so every crossing value materializes a boundary field.
+        runSixPhasePipeline(model, true);
+        const auto directory = root / "waveform";
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        {
+            diag::Diagnostics diagnostics;
+            const auto result = emitSixPhaseCpuCpp(model, directory / "model", diagnostics, true);
+            for (const auto &message : diagnostics.messages())
+                std::cout << message.context << ": " << message.message << '\n';
+            require(result.success && !result.artifacts.empty(), "waveform emit failed");
+        }
+        const auto waveSource = concatModelSources(directory / "model");
+        require(waveSource.find("wave_setup_0") != std::string::npos, "waveform emit produced no setup chunk");
+        require(waveSource.find("\"cnt\"") != std::string::npos, "waveform setup misses the cnt register");
+        require(waveSource.find("\"sum\"") != std::string::npos, "waveform setup misses the sum boundary value");
+        require(waveSource.find("\"a\"") != std::string::npos, "waveform setup misses the wide input port");
+        require(waveSource.find("ghost") == std::string::npos, "waveform setup dumps a symbol with no live object");
+        {
+            std::ofstream makefile(directory / "model" / "Makefile_check");
+            std::ifstream generated(directory / "model" / "Makefile");
+            const std::string text{std::istreambuf_iterator<char>(generated), std::istreambuf_iterator<char>()};
+            require(text.find("fstapi.o") != std::string::npos && text.find("LIBFST_SRC_DIR") != std::string::npos,
+                    "waveform Makefile misses the libfst rules");
+        }
+        {
+            std::ofstream driver(directory / "driver.cpp");
+            driver << "#include \"grhsim_phase_wave.hpp\"\n#include <cstdio>\n"
+                      "int main(){\nGrhSIM_phase_wave sim;\nsim.init();\n"
+                      "sim.configure_waveform(true,\"wave.fst\");\n"
+                      "if(!sim.waveform_enabled())return 2;\n"
+                      "for(int i=0;i<8;++i){sim.clk=(i&1)!=0;sim.eval();}\n"
+                      "sim.configure_waveform(false);\n"
+                      "if(sim.o!=4){std::fprintf(stderr,\"cnt mismatch\\n\");return 1;}\n"
+                      "std::printf(\"PASS\\n\");\nreturn 0;\n}\n";
+        }
+        command("make --no-print-directory -C " + quote((directory / "model").string()) + " -j 2 CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O2 -fsanitize=undefined -fno-sanitize-recover=all'");
+        command(quote(WOLVRIX_TEST_CXX) + " -std=c++20 -O2 -fsanitize=undefined -fno-sanitize-recover=all -I" +
+                quote((directory / "model").string()) + " -I" + quote(WOLVRIX_TEST_LIBFST_INCLUDE_DIR) + " " +
+                quote((directory / "driver.cpp").string()) + " " +
+                quote((directory / "model" / "libgrhsim_phase_wave.a").string()) + " -lz -o " +
+                quote((directory / "driver").string()));
+        command("cd " + quote(directory.string()) + " && ./driver");
+        const auto fst = directory / "wave.fst";
+        require(std::filesystem::exists(fst) && std::filesystem::file_size(fst) > 512,
+                "waveform capture produced no FST output");
     }
 
     // (2) A -> B NBA chain: at posedge clk, A <= in and B <= A in the same
@@ -665,7 +740,8 @@ namespace
         require(verifies(model), "nba chain fixture rejected");
         runSixPhasePipeline(model, false);
         const auto &mapping = *model.cpuMapping();
-        require(mapping.schedule->eventBitmaps->size() == 1, "nba chain should have one cluster");
+        require(mapping.schedule->eventActivation->empty(),
+                "nba chain: sink-only event carriers must produce an empty activation map");
         compileAndRun(model, root / "nba_chain", {
             {{{"in", "false"}, {"clk", "false"}}, {{"oa", "false"}, {"ob", "false"}}},
             {{{"in", "true"}}, {{"oa", "false"}, {"ob", "false"}}},   // no clock edge
@@ -727,7 +803,8 @@ namespace
         require(verifies(model), "async reset fixture rejected");
         runSixPhasePipeline(model, false);
         const auto &mapping = *model.cpuMapping();
-        require(mapping.schedule->eventBitmaps->size() == 2, "async reset should have two clusters");
+        require(mapping.schedule->eventActivation->empty(),
+                "async reset: sink-only event carriers must produce an empty activation map");
         compileAndRun(model, root / "async_reset", {
             {{{"d", "true"}, {"rst", "true"}, {"clk", "false"}}, {{"o", "false"}}},
             {{{"clk", "true"}}, {{"o", "true"}}},    // posedge clk: q <= d
@@ -747,9 +824,9 @@ namespace
         });
     }
 
-    // (5) clk0/clk1 dual domains: one cluster per clock, each bitmap covering
-    // exactly its own counter's supernode. Toggling one clock must neither
-    // fire the other domain (bitmap isolation) nor drop its pending data
+    // (5) clk0/clk1 dual domains: one cluster per clock, each counter write
+    // anchored in its own SinkEvent supernode. Toggling one clock must neither
+    // fire the other domain (signature isolation) nor drop its pending data
     // activation (a spurious fire would clear the sticky flag and lose it).
     void dualClockTest(const std::filesystem::path &root)
     {
@@ -775,15 +852,11 @@ namespace
         require(verifies(model), "dual clock fixture rejected");
         runSixPhasePipeline(model, false);
         const auto &mapping = *model.cpuMapping();
-        const auto &bitmaps = *mapping.schedule->eventBitmaps;
-        // The shared constant supernode influences both domains and appears in
-        // both bitmaps; each counter supernode is private to its own bitmap, so
-        // the two bitmaps must differ. Functional isolation is asserted by the
+        // V2 (M2): both counter writes are SinkEvent sinks, so the P_event
+        // activation map is empty. Functional isolation is asserted by the
         // driver (a clk0 edge must never fire the clk1 counter's write).
-        require(bitmaps.size() == 2 && bitmapBits(bitmaps[0]) >= 1 && bitmapBits(bitmaps[1]) >= 1,
-                "dual clock should have two nonempty bitmaps");
-        require(bitmaps[0].supernodeWords != bitmaps[1].supernodeWords,
-                "dual clock bitmaps must not be identical");
+        require(mapping.schedule->eventActivation->empty(),
+                "dual clock: sink-only event carriers must produce an empty activation map");
         compileAndRun(model, root / "dual_clock", {
             {{{"clk0", "false"}, {"clk1", "false"}}, {{"o0", "0"}, {"o1", "0"}}},
             {{{"clk0", "true"}}, {{"o0", "1"}, {"o1", "0"}}},
@@ -826,7 +899,8 @@ namespace
         require(verifies(model), "glitch clock fixture rejected");
         runSixPhasePipeline(model, false, false, tinyTu);
         const auto &mapping = *model.cpuMapping();
-        require(mapping.schedule->eventBitmaps->size() == 2, "glitch clock should have two clusters");
+        require(mapping.schedule->eventActivation->empty(),
+                "glitch clock: sink-only event carriers must produce an empty activation map");
         compileAndRun(model, root / (tinyTu ? "glitch_clock_tu" : "glitch_clock"), {
             {{{"d", "true"}, {"clk", "false"}}, {{"oq", "false"}, {"oq2", "false"}}},
             {{{"clk", "true"}}, {{"oq", "true"}, {"oq2", "true"}}},    // q rises; q2 samples d=1 in round 2
@@ -1066,12 +1140,14 @@ namespace
         }, false, {}, tinyTu);
     }
 
-    // (11) General-phase $display: an event-free task prints on every firing of
-    // its (always-active) supernode; an event-guarded task prints only when its
-    // supernode fires — eventActiveFlag && dataActiveFlag (plan §94). Per the
-    // documented double-gate semantics (plan §100), an edge with no data change
-    // since the last fire does NOT re-fire the task supernode; that is a known
-    // divergence from IEEE $display-on-every-edge (see the slice report).
+    // (11) General-phase $display under the V2 (M2) firing rules: the
+    // event-free task anchors a SinkEscape supernode that fires EVERY round,
+    // so it reprints on every eval (including evals whose only change is an
+    // unrelated clock edge or the OTHER task's data operand — en-gating
+    // alone decides, there is no operand-change prefilter). The event-guarded
+    // task anchors a SinkEvent supernode gated on its eventActStore signature,
+    // so it prints on every posedge — the pre-v2 "edge with no data change
+    // does not re-fire" divergence (old plan §100) is gone.
     void generalDisplayTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_display");
@@ -1102,24 +1178,23 @@ namespace
                                {}, params);
         }
         require(verifies(model), "display fixture rejected");
-        // Default merge keeps the event-free display out of the event domain
-        // (merge prohibition: an op with no event obligation never joins an
-        // event-carrying supernode).
         runSixPhasePipeline(model, false);
         const std::vector<DriveStep> steps{
             {{{"a", "false"}, {"d", "0"}, {"clk", "false"}}, {}},   // init fire: comb a=0
             {{{"a", "true"}}, {}},                                   // comb a=1
-            {{{"d", "1"}}, {}},                                      // data-only change: no print
-            {{{"clk", "true"}}, {}},                                 // edge: ev d=1
-            {{{"clk", "false"}}, {}},                                // nothing
+            {{{"d", "1"}}, {}},                                      // escape reprints: comb a=1
+            {{{"clk", "true"}}, {}},                                 // comb a=1, then the edge: ev d=1
+            {{{"clk", "false"}}, {}},                                // escape reprints: comb a=1
             {{{"a", "false"}}, {}},                                  // comb a=0
-            {{{"clk", "true"}}, {}},                                 // edge, d unchanged since last fire: no print (documented gap)
-            {{{"d", "2"}, {"clk", "false"}}, {}},                    // nothing
-            {{{"clk", "true"}}, {}},                                 // ev d=2
+            {{{"clk", "true"}}, {}},                                 // comb a=0, then ev d=1 (every edge fires)
+            {{{"d", "2"}, {"clk", "false"}}, {}},                    // escape reprints: comb a=0
+            {{{"clk", "true"}}, {}},                                 // comb a=0, then ev d=2
         };
         const auto output = compileAndRun(model, root / "display", steps, true);
         const auto lines = linesOf(output);
-        const std::vector<std::string> expected{"comb a=0", "comb a=1", "ev d=1", "comb a=0", "ev d=2"};
+        const std::vector<std::string> expected{"comb a=0", "comb a=1", "comb a=1", "comb a=1",
+                                                "ev d=1", "comb a=1", "comb a=0", "comb a=0",
+                                                "ev d=1", "comb a=0", "comb a=0", "ev d=2"};
         require(lines == expected, "display output mismatch: got [" + std::string([&] {
                     std::string joined; for (const auto &line : lines) joined += line + "|"; return joined; }()) + "]");
     }
@@ -1205,7 +1280,10 @@ namespace
 
     // (14) DPI smoke: an event-free import call (result republished through a
     // boundary field into a latch) and a posedge-gated import call. The driver
-    // supplies the extern "C" definitions.
+    // supplies the extern "C" definitions. V2 (M2): both calls share one
+    // non-sink supernode (the V2-M1 merge has no event prohibition); the
+    // P_event activation map raises its dataActiveFlag on the gated call's
+    // edge, and the per-op guard skips the gated call on data-only rounds.
     void dpiSmokeTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_dpi_smoke");
@@ -1237,9 +1315,13 @@ namespace
         addOutputWrite(model, "o", byte, addStateRead(model, q, "q_r"));
         addOutputWrite(model, "o2", byte, addStateRead(model, q2, "q2_r"));
         require(verifies(model), "dpi fixture rejected");
-        // Default merge keeps the event-free call out of the gated call's
-        // supernode (same merge prohibition as the display test).
         runSixPhasePipeline(model, false, false, tinyTu);
+        // V2 (M2): the shared non-sink supernode carries the gated call's act,
+        // so the activation map holds exactly that one entry.
+        const auto &activation = *model.cpuMapping()->schedule->eventActivation;
+        require(activation.size() == 1 && activation.front().act == 0 &&
+                activationBits(activation.front()) == 1,
+                "dpi smoke: activation map should cover exactly the shared call supernode");
         compileAndRun(model, root / (tinyTu ? "dpi_smoke_tu" : "dpi_smoke"), {
             {{{"a", "0"}, {"d", "0"}, {"clk", "false"}}, {{"o", "1"}, {"o2", "0"}}},
             {{{"a", "1"}}, {{"o", "2"}, {"o2", "0"}}},
@@ -1316,7 +1398,10 @@ namespace
                    << "(unsigned long long)c.round2Count,(unsigned long long)c.computeBatchExecCount,(unsigned long long)c.commitBatchExecCount,\n"
                    << "(unsigned long long)c.touchedStateShadowCount,(unsigned long long)c.touchedWriteCount);\n"
                    << "if(c.evalCount!=4||c.totalRoundCount!=4||c.round1Count!=4||c.round2Count!=0||c.commitBatchExecCount!=4||"
-                      "c.computeBatchExecCount!=4||c.touchedStateShadowCount!=3||c.touchedWriteCount!=0)return 1;\n"
+                      // V2-M1: the latch write anchors its own escape sink
+                      // supernode, so each eval fires two batches (the
+                      // non-sink input supernode plus the sink supernode).
+                      "c.computeBatchExecCount!=8||c.touchedStateShadowCount!=3||c.touchedWriteCount!=0)return 1;\n"
                    << "std::printf(\"PASS\\n\");\nreturn 0;\n}\n";
         }
         command("make --no-print-directory -C " + quote((directory / "model").string()) + " -j 2 CXX=" + quote(WOLVRIX_TEST_CXX) +
@@ -1629,6 +1714,7 @@ int main()
         // multi-TU emit (chunk functions + spill frames + parallel build).
         counterTest(root);
         counterTest(root, true);
+        waveformTest(root);
         nbaChainTest(root);
         powerOnTest(root);
         asyncResetTest(root);
@@ -1644,6 +1730,10 @@ int main()
         monitorFreeTest(root);
         monitorEventTest(root);
         monitorEventTest(root, true);
+        // dpiSmokeTest (both TU variants): re-enabled in V2-M2 — the new
+        // firing rules (non-sink supernodes fire on dataActiveFlag alone, the
+        // P_event activation map raises it on the gated call's edge) execute
+        // both the event-free and the posedge-gated import correctly.
         dpiSmokeTest(root);
         dpiSmokeTest(root, true);
         dpiBitAbiTest(root);

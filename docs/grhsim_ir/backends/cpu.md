@@ -178,12 +178,16 @@ PartitionAttrs
   kind: root | phase | event_domain | supernode | node | active_word | emit_function
   phase: none | compute | commit | event | general | mem | output
   helper_chunks: [{offset: UInt32, count: UInt32}]
-  event_acts: Int64[]?                             # General 超节点命中的聚类并集（C2 起 engaged，无事件为空数组）
+  event_acts: Int64[]?                             # General 超节点命中的聚类并集（C2 起 engaged，无事件为空数组；sink 超节点上即事件签名）
   supernode_range: {offset: UInt32, count: UInt32}?  # General 分枝尾随 EmitFunction 叶子（C6 起）
+  supernode_category: non_sink | sink_escape | sink_event?  # General 超节点分类（C2 起 engaged，V2-M1）
 ```
 
 `event_domain`/`active_word` kind 与 `compute`/`commit` phase 的枚举值仅为 checkpoint
 兼容保留，不再产生；旧 `event_gate`/`active_id`/`active_word` 字段已在 M5d-6 删除。
+`supernode_category` 在 V2-M1 引入：`non_sink` 超节点只含有返回值 op（走合并框架），
+`sink_event`/`sink_escape` 超节点只含无返回值 op（按事件签名聚类；空签名为逃逸类，
+每个 round 无条件激活）。V2-M1 之前的 checkpoint 缺少该字段，载入后由校验器拒绝。
 
 `PartitionTree` 满足以下约束：
 
@@ -212,8 +216,9 @@ root
 ```
 
 `kind` 标注树层次的用途，不增加独立的域、word 或函数实体。`CpuBackendMapping.stage`
-依次为 `GeneralNodes / GeneralSupernodes / LayoutNamedStores / EventBitmaps /
-MemWritePlan / GeneralFunctions / PhaseSchedule / TranslationUnits`（M5d-7 追加终态）；
+依次为 `GeneralNodes / GeneralSupernodes / LayoutNamedStores / EventActivationMap /
+MemWritePlan / GeneralFunctions / PhaseSchedule / TranslationUnits`（M5d-7 追加终态；
+`EventActivationMap` 在 V2-M2 前名为 `EventBitmaps`）；
 流水线顺序由 `cpuMappingStageRank` 给出（`GeneralFunctions` 的枚举数值在
 `MemWritePlan` 之前，但排在它之后）。每个 pass 只推进一个 stage：DataLayout 由第
 2.1 节的 C3 生成，SchedulePlan 由第 4.1 节的 C7 生成，TU 计划由 C8
@@ -242,7 +247,7 @@ attr_tail = [[helper_offset, helper_count], ...]   -- helperChunks
             [[range_offset, range_count]]?         -- supernodeRange（C6 起）
 layout    = [pointer_bytes, [type, ...], [named_store, ...]?]
 schedule  = [numa_nodes, input_fanout, supernode_fanout, state_fanout,
-             event_bitmaps?, mem_write_plan?, timeslot_triggers?]
+             event_activation?, mem_write_plan?, timeslot_triggers?]
 tu_plan   = [chunk_max_lines, unit_max_lines, [tu, ...]]        -- M5d-7（C8 起）
 tu        = [name, estimated_lines, [[kind, offset, count, estimated_lines], ...]]
 ```
@@ -261,7 +266,7 @@ SchedulePlan
   inputFanout: Map<ValueId, ActivationTargets>
   computeSupernodeFanout: Map<ValueId, ActivationTargets>
   commitStateFanout: Map<StateId, ActivationTargets>
-  eventBitmaps: [{cluster: UInt32, supernodeWords: UInt64[]}]?   # C4
+  eventActivation: [{act: UInt32, supernodeWords: UInt64[]}]?    # C4（V2-M2，只覆盖非 sink 超节点）
   memWritePlan: [{writeOp, priority, eventFree, readers}]?       # C5
   timeslotTriggers: [{act: UInt32, flag: UInt32}]?               # C7
 
@@ -280,7 +285,7 @@ ScheduledTask
   id: TaskId
   partition: PartitionId
   waits_for: TaskId[]
-  execution: AlwaysScanCommit | EventDataGated | EvalEnd
+  execution: AlwaysScanCommit | DataGated | EvalEnd
 ```
 
 旧的 `quiescenceProjection`/`roundSeeds`/`inputShadows`/demonitor 字段已在 M5d-6 删除；
@@ -288,12 +293,15 @@ ScheduledTask
 
 单线程方案的 task 引用 EmitFunction 叶子分区，只有一个 NUMA node 和 core，`waits_for`
 为空。task 顺序为 P_event（`AlwaysScanCommit`）→ P_general 各 EmitFunction
-（`EventDataGated`，执行其 `supernodeRange` 区间内的活动超节点）→ P_mem
-（`AlwaysScanCommit`）→ P_output（`EvalEnd`，round 循环外）；event guard（聚类位图 +
-写口精判）始终负责最终语义判断。
+（`DataGated`，执行其 `supernodeRange` 区间内的活动超节点；V2-M2 前名为
+`EventDataGated`）→ P_mem（`AlwaysScanCommit`）→ P_output（`EvalEnd`，round 循环外）；
+P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEvent 查 eventActStore
+签名，SinkEscape 每轮无条件），体内写口的 event guard 精判（V2-M3 前）始终负责最终
+语义判断。
 
 三张 fanout 表分别在输入差分、超节点 value 写站点、状态 publish 处消费。`activate` 只
-指向 General 超节点。`commitStateFanout` 中的 state 真变化激活其读者；其中属于 E 的
+指向 General 超节点，且 V2-M2 起一律收窄为非 sink 超节点（sink 超节点不经
+dataActiveFlag 激活）。`commitStateFanout` 中的 state 真变化激活其读者；其中属于 E 的
 成员才驱动下一轮 fixed-point 求值。无扇出的 input/value 没有表项；输入表的键同时确定
 需要变化检测的输入。state 表的 key 覆盖所有被 General 相读取的状态（不再限于 Overview
 第 4.2 节的 E 闭包）；mem 类数组的读者另由 `memWritePlan` 的读者表激活。
@@ -329,7 +337,7 @@ stage 之后生成：一个 NUMA node 0、core 0，task ID 从 1 开始，序列
 - `inputFanout` 覆盖 General 相 `input.read` 的所属超节点；`event_only` 标记的纯事件输入
   无条目（由 P_event 覆盖）。
 - `computeSupernodeFanout` 只激活跨超节点消费者，不建立自激活边；Mem 相写消费者除外
-  （P_mem 每轮运行）。
+  （P_mem 每轮运行）；sink 消费者一律过滤（V2-M2，sink 不经 dataActiveFlag 激活）。
 - `commitStateFanout` 覆盖所有被 General 相读取的状态（`state.read` 及目标为 regLatch
   类数组的 `memRead`），而不仅是 overview 第 4.2 节的输出/边沿状态依赖闭包 E；mem 类
   数组的读者由 C5 写计划的读者表激活。
@@ -389,24 +397,45 @@ false；stage、payload 和 complete 不一致会被拒绝。完整 JSON、clone
 
 ### CPU C++ 阶段计时
 
-模型默认关闭运行时计时。`set_runtime_profile_enabled(true)` 清空计数并启用新一轮测量；
-传入 false 暂停计数但保留数据。`init()` 清空计数并保持启用状态。
-`cpu_runtime_profile()` 返回只读快照引用，`dump_runtime_profile()` 在至少一个 eval 完成后
-向 stderr 输出一行 `[grhsim-cpu-phase]` 数据；XiangShan 的既有 `EMU_RUNTIME_PROFILE=1`
-会调用这些启用/导出接口，不需要修改 workload。
+当前六阶段 emitter **不实现运行时阶段计时**：`set_runtime_profile_enabled(bool)` 与
+`dump_runtime_profile()` 是空实现（保留接口形状供 XiangShan `EMU_RUNTIME_PROFILE=1`
+无改动调用；该开关在新模型上只多打一行 harness 日志，不产生 profile 数据）。旧
+emitter 的 `cpu_runtime_profile()`/`[grhsim-cpu-phase]` 分桶计时已随旧实现删除。
 
-计数项为完成的 `evals` 和进入的收敛 `rounds`。所有时间项使用 steady_clock 纳秒：
+唯一的模型内插桩是编译期 `WOLVRIX_GRHSIM_PERF`：为 1 时编译进
+`GRHSIM_PERF_COUNT` 计数与 `PerfCounters`/`perf_counters()`（eval/round1/round2/
+totalRound、computeBatch/commitBatch、touchedStateShadow/touchedWrite 计数）。运行
+性能测量以 emu 自报 Host time 与 `/usr/bin/time` 为准（M5d-8 口径），不依赖模型内
+计时。
 
-- `eval_ns`：成功返回的完整 eval 区间，包括输入同步、round seed、arm 交接和输出复制。
-- `compute_ns`：连续 ActivityDrivenCompute task 段，包含外层 activity guard 和实际调用。
-- `commit_ns`：连续 commit task 段，包含 domain guard 和实际调用。
-- `publish_ns`：每轮 cpu_publish 区间。
+### FST 波形（declared-symbols 模式）
 
-段切换只读一次时钟并累加前一段，不改变原调度顺序。相邻时钟读取和记账存在小额扰动，
-阶段时间不是纯 task CPU 时间；三个阶段的和应不大于完整 eval 时间，差值包含未分桶工作。
-失败 eval 可能留下部分 round/阶段计数，此时应丢弃测量并重置模型，不能用于性能结论。
-关闭计时不读时钟，但仍有条件分支和代码布局变化；其性能影响需在相同输入下实测。
-这些诊断计时不能直接作为未插桩仿真提速的证据。
+`cpu.st.emit-cpp --waveform declared-symbols`（Python 流程脚本 `--emit-waveform`；XS
+根流程 `WOLVRIX_GRHSIM_WAVEFORM=1`）让模型携带 FST 波形采集：模型在每次 eval 边界
+（P_output 之后）对选中信号做变化检测并写 FST，时间轴为 eval 序号；difftest 侧的
+`waveform_tick()` 因此是 no-op，`--dump-wave [--wave-path <fst>]` 即可采集（缺省路径
+`grhsim.fst`）。
+
+信号集与旧 emitter 的 declared-symbols 模式同源：遍历 `declaredSymbols`，解析到接口
+端口、RegLatch 状态字段或已实体化的 boundary 字段者入选；mem 状态（存储内容不进
+FST）、字符串/四态类型、无 live object 的符号（被优化掉的线网）、折叠为超节点局部
+的 value，以及超过 512 字节的数组字段（与 dumpState 的哈希口径一致）跳过。数组按
+元素位宽 × 元素数摊平为一个宽 var（元素存储须无空隙：位宽 8/16/32/64）。
+
+产物与接线：注册表在 `<prefix>_wave_<g>.cpp`（每 4096 信号一个 `wave_setup_<k>` 成员
+函数、8 块一文件）——刻意不进 C8 TU 计划（计划与 emit 选项无关），只追加进生成
+`Makefile` 的 `SOURCES`；Makefile 同时补 vendored libfst 规则（fstapi/fastlz/lz4 与
+`-I$(LIBFST_SRC_DIR)`，随 wolvrix 源码树定位）。模型类新增
+`configure_waveform(bool[, path])`/`waveform_enabled()`；`emit` 关闭波形时
+`configure_waveform` 保持桩实现并在 `WOLVRIX_GRHSIM_WAVEFORM=1` 构建下提示改用
+`--waveform declared-symbols` 重发。消费方（驱动或 difftest emu）链接模型库需 `-lz`
+（fstapi 读端引用 zlib），difftest `grhsim.mk` 在 `WOLVRIX_GRHSIM_WAVEFORM=1` 时自动
+追加；模型头经 `<prefix>_runtime.hpp` 引入 `fstapi.h`，消费方编译需把 libfst 源目录
+加入包含路径（difftest 侧已带）。
+
+变化检测按字段整块 `memcmp`/`memcpy` 进 `waveform_prev_` 字缓冲，首次 dump 强制全量
+以给出初值；`configure_waveform(false)` 或析构会关闭并落盘。
+
 
 ### Backend mapping 校验
 
@@ -421,8 +450,8 @@ false；stage、payload 和 complete 不一致会被拒绝。完整 JSON、clone
   op id 升序；General 超节点的 `eventActs` 与扫 op 重算一致；
 - 超节点序号为 General 分枝子节点顺序；`GeneralFunctions` 起 EmitFunction 叶子的
   `supernodeRange` 区间连续铺满 [0,N)；helper ranges 连续覆盖所属超节点；
-- 激活表的 `activate` 只引用 General 超节点；位图、mem 写计划、fanout、task 与 trigger
-  按模型与分区树重算并要求完全一致；
+- 激活表的 `activate` 只引用 General 超节点（V2-M2 起只引用非 sink 超节点）；激活映射、
+  mem 写计划、fanout、task 与 trigger 按模型与分区树重算并要求完全一致；
 - NUMA node 和 CPU core ID 唯一，每个 CPU core 只属于一个 NUMA node；
 - task ID 唯一，`waits_for` 只引用当前计划中的 task；task 所引用的分区互不重叠并完整覆盖
   `PartitionTree`；

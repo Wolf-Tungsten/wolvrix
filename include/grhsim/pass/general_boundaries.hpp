@@ -10,24 +10,22 @@ namespace wolvrix::lib::grhsim
 {
 
     // Predicted General-phase node partition and boundary value set (M5d-5,
-    // B7 boundary-aware cloning, plan 归位决议 1): a static simulation of the
-    // cone-absorption rules of cpu.st.build-general-nodes, computed without
-    // building any CPU mapping. build-general-nodes is deterministic — an
-    // absorbable op (core.compute.*, core.input.read, core.state.read,
-    // core.state.memRead) joins its results' single agreed consumer node,
-    // while shared values and commit-boundary consumers force a fresh node —
-    // so the boundary set is predictable from the sealed semantic model.
+    // B7 boundary-aware cloning, plan 归位决议 1; V2-M1 更新): a static
+    // simulation of the cone-absorption rules of cpu.st.build-general-nodes,
+    // computed without building any CPU mapping. build-general-nodes is
+    // deterministic — an absorbable op (core.compute.*, core.input.read,
+    // core.state.read, core.state.memRead) joins its results' single agreed
+    // consumer node, while shared values and commit-boundary consumers force
+    // a fresh node — so the boundary set is predictable from the sealed
+    // semantic model.
     //
-    // Op set (forward rule, matching the C1 rework in M5d-6): every
-    // General-phase op, including General-tagged mem writes (writes on
-    // regLatch-class states anchor nodes like regWrite/latchWrite sinks).
-    // Mem-phase writes stay out of the set and their operands are predicted
-    // boundaries (P_mem samples them). Event/Output cones are self-contained
-    // and never extend the set.
-    //
-    // The legacy backend's build-general-nodes currently excludes mem write
-    // op types (M5d-5 compat shim); on models without General-phase mem
-    // writes the prediction coincides with its node formation exactly.
+    // Op set (V2-M1 rule): every NON-SINK General-phase op (value-producing).
+    // No-result sink ops (reg/latch writes, General-phase regLatch-class mem
+    // writes, no-result calls) never enter cone absorption — each anchors a
+    // singleton node trailing the non-sink nodes, so sink operand values are
+    // predicted boundaries. Mem-phase writes stay out of the set and their
+    // operands are predicted boundaries (P_mem samples them). Event/Output
+    // cones are self-contained and never extend the set.
     struct GeneralBoundaryPrediction
     {
         static constexpr uint32_t kNoNode = ~0u;

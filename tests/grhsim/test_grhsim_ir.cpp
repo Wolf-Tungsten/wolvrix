@@ -2299,7 +2299,7 @@ namespace {
     }
 
     // Run the M5d-6 six-phase CPU mapping pipeline end to end and check that the
-    // produced namedStores/eventBitmaps/memWritePlan shells survive a JSON
+    // produced namedStores/eventActivation/memWritePlan shells survive a JSON
     // store/load/store round trip byte-identically.
     int runSimRefactorMappingShellTest(const std::filesystem::path &artifactDir) {
         using namespace grhsim;
@@ -2342,7 +2342,7 @@ namespace {
         for (const char *name : {"grhsim.extract-output-cones",
                                  "grhsim.split-phases", "grhsim.select-state-stores",
                                  "cpu.st.build-general-nodes", "cpu.st.merge-general-supernodes",
-                                 "cpu.st.layout-named-stores", "cpu.st.build-event-bitmaps",
+                                 "cpu.st.layout-named-stores", "cpu.st.build-event-activation-map",
                                  "cpu.st.build-mem-write-plan", "cpu.st.pack-general-functions",
                                  "cpu.st.build-phase-schedule", "cpu.st.plan-translation-units"})
             manager.addPass(defaultPassRegistry().create(name, {}, error));
@@ -2371,7 +2371,7 @@ namespace {
             !loadedMapping->translationUnits)
             return fail("shell GrhSIM JSON load lost the CPU mapping");
         if (loadedMapping->dataLayout->namedStores != model.cpuMapping()->dataLayout->namedStores ||
-            loadedMapping->schedule->eventBitmaps != model.cpuMapping()->schedule->eventBitmaps ||
+            loadedMapping->schedule->eventActivation != model.cpuMapping()->schedule->eventActivation ||
             loadedMapping->schedule->memWritePlan != model.cpuMapping()->schedule->memWritePlan ||
             loadedMapping->translationUnits != model.cpuMapping()->translationUnits)
             return fail("shell fields did not survive the JSON round trip");

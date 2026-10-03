@@ -19,53 +19,52 @@ The pass errors out on any `SimPhase::None` op, pointing at
    edges are detected. `Mem` holds the `Mem`-phase write ops in op-id order
    (the static priority seed; C5's mem write plan finalizes priorities).
    `Output` holds the Output-phase ops in topological order.
-3. Forms `Node` partitions under the General branch over **all**
-   General-phase ops — including the General-phase mem writes on
-   regLatch-class arrays that B5's class-aware attribution keeps out of
-   P_mem. The rule is the reverse-topological cone absorption:
-   - `core.state.regWrite` / `core.state.latchWrite`, the General-phase
-     `core.state.memWrite` / `memFill` / `memAssign` / `memWriteSeq`, and the
-     General-phase `core.system.task` / `core.dpi.call` are mergeable sinks:
-     they anchor nodes (a write has no results and is never absorbed) while
-     their single-consumer operand cones absorb into the sink's node. This is
-     the P_general "write ops fold into supernodes" boundary-reduction
-     motive.
-   - `core.compute.*`, `core.input.read`, `core.state.read` and
-     `core.state.memRead` follow the absorption rule: an op absorbs into its
-     result's only user node; shared values (used by several nodes) and ops
-     whose users include ops outside the General set (e.g. a mem write in the
-     Mem branch) block absorption and anchor their own node, becoming
-     boundary value candidates.
+3. Forms `Node` partitions under the General branch — over the **non-sink**
+   General-phase ops only (V2-M1). The General-phase ops split by shape:
+   - **Sink ops** (no results: `core.state.regWrite` / `latchWrite`, the
+     General-phase `core.state.memWrite` / `memFill` / `memAssign` /
+     `memWriteSeq` on regLatch-class arrays, and no-result
+     `core.system.task` / `core.dpi.call`) never enter node formation. Each
+     anchors a singleton `Node` appended in op-id order after the non-sink
+     nodes, and C2 clusters them into sink supernodes by event signature.
+   - **Non-sink ops** (value-producing, event-carrying ones included) go
+     through the reverse-topological cone absorption: `core.compute.*`,
+     `core.input.read`, `core.state.read` and `core.state.memRead` absorb
+     into their result's only user node; shared values (used by several
+     nodes) and ops whose users include ops outside the non-sink set (a sink
+     op, or a mem write in the Mem branch) block absorption and anchor their
+     own node, becoming boundary value candidates. Sink operand cones stay in
+     this non-sink frame — their values become boundary values sampled by the
+     sink supernodes.
    - The capacity knob is `--max-op-in-compute-node` (default 128).
-
-Event-carrying ops (`event_acts` on writes / tasks / DPI calls) are always
-anchors, so a node never holds more than one of them; rule 1 of the
-event-domain constraint therefore holds trivially at node granularity.
 
 For example, with `w = regWrite(cond=%c, next=%n, mask=%one)` where `%c` and
 `%n` are single-use:
 
 ```text
-op3 core.compute.and  -> %c     ; feeds only w
+op3 core.compute.and  -> %c     ; feeds only w (a sink)
 op4 core.compute.not  -> %n     ; feeds only w
 op5 core.compute.and  -> %mw_c  ; feeds a Mem-branch memWrite
 op6 core.state.regWrite [%c, %n, %one] {@q} { event_acts: [0] }
 ```
 
-becomes two nodes (op3/op4 absorb into the write's node; op5's only user
-sits outside the General set, so it anchors alone):
+becomes four nodes (every cone op's only user is outside the non-sink set,
+so nothing absorbs; the write anchors a singleton sink node):
 
 ```text
-node { op3, op4, op6 }   ; cone absorbs into the write's node
-node { op5 }             ; user outside the General set blocks absorption
+node { op3 }   ; cone op — user is a sink, absorption blocked
+node { op4 }   ; cone op — user is a sink, absorption blocked
+node { op5 }   ; cone op — user sits in the Mem branch, absorption blocked
+node { op6 }   ; singleton sink node
 ```
 
-Diagnostics: `event_ops`, `general_nodes`, `mem_ops`, `output_ops`,
-`boundary_value_targets` (cross-node value edges).
+Diagnostics: `event_ops`, `general_nodes`, `sink_nodes`, `mem_ops`,
+`output_ops`, `boundary_value_targets` (cross-node value edges).
 
 The semantic boundary-prediction helper `predictGeneralBoundaries`
 (`include/grhsim/pass/general_boundaries.hpp`) mirrors this pass's
-cone-absorption rules over the sealed model without building a mapping; the
-two implementations are kept aligned, and the B7 tests
-(`grhsim-split-phases-tests`) check that the predicted boundary set matches
-the node boundaries this pass actually forms.
+cone-absorption rules over the sealed model without building a mapping
+(non-sink op set, singleton sink nodes included); the two implementations
+are kept aligned, and the B7 tests (`grhsim-split-phases-tests`) check that
+the predicted boundary set matches the node boundaries this pass actually
+forms.

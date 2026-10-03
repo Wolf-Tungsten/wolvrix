@@ -1011,7 +1011,7 @@ void regToMemEmitChecks(const std::filesystem::path &directory) {
         for(auto name:{"grhsim.classify-event-inputs","grhsim.lower-edge-detect","grhsim.extract-output-cones",
             "grhsim.migrate-timeslot-tasks","grhsim.split-phases","grhsim.select-state-stores",
             "cpu.st.build-general-nodes","cpu.st.merge-general-supernodes","cpu.st.layout-named-stores",
-            "cpu.st.build-event-bitmaps","cpu.st.build-mem-write-plan","cpu.st.pack-general-functions",
+            "cpu.st.build-event-activation-map","cpu.st.build-mem-write-plan","cpu.st.pack-general-functions",
             "cpu.st.build-phase-schedule"}) {
             std::string error;
             auto pass=defaultPassRegistry().create(name,{},error);

@@ -1,4 +1,4 @@
-// predictGeneralBoundaries (M5d-5, B7 归位决议 1): mirror of the
+// predictGeneralBoundaries (M5d-5, B7 归位决议 1; V2-M1 更新): mirror of the
 // cpu.st.build-general-nodes cone-absorption rules (formNodes in
 // backend/cpu_partition.cpp) over the sealed model's General-phase op set,
 // producing the predicted node ownership and boundary value set without
@@ -6,6 +6,10 @@
 // ComputeGraph's use lists cover every model op (out-of-set consumers defeat
 // absorption as commit boundaries), the ready stack is LIFO over the op-set
 // scan order reversed, and node ids follow reverse-topo discovery order.
+// V2-M1: the node-formation op set holds only NON-SINK General ops
+// (value-producing); no-result sink ops never enter cone absorption — each
+// anchors a singleton node appended in op-id order, so their operand values
+// are predicted boundary values by construction.
 // C1 (M5d-6) consumes the same helper so both passes share one rule.
 
 #include "grhsim/pass/general_boundaries.hpp"
@@ -41,20 +45,26 @@ namespace wolvrix::lib::grhsim
         prediction.nodeOfOp.assign(opCount + 1, kNoNode);
         prediction.boundaryValue.assign(valueCount + 1, 0);
 
-        // Op set: every General-phase op (regLatch-class mem writes included).
-        std::vector<OpId> ops;
+        // Op set: every non-sink General-phase op (value-producing). Sink ops
+        // (no results: reg/latch writes, General-phase regLatch-class mem
+        // writes, no-result calls) are collected separately and anchor
+        // singleton nodes after the non-sink nodes, mirroring C1.
+        std::vector<OpId> ops, sinks;
         std::vector<uint8_t> inSet(opCount + 1, 0);
         for (const auto &op : model.operations())
         {
             if (op.phase != SimPhase::General) continue;
+            if (model.results(op).empty()) { sinks.push_back(op.id); continue; }
             ops.push_back(op.id);
             inSet[op.id.index] = 1;
         }
-        if (ops.empty()) return prediction;
+        if (ops.empty() && sinks.empty()) return prediction;
 
         // Producer/use tables over the whole model (use lists deliberately
         // include out-of-set consumers: they defeat absorption, mirroring
-        // ComputeGraph's commit-boundary rule).
+        // ComputeGraph's commit-boundary rule; sink consumers are out of the
+        // set by construction, so sink operand cones never absorb into a
+        // sink's node).
         std::vector<OpId> producer(valueCount + 1);
         std::vector<uint32_t> useOffsets(valueCount + 2, 0);
         for (const auto &op : model.operations())
@@ -128,11 +138,14 @@ namespace wolvrix::lib::grhsim
         }
         prediction.nodeCount = static_cast<uint32_t>(sizes.size());
         prediction.nodeOfOp = std::move(owner);
+        // Sink singleton nodes trail the non-sink nodes in op-id order.
+        for (auto id : sinks) prediction.nodeOfOp[id.index] = prediction.nodeCount++;
 
         // Predicted boundary values: a General-produced value is a boundary
-        // when it crosses predicted nodes, is sampled by a Mem-phase write,
-        // or leaves the partition any other way (conservative — the seal
-        // forbids Event/Output consumers of General values).
+        // when it crosses predicted nodes (sink singleton nodes included), is
+        // sampled by a Mem-phase write, or leaves the partition any other way
+        // (conservative — the seal forbids Event/Output consumers of General
+        // values).
         for (const auto &op : model.operations())
         {
             const uint32_t consumerNode = prediction.nodeOfOp[op.id.index];

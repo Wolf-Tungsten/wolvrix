@@ -53,59 +53,6 @@ namespace wolvrix::lib::grhsim
             return target.size() != middle;
         }
 
-        // Merge-time event domain state of a node/cluster (six-phase model,
-        // P_general supernode event domain constraint): hasEvent marks the
-        // presence of event-carrying ops, uniform tracks rule 1 (all event
-        // act sets equal), acts is the common set K, and influence is the
-        // E(.) downstream act closure union. unboundFree marks the presence of
-        // an op with no event obligations at all (no acts and an empty
-        // downstream closure) — such ops are data-driven by nature.
-        struct EventDomainInfo
-        {
-            bool hasEvent = false;
-            bool uniform = true;
-            bool unboundFree = false;
-            std::vector<int64_t> acts;
-            std::vector<int64_t> influence;
-        };
-
-        EventDomainInfo combineEventDomains(const EventDomainInfo &lhs, const EventDomainInfo &rhs)
-        {
-            EventDomainInfo result;
-            result.hasEvent = lhs.hasEvent || rhs.hasEvent;
-            result.uniform = lhs.uniform && rhs.uniform &&
-                             (!lhs.hasEvent || !rhs.hasEvent || lhs.acts == rhs.acts);
-            result.unboundFree = lhs.unboundFree || rhs.unboundFree;
-            result.acts = lhs.hasEvent ? lhs.acts : rhs.acts;
-            result.influence = lhs.influence;
-            unionInto(result.influence, rhs.influence);
-            return result;
-        }
-
-        // The merge prohibition: an event-carrying supernode must keep one
-        // common act set K (rule 1) whose downstream closure introduces no
-        // other acts (rule 2). Pure combinational/latch-only clusters are
-        // exempt from both rules — but an op with no event obligation anywhere
-        // (no acts, empty influence; e.g. an event-free system task or a
-        // level-sensitive read chain) must never land in an event-carrying
-        // supernode: the domain gate would suppress its data-driven execution.
-        // Event-free cone members whose downstream closure is exactly K belong
-        // to the domain and merge freely.
-        bool eventDomainAllowed(const EventDomainInfo &info)
-        {
-            return !info.hasEvent || (info.uniform && info.influence == info.acts && !info.unboundFree);
-        }
-
-        std::vector<EventDomainInfo> clusterEventDomains(const Clusters &clusters,
-                                                         std::span<const EventDomainInfo> nodeInfos)
-        {
-            std::vector<EventDomainInfo> result(clusters.size());
-            for (uint32_t i = 0; i < clusters.size(); ++i)
-                for (const auto node : clusters[i])
-                    result[i] = combineEventDomains(result[i], nodeInfos[node]);
-            return result;
-        }
-
         PartitionId phasePartition(const CpuPartitionTree &tree, CpuPhase phase)
         {
             for (auto id : tree.partitions[tree.root.index - 1].children)
@@ -330,17 +277,15 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
-        // Six-phase coarsen variant with the event-domain merge prohibition:
-        // every union-find merge additionally combines the two clusters' event
-        // domain state and rejects merges whose event-carrying result breaks
-        // rule 1 (one common act set) or rule 2 (downstream closure stays in
-        // that set). Rejected attempts are counted for diagnostics.
+        // Six-phase coarsen over the non-sink node graph (V2-M1: sink ops are
+        // clustered by event signature outside this framework, and the
+        // merge-time event-domain prohibition is gone — a non-sink supernode
+        // fires data-driven, with per-op eventActStore guards inside its
+        // body, so mixed act sets are legal here).
         bool coarsenGeneral(Clusters &clusters, std::span<const Edge> edges, std::span<const uint32_t> sizes,
-                            uint32_t maxOps, unsigned mode, std::span<const EventDomainInfo> nodeInfos,
-                            uint64_t &blocked)
+                            uint32_t maxOps, unsigned mode)
         {
             ClusterGraph graph(clusters, edges, sizes.size());
-            auto infos = clusterEventDomains(clusters, nodeInfos);
             std::vector<uint32_t> parent(clusters.size());
             std::iota(parent.begin(), parent.end(), 0);
             std::vector<uint64_t> weights;
@@ -354,9 +299,7 @@ namespace wolvrix::lib::grhsim
                 a = find(a); b = find(b);
                 if (a == b || weights[a] + weights[b] > maxOps) return false;
                 if (a > b) std::swap(a, b);
-                auto combined = combineEventDomains(infos[a], infos[b]);
-                if (!eventDomainAllowed(combined)) { ++blocked; return false; }
-                parent[b] = a; weights[a] += weights[b]; infos[a] = std::move(combined); changed = true;
+                parent[b] = a; weights[a] += weights[b]; changed = true;
                 return true;
             };
             if (mode == 2)
@@ -404,14 +347,10 @@ namespace wolvrix::lib::grhsim
             return true;
         }
 
-        // Six-phase DP segmentation with the event-domain prohibition: a
-        // multi-cluster span whose combined domain state breaks the rules can
-        // never become legal by growing further (uniformity is sticky and the
-        // influence union only grows), so the span scan stops there. Single
-        // clusters are exempt: node formation already fixed their contents.
+        // Six-phase DP segmentation over the non-sink clusters (V2-M1: no
+        // event-domain span check — see coarsenGeneral).
         Clusters segmentGeneral(const Clusters &clusters, const ClusterGraph &graph,
-                                std::span<const uint32_t> sizes, std::size_t valueCount, uint32_t maxOps,
-                                std::span<const EventDomainInfo> infos, uint64_t &blocked)
+                                std::span<const uint32_t> sizes, std::size_t valueCount, uint32_t maxOps)
         {
             std::vector<std::vector<uint32_t>> sources(clusters.size()), targets(clusters.size());
             std::vector<uint32_t> sourceOfValue(valueCount + 1, absent);
@@ -436,14 +375,9 @@ namespace wolvrix::lib::grhsim
             for (uint32_t end = 1; end <= clusters.size(); ++end)
             {
                 uint64_t incoming = 0;
-                bool spanFirst = true;
-                EventDomainInfo span;
                 for (uint32_t begin = end; begin > 0;)
                 {
                     --begin;
-                    if (spanFirst) { span = infos[begin]; spanFirst = false; }
-                    else span = combineEventDomains(infos[begin], span);
-                    if (begin + 1 != end && !eventDomainAllowed(span)) { ++blocked; break; }
                     if (prefix[end] - prefix[begin] > maxOps)
                     {
                         if (begin + 1 == end) continue;
@@ -475,51 +409,65 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
-        // cpu.st.merge-general-supernodes (C2): the coarsen+DP frame plus the
-        // event-domain merge prohibition from the P_general spec. Every
-        // resulting General supernode records its event act union in
-        // attrs.eventActs (engaged, empty array for event-free supernodes).
-        // M5d-6 (resolution 2): the supernodes stay direct children of the
-        // General branch in cluster (partition-result) order — that child
-        // order IS the final supernode ordinal space consumed by the layout,
-        // event bitmaps, schedule and emitter; function packing (C6) only
-        // records intervals over it.
+        // cpu.st.merge-general-supernodes (C2, V2-M1): the General branch's
+        // nodes split into non-sink nodes (value-producing ops) and sink
+        // nodes (no-result ops, one op each from C1). Non-sink nodes go
+        // through the coarsen+DP frame with no event-domain prohibition — a
+        // non-sink supernode fires data-driven and its event-carrying ops
+        // self-guard on eventActStore inside the body. Sink nodes never
+        // enter the frame: they cluster by canonical event signature (the
+        // op's sorted event_acts set), one supernode per signature — the
+        // empty signature forms the escape class (SinkEscape, fires every
+        // round), nonempty signatures form SinkEvent supernodes. Every
+        // supernode records attrs.eventActs (the act union; for sinks that IS
+        // the signature) and attrs.supernodeCategory. Child order: non-sink
+        // supernodes first (frame/topological order), sink supernodes after
+        // (lexicographic signature order) — sink operands are produced by
+        // non-sink ops only, so every sink boundary producer has a smaller
+        // ordinal (a verifyCpuMapping invariant). The child order IS the
+        // final supernode ordinal space consumed by the layout, event
+        // bitmaps, schedule and emitter (M5d-6, resolution 2).
         void mergeGeneralSupernodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
                                     diag::Diagnostics &diagnostics)
         {
             auto &tree = mapping.partitionTree;
             const auto phase = phasePartition(tree, CpuPhase::General);
             const auto nodes = tree.partitions[phase.index - 1].children;
-            const auto ops = partitionOps(tree, phase);
-            ComputeGraph graph(model, ops);
-            std::vector<uint32_t> owner(model.operations().size() + 1, absent), sizes;
-            Clusters clusters(nodes.size());
+            std::vector<uint32_t> nonSinkNodes, sinkNodes;
             for (uint32_t i = 0; i < nodes.size(); ++i)
             {
                 const auto &partition = tree.partitions[nodes[i].index - 1];
-                sizes.push_back(partition.ops.size()); clusters[i].push_back(i);
-                for (auto op : partition.ops) owner[op.index] = i;
+                bool sink = true;
+                for (auto op : partition.ops)
+                    if (!model.results(model.operations()[op.index - 1]).empty()) { sink = false; break; }
+                if (!sink)
+                    for (auto op : partition.ops)
+                        if (model.results(model.operations()[op.index - 1]).empty())
+                            throw std::runtime_error("general node mixes sink and non-sink ops");
+                (sink ? sinkNodes : nonSinkNodes).push_back(i);
+            }
+            std::vector<OpId> computeOps;
+            for (const auto index : nonSinkNodes)
+            {
+                const auto &ops = tree.partitions[nodes[index].index - 1].ops;
+                computeOps.insert(computeOps.end(), ops.begin(), ops.end());
+            }
+            ComputeGraph graph(model, computeOps);
+            std::vector<uint32_t> owner(model.operations().size() + 1, absent), sizes;
+            Clusters clusters(nonSinkNodes.size());
+            for (uint32_t i = 0; i < nonSinkNodes.size(); ++i)
+            {
+                sizes.push_back(tree.partitions[nodes[nonSinkNodes[i]].index - 1].ops.size());
+                clusters[i].push_back(i);
+                for (auto op : tree.partitions[nodes[nonSinkNodes[i]].index - 1].ops) owner[op.index] = i;
             }
             const auto edges = nodeEdges(model, graph, owner);
-            const auto domainSets = computeCpuEventDomainSets(model);
-            std::vector<EventDomainInfo> nodeInfos(nodes.size());
-            for (uint32_t i = 0; i < nodes.size(); ++i)
-                for (auto op : tree.partitions[nodes[i].index - 1].ops)
-                {
-                    EventDomainInfo info;
-                    info.hasEvent = !domainSets.acts[op.index].empty();
-                    info.unboundFree = domainSets.acts[op.index].empty() && domainSets.influence[op.index].empty();
-                    info.acts = domainSets.acts[op.index];
-                    info.influence = domainSets.influence[op.index];
-                    nodeInfos[i] = combineEventDomains(nodeInfos[i], info);
-                }
-            uint64_t blocked = 0;
             unsigned tail = 0, iterations = 0;
             while (!clusters.empty())
             {
                 const auto before = clusters.size();
                 for (unsigned mode = 0; mode < 3; ++mode)
-                    coarsenGeneral(clusters, edges, sizes, maxOps, mode, nodeInfos, blocked);
+                    coarsenGeneral(clusters, edges, sizes, maxOps, mode);
                 ++iterations;
                 if (clusters.size() == before) break;
                 tail = before >= 100000 && before - clusters.size() < 1024 ? tail + 1 : 0;
@@ -527,21 +475,61 @@ namespace wolvrix::lib::grhsim
             }
             const auto coarsened = clusters.size();
             clusters = segmentGeneral(clusters, ClusterGraph(clusters, edges, sizes.size()), sizes,
-                                      model.values().size(), maxOps,
-                                      clusterEventDomains(clusters, nodeInfos), blocked);
-            const auto finalInfos = clusterEventDomains(clusters, nodeInfos);
+                                      model.values().size(), maxOps);
             tree.partitions[phase.index - 1].children.clear();
-            for (uint32_t i = 0; i < clusters.size(); ++i)
+            uint64_t nonSinkSupernodes = 0;
+            for (const auto &cluster : clusters)
             {
                 const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
-                tree.partitions[supernode.index - 1].attrs.eventActs = finalInfos[i].acts;
-                for (auto node : clusters[i]) attach(tree, supernode, nodes[node]);
+                auto &attrs = tree.partitions[supernode.index - 1].attrs;
+                std::vector<int64_t> acts;
+                for (auto node : cluster)
+                    for (auto op : tree.partitions[nodes[nonSinkNodes[node]].index - 1].ops)
+                        unionInto(acts, readEventActs(model, model.operations()[op.index - 1]));
+                attrs.eventActs = std::move(acts);
+                attrs.supernodeCategory = CpuSupernodeCategory::NonSink;
+                for (auto node : cluster) attach(tree, supernode, nodes[nonSinkNodes[node]]);
+                ++nonSinkSupernodes;
+            }
+            // Sink clustering: one supernode per canonical event signature.
+            // A sink node must carry a single signature across its ops (C1
+            // forms singleton sink nodes, so this is structural).
+            std::map<std::vector<int64_t>, std::vector<uint32_t>> signatureGroups;
+            uint64_t sinkOps = 0;
+            for (const auto index : sinkNodes)
+            {
+                const auto &ops = tree.partitions[nodes[index].index - 1].ops;
+                std::vector<int64_t> signature;
+                bool firstOp = true;
+                for (auto op : ops)
+                {
+                    auto acts = readEventActs(model, model.operations()[op.index - 1]);
+                    if (firstOp) { signature = std::move(acts); firstOp = false; continue; }
+                    if (acts != signature)
+                        throw std::runtime_error("sink node carries mixed event signatures");
+                }
+                signatureGroups[signature].push_back(index);
+                sinkOps += ops.size();
+            }
+            uint64_t escapeSupernodes = 0, eventSupernodes = 0;
+            for (const auto &[signature, members] : signatureGroups)
+            {
+                const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
+                auto &attrs = tree.partitions[supernode.index - 1].attrs;
+                attrs.eventActs = signature;
+                attrs.supernodeCategory = signature.empty() ? CpuSupernodeCategory::SinkEscape
+                                                            : CpuSupernodeCategory::SinkEvent;
+                for (auto node : members) attach(tree, supernode, nodes[node]);
+                if (signature.empty()) ++escapeSupernodes; else ++eventSupernodes;
             }
             const auto finalEdges = ClusterGraph(clusters, edges, sizes.size()).edges.size();
             diagnostics.info("coarsen_iterations=" + std::to_string(iterations) + " coarsened_clusters=" + std::to_string(coarsened) +
-                             " general_supernodes=" + std::to_string(clusters.size()) +
-                             " boundary_value_targets=" + std::to_string(finalEdges) +
-                             " event_domain_blocked=" + std::to_string(blocked), "cpu.st.merge-general-supernodes");
+                             " nonsink_supernodes=" + std::to_string(nonSinkSupernodes) +
+                             " sink_supernodes=" + std::to_string(signatureGroups.size()) +
+                             " sink_escape_supernodes=" + std::to_string(escapeSupernodes) +
+                             " sink_event_supernodes=" + std::to_string(eventSupernodes) +
+                             " sink_ops=" + std::to_string(sinkOps) +
+                             " boundary_value_targets=" + std::to_string(finalEdges), "cpu.st.merge-general-supernodes");
         }
 
         // cpu.st.pack-general-functions (C6, M5d-6 position: after
@@ -667,19 +655,22 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
-        // cpu.st.build-general-nodes (C1, M5d-6): initializes the one final
+        // cpu.st.build-general-nodes (C1, V2-M1): initializes the one final
         // CPU mapping from the sealed semantic model. The semantic pipeline
         // (B5 grhsim.split-phases + B8 seal) has completed the class-aware
         // phase attribution, so this pass only consumes SimPhase: it builds
         // the four-branch root (flat Event in cone topo order with edgeDets
         // last, flat Mem in op-id order — the static priority seed, flat
-        // Output in topo order), then forms General nodes over ALL
-        // General-phase ops. reg/latch write ops, General-phase
-        // system.task/dpi.call and the General-phase regLatch-class mem
-        // writes are mergeable sinks: they anchor nodes (never absorbed)
-        // while their single-consumer operand cones absorb into the sink's
-        // node. Any previous mapping is discarded: this is the pipeline's
-        // single mapping initialization point.
+        // Output in topo order), then forms General nodes over the NON-SINK
+        // General-phase ops only. Sink ops (no results: reg/latch writes,
+        // General-phase system.task/dpi.call, General-phase regLatch-class
+        // mem writes) never enter node formation — each anchors a singleton
+        // node appended in op-id order after the non-sink nodes, and C2
+        // clusters them into sink supernodes by event signature. Their
+        // operand cones stay in the non-sink framework (their values become
+        // boundary values sampled by the sink supernodes). Any previous
+        // mapping is discarded: this is the pipeline's single mapping
+        // initialization point.
         class BuildGeneralNodesPass final : public Pass
         {
         public:
@@ -714,15 +705,24 @@ namespace wolvrix::lib::grhsim
                     if (op.phase == SimPhase::Mem) mem.ops.push_back(op.id);
                 auto &output = tree.partitions[branches[3].index - 1];
                 output.ops = orderFlatPhaseOps(model, SimPhase::Output, false);
-                std::vector<OpId> generalOps;
+                std::vector<OpId> generalOps, sinkOps;
                 for (const auto &op : model.operations())
-                    if (op.phase == SimPhase::General) generalOps.push_back(op.id);
+                    if (op.phase == SimPhase::General)
+                        (model.results(op).empty() ? sinkOps : generalOps).push_back(op.id);
                 const auto stats = formNodes(model, tree, branches[1], std::move(generalOps), maxOps_);
+                uint64_t sinkNodes = 0;
+                for (const auto opId : sinkOps)
+                {
+                    const auto id = addPartition(tree, branches[1], CpuPartitionKind::Node);
+                    tree.partitions[id.index - 1].ops = {opId};
+                    ++sinkNodes;
+                }
                 mapping.stage = CpuMappingStage::GeneralNodes;
                 // formNodes grows the partition table, so the branch reads go
                 // through fresh id lookups (no dangling references).
                 diagnostics.info("event_ops=" + std::to_string(tree.partitions[branches[0].index - 1].ops.size()) +
                                  " general_nodes=" + std::to_string(stats.nodes) +
+                                 " sink_nodes=" + std::to_string(sinkNodes) +
                                  " mem_ops=" + std::to_string(tree.partitions[branches[2].index - 1].ops.size()) +
                                  " output_ops=" + std::to_string(tree.partitions[branches[3].index - 1].ops.size()) +
                                  " boundary_value_targets=" + std::to_string(stats.boundaryEdges), name());
@@ -771,77 +771,6 @@ namespace wolvrix::lib::grhsim
             CpuMappingStage outputStage_;
             std::vector<uint32_t> options_;
         };
-    }
-
-    CpuEventDomainSets computeCpuEventDomainSets(const GrhSimModel &model)
-    {
-        const auto opCount = model.operations().size();
-        CpuEventDomainSets sets;
-        sets.acts.resize(opCount + 1);
-        sets.influence.resize(opCount + 1);
-        // The influence graph spans the General-phase ops plus the Mem-phase
-        // write ops; Event/Output ops are unreachable by construction (their
-        // cones are self-contained) and the timeslot tasks' acts do not gate.
-        // Edges are value fanout only (General -> Mem write-operand edges
-        // included, mem writes being sinks). State write -> read edges are
-        // deliberately excluded: state readers consume S directly and are
-        // activated by P_publish's stateFanout, not by eventActiveFlag, so a
-        // write's domain must not leak into its state readers' domains.
-        std::vector<bool> inGraph(opCount + 1, false);
-        for (const auto &op : model.operations())
-        {
-            if (op.phase != SimPhase::General && op.phase != SimPhase::Mem) continue;
-            inGraph[op.id.index] = true;
-            sets.acts[op.id.index] = readEventActs(model, op);
-        }
-        std::vector<OpId> producer(model.values().size() + 1);
-        std::vector<uint32_t> useOffsets(model.values().size() + 2, 0);
-        for (const auto &op : model.operations())
-        {
-            for (auto value : model.results(op)) producer[value.index] = op.id;
-            for (auto value : model.operands(op)) ++useOffsets[value.index + 1];
-        }
-        std::partial_sum(useOffsets.begin(), useOffsets.end(), useOffsets.begin());
-        std::vector<OpId> uses(useOffsets.back());
-        auto cursor = useOffsets;
-        for (const auto &op : model.operations())
-            for (auto value : model.operands(op)) uses[cursor[value.index]++] = op.id;
-        std::vector<std::vector<OpId>> successors(opCount + 1);
-        const auto link = [&](OpId from, OpId to) {
-            if (!from.index || !to.index || from == to) return;
-            if (!inGraph[from.index] || !inGraph[to.index]) return;
-            auto &row = successors[from.index];
-            if (std::find(row.begin(), row.end(), to) == row.end()) row.push_back(to);
-        };
-        for (const auto &op : model.operations())
-        {
-            if (!inGraph[op.id.index]) continue;
-            for (auto value : model.results(op))
-                for (uint32_t i = useOffsets[value.index]; i < useOffsets[value.index + 1]; ++i)
-                    link(op.id, uses[i]);
-        }
-        std::vector<std::vector<OpId>> predecessors(opCount + 1);
-        for (uint32_t i = 1; i <= opCount; ++i)
-            for (auto target : successors[i]) predecessors[target.index].push_back(OpId{i, 0});
-        for (uint32_t i = 1; i <= opCount; ++i) sets.influence[i] = sets.acts[i];
-        // Worklist least fixed point: influence = acts U union(influence[succ]).
-        // Monotone and bounded by the finite act universe, so it converges.
-        std::vector<bool> queued(opCount + 1, false);
-        std::vector<OpId> worklist;
-        for (const auto &op : model.operations())
-            if (inGraph[op.id.index]) { queued[op.id.index] = true; worklist.push_back(op.id); }
-        for (std::size_t head = 0; head < worklist.size();)
-        {
-            const auto id = worklist[head++];
-            queued[id.index] = false;
-            auto merged = sets.acts[id.index];
-            for (auto target : successors[id.index]) unionInto(merged, sets.influence[target.index]);
-            if (merged == sets.influence[id.index]) continue;
-            sets.influence[id.index] = std::move(merged);
-            for (auto source : predecessors[id.index])
-                if (!queued[source.index]) { queued[source.index] = true; worklist.push_back(source); }
-        }
-        return sets;
     }
 
     void registerCpuPartitionPasses(PassRegistry &registry)

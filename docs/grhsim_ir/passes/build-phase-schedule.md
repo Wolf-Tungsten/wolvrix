@@ -7,7 +7,10 @@ stage at which the mapping becomes `complete` (M5d-7 appends C8
 [`plan-translation-units`](plan-translation-units.md) → `TranslationUnits`,
 also `complete`; emit accepts only the latter).
 
-Fanout tables (targets sorted by the C2 supernode ordinal, deduplicated):
+Fanout tables (targets sorted by the C2 supernode ordinal, deduplicated).
+V2 (M2): every table's targets are **non-sink supernodes only** (boundary
+2) — sink supernodes fire on their eventActStore signature (SinkEvent) or
+unconditionally every round (SinkEscape), never on `dataActiveFlag`:
 
 - `inputFanout`: a General-phase `input.read` result maps to its owning
   supernode. Reads marked `event_only` produce no entry — P_input does not
@@ -16,7 +19,8 @@ Fanout tables (targets sorted by the C2 supernode ordinal, deduplicated):
   `computeSupernodeFanout`, not this table.
 - `computeSupernodeFanout`: a boundary value maps to its consumer
   supernodes; a real change sets their `dataActiveFlag`. Mem-write consumers
-  are excluded (P_mem runs every round).
+  are excluded (P_mem runs every round), and sink consumers are filtered
+  out — a value consumed only by sink supernodes gets no row.
 - `commitStateFanout`: a reg/latch state maps to its General reader
   supernodes (P_publish activation); every reader is covered. General-phase
   `memRead` ops whose target is a **regLatch-class** array join this table
@@ -30,12 +34,13 @@ timeslotFlag × event_acts Cartesian expansion, in task op-id order with acts
 ascending inside one task.
 
 Task sequence (single numa node, single core, 1-based task ids):
-P_event (`AlwaysScanCommit`) → one `EventDataGated` task per General
+P_event (`AlwaysScanCommit`) → one `DataGated` task per General
 emit-function leaf (the task executes the leaf's `supernodeRange` ordinal
-interval) → P_mem (`AlwaysScanCommit`) → P_output (`EvalEnd`, outside the
-round loop). Init semantics (dataActiveFlag all-ones,
-regLatchStoreNext == regLatchStore, prev = prevInit) are emit concerns and
-need no schedule tables.
+interval; the pre-v2 name was `EventDataGated`, before the eventActiveFlag
+half of the dual gate was removed) → P_mem (`AlwaysScanCommit`) → P_output
+(`EvalEnd`, outside the round loop). Init semantics (dataActiveFlag
+all-ones, regLatchStoreNext == regLatchStore, prev = prevInit) are emit
+concerns and need no schedule tables.
 
 The verifier recomputes all three fanout tables, the task sequence and the
 trigger map from the model and partition tree and requires an exact match.

@@ -45,6 +45,18 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
+        // Vendored libfst sources compiled into waveform-enabled model
+        // libraries (the wolvrix build itself links the same objects for the
+        // legacy path; generated models compile their own copies).
+        std::string libfstSourceDir()
+        {
+#ifdef WOLVRIX_SOURCE_DIR
+            return (std::filesystem::path(WOLVRIX_SOURCE_DIR) / "external/libfst/src").string();
+#else
+            throw std::runtime_error("waveform emit requires WOLVRIX_SOURCE_DIR (vendored libfst location)");
+#endif
+        }
+
         template <typename T>
         const T *parameter(const GrhSimModel &model, std::span<const Parameter> parameters, std::string_view name)
         {
@@ -341,12 +353,13 @@ namespace wolvrix::lib::grhsim
         class SixPhaseEmitter
         {
         public:
-            explicit SixPhaseEmitter(const GrhSimModel &model)
+            explicit SixPhaseEmitter(const GrhSimModel &model, bool waveform = false)
                 : model_(model), mapping_(*model.cpuMapping()), tree_(mapping_.partitionTree),
                   layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule), stores_(*layout_.namedStores),
                   tuPlan_(*mapping_.translationUnits),
                   prefix_("grhsim_" + identifier(model.text(model.name()))),
                   class_("GrhSIM_" + identifier(model.text(model.name()))),
+                  waveform_(waveform),
                   ordinalOf_(tree_.partitions.size() + 1, ~0u),
                   regFieldByState_(model.states().size() + 1),
                   memFieldByState_(model.states().size() + 1),
@@ -399,33 +412,13 @@ namespace wolvrix::lib::grhsim
                         outputOps_ = tree_.partitions[branch.children.front().index - 1].ops;
                 }
 
-                // The event bitmaps still drive the per-round eventActiveFlag
-                // rebuild (emitEdgeDet ORs them in); the supernode gate below
-                // no longer reads the coverage.
-                if (schedule_.eventBitmaps)
-                    for (const auto &bitmap : *schedule_.eventBitmaps)
-                    {
-                        bitmapByAct_[bitmap.cluster] = &bitmap;
-                        maxAct_ = std::max(maxAct_, bitmap.cluster);
-                    }
-                // The double gate (eventActiveFlag && dataActiveFlag) is only
-                // sound for supernodes that hold event-carrying ops: firing
-                // clears the sticky data flag, so such a supernode must not
-                // fire without its edge (a guard-skipped write would lose the
-                // pending update). Supernodes whose S is non-empty only through
-                // downstream influence (write-operand producers, level-sensitive
-                // mem readers, event-free side-effect sinks) fire data-driven;
-                // their recomputation is idempotent and the plan §112 exemption
-                // rationale requires it. S=empty supernodes stay exempt as
-                // before (they are a subset of event-free ones).
-                eventGated_.assign(supernodeCount_, false);
-                for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
-                    for (const auto opId : supernodeOps_[ordinal])
-                        if (!readCpuPhaseEventActs(model_, model_.operations()[opId.index - 1]).empty())
-                        {
-                            eventGated_[ordinal] = true;
-                            break;
-                        }
+                // V2 (M2): the P_event activation map (act -> non-sink
+                // supernodes holding an op with that act) replaces the pre-v2
+                // influence bitmaps; emitEdgeDet ORs the fired acts' words
+                // straight into dataActiveFlag (eventActiveFlag is gone).
+                if (schedule_.eventActivation)
+                    for (const auto &entry : *schedule_.eventActivation)
+                        activationByAct_[entry.act] = &entry;
                 for (const auto &op : model_.operations())
                 {
                     if (model_.text(op.opType) != "core.event.edgeDet") continue;
@@ -630,6 +623,7 @@ namespace wolvrix::lib::grhsim
                 outputFrame_ = computeFrameFields(outputOps_, outputChunks_, true);
                 crossingLocals_.assign(model_.values().size() + 1, 0);
                 precomputeStagedOutputWrites();
+                if (waveform_) collectWaveformSignals();
             }
 
             // Emission entry points (emitSixPhaseCpuCpp drives these).
@@ -668,12 +662,11 @@ namespace wolvrix::lib::grhsim
             uint32_t supernodeCount_ = 0;
             std::vector<std::vector<OpId>> supernodeOps_;
             std::vector<OpId> eventOps_, outputOps_;
-            std::vector<bool> eventGated_;
 
             std::vector<const CpuStoreField *> regFieldByState_, memFieldByState_;
             std::vector<const CpuStoreField *> boundaryByValue_, boundaryByInput_, prevByAct_;
             std::map<uint32_t, DetInfo> detByAct_;
-            std::map<uint32_t, const CpuEventBitmap *> bitmapByAct_;
+            std::map<uint32_t, const CpuEventActivation *> activationByAct_;
             std::vector<std::vector<uint32_t>> triggersByAct_;
             uint32_t maxAct_ = 0, maxTimeslotFlag_ = 0;
 
@@ -736,6 +729,34 @@ namespace wolvrix::lib::grhsim
             std::string cppType(const Type &type) const;
             std::string cppStoreType(CpuTypeId id) const;
             uint64_t storageBytes(const Type &type) const;
+
+            // ----- FST waveform (declared-symbols mode) -----
+            // One dumpable declared symbol: ports read from the interface
+            // members, registers/wires from their store fields. ref is the
+            // member-access expression (its address feeds the change detect).
+            struct WaveSignal
+            {
+                std::string name;
+                std::string ref;
+                uint64_t bytes = 0;
+                uint32_t width = 0;
+                uint32_t prevOff = 0;
+            };
+            bool waveform_ = false;
+            std::vector<WaveSignal> waveSignals_;
+            uint64_t wavePrevWords_ = 0;
+            // Setup chunking: one member function per kWaveSignalsPerChunk
+            // signals, grouped kWaveChunksPerFile to a .cpp file.
+            static constexpr uint32_t kWaveSignalsPerChunk = 4096;
+            static constexpr uint32_t kWaveChunksPerFile = 8;
+            uint32_t waveChunkCount() const
+            {
+                return static_cast<uint32_t>((waveSignals_.size() + kWaveSignalsPerChunk - 1) / kWaveSignalsPerChunk);
+            }
+            void collectWaveformSignals();
+            void waveSetupFile(std::ostream &out, uint32_t fileIndex) const;
+            void waveformGlue(std::ostream &out) const;
+            static std::string escapeWaveName(std::string_view name);
             std::string normalize(std::string expression, const Type &type) const;
             std::string literal(std::string_view text, const Type &type) const;
             std::string initLiteral(std::string_view text, const Type &type) const;
@@ -758,6 +779,7 @@ namespace wolvrix::lib::grhsim
 
             // ----- Guards / activation -----
             // OR of the op's event_acts bits in eventActStore; "true" when event-free.
+            std::string actBitsGuard(std::span<const int64_t> acts) const;
             std::string actGuard(const SimOp &op) const;
             std::string callCondition(ValueId condition) const;
             // Fanout activation statements. When a firing supernode ordinal is
@@ -1530,13 +1552,11 @@ namespace wolvrix::lib::grhsim
         }
 
         // ----- Guards / activation -----
-        // OR of the op's event_acts bits; "true" when event-free. eventActStore
-        // is byte-packed: bit act%8 of byte act/8 (layout-named-stores EventAct
-        // store) — the same packing emitEdgeDet and the timeslot triggers use.
-        std::string SixPhaseEmitter::actGuard(const SimOp &op) const
+        // OR of the given event act bits. eventActStore is byte-packed: bit
+        // act%8 of byte act/8 (layout-named-stores EventAct store) — the same
+        // packing emitEdgeDet and the timeslot triggers use.
+        std::string SixPhaseEmitter::actBitsGuard(std::span<const int64_t> acts) const
         {
-            const auto acts = readCpuPhaseEventActs(model_, op);
-            if (acts.empty()) return "true";
             std::string guard;
             for (const auto act : acts)
             {
@@ -1545,6 +1565,13 @@ namespace wolvrix::lib::grhsim
                 guard += "((eventActStore[" + std::to_string(act / 8) + "]>>" + std::to_string(act % 8) + ")&1)";
             }
             return guard;
+        }
+        // OR of the op's event_acts bits; "true" when event-free.
+        std::string SixPhaseEmitter::actGuard(const SimOp &op) const
+        {
+            const auto acts = readCpuPhaseEventActs(model_, op);
+            if (acts.empty()) return "true";
+            return actBitsGuard(acts);
         }
         std::string SixPhaseEmitter::callCondition(ValueId condition) const
         {
@@ -1564,8 +1591,8 @@ namespace wolvrix::lib::grhsim
             // round (dataActiveFlag); an earlier/self successor waits for the next
             // round (dataActiveFlagNext). current == ~0 (outside P_general) queues
             // every target into dataActiveFlagNext.
-            const auto dataActive = model_.text(activeStore_->fields[1].name);
-            const auto dataNext = model_.text(activeStore_->fields[2].name);
+            const auto dataActive = model_.text(activeStore_->fields[0].name);
+            const auto dataNext = model_.text(activeStore_->fields[1].name);
             for (const auto ordinal : ordinals)
                 out << (ordinal != ~0u && ordinal > current ? dataActive : dataNext) << '[' << ordinal << "]=1;\n";
         }
@@ -1833,19 +1860,20 @@ namespace wolvrix::lib::grhsim
             else throw std::runtime_error("CPU six-phase emit edgeDet event must be two-state logic");
             out << "if(" << hit << "){\n"
                 << "eventActStore[" << *act / 8 << "]|=std::uint8_t(1u<<" << *act % 8 << ");\n";
-            // OR the act's supernode bitmap (bit i == ordinal i) into the
-            // per-supernode byte eventActiveFlag.
-            if (const auto it = bitmapByAct_.find(static_cast<uint32_t>(*act));
-                it != bitmapByAct_.end() && std::any_of(it->second->supernodeWords.begin(), it->second->supernodeWords.end(),
-                                                        [](std::uint64_t word) { return word != 0; }))
+            // V2 (M2): OR the act's activation words (bit i == ordinal i, the
+            // non-sink supernodes holding an op with this act) straight into
+            // dataActiveFlag — eventActiveFlag and the dual gate are gone.
+            if (const auto it = activationByAct_.find(static_cast<uint32_t>(*act));
+                it != activationByAct_.end() && std::any_of(it->second->supernodeWords.begin(), it->second->supernodeWords.end(),
+                                                            [](std::uint64_t word) { return word != 0; }))
             {
                 const auto &words = it->second->supernodeWords;
-                const auto eventActive = model_.text(activeStore_->fields[0].name);
+                const auto dataActive = model_.text(activeStore_->fields[0].name);
                 out << "{static constexpr std::uint64_t cpu_bm[]={";
                 for (const auto word : words) out << "UINT64_C(0x" << std::hex << word << std::dec << "),";
                 out << "};\nfor(std::size_t cpu_i=0;cpu_i<" << words.size() << ";++cpu_i){std::uint64_t cpu_bits=cpu_bm[cpu_i];"
                     << "while(cpu_bits){const unsigned cpu_b=static_cast<unsigned>(__builtin_ctzll(cpu_bits));cpu_bits&=cpu_bits-1;"
-                    << eventActive << "[cpu_i*64+cpu_b]=1;}}\n}\n";
+                    << dataActive << "[cpu_i*64+cpu_b]=1;}}\n}\n";
             }
             // prev updates whether or not the edge hit (plan §72), so a missed
             // direction never replays and the next opposite edge is seen fresh.
@@ -1874,7 +1902,7 @@ namespace wolvrix::lib::grhsim
                 const std::string merged = normalize("(static_cast<std::uint64_t>(" + nextSlot + ")&~static_cast<std::uint64_t>(" + read(operands[2]) +
                     "))|(static_cast<std::uint64_t>(" + read(operands[1]) + ")&static_cast<std::uint64_t>(" + read(operands[2]) + "))", targetType);
                 out << "{const auto cpu_merged=" << merged << ";if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
-                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[2].name));
+                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
             }
@@ -1883,7 +1911,7 @@ namespace wolvrix::lib::grhsim
                 out << "{const auto cpu_merged=grhsim_merge_words_masked(" << nextSlot << ',' << read(operands[1]) << ','
                     << read(operands[2]) << ',' << targetType.width << ");\n"
                     << "if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
-                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[2].name));
+                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
             }
@@ -1909,7 +1937,7 @@ namespace wolvrix::lib::grhsim
             // eventFree writes enter every round and converge via cell change
             // detection (plan §123).
             const std::string guard = actGuard(op);
-            const auto dataNext = model_.text(activeStore_->fields[2].name);
+            const auto dataNext = model_.text(activeStore_->fields[1].name);
             // Reader activation for one actually-changed row: a static-row reader
             // fires only on an exact address overlap; a dynamic-row reader fires
             // on any change (plan §132-135). A statically known write row folds
@@ -2080,7 +2108,7 @@ namespace wolvrix::lib::grhsim
             const std::string guard = actGuard(op);
             (void)current; // state fanout always queues into dataActiveFlagNext
             const auto activateState = [&] {
-                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[2].name));
+                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
             };
             const auto writeCell = [&](const std::string &rowText, std::optional<uint64_t> constRow,
@@ -2821,6 +2849,7 @@ namespace wolvrix::lib::grhsim
         void SixPhaseEmitter::header(std::ostream &out) const
         {
             out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
+            if (waveform_) out << "#include <memory>\n";
             // Optional perf/waveform build knobs (XS difftest hooks): default
             // off; counters are only compiled in a WOLVRIX_GRHSIM_PERF build.
             out << "#ifndef WOLVRIX_GRHSIM_PERF\n#define WOLVRIX_GRHSIM_PERF 0\n#endif\n"
@@ -2992,18 +3021,41 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             for (const auto &input : model_.inputs()) out << cppType(model_.types()[input.type.index - 1]) << ' ' << identifier(model_.text(input.name)) << "{};\n";
             for (const auto &output : model_.outputs()) out << cppType(model_.types()[output.type.index - 1]) << ' ' << identifier(model_.text(output.name)) << "{};\n";
             out << "\n" << class_ << "()=default;\nvoid init();\nvoid eval();\nvoid dumpState(std::FILE *stream) const;\n"
-                << "void set_runtime_profile_enabled(bool){}\nvoid dump_runtime_profile() const {}\n"
-                << "void configure_waveform(bool enabled){configure_waveform(enabled,\"grhsim.fst\");}\n"
-                << "void configure_waveform(bool enabled,const char *path){(void)path;\n"
-                << "#if WOLVRIX_GRHSIM_WAVEFORM\n"
-                << "if(enabled){static bool cpu_wave_warned=false;if(!cpu_wave_warned){cpu_wave_warned=true;std::fprintf(stderr,\"[grhsim] waveform capture is not implemented in the six-phase model\\n\");}}\n"
-                << "#else\n(void)enabled;\n#endif\n"
-                << "}\n";
+                << "void set_runtime_profile_enabled(bool){}\nvoid dump_runtime_profile() const {}\n";
+            if (waveform_)
+                out << "void configure_waveform(bool enabled){configure_waveform(enabled,\"grhsim.fst\");}\n"
+                    << "void configure_waveform(bool enabled,const char *path);\n"
+                    << "[[nodiscard]] bool waveform_enabled() const{return waveform_enabled_;}\n";
+            else
+                out << "void configure_waveform(bool enabled){configure_waveform(enabled,\"grhsim.fst\");}\n"
+                    << "void configure_waveform(bool enabled,const char *path){(void)path;\n"
+                    << "#if WOLVRIX_GRHSIM_WAVEFORM\n"
+                    << "if(enabled){static bool cpu_wave_warned=false;if(!cpu_wave_warned){cpu_wave_warned=true;std::fprintf(stderr,\"[grhsim] waveform capture was not enabled at emit time (--waveform declared-symbols)\\n\");}}\n"
+                    << "#else\n(void)enabled;\n#endif\n"
+                    << "}\n";
             out << "#if WOLVRIX_GRHSIM_PERF\n"
                 << "struct PerfCounters{std::uint64_t evalCount=0,round1Count=0,round2Count=0,totalRoundCount=0,"
                 << "computeBatchExecCount=0,commitBatchExecCount=0,touchedStateShadowCount=0,touchedWriteCount=0;};\n"
                 << "PerfCounters perf_counters() const{return perf_;}\n#endif\n";
             out << "private:\n";
+            if (waveform_)
+            {
+                out << "struct WaveEntry{const void *ptr;std::uint32_t bytes;std::uint32_t width;std::uint32_t prevOff;};\n"
+                    << "bool waveform_enabled_=false,waveform_initialized_=false;\n"
+                    << "std::uint64_t waveform_time_=0;\n"
+                    << "std::string waveform_path_;\n"
+                    << "std::unique_ptr<grhsim_fst_writer> waveform_writer_;\n"
+                    << "std::vector<fstHandle> waveform_handles_;\n"
+                    << "std::vector<WaveEntry> wave_entries_;\n"
+                    << "std::array<std::uint64_t," << std::max<uint64_t>(wavePrevWords_, 1) << "> waveform_prev_{};\n"
+                    << "void wave_add(grhsim_fst_writer &cpu_w,const char *cpu_name,std::uint32_t cpu_width,"
+                    << "const void *cpu_ptr,std::uint32_t cpu_bytes,std::uint32_t cpu_prev){\n"
+                    << "waveform_handles_.push_back(cpu_w.register_logic(cpu_name,cpu_width));\n"
+                    << "wave_entries_.push_back({cpu_ptr,cpu_bytes,cpu_width,cpu_prev});}\n"
+                    << "void ensure_waveform_open();\nvoid dump_waveform();\n";
+                for (uint32_t chunk = 0; chunk < waveChunkCount(); ++chunk)
+                    out << "void wave_setup_" << chunk << "(grhsim_fst_writer &);\n";
+            }
             out << "#if WOLVRIX_GRHSIM_PERF\nPerfCounters perf_{};\n#endif\n";
             if (hasSystemTasks_)
                 out << "bool cpu_first_eval=true;\nstd::array<bool," << onceTasks_.size() << "> cpu_system_done{};\n"
@@ -3186,6 +3238,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             pOutputBody(out);
             evalBody(out);
             dumpStateBody(out);
+            if (waveform_) waveformGlue(out);
             systemTaskDriver(out);
         }
         void SixPhaseEmitter::supernodeBody(std::ostream &out, uint32_t ordinal) const
@@ -3289,19 +3342,32 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         }
         void SixPhaseEmitter::scanRange(std::ostream &out, uint32_t begin, uint32_t end) const
         {
-            const auto eventActive = model_.text(activeStore_->fields[0].name);
-            const auto dataActive = model_.text(activeStore_->fields[1].name);
+            // V2 (M2) firing rules by supernode category: a non-sink
+            // supernode fires on dataActiveFlag (cleared on fire); a sink
+            // event cluster fires on its eventActStore signature (the
+            // signature IS the gate — no flag involved); a sink escape
+            // supernode fires unconditionally every round.
+            const auto dataActive = model_.text(activeStore_->fields[0].name);
             for (uint32_t ordinal = begin; ordinal < end; ++ordinal)
             {
-                if (eventGated_[ordinal])
-                    out << "if(" << eventActive << '[' << ordinal << "]&&" << dataActive << '[' << ordinal << "]){"
-                        << eventActive << '[' << ordinal << "]=0;" << dataActive << '[' << ordinal << "]=0;\n"
+                const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+                switch (*attrs.supernodeCategory)
+                {
+                case CpuSupernodeCategory::SinkEscape:
+                    out << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
+                        << supernodeName(ordinal) << "();\n";
+                    break;
+                case CpuSupernodeCategory::SinkEvent:
+                    out << "if(" << actBitsGuard(*attrs.eventActs) << "){\n"
                         << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
                         << supernodeName(ordinal) << "();\n}\n";
-                else
+                    break;
+                case CpuSupernodeCategory::NonSink:
                     out << "if(" << dataActive << '[' << ordinal << "]){" << dataActive << '[' << ordinal << "]=0;\n"
                         << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
                         << supernodeName(ordinal) << "();\n}\n";
+                    break;
+                }
             }
         }
         void SixPhaseEmitter::scanChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
@@ -3427,7 +3493,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             // Load changed input ports into their boundary fields and flag the
             // input.read fanout. Pure-event inputs carry no inputFanout row, so
             // their write lands without raising dataActiveFlag (spec §3.3).
-            const auto dataActive = model_.text(activeStore_->fields[1].name);
+            const auto dataActive = model_.text(activeStore_->fields[0].name);
             out << "void " << class_ << "::pInput(){\n";
             for (const auto ordinal : randomSupernodes_) out << dataActive << '[' << ordinal << "]=1;\n";
             for (const auto &input : model_.inputs())
@@ -3444,9 +3510,8 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         }
         void SixPhaseEmitter::pEventBody(std::ostream &out) const
         {
-            const auto eventActive = model_.text(activeStore_->fields[0].name);
             out << "void " << class_ << "::pEvent(){\n"
-                << "eventActStore.fill(0);\n" << eventActive << ".fill(0);\n";
+                << "eventActStore.fill(0);\n";
             // M5d-7: the cone+edgeDet op list runs in the pEvent_c<k> chunk
             // members (EventFrame spills cross-chunk locals).
             if (!eventFrame_.empty()) out << "EventFrame cpu_f{};\n";
@@ -3472,8 +3537,8 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         }
         void SixPhaseEmitter::pPublishBody(std::ostream &out) const
         {
-            const auto dataActive = model_.text(activeStore_->fields[1].name);
-            const auto dataNext = model_.text(activeStore_->fields[2].name);
+            const auto dataActive = model_.text(activeStore_->fields[0].name);
+            const auto dataNext = model_.text(activeStore_->fields[1].name);
             out << "bool " << class_ << "::pPublish(){\n"
                 << "GRHSIM_PERF_COUNT(commitBatchExecCount);\n"
                 << "bool cpu_fixed=true;\nfor(std::size_t cpu_i=0;cpu_i<" << dataNext << ".size();++cpu_i)if(" << dataNext << "[cpu_i]){cpu_fixed=false;break;}\n"
@@ -3510,12 +3575,17 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 << "}\n"
                 << "if(!cpu_converged)throw std::runtime_error(\"CPU model did not converge\");\n"
                 << "pOutput();\n";
+            if (waveform_)
+                out << "// FST: one record per eval at the eval boundary (difftest waveform_tick is a no-op).\n"
+                    << "if(waveform_enabled_)dump_waveform();\n";
             if (hasSystemTasks_) out << "cpu_first_eval=false;\n";
             out << "}\n";
         }
         void SixPhaseEmitter::initGlue(std::ostream &out) const
         {
             out << "void " << class_ << "::init(){\n";
+            if (waveform_)
+                out << "waveform_initialized_=false;waveform_time_=0;waveform_prev_.fill(0);\n";
             for (const auto &input : model_.inputs())
                 out << "this->" << identifier(model_.text(input.name)) << '=' << cppType(model_.types()[input.type.index - 1]) << "{};\n";
             for (const auto &output : model_.outputs())
@@ -3538,10 +3608,13 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             resetStore("boundaryValueStore", "BoundaryValueStore", *boundaryStore_);
             resetStore("prevEventStore", "PrevEventStore", *prevEventStore_);
             out << "eventActStore.fill(0);\ntimeslotTriggerFlag.fill(0);\n";
-            const auto eventActive = model_.text(activeStore_->fields[0].name);
-            const auto dataActive = model_.text(activeStore_->fields[1].name);
-            const auto dataNext = model_.text(activeStore_->fields[2].name);
-            out << eventActive << ".fill(0);\n" << dataActive << ".fill(1);\n" << dataNext << ".fill(0);\n"
+            const auto dataActive = model_.text(activeStore_->fields[0].name);
+            const auto dataNext = model_.text(activeStore_->fields[1].name);
+            // V2 (M2): the fill(1) also sets the sink ordinals, which no call
+            // site ever reads (SinkEvent gates on its signature, SinkEscape
+            // fires anyway) — clearing them one by one would just bloat init
+            // on large models, so the stale bits stay (harmless, unread).
+            out << dataActive << ".fill(1);\n" << dataNext << ".fill(0);\n"
                 << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
             if (!randomFunctions_.empty()) out << "cpu_random_values.fill(0);\ncpu_random_sampled.fill(false);\n";
             // M5d-7: the init stream (steps, constant-boundary preloads,
@@ -3562,6 +3635,161 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             out << "std::fprintf(stream,\"" << store << '.' << model_.text(field.name) << "=\");" << prefix_
                 << "_dump::grhsim_dump_value(stream,"
                 << store << '.' << model_.text(field.name) << ");std::fputc('\\n',stream);\n";
+        }
+        void SixPhaseEmitter::collectWaveformSignals()
+        {
+            // Shape rule: a declared symbol is dumpable when its port/state/
+            // value reads back as flat two-state logic — scalars of any width
+            // (wide scalars are u64 word arrays in the layout), Reals (dumped
+            // as their 64-bit pattern) and unpacked arrays with gap-free
+            // element storage (element width 8/16/32/64). Strings, four-state
+            // values and fields over kWaveMaxBytes (memory-like arrays, which
+            // dumpState hashes for the same reason) are skipped, as are
+            // symbols whose value was folded into a supernode-local.
+            constexpr uint64_t kWaveMaxBytes = 512;
+            const auto shape = [&](const Type &type) -> std::optional<std::pair<uint32_t, uint64_t>> {
+                switch (type.kind)
+                {
+                case TypeKind::Logic:
+                    if (type.domain == LogicDomain::FourState) return std::nullopt;
+                    return std::pair{std::max(type.width, 1u), storageBytes(type)};
+                case TypeKind::Real: return std::pair{64u, uint64_t(8)};
+                case TypeKind::Array:
+                {
+                    const auto &element = model_.types()[type.elementType.index - 1];
+                    if (element.kind != TypeKind::Logic || element.domain == LogicDomain::FourState)
+                        return std::nullopt;
+                    switch (element.width)
+                    {
+                    case 8:
+                    case 16:
+                    case 32:
+                    case 64: break;
+                    default: return std::nullopt;
+                    }
+                    const uint64_t bytes = storageBytes(type);
+                    if (bytes > kWaveMaxBytes) return std::nullopt;
+                    return std::pair{static_cast<uint32_t>(element.width * type.count), bytes};
+                }
+                default: return std::nullopt;
+                }
+            };
+            std::unordered_map<std::string_view, StateId> stateByName;
+            for (const auto &state : model_.states()) stateByName.try_emplace(model_.text(state.name), state.id);
+            std::unordered_map<std::string_view, ValueId> valueByName;
+            for (const auto &value : model_.values())
+                if (value.name.valid()) valueByName.try_emplace(model_.text(value.name), value.id);
+            std::unordered_map<std::string_view, TypeId> portTypes;
+            for (const auto &input : model_.inputs()) portTypes.try_emplace(model_.text(input.name), input.type);
+            for (const auto &output : model_.outputs()) portTypes.try_emplace(model_.text(output.name), output.type);
+            std::unordered_set<std::string_view> seen;
+            seen.reserve(model_.declaredSymbols().size());
+            uint64_t prevWords = 0;
+            for (const auto symbolId : model_.declaredSymbols())
+            {
+                const std::string_view symbol = model_.text(symbolId);
+                if (symbol.empty() || !seen.insert(symbol).second) continue;
+                WaveSignal signal;
+                signal.name = symbol;
+                const Type *objectType = nullptr;
+                if (const auto it = portTypes.find(symbol); it != portTypes.end())
+                {
+                    objectType = &model_.types()[it->second.index - 1];
+                    signal.ref = "this->" + identifier(symbol);
+                }
+                else if (const auto it = stateByName.find(symbol); it != stateByName.end())
+                {
+                    const StateId state = it->second;
+                    const auto *field = state.index < regFieldByState_.size() ? regFieldByState_[state.index] : nullptr;
+                    if (!field) continue; // mem-class state (memory contents stay out of the FST)
+                    objectType = &stateType(state);
+                    signal.ref = "regLatchStore." + std::string(model_.text(field->name));
+                }
+                else if (const auto it = valueByName.find(symbol); it != valueByName.end())
+                {
+                    const ValueId value = it->second;
+                    const auto *field = value.index < boundaryByValue_.size() ? boundaryByValue_[value.index] : nullptr;
+                    if (!field) continue; // folded into a supernode-local value
+                    objectType = &type(value);
+                    signal.ref = "boundaryValueStore." + std::string(model_.text(field->name));
+                }
+                else
+                    continue; // no live object (optimized-away wire)
+                const auto signalShape = shape(*objectType);
+                if (!signalShape) continue;
+                signal.width = signalShape->first;
+                signal.bytes = signalShape->second;
+                signal.prevOff = static_cast<uint32_t>(prevWords);
+                prevWords += std::max<uint64_t>(1, (signal.bytes + 7) / 8);
+                waveSignals_.push_back(std::move(signal));
+            }
+            wavePrevWords_ = prevWords;
+        }
+        void SixPhaseEmitter::waveSetupFile(std::ostream &out, uint32_t fileIndex) const
+        {
+            out << "#include \"" << prefix_ << ".hpp\"\n";
+            const uint32_t firstChunk = fileIndex * kWaveChunksPerFile;
+            const uint32_t lastChunk = std::min(firstChunk + kWaveChunksPerFile, waveChunkCount());
+            for (uint32_t chunk = firstChunk; chunk < lastChunk; ++chunk)
+            {
+                out << "void " << class_ << "::wave_setup_" << chunk << "(grhsim_fst_writer &cpu_w){\n";
+                const uint64_t begin = uint64_t(chunk) * kWaveSignalsPerChunk;
+                const uint64_t end = std::min<uint64_t>(begin + kWaveSignalsPerChunk, waveSignals_.size());
+                for (uint64_t i = begin; i < end; ++i)
+                {
+                    const auto &signal = waveSignals_[i];
+                    out << "wave_add(cpu_w,\"" << escapeWaveName(signal.name) << "\"," << signal.width << ",&" << signal.ref
+                        << ",static_cast<std::uint32_t>(sizeof(" << signal.ref << "))," << signal.prevOff << ");\n";
+                }
+                out << "}\n";
+            }
+        }
+        void SixPhaseEmitter::waveformGlue(std::ostream &out) const
+        {
+            out << "void " << class_ << "::configure_waveform(bool enabled,const char *path){\n"
+                << "if(path&&path[0])waveform_path_=path;\n"
+                << "waveform_enabled_=enabled;\n"
+                << "if(!waveform_enabled_){\n"
+                << "if(waveform_writer_){waveform_writer_->close();waveform_writer_.reset();}\n"
+                << "waveform_handles_.clear();wave_entries_.clear();waveform_initialized_=false;}\n"
+                << "}\n";
+            out << "void " << class_ << "::ensure_waveform_open(){\n"
+                << "if(!waveform_enabled_||waveform_writer_)return;\n"
+                << "auto cpu_w=std::make_unique<grhsim_fst_writer>();\n"
+                << "const char *cpu_path=waveform_path_.empty()?\"grhsim.fst\":waveform_path_.c_str();\n"
+                << "if(!cpu_w->open(cpu_path,\"" << identifier(model_.text(model_.name())) << "\"))return;\n"
+                << "waveform_handles_.reserve(" << waveSignals_.size() << ");wave_entries_.reserve(" << waveSignals_.size()
+                << ");\n";
+            for (uint32_t chunk = 0; chunk < waveChunkCount(); ++chunk) out << "wave_setup_" << chunk << "(*cpu_w);\n";
+            out << "waveform_writer_=std::move(cpu_w);\n}\n";
+            out << "void " << class_ << "::dump_waveform(){\n"
+                << "ensure_waveform_open();\n"
+                << "if(!waveform_writer_)return;\n"
+                << "const bool cpu_force=!waveform_initialized_;\n"
+                << "waveform_writer_->emit_time(waveform_time_++);\n"
+                << "for(std::size_t cpu_i=0;cpu_i<wave_entries_.size();++cpu_i){\n"
+                << "const WaveEntry &cpu_e=wave_entries_[cpu_i];\n"
+                << "std::uint64_t *cpu_prev=&waveform_prev_[cpu_e.prevOff];\n"
+                << "if(!cpu_force&&!std::memcmp(cpu_prev,cpu_e.ptr,cpu_e.bytes))continue;\n"
+                << "std::memcpy(cpu_prev,cpu_e.ptr,cpu_e.bytes);\n"
+                << "if(cpu_e.bytes<=8){std::uint64_t cpu_v=0;std::memcpy(&cpu_v,cpu_e.ptr,cpu_e.bytes);\n"
+                << "waveform_writer_->emit_logic_u64(waveform_handles_[cpu_i],cpu_e.width,cpu_v);}\n"
+                << "else waveform_writer_->emit_logic_words(waveform_handles_[cpu_i],cpu_e.width,"
+                << "reinterpret_cast<const std::uint64_t*>(cpu_e.ptr));\n"
+                << "}\n"
+                << "waveform_initialized_=true;\n"
+                << "}\n";
+        }
+        std::string SixPhaseEmitter::escapeWaveName(std::string_view name)
+        {
+            std::string result;
+            result.reserve(name.size());
+            for (const char c : name)
+            {
+                if (c == '\\' || c == '"') result += '\\';
+                result += c;
+            }
+            return result;
         }
         void SixPhaseEmitter::systemTaskDriver(std::ostream &out) const
         {
@@ -3622,7 +3850,7 @@ if(terminal){
                 if (!out) throw std::runtime_error("cannot write CPU artifact: " + path.string());
                 artifacts.push_back(path.string());
             };
-            file(prefix_ + "_runtime.hpp", [&](auto &out) { emit::writeGrhSimRuntime(out, {.systemTasks = hasSystemTasks_}); });
+            file(prefix_ + "_runtime.hpp", [&](auto &out) { emit::writeGrhSimRuntime(out, {.waveform = waveform_, .systemTasks = hasSystemTasks_}); });
             file(prefix_ + ".hpp", [&](auto &out) { header(out); });
             // M5d-7: one .cpp per planned translation unit; the generated
             // Makefile lists them all, so `make -j` compiles the units in
@@ -3633,12 +3861,36 @@ if(terminal){
                 sources.push_back(source);
                 file(source, [&](auto &out) { unitCpp(out, unit); });
             }
+            // Waveform setup tables live outside the C8 TU plan (the plan is
+            // emit-option independent): one extra .cpp per kWaveChunksPerFile
+            // setup chunks.
+            if (waveform_)
+            {
+                const uint32_t fileCount = (waveChunkCount() + kWaveChunksPerFile - 1) / kWaveChunksPerFile;
+                for (uint32_t fileIndex = 0; fileIndex < fileCount; ++fileIndex)
+                {
+                    const auto source = prefix_ + "_wave_" + std::to_string(fileIndex) + ".cpp";
+                    sources.push_back(source);
+                    file(source, [&](auto &out) { waveSetupFile(out, fileIndex); });
+                }
+            }
             file("Makefile", [&](auto &out) {
-                out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\nSOURCES :=";
+                out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\n";
+                if (waveform_)
+                    out << "CC ?= cc\nCFLAGS ?= -O2 -D_GNU_SOURCE\nLIBFST_SRC_DIR := " << libfstSourceDir() << '\n';
+                out << "SOURCES :=";
                 for (const auto &source : sources) out << ' ' << source;
-                out << "\nOBJECTS := $(SOURCES:.cpp=.o)\nLIB := lib" << prefix_ << ".a\nall: $(LIB)\n"
-                    << "$(LIB): $(OBJECTS)\n\t$(AR) rcs $@ $^\n%.o: %.cpp " << prefix_ << ".hpp " << prefix_
-                    << "_runtime.hpp\n\t$(CXX) $(CXXFLAGS) -c $< -o $@\n.PHONY: all\n";
+                out << "\nOBJECTS := $(SOURCES:.cpp=.o)\n";
+                if (waveform_) out << "FST_OBJECTS := fstapi.o fastlz.o lz4.o\n";
+                out << "LIB := lib" << prefix_ << ".a\nall: $(LIB)\n"
+                    << "$(LIB): $(OBJECTS)" << (waveform_ ? " $(FST_OBJECTS)" : "") << "\n\t$(AR) rcs $@ $^\n"
+                    << "%.o: %.cpp " << prefix_ << ".hpp " << prefix_ << "_runtime.hpp\n"
+                    << "\t$(CXX) $(CXXFLAGS)" << (waveform_ ? " -I$(LIBFST_SRC_DIR)" : "") << " -c $< -o $@\n";
+                if (waveform_)
+                    for (const char *unit : {"fstapi", "fastlz", "lz4"})
+                        out << unit << ".o: $(LIBFST_SRC_DIR)/" << unit << ".c\n"
+                            << "\t$(CC) $(CFLAGS) -I$(LIBFST_SRC_DIR) -c $< -o $@\n";
+                out << ".PHONY: all\n";
             });
             return {true, false, std::move(artifacts)};
         }
@@ -3646,21 +3898,20 @@ if(terminal){
         class EmitPhaseCppPass final : public Pass
         {
         public:
-            explicit EmitPhaseCppPass(std::filesystem::path path, std::vector<std::string> optionNotes)
-                : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), optionNotes_(std::move(optionNotes)) {}
+            explicit EmitPhaseCppPass(std::filesystem::path path, bool waveform)
+                : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), waveform_(waveform) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
-                for (const auto &note : optionNotes_) diagnostics.info(note, "cpu.st.emit-cpp");
-                return emitSixPhaseCpuCpp(model, path_, diagnostics);
+                return emitSixPhaseCpuCpp(model, path_, diagnostics, waveform_);
             }
         private:
             std::filesystem::path path_;
-            std::vector<std::string> optionNotes_;
+            bool waveform_ = false;
         };
     }
 
     PassResult emitSixPhaseCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory,
-                                  wolvrix::lib::diag::Diagnostics &diagnostics)
+                                  wolvrix::lib::diag::Diagnostics &diagnostics, bool waveform)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         const auto *mapping = model.cpuMapping();
@@ -3675,9 +3926,17 @@ if(terminal){
             diagnostics.error("CPU six-phase emit requires the named-store layout and phase schedule", "cpu.st.emit-cpp");
             return {false, false, {}};
         }
+#if !WOLVRIX_HAVE_LIBFST
+        if (waveform)
+        {
+            diagnostics.error("waveform emission requested, but wolvrix was built without libfst support",
+                              "cpu.st.emit-cpp");
+            return {false, false, {}};
+        }
+#endif
         try
         {
-            SixPhaseEmitter emitter(model);
+            SixPhaseEmitter emitter(model, waveform);
             emitter.validate();
             return emitter.write(directory);
         }
@@ -3694,7 +3953,7 @@ if(terminal){
                     "expected --output <empty-directory> [--waveform <off|declared-symbols>] [--perf <off|eval>]";
                 if (args.empty() || args.size() % 2) { error = std::string(usage); return {}; }
                 std::filesystem::path output;
-                std::vector<std::string> optionNotes;
+                bool waveform = false;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     const auto key = args[i];
@@ -3702,18 +3961,16 @@ if(terminal){
                     if (key == "--output" && output.empty() && !value.empty()) { output = value; continue; }
                     if (key == "--waveform" && (value == "off" || value == "declared-symbols"))
                     {
-                        if (value != "off") optionNotes.emplace_back("waveform capture is not implemented in the six-phase emitter");
+                        waveform = value == "declared-symbols";
                         continue;
                     }
-                    if (key == "--perf" && (value == "off" || value == "eval"))
-                    {
-                        if (value != "off") optionNotes.emplace_back("performance counters are controlled by WOLVRIX_GRHSIM_PERF at model build time");
-                        continue;
-                    }
+                    // Counters are compiled in by WOLVRIX_GRHSIM_PERF at model
+                    // build time; the option is accepted for CLI compatibility.
+                    if (key == "--perf" && (value == "off" || value == "eval")) continue;
                     error = std::string(usage); return {};
                 }
                 if (output.empty()) { error = std::string(usage); return {}; }
-                return std::make_unique<EmitPhaseCppPass>(std::move(output), std::move(optionNotes));
+                return std::make_unique<EmitPhaseCppPass>(std::move(output), waveform);
             }, error)) throw std::logic_error(error);
     }
 }

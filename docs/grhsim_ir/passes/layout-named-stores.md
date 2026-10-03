@@ -43,8 +43,10 @@ The stores, in fixed `CpuNamedStoreKind` order:
 6. `timeslotTrigger` — one Bool byte per event-carrying timeslot task
    (Output-phase `core.system.task` with a `timeslotFlag` parameter),
    offset = aux = flag index, named after the task's `name` parameter.
-7. `activeFlags` — the `eventActiveFlag` / `dataActiveFlag` /
-   `dataActiveFlagNext` byte arrays, each `Array(UInt8, max(N,1))` with N =
+7. `activeFlags` — the `dataActiveFlag` / `dataActiveFlagNext` byte arrays
+   (V2-M2 removed `eventActiveFlag`: non-sink supernodes fire on
+   `dataActiveFlag` alone, sink supernodes gate on their eventActStore
+   signature or fire unconditionally), each `Array(UInt8, max(N,1))` with N =
    the General supernode count; aux carries N (byte index == the supernode
    ordinal fixed by C2, see
    [merge-general-supernodes](merge-general-supernodes.md)).

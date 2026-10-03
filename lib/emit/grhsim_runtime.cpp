@@ -81,10 +81,14 @@ namespace wolvrix::lib::emit
                 *stream << "    {\n";
                 *stream << "        fstWriterEmitValueChange64(ctx_, handle, width == 0 ? 1u : width, value);\n";
                 *stream << "    }\n";
+                *stream << "    void emit_logic_words(fstHandle handle, std::uint32_t width, const std::uint64_t *words)\n";
+                *stream << "    {\n";
+                *stream << "        fstWriterEmitValueChangeVec64(ctx_, handle, width == 0 ? 1u : width, words);\n";
+                *stream << "    }\n";
                 *stream << "    template <std::size_t N>\n";
                 *stream << "    void emit_logic_words(fstHandle handle, std::uint32_t width, const std::array<std::uint64_t, N> &value)\n";
                 *stream << "    {\n";
-                *stream << "        fstWriterEmitValueChangeVec64(ctx_, handle, width == 0 ? 1u : width, value.data());\n";
+                *stream << "        emit_logic_words(handle, width, value.data());\n";
                 *stream << "    }\n";
                 *stream << "    void emit_real(fstHandle handle, double value)\n";
                 *stream << "    {\n";

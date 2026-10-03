@@ -366,7 +366,7 @@ B8 封板后，CPU 后端只运行**一次最终 mapping**（C 段），单向�
 | C1 | `cpu.st.build-general-nodes` | 从零初始化 mapping：四平铺分枝 + General node（锥吸收） |
 | C2 | `cpu.st.merge-general-supernodes` | General 超节点；序号 = 分枝子节点顺序，就此固定 |
 | C3 | `cpu.st.layout-named-stores` | named-store 布局（零分类决策，只消费 A7 `storeClass`） |
-| C4 | `cpu.st.build-event-bitmaps` | (event,edge) 聚类 → 超节点位图（bit i = C2 序号 i） |
+| C4 | `cpu.st.build-event-activation-map` | event act → 含该 act 事件的**非 sink** 超节点位图（bit i = C2 序号 i；V2-M2 起 sink 超节点不再配位图） |
 | C5 | `cpu.st.build-mem-write-plan` | Mem 相写计划与 mem 类状态的读者表 |
 | C6 | `cpu.st.pack-general-functions` | EmitFunction 只记超节点序号区间（`supernodeRange`） |
 | C7 | `cpu.st.build-phase-schedule` | fanout/trigger/task；`PhaseSchedule`（complete） |

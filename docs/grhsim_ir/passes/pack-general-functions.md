@@ -43,6 +43,6 @@ root
 └─ phase Output  └─ EmitFunction { flat output ops }
 ```
 
-The `eventActs` annotations produced by
+The `eventActs` and `supernodeCategory` annotations produced by
 `cpu.st.merge-general-supernodes` stay on the supernodes. Diagnostics: the
 standard `partitions` count only.

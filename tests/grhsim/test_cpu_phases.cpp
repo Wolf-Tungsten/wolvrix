@@ -244,6 +244,32 @@ namespace
         });
     }
 
+    void requireCategory(const CpuPartition &supernode, CpuSupernodeCategory category, const char *tag)
+    {
+        require(supernode.attrs.supernodeCategory && *supernode.attrs.supernodeCategory == category,
+                std::string(tag) + ": supernode category wrong");
+    }
+
+    // V2-M1: the General branch child order lists every non-sink supernode
+    // before every sink supernode (sink boundary producers must carry a
+    // smaller ordinal).
+    void requireSinkOrder(const CpuBackendMapping &mapping, const char *tag)
+    {
+        const auto &general = branch(mapping, CpuPhase::General);
+        const auto &tree = mapping.partitionTree;
+        bool seenSink = false;
+        for (const auto child : general.children)
+        {
+            const auto &node = tree.partitions[child.index - 1];
+            if (node.attrs.kind != CpuPartitionKind::Supernode) continue;
+            require(node.attrs.supernodeCategory.has_value(),
+                    std::string(tag) + ": supernode lost its category");
+            const bool sink = *node.attrs.supernodeCategory != CpuSupernodeCategory::NonSink;
+            if (sink) seenSink = true;
+            require(sink || !seenSink, std::string(tag) + ": non-sink supernode trails a sink supernode");
+        }
+    }
+
     void requirePhases(const GrhSimModel &model)
     {
         for (const auto &op : model.operations())
@@ -271,7 +297,7 @@ namespace
     void advanceToFunctions(GrhSimModel &model)
     {
         runPass(model, "cpu.st.layout-named-stores");
-        runPass(model, "cpu.st.build-event-bitmaps");
+        runPass(model, "cpu.st.build-event-activation-map");
         runPass(model, "cpu.st.build-mem-write-plan");
         runPass(model, "cpu.st.pack-general-functions");
     }
@@ -320,8 +346,8 @@ namespace
         }
     };
 
-    // Gate case 1: two writes in the same event domain merge with their cones
-    // into a single supernode whose eventActs attr is the common set.
+    // V2-M1: two writes sharing one event signature cluster into a single
+    // sink supernode while their operand cones stay in the non-sink frame.
     void sameDomainMergeTest()
     {
         GrhSimModel model("f1_same_domain");
@@ -334,8 +360,8 @@ namespace
         const auto one = addConstant(model, bit, "1'b1");
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        addRegWrite(model, d, x, one, q1, {0});
-        addRegWrite(model, x, d, one, q2, {0});
+        const auto w1 = addRegWrite(model, d, x, one, q1, {0});
+        const auto w2 = addRegWrite(model, x, d, one, q2, {0});
         require(verifies(model), "f1: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
@@ -346,6 +372,8 @@ namespace
         const auto built = runPass(model, "cpu.st.build-general-nodes");
         require(infoValue(built, "cpu.st.build-general-nodes", "event_ops=") == std::optional<uint64_t>(2),
                 "f1: build event op count wrong");
+        require(infoValue(built, "cpu.st.build-general-nodes", "sink_nodes=") == std::optional<uint64_t>(2),
+                "f1: build sink node count wrong");
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::GeneralNodes, "f1: stage after node formation wrong");
         require(branch(mapping, CpuPhase::Event).ops.size() == 2, "f1: event branch wrong");
@@ -356,12 +384,22 @@ namespace
         runPass(model, "cpu.st.merge-general-supernodes");
         const auto &merged = *model.cpuMapping();
         const auto packs = supernodes(merged);
-        require(packs.size() == 1, "f1: same-domain writes did not merge into one supernode");
-        require(flatOps(merged, packs.front()->id).size() == 5,
-                "f1: supernode does not hold all general ops");
-        require(packs.front()->attrs.eventActs &&
-                *packs.front()->attrs.eventActs == std::vector<int64_t>{0},
-                "f1: supernode eventActs wrong");
+        require(packs.size() == 2, "f1: expected one non-sink and one sink supernode");
+        const auto *dataPack = supernodeOf(merged, producerOf(model, x));
+        const auto *sinkPack = supernodeOf(merged, w1);
+        require(dataPack && sinkPack && dataPack != sinkPack,
+                "f1: cone and writes did not split into non-sink and sink supernodes");
+        requireCategory(*dataPack, CpuSupernodeCategory::NonSink, "f1");
+        requireCategory(*sinkPack, CpuSupernodeCategory::SinkEvent, "f1");
+        require(flatOps(merged, dataPack->id).size() == 3,
+                "f1: non-sink supernode does not hold the whole cone");
+        require(containsOp(merged, *sinkPack, w2) && flatOps(merged, sinkPack->id).size() == 2,
+                "f1: same-signature writes did not cluster into one sink supernode");
+        require(sinkPack->attrs.eventActs && *sinkPack->attrs.eventActs == std::vector<int64_t>{0},
+                "f1: sink supernode signature wrong");
+        require(dataPack->attrs.eventActs && dataPack->attrs.eventActs->empty(),
+                "f1: non-sink supernode eventActs wrong");
+        requireSinkOrder(merged, "f1");
         roundTrip(model);
 
         advanceToFunctions(model);
@@ -372,13 +410,13 @@ namespace
                 branch(packed, CpuPhase::Output).children.size() == 1, "f1: flat functions missing");
         require(flatOps(packed, branch(packed, CpuPhase::Event).children.front()).size() == 2,
                 "f1: event function ops wrong");
-        require(supernodes(packed).size() == 1, "f1: packing lost the supernode");
+        require(supernodes(packed).size() == 2, "f1: packing lost a supernode");
         requirePackedGeneralBranch(packed, "f1");
         roundTrip(model);
     }
 
-    // Gate case 2: writes with subset act sets ({0} vs {0,1}) must stay in
-    // different supernodes (rule 1 forbids the merge).
+    // V2-M1: writes with subset act sets ({0} vs {0,1}) carry different
+    // canonical signatures and cluster into different sink supernodes.
     void subsetDomainBlockedTest()
     {
         TwoClockFixture fixture("f2_subset_domain");
@@ -398,25 +436,26 @@ namespace
         const auto &mapping = *model.cpuMapping();
         const auto *s1 = supernodeOf(mapping, w1);
         const auto *s2 = supernodeOf(mapping, w2);
-        require(s1 && s2 && s1 != s2, "f2: subset-domain writes merged");
+        require(s1 && s2 && s1 != s2, "f2: subset-signature writes merged");
+        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f2");
+        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f2");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
-                "f2: first supernode eventActs wrong");
+                "f2: first supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>({0, 1}),
-                "f2: second supernode eventActs wrong");
+                "f2: second supernode signature wrong");
         for (const auto *supernode : supernodes(mapping))
             require(!(containsOp(mapping, *supernode, w1) && containsOp(mapping, *supernode, w2)),
                     "f2: a supernode holds both writes");
+        requireSinkOrder(mapping, "f2");
         roundTrip(model);
         advanceToFunctions(model);
         roundTrip(model);
     }
 
-    // Gate case 3: a shared cone feeding two different event domains may not
-    // merge with either write, and the two writes may not merge with each
-    // other (rule 2 blocks the cone, rule 1 blocks the writes). The
-    // event_domain_blocked count (5) is unaffected by the removal of state
-    // write->read edges from the influence graph: this fixture contains no
-    // state.read op, so the edge sets before and after are identical.
+    // V2-M1: a shared cone feeding two different signature clusters stays in
+    // the non-sink frame (one data-driven supernode) while the writes split
+    // by signature — the cone no longer needs any merge prohibition to keep
+    // the partition legal.
     void crossDomainBlockedTest()
     {
         TwoClockFixture fixture("f3_cross_domain");
@@ -433,9 +472,7 @@ namespace
         runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
-        const auto merged = runPass(model, "cpu.st.merge-general-supernodes");
-        const auto blocked = infoValue(merged, "cpu.st.merge-general-supernodes", "event_domain_blocked=");
-        require(blocked && *blocked >= 1, "f3: event-domain prohibition never fired");
+        runPass(model, "cpu.st.merge-general-supernodes");
         const auto &mapping = *model.cpuMapping();
         const auto cone = opsOfType(model, "core.compute.not");
         require(cone.size() == 1, "f3: cone op missing");
@@ -446,22 +483,26 @@ namespace
         const auto *s2 = supernodeOf(mapping, w2);
         require(supernodes(mapping).size() == 3, "f3: expected exactly three supernodes");
         require(conePack && s1 && s2 && conePack != s1 && conePack != s2 && s1 != s2,
-                "f3: cross-domain merge happened");
+                "f3: cone or writes left their class");
+        requireCategory(*conePack, CpuSupernodeCategory::NonSink, "f3");
+        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f3");
+        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f3");
         require(conePack->attrs.eventActs && conePack->attrs.eventActs->empty(),
                 "f3: cone supernode should carry an empty eventActs");
         require(containsOp(mapping, *conePack, inputRead.back()),
                 "f3: cone supernode lost its input cone");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
-                "f3: first write supernode eventActs wrong");
+                "f3: first write supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>{1},
-                "f3: second write supernode eventActs wrong");
+                "f3: second write supernode signature wrong");
+        requireSinkOrder(mapping, "f3");
         roundTrip(model);
         advanceToFunctions(model);
         roundTrip(model);
     }
 
-    // Gate case 4: a pure combinational cluster is exempt from the event
-    // domain rules even when its downstream closure spans several domains.
+    // V2-M1: a pure combinational chain merges freely inside the non-sink
+    // frame even when its value feeds several signature clusters.
     void combExemptTest()
     {
         TwoClockFixture fixture("f4_comb_exempt");
@@ -489,30 +530,27 @@ namespace
         const auto *s1 = supernodeOf(mapping, w1);
         const auto *s2 = supernodeOf(mapping, w2);
         require(packA && packB && packA == packB, "f4: combinational chain did not merge");
+        requireCategory(*packA, CpuSupernodeCategory::NonSink, "f4");
         require(containsOp(mapping, *packA, inputRead.back()),
                 "f4: chain supernode lost the input read");
         require(packA->attrs.eventActs && packA->attrs.eventActs->empty(),
-                "f4: exempt supernode must carry an empty eventActs");
+                "f4: non-sink supernode must carry an empty eventActs");
         require(s1 && s2 && s1 != s2 && packA != s1 && packA != s2,
                 "f4: writes merged with each other or with the chain");
+        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f4");
+        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f4");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
-                "f4: first write supernode eventActs wrong");
+                "f4: first write supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>{1},
-                "f4: second write supernode eventActs wrong");
+                "f4: second write supernode signature wrong");
+        requireSinkOrder(mapping, "f4");
         roundTrip(model);
     }
 
-    // Gate case 9 (cross-domain state-read exemption): a domain {0} regWrite
-    // W1 -> Q whose Q state.read feeds, through a combinational cone, a
-    // domain {1} regWrite W2 is a legal two-domain design. State readers
-    // consume S directly and are activated by P_publish's stateFanout, so the
-    // influence graph carries no state write->read edge: W1 keeps
-    // influence == acts == {0} and the pipeline verifies. W1's and W2's
-    // supernodes must not merge — they only meet as same-predecessor-set
-    // coarsen candidates (mode 2, both preceded by the shared constant node),
-    // where rule 1 still blocks them; the shared constant's merges into
-    // either write node are blocked by rule 2 (its influence spans both
-    // domains), so the prohibition demonstrably stays active.
+    // V2-M1 (cross-domain state-read shape): a signature-{0} regWrite W1 -> Q
+    // whose Q state.read feeds, through a combinational cone, a signature-{1}
+    // regWrite W2. State readers are ordinary value-producing ops: the read
+    // cone lands in the non-sink frame while W1/W2 cluster by signature.
     void crossDomainStateReadTest()
     {
         TwoClockFixture fixture("f9_state_read_exempt");
@@ -529,30 +567,34 @@ namespace
         runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
-        const auto merged = runPass(model, "cpu.st.merge-general-supernodes");
-        const auto blocked = infoValue(merged, "cpu.st.merge-general-supernodes", "event_domain_blocked=");
-        require(blocked && *blocked >= 1, "f9: event-domain prohibition never fired");
+        runPass(model, "cpu.st.merge-general-supernodes");
         const auto &mapping = *model.cpuMapping();
         const auto *s1 = supernodeOf(mapping, w1);
         const auto *s2 = supernodeOf(mapping, w2);
         require(s1 && s2 && s1 != s2, "f9: cross-domain writes merged through the state read");
         require(supernodes(mapping).size() == 3, "f9: expected exactly three supernodes");
+        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f9");
+        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f9");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
-                "f9: first write supernode eventActs wrong");
+                "f9: first write supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>{1},
-                "f9: second write supernode eventActs wrong");
-        // The Q read cone belongs to the reading domain's supernode.
-        require(containsOp(mapping, *s2, producerOf(model, qr)) &&
-                containsOp(mapping, *s2, producerOf(model, y)),
-                "f9: state-read cone did not stay with the reading domain");
+                "f9: second write supernode signature wrong");
+        // The Q read cone lives in the non-sink frame.
+        const auto *cone = supernodeOf(mapping, producerOf(model, y));
+        require(cone && cone != s1 && cone != s2, "f9: read cone left the non-sink frame");
+        requireCategory(*cone, CpuSupernodeCategory::NonSink, "f9");
+        require(containsOp(mapping, *cone, producerOf(model, qr)),
+                "f9: state read lost from the non-sink supernode");
+        requireSinkOrder(mapping, "f9");
         roundTrip(model);
         advanceToFunctions(model);
         roundTrip(model);
     }
 
     // The four mem-write kinds split into the flat Mem branch (op-id order)
-    // while their operand cones stay on the General side; reg/latch writes
-    // merge with their exclusive cones.
+    // while their operand cones stay on the General side; the reg write
+    // (signature {0}) and the event-free latch write (escape class) each
+    // anchor their own sink supernode, cones remaining in the non-sink frame.
     void memWriteSplitTest()
     {
         GrhSimModel model("f5_mem_split");
@@ -629,15 +671,25 @@ namespace
         require(flatOps(packed, memBranch.children.front()) == memOrder,
                 "f5: mem function does not hold exactly the four writes");
         const auto *regPack = supernodeOf(packed, wr);
-        require(regPack && containsOp(packed, *regPack, producerOf(model, rc)) &&
-                containsOp(packed, *regPack, producerOf(model, rn)),
-                "f5: regWrite did not merge with its cone");
+        require(regPack && flatOps(packed, regPack->id) == std::vector<OpId>{wr},
+                "f5: regWrite sink cluster must hold the write alone");
+        requireCategory(*regPack, CpuSupernodeCategory::SinkEvent, "f5");
         require(regPack->attrs.eventActs && *regPack->attrs.eventActs == std::vector<int64_t>{0},
-                "f5: regWrite supernode eventActs wrong");
+                "f5: regWrite supernode signature wrong");
         const auto *latchPack = supernodeOf(packed, wl);
-        require(latchPack && containsOp(packed, *latchPack, producerOf(model, lc)) &&
-                containsOp(packed, *latchPack, producerOf(model, ln)),
-                "f5: latchWrite did not merge with its cone");
+        require(latchPack && flatOps(packed, latchPack->id) == std::vector<OpId>{wl},
+                "f5: latchWrite sink cluster must hold the write alone");
+        requireCategory(*latchPack, CpuSupernodeCategory::SinkEscape, "f5");
+        require(latchPack->attrs.eventActs && latchPack->attrs.eventActs->empty(),
+                "f5: escape sink supernode must carry an empty signature");
+        // The write cones live in the non-sink frame.
+        const auto *conePack = supernodeOf(packed, producerOf(model, rc));
+        require(conePack && containsOp(packed, *conePack, producerOf(model, rn)) &&
+                containsOp(packed, *conePack, producerOf(model, lc)) &&
+                containsOp(packed, *conePack, producerOf(model, ln)),
+                "f5: write cones left the non-sink frame");
+        requireCategory(*conePack, CpuSupernodeCategory::NonSink, "f5");
+        requireSinkOrder(packed, "f5");
         for (auto coneValue : {mwC, mwD, mfC, maC, ms1, ms2, ms3, ms4})
             require(supernodeOf(packed, producerOf(model, coneValue)),
                     "f5: mem operand cone left the general branch");
@@ -717,7 +769,12 @@ namespace
         const auto &merged = *model.cpuMapping();
         require(merged.stage == CpuMappingStage::GeneralSupernodes, "f6: supernode stage wrong");
         for (const auto *supernode : supernodes(merged))
+        {
             require(supernode->attrs.eventActs.has_value(), "f6: supernode lost its eventActs annotation");
+            require(supernode->attrs.supernodeCategory.has_value(),
+                    "f6: supernode lost its category annotation");
+        }
+        requireSinkOrder(merged, "f6");
         roundTrip(model);
 
         advanceToFunctions(model);
@@ -788,51 +845,35 @@ namespace
             if (partition.attrs.eventActs && *partition.attrs.eventActs == std::vector<int64_t>{0})
             { partition.attrs.eventActs = std::vector<int64_t>{1}; break; }
         reject(bad);
-        // (b) rule 2 violation with a consistent attr: the write-feeding cone
-        // node moved into a write's supernode; the attr still matches the op
-        // scan and uniformity holds, but the downstream closure reaches the
-        // other domain. Uses an F4-style model so the donor supernode keeps
-        // its remaining nodes.
+        // (b) classification invariant: a value-producing node moved into a
+        // sink supernode (inserted at the children front so the value order
+        // stays legal — the rejection must come from the category checks,
+        // not from the order check).
         {
-            TwoClockFixture f4("f7_rule2");
-            auto &m4 = f4.model;
-            const auto a4 = addNot(m4, f4.d, "a");
-            const auto b4 = addNot(m4, a4, "b");
-            const auto q41 = addState(m4, "q1", bit, "1'b0");
-            const auto q42 = addState(m4, "q2", bit, "1'b0");
-            addRegWrite(m4, f4.one, b4, f4.one, q41, {0});
-            addRegWrite(m4, f4.one, b4, f4.one, q42, {1});
-            runPass(m4, "grhsim.select-state-stores");
-            runPass(m4, "grhsim.split-phases");
-            const std::array<std::string_view, 2> singleNode{"--max-op-in-compute-node", "1"};
-            runPass(m4, "cpu.st.build-general-nodes", singleNode);
-            runPass(m4, "cpu.st.merge-general-supernodes");
-            auto corrupt = *m4.cpuMapping();
-            const auto bOp = producerOf(m4, b4);
-            PartitionId bNode, donor;
+            auto corrupt = mergedMapping;
+            const auto one2Op = producerOf(model, one2);
+            PartitionId coneNode, donor, target;
             for (const auto &partition : corrupt.partitionTree.partitions)
             {
                 if (partition.attrs.kind != CpuPartitionKind::Node) continue;
-                if (std::find(partition.ops.begin(), partition.ops.end(), bOp) != partition.ops.end())
-                { bNode = partition.id; donor = partition.parent; }
+                if (std::find(partition.ops.begin(), partition.ops.end(), one2Op) != partition.ops.end())
+                { coneNode = partition.id; donor = partition.parent; }
             }
-            require(bNode && donor, "f7: cone node missing for corruption");
-            PartitionId target;
-            for (const auto &partition : corrupt.partitionTree.partitions)
-                if (partition.attrs.kind == CpuPartitionKind::Supernode && partition.attrs.eventActs &&
-                    *partition.attrs.eventActs == std::vector<int64_t>{0})
-                    target = partition.id;
-            require(bool(target), "f7: write supernode missing for corruption");
+            require(coneNode && donor, "f7: cone node missing for corruption");
+            const auto *w1Supernode = supernodeOf(corrupt, w1);
+            require(bool(w1Supernode), "f7: write supernode missing for corruption");
+            target = w1Supernode->id;
             auto &donorChildren = corrupt.partitionTree.partitions[donor.index - 1].children;
-            donorChildren.erase(std::find(donorChildren.begin(), donorChildren.end(), bNode));
+            donorChildren.erase(std::find(donorChildren.begin(), donorChildren.end(), coneNode));
             require(!donorChildren.empty(), "f7: donor supernode would be empty");
-            corrupt.partitionTree.partitions[target.index - 1].children.push_back(bNode);
-            corrupt.partitionTree.partitions[bNode.index - 1].parent = target;
-            auto broken = m4.clone();
+            auto &targetChildren = corrupt.partitionTree.partitions[target.index - 1].children;
+            targetChildren.insert(targetChildren.begin(), coneNode);
+            corrupt.partitionTree.partitions[coneNode.index - 1].parent = target;
+            auto broken = model.clone();
             broken.setCpuMapping(std::move(corrupt));
             diag::Diagnostics diagnostics;
             require(!verifyGrhSimModel(broken, defaultDialectRegistry(), diagnostics) &&
-                    diagnostics.hasError(), "f7: verifier accepted a rule-2 event domain violation");
+                    diagnostics.hasError(), "f7: verifier accepted a value-producing op in a sink supernode");
         }
         // (c) coverage hole: a flat-branch op dropped from the mapping.
         bad = splitMapping;
@@ -856,6 +897,19 @@ namespace
         for (auto &partition : bad.partitionTree.partitions)
             if (partition.attrs.kind == CpuPartitionKind::Supernode && partition.attrs.eventActs)
             { partition.attrs.eventActs.reset(); break; }
+        reject(bad);
+        // (f) a General supernode missing its category annotation.
+        bad = mergedMapping;
+        for (auto &partition : bad.partitionTree.partitions)
+            if (partition.attrs.kind == CpuPartitionKind::Supernode && partition.attrs.supernodeCategory)
+            { partition.attrs.supernodeCategory.reset(); break; }
+        reject(bad);
+        // (g) a sink supernode whose category is tampered to non-sink.
+        bad = mergedMapping;
+        for (auto &partition : bad.partitionTree.partitions)
+            if (partition.attrs.kind == CpuPartitionKind::Supernode && partition.attrs.supernodeCategory &&
+                *partition.attrs.supernodeCategory == CpuSupernodeCategory::SinkEvent)
+            { partition.attrs.supernodeCategory = CpuSupernodeCategory::NonSink; break; }
         reject(bad);
 
         // Missing prerequisites fail cleanly. C1 requires total phase
@@ -988,8 +1042,12 @@ namespace
         const auto &merged = *model.cpuMapping();
         const auto *pack = supernodeOf(merged, write);
         require(pack, "f10: regLatch mem write is not inside a general supernode");
+        requireCategory(*pack, CpuSupernodeCategory::SinkEvent, "f10");
+        require(flatOps(merged, pack->id) == std::vector<OpId>{write},
+                "f10: regLatch mem write sink cluster must hold the write alone");
         require(pack->attrs.eventActs && *pack->attrs.eventActs == std::vector<int64_t>{0},
-                "f10: write supernode eventActs wrong");
+                "f10: write supernode signature wrong");
+        requireSinkOrder(merged, "f10");
         roundTrip(model);
         advanceToFunctions(model);
         const auto &packed = *model.cpuMapping();
@@ -1137,6 +1195,75 @@ namespace
         require(!defaultPassRegistry().create("cpu.st.plan-translation-units", unknownKey, error),
                 "f11: accepted an unknown option");
     }
+
+    // V2-M1 acceptance: a ClockGate latch-ICG shape (CASE_025 isomorphic).
+    // rcgE = rckEn | wckEn feeds a data-gated latch write (the ICG enable —
+    // no event acts, hence the escape sink class), the latched gated clock
+    // drives a posedge detector, and the "macro" registers write on that
+    // edge, forming one signature cluster. The partition must place the rcgE
+    // producer in a non-sink supernode, the enable write in the escape sink
+    // cluster, and both macro writes in a single event sink cluster — the
+    // NO00029 activation cycle cannot form: the enable write no longer waits
+    // on the gated edge it produces.
+    void latchIcgShapeTest()
+    {
+        GrhSimModel model("f12_latch_icg");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto clk = addInputRead(model, "clk");
+        const auto rckEn = addInputRead(model, "rckEn");
+        const auto wckEn = addInputRead(model, "wckEn");
+        const auto d = addInputRead(model, "d");
+        const auto rcgE = addOr(model, rckEn, wckEn, "rcgE");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto cg = addState(model, "cg", bit, "1'b0");
+        const std::array cgRefs{ObjectRef::state(cg)};
+        const auto enWrite = model.addOperation("core.state.latchWrite",
+                                                std::array{rcgE, clk, one}, {}, cgRefs);
+        const auto cgRead = model.addValue(bit, "cgRead");
+        const auto cgReadOp = model.addOperation("core.state.read", {}, std::array{cgRead}, cgRefs);
+        model.setOperationPhase(cgReadOp, SimPhase::Event);
+        addEdgeDet(model, cgRead, 0);
+        const auto q1 = addState(model, "q1", bit, "1'b0");
+        const auto q2 = addState(model, "q2", bit, "1'b0");
+        const auto w1 = addRegWrite(model, one, d, one, q1, {0});
+        const auto w2 = addRegWrite(model, one, d, one, q2, {0});
+        require(verifies(model), "f12: fixture rejected");
+
+        attributeAndInit(model);
+        runPass(model, "cpu.st.merge-general-supernodes");
+        const auto &mapping = *model.cpuMapping();
+        require(supernodes(mapping).size() == 3, "f12: expected non-sink, escape and event supernodes");
+        // The rcgE producer sits in the non-sink frame with its input cone.
+        const auto *dataPack = supernodeOf(mapping, producerOf(model, rcgE));
+        require(dataPack, "f12: rcgE producer missing");
+        requireCategory(*dataPack, CpuSupernodeCategory::NonSink, "f12");
+        require(containsOp(mapping, *dataPack, producerOf(model, clk)) &&
+                containsOp(mapping, *dataPack, producerOf(model, d)),
+                "f12: non-sink supernode lost part of the cone");
+        // The enable write is the whole escape cluster.
+        const auto *escapePack = supernodeOf(mapping, enWrite);
+        require(escapePack && escapePack != dataPack, "f12: enable write left the escape class");
+        requireCategory(*escapePack, CpuSupernodeCategory::SinkEscape, "f12");
+        require(flatOps(mapping, escapePack->id) == std::vector<OpId>{enWrite},
+                "f12: escape cluster must hold the enable write alone");
+        require(escapePack->attrs.eventActs && escapePack->attrs.eventActs->empty(),
+                "f12: escape cluster must carry an empty signature");
+        // Both macro writes share one signature cluster.
+        const auto *macroPack = supernodeOf(mapping, w1);
+        require(macroPack && macroPack != dataPack && macroPack != escapePack,
+                "f12: macro writes left the event sink class");
+        requireCategory(*macroPack, CpuSupernodeCategory::SinkEvent, "f12");
+        require(containsOp(mapping, *macroPack, w2) && flatOps(mapping, macroPack->id).size() == 2,
+                "f12: same-signature macro writes did not cluster");
+        require(macroPack->attrs.eventActs && *macroPack->attrs.eventActs == std::vector<int64_t>{0},
+                "f12: macro cluster signature wrong");
+        requireSinkOrder(mapping, "f12");
+        roundTrip(model);
+        advanceToFunctions(model);
+        requirePackedGeneralBranch(*model.cpuMapping(), "f12");
+        roundTrip(model);
+    }
 }
 
 int main()
@@ -1154,6 +1281,7 @@ int main()
         crossDomainStateReadTest();
         regLatchMemWriteTest();
         translationUnitsTest();
+        latchIcgShapeTest();
         std::cout << "CPU six-phase mapping tests passed\n";
         return 0;
     }

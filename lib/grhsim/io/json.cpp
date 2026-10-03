@@ -145,6 +145,12 @@ namespace wolvrix::lib::grhsim
             void startArray() { expect('['); }
             void endArray() { expect(']'); }
             bool comma() { return consume(','); }
+            // Peeks whether the next value opens an array (no consume).
+            bool arrayStarts()
+            {
+                skipWhitespace();
+                return input_.peek() == '[';
+            }
             bool nextArray(bool &first)
             {
                 skipWhitespace();
@@ -580,11 +586,14 @@ namespace wolvrix::lib::grhsim
         void writeCpuSchedule(StreamWriter &writer, const CpuSchedulePlan &schedule)
         {
             // M5d-6 shape: [numaNodes, inputFanout, supernodeFanout,
-            // stateFanout, eventBitmaps?, memWritePlan?, timeslotTriggers?] —
+            // stateFanout, eventActivation?, memWritePlan?, timeslotTriggers?] —
             // the last three stay positional: a present later field forces the
             // earlier ones to serialize (possibly as empty arrays). The legacy
             // round-seed/input-shadow/quiescence/demonitor/fold-residue
-            // payloads are gone.
+            // payloads are gone. (The fourth slot held the pre-v2 event
+            // bitmaps; V2-M2 repurposed it for the non-sink activation map —
+            // same wire shape, new semantics, and pre-v2 checkpoints are
+            // rejected upstream by the V2-M1 category checks anyway.)
             writer.startArray(); writer.startArray();
             for (const auto &node : schedule.numaNodes)
             {
@@ -605,16 +614,16 @@ namespace wolvrix::lib::grhsim
             writer.endArray();
             writeCpuFanout(writer, schedule.inputFanout); writeCpuFanout(writer, schedule.computeSupernodeFanout);
             writeCpuFanout(writer, schedule.commitStateFanout);
-            if (schedule.eventBitmaps || schedule.memWritePlan || schedule.timeslotTriggers)
+            if (schedule.eventActivation || schedule.memWritePlan || schedule.timeslotTriggers)
             {
                 writer.startArray();
-                if (schedule.eventBitmaps)
+                if (schedule.eventActivation)
                 {
-                    for (const auto &bitmap : *schedule.eventBitmaps)
+                    for (const auto &entry : *schedule.eventActivation)
                     {
-                        writer.startArray(); writer.value(static_cast<uint64_t>(bitmap.cluster));
+                        writer.startArray(); writer.value(static_cast<uint64_t>(entry.act));
                         writer.startArray();
-                        for (const auto word : bitmap.supernodeWords) writer.value(word);
+                        for (const auto word : entry.supernodeWords) writer.value(word);
                         writer.endArray(); writer.endArray();
                     }
                 }
@@ -693,12 +702,14 @@ namespace wolvrix::lib::grhsim
                 writer.value(static_cast<uint64_t>(partition.attrs.phase));
                 writeIdArray<PartitionId>(writer, partition.children);
                 writeIdArray<OpId>(writer, partition.ops);
-                // Attr tail (M5d-6 shape): [helperChunks...], then an optional
-                // [eventActs...], then an optional [supernodeRange offset,count].
-                // A present later field forces the earlier ones to serialize
-                // (possibly as empty arrays).
+                // Attr tail (V2-M1 shape): [helperChunks...], then an optional
+                // [eventActs...], then either an optional [supernodeRange
+                // offset,count] (emit functions) or a scalar supernode
+                // category (supernodes) — the two never co-occur. A present
+                // later field forces the earlier ones to serialize (possibly
+                // as empty arrays).
                 if (!partition.attrs.helperChunks.empty() || partition.attrs.eventActs ||
-                    partition.attrs.supernodeRange)
+                    partition.attrs.supernodeRange || partition.attrs.supernodeCategory)
                 {
                     writer.startArray();
                     for (auto chunk : partition.attrs.helperChunks)
@@ -707,7 +718,8 @@ namespace wolvrix::lib::grhsim
                         writer.value(static_cast<uint64_t>(chunk.count)); writer.endArray();
                     }
                     writer.endArray();
-                    if (partition.attrs.eventActs || partition.attrs.supernodeRange)
+                    if (partition.attrs.eventActs || partition.attrs.supernodeRange ||
+                        partition.attrs.supernodeCategory)
                     {
                         writer.startArray();
                         if (partition.attrs.eventActs)
@@ -721,6 +733,8 @@ namespace wolvrix::lib::grhsim
                         writer.value(static_cast<uint64_t>(partition.attrs.supernodeRange->count));
                         writer.endArray();
                     }
+                    else if (partition.attrs.supernodeCategory)
+                        writer.value(static_cast<uint64_t>(*partition.attrs.supernodeCategory));
                 }
                 writer.endArray();
             }
@@ -834,20 +848,21 @@ namespace wolvrix::lib::grhsim
             expectComma(reader); schedule.computeSupernodeFanout = readCpuFanout<ValueId>(reader);
             expectComma(reader); schedule.commitStateFanout = readCpuFanout<StateId>(reader);
             // M5d-6 shape: the legacy round-seed/input-shadow/quiescence/
-            // demonitor/fold-residue fields are gone; eventBitmaps,
-            // memWritePlan and timeslotTriggers remain positional tails.
+            // demonitor/fold-residue fields are gone; eventActivation (the
+            // pre-v2 event bitmaps' slot, V2-M2), memWritePlan and
+            // timeslotTriggers remain positional tails.
             if (reader.comma())
             {
-                schedule.eventBitmaps.emplace(); reader.startArray(); first = true;
+                schedule.eventActivation.emplace(); reader.startArray(); first = true;
                 while (reader.nextArray(first))
                 {
-                    CpuEventBitmap bitmap;
-                    reader.startArray(); bitmap.cluster = reader.index("event bitmap cluster", true);
+                    CpuEventActivation entry;
+                    reader.startArray(); entry.act = reader.index("event activation act", true);
                     expectComma(reader); reader.startArray(); bool wordFirst = true;
                     while (reader.nextArray(wordFirst))
-                        bitmap.supernodeWords.push_back(reader.unsignedInteger());
+                        entry.supernodeWords.push_back(reader.unsignedInteger());
                     reader.endArray();
-                    schedule.eventBitmaps->push_back(std::move(bitmap));
+                    schedule.eventActivation->push_back(std::move(entry));
                 }
             }
             if (reader.comma())
@@ -938,9 +953,11 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); partition.attrs.phase = readCpuEnum(reader, CpuPhase::Output);
                 expectComma(reader); partition.children = readIdArray<PartitionId>(reader, "partition child");
                 expectComma(reader); partition.ops = readIdArray<OpId>(reader, "partition op");
-                // Attr tail (M5d-6 shape): optional [helperChunks...], then
-                // optional [eventActs...], then optional [supernodeRange
-                // offset,count] — positional elements of the partition array.
+                // Attr tail (V2-M1 shape): optional [helperChunks...], then
+                // optional [eventActs...], then either an optional
+                // [supernodeRange offset,count] array (emit functions) or a
+                // scalar supernode category (supernodes) — positional
+                // elements of the partition array.
                 bool tailFirst = false;
                 if (reader.nextArray(tailFirst))
                 {
@@ -961,18 +978,24 @@ namespace wolvrix::lib::grhsim
                     }
                     if (reader.comma())
                     {
-                        reader.startArray();
-                        const auto offset = reader.index("supernode range offset", true);
-                        expectComma(reader); const auto count = reader.index("supernode range count", true);
-                        reader.endArray();
-                        partition.attrs.supernodeRange = Range{offset, count};
-                        // The empty event-acts element written before a range
-                        // is a positional placeholder, not an engaged empty
-                        // annotation (that combination never occurs on a valid
-                        // mapping: acts annotate supernodes, ranges annotate
-                        // emit functions).
-                        if (partition.attrs.eventActs && partition.attrs.eventActs->empty())
-                            partition.attrs.eventActs.reset();
+                        if (reader.arrayStarts())
+                        {
+                            reader.startArray();
+                            const auto offset = reader.index("supernode range offset", true);
+                            expectComma(reader); const auto count = reader.index("supernode range count", true);
+                            reader.endArray();
+                            partition.attrs.supernodeRange = Range{offset, count};
+                            // The empty event-acts element written before a range
+                            // is a positional placeholder, not an engaged empty
+                            // annotation (that combination never occurs on a valid
+                            // mapping: acts annotate supernodes, ranges annotate
+                            // emit functions).
+                            if (partition.attrs.eventActs && partition.attrs.eventActs->empty())
+                                partition.attrs.eventActs.reset();
+                        }
+                        else
+                            partition.attrs.supernodeCategory =
+                                readCpuEnum(reader, CpuSupernodeCategory::SinkEvent);
                     }
                     reader.endArray();
                 }

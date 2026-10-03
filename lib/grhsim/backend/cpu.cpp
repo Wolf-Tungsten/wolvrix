@@ -1,4 +1,5 @@
 #include "grhsim/backend/cpu.hpp"
+#include "grhsim/backend/cpu_phase_common.hpp"
 #include "grhsim/backend/cpu_phase_emit.hpp"
 
 #include "grhsim/pass/pass.hpp"
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <tuple>
@@ -20,8 +22,8 @@ namespace wolvrix::lib::grhsim
         // by verifyCpuMapping before reaching this verifier. Stage
         // comparisons use cpuMappingStageRank: the pipeline order is
         // GeneralNodes -> GeneralSupernodes -> LayoutNamedStores ->
-        // EventBitmaps -> MemWritePlan -> GeneralFunctions -> PhaseSchedule,
-        // which is not the enum's numeric order.
+        // EventActivationMap -> MemWritePlan -> GeneralFunctions ->
+        // PhaseSchedule, which is not the enum's numeric order.
         bool verifyCpuPhases(const GrhSimModel &model, const CpuBackendMapping &cpu,
                              diag::Diagnostics &diagnostics)
         {
@@ -93,9 +95,11 @@ namespace wolvrix::lib::grhsim
                 {
                     if (generalSupernode != attrs.eventActs.has_value())
                         return error("event act annotations must cover exactly the general supernodes");
+                    if (generalSupernode != attrs.supernodeCategory.has_value())
+                        return error("supernode categories must cover exactly the general supernodes");
                 }
-                else if (attrs.eventActs)
-                    return error("event act annotations require the general-supernode stage");
+                else if (attrs.eventActs || attrs.supernodeCategory)
+                    return error("supernode annotations require the general-supernode stage");
                 if (!attrs.helperChunks.empty() &&
                     !(atLeast(CpuMappingStage::GeneralFunctions) && generalSupernode))
                     return error("helper chunks annotate only packed general supernodes");
@@ -289,42 +293,69 @@ namespace wolvrix::lib::grhsim
             }
             if (atLeast(CpuMappingStage::GeneralSupernodes))
             {
-                const auto domainSets = computeCpuEventDomainSets(model);
-                const auto unionInto = [](std::vector<int64_t> &target, const std::vector<int64_t> &source) {
-                    if (source.empty()) return;
-                    const auto middle = target.size();
-                    target.insert(target.end(), source.begin(), source.end());
-                    std::inplace_merge(target.begin(), target.begin() + middle, target.end());
-                    target.erase(std::unique(target.begin(), target.end()), target.end());
-                };
-                for (const auto &partition : tree.partitions)
+                // V2-M1 classification invariants: every General supernode is
+                // category-annotated; non-sink supernodes hold only
+                // value-producing ops while sink supernodes hold only
+                // no-result ops (SinkEvent: one common nonempty signature,
+                // carried in attrs.eventActs; SinkEscape: no event acts at
+                // all); non-sink supernodes precede sink supernodes in the
+                // branch child order; and every sink operand is produced by
+                // an earlier (non-sink) supernode.
+                constexpr uint32_t absentOrdinal = std::numeric_limits<uint32_t>::max();
+                const auto &general = tree.partitions[root.children[1].index - 1];
+                std::vector<PartitionId> supernodeOrder;
+                for (const auto child : general.children)
+                    if (tree.partitions[child.index - 1].attrs.kind == CpuPartitionKind::Supernode)
+                        supernodeOrder.push_back(child);
+                std::vector<OpId> producer(model.values().size() + 1);
+                for (const auto &op : model.operations())
+                    for (auto value : model.results(op)) producer[value.index] = op.id;
+                std::vector<uint32_t> ordinalOfOp(model.operations().size() + 1, absentOrdinal);
+                bool seenSink = false;
+                for (uint32_t ordinal = 0; ordinal < supernodeOrder.size(); ++ordinal)
                 {
-                    if (partition.attrs.kind != CpuPartitionKind::Supernode) continue;
-                    std::vector<int64_t> acts, influence, common;
-                    bool sawEvent = false, uniform = true, unboundFree = false;
+                    const auto &partition = tree.partitions[supernodeOrder[ordinal].index - 1];
+                    const auto &attrs = partition.attrs;
+                    const auto category = *attrs.supernodeCategory;
+                    const bool sink = category != CpuSupernodeCategory::NonSink;
+                    if (sink) seenSink = true;
+                    else if (seenSink)
+                        return error("non-sink supernode trails a sink supernode");
+                    std::vector<int64_t> acts;
                     for (auto child : partition.children)
                         for (auto opId : tree.partitions[child.index - 1].ops)
                         {
-                            unionInto(influence, domainSets.influence[opId.index]);
-                            if (domainSets.acts[opId.index].empty())
-                            {
-                                // An op with no event obligation anywhere (no
-                                // acts, empty downstream closure) is data-driven
-                                // and must not share a supernode with event
-                                // ops — the domain gate would suppress it.
-                                unboundFree = unboundFree || domainSets.influence[opId.index].empty();
-                                continue;
-                            }
-                            if (!sawEvent) { common = domainSets.acts[opId.index]; sawEvent = true; }
-                            else if (common != domainSets.acts[opId.index]) uniform = false;
-                            unionInto(acts, domainSets.acts[opId.index]);
+                            const auto &op = model.operations()[opId.index - 1];
+                            const bool opSink = model.results(op).empty();
+                            if (sink && !opSink) return error("sink supernode holds a value-producing op");
+                            if (!sink && opSink) return error("non-sink supernode holds a sink op");
+                            const auto opActs = readCpuPhaseEventActs(model, op);
+                            unionCpuPhaseActs(acts, opActs);
+                            if (category == CpuSupernodeCategory::SinkEvent && opActs != *attrs.eventActs)
+                                return error("sink supernode mixes event signatures");
+                            if (category == CpuSupernodeCategory::SinkEscape && !opActs.empty())
+                                return error("escape sink supernode holds an event-carrying op");
+                            ordinalOfOp[opId.index] = ordinal;
                         }
-                    if (*partition.attrs.eventActs != acts)
+                    if (*attrs.eventActs != acts)
                         return error("general supernode event acts disagree with its ops");
-                    if (sawEvent && (!uniform || influence != acts))
-                        return error("general supernode violates the event domain constraint");
-                    if (sawEvent && unboundFree)
-                        return error("general supernode mixes event ops with event-free data-driven ops");
+                    if (category == CpuSupernodeCategory::SinkEvent && attrs.eventActs->empty())
+                        return error("event sink supernode requires a nonempty signature");
+                }
+                for (uint32_t ordinal = 0; ordinal < supernodeOrder.size(); ++ordinal)
+                {
+                    const auto &partition = tree.partitions[supernodeOrder[ordinal].index - 1];
+                    if (*partition.attrs.supernodeCategory == CpuSupernodeCategory::NonSink) continue;
+                    for (auto child : partition.children)
+                        for (auto opId : tree.partitions[child.index - 1].ops)
+                            for (auto value : model.operands(model.operations()[opId.index - 1]))
+                            {
+                                const auto source = producer[value.index];
+                                if (!source) continue;
+                                const auto sourceOrdinal = ordinalOfOp[source.index];
+                                if (sourceOrdinal == absentOrdinal || sourceOrdinal >= ordinal)
+                                    return error("sink supernode operand is not produced by an earlier supernode");
+                            }
                 }
             }
             if (atLeast(CpuMappingStage::LayoutNamedStores) &&

@@ -1,7 +1,7 @@
 # Mem write plan
 
 `cpu.st.build-mem-write-plan` is the fifth pass (C5) of the CPU mapping
-C segment. Requires an `EventBitmaps`-stage mapping; produces the
+C segment. Requires an `EventActivationMap`-stage mapping; produces the
 `MemWritePlan` stage by filling `schedule.memWritePlan` for P_mem.
 
 - One entry per **Mem-phase** write op (`memWrite`/`memFill`/`memAssign`/

@@ -61,8 +61,8 @@ namespace wolvrix::lib::grhsim
     // Supernode children in tree order — fixed at C2 and untouched by C6's
     // function packing (EmitFunction leaves trail the supernodes and are
     // skipped here). Partition ids never reach the emitter; this 0..N-1
-    // sequence indexes the ActiveFlags byte arrays and the event bitmap
-    // words.
+    // sequence indexes the ActiveFlags bit words (V3-M1: bit per supernode)
+    // and the event bitmap words.
     inline std::vector<PartitionId> generalSupernodeOrder(const CpuPartitionTree &tree)
     {
         std::vector<PartitionId> order;

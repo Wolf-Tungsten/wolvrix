@@ -296,7 +296,12 @@ ScheduledTask
 （`DataGated`，执行其 `supernodeRange` 区间内的活动超节点；V2-M2 前名为
 `EventDataGated`）→ P_mem（`AlwaysScanCommit`）→ P_output（`EvalEnd`，round 循环外）；
 P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEvent 查 eventActStore
-签名，SinkEscape 每轮无条件）。V2-M3 起 sink 超节点体内不再保留逐 op event guard
+签名，SinkEscape 每轮无条件）。V3-M1 起 dataActiveFlag/dataActiveFlagNext 为
+bit-per-supernode 的 u64 字数组：扫描先按字外层跳过（一个非零判断覆盖 64 个静默
+超节点），字内逐位读 live word 检测并清位点火——同轮 fanout 目标恒在扫描方向前方
+（activateFanout 的 ordinal>current 规则），live word 语义与旧逐字节循环逐点等价；
+fanout 置位与 P_event 激活一律按字批量掩码 OR，P_publish 的并入与收敛判定同为字级。
+V2-M3 起 sink 超节点体内不再保留逐 op event guard
 （SinkEvent 全体 op 与超节点签名同集，调用点门控已覆盖；en、地址等数据条件保留）；
 非 sink 超节点内的事件 op 与 P_mem 写口仍保留逐 op event guard 精判，负责最终语义
 判断。

@@ -407,20 +407,22 @@ namespace wolvrix::lib::grhsim
             timeslot.sizeBytes = timeslot.fields.empty() ? 0 : maxFlag + 1;
             stats.timeslotFlags = timeslot.fields.size();
 
-            // activeFlags: dataActiveFlag/dataActiveFlagNext byte arrays with
-            // one byte per General supernode (V2-M2 removed eventActiveFlag:
-            // non-sink supernodes fire on dataActiveFlag alone, sink
-            // supernodes gate on their eventActStore signature or fire
-            // unconditionally). aux carries the supernode count (the ordinal
-            // space of the M4 spec); bit/byte index == supernode ordinal by
-            // definition.
+            // activeFlags: dataActiveFlag/dataActiveFlagNext u64 word arrays
+            // with one BIT per General supernode (V3-M1: bit-packing replaces
+            // the byte-per-supernode arrays; the P_general scan skips silent
+            // words whole instead of testing every supernode byte. V2-M2
+            // removed eventActiveFlag: non-sink supernodes fire on
+            // dataActiveFlag alone, sink supernodes gate on their
+            // eventActStore signature or fire unconditionally). aux carries
+            // the supernode count (the ordinal space of the M4 spec); bit
+            // index == supernode ordinal by definition.
             auto &active = stores[6];
             active.kind = CpuNamedStoreKind::ActiveFlags;
             NamedStoreBuilder activeBuilder{layout, active};
-            const auto byteArray = mapper.array(mapper.scalar(CpuTypeKind::UInt, 8),
-                                                std::max<uint32_t>(supernodeCount, 1));
-            activeBuilder.add(namer.claim("dataActiveFlag", 0), byteArray, {}, {}, supernodeCount);
-            activeBuilder.add(namer.claim("dataActiveFlagNext", 1), byteArray, {}, {}, supernodeCount);
+            const auto wordCount = std::max<uint32_t>((supernodeCount + 63) / 64, 1);
+            const auto wordArray = mapper.array(mapper.scalar(CpuTypeKind::UInt, 64), wordCount);
+            activeBuilder.add(namer.claim("dataActiveFlag", 0), wordArray, {}, {}, supernodeCount);
+            activeBuilder.add(namer.claim("dataActiveFlagNext", 1), wordArray, {}, {}, supernodeCount);
             activeBuilder.finish();
             stats.activeBytes = active.sizeBytes;
 
@@ -670,7 +672,9 @@ namespace wolvrix::lib::grhsim
                 if (store.sizeBytes != (store.fields.empty() ? 0 : uint64_t(maxFlag) + 1))
                     return error("timeslot trigger store size bytes disagree with its flags");
             }
-            // activeFlags: the two byte arrays sized by the supernode count.
+            // activeFlags: the two u64 word arrays bit-sized by the supernode
+            // count (V3-M1: ceil(N/64) words each, aux keeps the supernode
+            // count).
             {
                 const auto &store = stores[6];
                 const auto supernodeCount = static_cast<uint32_t>(
@@ -678,9 +682,9 @@ namespace wolvrix::lib::grhsim
                 const std::array<std::string_view, 2> names{"dataActiveFlag", "dataActiveFlagNext"};
                 if (store.fields.size() != names.size())
                     return error("active flags store must hold exactly two fields");
-                const auto word = findType(CpuTypeKind::UInt, 8, {}, 0);
-                const auto byteArray = word ? findType(CpuTypeKind::Array, 0, word,
-                                                       std::max<uint32_t>(supernodeCount, 1))
+                const auto wordCount = std::max<uint32_t>((supernodeCount + 63) / 64, 1);
+                const auto word = findType(CpuTypeKind::UInt, 64, {}, 0);
+                const auto wordArray = word ? findType(CpuTypeKind::Array, 0, word, wordCount)
                                             : CpuTypeId{};
                 for (std::size_t i = 0; i < names.size(); ++i)
                 {
@@ -689,10 +693,10 @@ namespace wolvrix::lib::grhsim
                         return error("active flags fields must be dataActiveFlag, dataActiveFlagNext");
                     if (field.aux != supernodeCount)
                         return error("active flags field aux must be the supernode count");
-                    if (field.type != byteArray || field.offset != i * uint64_t(std::max<uint32_t>(supernodeCount, 1)))
+                    if (field.type != wordArray || field.offset != i * uint64_t(wordCount) * 8)
                         return error("active flags field type or offset is wrong");
                 }
-                if (store.sizeBytes != 2 * uint64_t(std::max<uint32_t>(supernodeCount, 1)))
+                if (store.sizeBytes != 2 * uint64_t(wordCount) * 8)
                     return error("active flags store size bytes disagree with its fields");
             }
             return true;

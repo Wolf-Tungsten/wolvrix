@@ -539,6 +539,24 @@ namespace
         require(text.find("regLatchStoreNext") != std::string::npos && text.find("// state=s1") != std::string::npos,
                 "regLatch store fields should be named and annotated");
         require(text.find("// value=x") != std::string::npos, "boundary store fields should carry the value comment");
+        // V3-M1 emitted shape: the non-sink scan wraps per-word skip blocks
+        // with per-bit live-word checks and clear-on-fire; fanout activation
+        // is batched per-word mask ORs; publish merges word-wise; init fills
+        // then masks exactly the non-sink bit prefix. The compileAndRun steps
+        // above are round-structure sensitive (o3/o4 settle in the same eval)
+        // and catch any lost same-word same-round activation.
+        const std::string cpp = concatModelSources(root / "fanout" / "model");
+        require(cpp.find("dataActiveFlag[0]&UINT64_C(0x") != std::string::npos,
+                "scan should test word 0 bits with constant masks");
+        require(cpp.find("]&=~UINT64_C(0x") != std::string::npos,
+                "scan should clear the fired bit before the supernode call");
+        require(cpp.find("]|=UINT64_C(0x") != std::string::npos,
+                "fanout activation should be batched per-word mask ORs");
+        require(cpp.find("dataActiveFlag[cpu_i]|=dataActiveFlagNext[cpu_i]") != std::string::npos,
+                "publish should merge Next into current word-wise");
+        require(cpp.find("dataActiveFlag.fill(UINT64_C(0xffffffffffffffff));") != std::string::npos &&
+                cpp.find("dataActiveFlag[0]=UINT64_C(0x") != std::string::npos,
+                "init should fill words then mask the non-sink bit prefix");
     }
 
     // The registered pass rejects removed legacy options and models that did

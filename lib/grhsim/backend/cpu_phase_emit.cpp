@@ -389,6 +389,19 @@ namespace wolvrix::lib::grhsim
                 order_ = generalSupernodeOrder(tree_);
                 supernodeCount_ = static_cast<uint32_t>(order_.size());
                 for (uint32_t i = 0; i < supernodeCount_; ++i) ordinalOf_[order_[i].index] = i;
+                // C2 child order: non-sink supernodes first, sink supernodes
+                // after — verify the prefix invariant the word scan relies on.
+                for (uint32_t i = 0; i < supernodeCount_; ++i)
+                {
+                    const auto category = *tree_.partitions[order_[i].index - 1].attrs.supernodeCategory;
+                    if (category == CpuSupernodeCategory::NonSink)
+                    {
+                        if (i != nonSinkCount_)
+                            throw std::runtime_error("CPU six-phase emit non-sink supernodes do not form an ordinal prefix");
+                        ++nonSinkCount_;
+                    }
+                }
+                activeWords_ = layout_.types[activeStore_->fields[0].type.index - 1].count;
                 supernodeOps_.resize(supernodeCount_);
                 for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
                 {
@@ -660,6 +673,13 @@ namespace wolvrix::lib::grhsim
             std::vector<PartitionId> order_;
             std::vector<uint32_t> ordinalOf_;
             uint32_t supernodeCount_ = 0;
+            // V3-M1: non-sink supernodes occupy the ordinal prefix [0,
+            // nonSinkCount_) (structural, C2 child order); only they read the
+            // ActiveFlags bit words.
+            uint32_t nonSinkCount_ = 0;
+            // Word count of the ActiveFlags arrays, read back from the layout
+            // field type (ceil(supernodeCount/64), at least 1).
+            uint32_t activeWords_ = 1;
             std::vector<std::vector<OpId>> supernodeOps_;
             std::vector<OpId> eventOps_, outputOps_;
 
@@ -1556,6 +1576,13 @@ namespace wolvrix::lib::grhsim
         }
 
         // ----- Guards / activation -----
+        // UINT64_C(0x…) literal for emitted bit masks.
+        static std::string u64Const(uint64_t value)
+        {
+            std::ostringstream text;
+            text << "UINT64_C(0x" << std::hex << value << ')';
+            return text.str();
+        }
         // OR of the given event act bits. eventActStore is byte-packed: bit
         // act%8 of byte act/8 (layout-named-stores EventAct store) — the same
         // packing emitEdgeDet and the timeslot triggers use.
@@ -1600,7 +1627,11 @@ namespace wolvrix::lib::grhsim
         void SixPhaseEmitter::activateOrdinals(std::ostream &out, std::span<const uint32_t> ordinals,
                                                std::string_view array) const
         {
-            for (const auto ordinal : ordinals) out << array << '[' << ordinal << "]=1;\n";
+            // V3-M1: batched per-word mask ORs into the ActiveFlags bit words
+            // (ordinals need not be sorted).
+            std::map<uint32_t, uint64_t> words;
+            for (const auto ordinal : ordinals) words[ordinal / 64] |= 1ull << (ordinal % 64);
+            for (const auto &[word, mask] : words) out << array << '[' << word << "]|=" << u64Const(mask) << ";\n";
         }
         void SixPhaseEmitter::activateFanout(std::ostream &out, std::span<const uint32_t> ordinals,
                                              uint32_t current) const
@@ -1611,8 +1642,11 @@ namespace wolvrix::lib::grhsim
             // every target into dataActiveFlagNext.
             const auto dataActive = model_.text(activeStore_->fields[0].name);
             const auto dataNext = model_.text(activeStore_->fields[1].name);
+            std::vector<uint32_t> now, later;
             for (const auto ordinal : ordinals)
-                out << (ordinal != ~0u && ordinal > current ? dataActive : dataNext) << '[' << ordinal << "]=1;\n";
+                (current != ~0u && ordinal > current ? now : later).push_back(ordinal);
+            activateOrdinals(out, now, dataActive);
+            activateOrdinals(out, later, dataNext);
         }
         void SixPhaseEmitter::publishBoundary(std::ostream &out, ValueId result, const std::string &expr,
                                               uint32_t current) const
@@ -1881,6 +1915,8 @@ namespace wolvrix::lib::grhsim
             // V2 (M2): OR the act's activation words (bit i == ordinal i, the
             // non-sink supernodes holding an op with this act) straight into
             // dataActiveFlag — eventActiveFlag and the dual gate are gone.
+            // V3-M1: the activation words and dataActiveFlag share the same
+            // bit-per-supernode layout, so the activation is a plain word OR.
             if (const auto it = activationByAct_.find(static_cast<uint32_t>(*act));
                 it != activationByAct_.end() && std::any_of(it->second->supernodeWords.begin(), it->second->supernodeWords.end(),
                                                             [](std::uint64_t word) { return word != 0; }))
@@ -1888,10 +1924,8 @@ namespace wolvrix::lib::grhsim
                 const auto &words = it->second->supernodeWords;
                 const auto dataActive = model_.text(activeStore_->fields[0].name);
                 out << "{static constexpr std::uint64_t cpu_bm[]={";
-                for (const auto word : words) out << "UINT64_C(0x" << std::hex << word << std::dec << "),";
-                out << "};\nfor(std::size_t cpu_i=0;cpu_i<" << words.size() << ";++cpu_i){std::uint64_t cpu_bits=cpu_bm[cpu_i];"
-                    << "while(cpu_bits){const unsigned cpu_b=static_cast<unsigned>(__builtin_ctzll(cpu_bits));cpu_bits&=cpu_bits-1;"
-                    << dataActive << "[cpu_i*64+cpu_b]=1;}}\n}\n";
+                for (const auto word : words) out << u64Const(word) << ',';
+                out << "};\nfor(std::size_t cpu_i=0;cpu_i<" << words.size() << ";++cpu_i)" << dataActive << "[cpu_i]|=cpu_bm[cpu_i];\n}\n";
             }
             // prev updates whether or not the edge hit (plan §72), so a missed
             // direction never replays and the next opposite edge is seen fresh.
@@ -1967,7 +2001,7 @@ namespace wolvrix::lib::grhsim
                         throw std::runtime_error("CPU six-phase emit mem reader has no supernode ordinal");
                     if (reader.staticRow && constRow && *reader.staticRow != *constRow) continue;
                     if (reader.staticRow && !constRow) out << "if(" << rowText << "==" << *reader.staticRow << ')';
-                    out << dataNext << '[' << ordinal << "]=1;\n";
+                    out << dataNext << '[' << ordinal / 64 << "]|=" << u64Const(1ull << (ordinal % 64)) << ";\n";
                 }
             };
             // One cell write with the plan §123 change detection: no change -> no
@@ -3366,8 +3400,35 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             // event cluster fires on its eventActStore signature (the
             // signature IS the gate — no flag involved); a sink escape
             // supernode fires unconditionally every round.
+            // V3-M1: the ActiveFlags arrays are u64 bit words. The non-sink
+            // prefix scans them with an outer per-word skip (64 silent
+            // supernodes collapse into one test); each bit check inside reads
+            // the LIVE word, so a same-round fanout to a later ordinal in the
+            // same word is still picked up — the ordinal>current rule in
+            // activateFanout makes every same-round target lie ahead in scan
+            // order. The bit clear before firing preserves clear-on-fire.
             const auto dataActive = model_.text(activeStore_->fields[0].name);
-            for (uint32_t ordinal = begin; ordinal < end; ++ordinal)
+            uint32_t ordinal = begin;
+            const uint32_t nonSinkEnd = std::min(end, nonSinkCount_);
+            while (ordinal < nonSinkEnd)
+            {
+                const uint32_t word = ordinal / 64;
+                const uint32_t wordEnd = std::min((word + 1) * 64, nonSinkEnd);
+                const uint32_t width = wordEnd - ordinal;
+                const uint64_t wordMask = width == 64 ? ~0ull : ((1ull << width) - 1) << (ordinal % 64);
+                out << "if(" << dataActive << '[' << word << ']';
+                if (wordMask != ~0ull) out << '&' << u64Const(wordMask);
+                out << "){\n";
+                for (; ordinal < wordEnd; ++ordinal)
+                {
+                    const auto bitMask = u64Const(1ull << (ordinal % 64));
+                    out << "if(" << dataActive << '[' << word << "]&" << bitMask << "){" << dataActive << '[' << word << "]&=~" << bitMask << ";\n"
+                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
+                        << supernodeName(ordinal) << "();\n}\n";
+                }
+                out << "}\n";
+            }
+            for (; ordinal < end; ++ordinal)
             {
                 const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
                 switch (*attrs.supernodeCategory)
@@ -3382,10 +3443,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                         << supernodeName(ordinal) << "();\n}\n";
                     break;
                 case CpuSupernodeCategory::NonSink:
-                    out << "if(" << dataActive << '[' << ordinal << "]){" << dataActive << '[' << ordinal << "]=0;\n"
-                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
-                        << supernodeName(ordinal) << "();\n}\n";
-                    break;
+                    throw std::runtime_error("CPU six-phase emit non-sink supernode beyond the ordinal prefix");
                 }
             }
         }
@@ -3514,7 +3572,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             // their write lands without raising dataActiveFlag (spec §3.3).
             const auto dataActive = model_.text(activeStore_->fields[0].name);
             out << "void " << class_ << "::pInput(){\n";
-            for (const auto ordinal : randomSupernodes_) out << dataActive << '[' << ordinal << "]=1;\n";
+            activateOrdinals(out, std::vector<uint32_t>(randomSupernodes_.begin(), randomSupernodes_.end()), dataActive);
             for (const auto &input : model_.inputs())
             {
                 const auto *field = input.id.index < boundaryByInput_.size() ? boundaryByInput_[input.id.index] : nullptr;
@@ -3522,7 +3580,7 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                 const auto slot = "boundaryValueStore." + std::string(model_.text(field->name));
                 const auto member = "this->" + identifier(model_.text(input.name));
                 out << "if(" << slot << "!=" << member << "){" << slot << '=' << member << ";\n";
-                for (const auto ordinal : inputPortFanout_[input.id.index - 1]) out << dataActive << '[' << ordinal << "]=1;\n";
+                activateOrdinals(out, inputPortFanout_[input.id.index - 1], dataActive);
                 out << "}\n";
             }
             out << "}\n";
@@ -3629,11 +3687,23 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             out << "eventActStore.fill(0);\ntimeslotTriggerFlag.fill(0);\n";
             const auto dataActive = model_.text(activeStore_->fields[0].name);
             const auto dataNext = model_.text(activeStore_->fields[1].name);
-            // V2 (M2): the fill(1) also sets the sink ordinals, which no call
-            // site ever reads (SinkEvent gates on its signature, SinkEscape
-            // fires anyway) — clearing them one by one would just bloat init
-            // on large models, so the stale bits stay (harmless, unread).
-            out << dataActive << ".fill(1);\n" << dataNext << ".fill(0);\n"
+            // V3-M1: set exactly the non-sink bits [0, nonSinkCount_) — sink
+            // ordinals and the tail padding bits stay 0. Writers never target
+            // them (schedule fanout covers non-sink targets only), so the
+            // word-level convergence check and merge stay exact.
+            if (nonSinkCount_ == 0)
+            {
+                out << dataActive << ".fill(0);\n";
+            }
+            else
+            {
+                out << dataActive << ".fill(UINT64_C(0xffffffffffffffff));\n";
+                if (nonSinkCount_ % 64)
+                    out << dataActive << '[' << (nonSinkCount_ - 1) / 64 << "]=" << u64Const((1ull << (nonSinkCount_ % 64)) - 1) << ";\n";
+                for (uint32_t word = (nonSinkCount_ + 63) / 64; word < activeWords_; ++word)
+                    out << dataActive << '[' << word << "]=0;\n";
+            }
+            out << dataNext << ".fill(0);\n"
                 << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
             if (!randomFunctions_.empty()) out << "cpu_random_values.fill(0);\ncpu_random_sampled.fill(false);\n";
             // M5d-7: the init stream (steps, constant-boundary preloads,

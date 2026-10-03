@@ -9,7 +9,8 @@ flag and the influence machinery.) The legacy schedule payload fields
 (roundSeeds/inputShadows/quiescenceProjection/…) were removed in M5d-6.
 
 **Supernode ordinal.** The index space shared by the activation map and the
-ActiveFlags byte arrays is exactly the one fixed by C2: the General branch's
+ActiveFlags bit words (V3-M1: bit per supernode) is exactly the one fixed by
+C2: the General branch's
 direct supernode children in partition order, numbered 0..N-1 (see
 [merge-general-supernodes](merge-general-supernodes.md); C6's emit functions
 only record intervals over it and never renumber). Partition ids never reach

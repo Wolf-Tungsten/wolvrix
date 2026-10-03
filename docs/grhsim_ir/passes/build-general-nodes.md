@@ -61,10 +61,9 @@ node { op6 }   ; singleton sink node
 Diagnostics: `event_ops`, `general_nodes`, `sink_nodes`, `mem_ops`,
 `output_ops`, `boundary_value_targets` (cross-node value edges).
 
-The semantic boundary-prediction helper `predictGeneralBoundaries`
-(`include/grhsim/pass/general_boundaries.hpp`) mirrors this pass's
-cone-absorption rules over the sealed model without building a mapping
-(non-sink op set, singleton sink nodes included); the two implementations
-are kept aligned, and the B7 tests (`grhsim-split-phases-tests`) check that
-the predicted boundary set matches the node boundaries this pass actually
-forms.
+The semantic boundary-prediction helper `predictGeneralBoundaries` was
+removed in V3-M3: its node-level prediction systematically over-counted the
+boundaries that survive C2's supernode merge. Boundary-aware cloning now
+consumes the real supernode boundaries after C2
+(`cpu.st.clone-shared-boundaries`, see
+[clone-shared-boundaries](clone-shared-boundaries.md)).

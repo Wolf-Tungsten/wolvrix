@@ -757,6 +757,14 @@ namespace wolvrix::lib::grhsim
         bool poisoned() const noexcept { return poisoned_; }
         void poison() noexcept { poisoned_ = true; }
         void commitSemanticMutation();
+        // V3-M3: revision bump WITHOUT the mapping wipe. Reserved for the
+        // registered C-segment micro-adjustment passes (currently
+        // cpu.st.clone-shared-boundaries): the caller mutates the semantic
+        // model in a controlled way and is itself responsible for keeping the
+        // existing CPU mapping consistent (partition-tree op lists, removal
+        // remaps) and re-stamping it via setCpuMapping afterwards. Any other
+        // use would silently invalidate stale-mapping detection.
+        void commitSemanticMicroMutation() noexcept { ++semanticRevision_; }
         void commitMetadataMutation() noexcept { ++metadataRevision_; }
 
         StringInterner &strings() noexcept { return strings_; }

@@ -1,8 +1,9 @@
 # `grhsim.simplify`
 
 统一化简基础设施（M5d-2）：把既有化简子 pass 按固定顺序组合，迭代至稳定或轮数上限。
-它是全图优化（A6）与分区化简（B6）共用的入口；[`clone-shared-compute`](clone-shared-compute.md)
-**不**加入此不动点——它是语义层最后一个改写 pass，放在化简之后避免与 CSE 反复抵消。
+它是全图优化（A6）与分区化简（B6）共用的入口；[`clone-shared-boundaries`](clone-shared-boundaries.md)
+（C 段边界克隆）**不**加入此不动点——它放在全部化简与 C2 超节点合并之后，
+避免与 CSE 反复抵消，并直接消费真实超节点边界。
 
 ## 子流程
 
@@ -30,7 +31,7 @@ grhsim.used-bits              # 位需求分析、窄化及死锥清理
   分区的 op。`--phase` 进一步限定单一分区（定向调试用）。
 
 生产接线（M5d-5）：A6 以 `--scope whole` 运行于全图优化段；B6 以 `--scope phase` 运行于
-分区段（`grhsim.split-phases` 之后、`clone-shared-compute` 之前）。
+分区段（`grhsim.split-phases` 之后、B8 封板之前）。
 
 ## scope 边界（phase 模式的保留规则）
 

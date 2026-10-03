@@ -6,17 +6,17 @@
 //    surviving event_edges, Mem operands produced in P_general;
 //  - B6 grhsim.simplify(scope=phase): cross-phase interface values (a Mem
 //    write's General operand) are never removed by an in-scope rewrite;
-//  - B7 grhsim.clone-shared-compute: boundary-aware cloning against the
-//    predictGeneralBoundaries helper, phase-inheriting clones, idle reasons;
-//  - prediction vs cpu.st.build-general-nodes node boundaries (consistency);
+//  - C2.5 cpu.st.clone-shared-boundaries (V3-M3, the C-segment landing of the
+//    removed B7): boundary-aware cloning against the REAL C2 supernode
+//    boundaries, per-consuming-supernode clones, veto gates, idle reasons;
 //  - partition-stage interpreter equivalence (raw event_edges form vs the
-//    sealed lowered form) and the timeslot lifecycle through B1-B8.
+//    sealed lowered form and vs the C2.5-cloned mapped form) and the
+//    timeslot lifecycle through B1-B8.
 
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/io/json.hpp"
 #include "grhsim/ir/model.hpp"
 #include "grhsim/ir/verifier.hpp"
-#include "grhsim/pass/general_boundaries.hpp"
 #include "grhsim/pass/pass.hpp"
 
 #include "slang/numeric/SVInt.h"
@@ -616,7 +616,9 @@ namespace
         runPass(model, "grhsim.migrate-timeslot-tasks");
         runPass(model, "grhsim.split-phases");
         runPass(model, "grhsim.simplify", std::array<std::string_view, 2>{"--scope", "phase"});
-        runPass(model, "grhsim.clone-shared-compute");
+        // V3-M3: the predictive B7 is gone; boundary cloning lives in the
+        // mapping stage (cpu.st.clone-shared-boundaries, C2.5), outside the
+        // semantic partition stage this helper exercises.
     }
 
     // ---- tests ------------------------------------------------------------
@@ -916,8 +918,35 @@ namespace
 
     int testBoundaryClone()
     {
-        // Two-node case: the shared bijection's consumers anchor different
-        // predicted nodes, so the clone eliminates the boundary.
+        // V3-M3: the pass under test is cpu.st.clone-shared-boundaries (the
+        // C-segment landing of the removed B7). It runs on the C2 mapping, so
+        // every fixture is attributed (split-phases) and mapped (C1+C2) first.
+        // split=true forces one supernode per op (tiny caps): small fixtures
+        // otherwise collapse into a single supernode under C2's merge, which
+        // is also why the old B7 over-cloned against node-level predictions.
+        const auto runClonePipeline = [](grhsim::GrhSimModel &model, bool split = false,
+                                         std::span<const std::string_view> args = {}) {
+            runPass(model, "grhsim.extract-output-cones");
+            runPass(model, "grhsim.split-phases");
+            if (split)
+            {
+                runPass(model, "cpu.st.build-general-nodes",
+                        std::array<std::string_view, 2>{"--max-op-in-compute-node", "1"});
+                runPass(model, "cpu.st.merge-general-supernodes",
+                        std::array<std::string_view, 2>{"--max-op-in-compute-supernode", "1"});
+            }
+            else
+            {
+                runPass(model, "cpu.st.build-general-nodes");
+                runPass(model, "cpu.st.merge-general-supernodes");
+            }
+            return runPass(model, "cpu.st.clone-shared-boundaries", args);
+        };
+        const auto passName = "cpu.st.clone-shared-boundaries";
+        // Two-target case (tiny caps): and(shared,shared) and or(shared,src)
+        // sit in separate one-op supernodes, so the shared bijection is
+        // cloned once per consuming supernode and the dead source's boundary
+        // is eliminated.
         {
             grhsim::GrhSimModel model("split-phases-clone-2node");
             model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -936,15 +965,14 @@ namespace
             const auto q2v = addStateRead(model, q2, bit, "q2v");
             addOutputWrite(model, "o2", q2v);
 
-            runPass(model, "grhsim.extract-output-cones");
-            runPass(model, "grhsim.split-phases");
-            const Messages messages = runPass(model, "grhsim.clone-shared-compute");
-            if (infoValue(messages, "grhsim.clone-shared-compute", "cloned=") !=
-                std::optional<uint64_t>(2))
-                return fail("boundary clone did not clone per consumer");
-            if (infoValue(messages, "grhsim.clone-shared-compute", "boundary_values_eliminated=") !=
+            const Messages messages = runClonePipeline(model, true);
+            if (infoValue(messages, passName, "cloned=") != std::optional<uint64_t>(2))
+                return fail("boundary clone did not clone per consuming supernode");
+            if (infoValue(messages, passName, "boundary_values_eliminated=") !=
                 std::optional<uint64_t>(1))
                 return fail("boundary elimination count wrong");
+            if (infoValue(messages, passName, "dead_sources_removed=") != std::optional<uint64_t>(1))
+                return fail("dead source removal count wrong");
             if (findOp(model, "shared.not")) return fail("dead shared source survived");
             unsigned localNots = 0;
             for (const auto &op : model.operations())
@@ -957,14 +985,34 @@ namespace
                     return fail("clone lost the source phase");
             }
             if (localNots != 2) return fail("clone count mismatch");
+            for (const auto &op : model.operations())
+            {
+                const auto type = model.text(op.opType);
+                if (type != "core.compute.and" && type != "core.compute.or") continue;
+                if (model.text(model.values()[model.operands(op)[0].index - 1].name).find(".local") ==
+                    std::string_view::npos)
+                    return fail("consumer still uses the original boundary candidate");
+            }
+            for (const auto &op : model.operations())
+                if (model.text(op.opType) == "core.compute.and" &&
+                    model.operands(op)[0] != model.operands(op)[1])
+                    return fail("repeated consumer operand did not reuse its clone");
             if (!verifies(model)) return fail("cloned model rejected");
             if (!sealVerifies(model)) return fail("cloned model failed the seal");
-            const Messages again = runPass(model, "grhsim.clone-shared-compute");
-            if (!infoHas(again, "grhsim.clone-shared-compute", "cloned=0"))
+            const std::string stored = storeJson(model);
+            std::istringstream input(stored);
+            diag::Diagnostics diagnostics;
+            auto loaded = grhsim::readGrhSimJson(input, grhsim::defaultDialectRegistry(), diagnostics);
+            if (!loaded || diagnostics.hasError()) return fail("cloned mapped model does not load");
+            if (storeJson(*loaded) != stored) return fail("cloned mapped model is not byte-stable");
+            const Messages again = runPass(model, passName);
+            if (!infoHas(again, passName, "cloned=0"))
                 return fail("boundary clone is not idempotent");
         }
-        // One-node case: both consumers absorb into the same sink node, so
-        // the value never crosses a boundary and nothing is cloned.
+        // Same-supernode case: and(shared,shared) merges with the shared
+        // source (single predecessor), and the trailing or(a,shared) follows
+        // the cluster, so the value never leaves one supernode and nothing
+        // is cloned.
         {
             grhsim::GrhSimModel model("split-phases-clone-1node");
             model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
@@ -972,25 +1020,26 @@ namespace
             const auto x = addInputRead(model, "x", bit);
             const auto one = addConstant(model, bit, "1'b1");
             const auto q = addStateInit(model, "q", bit, "1'b0");
+            const auto q2 = addStateInit(model, "q2", bit, "1'b0");
             const auto shared = addCompute(model, "core.compute.not", {x}, bit, "shared.not");
-            const auto c1 = addCompute(model, "core.compute.and", {shared, x}, bit, "c1");
-            const auto c2 = addCompute(model, "core.compute.or", {shared, x}, bit, "c2");
-            const auto data = addCompute(model, "core.compute.xor", {c1, c2}, bit, "data");
-            addRegWrite(model, q, one, data, one);
+            const auto a = addCompute(model, "core.compute.and", {shared, shared}, bit, "a");
+            const auto b = addCompute(model, "core.compute.or", {a, shared}, bit, "b");
+            addRegWrite(model, q, one, b, one);
+            // A second user of the varying parent: without it the bijection
+            // is not a candidate at all (cloning would just move the
+            // boundary to a locally-used input).
+            addRegWrite(model, q2, one, x, one);
             const auto qv = addStateRead(model, q, bit, "qv");
             addOutputWrite(model, "oQ", qv);
 
-            runPass(model, "grhsim.extract-output-cones");
-            runPass(model, "grhsim.split-phases");
-            const Messages messages = runPass(model, "grhsim.clone-shared-compute");
-            if (!infoHas(messages, "grhsim.clone-shared-compute", "cloned=0"))
-                return fail("a node-local shared producer was cloned");
-            if (!infoHas(messages, "grhsim.clone-shared-compute", "skipped_local=1"))
-                return fail("node-local rejection was not counted");
-            if (!infoHas(messages, "grhsim.clone-shared-compute",
-                         "idle_reason=no_boundary_candidates"))
+            const Messages messages = runClonePipeline(model);
+            if (!infoHas(messages, passName, "cloned=0"))
+                return fail("a supernode-local shared producer was cloned");
+            if (!infoHas(messages, passName, "skipped_local=1"))
+                return fail("supernode-local rejection was not counted");
+            if (!infoHas(messages, passName, "idle_reason=no_boundary_candidates"))
                 return fail("missing idle reason for a boundary-free model");
-            if (!verifies(model)) return fail("node-local model rejected");
+            if (!verifies(model)) return fail("supernode-local model rejected");
         }
         // Mem-consumer case: a Mem-phase write samples the shared value, so
         // cloning would not eliminate the boundary; the pass must skip it.
@@ -1016,131 +1065,114 @@ namespace
             addOutputWrite(model, "oM", bmv);
 
             runPass(model, "grhsim.select-state-stores");
-            runPass(model, "grhsim.extract-output-cones");
-            runPass(model, "grhsim.split-phases");
-            const Messages messages = runPass(model, "grhsim.clone-shared-compute");
-            if (!infoHas(messages, "grhsim.clone-shared-compute", "cloned=0"))
+            const Messages messages = runClonePipeline(model);
+            if (!infoHas(messages, passName, "cloned=0"))
                 return fail("a value sampled by P_mem was cloned away");
-            if (!infoHas(messages, "grhsim.clone-shared-compute",
-                         "skipped_non_compute_consumer=1"))
+            if (!infoHas(messages, passName, "skipped_non_compute_consumer=1"))
                 return fail("mem-consumer rejection was not counted");
             if (!verifies(model)) return fail("mem-consumer model rejected");
             if (!sealVerifies(model)) return fail("mem-consumer model failed the seal");
         }
-        // Unattributed model: no General ops, the pass is a documented no-op.
+        // Passthrough model: no General ops at all, the pass is a documented
+        // no-op (idle_reason=no_candidates).
         {
             grhsim::GrhSimModel model("split-phases-clone-idle");
             model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
+            const auto a = addInputRead(model, "a", bit);
+            addOutputWrite(model, "o", a);
+            const Messages messages = runClonePipeline(model);
+            if (!infoHas(messages, passName, "idle_reason=no_candidates"))
+                return fail("passthrough model did not report the idle reason");
+            if (!infoHas(messages, passName, "cloned=0"))
+                return fail("passthrough model cloned something");
+            if (!verifies(model)) return fail("passthrough model rejected");
+        }
+        // Two-target budget case (tiny caps): both and-consumers sit in
+        // their own supernodes; --max-clones 1 blocks the candidate and
+        // keeps the boundary.
+        {
+            grhsim::GrhSimModel model("split-phases-clone-budget");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto x = addInputRead(model, "x", bit);
+            const auto a1 = addInputRead(model, "a1", bit);
+            const auto a2 = addInputRead(model, "a2", bit);
+            const auto one = addConstant(model, bit, "1'b1");
+            const auto q1 = addStateInit(model, "q1", bit, "1'b0");
+            const auto q2 = addStateInit(model, "q2", bit, "1'b0");
+            const auto q3 = addStateInit(model, "q3", bit, "1'b0");
             const auto shared = addCompute(model, "core.compute.not", {x}, bit, "shared.not");
-            addCompute(model, "core.compute.and", {shared, x}, bit, "c1");
-            addCompute(model, "core.compute.or", {shared, x}, bit, "c2");
-            const Messages messages = runPass(model, "grhsim.clone-shared-compute");
-            if (!infoHas(messages, "grhsim.clone-shared-compute", "idle_reason=no_general_ops"))
-                return fail("unattributed model did not report the idle reason");
+            const auto d1 = addCompute(model, "core.compute.and", {shared, a1}, bit, "d1");
+            const auto d2 = addCompute(model, "core.compute.and", {shared, a2}, bit, "d2");
+            addRegWrite(model, q1, one, d1, one);
+            addRegWrite(model, q2, one, d2, one);
+            // Second user of the varying parent so the bijection is a candidate.
+            addRegWrite(model, q3, one, x, one);
+            const Messages full = runClonePipeline(model, true);
+            if (infoValue(full, passName, "cloned=") != std::optional<uint64_t>(2))
+                return fail("two-target model did not clone into both supernodes");
+            if (!verifies(model)) return fail("two-target model rejected");
+
+            grhsim::GrhSimModel capped("split-phases-clone-budget-cap");
+            capped.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto cbit = capped.logicType(1, false, grhsim::LogicDomain::TwoState);
+            const auto cx = addInputRead(capped, "x", cbit);
+            const auto ca1 = addInputRead(capped, "a1", cbit);
+            const auto ca2 = addInputRead(capped, "a2", cbit);
+            const auto cone = addConstant(capped, cbit, "1'b1");
+            const auto cq1 = addStateInit(capped, "q1", cbit, "1'b0");
+            const auto cq2 = addStateInit(capped, "q2", cbit, "1'b0");
+            const auto cq3 = addStateInit(capped, "q3", cbit, "1'b0");
+            const auto cshared = addCompute(capped, "core.compute.not", {cx}, cbit, "shared.not");
+            const auto cd1 = addCompute(capped, "core.compute.and", {cshared, ca1}, cbit, "d1");
+            const auto cd2 = addCompute(capped, "core.compute.and", {cshared, ca2}, cbit, "d2");
+            addRegWrite(capped, cq1, cone, cd1, cone);
+            addRegWrite(capped, cq2, cone, cd2, cone);
+            addRegWrite(capped, cq3, cone, cx, cone);
+            const Messages messages = runClonePipeline(
+                capped, true, std::array<std::string_view, 2>{"--max-clones", "1"});
+            if (!infoHas(messages, passName, "cloned=0"))
+                return fail("clone budget was ignored");
+            if (!infoHas(messages, passName, "skipped_budget=1"))
+                return fail("budget rejection was not counted");
+            if (!verifies(capped)) return fail("budget-capped model rejected");
         }
-        if (!passCreationFails("grhsim.clone-shared-compute",
-                               std::array<std::string_view, 2>{"--max-op-in-compute-node", "0"}))
-            return fail("clone-shared-compute accepted a zero node cap");
+        // Width guard: a >64-bit shared bijection is never a candidate even
+        // when it crosses supernodes.
+        {
+            grhsim::GrhSimModel model("split-phases-clone-wide");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
+            const auto word = model.logicType(128, false, grhsim::LogicDomain::TwoState);
+            const auto x = addInputRead(model, "x", word);
+            const auto a1 = addInputRead(model, "a1", word);
+            const auto a2 = addInputRead(model, "a2", word);
+            const auto one = addConstant(model, bit, "1'b1");
+            const auto mask = addConstant(model, word, "128'hffffffffffffffffffffffffffffffff");
+            const auto q1 = addStateInit(model, "q1", word, "128'h0");
+            const auto q2 = addStateInit(model, "q2", word, "128'h0");
+            const auto q3 = addStateInit(model, "q3", word, "128'h0");
+            const auto shared = addCompute(model, "core.compute.not", {x}, word, "shared.not");
+            const auto d1 = addCompute(model, "core.compute.and", {shared, a1}, word, "d1");
+            const auto d2 = addCompute(model, "core.compute.and", {shared, a2}, word, "d2");
+            addRegWrite(model, q1, one, d1, mask);
+            addRegWrite(model, q2, one, d2, mask);
+            // Second user of the varying parent: the width guard (not the
+            // candidate gate) is what must reject this fixture.
+            addRegWrite(model, q3, one, x, mask);
+            const Messages messages = runClonePipeline(model);
+            if (!infoHas(messages, passName, "cloned=0"))
+                return fail("a >64-bit shared producer was cloned");
+            if (!infoHas(messages, passName, "idle_reason=no_candidates"))
+                return fail("wide producer should not be a candidate");
+            if (!verifies(model)) return fail("wide model rejected");
+        }
+        if (!passCreationFails(passName, std::array<std::string_view, 2>{"--max-clones", "0"}))
+            return fail("clone-shared-boundaries accepted a zero clone budget");
         return 0;
     }
 
-    int testBoundaryPredictionConsistency()
-    {
-        // Dedicated fixture without regLatch-class arrays: no General-phase
-        // mem writes exist (bigMem is 64 bytes and lands in the mem store
-        // class), so the predictor and C1 form nodes over the same General
-        // op set.
-        grhsim::GrhSimModel model("split-phases-predict");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
-        const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
-        const auto addr6 = model.logicType(6, false, grhsim::LogicDomain::TwoState);
-        const auto a = addInputRead(model, "a", byte);
-        const auto b = addInputRead(model, "b", byte);
-        const auto c = addInputRead(model, "c", byte);
-        const auto we = addInputRead(model, "we", bit);
-        const auto cff = addConstant(model, byte, "8'hff");
-        const auto c00 = addConstant(model, addr6, "6'h00");
-        const auto q1 = addStateInit(model, "q1", byte, "8'h00");
-        const auto q2 = addStateInit(model, "q2", byte, "8'h00");
-        const auto q3 = addStateInit(model, "q3", byte, "8'h00");
-        const auto bigMem = addArrayState(model, "bigMem", byte, 64, "8'h00");
-        // s1 crosses two write cones and is also sampled by the Mem write.
-        const auto s1 = addCompute(model, "core.compute.xor", {a, b}, byte, "s1");
-        const auto s2 = addCompute(model, "core.compute.and", {s1, c}, byte, "s2");
-        addRegWrite(model, q1, we, s2, cff);
-        const auto s3 = addCompute(model, "core.compute.or", {s1, c}, byte, "s3");
-        addRegWrite(model, q2, we, s3, cff);
-        // Absorbed single-consumer chain: no boundary between t1 and t2.
-        const auto t1 = addCompute(model, "core.compute.not", {c}, byte, "t1");
-        const auto t2 = addCompute(model, "core.compute.xor", {t1, a}, byte, "t2");
-        addRegWrite(model, q3, we, t2, cff);
-        const auto q1r = addStateRead(model, q1, byte, "q1r");
-        const auto q3r = addStateRead(model, q3, byte, "q3r");
-        const auto q2r = addStateRead(model, q2, byte, "q2r");
-        addMemWrite(model, bigMem, we, s1, q1r, cff);
-        addOutputWrite(model, "o1", addCompute(model, "core.compute.xor", {q1r, q2r}, byte, "o1v"));
-        addOutputWrite(model, "o2",
-                       addCompute(model, "core.compute.add",
-                                  {addMemRead(model, bigMem, c00, byte, "bmv"), q3r}, byte, "o2v"));
-
-        runPass(model, "grhsim.select-state-stores");
-        runPass(model, "grhsim.classify-event-inputs");
-        runPass(model, "grhsim.lower-edge-detect");
-        runPass(model, "grhsim.extract-output-cones");
-        runPass(model, "grhsim.migrate-timeslot-tasks");
-        runPass(model, "grhsim.split-phases");
-        runPass(model, "grhsim.simplify", std::array<std::string_view, 2>{"--scope", "phase"});
-        // C1 forms nodes over the sealed General partition (M5d-6).
-        runPass(model, "cpu.st.build-general-nodes");
-
-        const auto *mapping = model.cpuMapping();
-        if (!mapping) return fail("cpu mapping missing");
-        const auto &tree = mapping->partitionTree;
-        std::vector<uint32_t> opNode(model.operations().size() + 1, 0);
-        for (const auto branchId : tree.partitions[tree.root.index - 1].children)
-        {
-            const auto &branch = tree.partitions[branchId.index - 1];
-            if (branch.attrs.phase != grhsim::CpuPhase::General) continue;
-            for (const auto nodeId : branch.children)
-                for (const auto opId : tree.partitions[nodeId.index - 1].ops)
-                    opNode[opId.index] = nodeId.index;
-        }
-        std::vector<grhsim::OpId> producer(model.values().size() + 1);
-        for (const auto &op : model.operations())
-            for (const auto value : model.results(op)) producer[value.index] = op.id;
-        std::set<uint32_t> actual;
-        for (const auto &op : model.operations())
-        {
-            const bool memConsumer = op.phase == grhsim::SimPhase::Mem;
-            for (const auto operand : model.operands(op))
-            {
-                const auto source = producer[operand.index];
-                if (!source || !opNode[source.index]) continue;
-                if (memConsumer || (opNode[op.id.index] && opNode[op.id.index] != opNode[source.index]))
-                    actual.insert(operand.index);
-            }
-        }
-        const auto prediction = grhsim::predictGeneralBoundaries(model, 128);
-        std::set<uint32_t> predicted;
-        for (std::size_t i = 1; i < prediction.boundaryValue.size(); ++i)
-            if (prediction.boundaryValue[i]) predicted.insert(i);
-        if (prediction.nodeCount == 0) return fail("prediction formed no nodes");
-        if (predicted != actual)
-        {
-            std::cerr << "[grhsim-split-phases] predicted-only:";
-            for (const auto index : predicted)
-                if (!actual.count(index)) std::cerr << ' ' << index;
-            std::cerr << " actual-only:";
-            for (const auto index : actual)
-                if (!predicted.count(index)) std::cerr << ' ' << index;
-            std::cerr << '\n';
-            return fail("predicted boundaries disagree with build-general-nodes");
-        }
-        return 0;
-    }
 
     int testPartitionEquivalence()
     {
@@ -1154,8 +1186,10 @@ namespace
         runPass(model, "grhsim.migrate-timeslot-tasks");
         const auto lowered = EventFixture::trace(model, 64);
         if (lowered != reference) return fail("B1-B4 changed the interpreter trace");
-        // Partition stage (B5-B8): attribution, per-partition simplify and
-        // boundary-aware cloning preserve the trace.
+        // Partition stage (B5-B8): attribution and per-partition simplify
+        // preserve the trace. V3-M3: the predictive B7 is gone — the seal now
+        // follows B6 directly, and boundary-aware cloning runs in the mapping
+        // stage (C1+C2+C2.5) where it must preserve the same trace.
         const Messages split = runPass(model, "grhsim.split-phases");
         if (infoValue(split, "grhsim.split-phases", "phase_mem=") != std::optional<uint64_t>(1))
             return fail("bigMem write was not attributed to P_mem");
@@ -1163,7 +1197,6 @@ namespace
             std::optional<uint64_t>(1))
             return fail("smallMem write was not kept on the General path");
         runPass(model, "grhsim.simplify", std::array<std::string_view, 2>{"--scope", "phase"});
-        runPass(model, "grhsim.clone-shared-compute");
         runPass(model, "grhsim.verify", std::array<std::string_view, 2>{"--seal", "semantic"});
         const auto sealed = EventFixture::trace(model, 64);
         if (sealed != reference) return fail("B5-B8 changed the interpreter trace");
@@ -1173,6 +1206,12 @@ namespace
         auto loaded = grhsim::readGrhSimJson(input, grhsim::defaultDialectRegistry(), diagnostics);
         if (!loaded || diagnostics.hasError()) return fail("sealed event model does not load");
         if (storeJson(*loaded) != stored) return fail("sealed event model is not byte-stable");
+        runPass(model, "cpu.st.build-general-nodes");
+        runPass(model, "cpu.st.merge-general-supernodes");
+        runPass(model, "cpu.st.clone-shared-boundaries");
+        if (!verifies(model)) return fail("cloned event fixture rejected");
+        const auto remapped = EventFixture::trace(model, 64);
+        if (remapped != reference) return fail("C2.5 boundary cloning changed the interpreter trace");
         return 0;
     }
 
@@ -1212,7 +1251,6 @@ namespace
 
         runPass(model, "grhsim.split-phases");
         runPass(model, "grhsim.simplify", std::array<std::string_view, 2>{"--scope", "phase"});
-        runPass(model, "grhsim.clone-shared-compute");
         runPass(model, "grhsim.verify", std::array<std::string_view, 2>{"--seal", "semantic"});
 
         // The monitoring states keep their regLatch class and their
@@ -1256,7 +1294,6 @@ int main()
         if (const int status = testSemanticSeal()) return status;
         if (const int status = testPhaseScopeInterface()) return status;
         if (const int status = testBoundaryClone()) return status;
-        if (const int status = testBoundaryPredictionConsistency()) return status;
         if (const int status = testPartitionEquivalence()) return status;
         if (const int status = testTimeslotLifecycle()) return status;
     }

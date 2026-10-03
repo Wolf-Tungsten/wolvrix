@@ -355,16 +355,18 @@ verifier 约束（含分区自封，任何中间形态都必须满足）：`edge
 
 JSON checkpoint 中相位随 op 行持久化，字节稳定往返。
 
-### 3.7 CPU mapping 的 C 段（M5d-6，C8 追加于 M5d-7）
+### 3.7 CPU mapping 的 C 段（M5d-6，C8 追加于 M5d-7，C2.5 追加于 V3-M3）
 
-B8 封板后，CPU 后端只运行**一次最终 mapping**（C 段），单向推进、不回改语义；mapping
-因语义 revision 失效后由 C1 整体重建。八个 pass 的顺序（机制细节见
+B8 封板后，CPU 后端只运行**一次最终 mapping**（C 段），单向推进；除注册的 C 段微调
+pass（C2.5）外不回改语义；mapping
+因语义 revision 失效后由 C1 整体重建。各 pass 的顺序（机制细节见
 [CPU 单线程活动度仿真 Flow](flows/cpu-st.md) 第 2 节与各 pass 文档）：
 
 | 阶段 | pass | 产出 |
 | --- | --- | --- |
 | C1 | `cpu.st.build-general-nodes` | 从零初始化 mapping：四平铺分枝 + General node（锥吸收） |
 | C2 | `cpu.st.merge-general-supernodes` | General 超节点；序号 = 分枝子节点顺序，就此固定 |
+| C2.5 | `cpu.st.clone-shared-boundaries` | 真实超节点边界上的廉价双射共享计算克隆（唯一注册的 C 段语义微调；就地维护分区树） |
 | C3 | `cpu.st.layout-named-stores` | named-store 布局（零分类决策，只消费 A7 `storeClass`） |
 | C4 | `cpu.st.build-event-activation-map` | event act → 含该 act 事件的**非 sink** 超节点位图（bit i = C2 序号 i；V2-M2 起 sink 超节点不再配位图） |
 | C5 | `cpu.st.build-mem-write-plan` | Mem 相写计划与 mem 类状态的读者表 |

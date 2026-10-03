@@ -20,8 +20,8 @@ namespace wolvrix::lib::grhsim
         // graph; scope=phase runs it per simulation phase (Event -> General ->
         // Mem -> Output), each restricted to its own ops, so partition
         // interfaces, side-effect roots and cross-partition references are
-        // preserved and no cross-phase CSE happens. clone-shared-compute is
-        // deliberately not part of this fixpoint.
+        // preserved and no cross-phase CSE happens. cpu.st.clone-shared-boundaries
+        // (the C-segment boundary clone) is deliberately not part of this fixpoint.
         struct StepEntry
         {
             std::string_view name;

@@ -4,7 +4,6 @@
 #include "grhsim/pass/const_fold.hpp"
 #include "grhsim/pass/simplify.hpp"
 #include "grhsim/pass/canonicalize_compute.hpp"
-#include "grhsim/pass/clone_shared_compute.hpp"
 #include "grhsim/pass/bitwise_predicates.hpp"
 #include "grhsim/pass/bitwise_muxes.hpp"
 #include "grhsim/pass/mux_chain_fold.hpp"
@@ -185,7 +184,6 @@ namespace wolvrix::lib::grhsim
         registerRegToMemPass(registry);
         registerCombPackPass(registry);
         registerCanonicalizeComputePass(registry);
-        registerCloneSharedComputePass(registry);
         registerBitwisePredicatesPass(registry);
         registerBitwiseMuxesPass(registry);
         registerMuxChainFoldPass(registry);

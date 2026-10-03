@@ -15,6 +15,9 @@ namespace wolvrix::lib::grhsim
     void registerCpuLayoutPasses(PassRegistry &registry);
     void registerCpuSchedulePasses(PassRegistry &registry);
     void registerCpuEmitPlanPasses(PassRegistry &registry);
+    // V3-M3: cpu.st.clone-shared-boundaries (the C-segment landing of the
+    // removed B7 predictive cloning) lives in cpu_clone_shared.cpp.
+    void registerCpuCloneSharedPasses(PassRegistry &registry);
     bool verifyCpuSchedule(const GrhSimModel &model, const CpuBackendMapping &mapping,
                            wolvrix::lib::diag::Diagnostics &diagnostics);
     bool verifyCpuDataLayout(const GrhSimModel &model, const CpuBackendMapping &mapping,

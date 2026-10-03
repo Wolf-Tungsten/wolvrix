@@ -407,5 +407,6 @@ namespace wolvrix::lib::grhsim
         registerCpuSchedulePasses(registry);
         registerCpuEmitPlanPasses(registry);
         registerCpuPhaseEmitPasses(registry);
+        registerCpuCloneSharedPasses(registry);
     }
 }

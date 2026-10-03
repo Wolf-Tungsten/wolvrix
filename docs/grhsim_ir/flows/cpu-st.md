@@ -69,13 +69,12 @@ event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全
 time-slot 结构降级；[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5）按
 A7 分类完成类感知相位归属（`mem` 类数组的写归 P_mem，`regLatch` 类状态的写——含小数组
 上的 mem op——归 P_general），`grhsim.simplify(scope=phase)`（B6）逐分区独立化简
-（保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），
-[`grhsim.clone-shared-compute`](../passes/clone-shared-compute.md)（B7）按边界感知成本
-模型只克隆能消除预测超节点边界的共享计算（归位决议 1），最后
+（保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），最后
 `grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
-P_mem 操作数产自 P_general）。**B8 之后不再有任何语义改写**：旧管线的"后置化简 +
-第二轮 mapping"往返段已拆除，CPU mapping（下表 C1–C8 八个 `cpu.st.*` pass）在封板
-模型上只运行一次，单向推进、不回改语义。
+P_mem 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clone-shared-compute`）撤除：
+边界感知克隆移入 mapping 段（C2.5，见下），**B8 之后除注册的 C 段微调 pass 外不再有
+任何语义改写**——旧管线的"后置化简 + 第二轮 mapping"往返段已拆除，CPU mapping
+（下表 C1–C8 八个 `cpu.st.*` pass 加 C2.5）在封板模型上只运行一次，单向推进。
 集成开关新增 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1`（B6 调试开关）；`--used-bits` 与
 `--bitwise-predicates` 旋钮随独立调用段的移除而成为空操作（两者都只在
 `grhsim.simplify` 内部固定点中运行）。
@@ -429,7 +428,8 @@ trigger 按模型与分区树重算要求完全一致；`GeneralFunctions` 起�
 区间连续铺满 [0,N)；`TranslationUnits` 起按记录的规模上限重放 TU 计划并要求完全一致。
 JSON 保持 v2 可选尾字段的位置化追加（TU 计划是 mapping 行的第六项）。
 
-语义边界预测 helper `predictGeneralBoundaries`
-（`include/grhsim/pass/general_boundaries.hpp`）静态模拟 C1 的锥吸收规则，不建立 mapping
-即给出预测边界集，供 B7 `clone-shared-compute` 使用；两者实现保持一致，B7 的定向测试
-（`grhsim-split-phases-tests`）校验预测边界集与 C1 实际 node 边界完全一致。
+语义边界预测 helper `predictGeneralBoundaries` 已随 V3-M3 撤除——B7 赖以工作的
+"C1 锥吸收静态模拟"被证明系统性高估边界（C2 合并会把大多数 node 级边界内部化），
+边界感知克隆改由 [`cpu.st.clone-shared-boundaries`](../passes/clone-shared-boundaries.md)
+（C2.5）在 C2 之后直接消费**真实超节点边界**（`sixPhaseBoundaryValues`），
+克隆粒度从"每消费者 op 一份"收紧为"每消费超节点一份"。

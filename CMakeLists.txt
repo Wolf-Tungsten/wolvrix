@@ -128,7 +128,6 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/reg_to_mem.cpp
     lib/grhsim/pass/comb_pack.cpp
     lib/grhsim/pass/canonicalize_compute.cpp
-    lib/grhsim/pass/clone_shared_compute.cpp
     lib/grhsim/pass/bitwise_predicates.cpp
     lib/grhsim/pass/bitwise_muxes.cpp
     lib/grhsim/pass/mux_chain_fold.cpp
@@ -141,13 +140,13 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/extract_output_cones.cpp
     lib/grhsim/pass/migrate_timeslot_tasks.cpp
     lib/grhsim/pass/split_phases.cpp
-    lib/grhsim/pass/general_boundaries.cpp
     lib/grhsim/backend/cpu.cpp
     lib/grhsim/backend/cpu_partition.cpp
     lib/grhsim/backend/cpu_layout.cpp
     lib/grhsim/backend/cpu_schedule.cpp
     lib/grhsim/backend/cpu_emit_plan.cpp
     lib/grhsim/backend/cpu_phase_emit.cpp
+    lib/grhsim/backend/cpu_clone_shared.cpp
     lib/grhsim/convert/grh_to_grhsim.cpp
     lib/grhsim/io/json.cpp
     lib/transform/activity_schedule.cpp

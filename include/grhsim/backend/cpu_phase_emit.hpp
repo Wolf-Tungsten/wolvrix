@@ -17,8 +17,11 @@ namespace wolvrix::lib::grhsim
     // (configure_waveform/dump at every eval boundary) plus extra setup
     // translation units and libfst rules in the generated Makefile.
     // Registered under the public "cpu.st.emit-cpp" pass name.
+    // `memEnableBitmap` (the --mem-enable-bitmap option, default on) emits the
+    // dense P_mem enable shadow bitmap and its sync hooks.
     PassResult emitSixPhaseCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory,
-                                  wolvrix::lib::diag::Diagnostics &diagnostics, bool waveform = false);
+                                  wolvrix::lib::diag::Diagnostics &diagnostics, bool waveform = false,
+                                  bool memEnableBitmap = true);
     void registerCpuPhaseEmitPasses(PassRegistry &registry);
 }
 

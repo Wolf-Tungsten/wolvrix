@@ -20,6 +20,32 @@ two classes that are supernoded by entirely different rules:
   `SinkEvent` supernodes. Sink supernodes never merge with non-sink
   supernodes or with each other.
 
+### A1: shared-enable subdivision inside a signature cluster
+
+A nonempty signature cluster is further subdivided by **shared write
+enable** (`--sink-enable-guard-min-size`, default 8; `0` disables the
+subdivision and restores the pre-A1 mapping):
+
+- A sink node qualifies when it holds exactly one op, that op is
+  `core.state.regWrite(en, next, mask)`, and the producer of `en`
+  (`operands[0]`) is **not** a `core.compute.constant`. Qualifying nodes
+  group by the value id of `en`.
+- Each group with at least `--sink-enable-guard-min-size` members becomes
+  its own `SinkEvent` supernode: same `eventActs` signature, plus the
+  **`enableGuard`** attribute (int64, the value index of the shared `en`).
+  The emitter ANDs one read of that value into the call-site gate
+  (`if(actBitsGuard(sig) && read(enableGuard))`), so the whole cluster is
+  skipped when the shared enable is low — sound because every member write
+  is individually guarded by exactly that value.
+- Everything else — non-`regWrite` sinks, constant-enable writes, groups
+  below the threshold — keeps the previous behavior and lands in the
+  signature's ordinary supernode (no `enableGuard`). The escape class
+  (empty signature) is never subdivided.
+
+Within one signature the guard supernodes come first (ordered by enable
+value id), then the ordinary supernode; all remain sink supernodes after
+the non-sink prefix, so the ordinal invariants below are unchanged.
+
 **Supernode ordinals are fixed here (resolution 2).** The resulting
 supernodes stay direct children of the General branch, **non-sink supernodes
 first** (frame/topological order), **sink supernodes after** (lexicographic
@@ -39,6 +65,13 @@ Every resulting General supernode records two annotations:
   emitter gates a `SinkEvent` supernode once at the call site and drops the
   per-op event guards inside its body (V2-M3).
 - `supernodeCategory` (engaged): `NonSink`, `SinkEscape` or `SinkEvent`.
+- `enableGuard` (optional, A1): only on a guard-subdivided `SinkEvent`
+  supernode — the value index of the members' shared write enable. The
+  verifier requires every op in such a supernode to carry the guard value
+  among its operands. The attribute is a **value reference**: any pass that
+  renumbers values must remap it — `cpu.st.clone-shared-boundaries` (C2.5)
+  rewrites it with `compact()`'s dense value renumbering when it removes
+  migrated shared sources.
 
 The verifier replays the classification: sink supernodes must hold only
 no-result ops (SinkEvent with one common nonempty signature, SinkEscape with
@@ -46,7 +79,9 @@ no event acts at all), non-sink supernodes only value-producing ops, and no
 non-sink supernode may trail a sink supernode in the branch order. Both
 annotations serialize in the partition's positional JSON attr tail
 (`[chunks], [acts…]?, ([supernodeRange] | category)` — the range array and
-the scalar category are mutually exclusive). Checkpoints written before
+the scalar category are mutually exclusive; a guard-subdivided SinkEvent
+supernode trails one more scalar, the `enableGuard` value index, after the
+category). Checkpoints written before
 V2-M1 lack the category element and are rejected by the verifier.
 
 For example (two writes, one shared cone):
@@ -64,5 +99,12 @@ x = not(d) feeds w1 {event_acts:[0]} and w2 {event_acts:[1]}
 
 Diagnostics: `coarsen_iterations`, `coarsened_clusters`,
 `nonsink_supernodes`, `sink_supernodes`, `sink_escape_supernodes`,
-`sink_event_supernodes`, `sink_ops`, `boundary_value_targets`, plus the
+`sink_event_supernodes`, `sink_guard_supernodes` / `sink_guard_ops` (A1:
+supernodes carved out by the enable subdivision and the writes they hold),
+`sink_ops`, `boundary_value_targets`, plus the
 standard `partitions` count.
+
+Integration knob: the XS/HDLBits pipeline scripts read
+`XS_WOLF_GRHSIM_IR_SINK_GUARD_MIN` (default `8`, `0` disables) and pass it
+as `--sink-enable-guard-min-size`; the XS script also accepts the
+`--sink-enable-guard-min-size` CLI override.

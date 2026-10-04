@@ -418,7 +418,14 @@ namespace wolvrix::lib::grhsim
         // enter the frame: they cluster by canonical event signature (the
         // op's sorted event_acts set), one supernode per signature — the
         // empty signature forms the escape class (SinkEscape, fires every
-        // round), nonempty signatures form SinkEvent supernodes. Every
+        // round), nonempty signatures form SinkEvent supernodes. A1: a
+        // nonempty signature cluster is further subdivided by shared write
+        // enable — singleton regWrite nodes with a non-constant en group by
+        // en value id, and a group reaching --sink-enable-guard-min-size
+        // (default 8, 0 disables) becomes its own SinkEvent supernode with
+        // attrs.enableGuard set (the call site ANDs one enable read into
+        // the signature gate); the rest keeps the plain per-signature
+        // supernode. Every
         // supernode records attrs.eventActs (the act union; for sinks that IS
         // the signature) and attrs.supernodeCategory. Child order: non-sink
         // supernodes first (frame/topological order), sink supernodes after
@@ -428,7 +435,7 @@ namespace wolvrix::lib::grhsim
         // final supernode ordinal space consumed by the layout, event
         // bitmaps, schedule and emitter (M5d-6, resolution 2).
         void mergeGeneralSupernodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
-                                    diag::Diagnostics &diagnostics)
+                                    uint32_t guardMinSize, diag::Diagnostics &diagnostics)
         {
             auto &tree = mapping.partitionTree;
             const auto phase = phasePartition(tree, CpuPhase::General);
@@ -511,15 +518,63 @@ namespace wolvrix::lib::grhsim
                 signatureGroups[signature].push_back(index);
                 sinkOps += ops.size();
             }
-            uint64_t escapeSupernodes = 0, eventSupernodes = 0;
+            uint64_t escapeSupernodes = 0, eventSupernodes = 0, guardSupernodes = 0, guardOps = 0;
             for (const auto &[signature, members] : signatureGroups)
             {
+                // A1: inside a nonempty signature, subdivide by shared write
+                // enable. A singleton regWrite node whose en (operands[0])
+                // producer is not a constant joins the group of its en value
+                // id; a group of at least guardMinSize nodes becomes its own
+                // SinkEvent supernode carrying attrs.enableGuard (the call
+                // site ANDs one read of the enable into the signature gate).
+                // Everything else — non-regWrite sinks, constant enables,
+                // small groups — keeps the previous behavior and lands in
+                // the signature's ordinary supernode. The escape class
+                // (empty signature) is never subdivided. guardMinSize == 0
+                // disables the subdivision entirely.
+                std::map<uint32_t, std::vector<uint32_t>> enableGroups;
+                std::vector<uint32_t> ordinary;
+                if (!signature.empty() && guardMinSize > 0)
+                {
+                    for (const auto index : members)
+                    {
+                        const auto &ops = tree.partitions[nodes[index].index - 1].ops;
+                        if (ops.size() != 1) { ordinary.push_back(index); continue; }
+                        const auto &op = model.operations()[ops.front().index - 1];
+                        const auto operands = model.operands(op);
+                        if (model.text(op.opType) != "core.state.regWrite" || operands.size() != 3)
+                        { ordinary.push_back(index); continue; }
+                        const auto producer = graph.producer[operands[0].index];
+                        if (!producer ||
+                            model.text(model.operations()[producer.index - 1].opType) == "core.compute.constant")
+                        { ordinary.push_back(index); continue; }
+                        enableGroups[operands[0].index].push_back(index);
+                    }
+                }
+                else
+                    ordinary = members;
+                for (const auto &[enable, group] : enableGroups)
+                {
+                    if (group.size() < guardMinSize)
+                    {
+                        ordinary.insert(ordinary.end(), group.begin(), group.end());
+                        continue;
+                    }
+                    const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
+                    auto &attrs = tree.partitions[supernode.index - 1].attrs;
+                    attrs.eventActs = signature;
+                    attrs.supernodeCategory = CpuSupernodeCategory::SinkEvent;
+                    attrs.enableGuard = static_cast<int64_t>(enable);
+                    for (auto node : group) attach(tree, supernode, nodes[node]);
+                    ++eventSupernodes; ++guardSupernodes; guardOps += group.size();
+                }
+                if (ordinary.empty()) continue;
                 const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
                 auto &attrs = tree.partitions[supernode.index - 1].attrs;
                 attrs.eventActs = signature;
                 attrs.supernodeCategory = signature.empty() ? CpuSupernodeCategory::SinkEscape
                                                             : CpuSupernodeCategory::SinkEvent;
-                for (auto node : members) attach(tree, supernode, nodes[node]);
+                for (auto node : ordinary) attach(tree, supernode, nodes[node]);
                 if (signature.empty()) ++escapeSupernodes; else ++eventSupernodes;
             }
             const auto finalEdges = ClusterGraph(clusters, edges, sizes.size()).edges.size();
@@ -528,6 +583,8 @@ namespace wolvrix::lib::grhsim
                              " sink_supernodes=" + std::to_string(signatureGroups.size()) +
                              " sink_escape_supernodes=" + std::to_string(escapeSupernodes) +
                              " sink_event_supernodes=" + std::to_string(eventSupernodes) +
+                             " sink_guard_supernodes=" + std::to_string(guardSupernodes) +
+                             " sink_guard_ops=" + std::to_string(guardOps) +
                              " sink_ops=" + std::to_string(sinkOps) +
                              " boundary_value_targets=" + std::to_string(finalEdges), "cpu.st.merge-general-supernodes");
         }
@@ -755,7 +812,7 @@ namespace wolvrix::lib::grhsim
                 CpuBackendMapping mapping = *previous;
                 switch (inputStage_)
                 {
-                case CpuMappingStage::GeneralNodes: mergeGeneralSupernodes(model, mapping, options_[0], diagnostics); break;
+                case CpuMappingStage::GeneralNodes: mergeGeneralSupernodes(model, mapping, options_[0], options_[1], diagnostics); break;
                 case CpuMappingStage::MemWritePlan:
                     packGeneralFunctions(model, mapping, options_[0], options_[1], options_[2], options_[3]); break;
                 default: throw std::logic_error("invalid CPU partition pass stage");
@@ -797,8 +854,13 @@ namespace wolvrix::lib::grhsim
                     seen[index] = true;
                     const auto text = args[i + 1];
                     const auto result = std::from_chars(text.data(), text.data() + text.size(), options[index]);
+                    // Zero disables the sink enable-guard subdivision; every
+                    // other limit must be positive (batch count excepted: it
+                    // means "auto").
+                    const bool zeroAllowed = keys[index] == "--target-batch-count" ||
+                                             keys[index] == "--sink-enable-guard-min-size";
                     if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
-                        (options[index] == 0 && keys[index] != "--target-batch-count"))
+                        (options[index] == 0 && !zeroAllowed))
                     { error = "CPU partition limit must be a positive 32-bit integer"; return {}; }
                 }
                 if (!inputStage) return std::unique_ptr<Pass>(std::make_unique<BuildGeneralNodesPass>(options[0]));
@@ -809,7 +871,7 @@ namespace wolvrix::lib::grhsim
         };
         add("cpu.st.build-general-nodes", std::nullopt, CpuMappingStage::GeneralNodes, {"--max-op-in-compute-node"}, {128});
         add("cpu.st.merge-general-supernodes", CpuMappingStage::GeneralNodes, CpuMappingStage::GeneralSupernodes,
-            {"--max-op-in-compute-supernode"}, {128});
+            {"--max-op-in-compute-supernode", "--sink-enable-guard-min-size"}, {128, 8});
         add("cpu.st.pack-general-functions", CpuMappingStage::MemWritePlan, CpuMappingStage::GeneralFunctions,
             {"--helper-max-estimated-lines", "--batch-max-ops", "--batch-max-estimated-lines", "--target-batch-count"},
             {2048, 2048, 8192, 64});

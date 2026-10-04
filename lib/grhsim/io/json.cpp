@@ -705,9 +705,13 @@ namespace wolvrix::lib::grhsim
                 // Attr tail (V2-M1 shape): [helperChunks...], then an optional
                 // [eventActs...], then either an optional [supernodeRange
                 // offset,count] (emit functions) or a scalar supernode
-                // category (supernodes) — the two never co-occur. A present
-                // later field forces the earlier ones to serialize (possibly
-                // as empty arrays).
+                // category (supernodes) — the two never co-occur — and, on
+                // guard-subdivided SinkEvent supernodes only (A1), a trailing
+                // scalar enableGuard value index. A present later field
+                // forces the earlier ones to serialize (possibly as empty
+                // arrays).
+                if (partition.attrs.enableGuard && !partition.attrs.supernodeCategory)
+                    throw std::runtime_error("CPU mapping enable guard requires a supernode category");
                 if (!partition.attrs.helperChunks.empty() || partition.attrs.eventActs ||
                     partition.attrs.supernodeRange || partition.attrs.supernodeCategory)
                 {
@@ -734,7 +738,10 @@ namespace wolvrix::lib::grhsim
                         writer.endArray();
                     }
                     else if (partition.attrs.supernodeCategory)
+                    {
                         writer.value(static_cast<uint64_t>(*partition.attrs.supernodeCategory));
+                        if (partition.attrs.enableGuard) writer.value(*partition.attrs.enableGuard);
+                    }
                 }
                 writer.endArray();
             }
@@ -957,7 +964,8 @@ namespace wolvrix::lib::grhsim
                 // optional [eventActs...], then either an optional
                 // [supernodeRange offset,count] array (emit functions) or a
                 // scalar supernode category (supernodes) — positional
-                // elements of the partition array.
+                // elements of the partition array; on the category path a
+                // further trailing scalar is the A1 enableGuard value index.
                 bool tailFirst = false;
                 if (reader.nextArray(tailFirst))
                 {
@@ -994,8 +1002,14 @@ namespace wolvrix::lib::grhsim
                                 partition.attrs.eventActs.reset();
                         }
                         else
+                        {
                             partition.attrs.supernodeCategory =
                                 readCpuEnum(reader, CpuSupernodeCategory::SinkEvent);
+                            // A1: a guard-subdivided SinkEvent supernode
+                            // trails its shared-enable value index after the
+                            // category scalar.
+                            if (reader.comma()) partition.attrs.enableGuard = reader.integer();
+                        }
                     }
                     reader.endArray();
                 }

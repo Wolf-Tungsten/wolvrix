@@ -100,6 +100,19 @@ namespace wolvrix::lib::grhsim
                 }
                 else if (attrs.eventActs || attrs.supernodeCategory)
                     return error("supernode annotations require the general-supernode stage");
+                // A1: an enable guard annotates only SinkEvent supernodes
+                // (carved out by shared-enable subdivision) from the
+                // general-supernode stage on; the per-op membership check
+                // runs in the classification walk below.
+                if (attrs.enableGuard &&
+                    !(generalSupernode && atLeast(CpuMappingStage::GeneralSupernodes) &&
+                      attrs.supernodeCategory &&
+                      *attrs.supernodeCategory == CpuSupernodeCategory::SinkEvent))
+                    return error("enable guards annotate only event sink supernodes");
+                if (attrs.enableGuard &&
+                    (*attrs.enableGuard <= 0 ||
+                     static_cast<uint64_t>(*attrs.enableGuard) > model.values().size()))
+                    return error("enable guard is not a valid value index");
                 if (!attrs.helperChunks.empty() &&
                     !(atLeast(CpuMappingStage::GeneralFunctions) && generalSupernode))
                     return error("helper chunks annotate only packed general supernodes");
@@ -335,6 +348,18 @@ namespace wolvrix::lib::grhsim
                                 return error("sink supernode mixes event signatures");
                             if (category == CpuSupernodeCategory::SinkEscape && !opActs.empty())
                                 return error("escape sink supernode holds an event-carrying op");
+                            // A1: every op in a guard supernode must be
+                            // individually guarded by the shared enable —
+                            // the call-site gate is only sound when no op
+                            // can fire without it.
+                            if (attrs.enableGuard)
+                            {
+                                const auto guard = static_cast<uint32_t>(*attrs.enableGuard);
+                                const auto operands = model.operands(op);
+                                if (std::none_of(operands.begin(), operands.end(),
+                                                 [guard](ValueId value) { return value.index == guard; }))
+                                    return error("enable guard supernode holds an op without the guard operand");
+                            }
                             ordinalOfOp[opId.index] = ordinal;
                         }
                     if (*attrs.eventActs != acts)

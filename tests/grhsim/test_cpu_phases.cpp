@@ -1348,6 +1348,233 @@ namespace
         requirePackedGeneralBranch(*model.cpuMapping(), "f12");
         roundTrip(model);
     }
+
+    // A1: a nonempty signature cluster subdivides by shared write enable.
+    // Singleton regWrite nodes with a non-constant en group by en value id;
+    // a group reaching --sink-enable-guard-min-size becomes its own
+    // SinkEvent supernode carrying attrs.enableGuard, while small groups,
+    // constant-enable writes and the escape class keep the previous
+    // behavior. K=0 restores the pre-A1 mapping exactly.
+    void sinkEnableGuardTest()
+    {
+        struct Fixture
+        {
+            std::vector<OpId> groupA, groupB, groupC, constEn;
+            OpId escapeWrite;
+            ValueId enA, enB;
+        };
+        const auto buildFixture = [](GrhSimModel &model) {
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto clk = addInputRead(model, "clk", SimPhase::Event);
+            addEdgeDet(model, clk, 0);
+            const auto d = addInputRead(model, "d");
+            const auto one = addConstant(model, bit, "1'b1");
+            Fixture fixture;
+            fixture.enA = addInputRead(model, "enA");
+            fixture.enB = addInputRead(model, "enB");
+            const auto enC = addInputRead(model, "enC");
+            const auto addWrites = [&](std::vector<OpId> &target, ValueId en, uint32_t count, const char *prefix) {
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    const std::string name = prefix + std::to_string(i);
+                    target.push_back(addRegWrite(model, en, d, one, addState(model, name.c_str(), bit, "1'b0"), {0}));
+                }
+            };
+            addWrites(fixture.groupA, fixture.enA, 5, "qa");
+            addWrites(fixture.groupB, fixture.enB, 4, "qb");
+            addWrites(fixture.groupC, enC, 3, "qc");
+            addWrites(fixture.constEn, one, 2, "qd");
+            fixture.escapeWrite = addRegWrite(model, fixture.enA, d, one, addState(model, "qe", bit, "1'b0"), {});
+            return fixture;
+        };
+
+        // K=4: the 5- and 4-node enable groups carve out guard supernodes.
+        {
+            GrhSimModel model("f13_sink_guard");
+            const auto fixture = buildFixture(model);
+            require(verifies(model), "f13: fixture rejected");
+            attributeAndInit(model);
+            const auto merged = runPass(model, "cpu.st.merge-general-supernodes",
+                                        std::array<std::string_view, 2>{"--sink-enable-guard-min-size", "4"});
+            require(infoValue(merged, "cpu.st.merge-general-supernodes", "sink_guard_supernodes=") ==
+                    std::optional<uint64_t>(2), "f13: guard supernode count wrong");
+            require(infoValue(merged, "cpu.st.merge-general-supernodes", "sink_guard_ops=") ==
+                    std::optional<uint64_t>(9), "f13: guard op count wrong");
+            const auto &mapping = *model.cpuMapping();
+            const auto *guardA = supernodeOf(mapping, fixture.groupA.front());
+            const auto *guardB = supernodeOf(mapping, fixture.groupB.front());
+            const auto *ordinary = supernodeOf(mapping, fixture.groupC.front());
+            const auto *escape = supernodeOf(mapping, fixture.escapeWrite);
+            require(guardA && guardB && ordinary && escape, "f13: supernode lookup failed");
+            require(guardA != guardB && guardA != ordinary && guardB != ordinary,
+                    "f13: enable groups did not form distinct supernodes");
+            requireCategory(*guardA, CpuSupernodeCategory::SinkEvent, "f13");
+            requireCategory(*guardB, CpuSupernodeCategory::SinkEvent, "f13");
+            requireCategory(*ordinary, CpuSupernodeCategory::SinkEvent, "f13");
+            requireCategory(*escape, CpuSupernodeCategory::SinkEscape, "f13");
+            require(guardA->attrs.enableGuard && *guardA->attrs.enableGuard == int64_t(fixture.enA.index),
+                    "f13: first guard supernode enableGuard wrong");
+            require(guardB->attrs.enableGuard && *guardB->attrs.enableGuard == int64_t(fixture.enB.index),
+                    "f13: second guard supernode enableGuard wrong");
+            require(!ordinary->attrs.enableGuard && !escape->attrs.enableGuard,
+                    "f13: ordinary or escape supernode gained an enableGuard");
+            require(guardA->attrs.eventActs && *guardA->attrs.eventActs == std::vector<int64_t>{0} &&
+                    guardB->attrs.eventActs && *guardB->attrs.eventActs == std::vector<int64_t>{0},
+                    "f13: guard supernode signature wrong");
+            require(flatOps(mapping, guardA->id).size() == 5 && flatOps(mapping, guardB->id).size() == 4,
+                    "f13: guard supernode sizes wrong");
+            for (auto op : fixture.groupA)
+                require(containsOp(mapping, *guardA, op), "f13: group A write misplaced");
+            for (auto op : fixture.groupB)
+                require(containsOp(mapping, *guardB, op), "f13: group B write misplaced");
+            for (auto op : fixture.groupC)
+                require(containsOp(mapping, *ordinary, op), "f13: small-group write left the ordinary supernode");
+            for (auto op : fixture.constEn)
+                require(containsOp(mapping, *ordinary, op), "f13: constant-enable write left the ordinary supernode");
+            require(containsOp(mapping, *ordinary, fixture.constEn.back()) &&
+                    !containsOp(mapping, *ordinary, fixture.groupA.front()),
+                    "f13: ordinary supernode membership wrong");
+            require(flatOps(mapping, escape->id) == std::vector<OpId>{fixture.escapeWrite},
+                    "f13: escape supernode wrong");
+            require(supernodes(mapping).size() == 5, "f13: total supernode count wrong");
+            requireSinkOrder(mapping, "f13");
+            require(verifies(model), "f13: guarded mapping rejected");
+            roundTrip(model);
+            advanceToFunctions(model);
+            requirePackedGeneralBranch(*model.cpuMapping(), "f13");
+            require(verifies(model), "f13: guarded mapping rejected after packing");
+            roundTrip(model);
+        }
+
+        // K=0: the subdivision is off and the mapping matches the pre-A1
+        // shape — one ordinary supernode per signature, no enableGuard.
+        {
+            GrhSimModel model("f13_sink_guard_off");
+            const auto fixture = buildFixture(model);
+            require(verifies(model), "f13(off): fixture rejected");
+            attributeAndInit(model);
+            const auto merged = runPass(model, "cpu.st.merge-general-supernodes",
+                                        std::array<std::string_view, 2>{"--sink-enable-guard-min-size", "0"});
+            require(infoValue(merged, "cpu.st.merge-general-supernodes", "sink_guard_supernodes=") ==
+                    std::optional<uint64_t>(0), "f13(off): subdivision not disabled");
+            const auto &mapping = *model.cpuMapping();
+            require(supernodes(mapping).size() == 3,
+                    "f13(off): expected non-sink, event and escape supernodes");
+            const auto *ordinary = supernodeOf(mapping, fixture.groupA.front());
+            require(ordinary, "f13(off): event sink supernode missing");
+            requireCategory(*ordinary, CpuSupernodeCategory::SinkEvent, "f13(off)");
+            require(!ordinary->attrs.enableGuard, "f13(off): ordinary supernode gained an enableGuard");
+            require(containsOp(mapping, *ordinary, fixture.groupB.front()) &&
+                    containsOp(mapping, *ordinary, fixture.groupC.front()) &&
+                    containsOp(mapping, *ordinary, fixture.constEn.front()),
+                    "f13(off): signature cluster did not hold every event write");
+            require(flatOps(mapping, ordinary->id).size() == 14, "f13(off): event cluster size wrong");
+            const auto *escape = supernodeOf(mapping, fixture.escapeWrite);
+            require(escape && escape != ordinary, "f13(off): escape supernode missing");
+            for (const auto *supernode : supernodes(mapping))
+                require(!supernode->attrs.enableGuard, "f13(off): an enableGuard survived K=0");
+            requireSinkOrder(mapping, "f13(off)");
+            require(verifies(model), "f13(off): mapping rejected");
+            roundTrip(model);
+        }
+    }
+
+    // A1 + C2.5 (V3-M3): clone-shared-boundaries removes a migrated shared
+    // source and runs compact(), which densely renumbers every live value.
+    // attrs.enableGuard is a value-id payload, so the pass must remap it —
+    // otherwise the verifier's "guard must be an operand of every member
+    // op" check fails on any design where cloning happened. The fixture
+    // places a cloneable shared not(d) value BELOW the guard enable in the
+    // value-id space, so compact provably shifts the guard value.
+    void sinkEnableGuardCloneRemapTest()
+    {
+        GrhSimModel model("f14_guard_clone_remap");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto clk = addInputRead(model, "clk", SimPhase::Event);
+        addEdgeDet(model, clk, 0);
+        // d fans out to the shared source and to every write's next operand,
+        // so the not(d) source meets the "varying parent is shared" rule.
+        const auto d = addInputRead(model, "d");
+        const auto x = addInputRead(model, "x");
+        const auto y = addInputRead(model, "y");
+        const auto e1 = addInputRead(model, "e1");
+        const auto e2 = addInputRead(model, "e2");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto shared = addNot(model, d, "shared");
+        addAnd(model, shared, x, "useA");
+        addOr(model, shared, y, "useB");
+        // The guard enable is created AFTER the shared source, so its value
+        // index is higher and compact shifts it down when the source dies.
+        const auto en = addOr(model, e1, e2, "en");
+        for (uint32_t i = 0; i < 5; ++i)
+        {
+            const std::string name = "q" + std::to_string(i);
+            addRegWrite(model, en, d, one, addState(model, name.c_str(), bit, "1'b0"), {0});
+        }
+        require(verifies(model), "f14: fixture rejected");
+        runPass(model, "grhsim.select-state-stores");
+        runPass(model, "grhsim.split-phases");
+        runPass(model, "cpu.st.build-general-nodes",
+                std::array<std::string_view, 2>{"--max-op-in-compute-node", "1"});
+        runPass(model, "cpu.st.merge-general-supernodes",
+                std::array<std::string_view, 4>{"--max-op-in-compute-supernode", "1",
+                                                "--sink-enable-guard-min-size", "4"});
+        const auto guardSupernodeOf = [](const CpuBackendMapping &mapping) {
+            const CpuPartition *result = nullptr;
+            for (const auto &partition : mapping.partitionTree.partitions)
+                if (partition.attrs.enableGuard)
+                {
+                    require(!result, "f14: more than one guard supernode");
+                    result = &partition;
+                }
+            return result;
+        };
+        const auto memberEn = [&](const CpuBackendMapping &mapping, const CpuPartition &supernode) {
+            uint32_t sharedIndex = 0;
+            for (auto opId : flatOps(mapping, supernode.id))
+            {
+                const auto &op = model.operations()[opId.index - 1];
+                require(model.text(op.opType) == "core.state.regWrite",
+                        "f14: guard supernode holds a non-regWrite op");
+                const auto enIndex = model.operands(op).front().index;
+                if (!sharedIndex) sharedIndex = enIndex;
+                require(enIndex == sharedIndex, "f14: guard members disagree on the enable value");
+            }
+            require(sharedIndex != 0, "f14: guard supernode is empty");
+            return sharedIndex;
+        };
+        const auto *before = guardSupernodeOf(*model.cpuMapping());
+        require(before, "f14: guard supernode missing after C2");
+        require(flatOps(*model.cpuMapping(), before->id).size() == 5,
+                "f14: guard supernode size wrong after C2");
+        const auto oldGuard = static_cast<uint32_t>(*before->attrs.enableGuard);
+        require(oldGuard == en.index, "f14: C2 guard does not name the shared enable");
+        require(oldGuard > shared.index,
+                "f14: fixture must order the enable value above the shared source");
+        require(memberEn(*model.cpuMapping(), *before) == oldGuard,
+                "f14: C2 guard disagrees with the member writes");
+
+        const auto cloned = runPass(model, "cpu.st.clone-shared-boundaries");
+        require(infoValue(cloned, "cpu.st.clone-shared-boundaries", "cloned=") ==
+                std::optional<uint64_t>(2), "f14: expected the shared source to clone into both consumers");
+        require(infoValue(cloned, "cpu.st.clone-shared-boundaries", "dead_sources_removed=") ==
+                std::optional<uint64_t>(1), "f14: shared source must die so compact renumbers");
+        const auto &mapping = *model.cpuMapping();
+        const auto *after = guardSupernodeOf(mapping);
+        require(after, "f14: guard supernode lost in clone-shared-boundaries");
+        const auto newEn = memberEn(mapping, *after);
+        require(newEn == oldGuard - 1, "f14: compact did not shift the shared enable as expected");
+        require(*after->attrs.enableGuard == int64_t(newEn),
+                "f14: enableGuard was not remapped by compact");
+        require(verifies(model), "f14: guarded mapping rejected after clone-shared-boundaries");
+        roundTrip(model);
+        advanceToFunctions(model);
+        requirePackedGeneralBranch(*model.cpuMapping(), "f14");
+        require(verifies(model), "f14: guarded mapping rejected after packing");
+        roundTrip(model);
+    }
 }
 
 int main()
@@ -1367,6 +1594,8 @@ int main()
         translationUnitsTest();
         translationUnitsSplitTest();
         latchIcgShapeTest();
+        sinkEnableGuardTest();
+        sinkEnableGuardCloneRemapTest();
         std::cout << "CPU six-phase mapping tests passed\n";
         return 0;
     }

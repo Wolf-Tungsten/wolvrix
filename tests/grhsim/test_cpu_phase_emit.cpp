@@ -62,7 +62,10 @@ namespace
     // default small arrays classify regLatch and their writes become
     // General-phase NBA ops (M5d-6). tinyTu shrinks the C6/C8 size caps so a
     // small model still exercises chunked functions and multi-TU emit.
-    void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes, bool allMem = false, bool tinyTu = false)
+    // sinkGuardMin pins C2's A1 --sink-enable-guard-min-size (the pass
+    // default is 8, so existing callers see no behavior change).
+    void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes, bool allMem = false, bool tinyTu = false,
+                             uint32_t sinkGuardMin = 8)
     {
         runPass(model, "grhsim.classify-event-inputs");
         runPass(model, "grhsim.lower-edge-detect");
@@ -74,17 +77,20 @@ namespace
         else
             runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.split-phases");
+        const auto guardMinText = std::to_string(sinkGuardMin);
         if (splitSupernodes)
         {
             const std::array<std::string_view, 2> nodeCap{"--max-op-in-compute-node", "1"};
-            const std::array<std::string_view, 2> supernodeCap{"--max-op-in-compute-supernode", "1"};
+            const std::array<std::string_view, 4> supernodeCap{"--max-op-in-compute-supernode", "1",
+                                                               "--sink-enable-guard-min-size", guardMinText};
             runPass(model, "cpu.st.build-general-nodes", nodeCap);
             runPass(model, "cpu.st.merge-general-supernodes", supernodeCap);
         }
         else
         {
+            const std::array<std::string_view, 2> guardMin{"--sink-enable-guard-min-size", guardMinText};
             runPass(model, "cpu.st.build-general-nodes");
-            runPass(model, "cpu.st.merge-general-supernodes");
+            runPass(model, "cpu.st.merge-general-supernodes", guardMin);
         }
         runPass(model, "cpu.st.layout-named-stores");
         runPass(model, "cpu.st.build-event-activation-map");
@@ -1076,6 +1082,144 @@ namespace
                 std::to_string(guards) + " eventActStore guard texts");
     }
 
+    // (7c) A1 sink enable-guard subdivision: eight regWrites sharing one
+    // computed enable and one event signature carve out a guard-gated
+    // SinkEvent supernode — the scan call site ANDs one boundary read of the
+    // enable into the actBitsGuard gate, while the constant-enabled writes
+    // keep the plain signature gate. The member write ops are untouched
+    // (the V2-M3 in-body guard drop applies to every sink body), so the only
+    // new text is the call-site conjunction. Functionally the guard
+    // suppresses exactly the shared-enable writes while en is low.
+    void sinkEnableGuardTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_sink_guard");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto enA = addInputRead(model, "enA", bit);
+        const auto enB = addInputRead(model, "enB", bit);
+        const auto d = addInputRead(model, "d", bit);
+        const auto one = addConstant(model, bit, "1'b1");
+        // A computed enable crosses the supernode boundary as a named
+        // boundary field — the typical XS shape (en decoded by comb logic).
+        const auto en = addCompute(model, "core.compute.or", bit, "en", {enA, enB});
+        std::vector<ValueId> guardedReads;
+        std::vector<StateId> guardedStates;
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            const auto q = addState(model, "q" + std::to_string(i), bit, "1'b0");
+            addEventRegWrite(model, en, d, one, q, {{clk, "posedge"}});
+            guardedStates.push_back(q);
+            guardedReads.push_back(addStateRead(model, q, "q" + std::to_string(i) + "_r"));
+        }
+        const auto r0 = addState(model, "r0", bit, "1'b0");
+        const auto r1 = addState(model, "r1", bit, "1'b0");
+        addEventRegWrite(model, one, d, one, r0, {{clk, "posedge"}});
+        addEventRegWrite(model, one, d, one, r1, {{clk, "posedge"}});
+        auto any = guardedReads.front(), all = guardedReads.front();
+        for (uint32_t i = 1; i < guardedReads.size(); ++i)
+        {
+            any = addCompute(model, "core.compute.or", bit, "qany" + std::to_string(i), {any, guardedReads[i]});
+            all = addCompute(model, "core.compute.and", bit, "qall" + std::to_string(i), {all, guardedReads[i]});
+        }
+        addOutputWrite(model, "qAny", bit, any);
+        addOutputWrite(model, "qAll", bit, all);
+        addOutputWrite(model, "r0o", bit, addStateRead(model, r0, "r0_r"));
+        addOutputWrite(model, "r1o", bit, addStateRead(model, r1, "r1_r"));
+        require(verifies(model), "sink-guard fixture rejected");
+        runSixPhasePipeline(model, false);
+        const auto &mapping = *model.cpuMapping();
+        const auto &tree = mapping.partitionTree;
+        const auto opCount = [&](const CpuPartition &supernode) {
+            uint64_t count = 0;
+            for (auto child : supernode.children) count += tree.partitions[child.index - 1].ops.size();
+            return count;
+        };
+        // Exactly one guard supernode: SinkEvent, enableGuard naming the
+        // shared enable value, holding exactly the eight shared-en writes.
+        const CpuPartition *guardSupernode = nullptr;
+        uint32_t guardCount = 0;
+        for (const auto &partition : tree.partitions)
+        {
+            if (!partition.attrs.enableGuard) continue;
+            ++guardCount;
+            guardSupernode = &partition;
+        }
+        require(guardCount == 1 && guardSupernode, "sink-guard: expected exactly one guard supernode");
+        // The guard names exactly the value the member writes see as their
+        // en operand — the semantic passes may have rewired the fixture-time
+        // value, so compare against the live operand.
+        uint32_t sharedEnIndex = 0;
+        for (const auto &op : model.operations())
+        {
+            if (model.text(op.opType) != "core.state.regWrite") continue;
+            const auto refs = model.objectRefs(op);
+            if (refs.size() != 1) continue;
+            bool guardedWrite = false;
+            for (auto state : guardedStates) guardedWrite = guardedWrite || refs.front().index == state.index;
+            if (!guardedWrite) continue;
+            const auto enOperand = model.operands(op).front().index;
+            if (!sharedEnIndex) sharedEnIndex = enOperand;
+            require(enOperand == sharedEnIndex, "sink-guard: guarded writes disagree on the enable value");
+        }
+        require(sharedEnIndex != 0, "sink-guard: guarded writes not found");
+        require(*guardSupernode->attrs.enableGuard == int64_t(sharedEnIndex),
+                "sink-guard: enableGuard does not name the shared enable");
+        require(guardSupernode->attrs.supernodeCategory &&
+                *guardSupernode->attrs.supernodeCategory == CpuSupernodeCategory::SinkEvent,
+                "sink-guard: guard supernode is not a SinkEvent");
+        require(guardSupernode->attrs.eventActs && guardSupernode->attrs.eventActs->size() == 1,
+                "sink-guard: guard supernode signature wrong");
+        require(opCount(*guardSupernode) == 8,
+                "sink-guard: guard supernode does not hold the eight shared-enable writes");
+        // The ordinary signature cluster keeps the two constant-enable
+        // writes and carries no guard.
+        bool sawOrdinary = false;
+        for (const auto &partition : tree.partitions)
+        {
+            if (partition.attrs.kind != CpuPartitionKind::Supernode || partition.attrs.enableGuard ||
+                !partition.attrs.supernodeCategory ||
+                *partition.attrs.supernodeCategory != CpuSupernodeCategory::SinkEvent)
+                continue;
+            require(!sawOrdinary, "sink-guard: more than one ordinary event cluster");
+            sawOrdinary = true;
+            require(opCount(partition) == 2,
+                    "sink-guard: ordinary cluster does not hold exactly the constant-enable writes");
+        }
+        require(sawOrdinary, "sink-guard: ordinary event cluster missing");
+        compileAndRun(model, root / "sink_guard", {
+            {{{"clk", "false"}, {"enA", "false"}, {"enB", "false"}, {"d", "true"}},
+             {{"qAny", "false"}, {"qAll", "false"}, {"r0o", "false"}, {"r1o", "false"}}},
+            // en low at the posedge: only the constant-enabled pair writes.
+            {{{"clk", "true"}}, {{"qAny", "false"}, {"qAll", "false"}, {"r0o", "true"}, {"r1o", "true"}}},
+            // Raising en without an edge changes nothing.
+            {{{"clk", "false"}, {"enA", "true"}}, {{"qAny", "false"}, {"qAll", "false"}}},
+            // en high at the posedge: every guarded write lands.
+            {{{"clk", "true"}}, {{"qAny", "true"}, {"qAll", "true"}}},
+            // d low with en via the other leg: writes of 0 land everywhere.
+            {{{"clk", "false"}, {"enA", "false"}, {"enB", "true"}, {"d", "false"}},
+             {{"qAll", "true"}, {"r0o", "true"}}},
+            {{{"clk", "true"}}, {{"qAny", "false"}, {"qAll", "false"}, {"r0o", "false"}, {"r1o", "false"}}},
+        });
+        // Source pin: the guarded call site is the only place an actBitsGuard
+        // text is ANDed with a boundary read, and the sink bodies still carry
+        // no per-op event guard (exactly two call-site gates survive: the
+        // guarded cluster and the ordinary one).
+        const auto source = concatModelSources(root / "sink_guard" / "model");
+        const auto countOf = [&source](const std::string &needle) {
+            std::size_t count = 0;
+            for (std::size_t at = 0; (at = source.find(needle, at)) != std::string::npos; at += needle.size())
+                ++count;
+            return count;
+        };
+        require(countOf("&1)&&boundaryValueStore.") == 1,
+                "sink-guard: expected exactly one enable-guarded sink call site");
+        const auto guards = countOf("((eventActStore[") - countOf("static_cast<unsigned>((eventActStore[");
+        require(guards == 2,
+                "sink-guard: per-op event guards leaked back into the sink bodies, got " +
+                std::to_string(guards) + " eventActStore guard texts");
+    }
+
     // (8) Event-free mem writes converge via cell change detection: memWrite
     // (single cell), memFill (broadcast), memAssign (whole-array copy from an
     // initialized source). Every write re-runs every round while enabled, so
@@ -1247,6 +1391,175 @@ namespace
             {{{"enc", "false"}, {"clk", "false"}}, {{"o", "204"}}},
             {{{"clk", "true"}}, {{"o", "204"}}},
         }, false, {}, tinyTu);
+    }
+
+    // (10b) P_mem enable shadow bitmap: boundary-backed 1-bit write enables
+    // become dense memEnableBits reads (an aggregate word-OR wraps each run of
+    // fully shadowed ports), kept in sync by the boundary compare-store /
+    // pInput hooks and built once in init(). --mem-enable-bitmap off restores
+    // the plain scattered boundary reads.
+    void memEnableBitmapTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_mem_bitmap");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto memType = model.arrayType(word, 16);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto bypass = addInputRead(model, "bypass", bit);
+        const auto waddr = addInputRead(model, "waddr", addrType);
+        const auto wdata = addInputRead(model, "wdata", word);
+        const auto raddr = addInputRead(model, "raddr", addrType);
+        const auto mask = addConstant(model, word, "8'hff");
+        // Computed enable: boundary-published by its supernode, mirrored
+        // through the publishBoundary hook. wen drives the second port
+        // directly (input-backed enable, mirrored through the pInput hook).
+        const auto nb = addCompute(model, "core.compute.not", bit, "nb", {bypass});
+        const auto en = addCompute(model, "core.compute.and", bit, "en", {wen, nb});
+        const auto memA = addMemState(model, "memA", memType, "8'h00");
+        const auto memB = addMemState(model, "memB", memType, "8'h00");
+        addEventWrite(model, "core.state.memWrite", {en, waddr, wdata, mask}, memA, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, memB, {{clk, "posedge"}});
+        addOutputWrite(model, "oa", word, addMemRead(model, memA, word, raddr, "ra"));
+        addOutputWrite(model, "ob", word, addMemRead(model, memB, word, raddr, "rb"));
+        require(verifies(model), "mem enable bitmap fixture rejected");
+        runSixPhasePipeline(model, false, true);
+        compileAndRun(model, root / "mem_enable_bitmap", {
+            {{{"clk", "false"}, {"wen", "false"}, {"bypass", "false"}, {"waddr", "0"}, {"wdata", "0"}, {"raddr", "0"}},
+             {{"oa", "0"}, {"ob", "0"}}},
+            {{{"wen", "true"}, {"waddr", "3"}, {"wdata", "29"}, {"raddr", "3"}}, {{"oa", "0"}, {"ob", "0"}}},
+            {{{"clk", "true"}}, {{"oa", "29"}, {"ob", "29"}}},   // en=wen&!bypass=1: both arrays written
+            {{{"clk", "false"}}, {{"oa", "29"}, {"ob", "29"}}},
+            {{{"bypass", "true"}, {"wdata", "47"}}, {{"oa", "29"}, {"ob", "29"}}},
+            {{{"clk", "true"}}, {{"oa", "29"}, {"ob", "47"}}},   // en=0: memA holds; memB (wen) takes 47
+            {{{"bypass", "false"}, {"clk", "false"}}, {{"oa", "29"}, {"ob", "47"}}},
+            {{{"clk", "true"}}, {{"oa", "47"}, {"ob", "47"}}},   // en=1 again: memA catches up
+        });
+        const std::string text = concatModelSources(root / "mem_enable_bitmap" / "model");
+        require(text.find("memEnableBits[") != std::string::npos, "mem enable bitmap missing from emitted model");
+        {
+            std::ifstream headerStream(root / "mem_enable_bitmap" / "model" / "grhsim_phase_mem_bitmap.hpp");
+            const std::string header{std::istreambuf_iterator<char>(headerStream), std::istreambuf_iterator<char>()};
+            require(header.find("std::array<std::uint64_t,1> memEnableBits{};") != std::string::npos,
+                    "mem enable bitmap member declaration missing");
+        }
+        const auto countOccurrences = [](const std::string &haystack, const std::string &needle) {
+            unsigned count = 0;
+            for (std::size_t at = 0; (at = haystack.find(needle, at)) != std::string::npos; at += needle.size())
+                ++count;
+            return count;
+        };
+        const auto pMemAt = text.find("::pMem_c0()");
+        require(pMemAt != std::string::npos, "pMem chunk body missing");
+        const auto pMemEnd = text.find("\nvoid ", pMemAt + 1);
+        const auto pMem = text.substr(pMemAt, pMemEnd == std::string::npos ? pMemEnd : pMemEnd - pMemAt);
+        require(pMem.find("memEnableBits[0]") != std::string::npos, "pMem chunk does not read the enable bitmap");
+        require(pMem.find(")!=UINT64_C(0)){") != std::string::npos,
+                "fully shadowed port run misses the aggregate word skip");
+        // The compare-store hook mirrors the computed enable into its bit, and
+        // init() builds every bit from the boundary fields.
+        require(text.find("?UINT64_C(0x") != std::string::npos &&
+                text.find("memEnableBits[0]=(boundaryValueStore.") != std::string::npos,
+                "init-time bitmap build missing");
+        require(text.find("=(cpu_value)?(memEnableBits[") != std::string::npos,
+                "publishBoundary enable sync hook missing");
+        // Off mode: no bitmap anywhere, and the pMem chunk keeps the two
+        // scattered boundary enable reads the bitmap replaced.
+        const auto offDir = root / "mem_enable_bitmap_off";
+        std::filesystem::remove_all(offDir);
+        std::filesystem::create_directories(offDir);
+        {
+            diag::Diagnostics offDiagnostics;
+            const auto offResult = emitSixPhaseCpuCpp(model, offDir / "model", offDiagnostics, false, false);
+            require(offResult.success, "mem-enable-bitmap off emit failed");
+        }
+        const std::string offText = concatModelSources(offDir / "model");
+        require(offText.find("memEnableBits") == std::string::npos,
+                "mem-enable-bitmap off still emits the shadow bitmap");
+        const auto offMemAt = offText.find("::pMem_c0()");
+        require(offMemAt != std::string::npos, "off-mode pMem chunk body missing");
+        const auto offMemEnd = offText.find("\nvoid ", offMemAt + 1);
+        const auto offMem = offText.substr(offMemAt, offMemEnd == std::string::npos ? offMemEnd : offMemEnd - offMemAt);
+        require(countOccurrences(offMem, "boundaryValueStore.") == countOccurrences(pMem, "boundaryValueStore.") + 2,
+                "bitmap should remove exactly the two enable reads from the pMem chunk");
+    }
+
+    // (10c) P_mem act clustering + dead compare-store elimination: ports
+    // sharing one eventActStore guard get a single hoisted test per run; a
+    // boundary value consumed only by P_mem (no supernode fanout, no bitmap
+    // hook) publishes with a plain store instead of a compare-store.
+    void memActClusterDeadCompareTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_mem_cluster");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto memType = model.arrayType(word, 16);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto e1 = addInputRead(model, "e1", bit);
+        const auto e2 = addInputRead(model, "e2", bit);
+        const auto a = addInputRead(model, "a", word);
+        const auto b = addInputRead(model, "b", word);
+        const auto waddr = addInputRead(model, "waddr", addrType);
+        const auto raddr = addInputRead(model, "raddr", addrType);
+        const auto mask = addConstant(model, word, "8'hff");
+        // Computed enable (keeps its compare-store: the enable bitmap hook is
+        // the change consumer); computed data values feed only P_mem ports, so
+        // their publishes must degenerate to plain stores.
+        const auto en = addCompute(model, "core.compute.and", bit, "en", {e1, e2});
+        const auto sum = addCompute(model, "core.compute.add", word, "sum", {a, b});
+        const auto diff = addCompute(model, "core.compute.sub", word, "diff", {a, b});
+        const auto memA = addMemState(model, "memA", memType, "8'h00");
+        const auto memB = addMemState(model, "memB", memType, "8'h00");
+        addEventWrite(model, "core.state.memWrite", {en, waddr, sum, mask}, memA, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.memWrite", {en, waddr, diff, mask}, memB, {{clk, "posedge"}});
+        addOutputWrite(model, "oa", word, addMemRead(model, memA, word, raddr, "ra"));
+        addOutputWrite(model, "ob", word, addMemRead(model, memB, word, raddr, "rb"));
+        require(verifies(model), "mem act cluster fixture rejected");
+        runSixPhasePipeline(model, false, true);
+        compileAndRun(model, root / "mem_act_cluster", {
+            {{{"clk", "false"}, {"e1", "false"}, {"e2", "false"}, {"a", "0"}, {"b", "0"}, {"waddr", "0"}, {"raddr", "0"}},
+             {{"oa", "0"}, {"ob", "0"}}},
+            {{{"e1", "true"}, {"e2", "true"}, {"a", "30"}, {"b", "12"}, {"waddr", "5"}, {"raddr", "5"}},
+             {{"oa", "0"}, {"ob", "0"}}},
+            {{{"clk", "true"}}, {{"oa", "42"}, {"ob", "18"}}},    // both ports fire on the same edge
+            {{{"clk", "false"}}, {{"oa", "42"}, {"ob", "18"}}},
+            {{{"e2", "false"}, {"a", "7"}, {"b", "1"}}, {{"oa", "42"}, {"ob", "18"}}},
+            {{{"clk", "true"}}, {{"oa", "42"}, {"ob", "18"}}},    // en=0: neither writes
+            {{{"e2", "true"}, {"clk", "false"}}, {{"oa", "42"}, {"ob", "18"}}},
+            {{{"clk", "true"}}, {{"oa", "8"}, {"ob", "6"}}},      // en=1 again: both write
+        });
+        const std::string text = concatModelSources(root / "mem_act_cluster" / "model");
+        const auto countOccurrences = [](const std::string &haystack, const std::string &needle) {
+            unsigned count = 0;
+            for (std::size_t at = 0; (at = haystack.find(needle, at)) != std::string::npos; at += needle.size())
+                ++count;
+            return count;
+        };
+        const auto pMemAt = text.find("::pMem_c0()");
+        require(pMemAt != std::string::npos, "pMem chunk body missing");
+        const auto pMemEnd = text.find("\nvoid ", pMemAt + 1);
+        const auto pMem = text.substr(pMemAt, pMemEnd == std::string::npos ? pMemEnd : pMemEnd - pMemAt);
+        // Act clustering: the two same-act ports share one hoisted guard.
+        require(countOccurrences(pMem, "((eventActStore") == 1,
+                "same-act ports were not folded into one hoisted guard");
+        // Dead compare elimination: the computed data values (sum/diff) are
+        // P_mem-only, so their publishes are unconditional stores; the hooked
+        // enable keeps its compare-store (exactly one left in the model).
+        unsigned plainStores = 0;
+        for (const auto &line : linesOf(text))
+        {
+            const auto first = line.find_first_not_of(' ');
+            if (first == std::string::npos || line.find("if(") != std::string::npos) continue;
+            if (line.compare(first, 19, "boundaryValueStore.") == 0 && line.find('=') != std::string::npos)
+                ++plainStores;
+        }
+        require(plainStores >= 2, "P_mem-only boundary values still carry compare-stores");
+        require(countOccurrences(text, "!=cpu_value") == 1,
+                "only the hooked enable publish should keep its compare-store");
     }
 
     // (11) General-phase $display under the V2 (M2) firing rules: the
@@ -1861,10 +2174,13 @@ int main()
         glitchClockTest(root, true);
         latchRingTest(root);
         icgGatedSramTest(root);
+        sinkEnableGuardTest(root);
         memConvergeTest(root);
         memReaderGatingTest(root);
         memPriorityTest(root);
         memPriorityTest(root, true);
+        memEnableBitmapTest(root);
+        memActClusterDeadCompareTest(root);
         generalDisplayTest(root);
         monitorFreeTest(root);
         monitorEventTest(root);

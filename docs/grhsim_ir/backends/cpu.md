@@ -181,6 +181,7 @@ PartitionAttrs
   event_acts: Int64[]?                             # General 超节点命中的聚类并集（C2 起 engaged，无事件为空数组；sink 超节点上即事件签名）
   supernode_range: {offset: UInt32, count: UInt32}?  # General 分枝尾随 EmitFunction 叶子（C6 起）
   supernode_category: non_sink | sink_escape | sink_event?  # General 超节点分类（C2 起 engaged，V2-M1）
+  enable_guard: Int64?                             # 共享 en 细分的 SinkEvent 超节点：成员共有写使能的 value index（C2 起，A1）
 ```
 
 `event_domain`/`active_word` kind 与 `compute`/`commit` phase 的枚举值仅为 checkpoint
@@ -245,6 +246,8 @@ partition = [id, parent, kind, phase, children, ops]
 attr_tail = [[helper_offset, helper_count], ...]   -- helperChunks
             [[event_act, ...]]?                    -- eventActs（C2 起）
             [[range_offset, range_count]]?         -- supernodeRange（C6 起）
+            enable_guard?                          -- 标量 value index，仅 A1 守卫细分
+                                                     -- 的 SinkEvent 超节点（category 标量之后）
 layout    = [pointer_bytes, [type, ...], [named_store, ...]?]
 schedule  = [numa_nodes, input_fanout, supernode_fanout, state_fanout,
              event_activation?, mem_write_plan?, timeslot_triggers?]
@@ -296,7 +299,10 @@ ScheduledTask
 （`DataGated`，执行其 `supernodeRange` 区间内的活动超节点；V2-M2 前名为
 `EventDataGated`）→ P_mem（`AlwaysScanCommit`）→ P_output（`EvalEnd`，round 循环外）；
 P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEvent 查 eventActStore
-签名，SinkEscape 每轮无条件）。V3-M1 起 dataActiveFlag/dataActiveFlagNext 为
+签名，SinkEscape 每轮无条件；A1 守卫细分的 SinkEvent 在签名门之后再 AND 一次
+`enableGuard` value 的读取——形如 `if(actBitsGuard(sig) && read(enableGuard))`，
+该 value 即成员 regWrite 共有的 en 操作数，经 boundaryValueStore（或
+input/state 读取重发）现成可读，语义上与体内逐 op 的 en 判断等价）。V3-M1 起 dataActiveFlag/dataActiveFlagNext 为
 bit-per-supernode 的 u64 字数组：扫描先按字外层跳过（一个非零判断覆盖 64 个静默
 超节点），字内逐位读 live word 检测并清位点火——同轮 fanout 目标恒在扫描方向前方
 （activateFanout 的 ordinal>current 规则），live word 语义与旧逐字节循环逐点等价；
@@ -305,6 +311,25 @@ V2-M3 起 sink 超节点体内不再保留逐 op event guard
 （SinkEvent 全体 op 与超节点签名同集，调用点门控已覆盖；en、地址等数据条件保留）；
 非 sink 超节点内的事件 op 与 P_mem 写口仍保留逐 op event guard 精判，负责最终语义
 判断。
+
+P_mem 写口的 enable 判定另有一层 `memEnableBits` 影子位图（`cpu.st.emit-cpp
+--mem-enable-bitmap`，默认 on）：emit 期为每个"boundary 字段承载的 1-bit 两态
+enable"（compare-store 发布的 value 字段，或 input.read 直读的输入端口字段）分配一个
+稠密位；位图由 init() 末尾按 boundary 字段一次性构建，之后由三条写路径同步——
+`publishBoundary`/`publishDpiResult` 的 compare-store 在字段真变化时同步置位/清零，
+`pInput` 的输入端口直写在变化时同步。P_mem 端口守卫因此从"每轮重读散布在
+BoundaryValueStore 大结构上的 enable 字段"变为稠密位测试；且每个 mem chunk 内
+enable 全部被影子化的极大连续 run 外包一层按字 OR 聚合跳过（不改变端口的计划优先级
+顺序：未被影子化的端口——常数 enable、regLatch/mem 回读 enable——仅仅结束一个
+run，不参与聚合）。常量 enable（如恒 1）保持折叠、不进位图。
+
+P_mem 端口另按 event act 聚类：同一 chunk 内共享同一 `eventActStore` 守卫的极大
+连续端口段只在段首判断一次守卫（端口体只读 eventActStore、不写，合并精确）；段内再
+套 enable 位图 run 聚合。此外，boundary 发布在"无超节点 fanout 且无位图 hook"时
+不再发射 compare-store——此时 `if(slot!=v){slot=v;}` 与 `slot=v;` 严格等价
+（变化事件无人消费），改为无条件 store，消掉发布路径上的 load→比较→分支依赖链
+（典型人群：只喂 P_mem/P_event/P_output 的字段——这些相都是无条件执行，不经
+dataActiveFlag 激活）。
 
 三张 fanout 表分别在输入差分、超节点 value 写站点、状态 publish 处消费。`activate` 只
 指向 General 超节点，且 V2-M2 起一律收窄为非 sink 超节点（sink 超节点不经

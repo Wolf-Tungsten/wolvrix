@@ -15,7 +15,10 @@
 //     earliest consumer, preserving the local topological order;
 //   * source ops whose consumers all migrated are dropped from the tree and
 //     removed via compact(); the pass computes the same dense op-id remap
-//     compact() applies and rewrites the tree's op lists to match.
+//     compact() applies and rewrites the tree's op lists to match, and
+//     remaps attrs.enableGuard (the A1 sink enable guard, the tree's only
+//     value-id payload) with compact()'s dense value renumbering — sink
+//     consumers never migrate, so a guard value always survives.
 //
 // The pass is the sole registered C-segment semantic micro-adjustment: it
 // ends with commitSemanticMicroMutation() (revision bump, no mapping wipe)
@@ -363,6 +366,31 @@ namespace wolvrix::lib::grhsim
                         for (auto &op : ops) op = OpId{opRemap[op.index], 0};
                         ops.erase(std::remove(ops.begin(), ops.end(), OpId{}), ops.end());
                     }
+                    // Dense value-id remap matching compact()'s value
+                    // renumbering (results of surviving ops, kept in original
+                    // value order). attrs.enableGuard (A1) is the partition
+                    // tree's only value-id payload and must follow the same
+                    // remap; a guard value always survives (its sink
+                    // consumers never migrate), so a zero remap is a bug.
+                    std::vector<uint32_t> valueRemap(model.values().size() + 1, 0);
+                    {
+                        std::vector<uint8_t> liveValues(model.values().size() + 1, 0);
+                        for (const auto &op : model.operations())
+                            if (!removeOps[op.id.index])
+                                for (auto value : model.results(op)) liveValues[value.index] = 1;
+                        uint32_t nextValue = 1;
+                        for (std::size_t i = 1; i < liveValues.size(); ++i)
+                            if (liveValues[i]) valueRemap[i] = nextValue++;
+                    }
+                    for (auto &partition : tree.partitions)
+                        if (partition.attrs.enableGuard)
+                        {
+                            const auto remapped =
+                                valueRemap[static_cast<std::size_t>(*partition.attrs.enableGuard)];
+                            if (remapped == 0)
+                                throw std::runtime_error("clone-shared-boundaries removed an enable guard value");
+                            partition.attrs.enableGuard = static_cast<int64_t>(remapped);
+                        }
                     // Nodes whose ops all died (a removed source was their
                     // only op) and supernodes left with no node must leave
                     // the tree: the verifier requires nonempty leaves.

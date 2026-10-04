@@ -81,7 +81,10 @@ The pass is registered as `PassKind::BackendMapping` at stage
 sole registered C-segment semantic micro-adjustment: it ends with
 `commitSemanticMicroMutation()` (semantic revision bump **without** the mapping
 wipe) after updating the partition tree itself — clone attachment, dead-op
-removal with the same dense op-id remap `compact()` applies, and empty
+removal with the same dense op-id remap `compact()` applies, the A1
+`attrs.enableGuard` value-id remap with `compact()`'s dense value renumbering
+(the tree's only value-id payload; sink consumers never migrate, so a guard
+value always survives), and empty
 node/supernode shell pruning with a dense partition-id remap — and re-stamps
 the mapping via `setCpuMapping`. The post-pass model verify enforces total
 phase attribution and full partition coverage as the hard guard rail. The

@@ -390,6 +390,13 @@ namespace wolvrix::lib::grhsim
         // For sink supernodes attrs.eventActs doubles as the event signature
         // (empty for SinkEscape, the common nonempty act set for SinkEvent).
         std::optional<CpuSupernodeCategory> supernodeCategory;
+        // A1: on a SinkEvent supernode carved out by shared-enable
+        // subdivision (cpu.st.merge-general-supernodes), the value index of
+        // the members' common write enable (the regWrite en operand). Every
+        // op in the supernode is individually guarded by that value, so the
+        // emitter ANDs one read of it into the call-site gate. Engaged only
+        // on SinkEvent supernodes from the GeneralSupernodes stage on.
+        std::optional<int64_t> enableGuard;
     };
 
     struct CpuPartition

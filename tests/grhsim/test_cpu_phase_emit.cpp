@@ -336,8 +336,8 @@ namespace
         });
     }
 
-    // (b) 128-bit adder: wide values flow through the pointer-based runtime
-    // helpers (P_output clone) with std::array port members.
+    // (b) 128-bit adder: wide values are _BitInt objects end to end (native
+    // add in the P_output clone), ports drive/compare as _BitInt literals.
     void wideAddTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_add128");
@@ -351,7 +351,8 @@ namespace
         const auto words = [](unsigned __int128 value) {
             const auto lo = static_cast<std::uint64_t>(value);
             const auto hi = static_cast<std::uint64_t>(value >> 64);
-            return "std::array<std::uint64_t,2>{UINT64_C(" + std::to_string(lo) + "),UINT64_C(" + std::to_string(hi) + ")}";
+            return "(((unsigned _BitInt(128))UINT64_C(" + std::to_string(hi) + ")<<64)|UINT64_C(" +
+                   std::to_string(lo) + "))";
         };
         const auto step = [&](unsigned __int128 av, unsigned __int128 bv) {
             const unsigned __int128 sum = av + bv;

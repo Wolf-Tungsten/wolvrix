@@ -97,7 +97,8 @@ x = not(d) feeds w1 {event_acts:[0]} and w2 {event_acts:[1]}
   edge;
 - result: three supernodes, ordinals `[non-sink, sink{0}, sink{1}]`.
 
-Diagnostics: `coarsen_iterations`, `coarsened_clusters`,
+Diagnostics: `coarsen_iterations`, `coarsen_cap` (the effective coarsen
+merge weight cap), `coarsened_clusters`,
 `nonsink_supernodes`, `sink_supernodes`, `sink_escape_supernodes`,
 `sink_event_supernodes`, `sink_guard_supernodes` / `sink_guard_ops` (A1:
 supernodes carved out by the enable subdivision and the writes they hold),
@@ -107,4 +108,12 @@ standard `partitions` count.
 Integration knob: the XS/HDLBits pipeline scripts read
 `XS_WOLF_GRHSIM_IR_SINK_GUARD_MIN` (default `8`, `0` disables) and pass it
 as `--sink-enable-guard-min-size`; the XS script also accepts the
-`--sink-enable-guard-min-size` CLI override.
+`--sink-enable-guard-min-size` CLI override. For boundary-reduction
+exploration (plan
+`pdocs/perf-optimization/20261005-170704-nonsink-semantic-partition-plan.md`)
+the scripts also read `XS_WOLF_GRHSIM_IR_COARSEN_MAX_OP` and pass it as
+`--coarsen-max-op` (default `0` = the coarsen merge weight cap follows
+`--max-op-in-compute-supernode`, the legacy behavior; a large value
+effectively lifts the cap so chain/sibling absorption is limited by
+structure, not size — the DP window still caps segment size and oversized
+clusters become singleton segments).

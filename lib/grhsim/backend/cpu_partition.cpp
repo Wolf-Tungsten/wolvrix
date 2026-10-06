@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -224,21 +226,48 @@ namespace wolvrix::lib::grhsim
         {
             uint64_t nodes = 0;
             uint64_t boundaryEdges = 0;
+            uint64_t anchoredValues = 0;
         };
 
+        // Reverse-topological cone absorption. Legacy mode stops at shared
+        // values, commit boundaries and the maxOps node size cap. Semantic
+        // mode (S1, plan 20261005-170704): every value targeted by a
+        // DeclProvenance Value slice (a source-level declared signal) anchors
+        // its own node — the producer op is never absorbed downstream — and
+        // the maxOps cap is dropped, so node shape follows declaration
+        // boundaries instead of dataflow shape; the optional semanticMaxOps
+        // cap (0 = none) can still bound cone growth for compile-time
+        // control. Unanchored ops keep the legacy single-consumer cone
+        // absorption: values outside provenance coverage fall back to the old
+        // rule. No source cloning either way: every op remains owned by
+        // exactly one mapping leaf.
         NodeStats formNodes(const GrhSimModel &model, CpuPartitionTree &tree, PartitionId phase,
-                            std::vector<OpId> ops, uint32_t maxOps)
+                            std::vector<OpId> ops, uint32_t maxOps, bool semantic, uint32_t semanticMaxOps)
         {
             ComputeGraph graph(model, ops);
+            std::vector<bool> anchored;
+            uint64_t anchoredValues = 0;
+            if (semantic)
+            {
+                anchored.assign(model.values().size() + 1, false);
+                for (const auto &record : model.declProvenances())
+                    for (const auto &slice : record.slices)
+                    {
+                        if (slice.target != DeclProvenanceTarget::Value) continue;
+                        if (slice.targetIndex == 0 || slice.targetIndex >= anchored.size()) continue;
+                        if (!anchored[slice.targetIndex]) { anchored[slice.targetIndex] = true; ++anchoredValues; }
+                    }
+            }
             std::vector<uint32_t> owner(model.operations().size() + 1, absent), sizes;
-            // Reverse-topological cone absorption stops at shared values and commit boundaries.
-            // No source cloning: every op remains owned by exactly one mapping leaf.
             for (auto it = graph.topo.rbegin(); it != graph.topo.rend(); ++it)
             {
                 const auto &op = model.operations()[it->index - 1];
                 const auto type = model.text(op.opType);
                 bool absorb = type.starts_with("core.compute.") || type == "core.input.read" ||
                               type == "core.state.read" || type == "core.state.memRead";
+                if (semantic)
+                    for (auto value : model.results(op))
+                        if (anchored[value.index]) { absorb = false; break; }
                 uint32_t target = absent;
                 for (auto value : model.results(op))
                     for (uint32_t i = graph.useOffsets[value.index]; i < graph.useOffsets[value.index + 1]; ++i)
@@ -248,7 +277,8 @@ namespace wolvrix::lib::grhsim
                         if (target == absent) target = owner[user.index];
                         else if (target != owner[user.index]) absorb = false;
                     }
-                if (!absorb || target == absent || sizes[target] >= maxOps)
+                if (!absorb || target == absent || (!semantic && sizes[target] >= maxOps) ||
+                    (semantic && semanticMaxOps && sizes[target] >= semanticMaxOps))
                 {
                     target = sizes.size(); sizes.push_back(0);
                 }
@@ -267,7 +297,7 @@ namespace wolvrix::lib::grhsim
                 const auto id = addPartition(tree, phase, CpuPartitionKind::Node);
                 tree.partitions[id.index - 1].ops = std::move(nodeOps[cluster.front()]);
             }
-            return {sizes.size(), edges.size()};
+            return {sizes.size(), edges.size(), anchoredValues};
         }
 
         uint64_t clusterSize(const std::vector<uint32_t> &cluster, std::span<const uint32_t> sizes)
@@ -348,9 +378,13 @@ namespace wolvrix::lib::grhsim
         }
 
         // Six-phase DP segmentation over the non-sink clusters (V2-M1: no
-        // event-domain span check — see coarsenGeneral).
+        // event-domain span check — see coarsenGeneral). valueRate, when
+        // nonempty, replaces the uniform per-value weight with measured
+        // firing rates (profile-guided boundary cost; rate 0 falls back to
+        // uniform weight 1 for unprofiled values).
         Clusters segmentGeneral(const Clusters &clusters, const ClusterGraph &graph,
-                                std::span<const uint32_t> sizes, std::size_t valueCount, uint32_t maxOps)
+                                std::span<const uint32_t> sizes, std::size_t valueCount, uint32_t maxOps,
+                                uint32_t segmentPenalty, std::span<const uint64_t> valueRate)
         {
             std::vector<std::vector<uint32_t>> sources(clusters.size()), targets(clusters.size());
             std::vector<uint32_t> sourceOfValue(valueCount + 1, absent);
@@ -371,7 +405,16 @@ namespace wolvrix::lib::grhsim
             std::vector<uint64_t> cost(clusters.size() + 1, infinity);
             std::vector<uint32_t> previous(clusters.size() + 1), seen(valueCount + 1), counted(valueCount + 1);
             cost[0] = 0;
-            // Legacy's uniform-weight objective: distinct incoming activation values + one per segment.
+            // Legacy's uniform-weight objective: distinct incoming activation
+            // values + segmentPenalty per segment (default 1; larger values
+            // bias toward fewer, larger segments). With a firing profile the
+            // per-value term becomes the measured producer firing rate, so
+            // hot boundaries price out of segment splits.
+            const auto weightOf = [&](uint32_t value) -> uint64_t {
+                if (valueRate.empty()) return 1;
+                const auto rate = value < valueRate.size() ? valueRate[value] : 0;
+                return rate ? rate : 1;
+            };
             for (uint32_t end = 1; end <= clusters.size(); ++end)
             {
                 uint64_t incoming = 0;
@@ -387,14 +430,14 @@ namespace wolvrix::lib::grhsim
                     {
                         if (seen[value] == end) continue;
                         seen[value] = end;
-                        if (sourceOfValue[value] < begin) { counted[value] = end; ++incoming; }
+                        if (sourceOfValue[value] < begin) { counted[value] = end; incoming += weightOf(value); }
                     }
                     for (auto value : sources[begin])
-                        if (counted[value] == end) { counted[value] = 0; --incoming; }
-                    const auto candidate = cost[begin] + incoming + 1;
+                        if (counted[value] == end) { counted[value] = 0; incoming -= weightOf(value); }
+                    const auto candidate = cost[begin] + incoming + segmentPenalty;
                     if (candidate <= cost[end]) { cost[end] = candidate; previous[end] = begin; }
                 }
-                if (cost[end] == infinity) { cost[end] = cost[end - 1] + 1; previous[end] = end - 1; }
+                if (cost[end] == infinity) { cost[end] = cost[end - 1] + segmentPenalty; previous[end] = end - 1; }
             }
             Clusters result;
             for (uint32_t end = clusters.size(); end > 0;)
@@ -407,6 +450,41 @@ namespace wolvrix::lib::grhsim
             }
             std::reverse(result.begin(), result.end());
             return result;
+        }
+
+        // Optional firing-rate profile for the DP segmentation (E3 boundary
+        // exploration): env WOLVRIX_GRHSIM_FIRE_PROFILE points to a TSV of
+        // "opIndex<TAB>fireCount" rows (op indices are the model's 1-based
+        // OpId indexes, e.g. produced from an instrumented emu's per-supernode
+        // firing dump). Empty/absent file keeps the uniform objective.
+        std::vector<uint64_t> loadFireProfile(const GrhSimModel &model, std::size_t opCount,
+                                              diag::Diagnostics &diagnostics)
+        {
+            const char *path = std::getenv("WOLVRIX_GRHSIM_FIRE_PROFILE");
+            if (!path || !*path) return {};
+            std::ifstream stream(path, std::ios::binary);
+            if (!stream) throw std::runtime_error(std::string("cannot open firing profile: ") + path);
+            std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+            std::vector<uint64_t> fire(opCount + 1, 0);
+            const char *cursor = text.data(), *end = cursor + text.size();
+            uint64_t rows = 0;
+            while (cursor < end)
+            {
+                uint32_t op = 0;
+                auto first = std::from_chars(cursor, end, op);
+                if (first.ec != std::errc{}) break;
+                cursor = first.ptr;
+                if (cursor < end && (*cursor == '\t' || *cursor == ' ')) ++cursor;
+                uint64_t count = 0;
+                auto second = std::from_chars(cursor, end, count);
+                if (second.ec != std::errc{}) break;
+                cursor = second.ptr;
+                while (cursor < end && *cursor != '\n') ++cursor;
+                if (cursor < end) ++cursor;
+                if (op >= 1 && op <= opCount) { fire[op] = count; ++rows; }
+            }
+            diagnostics.info("fire_profile_rows=" + std::to_string(rows), "cpu.st.merge-general-supernodes");
+            return fire;
         }
 
         // cpu.st.merge-general-supernodes (C2, V2-M1): the General branch's
@@ -435,8 +513,15 @@ namespace wolvrix::lib::grhsim
         // final supernode ordinal space consumed by the layout, event
         // bitmaps, schedule and emitter (M5d-6, resolution 2).
         void mergeGeneralSupernodes(const GrhSimModel &model, CpuBackendMapping &mapping, uint32_t maxOps,
-                                    uint32_t guardMinSize, diag::Diagnostics &diagnostics)
+                                    uint32_t guardMinSize, uint32_t segmentPenalty, uint32_t coarsenMaxOps,
+                                    diag::Diagnostics &diagnostics)
         {
+            // S2 (plan 20261005-170704): coarsen merge weight cap. 0 follows
+            // maxOps (legacy); a large value effectively lifts the cap so
+            // chain/sibling absorption is limited by structure, not size
+            // (the DP window below still caps segment size; oversized
+            // clusters become singleton segments).
+            const uint32_t coarsenCap = coarsenMaxOps ? coarsenMaxOps : maxOps;
             auto &tree = mapping.partitionTree;
             const auto phase = phasePartition(tree, CpuPhase::General);
             const auto nodes = tree.partitions[phase.index - 1].children;
@@ -474,15 +559,23 @@ namespace wolvrix::lib::grhsim
             {
                 const auto before = clusters.size();
                 for (unsigned mode = 0; mode < 3; ++mode)
-                    coarsenGeneral(clusters, edges, sizes, maxOps, mode);
+                    coarsenGeneral(clusters, edges, sizes, coarsenCap, mode);
                 ++iterations;
                 if (clusters.size() == before) break;
                 tail = before >= 100000 && before - clusters.size() < 1024 ? tail + 1 : 0;
                 if (tail == 3) break;
             }
             const auto coarsened = clusters.size();
+            const auto opFire = loadFireProfile(model, model.operations().size(), diagnostics);
+            std::vector<uint64_t> valueRate;
+            if (!opFire.empty())
+            {
+                valueRate.assign(model.values().size() + 1, 0);
+                for (uint32_t value = 1; value < valueRate.size(); ++value)
+                    valueRate[value] = opFire[graph.producer[value].index];
+            }
             clusters = segmentGeneral(clusters, ClusterGraph(clusters, edges, sizes.size()), sizes,
-                                      model.values().size(), maxOps);
+                                      model.values().size(), maxOps, segmentPenalty, valueRate);
             tree.partitions[phase.index - 1].children.clear();
             uint64_t nonSinkSupernodes = 0;
             for (const auto &cluster : clusters)
@@ -578,7 +671,8 @@ namespace wolvrix::lib::grhsim
                 if (signature.empty()) ++escapeSupernodes; else ++eventSupernodes;
             }
             const auto finalEdges = ClusterGraph(clusters, edges, sizes.size()).edges.size();
-            diagnostics.info("coarsen_iterations=" + std::to_string(iterations) + " coarsened_clusters=" + std::to_string(coarsened) +
+            diagnostics.info("coarsen_iterations=" + std::to_string(iterations) + " coarsen_cap=" + std::to_string(coarsenCap) +
+                             " coarsened_clusters=" + std::to_string(coarsened) +
                              " nonsink_supernodes=" + std::to_string(nonSinkSupernodes) +
                              " sink_supernodes=" + std::to_string(signatureGroups.size()) +
                              " sink_escape_supernodes=" + std::to_string(escapeSupernodes) +
@@ -731,8 +825,9 @@ namespace wolvrix::lib::grhsim
         class BuildGeneralNodesPass final : public Pass
         {
         public:
-            explicit BuildGeneralNodesPass(uint32_t maxOps)
-                : Pass("cpu.st.build-general-nodes", PassKind::BackendMapping), maxOps_(maxOps) {}
+            explicit BuildGeneralNodesPass(uint32_t maxOps, bool semantic, uint32_t semanticMaxOps)
+                : Pass("cpu.st.build-general-nodes", PassKind::BackendMapping), maxOps_(maxOps),
+                  semantic_(semantic), semanticMaxOps_(semanticMaxOps) {}
 
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
@@ -766,7 +861,7 @@ namespace wolvrix::lib::grhsim
                 for (const auto &op : model.operations())
                     if (op.phase == SimPhase::General)
                         (model.results(op).empty() ? sinkOps : generalOps).push_back(op.id);
-                const auto stats = formNodes(model, tree, branches[1], std::move(generalOps), maxOps_);
+                const auto stats = formNodes(model, tree, branches[1], std::move(generalOps), maxOps_, semantic_, semanticMaxOps_);
                 uint64_t sinkNodes = 0;
                 for (const auto opId : sinkOps)
                 {
@@ -779,6 +874,8 @@ namespace wolvrix::lib::grhsim
                 // through fresh id lookups (no dangling references).
                 diagnostics.info("event_ops=" + std::to_string(tree.partitions[branches[0].index - 1].ops.size()) +
                                  " general_nodes=" + std::to_string(stats.nodes) +
+                                 " anchored_values=" + std::to_string(stats.anchoredValues) +
+                                 " semantic_nodes=" + (semantic_ ? "1" : "0") +
                                  " sink_nodes=" + std::to_string(sinkNodes) +
                                  " mem_ops=" + std::to_string(tree.partitions[branches[2].index - 1].ops.size()) +
                                  " output_ops=" + std::to_string(tree.partitions[branches[3].index - 1].ops.size()) +
@@ -789,6 +886,8 @@ namespace wolvrix::lib::grhsim
 
         private:
             uint32_t maxOps_;
+            bool semantic_;
+            uint32_t semanticMaxOps_;
         };
 
         // C2 (cpu.st.merge-general-supernodes, GeneralNodes ->
@@ -812,7 +911,7 @@ namespace wolvrix::lib::grhsim
                 CpuBackendMapping mapping = *previous;
                 switch (inputStage_)
                 {
-                case CpuMappingStage::GeneralNodes: mergeGeneralSupernodes(model, mapping, options_[0], options_[1], diagnostics); break;
+                case CpuMappingStage::GeneralNodes: mergeGeneralSupernodes(model, mapping, options_[0], options_[1], options_[2], options_[3], diagnostics); break;
                 case CpuMappingStage::MemWritePlan:
                     packGeneralFunctions(model, mapping, options_[0], options_[1], options_[2], options_[3]); break;
                 default: throw std::logic_error("invalid CPU partition pass stage");
@@ -856,22 +955,31 @@ namespace wolvrix::lib::grhsim
                     const auto result = std::from_chars(text.data(), text.data() + text.size(), options[index]);
                     // Zero disables the sink enable-guard subdivision; every
                     // other limit must be positive (batch count excepted: it
-                    // means "auto").
+                    // means "auto"; semantic-nodes is a 0/1 flag; semantic-node-max-op
+                    // and coarsen-max-op zero mean uncapped/follow the supernode cap).
                     const bool zeroAllowed = keys[index] == "--target-batch-count" ||
-                                             keys[index] == "--sink-enable-guard-min-size";
+                                             keys[index] == "--sink-enable-guard-min-size" ||
+                                             keys[index] == "--segment-penalty" ||
+                                             keys[index] == "--semantic-nodes" ||
+                                             keys[index] == "--semantic-node-max-op" ||
+                                             keys[index] == "--coarsen-max-op";
                     if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
                         (options[index] == 0 && !zeroAllowed))
                     { error = "CPU partition limit must be a positive 32-bit integer"; return {}; }
                 }
-                if (!inputStage) return std::unique_ptr<Pass>(std::make_unique<BuildGeneralNodesPass>(options[0]));
+                if (!inputStage) return std::unique_ptr<Pass>(std::make_unique<BuildGeneralNodesPass>(options[0],
+                                                                                                      options[1] != 0,
+                                                                                                      options[2]));
                 return std::unique_ptr<Pass>(std::make_unique<PhasePartitionPass>(name, *inputStage, outputStage,
                                                                                   std::move(options)));
             };
             if (!registry.registerPass(name, PassKind::BackendMapping, factory, error)) throw std::logic_error(error);
         };
-        add("cpu.st.build-general-nodes", std::nullopt, CpuMappingStage::GeneralNodes, {"--max-op-in-compute-node"}, {128});
+        add("cpu.st.build-general-nodes", std::nullopt, CpuMappingStage::GeneralNodes,
+            {"--max-op-in-compute-node", "--semantic-nodes", "--semantic-node-max-op"}, {128, 0, 0});
         add("cpu.st.merge-general-supernodes", CpuMappingStage::GeneralNodes, CpuMappingStage::GeneralSupernodes,
-            {"--max-op-in-compute-supernode", "--sink-enable-guard-min-size"}, {128, 8});
+            {"--max-op-in-compute-supernode", "--sink-enable-guard-min-size", "--segment-penalty", "--coarsen-max-op"},
+            {128, 8, 1, 0});
         add("cpu.st.pack-general-functions", CpuMappingStage::MemWritePlan, CpuMappingStage::GeneralFunctions,
             {"--helper-max-estimated-lines", "--batch-max-ops", "--batch-max-estimated-lines", "--target-batch-count"},
             {2048, 2048, 8192, 64});

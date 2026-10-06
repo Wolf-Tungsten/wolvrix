@@ -2503,6 +2503,28 @@ inline grhsim_task_arg grhsim_make_task_arg(const std::array<std::uint64_t, N> &
     return arg;
 }
 
+// Wide values are C23 _BitInt objects: accept the deduced integer type and
+// unpack 64-bit words (the value is width-clean by the padding invariant).
+template <typename T>
+inline grhsim_task_arg grhsim_make_task_arg_wide(const T &value, std::size_t width, bool isSigned)
+{
+    grhsim_task_arg arg;
+    arg.kind = grhsim_task_arg_kind::Logic;
+    arg.width = width;
+    arg.isSigned = isSigned;
+    arg.isWide = true;
+    const std::size_t liveWords = (width + 63u) / 64u;
+    arg.words.resize(liveWords);
+    for (std::size_t i = 0; i < liveWords; ++i) {
+        arg.words[i] = static_cast<std::uint64_t>(value >> (i * 64u));
+    }
+    if (width != 0 && liveWords != 0) {
+        const std::size_t tailWidth = width - ((liveWords - 1u) * 64u);
+        arg.words[liveWords - 1u] = grhsim_trunc_u64(arg.words[liveWords - 1u], tailWidth);
+    }
+    return arg;
+}
+
 inline grhsim_task_arg grhsim_make_task_arg(double value)
 {
     grhsim_task_arg arg;

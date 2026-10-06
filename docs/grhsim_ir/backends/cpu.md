@@ -49,7 +49,7 @@ CpuNamedStore
 | 语义类型 | cpu 类型 |
 | --- | --- |
 | `core.logic<1, false, 2-state>` | `cpu.bool` |
-| `core.logic<w, s, 2-state>` | `w <= 64` 时按 `s` 取 `cpu.uint8/16/32/64` 或 `cpu.sint8/16/32/64` 中最小能容纳 `w` 位者；`w > 64` 时按 `s` 取 `cpu.uint<w>` 或 `cpu.sint<w>` |
+| `core.logic<w, s, 2-state>` | `w <= 64` 时按 `s` 取 `cpu.uint8/16/32/64` 或 `cpu.sint8/16/32/64` 中最小能容纳 `w` 位者；`w > 64` 时取 `cpu.uint<w>`（存储恒无符号，signedness 在运算点恢复） |
 | `core.logic<w, s, 4-state>` | `cpu.array<V, 2>`，`V` 是对应的 2-state 表示 |
 | `core.real` | `cpu.f64` |
 | `core.string` | `cpu.str` |
@@ -501,19 +501,20 @@ FST）、字符串/四态类型、无 live object 的符号（被优化掉的线
 
 ### CPU C++ 宽比较与移位量
 
-两态比较结果虽然是 1 位，helper 选择仍由操作数位宽决定。超过 64 位时，CPU emitter
-调用 pointer-based `grhsim_compare_extended_words(lhs, lhsWords, lhsWidth, rhs, rhsWords,
-rhsWidth, signedMode)`：两个 pointer 指向低字在前的 uint64_t 数据，`Words` 是缓冲区长度，
-`Width` 是逻辑位宽，`signedMode` 仅在双方操作数均 signed 时成立。helper 屏蔽末字 padding，
-按需逐字符号/零扩展到共同宽度，不分配扩展后的宽数组。标量操作数先放进 uint64_t 局部变量，
-不能将 bool/uint32_t 存储地址重新解释为 uint64_t 指针。
+两态宽值（>64 位）是 `unsigned _BitInt` 对象，比较和移位**不再调用 runtime helper**，
+全部发射为原生表达式。无符号比较把两侧显式拓宽到公共容器后直接用原生关系运算符；
+双方均 signed 时先各自从自身位宽做符号扩展（gsim 的 shift-trick：
+`((_BitInt(M))((unsigned _BitInt(M))x << (M-w)) >> (M-w))`）再比较。mixed signedness
+与旧 helper 一致按零扩展处理。
 
 例如 signed 8 位 `-1` 与 signed 129 位 `-1` 比较相等；signed 8 位 `-1` 与 unsigned
 129 位 `255` 比较也相等，因为 mixed signedness 使用零扩展后的 8'hff。
 
-`shl/lshr/ashr` 的移位量使用现有 `grhsim_index_words(amount, resultWidth)` 饱和转换。
-512 位移位量若高字非零，即使低字为 0，也返回 `resultWidth`，触发超范围移位规则：
-逻辑移位归零，负数算术右移填充符号位。不得只读取移位量低 64 位。
+`shl/lshr` 的移位量直接与结果位宽比较：`amount >= width` 时结果为 0，三元运算同时
+保证移位量严格小于容器宽度（移位 >= 容器宽在 C 里是未定义行为）。`ashr` 先把被移值
+符号扩展到容器，移位量钳到 `容器宽 - 1`（超出位宽的移位在语义上饱和为全符号位），
+再掩回语义位宽。宽移位量按全精度与位宽比较——高字非零自然落入饱和分支，不会出现
+只读低 64 位的截断。
 
 ### CPU C++ 宽状态写入
 
@@ -528,8 +529,9 @@ visible 就忽略第二次写入。已有 pending 条目保留到 publish，由�
 事件 history 仍在原采样位置更新，不受 data enable 或是否触发写边沿影响。批量 history、
 memory cell、宽值和已证明可 direct-commit 的写口继续使用各自的路径。
 
-宽寄存器、锁存器和内存 cell 的 mask 写入复用 legacy 原地 helper，目标指向 staged state。
-每个 word 计算 `(staged & ~mask) | (data & mask)`，保留先前 disjoint-mask 写口在同轮的修改。
+宽寄存器、锁存器和内存 cell 的 mask 写入直接以原生 `_BitInt` 表达式合并：
+`(staged & ~mask) | (data & mask)`（旧实现调用逐字 helper，语义相同），保留先前
+disjoint-mask 写口在同轮的修改。
 例如 129 位状态的两次写入分别选中 bits 0-63 与 64-128 时，publish 后同时包含两次更新，
 不能将第二次写入直接赋值为完整 data。标量 staging 以 state 为粒度，内存 staging 以 cell 为粒度。
 

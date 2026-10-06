@@ -45,6 +45,95 @@ namespace wolvrix::lib::grhsim
             return result;
         }
 
+        // E-flat (gsim-shape emit, 2026-10-06): textual expansion of the
+        // ≤64-bit runtime helpers into raw constant-masked expressions. Every
+        // expansion is the corresponding helper body from grhsim_runtime.cpp,
+        // so the emitted semantics are identical; the point is that no call
+        // site reaches the compiler, keeping the -O3 inliner off the hot path
+        // of generated TUs.
+        std::string maskLiteral(uint64_t width)
+        {
+            if (width >= 64) return "~UINT64_C(0)";
+            std::ostringstream os;
+            os << "UINT64_C(0x" << std::hex << ((UINT64_C(1) << width) - 1) << ')';
+            return os.str();
+        }
+        // grhsim_trunc_u64 body.
+        std::string truncRaw(std::string expr, uint64_t width)
+        {
+            if (width >= 64) return expr;
+            return "(" + expr + "&" + maskLiteral(width) + ")";
+        }
+        // grhsim_sign_extend_i64 body (the helper's return type is int64_t).
+        std::string sextRaw(const std::string &expr, uint64_t width)
+        {
+            if (width == 0) return "INT64_C(0)";
+            if (width >= 64) return "static_cast<std::int64_t>(" + expr + ")";
+            std::ostringstream sign;
+            sign << "UINT64_C(0x" << std::hex << (UINT64_C(1) << (width - 1)) << ')';
+            const std::string mask = maskLiteral(width);
+            return "static_cast<std::int64_t>(((" + expr + ")&" + mask + ")|(((" + expr + ")&" + sign.str() + ")?~" +
+                   mask + ":UINT64_C(0)))";
+        }
+
+        // ----- Wide (>64-bit) two-state values: C23 _BitInt shapes -----
+        // Storage is always an unsigned _BitInt of the 64-rounded container
+        // width; signedness is re-derived at op points (gsim-shape, see
+        // reference/gsim instsGenerator). Every value-producing shape masks
+        // its result back to the semantic width, keeping the container's
+        // padding bits zero — the raw-byte paths (FST word dump, whole-store
+        // memcpy, dumpState hash) and value compares rely on that invariant.
+        uint64_t wideContainer(uint64_t width) { return (width + 63) / 64 * 64; }
+        std::string wideType(uint64_t width)
+        {
+            return "unsigned _BitInt(" + std::to_string(wideContainer(width)) + ")";
+        }
+        std::string wideSignedType(uint64_t width)
+        {
+            return "_BitInt(" + std::to_string(wideContainer(width)) + ")";
+        }
+        // bitMask(width) as a _BitInt constant (gsim util.cpp bitMask: the
+        // full-container case avoids the undefined 1<<container shift).
+        std::string wideMask(uint64_t width)
+        {
+            if (width == wideContainer(width)) return "((" + wideType(width) + ")0-1)";
+            return "(((" + wideType(width) + ")1<<" + std::to_string(width) + ")-1)";
+        }
+        // Mask to the semantic width (identity on already-clean values).
+        std::string wideTrunc(std::string expr, uint64_t width)
+        {
+            if (width == wideContainer(width)) return "(" + expr + ")";
+            return "(" + expr + "&" + wideMask(width) + ")";
+        }
+        // Sign-extend a width-bit value to its container (result: signed
+        // _BitInt) — gsim's shift trick from instsAsSInt.
+        std::string wideSext(const std::string &expr, uint64_t width)
+        {
+            const auto container = wideContainer(width);
+            if (width == container)
+                return "static_cast<" + wideSignedType(width) + ">(" + expr + ")";
+            const auto shift = std::to_string(container - width);
+            return "(static_cast<" + wideSignedType(width) + ">((" + wideType(width) + ")(" + expr + ")<<" + shift +
+                   ")>>" + shift + ")";
+        }
+        // grhsim_index_words wide overload: any nonzero bit above word 0
+        // clamps to cap. ((expr)>>64)!=0 covers every high word at once.
+        std::string wideIndexRaw(const std::string &expr, uint64_t cap)
+        {
+            return "(((" + expr + ")>>64)!=0?UINT64_C(" + std::to_string(cap) + "):((std::uint64_t)(" + expr +
+                   ")>=UINT64_C(" + std::to_string(cap) + ")?UINT64_C(" + std::to_string(cap) + "):(std::uint64_t)(" +
+                   expr + ")))";
+        }
+        // grhsim_index_words body: min(uint64(value), cap); wide operands keep
+        // the overload's rule (any nonzero high word clamps to cap).
+        std::string indexRaw(const std::string &expr, uint64_t srcWidth, uint64_t cap)
+        {
+            if (srcWidth <= 64)
+                return "((std::uint64_t)(" + expr + ")>=UINT64_C(" + std::to_string(cap) + ")?UINT64_C(" +
+                       std::to_string(cap) + "):(std::uint64_t)(" + expr + "))";
+            return wideIndexRaw(expr, cap);
+        }
+
         // Vendored libfst sources compiled into waveform-enabled model
         // libraries (the wolvrix build itself links the same objects for the
         // legacy path; generated models compile their own copies).
@@ -905,6 +994,12 @@ namespace wolvrix::lib::grhsim
                                   std::string_view array) const;
             void activateFanout(std::ostream &out, std::span<const uint32_t> ordinals,
                                 uint32_t current) const;
+            // Branchless twins (E-flat publish): the batched word masks are ORed
+            // under -uint64(cond) instead of guarding the ORs with a branch.
+            void activateOrdinalsCond(std::ostream &out, std::span<const uint32_t> ordinals,
+                                      std::string_view array, std::string_view cond) const;
+            void activateFanoutCond(std::ostream &out, std::span<const uint32_t> ordinals,
+                                    uint32_t current, std::string_view cond) const;
             // Compare-store of a computed boundary value; on a real change the
             // supernodeFanout ordinals fire (same-round split by current).
             void publishBoundary(std::ostream &out, ValueId result, const std::string &expr,
@@ -1181,12 +1276,9 @@ namespace wolvrix::lib::grhsim
             if (type.kind == TypeKind::Real) return "double";
             if (type.kind != TypeKind::Logic)
                 throw std::runtime_error("CPU six-phase emit non-logic scalar storage is not implemented");
-            if (type.domain != LogicDomain::TwoState || type.width == 0 || type.width > 64)
-            {
-                if (type.domain != LogicDomain::TwoState || type.width == 0)
-                    throw std::runtime_error("CPU six-phase emit scalar logic width/domain is not implemented");
-                return "std::array<std::uint64_t," + std::to_string((type.width + 63u) / 64u) + ">";
-            }
+            if (type.domain != LogicDomain::TwoState || type.width == 0)
+                throw std::runtime_error("CPU six-phase emit scalar logic width/domain is not implemented");
+            if (type.width > 64) return wideType(type.width);
             if (type.width == 1 && !type.isSigned) return "bool";
             return "std::" + std::string(type.isSigned ? "int" : "uint") +
                    std::to_string(type.width <= 8 ? 8 : type.width <= 16 ? 16 : type.width <= 32 ? 32 : 64) + "_t";
@@ -1198,6 +1290,7 @@ namespace wolvrix::lib::grhsim
             {
             case CpuTypeKind::Bool: return "bool";
             case CpuTypeKind::UInt:
+                if (type.width > 64) return wideType(type.width);
                 return "std::uint" + std::to_string(type.width <= 8 ? 8 : type.width <= 16 ? 16 : type.width <= 32 ? 32 : 64) + "_t";
             case CpuTypeKind::SInt:
                 return "std::int" + std::to_string(type.width <= 8 ? 8 : type.width <= 16 ? 16 : type.width <= 32 ? 32 : 64) + "_t";
@@ -1221,9 +1314,16 @@ namespace wolvrix::lib::grhsim
         std::string SixPhaseEmitter::normalize(std::string expression, const Type &type) const
         {
             if (type.kind == TypeKind::String || type.kind == TypeKind::Real) return expression;
-            if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 64) return expression;
-            return "static_cast<" + cppType(type) + ">(" + (type.isSigned ? "grhsim_sign_extend_i64(" : "grhsim_trunc_u64(") +
-                   expression + "," + std::to_string(type.width) + "))";
+            // Wide two-state: mask back to the semantic width (the padding
+            // invariant); signedness is re-derived at op points, so signed
+            // and unsigned share the same shape here.
+            if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 64)
+                return wideTrunc(std::move(expression), type.width);
+            // E-flat: grhsim_trunc_u64/grhsim_sign_extend_i64 expanded inline.
+            return "static_cast<" + cppType(type) + ">(" +
+                   (type.isSigned ? sextRaw(expression, type.width)
+                                  : truncRaw(std::move(expression), type.width)) +
+                   ")";
         }
         std::string SixPhaseEmitter::literal(std::string_view text, const Type &type) const
         {
@@ -1234,12 +1334,15 @@ namespace wolvrix::lib::grhsim
             parsed.flattenUnknowns(); const auto bits = parsed.as<uint64_t>();
             if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 64)
             {
+                // _BitInt constants fold from 64-bit words, most-significant
+                // first (gsim legalCppCons shape); resize(width) already
+                // cleaned the top word.
                 const auto words = (type.width + 63u) / 64u;
-                std::string result = "std::array<std::uint64_t," + std::to_string(words) + ">{";
                 const auto *raw = parsed.getRawPtr();
-                for (uint32_t i = 0; i < words; ++i)
-                    result += (i ? "," : "") + std::string("UINT64_C(") + std::to_string(raw[i]) + ")";
-                return result + "}";
+                std::string result = "((" + wideType(type.width) + ")UINT64_C(" + std::to_string(raw[words - 1]) + "))";
+                for (uint32_t i = words - 1; i-- > 0;)
+                    result = "((" + result + "<<64)|UINT64_C(" + std::to_string(raw[i]) + "))";
+                return result;
             }
             if (!bits) throw std::runtime_error("cannot encode CPU scalar literal");
             return normalize("UINT64_C(" + std::to_string(*bits) + ")", type);
@@ -1258,9 +1361,13 @@ namespace wolvrix::lib::grhsim
                 out << destination << '=' << normalize("grhsim_random_u64(" + std::string(rng) + "," + std::to_string(type.width) + ")", type) << ";\n";
             else
             {
-                out << "for(std::size_t w=0;w<" << (type.width + 63u) / 64u << ";++w) " << destination
-                    << "[w]=grhsim_splitmix64_next(" << rng << ");\n"
-                    << "grhsim_trunc_words(" << destination << ',' << type.width << ");\n";
+                // Fill the _BitInt object through its u64-word image (the
+                // header static_assert pins the layout), then mask the top.
+                const auto words = (type.width + 63u) / 64u;
+                out << "{std::uint64_t cpu_rw[" << words << "];for(std::size_t w=0;w<" << words
+                    << ";++w) cpu_rw[w]=grhsim_splitmix64_next(" << rng << ");\n"
+                    << "std::memcpy(&" << destination << ",cpu_rw,sizeof(cpu_rw));\n"
+                    << destination << "&=" << wideMask(type.width) << ";}\n";
             }
         }
 
@@ -1307,8 +1414,12 @@ namespace wolvrix::lib::grhsim
             const auto width = result.width;
             const auto cast = [&](std::size_t i, uint32_t width) {
                 const auto expr = raw(i); const auto &source = typeOf(i);
-                return "grhsim_cast_u64(" + expr + "," + std::to_string(source.width) + "," + std::to_string(width) +
-                       "," + (source.isSigned ? "true" : "false") + ")";
+                // E-flat: grhsim_cast_u64 expanded inline — trunc to srcWidth,
+                // sign-extend when signed, trunc to destWidth; narrowing
+                // (srcWidth >= destWidth) makes the sign-extend unobservable.
+                if (!source.isSigned) return truncRaw(expr, std::min<uint64_t>(source.width, width));
+                if (source.width >= width) return truncRaw(expr, width);
+                return truncRaw("static_cast<std::uint64_t>(" + sextRaw(expr, source.width) + ")", width);
             };
             if (kind == "assign") return cast(0, width);
             if ((kind == "and" || kind == "or") && arity == 2 &&
@@ -1327,7 +1438,9 @@ namespace wolvrix::lib::grhsim
             if (kind == "mux")
             {
                 if (result.domain == LogicDomain::TwoState && width <= 64 && arity == 3)
-                    return "grhsim_mux_u64(" + raw(0) + "," + cast(1, width) + "," + cast(2, width) + ")";
+                    return "((" + cast(1, width) + ")&static_cast<std::uint64_t>(-static_cast<std::int64_t>(" + raw(0) +
+                           "!=0)))|((" + cast(2, width) + ")&~static_cast<std::uint64_t>(-static_cast<std::int64_t>(" +
+                           raw(0) + "!=0)))";
                 return "(" + raw(0) + "?" + cast(1, width) + ":" + cast(2, width) + ")";
             }
             if (kind == "prioritySelect")
@@ -1337,7 +1450,9 @@ namespace wolvrix::lib::grhsim
                     throw std::runtime_error("CPU six-phase emit prioritySelect condition count is out of range");
                 std::string expr = cast(2 * count, width);
                 for (std::size_t i = count; i-- > 0;)
-                    expr = "grhsim_mux_u64(" + raw(i) + "," + cast(count + i, width) + "," + expr + ")";
+                    expr = "((" + cast(count + i, width) + ")&static_cast<std::uint64_t>(-static_cast<std::int64_t>(" +
+                           raw(i) + "!=0)))|((" + expr + ")&~static_cast<std::uint64_t>(-static_cast<std::int64_t>(" +
+                           raw(i) + "!=0)))";
                 return expr;
             }
             if (kind == "bitSelect") {
@@ -1347,7 +1462,19 @@ namespace wolvrix::lib::grhsim
                        "&" + cast(2, width) + "))";
             }
             if (kind == "shl" || kind == "lshr" || kind == "ashr")
-                return "grhsim_" + std::string(kind) + "_u64(" + cast(0, width) + ",grhsim_index_words(" + raw(1) + "," + std::to_string(width) + ")," + std::to_string(width) + ")";
+            {
+                // E-flat: grhsim_index_words + grhsim_{shl,lshr,ashr}_u64 expanded.
+                const auto amount = indexRaw(raw(1), typeOf(1).width, width);
+                const auto value = cast(0, width);
+                if (kind == "shl")
+                    return "(" + amount + ">=64?UINT64_C(0):" + truncRaw("(" + value + ")<<" + amount, width) + ")";
+                if (kind == "lshr")
+                    return "(" + amount + ">=64?UINT64_C(0):(" + value + ")>>" + amount + ")";
+                return "(" + truncRaw("static_cast<std::uint64_t>(" + sextRaw(value, width) + ">>(" + amount +
+                                      ">=64?63:" + amount + "))",
+                                      width) +
+                       ")";
+            }
             if (kind == "div" || kind == "mod")
                 return "grhsim_" + std::string(typeOf(0).isSigned && typeOf(1).isSigned ? "s" : "u") +
                        std::string(kind) + "_u64(" + cast(0, width) + "," + cast(1, width) + "," + std::to_string(width) + ")";
@@ -1359,28 +1486,36 @@ namespace wolvrix::lib::grhsim
                 const auto compareWidth = std::max(typeOf(0).width, typeOf(1).width);
                 if (compareWidth > 64)
                 {
-                    std::string prefix = "([&](){";
-                    std::array<std::string, 2> pointers;
-                    for (std::size_t i = 0; i < 2; ++i)
-                    {
-                        if (typeOf(i).width > 64) pointers[i] = "(" + raw(i) + ").data()";
-                        else
-                        {
-                            const auto local = "cpu_cmp_" + std::to_string(i);
-                            prefix += "const std::uint64_t " + local + "=static_cast<std::uint64_t>(" + raw(i) + ");";
-                            pointers[i] = "&" + local;
-                        }
-                    }
-                    return prefix + "return grhsim_compare_extended_words(" + pointers[0] + "," +
-                        std::to_string((typeOf(0).width + 63u) / 64u) + "," + std::to_string(typeOf(0).width) + "," +
-                        pointers[1] + "," + std::to_string((typeOf(1).width + 63u) / 64u) + "," +
-                        std::to_string(typeOf(1).width) + "," +
-                        (typeOf(0).isSigned && typeOf(1).isSigned ? "true" : "false") + ")" +
-                        std::string(it->second) + "0;}())";
+                    // Wide values are unsigned _BitInt objects holding clean
+                    // width-bit values. Unsigned compares just widen both
+                    // sides to the compare container; signed compares
+                    // sign-extend each side from its own width first
+                    // (grhsim_compare_extended_words semantics).
+                    const bool bothSigned = typeOf(0).isSigned && typeOf(1).isSigned;
+                    const auto extend = [&](std::size_t i) -> std::string {
+                        const auto &source = typeOf(i);
+                        if (source.width > 64)
+                            return bothSigned
+                                       ? "((" + wideSignedType(compareWidth) + ")(" + wideSext(raw(i), source.width) + "))"
+                                       : "((" + wideType(compareWidth) + ")(" + raw(i) + "))";
+                        if (bothSigned)
+                            return "((" + wideSignedType(compareWidth) + ")(" + sextRaw(raw(i), source.width) + "))";
+                        return "((" + wideType(compareWidth) + ")(" + truncRaw(raw(i), source.width) + "))";
+                    };
+                    return "(" + extend(0) + std::string(it->second) + extend(1) + ")";
                 }
-                return "(grhsim_compare_" + std::string(typeOf(0).isSigned && typeOf(1).isSigned ? "signed" : "unsigned") +
-                       "_u64(" + cast(0, compareWidth) + "," + cast(1, compareWidth) + "," + std::to_string(compareWidth) + ")" +
-                       std::string(it->second) + "0)";
+                // E-flat: grhsim_compare_{un}signed_u64 expanded. cast()
+                // truncs/sign-extends to compareWidth; the UNSIGNED compare
+                // uses the truncated patterns directly. The SIGNED compare
+                // must still sign-extend the compareWidth pattern (cast()
+                // alone leaves srcWidth == compareWidth values as unsigned
+                // patterns — dropping the sign here was the E-flat bug that
+                // CASE_003 caught: sext(-1,3) compared as (7 < 0)).
+                const std::string lhs = cast(0, compareWidth), rhs = cast(1, compareWidth);
+                if (typeOf(0).isSigned && typeOf(1).isSigned)
+                    return "(" + sextRaw(lhs, compareWidth) + std::string(it->second) +
+                           sextRaw(rhs, compareWidth) + ")";
+                return "(" + lhs + std::string(it->second) + rhs + ")";
             }
             static const std::map<std::string_view, std::string_view> reduces{
                 {"reduceAnd", "and"}, {"reduceNand", "nand"}, {"reduceOr", "or"}, {"reduceNor", "nor"},
@@ -1389,23 +1524,51 @@ namespace wolvrix::lib::grhsim
             {
                 const auto operandWidth = typeOf(0).width;
                 if (operandWidth > 64)
-                    return "grhsim_reduce_" + std::string(it->second) + "_words(" + raw(0) + "," + std::to_string(operandWidth) + ")";
-                return "grhsim_reduce_" + std::string(it->second) + "_u64(" + raw(0) + "," + std::to_string(operandWidth) + ")";
+                {
+                    // Native reduce on the clean _BitInt value (padding is
+                    // zero, so == mask / != 0 / parity all see exactly the
+                    // semantic width — grhsim_reduce_*_words semantics).
+                    const auto value = raw(0);
+                    if (it->second == "and") return "(" + value + "==" + wideMask(operandWidth) + ")";
+                    if (it->second == "nand") return "(" + value + "!=" + wideMask(operandWidth) + ")";
+                    if (it->second == "or") return "((" + value + ")!=0)";
+                    if (it->second == "nor") return "((" + value + ")==0)";
+                    const auto words = (operandWidth + 63u) / 64u;
+                    std::string parity = "__builtin_parityll((std::uint64_t)(" + value + "))";
+                    for (uint64_t i = 1; i < words; ++i)
+                        parity = "(" + parity + "^__builtin_parityll((std::uint64_t)((" + value + ")>>" +
+                                 std::to_string(i * 64) + ")))";
+                    return it->second == "xor" ? "(" + parity + "!=0)" : "(" + parity + "==0)";
+                }
+                // E-flat: grhsim_reduce_*_u64 bodies expanded.
+                if (operandWidth == 0) return it->second == "nand" || it->second == "nor" || it->second == "xnor" ? "true" : "false";
+                const auto masked = truncRaw(raw(0), operandWidth);
+                if (it->second == "and") return "(" + masked + "==" + maskLiteral(operandWidth) + ")";
+                if (it->second == "nand") return "!(" + masked + "==" + maskLiteral(operandWidth) + ")";
+                if (it->second == "or") return "(" + masked + "!=UINT64_C(0))";
+                if (it->second == "nor") return "(" + masked + "==UINT64_C(0))";
+                if (it->second == "xor") return "((__builtin_popcountll(" + masked + ")&1)!=0)";
+                return "((__builtin_popcountll(" + masked + ")&1)==0)";
             }
             if (kind == "sliceStatic" || kind == "sliceDynamic" || kind == "sliceArray")
             {
                 if (typeOf(0).width > 64)
                 {
-                    const auto srcWords = (typeOf(0).width + 63u) / 64u;
+                    // grhsim_slice_words_u64 on the _BitInt object: start is
+                    // bounded by the container width (padding reads as zero);
+                    // the ternary keeps the shift itself defined.
+                    const auto container = wideContainer(typeOf(0).width);
                     std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, typeOf(1).width);
                     if (kind == "sliceArray") start = "(" + start + ")*" + std::to_string(width);
-                    return "grhsim_slice_words_u64<" + std::to_string(srcWords) + ">( " + raw(0) + "," + start + "," + std::to_string(width) + ")";
+                    return "((" + start + ")>=" + std::to_string(container) + "?UINT64_C(0):" +
+                           truncRaw("(std::uint64_t)((" + raw(0) + ")>>(" + start + "))", width) + ")";
                 }
                 std::string start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : cast(1, typeOf(1).width);
                 if (kind == "sliceArray")
                     start = "((" + start + ")>=64/" + std::to_string(width) + "+1?64:(" + start + ")*" + std::to_string(width) + ")";
-                return "grhsim_slice_dynamic_u64(grhsim_trunc_u64(" + raw(0) + "," + std::to_string(typeOf(0).width) +
-                       ")," + start + "," + std::to_string(width) + ")";
+                // E-flat: grhsim_slice_dynamic_u64(trunc(v, srcW), start, w) expanded.
+                return "(" + start + ">=64?UINT64_C(0):" +
+                       truncRaw("(" + truncRaw(raw(0), typeOf(0).width) + ")>>" + start, width) + ")";
             }
             if (kind == "concat" || kind == "replicate")
             {
@@ -1419,9 +1582,14 @@ namespace wolvrix::lib::grhsim
                 for (uint64_t i = 0; i < count; ++i)
                 {
                     const auto index = kind == "replicate" ? 0 : i;
-                    expr = "grhsim_concat_u64(" + expr + "," + std::to_string(total) + "," + raw(index) + "," +
-                           std::to_string(typeOf(index).width) + ")";
-                    total += typeOf(index).width;
+                    const auto operandWidth = typeOf(index).width;
+                    // E-flat: grhsim_concat_u64 expanded; the accumulator is
+                    // width-clean by construction (masked at every step).
+                    if (operandWidth >= 64) { expr = raw(index); total += operandWidth; continue; }
+                    expr = truncRaw("((" + expr + ")<<" + std::to_string(operandWidth) + "|" +
+                                        truncRaw(raw(index), operandWidth) + ")",
+                                    total + operandWidth);
+                    total += operandWidth;
                 }
                 return expr;
             }
@@ -1592,56 +1760,114 @@ namespace wolvrix::lib::grhsim
             const auto kind = name.substr(13);
             if (width > 64)
             {
-                const auto words = std::to_string((width + 63u) / 64u);
+                // Native _BitInt shapes (gsim-style). Operands are clean
+                // width-bit values by the padding invariant; every shape
+                // that can set bits above the semantic width masks its
+                // result (wideTrunc), so the invariant propagates.
+                const auto widen = [&](std::size_t i) { return "((" + wideType(width) + ")(" + raw(i) + "))"; };
                 if (kind == "assign") return raw(0);
-                if (kind == "and" || kind == "or" || kind == "xor" || kind == "xnor")
-                    return "grhsim_" + std::string(kind) + "_words(" + raw(0) + "," + raw(1) + "," + std::to_string(width) + ")";
-                if (kind == "not") return "grhsim_not_words(" + raw(0) + "," + std::to_string(width) + ")";
-                if (kind == "mux") return "grhsim_mux_words(" + raw(0) + "," + raw(1) + "," + raw(2) + "," + std::to_string(width) + ")";
-                if (kind == "shl" || kind == "lshr" || kind == "ashr")
-                    return "grhsim_" + std::string(kind) + "_words(" + raw(0) + "," + raw(1) + "," + std::to_string(width) + ")";
+                if (kind == "and" || kind == "or" || kind == "xor")
+                    return "(" + raw(0) + (kind == "and" ? "&" : kind == "or" ? "|" : "^") + raw(1) + ")";
+                // xnor/not flip exactly the semantic bits (grhsim_not_words
+                // and the xnor helper both end with a width mask).
+                if (kind == "xnor") return "((" + raw(0) + "^" + raw(1) + ")^" + wideMask(width) + ")";
+                if (kind == "not") return "(" + raw(0) + "^" + wideMask(width) + ")";
+                if (kind == "mux")
+                {
+                    // grhsim_mux_words body: branchless masked select; both
+                    // inputs are clean, so the result is clean.
+                    const auto select = "((" + wideType(width) + ")0-((std::uint64_t)(" + raw(0) + ")!=0))";
+                    return "((" + raw(1) + "&" + select + ")|(" + raw(2) + "&~" + select + "))";
+                }
+                if (kind == "shl" || kind == "lshr")
+                {
+                    // amount >= width yields 0; the ternary keeps the shift
+                    // amount strictly below the container width (no UB). shl
+                    // widens the value to the result container first — the
+                    // operand is often far narrower than the result, and
+                    // shifting in the narrow type is undefined.
+                    const auto shifted = kind == "shl" ? wideTrunc(widen(0) + "<<(" + raw(1) + ")", width)
+                                                       : "((" + raw(0) + ")>>(" + raw(1) + "))";
+                    return "((" + raw(1) + ")>=" + std::to_string(width) + "?" + wideTrunc("0", width) + ":" + shifted + ")";
+                }
+                if (kind == "ashr")
+                {
+                    // grhsim_ashr_words: sign-extend from the semantic width,
+                    // clamp the amount to container-1 (beyond-width amounts
+                    // saturate to the sign), mask back down.
+                    const auto container = wideContainer(width);
+                    const auto amount = "((" + raw(1) + ")>=" + std::to_string(container) + "?" +
+                                        std::to_string(container - 1) + ":(" + raw(1) + "))";
+                    return wideTrunc("(" + wideSext(raw(0), width) + ")>>(" + amount + ")", width);
+                }
                 if (kind == "add" || kind == "sub")
-                    return "grhsim_" + std::string(kind) + "_words(" + raw(0) + "," + raw(1) + "," + std::to_string(width) + ")";
+                    return wideTrunc("(" + raw(0) + (kind == "add" ? "+" : "-") + raw(1) + ")", width);
                 if (kind == "replicate")
-                    return "grhsim_replicate_words<" + words + "," + std::to_string((type(operands[0]).width + 63u) / 64u) + ">( " + raw(0) + "," +
-                           std::to_string(type(operands[0]).width) + "," + std::to_string(number("rep")) + "," + std::to_string(width) + ")";
+                {
+                    const auto elemWidth = type(operands[0]).width;
+                    const auto rep = number("rep");
+                    if (elemWidth == 1)
+                        // Bit fill: 0 - bit broadcasts the bit across the container.
+                        return wideTrunc("((" + wideType(width) + ")0-" + widen(0) + ")", width);
+                    const auto element = elemWidth > 64 ? raw(0) : truncRaw(raw(0), elemWidth);
+                    return "([&](){ " + wideType(width) + " cpu_rep=0;for(unsigned cpu_ri=0;cpu_ri<" +
+                           std::to_string(rep) + "&&cpu_ri*" + std::to_string(elemWidth) + "<" +
+                           std::to_string(width) + ";++cpu_ri) cpu_rep|=(" + wideType(width) + ")(" + element +
+                           ")<<(cpu_ri*" + std::to_string(elemWidth) + ");return cpu_rep&" + wideMask(width) + ";}())";
+                }
                 if (kind == "concat" && operands.size() >= 2)
                 {
-                    std::string joined = raw(0); uint64_t joinedWidth = type(operands[0]).width;
+                    // {joined, rhs}: rhs takes the low bits. Operands wider
+                    // than the result contribute only their low `width` bits
+                    // (same truncation the insert-words helpers applied).
+                    const auto low = [&](std::size_t i, uint64_t limit) {
+                        const auto w = type(operands[i]).width;
+                        return w > 64 ? wideTrunc(raw(i), std::min<uint64_t>(w, limit))
+                                      : truncRaw(raw(i), std::min<uint64_t>(w, limit));
+                    };
+                    if (operands.size() <= 8)
+                    {
+                        std::string joined = low(0, width);
+                        for (std::size_t i = 1; i < operands.size(); ++i)
+                        {
+                            const auto rhsWidth = type(operands[i]).width;
+                            if (rhsWidth >= width) { joined = low(i, width); continue; }
+                            joined = wideTrunc("((" + wideType(width) + ")(" + joined + ")<<" +
+                                                   std::to_string(rhsWidth) + "|(" + low(i, rhsWidth) + "))",
+                                               width);
+                        }
+                        return joined;
+                    }
+                    // Large concats use the statement form: a left-nested
+                    // expression with hundreds of << operators exhausts the
+                    // clang parser stack (measured on the XS bloomFilter
+                    // concat). Semantics are identical to the chain above.
+                    std::string body = "([&](){ " + wideType(width) + " cpu_cat=(" + low(0, width) + ");\n";
                     for (std::size_t i = 1; i < operands.size(); ++i)
                     {
                         const auto rhsWidth = type(operands[i]).width;
-                        if (joinedWidth <= 64 && rhsWidth <= 64 && joinedWidth + rhsWidth > 64)
-                            joined = "grhsim_concat_scalar_scalar_wide<" + words + ">( " + joined + "," + std::to_string(joinedWidth) + "," + raw(i) + "," +
-                                     std::to_string(rhsWidth) + "," + std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
-                        else if (joinedWidth <= 64 && rhsWidth <= 64)
-                            joined = "grhsim_concat_u64(" + joined + "," + std::to_string(joinedWidth) + "," + raw(i) + "," +
-                                     std::to_string(rhsWidth) + ")";
-                        else if (rhsWidth <= 64)
-                            joined = "grhsim_concat_wide_scalar<" + words + ">( " + joined + "," + std::to_string(joinedWidth) + "," +
-                                     raw(i) + "," + std::to_string(rhsWidth) + "," + std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
-                        else if (joinedWidth <= 64)
-                            joined = "grhsim_concat_scalar_wide<" + words + "," + std::to_string((rhsWidth + 63u) / 64u) + ">( " + joined + "," +
-                                     std::to_string(joinedWidth) + "," + raw(i) + "," + std::to_string(rhsWidth) + "," +
-                                     std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
-                        else
-                            joined = "grhsim_concat_words<" + words + ">( " + joined + "," + std::to_string(joinedWidth) + "," + raw(i) + "," +
-                                     std::to_string(rhsWidth) + "," + std::to_string(std::min<uint32_t>(width, joinedWidth + rhsWidth)) + ")";
-                        joinedWidth += type(operands[i]).width;
+                        if (rhsWidth >= width) { body += "cpu_cat=(" + low(i, width) + ");\n"; continue; }
+                        body += "cpu_cat=((" + wideType(width) + ")(cpu_cat)<<" + std::to_string(rhsWidth) +
+                                "|(" + low(i, rhsWidth) + "));\n";
                     }
-                    return joined;
+                    body += "return cpu_cat&" + wideMask(width) + ";}())";
+                    return body;
                 }
                 if ((kind == "sliceStatic" || kind == "sliceDynamic") && type(operands[0]).width > 64)
                 {
-                    const auto srcWords = (type(operands[0]).width + 63u) / 64u;
+                    // start clamps at the source container (padding reads as
+                    // zero), the ternary keeps the shift defined.
+                    const auto srcContainer = wideContainer(type(operands[0]).width);
                     const auto start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : raw(1);
-                    return "grhsim_slice_words<" + words + "," + std::to_string(srcWords) + ">( " + raw(0) + "," + start + "," + std::to_string(width) + ")";
+                    return "((" + start + ")>=" + std::to_string(srcContainer) + "?" + wideTrunc("0", width) + ":" +
+                           wideTrunc("(" + raw(0) + ")>>(" + start + ")", width) + ")";
                 }
                 if (kind == "sliceArray" && type(operands[0]).width > 64)
                 {
-                    const auto srcWords = (type(operands[0]).width + 63u) / 64u;
-                    return "grhsim_slice_words<" + words + "," + std::to_string(srcWords) + ">( " + raw(0) + ",(" + raw(1) + ")*" +
-                           std::to_string(width) + "," + std::to_string(width) + ")";
+                    const auto srcContainer = wideContainer(type(operands[0]).width);
+                    const auto start = "(" + raw(1) + ")*" + std::to_string(width);
+                    return "((" + start + ")>=" + std::to_string(srcContainer) + "?" + wideTrunc("0", width) + ":" +
+                           wideTrunc("(" + raw(0) + ")>>(" + start + ")", width) + ")";
                 }
                 throw std::runtime_error("CPU six-phase emit unsupported wide operation: " + std::string(kind) + " width=" + std::to_string(width));
             }
@@ -1724,8 +1950,8 @@ namespace wolvrix::lib::grhsim
         std::string SixPhaseEmitter::callCondition(ValueId condition) const
         {
             const auto &target = type(condition);
-            return target.width > 64 ? "grhsim_reduce_or_words(" + read(condition) + ',' +
-                std::to_string(target.width) + ')' : read(condition);
+            // Wide conditions are clean _BitInt values: reduce-or is != 0.
+            return target.width > 64 ? "((" + read(condition) + ")!=0)" : read(condition);
         }
         void SixPhaseEmitter::activateOrdinals(std::ostream &out, std::span<const uint32_t> ordinals,
                                                std::string_view array) const
@@ -1751,6 +1977,25 @@ namespace wolvrix::lib::grhsim
             activateOrdinals(out, now, dataActive);
             activateOrdinals(out, later, dataNext);
         }
+        void SixPhaseEmitter::activateOrdinalsCond(std::ostream &out, std::span<const uint32_t> ordinals,
+                                                   std::string_view array, std::string_view cond) const
+        {
+            std::map<uint32_t, uint64_t> words;
+            for (const auto ordinal : ordinals) words[ordinal / 64] |= 1ull << (ordinal % 64);
+            for (const auto &[word, mask] : words)
+                out << array << '[' << word << "]|=-(std::uint64_t)" << cond << '&' << u64Const(mask) << ";\n";
+        }
+        void SixPhaseEmitter::activateFanoutCond(std::ostream &out, std::span<const uint32_t> ordinals,
+                                                 uint32_t current, std::string_view cond) const
+        {
+            const auto dataActive = model_.text(activeStore_->fields[0].name);
+            const auto dataNext = model_.text(activeStore_->fields[1].name);
+            std::vector<uint32_t> now, later;
+            for (const auto ordinal : ordinals)
+                (current != ~0u && ordinal > current ? now : later).push_back(ordinal);
+            activateOrdinalsCond(out, now, dataActive, cond);
+            activateOrdinalsCond(out, later, dataNext, cond);
+        }
         void SixPhaseEmitter::publishBoundary(std::ostream &out, ValueId result, const std::string &expr,
                                               uint32_t current) const
         {
@@ -1768,10 +2013,26 @@ namespace wolvrix::lib::grhsim
                 out << slot << '=' << expr << ";\n";
                 return;
             }
-            out << "{const auto cpu_value=" << expr << ";if(" << slot << "!=cpu_value){" << slot << "=cpu_value;\n";
+            // E-flat (gsim-shape publish): scalars publish branchlessly — the
+            // store is unconditional and the change bit masks the fanout flag
+            // ORs; same flag semantics, no per-value branch. Strings and
+            // whole-array images keep the conditional store: their copy cost
+            // dominates, and both are rare.
+            const bool conditional = boundaryStringSlot_.contains(field) ||
+                layout_.types[field->type.index - 1].kind == CpuTypeKind::Array;
+            if (conditional)
+            {
+                out << "{const auto cpu_value=" << expr << ";if(" << slot << "!=cpu_value){" << slot << "=cpu_value;\n";
+                if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, "cpu_value");
+                activateFanout(out, supernodeFanout_[result.index], current);
+                out << "}}\n";
+                return;
+            }
+            out << "{const auto cpu_value=" << expr << ";const bool cpu_chg=" << slot << "!=cpu_value;" << slot <<
+                   "=cpu_value;\n";
             if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, "cpu_value");
-            activateFanout(out, supernodeFanout_[result.index], current);
-            out << "}}\n";
+            activateFanoutCond(out, supernodeFanout_[result.index], current, "cpu_chg");
+            out << "}\n";
         }
 
         // ----- Per-op emission -----
@@ -1800,192 +2061,11 @@ namespace wolvrix::lib::grhsim
                 return;
             }
             const auto &resultType = type(result);
-            if (resultType.kind == TypeKind::Logic && resultType.domain == LogicDomain::TwoState && resultType.width > 64 &&
-                name.starts_with("core.compute."))
-            {
-                const auto kind = name.substr(std::string_view("core.compute.").size());
-                const auto operands = model_.operands(op);
-                const auto words = (resultType.width + 63u) / 64u;
-                const auto *field = boundaryByValue_[result.index];
-                std::string dst;
-                if (field) dst = boundaryRef(field);
-                else
-                {
-                    dst = localRef(result);
-                    if (!crossingLocals_[result.index])
-                    {
-                        out << cppType(resultType) << ' ' << dst << ";\n";
-                        activeLocals_[result.index] = 1;
-                    }
-                }
-                if (kind == "concat")
-                {
-                    out << "{\n";
-                    std::string build = dst;
-                    if (field)
-                    {
-                        out << cppType(resultType) << " cpu_concat{};\n";
-                        build = "cpu_concat";
-                    }
-                    else out << dst << ".fill(0);\n";
-                    uint64_t offset = 0;
-                    for (std::size_t i = operands.size(); i > 0 && offset < resultType.width; --i)
-                    {
-                        const auto operand = operands[i - 1];
-                        const auto width = std::min<uint64_t>(type(operand).width, resultType.width - offset);
-                        out << (type(operand).width > 64 ? "grhsim_insert_words" : "grhsim_insert_scalar_words")
-                            << '(' << build << ',' << offset << ',' << read(operand) << ',' << width << ");\n";
-                        offset += width;
-                    }
-                    if (field)
-                    {
-                        // Dead-compare elimination (same rule as publishBoundary):
-                        // no fanout consumer -> the change test guards nothing.
-                        if (supernodeFanout_[result.index].empty()) out << dst << "=cpu_concat;\n";
-                        else
-                        {
-                            out << "if(" << dst << "!=cpu_concat){" << dst << "=cpu_concat;\n";
-                            activateFanout(out, supernodeFanout_[result.index], current);
-                            out << "}\n";
-                        }
-                    }
-                    out << "}\n";
-                    return;
-                }
-                if (kind == "replicate")
-                {
-                    const auto operand = operands[0];
-                    const auto &sourceType = type(operand);
-                    const auto sourceWords = (sourceType.width + 63u) / 64u;
-                    const auto *rep = parameter<int64_t>(model_, model_.parameters(op), "rep");
-                    if (!rep || *rep < 0) throw std::runtime_error("missing or negative CPU replication parameter");
-                    const auto call = (sourceType.width > 64 ?
-                        "cpu_replicate_words_changed<" + std::to_string(words) + "," + std::to_string(sourceWords) + ">( " :
-                        "cpu_replicate_words_changed<" + std::to_string(words) + ">( ") + read(operand) + "," +
-                        std::to_string(sourceType.width) + "," + std::to_string(*rep) + "," +
-                        std::to_string(resultType.width) + "," + dst + ")";
-                    if (field)
-                    {
-                        out << "if(" << call << "){\n";
-                        activateFanout(out, supernodeFanout_[result.index], current);
-                        out << "}\n";
-                    }
-                    else out << "(void)" << call << ";\n";
-                    return;
-                }
-                const bool pointerOperation = kind == "and" || kind == "or" || kind == "xor" || kind == "not" ||
-                    kind == "shl" || kind == "lshr" || kind == "ashr" || kind == "add" || kind == "sub";
-                if (pointerOperation)
-                {
-                    out << "{\n";
-                    std::set<uint32_t> scalars;
-                    const bool binary = kind == "and" || kind == "or" || kind == "xor" || kind == "add" || kind == "sub";
-                    for (std::size_t i = 0; i < (binary ? 2u : 1u); ++i)
-                    {
-                        const auto operand = operands[i];
-                        if (type(operand).width <= 64 && scalars.insert(operand.index).second)
-                            out << "const std::uint64_t cpu_operand_" << operand.index << "=grhsim_trunc_u64("
-                                << read(operand) << ',' << type(operand).width << ");\n";
-                    }
-                    const auto ptr = [&](ValueId valueId, const std::string &expr) {
-                        return type(valueId).width > 64 ? "(" + expr + ").data()" : "&cpu_operand_" + std::to_string(valueId.index);
-                    };
-                    if (kind == "and" || kind == "or" || kind == "xor" || kind == "not")
-                    {
-                        const bool unary = kind == "not";
-                        const char operation = unary ? '~' : kind == "and" ? '&' : kind == "or" ? '|' : '^';
-                        // cpu_bitwise_words_changed takes an explicit (nullptr,0) rhs
-                        // for '~'; the plain grhsim_not_words drops those two slots.
-                        const auto args = [&](std::ostream &stream, bool nullRhs) {
-                            stream << ptr(operands[0], read(operands[0])) << ',' << ((type(operands[0]).width + 63u) / 64u) << ',';
-                            if (unary) { if (nullRhs) stream << "nullptr,0,"; }
-                            else stream << ptr(operands[1], read(operands[1])) << ',' << ((type(operands[1]).width + 63u) / 64u) << ',';
-                            stream << resultType.width << ',' << dst << ".data()," << words;
-                        };
-                        if (field)
-                        {
-                            out << "if(cpu_bitwise_words_changed<'" << operation << "'>(";
-                            args(out, true);
-                            out << ")){\n";
-                            activateFanout(out, supernodeFanout_[result.index], current);
-                            out << "}\n";
-                        }
-                        else
-                        {
-                            out << (unary ? "grhsim_not_words(" : "grhsim_" + std::string(kind) + "_words(");
-                            args(out, false);
-                            out << ");\n";
-                        }
-                        out << "}\n";
-                        return;
-                    }
-                    if (kind == "add" || kind == "sub")
-                    {
-                        const auto args = [&](std::ostream &stream) {
-                            stream << ptr(operands[0], read(operands[0])) << ',' << ((type(operands[0]).width + 63u) / 64u) << ','
-                                << ptr(operands[1], read(operands[1])) << ',' << ((type(operands[1]).width + 63u) / 64u) << ','
-                                << resultType.width << ',' << dst << ".data()," << words;
-                        };
-                        if (field)
-                        {
-                            out << (kind == "add" ? "if(cpu_arithmetic_words_changed<'+'>(" : "if(cpu_arithmetic_words_changed<'-'>(");
-                            args(out);
-                            out << ")){\n";
-                            activateFanout(out, supernodeFanout_[result.index], current);
-                            out << "}\n";
-                        }
-                        else
-                        {
-                            out << (kind == "add" ? "grhsim_add_words(" : "grhsim_sub_words(");
-                            args(out);
-                            out << ");\n";
-                        }
-                        out << "}\n";
-                        return;
-                    }
-                    // shl/lshr/ashr
-                    const auto args = [&](std::ostream &stream) {
-                        stream << ptr(operands[0], read(operands[0])) << ',' << ((type(operands[0]).width + 63u) / 64u)
-                            << ",grhsim_index_words(" << read(operands[1]) << ',' << resultType.width << ")," << resultType.width << ','
-                            << dst << ".data()," << words;
-                    };
-                    if (field)
-                    {
-                        out << "if(cpu_shift_words_changed<'"
-                            << (kind == "shl" ? 'L' : kind == "lshr" ? 'R' : 'A') << "'>(";
-                        args(out);
-                        out << ")){\n";
-                        activateFanout(out, supernodeFanout_[result.index], current);
-                        out << "}\n";
-                    }
-                    else
-                    {
-                        out << "grhsim_" << kind << "_words(";
-                        args(out);
-                        out << ");\n";
-                    }
-                    out << "}\n";
-                    return;
-                }
-                // Remaining wide ops (mux/slice/div/mod/mul/...) use the
-                // value-returning runtime helpers with a compare-store on top.
-                const auto expr = expression(op);
-                if (field)
-                {
-                    // Dead-compare elimination (same rule as publishBoundary):
-                    // no fanout consumer -> the change test guards nothing.
-                    if (supernodeFanout_[result.index].empty())
-                    {
-                        out << dst << '=' << expr << ";\n";
-                        return;
-                    }
-                    out << "{const auto cpu_value=" << expr << ";if(" << dst << "!=cpu_value){" << dst << "=cpu_value;\n";
-                    activateFanout(out, supernodeFanout_[result.index], current);
-                    out << "}}\n";
-                }
-                else out << dst << '=' << expr << ";\n";
-                return;
-            }
+            // Wide two-state compute ops need no dedicated path: they are
+            // plain _BitInt expressions and flow through the generic
+            // normalize + publishBoundary/declareLocal tail below (the
+            // pointer-ABI word helpers and fused change-detection templates
+            // of the array storage era are gone).
             // Whole-array values (a memAssign source read) skip normalize():
             // they move as std::array units between the mem store, the boundary
             // store, and locals.
@@ -2024,10 +2104,11 @@ namespace wolvrix::lib::grhsim
             std::string hit;
             if (eventType.kind == TypeKind::Logic && eventType.domain == LogicDomain::TwoState && eventType.width > 64)
             {
-                const auto width = std::to_string(eventType.width);
-                if (*edge == "posedge") hit = "grhsim_event_posedge_words(" + cur + "," + prevSlot + "," + width + ")";
-                else if (*edge == "negedge") hit = "grhsim_event_negedge_words(" + cur + "," + prevSlot + "," + width + ")";
-                else hit = "(grhsim_event_posedge_words(" + cur + "," + prevSlot + "," + width + ")||grhsim_event_negedge_words(" + cur + "," + prevSlot + "," + width + "))";
+                // Full-width any-bit edge on clean _BitInt values
+                // (grhsim_event_*_words semantics).
+                if (*edge == "posedge") hit = "((" + cur + ")!=0&&(" + prevSlot + ")==0)";
+                else if (*edge == "negedge") hit = "((" + cur + ")==0&&(" + prevSlot + ")!=0)";
+                else hit = "(((" + cur + ")!=0&&(" + prevSlot + ")==0)||((" + cur + ")==0&&(" + prevSlot + ")!=0))";
             }
             else if (isScalarLogic(eventType))
             {
@@ -2087,9 +2168,11 @@ namespace wolvrix::lib::grhsim
             }
             else if (targetType.kind == TypeKind::Logic && targetType.domain == LogicDomain::TwoState)
             {
-                out << "{const auto cpu_merged=grhsim_merge_words_masked(" << nextSlot << ',' << read(operands[1]) << ','
-                    << read(operands[2]) << ',' << targetType.width << ");\n"
-                    << "if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
+                // grhsim_merge_words_masked natively: (base & ~mask) | (data & mask).
+                const std::string merged = normalize("(" + nextSlot + "&~(" + read(operands[2]) + "))|(" +
+                                                         read(operands[1]) + "&(" + read(operands[2]) + "))",
+                                                     targetType);
+                out << "{const auto cpu_merged=" << merged << ";if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
                 activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
@@ -2183,13 +2266,19 @@ namespace wolvrix::lib::grhsim
                 }
                 if (element.kind == TypeKind::Logic && element.domain == LogicDomain::TwoState)
                 {
+                    // grhsim_apply_masked_words_inplace natively: merged =
+                    // (cell & ~mask) | (data & mask), store on change.
                     if (mask)
-                        out << "if(grhsim_apply_masked_words_inplace(" << cell << ',' << data << ',' << *mask << ',' << element.width << ")){\n";
+                        out << "{const auto cpu_merged=" << normalize("(" + cell + "&~(" + *mask + "))|(" + data +
+                                                                       "&(" + *mask + "))",
+                                                                       element)
+                            << ";if(" << cell << "!=cpu_merged){" << cell << "=cpu_merged;\n";
                     else
                         out << "if(" << cell << "!=" << data << "){" << cell << '=' << data << ";\n";
                     out << "GRHSIM_PERF_COUNT(touchedWriteCount);\n";
                     activateReaders(rowText, constRow);
-                    out << "}\n";
+                    // The masked branch opened an extra cpu_merged block.
+                    out << (mask ? "}}\n" : "}\n");
                     return;
                 }
                 throw std::runtime_error("CPU six-phase emit mem write element type is not two-state logic");
@@ -2248,22 +2337,18 @@ namespace wolvrix::lib::grhsim
                                   std::to_string(element.width) + "u)",
                               nullptr);
                 else if (isScalarLogic(element))
-                    // Wide packed data, scalar rows: slice straight to a word.
+                    // Wide packed data, scalar rows: slice straight to a word
+                    // (the row shift stays below the packed container width).
                     writeCell("cpu_row", std::nullopt,
-                              "grhsim_slice_words_u64<" + std::to_string((dataType.width + 63u) / 64u) +
-                                  ">((" + data + "),cpu_row*" + std::to_string(element.width) + "u," +
-                                  std::to_string(element.width) + "u)",
+                              truncRaw("(std::uint64_t)((" + data + ")>>(cpu_row*" + std::to_string(element.width) +
+                                       "u))", element.width),
                               nullptr);
                 else
-                {
-                    const auto elementWords = (element.width + 63u) / 64u;
-                    out << "{std::array<std::uint64_t," << elementWords << "> cpu_fill_slice;\n"
-                        << "grhsim_slice_words((" << data << ").data()," << (packedWidth + 63u) / 64u
-                        << ",cpu_row*" << element.width << "u," << element.width << ",cpu_fill_slice.data(),"
-                        << elementWords << ");\n";
-                    writeCell("cpu_row", std::nullopt, "cpu_fill_slice", nullptr);
-                    out << "}\n";
-                }
+                    // Wide rows slice natively out of the packed _BitInt value.
+                    writeCell("cpu_row", std::nullopt,
+                              wideTrunc("((" + data + ")>>(cpu_row*" + std::to_string(element.width) + "u))",
+                                        element.width),
+                              nullptr);
                 out << "}\n}\n";
             }
             else if (name == "core.state.memWriteSeq")
@@ -2342,9 +2427,12 @@ namespace wolvrix::lib::grhsim
                 }
                 if (element.kind == TypeKind::Logic && element.domain == LogicDomain::TwoState)
                 {
+                    // grhsim_merge_words_masked natively (see emitRegWrite).
                     if (mask)
-                        out << "{const auto cpu_merged=grhsim_merge_words_masked(" << nextCell << ',' << data << ','
-                            << *mask << ',' << element.width << ");if(" << nextCell << "!=cpu_merged){if(" << curCell
+                        out << "{const auto cpu_merged=" << normalize("(" + nextCell + "&~(" + *mask + "))|(" + data +
+                                                                       "&(" + *mask + "))",
+                                                                       element)
+                            << ";if(" << nextCell << "!=cpu_merged){if(" << curCell
                             << "!=cpu_merged){\n";
                     else
                         out << "{if(" << nextCell << "!=" << data << "){if(" << curCell << "!=" << data << "){\n";
@@ -2407,20 +2495,14 @@ namespace wolvrix::lib::grhsim
                               nullptr);
                 else if (isScalarLogic(element))
                     writeCell("cpu_row", std::nullopt,
-                              "grhsim_slice_words_u64<" + std::to_string((dataType.width + 63u) / 64u) +
-                                  ">((" + data + "),cpu_row*" + std::to_string(element.width) + "u," +
-                                  std::to_string(element.width) + "u)",
+                              truncRaw("(std::uint64_t)((" + data + ")>>(cpu_row*" + std::to_string(element.width) +
+                                       "u))", element.width),
                               nullptr);
                 else
-                {
-                    const auto elementWords = (element.width + 63u) / 64u;
-                    out << "{std::array<std::uint64_t," << elementWords << "> cpu_fill_slice;\n"
-                        << "grhsim_slice_words((" << data << ").data()," << (packedWidth + 63u) / 64u
-                        << ",cpu_row*" << element.width << "u," << element.width << ",cpu_fill_slice.data(),"
-                        << elementWords << ");\n";
-                    writeCell("cpu_row", std::nullopt, "cpu_fill_slice", nullptr);
-                    out << "}\n";
-                }
+                    writeCell("cpu_row", std::nullopt,
+                              wideTrunc("((" + data + ")>>(cpu_row*" + std::to_string(element.width) + "u))",
+                                        element.width),
+                              nullptr);
                 out << "}\n}\n";
             }
             else if (name == "core.state.memWriteSeq")
@@ -2507,9 +2589,20 @@ namespace wolvrix::lib::grhsim
             for (std::size_t i = 0; i < args.size(); ++i)
             {
                 if (i) out << ',';
-                out << "grhsim_make_task_arg(" << read(args[i]);
-                if (type(args[i]).kind == TypeKind::Logic)
-                    out << ',' << type(args[i]).width << ',' << (type(args[i]).isSigned ? "true" : "false");
+                const auto &argType = type(args[i]);
+                if (argType.kind == TypeKind::Logic && argType.domain == LogicDomain::TwoState && argType.width > 64)
+                {
+                    // Wide values are _BitInt objects: the scalar overload
+                    // would silently truncate to u64, so unpack words here.
+                    out << "grhsim_make_task_arg_wide(" << read(args[i]);
+                    out << ',' << argType.width << ',' << (argType.isSigned ? "true" : "false");
+                }
+                else
+                {
+                    out << "grhsim_make_task_arg(" << read(args[i]);
+                    if (argType.kind == TypeKind::Logic)
+                        out << ',' << argType.width << ',' << (argType.isSigned ? "true" : "false");
+                }
                 out << ')';
             }
             out << "}};cpu_system_task(\"";
@@ -2589,7 +2682,9 @@ namespace wolvrix::lib::grhsim
             out << "{\n";
             auto source = temporary;
             if (target.kind == TypeKind::Logic && target.width > 64)
-                out << "grhsim_trunc_words(" << temporary << ',' << target.width << ");\n";
+                // Mask the C side's result back to the semantic width (was
+                // grhsim_trunc_words on the word array).
+                out << temporary << "&=" << wideMask(target.width) << ";\n";
             else if (target.kind == TypeKind::Logic)
             {
                 source = "cpu_dpi_normalized";
@@ -2605,10 +2700,24 @@ namespace wolvrix::lib::grhsim
                     out << slot << "=std::move(" << source << ");\n";
                 else
                 {
-                    out << "if(" << slot << "!=" << source << "){" << slot << "=std::move(" << source << ");\n";
-                    if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, source);
-                    activateFanout(out, supernodeFanout_[result.index], current);
-                    out << "}\n";
+                    // Same E-flat split as publishBoundary: scalars publish
+                    // branchlessly; strings/arrays keep the conditional store.
+                    const bool conditional = boundaryStringSlot_.contains(field) ||
+                        layout_.types[field->type.index - 1].kind == CpuTypeKind::Array;
+                    if (conditional)
+                    {
+                        out << "if(" << slot << "!=" << source << "){" << slot << "=std::move(" << source << ");\n";
+                        if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, source);
+                        activateFanout(out, supernodeFanout_[result.index], current);
+                        out << "}\n";
+                    }
+                    else
+                    {
+                        out << "const bool cpu_chg=" << slot << "!=" << source << ";" << slot << "=std::move(" <<
+                               source << ");\n";
+                        if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, source);
+                        activateFanoutCond(out, supernodeFanout_[result.index], current, "cpu_chg");
+                    }
                 }
             }
             else out << localRef(result) << "=std::move(" << source << ");\n";
@@ -2672,8 +2781,8 @@ namespace wolvrix::lib::grhsim
                 }
                 else if (target.kind == TypeKind::Logic && target.domain == LogicDomain::TwoState)
                 {
-                    out << "{const auto cpu_merged=grhsim_merge_words_masked(regLatchStore." << name << ',' << staged.data << ','
-                        << staged.mask << ',' << target.width << ");\n"
+                    out << "{const auto cpu_merged=" << normalize("(regLatchStore." + name + "&~(" + staged.mask + "))|(" +
+                                                                      staged.data + "&(" + staged.mask + "))", target) << ";\n"
                         << "if(regLatchStore." << name << "!=cpu_merged){GRHSIM_PERF_COUNT(touchedStateShadowCount);\n"
                         << "regLatchStore." << name << "=cpu_merged;\nregLatchStoreNext." << name << "=cpu_merged;\n}}\n";
                 }
@@ -3072,155 +3181,21 @@ namespace wolvrix::lib::grhsim
         {
             out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
             if (waveform_) out << "#include <memory>\n";
+            // Wide (>64-bit) two-state values are C23 unsigned _BitInt objects:
+            // clang is required (gcc's C++ frontend rejects _BitInt), and the
+            // raw-byte paths (FST word dump, whole-store memcpy, dumpState
+            // hash) rely on the little-endian u64-word layout with 8-byte
+            // size rounding and alignment.
+            out << "#ifndef __BITINT_MAXWIDTH__\n#error \"C23 _BitInt support is required (compile the model with clang >= 19)\"\n#endif\n"
+                << "static_assert(sizeof(unsigned _BitInt(65))==16 && alignof(unsigned _BitInt(65))==8 &&\n"
+                << "    sizeof(unsigned _BitInt(128))==16 && alignof(unsigned _BitInt(128))==8,\n"
+                << "    \"unexpected _BitInt object layout: the generated model requires 8-byte-rounded little-endian words\");\n";
             // Optional perf/waveform build knobs (XS difftest hooks): default
             // off; counters are only compiled in a WOLVRIX_GRHSIM_PERF build.
             out << "#ifndef WOLVRIX_GRHSIM_PERF\n#define WOLVRIX_GRHSIM_PERF 0\n#endif\n"
                 << "#ifndef WOLVRIX_GRHSIM_WAVEFORM\n#define WOLVRIX_GRHSIM_WAVEFORM 0\n#endif\n"
                 << "#if WOLVRIX_GRHSIM_PERF\n#define GRHSIM_PERF_COUNT(field) (++perf_.field)\n"
                 << "#else\n#define GRHSIM_PERF_COUNT(field) ((void)0)\n#endif\n";
-            // Pointer-based wide-value change helpers (caller-provided out
-            // buffers, same ABI shape as the legacy emitter's header copies).
-            out << R"CPP(template<char Operation>
-inline bool cpu_bitwise_words_changed(const std::uint64_t *lhs, std::size_t lhsWords,
-    const std::uint64_t *rhs, std::size_t rhsWords, std::size_t width,
-    std::uint64_t *out, std::size_t outWords)
-{
-    static_assert(Operation=='&' || Operation=='|' || Operation=='^' || Operation=='~');
-    bool changed=false;
-    for(std::size_t i=0;i<outWords;++i){
-        const std::uint64_t a=i<lhsWords?lhs[i]:UINT64_C(0);
-        std::uint64_t word;
-        if constexpr(Operation=='~') word=~a;
-        else {
-            const std::uint64_t b=i<rhsWords?rhs[i]:UINT64_C(0);
-            if constexpr(Operation=='&') word=a&b;
-            else if constexpr(Operation=='|') word=a|b;
-            else word=a^b;
-        }
-        if(i>=width/64) word=i==width/64 ? word&grhsim_mask(width%64) : UINT64_C(0);
-        changed|=out[i]!=word;
-        out[i]=word;
-    }
-    return changed;
-}
-template<char Operation>
-inline bool cpu_arithmetic_words_changed(const std::uint64_t *lhs, std::size_t lhsWords,
-    const std::uint64_t *rhs, std::size_t rhsWords, std::size_t width,
-    std::uint64_t *out, std::size_t outWords)
-{
-    static_assert(Operation=='+' || Operation=='-');
-    bool changed=false;
-    std::uint64_t carry=0;
-    for(std::size_t i=0;i<outWords;++i){
-        const std::uint64_t a=i<lhsWords?lhs[i]:UINT64_C(0);
-        const std::uint64_t b=i<rhsWords?rhs[i]:UINT64_C(0);
-        std::uint64_t word;
-        if constexpr(Operation=='+'){
-            const unsigned __int128 sum=static_cast<unsigned __int128>(a)+b+carry;
-            word=static_cast<std::uint64_t>(sum);carry=sum>>64;
-        }else{
-            const std::uint64_t subtrahend=b+carry;
-            carry=(subtrahend<b || a<subtrahend)?1:0;
-            word=a-subtrahend;
-        }
-        if(i>=width/64) word=i==width/64 ? word&grhsim_mask(width%64) : UINT64_C(0);
-        changed|=out[i]!=word;
-        out[i]=word;
-    }
-    return changed;
-}
-template<char Operation>
-inline bool cpu_shift_words_changed(const std::uint64_t *value, std::size_t valueWords,
-    std::size_t amount, std::size_t width, std::uint64_t *out, std::size_t outWords)
-{
-    static_assert(Operation=='L' || Operation=='R' || Operation=='A');
-    bool changed=false;
-    const bool sign=Operation=='A' && grhsim_sign_bit_words(value,valueWords,width);
-    const std::size_t wordShift=amount/64,bitShift=amount%64;
-    for(std::size_t step=0;step<outWords;++step){
-        const std::size_t i=Operation=='L'?outWords-1-step:step;
-        std::uint64_t word=0;
-        if(amount<width){
-            if constexpr(Operation=='L'){
-                if(i>=wordShift){
-                    const std::size_t src=i-wordShift;
-                    if(src<valueWords) word=value[src]<<bitShift;
-                    if(bitShift && src>0 && src-1<valueWords) word|=value[src-1]>>(64-bitShift);
-                }
-            }else{
-                const std::size_t src=i+wordShift;
-                if(src<valueWords) word=value[src]>>bitShift;
-                if(bitShift && src+1<valueWords) word|=value[src+1]<<(64-bitShift);
-            }
-        }
-        if(sign){
-            const std::size_t start=amount>=width?0:width-amount;
-            if(i>=start/64) word|=i==start/64 ? ~grhsim_mask(start%64) : ~UINT64_C(0);
-        }
-        if(i>=width/64) word=i==width/64 ? word&grhsim_mask(width%64) : UINT64_C(0);
-        changed|=out[i]!=word;
-        out[i]=word;
-    }
-    return changed;
-}
-)CPP";
-            out << R"CPP(template<std::size_t DestN,std::size_t SrcN>
-inline bool cpu_replicate_words_changed(const std::array<std::uint64_t,SrcN> &source,
-    std::size_t elemWidth,std::size_t rep,std::size_t totalWidth,
-    std::array<std::uint64_t,DestN> &out)
-{
-    bool changed=false;
-    for(std::size_t repeat=0;repeat<rep;++repeat){
-        const std::size_t destLsb=repeat*elemWidth;
-        if(destLsb>=totalWidth) break;
-        const std::size_t width=std::min(elemWidth,totalWidth-destLsb);
-        const std::size_t sourceWords=(width+63u)/64u;
-        for(std::size_t i=0;i<sourceWords && i<SrcN;++i){
-            const std::size_t wordWidth=(i+1u==sourceWords)?width-i*64u:64u;
-            const std::uint64_t sourceWord=source[i]&grhsim_mask(wordWidth);
-            const std::size_t bit=destLsb+i*64u;
-            const std::size_t word=bit/64u;
-            const std::size_t shift=bit&63u;
-            if(word<DestN){
-                const std::size_t first=std::min(wordWidth,64u-shift);
-                const std::uint64_t mask=grhsim_mask(first)<<shift;
-                const std::uint64_t value=(sourceWord&grhsim_mask(first))<<shift;
-                const std::uint64_t next=(out[word]&~mask)|value;
-                changed|=out[word]!=next;out[word]=next;
-                if(first<wordWidth && word+1u<DestN){
-                    const std::size_t second=wordWidth-first;
-                    const std::uint64_t nextWord=(out[word+1u]&~grhsim_mask(second))|(sourceWord>>first&grhsim_mask(second));
-                    changed|=out[word+1u]!=nextWord;out[word+1u]=nextWord;
-                }
-            }
-        }
-    }
-    const std::size_t liveWidth=elemWidth==0||rep==0?0:rep>totalWidth/elemWidth?totalWidth:rep*elemWidth;
-    const std::size_t firstDead=liveWidth/64u;
-    if(liveWidth&63u){
-        if(firstDead<DestN){
-            const std::uint64_t next=out[firstDead]&grhsim_mask(liveWidth&63u);
-            changed|=out[firstDead]!=next;out[firstDead]=next;
-            for(std::size_t i=firstDead+1u;i<DestN;++i){changed|=out[i]!=UINT64_C(0);out[i]=UINT64_C(0);}
-        }
-    }
-    else if(firstDead<DestN){
-        for(std::size_t i=firstDead;i<DestN;++i){changed|=out[i]!=UINT64_C(0);out[i]=UINT64_C(0);}
-    }
-    return changed;
-}
-template<std::size_t DestN,class Scalar>
-inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std::size_t rep,
-    std::size_t totalWidth,std::array<std::uint64_t,DestN> &out)
-{
-    const std::array<std::uint64_t,1> words{{static_cast<std::uint64_t>(source)}};
-    return cpu_replicate_words_changed<DestN,1>(words,elemWidth,rep,totalWidth,out);
-}
-)CPP";
-            out << "template<std::size_t N,std::size_t R> inline std::array<std::uint64_t,N> grhsim_concat_wide_scalar(const std::array<std::uint64_t,R>& lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
-            out << "template<std::size_t N> inline std::array<std::uint64_t,N> grhsim_concat_wide_scalar(std::uint64_t lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
-            out << "template<std::size_t N> inline std::array<std::uint64_t,N> grhsim_concat_scalar_scalar_wide(std::uint64_t lhs,std::size_t lhsWidth,std::uint64_t rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_scalar_words(out,0,rhs,rhsWidth);grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
-            out << "template<std::size_t N,std::size_t R> inline std::array<std::uint64_t,N> grhsim_concat_scalar_wide(std::uint64_t lhs,std::size_t lhsWidth,const std::array<std::uint64_t,R>& rhs,std::size_t rhsWidth,std::size_t totalWidth){std::array<std::uint64_t,N> out{};grhsim_insert_words(out,0,rhs,std::min(rhsWidth,totalWidth));if(rhsWidth<totalWidth)grhsim_insert_scalar_words(out,rhsWidth,lhs,std::min(lhsWidth,totalWidth-rhsWidth));grhsim_trunc_words(out,totalWidth);return out;}\n";
             // M5d-7 multi-TU: every unit includes this header, so the shared
             // pieces live here — the dump value printers (the port section
             // matches the trace shim: bool -> 0/1, integral -> zero-padded
@@ -3229,10 +3204,12 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             // copies); each unit .cpp redeclares the imports it references.
             out << "namespace " << prefix_ << "_dump {\n"
                 << "inline void grhsim_dump_value(std::FILE *stream,bool value){std::fprintf(stream,\"%u\",value?1u:0u);}\n"
+                << "inline void grhsim_dump_wide(std::FILE *stream,const std::uint64_t *words,std::size_t count){for(std::size_t i=count;i-->0;)std::fprintf(stream,\"%016llx\",static_cast<unsigned long long>(words[i]));}\n"
                 << "template<typename T> inline void grhsim_dump_value(std::FILE *stream,const T &value){\n"
                 << "if constexpr(std::is_same_v<T,double>){std::uint64_t bits=0;std::memcpy(&bits,&value,sizeof(bits));std::fprintf(stream,\"%016llx\",static_cast<unsigned long long>(bits));}\n"
                 << "else if constexpr(std::is_same_v<T,float>){std::uint32_t bits=0;std::memcpy(&bits,&value,sizeof(bits));std::fprintf(stream,\"%08x\",bits);}\n"
                 << "else if constexpr(std::is_same_v<T,std::string>){std::fprintf(stream,\"%s\",value.c_str());}\n"
+                << "else if constexpr(sizeof(T)>8){grhsim_dump_wide(stream,reinterpret_cast<const std::uint64_t*>(&value),sizeof(T)/8);}\n"
                 << "else{using U=std::make_unsigned_t<T>;std::fprintf(stream,\"%0*llx\",static_cast<int>(sizeof(T))*2,static_cast<unsigned long long>(static_cast<U>(value)));}\n"
                 << "}\n"
                 << "template<typename T,std::size_t N> inline void grhsim_dump_value(std::FILE *stream,const std::array<T,N> &value){for(std::size_t i=N;i-->0;)grhsim_dump_value(stream,value[i]);}\n"
@@ -3800,19 +3777,32 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             // Canonical dump item order (C8 contract): input ports, output
             // ports, then the named-store fields in store order.
             const auto dumpPrinter = prefix_ + "_dump::grhsim_dump_value";
-            const auto portLine = [&](const std::string &name) {
+            // Wide _BitInt objects print through their u64-word image (the
+            // generic grhsim_dump_value overload cannot name _BitInt).
+            const auto wideLine = [&](const std::string &label, const std::string &ref, uint64_t width) {
+                out << "std::fprintf(stream,\"" << label << "=\");" << prefix_
+                    << "_dump::grhsim_dump_wide(stream,reinterpret_cast<const std::uint64_t*>(&(" << ref << ")),"
+                    << (width + 63) / 64 << ");std::fputc('\\n',stream);\n";
+            };
+            const auto portLine = [&](const std::string &name, TypeId typeId) {
+                const auto &type = model_.types()[typeId.index - 1];
+                if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState && type.width > 64)
+                {
+                    wideLine(name, "this->" + identifier(name), type.width);
+                    return;
+                }
                 out << "std::fprintf(stream,\"" << name << "=\");" << dumpPrinter << "(stream,this->" << identifier(name)
                     << ");std::fputc('\\n',stream);\n";
             };
             if (position < model_.inputs().size())
             {
-                portLine(std::string(model_.text(model_.inputs()[position].name)));
+                portLine(std::string(model_.text(model_.inputs()[position].name)), model_.inputs()[position].type);
                 return;
             }
             position -= model_.inputs().size();
             if (position < model_.outputs().size())
             {
-                portLine(std::string(model_.text(model_.outputs()[position].name)));
+                portLine(std::string(model_.text(model_.outputs()[position].name)), model_.outputs()[position].type);
                 return;
             }
             position -= model_.outputs().size();
@@ -3850,6 +3840,13 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
                     // The dump label keeps the store field name (trace
                     // consumers parse it); hoisted strings print from
                     // boundaryStrings.
+                    const auto &fieldType = layout_.types[field.type.index - 1];
+                    if (fieldType.kind == CpuTypeKind::UInt && fieldType.width > 64)
+                    {
+                        wideLine("boundaryValueStore." + std::string(model_.text(field.name)), boundaryRef(&field),
+                                 fieldType.width);
+                        return;
+                    }
                     out << "std::fprintf(stream,\"boundaryValueStore." << model_.text(field.name) << "=\");" << prefix_
                         << "_dump::grhsim_dump_value(stream," << boundaryRef(&field)
                         << ");std::fputc('\\n',stream);\n";
@@ -3982,9 +3979,9 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
             if (waveform_)
                 out << "waveform_initialized_=false;waveform_time_=0;waveform_prev_.fill(0);\n";
             for (const auto &input : model_.inputs())
-                out << "this->" << identifier(model_.text(input.name)) << '=' << cppType(model_.types()[input.type.index - 1]) << "{};\n";
+                out << "this->" << identifier(model_.text(input.name)) << "={};\n";
             for (const auto &output : model_.outputs())
-                out << "this->" << identifier(model_.text(output.name)) << '=' << cppType(model_.types()[output.type.index - 1]) << "{};\n";
+                out << "this->" << identifier(model_.text(output.name)) << "={};\n";
             // M5d-7: memset the (trivially copyable) stores — a value-init of
             // a 100k-field aggregate makes the compiler materialize a giant
             // ctor (measured: clang -O1 never finishes on the XS boundary
@@ -4059,6 +4056,17 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         }
         void SixPhaseEmitter::dumpStateField(std::ostream &out, std::string_view store, const CpuStoreField &field) const
         {
+            const auto &cpuType = layout_.types[field.type.index - 1];
+            if (cpuType.kind == CpuTypeKind::UInt && cpuType.width > 64)
+            {
+                // Wide _BitInt values print through their u64-word image,
+                // most-significant word first (identical text to the old
+                // std::array<uint64_t,N> dump).
+                out << "std::fprintf(stream,\"" << store << '.' << model_.text(field.name) << "=\");" << prefix_
+                    << "_dump::grhsim_dump_wide(stream,reinterpret_cast<const std::uint64_t*>(&" << store << '.'
+                    << model_.text(field.name) << ")," << (cpuType.width + 63) / 64 << ");std::fputc('\\n',stream);\n";
+                return;
+            }
             out << "std::fprintf(stream,\"" << store << '.' << model_.text(field.name) << "=\");" << prefix_
                 << "_dump::grhsim_dump_value(stream,"
                 << store << '.' << model_.text(field.name) << ");std::fputc('\\n',stream);\n";
@@ -4067,12 +4075,13 @@ inline bool cpu_replicate_words_changed(Scalar source,std::size_t elemWidth,std:
         {
             // Shape rule: a declared symbol is dumpable when its port/state/
             // value reads back as flat two-state logic — scalars of any width
-            // (wide scalars are u64 word arrays in the layout), Reals (dumped
-            // as their 64-bit pattern) and unpacked arrays with gap-free
-            // element storage (element width 8/16/32/64). Strings, four-state
-            // values and fields over kWaveMaxBytes (memory-like arrays, which
-            // dumpState hashes for the same reason) are skipped, as are
-            // symbols whose value was folded into a supernode-local.
+            // (wide scalars are _BitInt objects, dumped through their u64-word
+            // image), Reals (dumped as their 64-bit pattern) and unpacked
+            // arrays with gap-free element storage (element width 8/16/32/64).
+            // Strings, four-state values and fields over kWaveMaxBytes
+            // (memory-like arrays, which dumpState hashes for the same reason)
+            // are skipped, as are symbols whose value was folded into a
+            // supernode-local.
             constexpr uint64_t kWaveMaxBytes = 512;
             const auto shape = [&](const Type &type) -> std::optional<std::pair<uint32_t, uint64_t>> {
                 switch (type.kind)
@@ -4302,7 +4311,12 @@ if(terminal){
                 }
             }
             file("Makefile", [&](auto &out) {
-                out << "CXX ?= c++\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\n";
+                // Generated code uses C23 _BitInt for wide values: clang is
+                // required (gcc's C++ frontend does not support it). make's
+                // built-in CXX default is g++, and ?= does not override a
+                // built-in default — replace only the default origin so an
+                // env or command-line CXX still wins.
+                out << "ifeq ($(origin CXX),default)\nCXX := $(shell command -v clang++ || echo c++)\nendif\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\n";
                 if (waveform_)
                     out << "CC ?= cc\nCFLAGS ?= -O2 -D_GNU_SOURCE\nLIBFST_SRC_DIR := " << libfstSourceDir() << '\n';
                 out << "SOURCES :=";

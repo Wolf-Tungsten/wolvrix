@@ -32,9 +32,12 @@
 ### 1.2 `cpu.uint<width>` / `cpu.sint<width>`
 
 宽整数。`width` 为大于 64 的整数位宽；`width <= 64` 时使用第 1.1 节的定长标量。取值集合
-为 `width` 位无符号 / 有符号整数。存放为 `ceil(width/64)` 个 64 位无符号字，第 0 字的
-第 0 位对应整数的最低位，最高字中超出位宽的位按符号性填充（无符号补 0，有符号补
-第 `width - 1` 位）。大小 `8 * ceil(width/64)` 字节，对齐 8 字节。
+为 `width` 位无符号 / 有符号整数。物理表示为单个 C23 `unsigned _BitInt(N)` 对象
+（`N = ceil(width/64) * 64`，低 `width` 位承载取值，高于 `width` 的 padding 位恒为 0；
+signedness 只在运算点解释，存储恒为无符号）。大小 `8 * ceil(width/64)` 字节，对齐
+8 字节——与等长 `std::array<std::uint64_t, ceil(width/64)>` 完全相同，因此裸字节路径
+（整 store memcpy、FST 按字转储、按字节哈希）可直接复用其 u64 字镜像（生成头以
+static_assert 钉死该布局）。
 
 ### 1.3 `cpu.array<element_type, count>`
 

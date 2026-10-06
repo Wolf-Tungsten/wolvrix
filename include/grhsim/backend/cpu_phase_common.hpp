@@ -154,7 +154,16 @@ namespace wolvrix::lib::grhsim
         for (auto value : model.results(op))
         {
             const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];
-            if (type.kind == TypeKind::Logic) lines += (uint64_t(type.width) + 63) / 64;
+            if (type.kind == TypeKind::Logic)
+            {
+                const uint64_t words = (uint64_t(type.width) + 63) / 64;
+                // Wide values are single _BitInt objects; a wide op lowers to
+                // roughly `words` limbs of backend work (clang legalization),
+                // so weight wide results by words. (The earlier words*8
+                // factor was a workaround for the word-loop helper era's
+                // inliner/SLP superlinearity, which _BitInt removed.)
+                lines += words;
+            }
         }
         return lines;
     }

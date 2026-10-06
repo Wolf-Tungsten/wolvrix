@@ -150,8 +150,11 @@ namespace wolvrix::lib::grhsim
         };
 
         // Physical field type for a semantic type: 2-state logic picks
-        // Bool(1)/UInt(8/16/32/64) by width, wider values map to an array of
-        // UInt64 words, four-state doubles into a two-element array.
+        // Bool(1)/UInt(8/16/32/64) by width; wide two-state values are a
+        // single UInt(width) (emitted as a C23 unsigned _BitInt object —
+        // unsigned storage, signedness re-derived at op points); four-state
+        // values keep the UInt64 word array and double into a two-element
+        // array.
         CpuTypeId namedStorePhysicalType(TypeMapper &mapper, const GrhSimModel &model, TypeId semantic)
         {
             const auto &type = model.types()[semantic.index - 1];
@@ -167,6 +170,8 @@ namespace wolvrix::lib::grhsim
                                          type.width <= 32 ? 32 : 64;
                     base = mapper.scalar(type.isSigned ? CpuTypeKind::SInt : CpuTypeKind::UInt, rounded);
                 }
+                else if (type.domain == LogicDomain::TwoState)
+                    base = mapper.scalar(CpuTypeKind::UInt, type.width);
                 else base = mapper.array(mapper.scalar(CpuTypeKind::UInt, 64),
                                          (uint64_t(type.width) + 63) / 64);
                 if (type.domain == LogicDomain::FourState) return mapper.array(base, 2);
@@ -474,6 +479,8 @@ namespace wolvrix::lib::grhsim
                         base = findType(type.isSigned ? CpuTypeKind::SInt : CpuTypeKind::UInt,
                                         rounded, {}, 0);
                     }
+                    else if (type.domain == LogicDomain::TwoState)
+                        base = findType(CpuTypeKind::UInt, type.width, {}, 0);
                     else
                     {
                         const auto word = findType(CpuTypeKind::UInt, 64, {}, 0);

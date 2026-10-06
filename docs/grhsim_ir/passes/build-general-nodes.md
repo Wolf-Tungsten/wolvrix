@@ -37,6 +37,14 @@ The pass errors out on any `SimPhase::None` op, pointing at
      this non-sink frame — their values become boundary values sampled by the
      sink supernodes.
    - The capacity knob is `--max-op-in-compute-node` (default 128).
+   - `--semantic-nodes` (default 0, S1 exploration): every value targeted by
+     a `DeclProvenance` Value slice (a source-level declared signal) anchors
+     its own node — its producer op is never absorbed downstream — and the
+     128-op node size cap is dropped, so node shape follows declaration
+     boundaries instead of dataflow shape. Unanchored ops keep the legacy
+     cone absorption above, so values outside provenance coverage fall back
+     to the old rule. Diagnostics then also report `anchored_values` and
+     `semantic_nodes`.
 
 For example, with `w = regWrite(cond=%c, next=%n, mask=%one)` where `%c` and
 `%n` are single-use:

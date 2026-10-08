@@ -19,9 +19,13 @@ namespace wolvrix::lib::grhsim
     // Registered under the public "cpu.st.emit-cpp" pass name.
     // `memEnableBitmap` (the --mem-enable-bitmap option, default on) emits the
     // dense P_mem enable shadow bitmap and its sync hooks.
+    // `memWriteOnWrite` (the --mem-write-activate on-write option, default
+    // on-write) drops the P_mem per-cell change compare and activates the
+    // array's readers once per enable-word run (write-occurs); event-free
+    // writes keep the on-change compare for fixpoint convergence.
     PassResult emitSixPhaseCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory,
                                   wolvrix::lib::diag::Diagnostics &diagnostics, bool waveform = false,
-                                  bool memEnableBitmap = true);
+                                  bool memEnableBitmap = true, bool memWriteOnWrite = true);
     void registerCpuPhaseEmitPasses(PassRegistry &registry);
 }
 

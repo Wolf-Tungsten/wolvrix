@@ -442,13 +442,14 @@ namespace wolvrix::lib::grhsim
         class SixPhaseEmitter
         {
         public:
-            explicit SixPhaseEmitter(const GrhSimModel &model, bool waveform = false, bool memEnableBitmap = true)
+            explicit SixPhaseEmitter(const GrhSimModel &model, bool waveform = false, bool memEnableBitmap = true,
+                                     bool memWriteOnWrite = false)
                 : model_(model), mapping_(*model.cpuMapping()), tree_(mapping_.partitionTree),
                   layout_(*mapping_.dataLayout), schedule_(*mapping_.schedule), stores_(*layout_.namedStores),
                   tuPlan_(*mapping_.translationUnits),
                   prefix_("grhsim_" + identifier(model.text(model.name()))),
                   class_("GrhSIM_" + identifier(model.text(model.name()))),
-                  waveform_(waveform), memEnableBitmap_(memEnableBitmap),
+                  waveform_(waveform), memEnableBitmap_(memEnableBitmap), memWriteOnWrite_(memWriteOnWrite),
                   ordinalOf_(tree_.partitions.size() + 1, ~0u),
                   regFieldByState_(model.states().size() + 1),
                   memFieldByState_(model.states().size() + 1),
@@ -512,6 +513,27 @@ namespace wolvrix::lib::grhsim
                         eventOps_ = tree_.partitions[branch.children.front().index - 1].ops;
                     else if (branch.attrs.phase == CpuPhase::Output)
                         outputOps_ = tree_.partitions[branch.children.front().index - 1].ops;
+                }
+                {
+                    // The gate is safe only for pure output cones: a task/dpi
+                    // side effect or a staged latchWrite commit forces the
+                    // unconditional path.  ($urandom re-samples flag the gate
+                    // at the sampling site itself.)
+                    outputGate_ = stagedOutputWrites_.empty();
+                    for (const auto opId : outputOps_)
+                    {
+                        const auto &op = model_.operations()[opId.index - 1];
+                        const auto k = model_.text(op.opType);
+                        if (k == "core.system.task" || k == "core.dpi.call") { outputGate_ = false; break; }
+                        for (const auto ref : model_.objectRefs(op))
+                        {
+                            if (ref.kind == ObjectKind::State) outputReadStates_.insert(ref.index);
+                            else if (ref.kind == ObjectKind::Input) outputReadInputs_.insert(ref.index);
+                        }
+                        for (const auto v : model_.operands(op))
+                            if (v.index < boundaryByValue_.size() && boundaryByValue_[v.index])
+                                outputReadValues_.insert(v.index);
+                    }
                 }
 
                 // V2 (M2): the P_event activation map (act -> non-sink
@@ -891,6 +913,14 @@ namespace wolvrix::lib::grhsim
             std::unordered_map<uint32_t, std::string> staticScalars_, staticStrings_;
             std::map<const CpuStoreField *, std::string> constBoundaryInit_;
             bool hasSystemTasks_ = false;
+            // Output-activity gate: the P_output cone chunks run only when an
+            // output-read state/boundary/input changed this eval.  The flag is
+            // raised only for output-read dependencies (emitted conditionally
+            // at emit time, so non-output writes pay nothing).
+            bool outputGate_ = false;
+            std::unordered_set<uint32_t> outputReadStates_;
+            std::unordered_set<uint32_t> outputReadValues_;
+            std::unordered_set<uint32_t> outputReadInputs_;
             std::unordered_map<uint32_t, uint32_t> onceTasks_;
             std::unordered_map<uint32_t, uint32_t> randomFunctions_;
             std::set<uint32_t> randomSupernodes_;
@@ -907,6 +937,15 @@ namespace wolvrix::lib::grhsim
             std::map<const CpuStoreField *, uint32_t> fieldEnableBit_;
             std::unordered_map<uint32_t, uint32_t> inputEnableBit_;
             uint32_t memEnableWords_ = 0;
+
+            // P_mem write-occurs activation knob (memWriteOnWrite_ = the
+            // --mem-write-activate on-write emit option): drop the per-cell
+            // change compare and activate the array's readers once per enable
+            // word run (gsim-style write-occurs). Event-free writes (no
+            // eventActStore guard) keep the on-change compare — they re-enter
+            // every round and would never converge with write-occurs
+            // activation.
+            bool memWriteOnWrite_ = false;
 
             // Per-function value locals: values with a live cpu_v<index> local in
             // the function currently being emitted.
@@ -1010,7 +1049,8 @@ namespace wolvrix::lib::grhsim
             void emitEdgeDet(std::ostream &out, const SimOp &op) const;
             void emitRegWrite(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitMemWrite(std::ostream &out, const SimOp &op, const CpuMemWritePlanEntry &plan,
-                              bool actHoisted = false) const;
+                              bool actHoisted = false, std::set<uint32_t> *burstReaders = nullptr,
+                              bool forceOnChange = false) const;
             // Enable operands of a mem write op (one per memWrite/memFill/
             // memAssign, one per triple for memWriteSeq).
             std::vector<ValueId> memEnableOperands(const SimOp &op) const;
@@ -1753,7 +1793,7 @@ namespace wolvrix::lib::grhsim
                 const auto slot = randomFunctions_.at(op.id.index);
                 return "([&](){if(!cpu_random_sampled[" + std::to_string(slot) + "]){cpu_random_values[" +
                        std::to_string(slot) + "]=grhsim_random_u64(cpu_rng," + std::to_string(width) +
-                       ");cpu_random_sampled[" + std::to_string(slot) + "]=true;}return cpu_random_values[" +
+                       ");cpu_random_sampled[" + std::to_string(slot) + "]=true;cpu_anyOutChange_=true;}return cpu_random_values[" +
                        std::to_string(slot) + "]; }())";
             }
             if (!name.starts_with("core.compute.")) throw std::runtime_error("CPU six-phase emit unsupported operation: " + std::string(name));
@@ -1985,6 +2025,13 @@ namespace wolvrix::lib::grhsim
             for (const auto &[word, mask] : words)
                 out << array << '[' << word << "]|=-(std::uint64_t)" << cond << '&' << u64Const(mask) << ";\n";
         }
+        // Emit the output-gate dirty flag when this change point feeds the
+        // output phase (the set membership is decided at emit time, so other
+        // writes pay nothing at runtime).
+        static void flagOutputDirty(std::ostream &out, bool feeds)
+        {
+            if (feeds) out << "cpu_anyOutChange_=true;\n";
+        }
         void SixPhaseEmitter::activateFanoutCond(std::ostream &out, std::span<const uint32_t> ordinals,
                                                  uint32_t current, std::string_view cond) const
         {
@@ -2022,7 +2069,9 @@ namespace wolvrix::lib::grhsim
                 layout_.types[field->type.index - 1].kind == CpuTypeKind::Array;
             if (conditional)
             {
-                out << "{const auto cpu_value=" << expr << ";if(" << slot << "!=cpu_value){" << slot << "=cpu_value;\n";
+                out << "{const auto cpu_value=" << expr << ";if(" << slot << "!=cpu_value){" << slot << "=cpu_value;";
+                flagOutputDirty(out, outputReadValues_.contains(result.index));
+                out << "\n";
                 if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, "cpu_value");
                 activateFanout(out, supernodeFanout_[result.index], current);
                 out << "}}\n";
@@ -2162,6 +2211,7 @@ namespace wolvrix::lib::grhsim
                 const std::string merged = normalize("(static_cast<std::uint64_t>(" + nextSlot + ")&~static_cast<std::uint64_t>(" + read(operands[2]) +
                     "))|(static_cast<std::uint64_t>(" + read(operands[1]) + ")&static_cast<std::uint64_t>(" + read(operands[2]) + "))", targetType);
                 out << "{const auto cpu_merged=" << merged << ";if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
+                flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
                 activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
@@ -2173,6 +2223,7 @@ namespace wolvrix::lib::grhsim
                                                          read(operands[1]) + "&(" + read(operands[2]) + "))",
                                                      targetType);
                 out << "{const auto cpu_merged=" << merged << ";if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
+                flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
                 activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
@@ -2210,7 +2261,7 @@ namespace wolvrix::lib::grhsim
             return word + "=(" + valueText + ")?(" + word + "|" + mask + "):(" + word + "&~" + mask + ");\n";
         }
         void SixPhaseEmitter::emitMemWrite(std::ostream &out, const SimOp &op, const CpuMemWritePlanEntry &plan,
-                                           bool actHoisted) const
+                                           bool actHoisted, std::set<uint32_t> *burstReaders, bool forceOnChange) const
         {
             const auto name = model_.text(op.opType);
             const auto operands = model_.operands(op);
@@ -2232,11 +2283,16 @@ namespace wolvrix::lib::grhsim
             // re-reading the scattered boundary field.
             const std::string guard = actGuard(op);
             const auto dataNext = model_.text(activeStore_->fields[1].name);
+            // Write-occurs activation (--mem-write-activate on-write) drops the
+            // per-cell compare; event-free writes re-enter every round and must
+            // keep it, otherwise their readers never quiesce.
+            const bool onWrite = memWriteOnWrite_ && !forceOnChange;
             // Reader activation for one actually-changed row: a static-row reader
             // fires only on an exact address overlap; a dynamic-row reader fires
             // on any change (plan §132-135). A statically known write row folds
             // the overlap test at emit time.
             const auto activateReaders = [&](const std::string &rowText, std::optional<uint64_t> constRow) {
+                flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
                 for (const auto &reader : plan.readers)
                 {
                     const auto ordinal = reader.owner.index < ordinalOf_.size() ? ordinalOf_[reader.owner.index] : ~0u;
@@ -2247,8 +2303,24 @@ namespace wolvrix::lib::grhsim
                     out << dataNext << '[' << ordinal / 64 << "]|=" << u64Const(1ull << (ordinal % 64)) << ";\n";
                 }
             };
+            // On-write mode with a burst collector: reader ordinals are queued
+            // for one hoisted activation burst per enable-word run instead of
+            // per-cell sets. The emit-time row overlap fold still applies; the
+            // runtime row test is dropped (conservative over-activation).
+            const auto collectReaders = [&](std::optional<uint64_t> constRow) {
+                flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
+                for (const auto &reader : plan.readers)
+                {
+                    const auto ordinal = reader.owner.index < ordinalOf_.size() ? ordinalOf_[reader.owner.index] : ~0u;
+                    if (ordinal == ~0u)
+                        throw std::runtime_error("CPU six-phase emit mem reader has no supernode ordinal");
+                    if (reader.staticRow && constRow && *reader.staticRow != *constRow) continue;
+                    burstReaders->insert(ordinal);
+                }
+            };
             // One cell write with the plan §123 change detection: no change -> no
-            // write, no reader activation.
+            // write, no reader activation. On-write mode: unconditional store,
+            // readers activate on write-occurs.
             const auto writeCell = [&](const std::string &rowText, std::optional<uint64_t> constRow,
                                        const std::string &data, const std::string *mask) {
                 const std::string cell = mem + "[" + rowText + "]";
@@ -2258,6 +2330,14 @@ namespace wolvrix::lib::grhsim
                         ? normalize("(static_cast<std::uint64_t>(" + cell + ")&~static_cast<std::uint64_t>(" + *mask +
                                     "))|(static_cast<std::uint64_t>(" + data + ")&static_cast<std::uint64_t>(" + *mask + "))", element)
                         : normalize(data, element);
+                    if (onWrite)
+                    {
+                        out << cell << "=" << next << ";\n"
+                            << "GRHSIM_PERF_COUNT(touchedWriteCount);\n";
+                        if (burstReaders) collectReaders(constRow);
+                        else activateReaders(rowText, constRow);
+                        return;
+                    }
                     out << "{auto &cpu_cell=" << cell << ";const auto cpu_next=" << next << ";if(cpu_cell!=cpu_next){cpu_cell=cpu_next;\n"
                         << "GRHSIM_PERF_COUNT(touchedWriteCount);\n";
                     activateReaders(rowText, constRow);
@@ -2268,6 +2348,19 @@ namespace wolvrix::lib::grhsim
                 {
                     // grhsim_apply_masked_words_inplace natively: merged =
                     // (cell & ~mask) | (data & mask), store on change.
+                    if (onWrite)
+                    {
+                        if (mask)
+                            out << cell << "=" << normalize("(" + cell + "&~(" + *mask + "))|(" + data + "&(" + *mask + "))",
+                                                            element)
+                                << ";\n";
+                        else
+                            out << cell << '=' << data << ";\n";
+                        out << "GRHSIM_PERF_COUNT(touchedWriteCount);\n";
+                        if (burstReaders) collectReaders(constRow);
+                        else activateReaders(rowText, constRow);
+                        return;
+                    }
                     if (mask)
                         out << "{const auto cpu_merged=" << normalize("(" + cell + "&~(" + *mask + "))|(" + data +
                                                                        "&(" + *mask + "))",
@@ -2404,6 +2497,7 @@ namespace wolvrix::lib::grhsim
             const std::string guard = bodyGuard(op, current);
             // State fanout always queues into dataActiveFlagNext.
             const auto activateState = [&] {
+                flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
                 activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
             };
@@ -3181,6 +3275,8 @@ namespace wolvrix::lib::grhsim
         {
             out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
             if (waveform_) out << "#include <memory>\n";
+            if (memWriteOnWrite_)
+                out << "// emit option: --mem-write-activate on-write (write-occurs reader activation)\n";
             // Wide (>64-bit) two-state values are C23 unsigned _BitInt objects:
             // clang is required (gcc's C++ frontend rejects _BitInt), and the
             // raw-byte paths (FST word dump, whole-store memcpy, dumpState
@@ -3281,6 +3377,7 @@ namespace wolvrix::lib::grhsim
             for (const auto &field : activeStore_->fields)
                 out << cppStoreType(field.type) << ' ' << model_.text(field.name) << "{}; // supernodes=" << field.aux << '\n';
             out << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
+            out << "bool cpu_anyOutChange_=true; // output gate: dirty through the first eval\n";
             if (randomSampleCount_)
                 out << "std::array<std::uint64_t," << randomSampleCount_ << "> cpu_random_values{};\n"
                     << "std::array<bool," << randomSampleCount_ << "> cpu_random_sampled{};\n";
@@ -3697,6 +3794,11 @@ namespace wolvrix::lib::grhsim
                            actGuard(model_.operations()[plan[chunk.offset + end].writeOp.index - 1]) == guard)
                         ++end;
                     const bool hoisted = guard != "true";
+                    // Event-free runs re-enter every round: on-write activation
+                    // would never quiesce, so they keep the on-change compare.
+                    const bool eventFree = guard == "true";
+                    if (eventFree && memWriteOnWrite_)
+                        out << "// mem-write-activate fallback: event-free run keeps on-change detection\n";
                     if (hoisted) out << "if(" << guard << "){\n";
                     uint32_t k = i;
                     while (k < end)
@@ -3717,7 +3819,7 @@ namespace wolvrix::lib::grhsim
                         if (!entryWords(k, words))
                         {
                             emitMemWrite(out, model_.operations()[plan[chunk.offset + k].writeOp.index - 1],
-                                         plan[chunk.offset + k], hoisted);
+                                         plan[chunk.offset + k], hoisted, nullptr, eventFree);
                             ++k;
                             continue;
                         }
@@ -3732,7 +3834,7 @@ namespace wolvrix::lib::grhsim
                         if (runEnd - k < 2)
                         {
                             emitMemWrite(out, model_.operations()[plan[chunk.offset + k].writeOp.index - 1],
-                                         plan[chunk.offset + k], hoisted);
+                                         plan[chunk.offset + k], hoisted, nullptr, eventFree);
                             k = runEnd;
                             continue;
                         }
@@ -3745,9 +3847,21 @@ namespace wolvrix::lib::grhsim
                             out << "memEnableBits[" << word << ']';
                         }
                         out << ")!=UINT64_C(0)){\n";
+                        std::set<uint32_t> burst;
                         for (uint32_t m = k; m < runEnd; ++m)
                             emitMemWrite(out, model_.operations()[plan[chunk.offset + m].writeOp.index - 1],
-                                         plan[chunk.offset + m], hoisted);
+                                         plan[chunk.offset + m], hoisted,
+                                         (memWriteOnWrite_ && !eventFree) ? &burst : nullptr, eventFree);
+                        // Write-occurs activation burst (on-write mode): one
+                        // union of the run's reader ordinals, set once when any
+                        // enable in the word group fired.
+                        if (!burst.empty())
+                        {
+                            const auto dataNext = model_.text(activeStore_->fields[1].name);
+                            for (const auto ordinal : burst)
+                                out << dataNext << '[' << ordinal / 64 << "]|=" << u64Const(1ull << (ordinal % 64))
+                                    << ";\n";
+                        }
                         out << "}\n";
                         k = runEnd;
                     }
@@ -3892,7 +4006,9 @@ namespace wolvrix::lib::grhsim
                 if (!field) throw std::runtime_error("CPU six-phase emit input port has no boundary field");
                 const auto slot = "boundaryValueStore." + std::string(model_.text(field->name));
                 const auto member = "this->" + identifier(model_.text(input.name));
-                out << "if(" << slot << "!=" << member << "){" << slot << '=' << member << ";\n";
+                out << "if(" << slot << "!=" << member << "){" << slot << '=' << member << ";";
+                flagOutputDirty(out, outputReadInputs_.contains(input.id.index));
+                out << "\n";
                 if (const auto it = inputEnableBit_.find(input.id.index); it != inputEnableBit_.end())
                     out << memEnableSync(it->second, member);
                 activateOrdinals(out, inputPortFanout_[input.id.index - 1], dataActive);
@@ -3945,9 +4061,23 @@ namespace wolvrix::lib::grhsim
             // commit trails every chunk so its ne comparisons all observed the
             // previous eval's values.
             out << "void " << class_ << "::pOutput(){\n";
-            if (!outputFrame_.empty()) out << "OutputFrame cpu_f{};\n";
-            for (uint32_t i = 0; i < outputChunks_.size(); ++i)
-                out << "pOutput_c" << i << '(' << (outputFrame_.empty() ? "" : "cpu_f") << ");\n";
+            // Output-activity gate: skip the cone sweep when no output-read
+            // state/boundary/input changed this eval (outputs hold).  The
+            // staged latchWrite commit always runs.
+            if (outputGate_)
+            {
+                out << "const bool cpu_run=cpu_anyOutChange_;\ncpu_anyOutChange_=false;\nif(cpu_run){\n";
+                if (!outputFrame_.empty()) out << "OutputFrame cpu_f{};\n";
+                for (uint32_t i = 0; i < outputChunks_.size(); ++i)
+                    out << "pOutput_c" << i << '(' << (outputFrame_.empty() ? "" : "cpu_f") << ");\n";
+                out << "}\n";
+            }
+            else
+            {
+                if (!outputFrame_.empty()) out << "OutputFrame cpu_f{};\n";
+                for (uint32_t i = 0; i < outputChunks_.size(); ++i)
+                    out << "pOutput_c" << i << '(' << (outputFrame_.empty() ? "" : "cpu_f") << ");\n";
+            }
             commitStagedOutputWrites(out);
             out << "}\n";
         }
@@ -4339,22 +4469,25 @@ if(terminal){
         class EmitPhaseCppPass final : public Pass
         {
         public:
-            explicit EmitPhaseCppPass(std::filesystem::path path, bool waveform, bool memEnableBitmap)
+            explicit EmitPhaseCppPass(std::filesystem::path path, bool waveform, bool memEnableBitmap,
+                                      bool memWriteOnWrite)
                 : Pass("cpu.st.emit-cpp", PassKind::Emit), path_(std::move(path)), waveform_(waveform),
-                  memEnableBitmap_(memEnableBitmap) {}
+                  memEnableBitmap_(memEnableBitmap), memWriteOnWrite_(memWriteOnWrite) {}
             PassResult run(GrhSimModel &model, diag::Diagnostics &diagnostics) override
             {
-                return emitSixPhaseCpuCpp(model, path_, diagnostics, waveform_, memEnableBitmap_);
+                return emitSixPhaseCpuCpp(model, path_, diagnostics, waveform_, memEnableBitmap_, memWriteOnWrite_);
             }
         private:
             std::filesystem::path path_;
             bool waveform_ = false;
             bool memEnableBitmap_ = true;
+            bool memWriteOnWrite_ = false;
         };
     }
 
     PassResult emitSixPhaseCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory,
-                                  wolvrix::lib::diag::Diagnostics &diagnostics, bool waveform, bool memEnableBitmap)
+                                  wolvrix::lib::diag::Diagnostics &diagnostics, bool waveform, bool memEnableBitmap,
+                                  bool memWriteOnWrite)
     {
         if (!verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics)) return {false, false, {}};
         const auto *mapping = model.cpuMapping();
@@ -4379,7 +4512,7 @@ if(terminal){
 #endif
         try
         {
-            SixPhaseEmitter emitter(model, waveform, memEnableBitmap);
+            SixPhaseEmitter emitter(model, waveform, memEnableBitmap, memWriteOnWrite);
             emitter.validate();
             return emitter.write(directory);
         }
@@ -4394,11 +4527,12 @@ if(terminal){
             [](std::span<const std::string_view> args, std::string &error) -> std::unique_ptr<Pass> {
                 constexpr std::string_view usage =
                     "expected --output <empty-directory> [--waveform <off|declared-symbols>] [--perf <off|eval>] "
-                    "[--mem-enable-bitmap <on|off>]";
+                    "[--mem-enable-bitmap <on|off>] [--mem-write-activate <on-change|on-write>]";
                 if (args.empty() || args.size() % 2) { error = std::string(usage); return {}; }
                 std::filesystem::path output;
                 bool waveform = false;
                 bool memEnableBitmap = true;
+                bool memWriteOnWrite = true;
                 for (std::size_t i = 0; i < args.size(); i += 2)
                 {
                     const auto key = args[i];
@@ -4417,10 +4551,16 @@ if(terminal){
                         memEnableBitmap = value == "on";
                         continue;
                     }
+                    if (key == "--mem-write-activate" && (value == "on-change" || value == "on-write"))
+                    {
+                        memWriteOnWrite = value == "on-write";
+                        continue;
+                    }
                     error = std::string(usage); return {};
                 }
                 if (output.empty()) { error = std::string(usage); return {}; }
-                return std::make_unique<EmitPhaseCppPass>(std::move(output), waveform, memEnableBitmap);
+                return std::make_unique<EmitPhaseCppPass>(std::move(output), waveform, memEnableBitmap,
+                                                          memWriteOnWrite);
             }, error)) throw std::logic_error(error);
     }
 }

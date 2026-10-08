@@ -46,6 +46,7 @@ namespace wolvrix::lib::grhsim
         {
             uint32_t maxFanout = 8;
             uint32_t maxClones = 250000;
+            uint32_t lossyCompare = 1;
         };
 
         const Type &valueType(const GrhSimModel &model, ValueId value)
@@ -64,11 +65,17 @@ namespace wolvrix::lib::grhsim
         // parameter/ref-free not/logicNot/xor/add/sub with exactly one
         // varying operand, two-state scalar 1..64 bits. f(x) changes iff x
         // changes, so deleting the boundary compare cannot filter source
-        // changes; the varying parent must itself be shared (users > 1) or
-        // the clone would only move the boundary to an otherwise local input.
+        // changes. With lossy-compare, eq/ne against a constant are also
+        // candidates: they are lossy (their boundary compare does filter
+        // parent wiggles), so cloning trades that filter for the slot —
+        // worthwhile when the consumer supernodes fire on other inputs anyway.
+        // In both cases the varying parent must stay readable at the clone
+        // sites with no new boundary value: it is a boundary value already,
+        // or an ambient source (module input / state read) any supernode may
+        // read. Otherwise the clone would only move the boundary.
         ValueId varyingSource(const GrhSimModel &model, const SimOp &op,
                               const std::vector<OpId> &producers,
-                              const std::vector<std::vector<OpId>> &users)
+                              const std::vector<bool> &boundary, bool lossyCompare)
         {
             const auto name = model.text(op.opType);
             if (model.results(op).size() != 1 ||
@@ -78,6 +85,12 @@ namespace wolvrix::lib::grhsim
             const auto type = model.values()[result.index - 1].type;
             const auto sameType = [&](ValueId value) { return model.values()[value.index - 1].type == type; };
             const auto operands = model.operands(op);
+            const auto constant = [&](ValueId value) {
+                if (!producers[value.index]) return false;
+                const auto &source = model.operations()[producers[value.index].index - 1];
+                return model.text(source.opType) == "core.compute.constant" &&
+                       model.operands(source).empty() && model.objectRefs(source).empty();
+            };
             ValueId varying;
             if (name == "core.compute.not" && operands.size() == 1 && sameType(operands[0]))
                 varying = operands[0];
@@ -88,16 +101,23 @@ namespace wolvrix::lib::grhsim
             else if ((name == "core.compute.xor" || name == "core.compute.add" || name == "core.compute.sub") &&
                      operands.size() == 2 && sameType(operands[0]) && sameType(operands[1]))
             {
-                const auto constant = [&](ValueId value) {
-                    if (!producers[value.index]) return false;
-                    const auto &source = model.operations()[producers[value.index].index - 1];
-                    return model.text(source.opType) == "core.compute.constant" &&
-                           model.operands(source).empty() && model.objectRefs(source).empty();
-                };
                 const bool left = constant(operands[0]), right = constant(operands[1]);
                 if (left != right) varying = operands[left ? 1 : 0];
             }
-            return varying && users[varying.index].size() > 1 ? varying : ValueId{};
+            else if (lossyCompare && (name == "core.compute.eq" || name == "core.compute.ne") &&
+                     operands.size() == 2 && scalarTwoState(model, operands[0]) &&
+                     scalarTwoState(model, operands[1]))
+            {
+                const bool left = constant(operands[0]), right = constant(operands[1]);
+                if (left != right) varying = operands[left ? 1 : 0];
+            }
+            if (!varying) return {};
+            if (varying.index < boundary.size() && boundary[varying.index]) return varying;
+            const auto parent = producers[varying.index];
+            if (!parent) return varying; // module input value: ambient
+            const auto parentType = model.text(model.operations()[parent.index - 1].opType);
+            if (parentType == "core.input.read" || parentType == "core.state.read") return varying;
+            return {};
         }
 
         class CloneSharedBoundariesPass final : public Pass
@@ -157,7 +177,8 @@ namespace wolvrix::lib::grhsim
                 for (std::size_t i = 0; i < originalCount; ++i)
                 {
                     const auto &source = model.operations()[i];
-                    const auto varying = varyingSource(model, source, producers, users);
+                    const auto varying = varyingSource(model, source, producers, boundary,
+                                                       options_.lossyCompare != 0);
                     if (!varying) continue;
                     const auto result = model.results(source)[0];
                     const auto &consumers = users[result.index];
@@ -489,10 +510,10 @@ namespace wolvrix::lib::grhsim
         if (!registry.registerPass("cpu.st.clone-shared-boundaries", PassKind::BackendMapping,
                                    [](std::span<const std::string_view> args, std::string &error)
                                        -> std::unique_ptr<Pass> {
-                                       constexpr std::string_view usage = "expected [--max-fanout <n>] [--max-clones <n>]";
+                                       constexpr std::string_view usage = "expected [--max-fanout <n>] [--max-clones <n>] [--lossy-compare 1]";
                                        if (args.size() % 2 != 0) { error = std::string(usage); return {}; }
                                        Options options;
-                                       const std::array<std::string_view, 2> keys{"--max-fanout", "--max-clones"};
+                                       const std::array<std::string_view, 3> keys{"--max-fanout", "--max-clones", "--lossy-compare"};
                                        std::vector<bool> seen(keys.size());
                                        for (std::size_t i = 0; i < args.size(); i += 2)
                                        {
@@ -501,7 +522,9 @@ namespace wolvrix::lib::grhsim
                                            const auto index = static_cast<std::size_t>(it - keys.begin());
                                            if (seen[index]) { error = std::string(usage); return {}; }
                                            seen[index] = true;
-                                           uint32_t *target = index == 0 ? &options.maxFanout : &options.maxClones;
+                                           uint32_t *target = index == 0 ? &options.maxFanout
+                                                              : index == 1 ? &options.maxClones
+                                                                           : &options.lossyCompare;
                                            if (!parsePositive(args[i + 1], *target)) { error = std::string(usage); return {}; }
                                        }
                                        return std::make_unique<CloneSharedBoundariesPass>(options);

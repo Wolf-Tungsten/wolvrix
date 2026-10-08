@@ -245,13 +245,13 @@ namespace
     // translation units and that the generated Makefile lists exactly them.
     std::string compileAndRun(const GrhSimModel &model, const std::filesystem::path &directory,
                               const std::vector<DriveStep> &steps, bool captureStdout = false,
-                              std::string_view prelude = {}, bool expectMultiTu = false)
+                              std::string_view prelude = {}, bool expectMultiTu = false, bool memWriteOnWrite = false)
     {
         const auto top = std::string(model.text(model.name()));
         std::filesystem::remove_all(directory);
         std::filesystem::create_directories(directory);
         diag::Diagnostics diagnostics;
-        const auto result = emitSixPhaseCpuCpp(model, directory / "model", diagnostics);
+        const auto result = emitSixPhaseCpuCpp(model, directory / "model", diagnostics, false, true, memWriteOnWrite);
         for (const auto &message : diagnostics.messages())
             std::cout << message.context << ": " << message.message << '\n';
         require(result.success && !result.artifacts.empty(), "six-phase emit failed");
@@ -1487,6 +1487,61 @@ namespace
                 "bitmap should remove exactly the two enable reads from the pMem chunk");
     }
 
+    // (10d) --mem-write-activate on-write: event-gated P_mem writes drop the
+    // per-cell change compare and activate readers in one burst per
+    // enable-word run; observable behavior is unchanged (same stimulus
+    // vectors as the bitmap test must produce identical outputs).
+    void memWriteOnWriteTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_mem_onwrite");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
+        const auto word = model.logicType(8, false, LogicDomain::TwoState);
+        const auto memType = model.arrayType(word, 16);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto bypass = addInputRead(model, "bypass", bit);
+        const auto waddr = addInputRead(model, "waddr", addrType);
+        const auto wdata = addInputRead(model, "wdata", word);
+        const auto raddr = addInputRead(model, "raddr", addrType);
+        const auto mask = addConstant(model, word, "8'hff");
+        const auto nb = addCompute(model, "core.compute.not", bit, "nb", {bypass});
+        const auto en = addCompute(model, "core.compute.and", bit, "en", {wen, nb});
+        const auto memA = addMemState(model, "memA", memType, "8'h00");
+        const auto memB = addMemState(model, "memB", memType, "8'h00");
+        addEventWrite(model, "core.state.memWrite", {en, waddr, wdata, mask}, memA, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, memB, {{clk, "posedge"}});
+        addOutputWrite(model, "oa", word, addMemRead(model, memA, word, raddr, "ra"));
+        addOutputWrite(model, "ob", word, addMemRead(model, memB, word, raddr, "rb"));
+        require(verifies(model), "mem write on-write fixture rejected");
+        runSixPhasePipeline(model, false, true);
+        compileAndRun(model, root / "mem_onwrite", {
+            {{{"clk", "false"}, {"wen", "false"}, {"bypass", "false"}, {"waddr", "0"}, {"wdata", "0"}, {"raddr", "0"}},
+             {{"oa", "0"}, {"ob", "0"}}},
+            {{{"wen", "true"}, {"waddr", "3"}, {"wdata", "29"}, {"raddr", "3"}}, {{"oa", "0"}, {"ob", "0"}}},
+            {{{"clk", "true"}}, {{"oa", "29"}, {"ob", "29"}}},
+            {{{"clk", "false"}}, {{"oa", "29"}, {"ob", "29"}}},
+            {{{"bypass", "true"}, {"wdata", "47"}}, {{"oa", "29"}, {"ob", "29"}}},
+            {{{"clk", "true"}}, {{"oa", "29"}, {"ob", "47"}}},
+            {{{"bypass", "false"}, {"clk", "false"}}, {{"oa", "29"}, {"ob", "47"}}},
+            {{{"clk", "true"}}, {{"oa", "47"}, {"ob", "47"}}},
+        }, false, {}, false, /*memWriteOnWrite=*/true);
+        const std::string text = concatModelSources(root / "mem_onwrite" / "model");
+        require(text.find("cpu_cell!=cpu_next") == std::string::npos,
+                "on-write mode still emits the per-cell change compare");
+        {
+            std::ifstream headerStream(root / "mem_onwrite" / "model" / "grhsim_phase_mem_onwrite.hpp");
+            const std::string header{std::istreambuf_iterator<char>(headerStream), std::istreambuf_iterator<char>()};
+            require(header.find("--mem-write-activate on-write") != std::string::npos,
+                    "on-write marker missing from the generated header");
+        }
+        require(text.find("mem-write-activate fallback") == std::string::npos,
+                "event-gated fixture should have no on-change fallback");
+        require(text.find("dataActiveFlagNext[") != std::string::npos,
+                "on-write mode dropped reader activation entirely");
+    }
+
     // (10c) P_mem act clustering + dead compare-store elimination: ports
     // sharing one eventActStore guard get a single hoisted test per run; a
     // boundary value consumed only by P_mem (no supernode fanout, no bitmap
@@ -2181,6 +2236,7 @@ int main()
         memPriorityTest(root);
         memPriorityTest(root, true);
         memEnableBitmapTest(root);
+        memWriteOnWriteTest(root);
         memActClusterDeadCompareTest(root);
         generalDisplayTest(root);
         monitorFreeTest(root);

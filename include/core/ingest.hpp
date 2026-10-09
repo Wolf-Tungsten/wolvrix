@@ -162,12 +162,24 @@ using SignalId = PlanIndex;
 using InstanceId = PlanIndex;
 using ExprNodeId = PlanIndex;
 
+struct UnpackedDimInfo {
+    int32_t extent = 1;
+    int32_t left = 0;
+    int32_t right = 0;
+};
+
 struct PortInfo {
     PlanSymbolId symbol;
     PortDirection direction = PortDirection::Input;
-    int32_t width = 0;
+    int32_t width = 0;  // total flat width (element width * product of shape dims)
     bool isSigned = false;
     wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
+    // stage-04: array ports keep their shape instead of being flattened.
+    // shape = unpacked extents (leading) + packed dims (trailing, innermost
+    // scalar-element dim excluded); empty means scalar port.
+    std::vector<int64_t> shape;
+    std::vector<int32_t> packedDims;
+    std::vector<UnpackedDimInfo> unpackedDims;
     struct InoutBinding {
         PlanSymbolId inSymbol;
         PlanSymbolId outSymbol;
@@ -181,21 +193,22 @@ struct InoutSignalInfo {
     PortInfo::InoutBinding binding;
 };
 
-struct UnpackedDimInfo {
-    int32_t extent = 1;
-    int32_t left = 0;
-    int32_t right = 0;
-};
-
 struct SignalInfo {
     PlanSymbolId symbol;
     SignalKind kind = SignalKind::Net;
-    int32_t width = 0;
+    int32_t width = 0;  // element width (innermost bit type) for arrays; total width for scalars
     bool isSigned = false;
     wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
     int64_t memoryRows = 0;
+    // stage-04: GRH array shape = unpacked extents (leading) + packed dims
+    // (trailing, innermost scalar-element dim excluded). Empty means scalar.
+    // Total flat width = width * product(shape).
+    std::vector<int64_t> shape;
     std::vector<int32_t> packedDims;
     std::vector<UnpackedDimInfo> unpackedDims;
+    // Per-dim bounds of packed array dims (same order as packedDims); used by
+    // the write path to normalize raw SV indices to lane indices.
+    std::vector<UnpackedDimInfo> packedDimInfos;
 };
 
 struct InstanceParameter {
@@ -395,7 +408,9 @@ struct LoweredStmt {
 struct MemoryReadPort {
     PlanSymbolId memory;
     SignalId signal = kInvalidPlanIndex;
-    ExprNodeId address = kInvalidPlanIndex;
+    // stage-04: normalized per-dim indices (1..rank entries; fewer than rank
+    // reads a sub-array), replacing the old linearized single address.
+    std::vector<ExprNodeId> addressIndices;
     ExprNodeId data = kInvalidPlanIndex;
     ExprNodeId replacement = kInvalidPlanIndex;
     bool isSync = false;
@@ -408,8 +423,9 @@ struct MemoryReadPort {
 struct MemoryWritePort {
     PlanSymbolId memory;
     SignalId signal = kInvalidPlanIndex;
-    ExprNodeId address = kInvalidPlanIndex;
+    std::vector<ExprNodeId> addressIndices;
     ExprNodeId data = kInvalidPlanIndex;
+    // kInvalidPlanIndex means no mask (whole addressed sub-array write).
     ExprNodeId mask = kInvalidPlanIndex;
     ExprNodeId updateCond = kInvalidPlanIndex;
     bool isMasked = false;

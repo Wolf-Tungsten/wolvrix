@@ -196,11 +196,11 @@ int testReadComb(const std::filesystem::path& sourcePath) {
     if (!entry.eventEdges.empty() || !entry.eventOperands.empty()) {
         return fail("Unexpected event binding for comb memory read");
     }
-    if (entry.address == wolvrix::lib::ingest::kInvalidPlanIndex ||
-        entry.address >= lowering.values.size()) {
+    if (entry.addressIndices.size() != 1 ||
+        entry.addressIndices.front() >= lowering.values.size()) {
         return fail("Missing comb memory read address");
     }
-    const auto& addrNode = lowering.values[entry.address];
+    const auto& addrNode = lowering.values[entry.addressIndices.front()];
     if (addrNode.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
         plan.symbolTable.text(addrNode.symbol) != std::string_view("addr")) {
         return fail("Unexpected comb memory read address symbol");
@@ -322,7 +322,10 @@ int testReadElementBit(const std::filesystem::path& sourcePath) {
             replacement.op != wolvrix::lib::grh::OperationKind::kSliceDynamic) {
             return fail("Unexpected element read replacement node");
         }
-        const auto& addrNode = lowering.values[entry.address];
+        if (entry.addressIndices.size() != 1) {
+            return fail("Unexpected element bit read address index count");
+        }
+        const auto& addrNode = lowering.values[entry.addressIndices.front()];
         if (addrNode.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
             plan.symbolTable.text(addrNode.symbol) != std::string_view("addr")) {
             return fail("Unexpected element bit read address symbol");
@@ -349,11 +352,11 @@ int testReadCast(const std::filesystem::path& sourcePath) {
         return fail("Expected one cast-wrapped memory read");
     }
     const auto& entry = lowering.memoryReads.front();
-    if (entry.address == wolvrix::lib::ingest::kInvalidPlanIndex ||
-        entry.address >= lowering.values.size()) {
+    if (entry.addressIndices.size() != 1 ||
+        entry.addressIndices.front() >= lowering.values.size()) {
         return fail("Missing cast read address");
     }
-    const auto& addrNode = lowering.values[entry.address];
+    const auto& addrNode = lowering.values[entry.addressIndices.front()];
     if (addrNode.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
         plan.symbolTable.text(addrNode.symbol) != std::string_view("addr")) {
         return fail("Unexpected cast read address symbol");
@@ -427,15 +430,38 @@ int testPackedAggregatePriorityRowWrite(const std::filesystem::path& sourcePath)
     if (lowering.memoryReads.size() != 1) {
         return fail("Expected one indexed read from priority row-write memory");
     }
-    if (lowering.memoryWrites.size() != 1) {
-        return fail("Expected priority writes to the same row to merge into one write port");
+    // stage-04: same-address writes are no longer merged into one port; the
+    // if / else-if chain stays two ports in statement order (later port has
+    // overriding priority by declaration order), and element writes without a
+    // data slice carry no mask.
+    if (lowering.memoryWrites.size() != 2) {
+        return fail("Expected priority writes to stay two write ports in declaration order");
     }
-    const auto& write = lowering.memoryWrites.front();
-    if (countOpInExpr(lowering, write.data, wolvrix::lib::grh::OperationKind::kMux) == 0) {
-        return fail("Expected merged priority row-write data to contain a mux");
+    const auto& firstWrite = lowering.memoryWrites[0];
+    const auto& secondWrite = lowering.memoryWrites[1];
+    if (firstWrite.mask != wolvrix::lib::ingest::kInvalidPlanIndex ||
+        secondWrite.mask != wolvrix::lib::ingest::kInvalidPlanIndex) {
+        return fail("Expected unmasked element writes for priority row-write");
     }
-    if (countOpInExpr(lowering, write.updateCond, wolvrix::lib::grh::OperationKind::kLogicOr) == 0) {
-        return fail("Expected merged priority row-write update condition to contain an OR");
+    if (firstWrite.addressIndices.size() != 1 || secondWrite.addressIndices.size() != 1) {
+        return fail("Expected one address index per priority row-write port");
+    }
+    const auto& firstData = lowering.values[firstWrite.data];
+    const auto& secondData = lowering.values[secondWrite.data];
+    if (firstData.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
+        plan.symbolTable.text(firstData.symbol) != std::string_view("d0") ||
+        secondData.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
+        plan.symbolTable.text(secondData.symbol) != std::string_view("d1")) {
+        return fail("Unexpected priority row-write data symbols");
+    }
+    const auto& firstCond = lowering.values[firstWrite.updateCond];
+    if (firstCond.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
+        plan.symbolTable.text(firstCond.symbol) != std::string_view("a")) {
+        return fail("Unexpected first priority row-write update condition");
+    }
+    if (countOpInExpr(lowering, secondWrite.updateCond,
+                      wolvrix::lib::grh::OperationKind::kLogicNot) == 0) {
+        return fail("Expected else-if guard negation in second priority row-write");
     }
     if (diagnostics.hasError()) {
         return fail("Unexpected Convert diagnostics errors in packed aggregate priority row-write");
@@ -744,11 +770,21 @@ int testWriteMultiDim(const std::filesystem::path& sourcePath) {
         return fail("Expected 1 memory write entry in multi-dim");
     }
     const auto& entry = lowering.memoryWrites.front();
-    const auto& addrNode = lowering.values[entry.address];
-    if (addrNode.kind != wolvrix::lib::ingest::ExprNodeKind::Operation ||
-        (addrNode.op != wolvrix::lib::grh::OperationKind::kAdd &&
-         addrNode.op != wolvrix::lib::grh::OperationKind::kMul)) {
-        return fail("Unexpected multi-dim address op");
+    // stage-04: multi-dim writes keep per-dim indices (no linearization).
+    if (entry.addressIndices.size() != 2) {
+        return fail("Expected two per-dim address indices in multi-dim write");
+    }
+    for (const auto indexId : entry.addressIndices) {
+        const auto& indexNode = lowering.values[indexId];
+        if (indexNode.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol) {
+            return fail("Unexpected multi-dim address index kind");
+        }
+    }
+    if (plan.symbolTable.text(lowering.values[entry.addressIndices[0]].symbol) !=
+            std::string_view("idx0") ||
+        plan.symbolTable.text(lowering.values[entry.addressIndices[1]].symbol) !=
+            std::string_view("idx1")) {
+        return fail("Unexpected multi-dim address index symbols");
     }
     if (diagnostics.hasError()) {
         return fail("Unexpected Convert diagnostics errors in multi-dim");
@@ -768,7 +804,14 @@ int testWriteMultiDimOffset(const std::filesystem::path& sourcePath) {
         return fail("Expected 1 memory write entry in offset multi-dim");
     }
     const auto& entry = lowering.memoryWrites.front();
-    if (countOpInExpr(lowering, entry.address, wolvrix::lib::grh::OperationKind::kSub) < 2) {
+    // stage-04: per-dim indices carry their own bound normalization.
+    if (entry.addressIndices.size() != 2) {
+        return fail("Expected two per-dim address indices in offset multi-dim write");
+    }
+    if (countOpInExpr(lowering, entry.addressIndices[0],
+                      wolvrix::lib::grh::OperationKind::kSub) < 1 ||
+        countOpInExpr(lowering, entry.addressIndices[1],
+                      wolvrix::lib::grh::OperationKind::kSub) < 1) {
         return fail("Expected address normalization for offset multi-dim write");
     }
     if (diagnostics.hasError()) {

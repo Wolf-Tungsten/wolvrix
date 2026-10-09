@@ -467,8 +467,12 @@ struct TypeResolution {
     bool isSigned = false;
     wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
     int64_t memoryRows = 0;
+    // stage-04: GRH array shape = unpacked extents (leading) + packed dims
+    // (trailing; innermost scalar-element dim excluded). Empty means scalar.
+    std::vector<int64_t> shape;
     std::vector<int32_t> packedDims;
     std::vector<UnpackedDimInfo> unpackedDims;
+    std::vector<UnpackedDimInfo> packedDimInfos;
     bool hasUnpacked = false;
 };
 
@@ -477,40 +481,57 @@ bool isFlattenedNetArray(const SignalInfo& signal)
     return signal.kind == SignalKind::Net && signal.memoryRows > 0;
 }
 
-int64_t flattenedNetWidth(const SignalInfo& signal)
+int64_t shapeElementCount(std::span<const int64_t> shape)
 {
-    if (!isFlattenedNetArray(signal))
+    int64_t total = 1;
+    for (const int64_t dim : shape)
     {
-        return signal.width;
+        if (dim <= 0)
+        {
+            continue;
+        }
+        const int64_t maxValue = std::numeric_limits<int64_t>::max();
+        if (total > maxValue / dim)
+        {
+            return maxValue;
+        }
+        total *= dim;
     }
+    return total;
+}
+
+// Total flat width of a signal value: element width times all shape dims.
+int64_t signalTotalWidth(const SignalInfo& signal)
+{
     const int64_t elementWidth = signal.width > 0 ? signal.width : 1;
-    const int64_t rows = signal.memoryRows > 0 ? signal.memoryRows : 1;
     const int64_t maxWidth = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+    const int64_t rows = shapeElementCount(signal.shape);
     if (rows > 0 && elementWidth > maxWidth / rows)
     {
         return maxWidth;
     }
-    const int64_t total = elementWidth * rows;
-    return std::min<int64_t>(total, maxWidth);
+    return std::min<int64_t>(elementWidth * rows, maxWidth);
+}
+
+int64_t flattenedNetWidth(const SignalInfo& signal)
+{
+    // Total flat width in all cases: scalars have an empty shape, arrays have
+    // width = element width and shape = all dims.
+    return signalTotalWidth(signal);
 }
 
 int64_t flattenedAggregateWidth(const SignalInfo& signal)
 {
-    const int64_t elementWidth = signal.width > 0 ? signal.width : 1;
-    const int64_t rows = signal.memoryRows > 0 ? signal.memoryRows : 1;
-    const int64_t maxWidth = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
-    if (rows > 0 && elementWidth > maxWidth / rows)
-    {
-        return maxWidth;
-    }
-    const int64_t total = elementWidth * rows;
-    return std::min<int64_t>(total, maxWidth);
+    return signalTotalWidth(signal);
 }
 
 bool isPackedAggregateVariable(const SignalInfo& signal)
 {
+    // stage-04: array-state variable whose array-ness comes from packed dims
+    // rather than unpacked dims (the old packedDims.empty() test relied on the
+    // retired packed-element reinterpretation clearing packedDims).
     return signal.kind != SignalKind::Net && signal.kind != SignalKind::Memory &&
-           signal.memoryRows > 0 && signal.packedDims.empty();
+           signal.memoryRows > 0 && signal.unpackedDims.empty();
 }
 
 int32_t clampWidth(uint64_t width, const slang::ast::Symbol& origin, ConvertDiagnostics* diagnostics,
@@ -648,7 +669,8 @@ uint64_t computeFixedWidth(const slang::ast::Type& type, const slang::ast::Symbo
 }
 
 void collectPackedDims(const slang::ast::Type& type, const slang::ast::Symbol& origin,
-                       ConvertDiagnostics* diagnostics, std::vector<int32_t>& out)
+                       ConvertDiagnostics* diagnostics, std::vector<int32_t>& out,
+                       std::vector<UnpackedDimInfo>* boundsOut = nullptr)
 {
     const slang::ast::Type* current = &type;
     while (current)
@@ -664,6 +686,14 @@ void collectPackedDims(const slang::ast::Type& type, const slang::ast::Symbol& o
             const auto& packed = canonical.as<slang::ast::PackedArrayType>();
             const uint64_t extent = packed.range.fullWidth();
             out.push_back(clampDim(extent, origin, diagnostics, "Packed array dimension"));
+            if (boundsOut)
+            {
+                UnpackedDimInfo dim;
+                dim.extent = out.back();
+                dim.left = packed.range.left;
+                dim.right = packed.range.right;
+                boundsOut->push_back(dim);
+            }
             current = &packed.elementType;
             continue;
         }
@@ -671,10 +701,10 @@ void collectPackedDims(const slang::ast::Type& type, const slang::ast::Symbol& o
     }
 }
 
-std::optional<std::pair<int32_t, int64_t>>
-analyzePackedElementMemoryType(const slang::ast::Type& type,
-                               const slang::ast::Symbol& origin,
-                               ConvertDiagnostics* diagnostics)
+// stage-04: is the (canonical) type a scalar integral bit type, as opposed to
+// an aggregate (struct/union) element? Decides whether the innermost packed
+// dim is the element bit width (scalar) or an array dim (aggregate element).
+bool isScalarBitType(const slang::ast::Type& type)
 {
     const slang::ast::Type* current = &type;
     while (current)
@@ -685,28 +715,18 @@ analyzePackedElementMemoryType(const slang::ast::Type& type,
             current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
             continue;
         }
-        if (canonical.kind != slang::ast::SymbolKind::PackedArrayType)
+        switch (canonical.kind)
         {
-            return std::nullopt;
+        case slang::ast::SymbolKind::PackedStructType:
+        case slang::ast::SymbolKind::UnpackedStructType:
+        case slang::ast::SymbolKind::PackedUnionType:
+        case slang::ast::SymbolKind::UnpackedUnionType:
+            return false;
+        default:
+            return true;
         }
-        const auto& packed = canonical.as<slang::ast::PackedArrayType>();
-        const slang::ast::Type& elementType = packed.elementType.getCanonicalType();
-        if (elementType.kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType)
-        {
-            return std::nullopt;
-        }
-        const uint64_t rowsRaw = packed.range.fullWidth();
-        const uint64_t widthRaw = computeFixedWidth(elementType, origin, diagnostics);
-        if (rowsRaw <= 1 || widthRaw <= 1)
-        {
-            return std::nullopt;
-        }
-        return std::make_pair(
-            clampWidth(widthRaw, origin, diagnostics, "Packed array element"),
-            static_cast<int64_t>(clampDim(rowsRaw, origin, diagnostics,
-                                          "Packed array memory dimension")));
     }
-    return std::nullopt;
+    return true;
 }
 
 bool containsUnpackedDims(const slang::ast::Type& type, const slang::ast::Symbol& origin,
@@ -754,6 +774,79 @@ wolvrix::lib::grh::ValueType classifyValueType(const slang::ast::Type& type)
         return wolvrix::lib::grh::ValueType::Real;
     }
     return wolvrix::lib::grh::ValueType::Logic;
+}
+
+// stage-04: analyze the non-unpacked remainder of a type: collect packed dims
+// (with bounds), derive the GRH shape trailing dims and the element/total
+// width. Shared by analyzeSignalType and analyzePortType.
+void analyzePackedPart(const slang::ast::Type& type, const slang::ast::Symbol& origin,
+                       ConvertDiagnostics* diagnostics, TypeResolution& info)
+{
+    collectPackedDims(type, origin, diagnostics, info.packedDims, &info.packedDimInfos);
+
+    // Peel aliases + packed layers to find the innermost element type; a
+    // scalar bit element means the innermost packed dim is the element width,
+    // an aggregate (struct/union) element makes every packed dim a shape dim.
+    const slang::ast::Type* remainder = &type;
+    while (remainder)
+    {
+        const slang::ast::Type& canonical = remainder->getCanonicalType();
+        if (canonical.kind == slang::ast::SymbolKind::TypeAlias)
+        {
+            remainder = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+            continue;
+        }
+        if (canonical.kind == slang::ast::SymbolKind::PackedArrayType)
+        {
+            remainder = &canonical.as<slang::ast::PackedArrayType>().elementType;
+            continue;
+        }
+        break;
+    }
+
+    for (const UnpackedDimInfo& dim : info.unpackedDims)
+    {
+        info.shape.push_back(dim.extent);
+    }
+    const bool scalarElement = !remainder || isScalarBitType(*remainder);
+    if (!info.packedDims.empty())
+    {
+        const std::size_t shapeDims =
+            scalarElement ? info.packedDims.size() - 1 : info.packedDims.size();
+        for (std::size_t i = 0; i < shapeDims; ++i)
+        {
+            info.shape.push_back(info.packedDims[i]);
+        }
+    }
+
+    if (!info.shape.empty())
+    {
+        // Array: width is the element width (innermost bit type / aggregate).
+        // An unpacked array element may be a bare scalar with no packed dim
+        // at all (e.g. `reg mem [0:N]` or `integer mem [0:N]`).
+        uint64_t elementWidth = 0;
+        if (scalarElement)
+        {
+            elementWidth = info.packedDims.empty()
+                               ? (remainder ? computeFixedWidth(*remainder, origin, diagnostics)
+                                            : 0)
+                               : static_cast<uint64_t>(info.packedDims.back());
+        }
+        else if (remainder)
+        {
+            elementWidth = computeFixedWidth(*remainder, origin, diagnostics);
+        }
+        if (elementWidth == 0)
+        {
+            elementWidth = 1;
+        }
+        info.width = clampWidth(elementWidth, origin, diagnostics, "Array element");
+    }
+    else
+    {
+        const uint64_t width = computeFixedWidth(type, origin, diagnostics);
+        info.width = clampWidth(width, origin, diagnostics, "Signal");
+    }
 }
 
 TypeResolution analyzeSignalType(const slang::ast::Type& type, const slang::ast::Symbol& origin,
@@ -857,9 +950,7 @@ TypeResolution analyzeSignalType(const slang::ast::Type& type, const slang::ast:
         return info;
     }
 
-    collectPackedDims(*current, origin, diagnostics, info.packedDims);
-    const uint64_t width = computeFixedWidth(*current, origin, diagnostics);
-    info.width = clampWidth(width, origin, diagnostics, "Signal");
+    analyzePackedPart(*current, origin, diagnostics, info);
     info.isSigned = current->isSigned();
     info.valueType = wolvrix::lib::grh::ValueType::Logic;
     if (info.hasUnpacked)
@@ -885,16 +976,57 @@ TypeResolution analyzePortType(const slang::ast::Type& type, const slang::ast::S
         info.isSigned = false;
         return info;
     }
-    if (containsUnpackedDims(type, origin, diagnostics))
+    // stage-04: array ports keep their dimensions (no flattening). Reuse the
+    // signal analysis for unpacked dims, but ports never become memory state.
+    const slang::ast::Type* current = &type;
+    while (current)
     {
-        if (diagnostics)
+        const slang::ast::Type& canonical = current->getCanonicalType();
+        if (canonical.kind == slang::ast::SymbolKind::TypeAlias)
         {
-            diagnostics->warn(origin,
-                              "Unpacked array port flattened; array dimensions are ignored");
+            current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+            continue;
         }
+        if (canonical.kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType)
+        {
+            info.hasUnpacked = true;
+            const auto& unpacked = canonical.as<slang::ast::FixedSizeUnpackedArrayType>();
+            uint64_t extent = unpacked.range.fullWidth();
+            if (extent == 0)
+            {
+                if (diagnostics)
+                {
+                    diagnostics->error(origin,
+                                       "Unpacked array dimension must have positive extent");
+                }
+                extent = 1;
+            }
+            UnpackedDimInfo dim;
+            dim.extent = clampDim(extent, origin, diagnostics, "Unpacked array dimension");
+            dim.left = unpacked.range.left;
+            dim.right = unpacked.range.right;
+            info.unpackedDims.push_back(dim);
+            current = &unpacked.elementType;
+            continue;
+        }
+        if (canonical.kind == slang::ast::SymbolKind::DynamicArrayType ||
+            canonical.kind == slang::ast::SymbolKind::AssociativeArrayType ||
+            canonical.kind == slang::ast::SymbolKind::QueueType)
+        {
+            if (diagnostics)
+            {
+                diagnostics->error(origin,
+                                   "Unsupported unpacked array kind on port declaration");
+            }
+            break;
+        }
+        break;
     }
-    const uint64_t width = computeFixedWidth(type, origin, diagnostics);
-    info.width = clampWidth(width, origin, diagnostics, "Port");
+    if (!current)
+    {
+        return info;
+    }
+    analyzePackedPart(*current, origin, diagnostics, info);
     info.isSigned = type.isSigned();
     return info;
 }
@@ -9271,10 +9403,17 @@ private:
             return std::nullopt;
         }
 
-        const int32_t rowWidth = signal.width;
-        const int64_t totalWidth = static_cast<int64_t>(rowWidth) * signal.memoryRows;
+        // stage-04: init rows are outer-dim rows; each row spans total/rows
+        // bits (the element width for rank-1, a sub-array for higher ranks).
+        const int64_t totalWidth = signalTotalWidth(signal);
         if (totalWidth <= 0 ||
             totalWidth > static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
+        {
+            return std::nullopt;
+        }
+        const int32_t rowWidth =
+            static_cast<int32_t>(totalWidth / signal.memoryRows);
+        if (rowWidth <= 0)
         {
             return std::nullopt;
         }
@@ -9855,6 +9994,22 @@ void collectPorts(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan,
 
             TypeResolution typeInfo = analyzePortType(port->getType(), *port, diagnostics);
             info.width = typeInfo.width;
+            if (!typeInfo.shape.empty())
+            {
+                // stage-04: array port — PortInfo.width stays the total flat
+                // width; the shape view rides alongside.
+                int64_t total = typeInfo.width;
+                for (const int64_t dim : typeInfo.shape)
+                {
+                    total *= dim > 0 ? dim : 1;
+                }
+                const int64_t maxWidth =
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+                info.width = static_cast<int32_t>(std::min<int64_t>(total, maxWidth));
+                info.shape = std::move(typeInfo.shape);
+                info.packedDims = std::move(typeInfo.packedDims);
+                info.unpackedDims = std::move(typeInfo.unpackedDims);
+            }
             info.isSigned = typeInfo.isSigned;
             info.valueType = typeInfo.valueType;
 
@@ -9989,8 +10144,10 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
         info.isSigned = typeInfo.isSigned;
         info.valueType = typeInfo.valueType;
         info.memoryRows = typeInfo.memoryRows;
+        info.shape = std::move(typeInfo.shape);
         info.packedDims = std::move(typeInfo.packedDims);
         info.unpackedDims = std::move(typeInfo.unpackedDims);
+        info.packedDimInfos = std::move(typeInfo.packedDimInfos);
         plan.signals.push_back(std::move(info));
     };
 
@@ -10018,25 +10175,36 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
         info.symbol = internSignal(variable, scope);
         info.kind = SignalKind::Variable;
         TypeResolution typeInfo = analyzeSignalType(variable.getType(), variable, diagnostics);
-        if (auto packedMemory =
-                analyzePackedElementMemoryType(variable.getType(), variable, diagnostics))
+        // stage-04: a pure packed array variable becomes array state under the
+        // same threshold as the retired packed-element reinterpretation
+        // (outer extent > 1 and element width > 1); below the threshold it
+        // stays a scalar register with an empty shape, exactly as before.
+        if (typeInfo.unpackedDims.empty() && !typeInfo.shape.empty() &&
+            typeInfo.shape.front() > 1 && typeInfo.width > 1)
         {
-            typeInfo.width = packedMemory->first;
-            typeInfo.memoryRows = packedMemory->second;
-            typeInfo.unpackedDims.clear();
-            UnpackedDimInfo dim;
-            dim.extent = static_cast<int32_t>(packedMemory->second);
-            dim.left = 0;
-            dim.right = static_cast<int32_t>(packedMemory->second - 1);
-            typeInfo.unpackedDims.push_back(dim);
-            typeInfo.packedDims.clear();
+            typeInfo.memoryRows = typeInfo.shape.front();
+        }
+        else if (typeInfo.memoryRows == 0 && !typeInfo.shape.empty())
+        {
+            // Scalar-classified signal: fold the array view back into a flat
+            // vector (width = total bits, no shape).
+            int64_t total = typeInfo.width;
+            for (const int64_t dim : typeInfo.shape)
+            {
+                total *= dim > 0 ? dim : 1;
+            }
+            const int64_t maxWidth = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+            typeInfo.width = static_cast<int32_t>(std::min<int64_t>(total, maxWidth));
+            typeInfo.shape.clear();
         }
         info.width = typeInfo.width;
         info.isSigned = typeInfo.isSigned;
         info.valueType = typeInfo.valueType;
         info.memoryRows = typeInfo.memoryRows;
+        info.shape = std::move(typeInfo.shape);
         info.packedDims = std::move(typeInfo.packedDims);
         info.unpackedDims = std::move(typeInfo.unpackedDims);
+        info.packedDimInfos = std::move(typeInfo.packedDimInfos);
         plan.signals.push_back(std::move(info));
     };
 
@@ -11141,15 +11309,9 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         }
         if (widthBySymbol[signal.symbol.index] == 0)
         {
-            int32_t width = signal.width;
-            if (isFlattenedNetArray(signal))
-            {
-                width = static_cast<int32_t>(flattenedNetWidth(signal));
-            }
-            else if (isPackedAggregateVariable(signal))
-            {
-                width = static_cast<int32_t>(flattenedAggregateWidth(signal));
-            }
+            // stage-04: always the total flat width (scalars have an empty
+            // shape; arrays have width = element width and shape = all dims).
+            int32_t width = static_cast<int32_t>(flattenedNetWidth(signal));
             widthBySymbol[signal.symbol.index] = width;
         }
     }
@@ -15188,13 +15350,6 @@ struct MemoryReadUse {
     slang::SourceLocation location{};
 };
 
-struct IndexedMemoryWriteMergeCandidate {
-    std::size_t writeIndex = 0;
-    int64_t addressConst = 0;
-    ExprNodeId dynamicAddress = kInvalidPlanIndex;
-    std::vector<ExprNodeId> enableTerms;
-};
-
 } // namespace
 
 void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
@@ -15235,15 +15390,33 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         return id;
     };
 
-    auto isPackedAggregateSymbol = [&](PlanSymbolId symbol) -> bool {
-        if (!symbol.valid() || symbol.index >= signalBySymbol.size())
+    MemoryPortBuilder builder(plan, lowering);
+
+    // stage-04: normalize one read/write index for one unpacked shape dim.
+    // Indices on unpacked dims are raw SV indices normalized by the declared
+    // bounds; packed read indices arrive already lane-normalized from the
+    // statement lowerer, and packed write indices are normalized at the write
+    // site via packedDimInfos.
+    auto normalizeUnpackedIndex = [&](ExprNodeId term, const UnpackedDimInfo& dim,
+                                      slang::SourceLocation location) -> ExprNodeId {
+        if (dim.left < dim.right)
         {
-            return false;
+            if (dim.left != 0)
+            {
+                ExprNodeId offset =
+                    builder.addConstantLiteral(std::to_string(dim.left), location);
+                term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                             {term, offset}, location);
+            }
         }
-        const SignalId signal = signalBySymbol[symbol.index];
-        return signal != kInvalidPlanIndex &&
-               signal < static_cast<SignalId>(plan.signals.size()) &&
-               isPackedAggregateVariable(plan.signals[signal]);
+        else
+        {
+            ExprNodeId offset =
+                builder.addConstantLiteral(std::to_string(dim.left), location);
+            term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                         {offset, term}, location);
+        }
+        return term;
     };
 
     auto getMemoryReadCandidate = [&](ExprNodeId id, MemoryReadUse& out) -> bool {
@@ -15252,8 +15425,12 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             return false;
         }
         ExprNodeId current = id;
-        std::vector<ExprNodeId> indices;
-        ExprNodeId replacement = id;
+        struct IndexLevel {
+            wolvrix::lib::grh::OperationKind op;
+            ExprNodeId index;
+            ExprNodeId node = kInvalidPlanIndex;
+        };
+        std::vector<IndexLevel> levels;
         while (current != kInvalidPlanIndex && current < lowering.values.size())
         {
             const ExprNode& node = lowering.values[current];
@@ -15278,18 +15455,12 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             }
             if (node.operands.size() == 2)
             {
-                indices.push_back(node.operands[1]);
+                levels.push_back(IndexLevel{node.op, node.operands[1], current});
             }
             const ExprNodeId next = node.operands[0];
             if (next != kInvalidPlanIndex && next < lowering.values.size() &&
                 lowering.values[next].kind == ExprNodeKind::Symbol)
             {
-                if (node.op == wolvrix::lib::grh::OperationKind::kSliceDynamic &&
-                    isPackedAggregateSymbol(lowering.values[next].symbol))
-                {
-                    return false;
-                }
-                replacement = current;
                 current = next;
                 break;
             }
@@ -15309,24 +15480,46 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         {
             return false;
         }
-        if (!indices.empty())
-        {
-            std::reverse(indices.begin(), indices.end());
-        }
-        const auto& dims = plan.signals[signal].unpackedDims;
-        const std::size_t addressCount = dims.empty() ? 1 : dims.size();
-        if (indices.size() < addressCount)
+        const SignalInfo& info = plan.signals[signal];
+        // stage-04: rank comes from the declaration shape. 1..rank indices are
+        // accepted (fewer than rank reads a sub-array); levels beyond rank
+        // stay above the replaced expression (in-element bit selects).
+        const std::size_t rank = info.shape.size();
+        if (levels.empty() || rank == 0)
         {
             return false;
         }
-        if (indices.size() > addressCount)
+        std::reverse(levels.begin(), levels.end());
+        if (levels.size() > rank)
         {
-            indices.resize(addressCount);
+            levels.resize(rank);
+        }
+        std::vector<ExprNodeId> indices;
+        indices.reserve(levels.size());
+        for (std::size_t i = 0; i < levels.size(); ++i)
+        {
+            if (i < info.unpackedDims.size())
+            {
+                indices.push_back(
+                    normalizeUnpackedIndex(levels[i].index, info.unpackedDims[i],
+                                           baseNode.location));
+                continue;
+            }
+            // Packed dim: the statement lowerer already lane-normalized the
+            // index. A kSliceDynamic level here is a flattened bit select, not
+            // an element select (kept from the old packed-aggregate guard).
+            if (levels[i].op == wolvrix::lib::grh::OperationKind::kSliceDynamic)
+            {
+                return false;
+            }
+            indices.push_back(levels[i].index);
         }
         out.memory = baseNode.symbol;
         out.signal = signal;
         out.data = id;
-        out.replacement = replacement;
+        // The read port replaces the last consumed chain level; levels beyond
+        // rank (in-element selects) stay above it as normal expressions.
+        out.replacement = levels.back().node;
         out.addressIndices = std::move(indices);
         out.location = baseNode.location.valid() ? baseNode.location : lowering.values[id].location;
         return true;
@@ -15349,8 +15542,6 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         }
         readUses.push_back(candidate);
     };
-
-    MemoryPortBuilder builder(plan, lowering);
 
     auto exprDependsOn = [&](ExprNodeId root, ExprNodeId needle) -> bool {
         if (root == kInvalidPlanIndex || needle == kInvalidPlanIndex)
@@ -15562,66 +15753,6 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         readUses.swap(deduped);
     }
 
-    auto buildLinearAddress = [&](std::span<const ExprNodeId> indices,
-                                  std::span<const UnpackedDimInfo> dims,
-                                  slang::SourceLocation location) -> ExprNodeId {
-        if (indices.size() < dims.size() || dims.empty())
-        {
-            return kInvalidPlanIndex;
-        }
-        ExprNodeId address = kInvalidPlanIndex;
-        int64_t stride = 1;
-        std::vector<int64_t> strides(dims.size(), 1);
-        for (std::size_t i = dims.size(); i-- > 0;)
-        {
-            strides[i] = stride;
-            const int32_t extent = dims[i].extent;
-            if (extent > 0 && stride <= std::numeric_limits<int64_t>::max() / extent)
-            {
-                stride *= extent;
-            }
-        }
-        for (std::size_t i = 0; i < dims.size(); ++i)
-        {
-            ExprNodeId term = indices[i];
-            const UnpackedDimInfo& dim = dims[i];
-            if (dim.left < dim.right)
-            {
-                if (dim.left != 0)
-                {
-                    ExprNodeId offset =
-                        builder.addConstantLiteral(std::to_string(dim.left), location);
-                    term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kSub,
-                                                 {term, offset}, location);
-                }
-            }
-            else
-            {
-                ExprNodeId offset =
-                    builder.addConstantLiteral(std::to_string(dim.left), location);
-                term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kSub,
-                                             {offset, term}, location);
-            }
-            if (strides[i] != 1)
-            {
-                ExprNodeId strideId =
-                    builder.addConstantLiteral(std::to_string(strides[i]), location);
-                term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kMul,
-                                             {term, strideId}, location);
-            }
-            if (address == kInvalidPlanIndex)
-            {
-                address = term;
-            }
-            else
-            {
-                address = builder.makeOperation(wolvrix::lib::grh::OperationKind::kAdd,
-                                                {address, term}, location);
-            }
-        }
-        return address;
-    };
-
     std::vector<uint8_t> indexedMemoryAccess(plan.symbolTable.size(), 0);
     for (const auto& use : readUses)
     {
@@ -15642,9 +15773,10 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         {
             continue;
         }
-        const auto& dims = plan.signals[signal].unpackedDims;
-        const std::size_t addressCount = dims.empty() ? 1 : dims.size();
-        if (stmt.write.slices.size() >= addressCount)
+        // stage-04: any leading BitSelect slice is an indexed access (partial
+        // indexing writes a sub-array and still counts as indexed).
+        if (!stmt.write.slices.empty() &&
+            stmt.write.slices.front().kind == WriteSliceKind::BitSelect)
         {
             indexedMemoryAccess[stmt.write.target.index] = 1;
         }
@@ -15665,20 +15797,7 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             }
             continue;
         }
-        const auto& dims = plan.signals[use.signal].unpackedDims;
-        ExprNodeId address = kInvalidPlanIndex;
-        if (dims.empty())
-        {
-            if (!use.addressIndices.empty())
-            {
-                address = use.addressIndices.front();
-            }
-        }
-        else
-        {
-            address = buildLinearAddress(use.addressIndices, dims, use.location);
-        }
-        if (address == kInvalidPlanIndex)
+        if (use.addressIndices.empty())
         {
             if (context_.diagnostics)
             {
@@ -15691,7 +15810,7 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         MemoryReadPort entry;
         entry.memory = use.memory;
         entry.signal = use.signal;
-        entry.address = address;
+        entry.addressIndices = use.addressIndices;
         entry.data = use.data;
         entry.replacement = use.replacement;
         entry.isSync = use.domain == ControlDomain::Sequential;
@@ -15718,24 +15837,18 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         {
             continue;
         }
-        const int64_t memWidth = plan.signals[signal].width > 0 ? plan.signals[signal].width : 0;
-        const int64_t aggregateWidth =
-            isPackedAggregateVariable(plan.signals[signal])
-                ? flattenedAggregateWidth(plan.signals[signal])
-                : memWidth;
-        if (memWidth <= 0)
-        {
-            if (context_.diagnostics)
-            {
-                context_.diagnostics->error(write.location, "Memory write missing valid width");
-            }
-            continue;
-        }
-        const int32_t memWidthHint =
-            static_cast<int32_t>(std::min<int64_t>(
-                memWidth, std::numeric_limits<int32_t>::max()));
-        auto applyWriteWidthHint = [&](ExprNodeId id) {
-            if (memWidthHint <= 0 || id == kInvalidPlanIndex ||
+        const SignalInfo& info = plan.signals[signal];
+        const std::size_t rank = info.shape.size();
+        const int64_t elementWidth = info.width > 0 ? info.width : 1;
+        const int64_t totalWidth = signalTotalWidth(info);
+        const bool indexed =
+            write.target.valid() && write.target.index < indexedMemoryAccess.size() &&
+            indexedMemoryAccess[write.target.index];
+        auto applyWriteWidthHint = [&](ExprNodeId id, int64_t width) {
+            const int32_t widthHint =
+                static_cast<int32_t>(std::min<int64_t>(
+                    width > 0 ? width : 1, std::numeric_limits<int32_t>::max()));
+            if (id == kInvalidPlanIndex ||
                 id >= static_cast<ExprNodeId>(lowering.values.size()))
             {
                 return;
@@ -15745,127 +15858,150 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             {
                 return;
             }
-            if (node.widthHint <= 0 || node.widthHint < memWidthHint)
+            if (node.widthHint <= 0 || node.widthHint < widthHint)
             {
-                node.widthHint = memWidthHint;
+                node.widthHint = widthHint;
             }
         };
-        if (isPackedAggregateVariable(plan.signals[signal]) && write.slices.empty() &&
-            write.target.valid() && write.target.index < indexedMemoryAccess.size() &&
-            indexedMemoryAccess[write.target.index])
+
+        // stage-04: whole write (no slices). Indexed-access arrays become a
+        // full-array kRegisterWritePort; packed aggregates never touched by
+        // index fall through to the scalar write-back path (as before).
+        if (write.slices.empty())
         {
+            if (isPackedAggregateVariable(info) && !indexed)
+            {
+                continue;
+            }
             if (write.domain == ControlDomain::Sequential && stmt.eventEdges.empty())
             {
                 if (context_.diagnostics)
                 {
                     context_.diagnostics->warn(
                         write.location,
-                        "Skipping memory fill without edge-sensitive timing control");
+                        "Skipping memory write without edge-sensitive timing control");
                 }
                 continue;
             }
-            MemoryFillPort fill;
-            fill.memory = write.target;
-            fill.signal = signal;
-            const int32_t fillWidthHint =
+            MemoryWritePort entry;
+            entry.memory = write.target;
+            entry.signal = signal;
+            // Empty addressIndices + no mask = whole-array kRegisterWritePort.
+            entry.data = builder.resizeValueToWidth(
+                write.value,
                 static_cast<int32_t>(std::min<int64_t>(
-                    aggregateWidth > 0 ? aggregateWidth : memWidth,
-                    std::numeric_limits<int32_t>::max()));
-            fill.data = builder.resizeValueToWidth(write.value, fillWidthHint,
-                                                   plan.signals[signal].isSigned,
-                                                   write.location);
-            if (fill.data == kInvalidPlanIndex)
+                    totalWidth, std::numeric_limits<int32_t>::max())),
+                info.isSigned, write.location);
+            if (entry.data == kInvalidPlanIndex)
             {
                 continue;
             }
-            applyWriteWidthHint(fill.data);
-            fill.updateCond = builder.ensureGuardExpr(write.guard, write.location);
-            fill.eventEdges = stmt.eventEdges;
-            fill.eventOperands = stmt.eventOperands;
-            fill.location = write.location;
-            lowering.memoryFills.push_back(std::move(fill));
-            continue;
-        }
-        if (isPackedAggregateVariable(plan.signals[signal]) && write.slices.empty())
-        {
-            continue;
-        }
-        const auto& dims = plan.signals[signal].unpackedDims;
-        if (write.slices.size() < (dims.empty() ? 1 : dims.size()))
-        {
-            if (context_.diagnostics)
-            {
-                context_.diagnostics->error(write.location,
-                                           "Memory write missing address slices");
-            }
+            applyWriteWidthHint(entry.data, totalWidth);
+            entry.updateCond = builder.ensureGuardExpr(write.guard, write.location);
+            entry.eventEdges = stmt.eventEdges;
+            entry.eventOperands = stmt.eventOperands;
+            entry.location = write.location;
+            lowering.memoryWrites.push_back(std::move(entry));
             continue;
         }
 
+        // stage-04: leading BitSelect slices are per-dim array indices (up to
+        // rank; fewer than rank writes a sub-array); at most one trailing
+        // slice is an in-element bit/range write synthesized into a mask.
+        std::size_t indexCount = 0;
+        while (indexCount < write.slices.size() && indexCount < rank &&
+               write.slices[indexCount].kind == WriteSliceKind::BitSelect &&
+               write.slices[indexCount].index != kInvalidPlanIndex)
+        {
+            ++indexCount;
+        }
+        if (indexCount == 0)
+        {
+            if (context_.diagnostics)
+            {
+                context_.diagnostics->error(write.location,
+                                            "Unsupported memory address slice kind");
+            }
+            continue;
+        }
+        if (write.slices.size() > indexCount + 1)
+        {
+            if (context_.diagnostics)
+            {
+                context_.diagnostics->error(write.location,
+                                            "Multi-slice memory write is unsupported");
+            }
+            continue;
+        }
+        // Flat width of the sub-array addressed by indexCount indices.
+        int64_t subWidth = elementWidth;
+        for (std::size_t i = indexCount; i < rank; ++i)
+        {
+            const int64_t dim = info.shape[i] > 0 ? info.shape[i] : 1;
+            if (subWidth <= std::numeric_limits<int32_t>::max() / dim)
+            {
+                subWidth *= dim;
+            }
+            else
+            {
+                subWidth = std::numeric_limits<int32_t>::max();
+            }
+        }
+
         std::vector<ExprNodeId> addressIndices;
-        const std::size_t addressCount = dims.empty() ? 1 : dims.size();
-        bool addressOk = true;
-        for (std::size_t i = 0; i < addressCount; ++i)
+        addressIndices.reserve(indexCount);
+        for (std::size_t i = 0; i < indexCount; ++i)
         {
-            const WriteSlice& addrSlice = write.slices[i];
-            if (addrSlice.kind != WriteSliceKind::BitSelect ||
-                addrSlice.index == kInvalidPlanIndex)
+            ExprNodeId term = write.slices[i].index;
+            if (i < info.unpackedDims.size())
             {
-                addressOk = false;
-                break;
+                term = normalizeUnpackedIndex(term, info.unpackedDims[i], write.location);
             }
-            addressIndices.push_back(addrSlice.index);
-        }
-        if (!addressOk)
-        {
-            if (context_.diagnostics)
+            else
             {
-                context_.diagnostics->error(write.location,
-                                           "Unsupported memory address slice kind");
+                // Packed dim: raw SV index on the write path, normalized to a
+                // lane index here (downto: index - low; upto: high - index).
+                const std::size_t packedIdx = i - info.unpackedDims.size();
+                if (packedIdx < info.packedDimInfos.size())
+                {
+                    const UnpackedDimInfo& dim = info.packedDimInfos[packedIdx];
+                    const int64_t low = std::min<int32_t>(dim.left, dim.right);
+                    const int64_t high = std::max<int32_t>(dim.left, dim.right);
+                    if (dim.left > dim.right)
+                    {
+                        if (low != 0)
+                        {
+                            ExprNodeId offset =
+                                builder.addConstantLiteral(std::to_string(low), write.location);
+                            term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                                         {term, offset}, write.location);
+                        }
+                    }
+                    else
+                    {
+                        ExprNodeId offset =
+                            builder.addConstantLiteral(std::to_string(high), write.location);
+                        term = builder.makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                                     {offset, term}, write.location);
+                    }
+                }
             }
-            continue;
+            addressIndices.push_back(term);
         }
-        ExprNodeId address = kInvalidPlanIndex;
-        if (dims.empty())
-        {
-            address = addressIndices.front();
-        }
-        else
-        {
-            address = buildLinearAddress(addressIndices, dims, write.location);
-        }
-        if (address == kInvalidPlanIndex)
-        {
-            if (context_.diagnostics)
-            {
-                context_.diagnostics->error(write.location,
-                                           "Memory write address linearization failed");
-            }
-            continue;
-        }
+
         ExprNodeId data = write.value;
         ExprNodeId mask = kInvalidPlanIndex;
         bool isMasked = false;
-        const std::size_t packedStart = addressCount;
-        if (write.slices.size() == packedStart)
+        const int64_t memWidth = subWidth;
+        if (write.slices.size() == indexCount + 1)
         {
-            auto literal = makeMaskLiteral(memWidth, 0, memWidth - 1);
-            if (!literal)
-            {
-                continue;
-            }
-            mask = builder.addConstantLiteral(*literal, write.location);
-        }
-        else if (write.slices.size() == packedStart + 1)
-        {
-            const WriteSlice& dataSlice = write.slices[packedStart];
+            const WriteSlice& dataSlice = write.slices[indexCount];
             if (dataSlice.kind == WriteSliceKind::BitSelect)
             {
                 isMasked = true;
                 const int32_t widthHint =
-                    memWidth > 0
-                        ? static_cast<int32_t>(std::min<int64_t>(
-                              memWidth, std::numeric_limits<int32_t>::max()))
-                        : 0;
+                    static_cast<int32_t>(std::min<int64_t>(
+                        memWidth, std::numeric_limits<int32_t>::max()));
                 const ExprNodeId bitIndex = dataSlice.index;
                 if (bitIndex == kInvalidPlanIndex)
                 {
@@ -15876,10 +16012,6 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 mask = builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kShl,
                                                       {one, bitIndex}, widthHint,
                                                       write.location);
-                if (bitIndex == kInvalidPlanIndex)
-                {
-                    continue;
-                }
                 data = builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kShl,
                                                       {write.value, bitIndex},
                                                       widthHint, write.location);
@@ -15888,10 +16020,8 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             {
                 isMasked = true;
                 const int32_t widthHint =
-                    memWidth > 0
-                        ? static_cast<int32_t>(std::min<int64_t>(
-                              memWidth, std::numeric_limits<int32_t>::max()))
-                        : 0;
+                    static_cast<int32_t>(std::min<int64_t>(
+                        memWidth, std::numeric_limits<int32_t>::max()));
                 auto leftConst = evalConstInt(plan, lowering, dataSlice.left);
                 auto rightConst = evalConstInt(plan, lowering, dataSlice.right);
                 if (dataSlice.rangeKind == WriteRangeKind::Simple)
@@ -16057,23 +16187,17 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 continue;
             }
         }
-        else
-        {
-            if (context_.diagnostics)
-            {
-                context_.diagnostics->error(write.location,
-                                           "Multi-slice memory write is unsupported");
-            }
-            continue;
-        }
 
-        if (mask == kInvalidPlanIndex || data == kInvalidPlanIndex)
+        if (data == kInvalidPlanIndex)
         {
             continue;
         }
 
-        applyWriteWidthHint(data);
-        applyWriteWidthHint(mask);
+        applyWriteWidthHint(data, memWidth);
+        if (mask != kInvalidPlanIndex)
+        {
+            applyWriteWidthHint(mask, memWidth);
+        }
 
         if (write.domain == ControlDomain::Sequential && stmt.eventEdges.empty())
         {
@@ -16089,7 +16213,7 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         MemoryWritePort entry;
         entry.memory = write.target;
         entry.signal = signal;
-        entry.address = address;
+        entry.addressIndices = std::move(addressIndices);
         entry.data = data;
         entry.mask = mask;
         entry.updateCond = builder.ensureGuardExpr(write.guard, write.location);
@@ -16100,669 +16224,6 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         lowering.memoryWrites.push_back(std::move(entry));
     }
 
-    auto exprStructurallyEquivalent = [&](auto&& self, ExprNodeId lhs, ExprNodeId rhs) -> bool {
-        if (lhs == rhs)
-        {
-            return true;
-        }
-        if (lhs == kInvalidPlanIndex || rhs == kInvalidPlanIndex ||
-            lhs >= lowering.values.size() || rhs >= lowering.values.size())
-        {
-            return false;
-        }
-        const ExprNode& lhsNode = lowering.values[lhs];
-        const ExprNode& rhsNode = lowering.values[rhs];
-        if (lhsNode.kind != rhsNode.kind)
-        {
-            return false;
-        }
-        switch (lhsNode.kind)
-        {
-        case ExprNodeKind::Invalid:
-            return true;
-        case ExprNodeKind::Constant:
-            return lhsNode.literal == rhsNode.literal;
-        case ExprNodeKind::Symbol:
-            return lhsNode.symbol.index == rhsNode.symbol.index;
-        case ExprNodeKind::XmrRead:
-            return lhsNode.xmrPath == rhsNode.xmrPath;
-        case ExprNodeKind::Operation:
-            if (lhsNode.op != rhsNode.op ||
-                lhsNode.operands.size() != rhsNode.operands.size())
-            {
-                return false;
-            }
-            for (std::size_t i = 0; i < lhsNode.operands.size(); ++i)
-            {
-                if (!self(self, lhsNode.operands[i], rhsNode.operands[i]))
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-        return false;
-    };
-
-    auto exprListStructurallyEquivalent =
-        [&](const std::vector<ExprNodeId>& lhs,
-            const std::vector<ExprNodeId>& rhs) -> bool {
-        if (lhs.size() != rhs.size())
-        {
-            return false;
-        }
-        for (std::size_t i = 0; i < lhs.size(); ++i)
-        {
-            if (!exprStructurallyEquivalent(exprStructurallyEquivalent, lhs[i], rhs[i]))
-            {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    auto makeLogicAnd = [&](ExprNodeId lhs, ExprNodeId rhs,
-                            slang::SourceLocation location) -> ExprNodeId {
-        if (lhs == kInvalidPlanIndex)
-        {
-            return rhs;
-        }
-        if (rhs == kInvalidPlanIndex)
-        {
-            return lhs;
-        }
-        return builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kLogicAnd,
-                                              {lhs, rhs}, 1, location);
-    };
-
-    auto makeLogicOr = [&](ExprNodeId lhs, ExprNodeId rhs,
-                           slang::SourceLocation location) -> ExprNodeId {
-        if (lhs == kInvalidPlanIndex)
-        {
-            return rhs;
-        }
-        if (rhs == kInvalidPlanIndex)
-        {
-            return lhs;
-        }
-        return builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kLogicOr,
-                                              {lhs, rhs}, 1, location);
-    };
-
-    auto makeLogicNot = [&](ExprNodeId operand,
-                            slang::SourceLocation location) -> ExprNodeId {
-        if (operand == kInvalidPlanIndex)
-        {
-            return kInvalidPlanIndex;
-        }
-        return builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kLogicNot,
-                                              {operand}, 1, location);
-    };
-
-    auto exprWidthHint = [&](ExprNodeId id) -> int32_t {
-        if (id == kInvalidPlanIndex || id >= lowering.values.size())
-        {
-            return 0;
-        }
-        return lowering.values[id].widthHint;
-    };
-
-    auto flattenAndTerms = [&](auto&& self, ExprNodeId id,
-                               std::vector<ExprNodeId>& terms) -> void {
-        if (id == kInvalidPlanIndex || id >= lowering.values.size())
-        {
-            return;
-        }
-        const ExprNode& node = lowering.values[id];
-        if (node.kind == ExprNodeKind::Operation &&
-            (node.op == wolvrix::lib::grh::OperationKind::kLogicAnd ||
-             node.op == wolvrix::lib::grh::OperationKind::kAnd) &&
-            node.operands.size() == 2)
-        {
-            self(self, node.operands[0], terms);
-            self(self, node.operands[1], terms);
-            return;
-        }
-        terms.push_back(id);
-    };
-
-    auto matchEqualityToConst =
-        [&](ExprNodeId id, int64_t addressConst, ExprNodeId& dynamicAddress) -> bool {
-        if (id == kInvalidPlanIndex || id >= lowering.values.size())
-        {
-            return false;
-        }
-        const ExprNode& node = lowering.values[id];
-        if (node.kind != ExprNodeKind::Operation)
-        {
-            return false;
-        }
-        if ((node.op == wolvrix::lib::grh::OperationKind::kEq ||
-             node.op == wolvrix::lib::grh::OperationKind::kCaseEq) &&
-            node.operands.size() == 2)
-        {
-            auto lhsConst = evalConstInt(plan, lowering, node.operands[0]);
-            auto rhsConst = evalConstInt(plan, lowering, node.operands[1]);
-            if (lhsConst && *lhsConst == addressConst && !rhsConst)
-            {
-                dynamicAddress = node.operands[1];
-                return true;
-            }
-            if (rhsConst && *rhsConst == addressConst && !lhsConst)
-            {
-                dynamicAddress = node.operands[0];
-                return true;
-            }
-        }
-        if (node.op == wolvrix::lib::grh::OperationKind::kReduceAnd &&
-            node.operands.size() == 1)
-        {
-            ExprNodeId operand = node.operands[0];
-            if (operand != kInvalidPlanIndex && operand < lowering.values.size() &&
-                addressConst > 0 && ((addressConst + 1) & addressConst) == 0)
-            {
-                dynamicAddress = operand;
-                return true;
-            }
-        }
-        return false;
-    };
-
-    std::vector<ExprNodeId> singleAssignNetValue(plan.symbolTable.size(),
-                                                 kInvalidPlanIndex);
-    std::vector<uint8_t> singleAssignNetAmbiguous(plan.symbolTable.size(), 0);
-    for (const auto& stmt : lowering.loweredStmts)
-    {
-        if (stmt.kind != LoweredStmtKind::Write || stmt.write.isXmr ||
-            stmt.write.domain != ControlDomain::Combinational ||
-            !stmt.eventEdges.empty() || !stmt.write.slices.empty() ||
-            !stmt.write.target.valid() ||
-            stmt.write.target.index >= singleAssignNetValue.size())
-        {
-            continue;
-        }
-        SignalId signal = resolveMemorySignal(stmt.write.target);
-        if (signal != kInvalidPlanIndex ||
-            stmt.write.target.index >= signalBySymbol.size())
-        {
-            continue;
-        }
-        SignalId targetSignal = signalBySymbol[stmt.write.target.index];
-        if (targetSignal == kInvalidPlanIndex ||
-            targetSignal >= static_cast<SignalId>(plan.signals.size()) ||
-            plan.signals[targetSignal].kind != SignalKind::Net)
-        {
-            continue;
-        }
-        ExprNodeId& slot = singleAssignNetValue[stmt.write.target.index];
-        if (slot == kInvalidPlanIndex)
-        {
-            slot = stmt.write.value;
-        }
-        else
-        {
-            singleAssignNetAmbiguous[stmt.write.target.index] = 1;
-        }
-    }
-
-    auto resolveSingleAssignNet =
-        [&](auto&& self, ExprNodeId id, std::vector<uint8_t>& seen) -> ExprNodeId {
-        if (id == kInvalidPlanIndex || id >= lowering.values.size())
-        {
-            return id;
-        }
-        const ExprNode& node = lowering.values[id];
-        if (node.kind != ExprNodeKind::Symbol || !node.symbol.valid() ||
-            node.symbol.index >= singleAssignNetValue.size() ||
-            singleAssignNetAmbiguous[node.symbol.index] ||
-            singleAssignNetValue[node.symbol.index] == kInvalidPlanIndex)
-        {
-            return id;
-        }
-        if (seen[node.symbol.index])
-        {
-            return id;
-        }
-        seen[node.symbol.index] = 1;
-        return self(self, singleAssignNetValue[node.symbol.index], seen);
-    };
-
-    auto matchResolvedEqualityToConst =
-        [&](ExprNodeId id, int64_t addressConst, ExprNodeId& dynamicAddress) -> bool {
-        if (matchEqualityToConst(id, addressConst, dynamicAddress))
-        {
-            return true;
-        }
-        std::vector<uint8_t> seen(plan.symbolTable.size(), 0);
-        ExprNodeId resolved = resolveSingleAssignNet(resolveSingleAssignNet, id, seen);
-        return resolved != id && matchEqualityToConst(resolved, addressConst, dynamicAddress);
-    };
-
-    auto makeAddressEquality = [&](ExprNodeId lhs, ExprNodeId rhs,
-                                   slang::SourceLocation location) -> ExprNodeId {
-        return builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kEq,
-                                              {lhs, rhs}, 1, location);
-    };
-
-    auto replaceAddressConstMatch =
-        [&](auto&& self, ExprNodeId id, int64_t addressConst, ExprNodeId newAddress,
-            ExprNodeId& replaced) -> ExprNodeId {
-        if (id == kInvalidPlanIndex || id >= lowering.values.size())
-        {
-            return kInvalidPlanIndex;
-        }
-        const ExprNode& node = lowering.values[id];
-        ExprNodeId dynamicAddress = kInvalidPlanIndex;
-        if (matchResolvedEqualityToConst(id, addressConst, dynamicAddress))
-        {
-            replaced = dynamicAddress;
-            return makeAddressEquality(dynamicAddress, newAddress, node.location);
-        }
-        if (node.kind != ExprNodeKind::Operation)
-        {
-            return id;
-        }
-        std::vector<ExprNodeId> operands;
-        operands.reserve(node.operands.size());
-        bool changed = false;
-        for (ExprNodeId operand : node.operands)
-        {
-            ExprNodeId before = replaced;
-            ExprNodeId rewritten = self(self, operand, addressConst, newAddress, replaced);
-            if (rewritten == kInvalidPlanIndex)
-            {
-                return kInvalidPlanIndex;
-            }
-            changed = changed || rewritten != operand || before != replaced;
-            operands.push_back(rewritten);
-        }
-        if (!changed)
-        {
-            return id;
-        }
-        return builder.makeOperationWithWidth(node.op, std::move(operands),
-                                              node.widthHint, node.location);
-    };
-
-    auto matchIndexedWriteGuard =
-        [&](ExprNodeId guard, int64_t addressConst, ExprNodeId& dynamicAddress,
-            std::vector<ExprNodeId>& enableTerms) -> bool {
-        std::vector<ExprNodeId> terms;
-        flattenAndTerms(flattenAndTerms, guard, terms);
-        bool found = false;
-        enableTerms.clear();
-        for (ExprNodeId term : terms)
-        {
-            ExprNodeId termDynamicAddress = kInvalidPlanIndex;
-            if (!found && matchResolvedEqualityToConst(term, addressConst, termDynamicAddress))
-            {
-                dynamicAddress = termDynamicAddress;
-                found = true;
-                continue;
-            }
-            enableTerms.push_back(term);
-        }
-        return found;
-    };
-
-    auto exprTermExists =
-        [&](const std::vector<ExprNodeId>& terms, ExprNodeId candidate) -> bool {
-        for (ExprNodeId term : terms)
-        {
-            if (exprStructurallyEquivalent(exprStructurallyEquivalent, term, candidate))
-            {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    auto sortedCandidatesByAddress =
-        [](std::vector<IndexedMemoryWriteMergeCandidate> candidates) {
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const IndexedMemoryWriteMergeCandidate& lhs,
-                     const IndexedMemoryWriteMergeCandidate& rhs) {
-                      return lhs.addressConst < rhs.addressConst;
-                  });
-        return candidates;
-    };
-
-    auto commonEnableTerms =
-        [&](const std::vector<IndexedMemoryWriteMergeCandidate>& candidates) {
-        std::vector<ExprNodeId> common;
-        if (candidates.empty())
-        {
-            return common;
-        }
-        for (ExprNodeId term : candidates.front().enableTerms)
-        {
-            bool presentInAll = true;
-            for (std::size_t i = 1; i < candidates.size(); ++i)
-            {
-                if (!exprTermExists(candidates[i].enableTerms, term))
-                {
-                    presentInAll = false;
-                    break;
-                }
-            }
-            if (presentInAll && !exprTermExists(common, term))
-            {
-                common.push_back(term);
-            }
-        }
-        return common;
-    };
-
-    auto buildPriorityConflictExpr =
-        [&](const std::vector<IndexedMemoryWriteMergeCandidate>& candidates,
-            const std::vector<ExprNodeId>& commonTerms) -> ExprNodeId {
-        ExprNodeId conflictExpr = kInvalidPlanIndex;
-        ExprNodeId blockedDynamicAddress = kInvalidPlanIndex;
-        for (const auto& candidate : candidates)
-        {
-            bool foundForCandidate = false;
-            for (ExprNodeId term : candidate.enableTerms)
-            {
-                if (exprTermExists(commonTerms, term))
-                {
-                    continue;
-                }
-                if (term == kInvalidPlanIndex || term >= lowering.values.size())
-                {
-                    continue;
-                }
-                const ExprNode& termNode = lowering.values[term];
-                if (termNode.kind != ExprNodeKind::Operation ||
-                    termNode.op != wolvrix::lib::grh::OperationKind::kLogicNot ||
-                    termNode.operands.size() != 1)
-                {
-                    continue;
-                }
-                ExprNodeId termDynamicAddress = kInvalidPlanIndex;
-                ExprNodeId rewritten =
-                    replaceAddressConstMatch(replaceAddressConstMatch,
-                                             termNode.operands[0],
-                                             candidate.addressConst,
-                                             candidate.dynamicAddress,
-                                             termDynamicAddress);
-                if (termDynamicAddress == kInvalidPlanIndex ||
-                    rewritten == kInvalidPlanIndex ||
-                    rewritten == termNode.operands[0])
-                {
-                    continue;
-                }
-                if (blockedDynamicAddress == kInvalidPlanIndex)
-                {
-                    blockedDynamicAddress = termDynamicAddress;
-                }
-                else if (!exprStructurallyEquivalent(exprStructurallyEquivalent,
-                                                     blockedDynamicAddress,
-                                                     termDynamicAddress))
-                {
-                    return kInvalidPlanIndex;
-                }
-                if (conflictExpr == kInvalidPlanIndex)
-                {
-                    conflictExpr = rewritten;
-                }
-                else if (!exprStructurallyEquivalent(exprStructurallyEquivalent,
-                                                     conflictExpr,
-                                                     rewritten))
-                {
-                    return kInvalidPlanIndex;
-                }
-                foundForCandidate = true;
-                break;
-            }
-            if (!foundForCandidate)
-            {
-                return kInvalidPlanIndex;
-            }
-        }
-        return conflictExpr;
-    };
-
-    auto buildEnableFromTerms =
-        [&](const std::vector<ExprNodeId>& terms, slang::SourceLocation location) {
-        ExprNodeId enable = kInvalidPlanIndex;
-        for (ExprNodeId term : terms)
-        {
-            enable = makeLogicAnd(enable, term, location);
-        }
-        return enable == kInvalidPlanIndex
-                   ? builder.ensureGuardExpr(kInvalidPlanIndex, location)
-                   : enable;
-    };
-
-    auto mergeSameAddressMemoryWrites = [&]() {
-        if (lowering.memoryWrites.size() < 2)
-        {
-            return;
-        }
-        std::vector<uint8_t> consumed(lowering.memoryWrites.size(), 0);
-        std::vector<MemoryWritePort> merged;
-        merged.reserve(lowering.memoryWrites.size());
-        for (std::size_t i = 0; i < lowering.memoryWrites.size(); ++i)
-        {
-            if (consumed[i])
-            {
-                continue;
-            }
-            const MemoryWritePort& seed = lowering.memoryWrites[i];
-            std::vector<std::size_t> group;
-            group.push_back(i);
-            for (std::size_t j = i + 1; j < lowering.memoryWrites.size(); ++j)
-            {
-                if (consumed[j])
-                {
-                    continue;
-                }
-                const MemoryWritePort& other = lowering.memoryWrites[j];
-                if (other.memory.index != seed.memory.index ||
-                    other.signal != seed.signal ||
-                    other.isMasked != seed.isMasked ||
-                    other.eventEdges != seed.eventEdges ||
-                    !exprListStructurallyEquivalent(other.eventOperands, seed.eventOperands))
-                {
-                    continue;
-                }
-                if (!exprStructurallyEquivalent(exprStructurallyEquivalent,
-                                                other.address,
-                                                seed.address) ||
-                    !exprStructurallyEquivalent(exprStructurallyEquivalent,
-                                                other.mask,
-                                                seed.mask))
-                {
-                    continue;
-                }
-                group.push_back(j);
-            }
-            if (group.size() == 1)
-            {
-                merged.push_back(seed);
-                consumed[i] = 1;
-                continue;
-            }
-
-            MemoryWritePort combined = seed;
-            ExprNodeId updateCond = kInvalidPlanIndex;
-            for (std::size_t index : group)
-            {
-                const MemoryWritePort& write = lowering.memoryWrites[index];
-                updateCond = makeLogicOr(updateCond, write.updateCond, write.location);
-            }
-            ExprNodeId data = lowering.memoryWrites[group.front()].data;
-            for (std::size_t idx = 1; idx < group.size(); ++idx)
-            {
-                const MemoryWritePort& write = lowering.memoryWrites[group[idx]];
-                int32_t widthHint = exprWidthHint(write.data);
-                if (widthHint <= 0)
-                {
-                    widthHint = exprWidthHint(data);
-                }
-                data = builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kMux,
-                                                      {write.updateCond, write.data, data},
-                                                      widthHint, write.location);
-            }
-            combined.updateCond = updateCond == kInvalidPlanIndex
-                                      ? builder.ensureGuardExpr(kInvalidPlanIndex,
-                                                                seed.location)
-                                      : updateCond;
-            combined.data = data;
-            combined.location = lowering.memoryWrites[group.back()].location;
-            for (std::size_t index : group)
-            {
-                consumed[index] = 1;
-            }
-            merged.push_back(std::move(combined));
-        }
-        lowering.memoryWrites = std::move(merged);
-    };
-
-    auto mergeIndexedMemoryWrites = [&]() {
-        if (lowering.memoryWrites.size() < 4)
-        {
-            return;
-        }
-        std::vector<uint8_t> consumed(lowering.memoryWrites.size(), 0);
-        std::vector<MemoryWritePort> merged;
-        merged.reserve(lowering.memoryWrites.size());
-        for (std::size_t i = 0; i < lowering.memoryWrites.size(); ++i)
-        {
-            if (consumed[i])
-            {
-                continue;
-            }
-            MemoryWritePort& seed = lowering.memoryWrites[i];
-            auto seedAddrConst = evalConstInt(plan, lowering, seed.address);
-            if (!seedAddrConst)
-            {
-                merged.push_back(seed);
-                consumed[i] = 1;
-                continue;
-            }
-            ExprNodeId seedDynamicAddress = kInvalidPlanIndex;
-            std::vector<ExprNodeId> seedEnableTerms;
-            if (!matchIndexedWriteGuard(seed.updateCond,
-                                        *seedAddrConst,
-                                        seedDynamicAddress,
-                                        seedEnableTerms))
-            {
-                merged.push_back(seed);
-                consumed[i] = 1;
-                continue;
-            }
-            std::vector<IndexedMemoryWriteMergeCandidate> candidates;
-            candidates.push_back(IndexedMemoryWriteMergeCandidate{
-                .writeIndex = i,
-                .addressConst = *seedAddrConst,
-                .dynamicAddress = seedDynamicAddress,
-                .enableTerms = seedEnableTerms,
-            });
-            for (std::size_t j = i + 1; j < lowering.memoryWrites.size(); ++j)
-            {
-                if (consumed[j])
-                {
-                    continue;
-                }
-                const MemoryWritePort& other = lowering.memoryWrites[j];
-                if (other.memory.index != seed.memory.index ||
-                    other.signal != seed.signal ||
-                    other.isMasked != seed.isMasked ||
-                    other.eventEdges != seed.eventEdges ||
-                    !exprListStructurallyEquivalent(other.eventOperands, seed.eventOperands))
-                {
-                    continue;
-                }
-                if (!exprStructurallyEquivalent(exprStructurallyEquivalent, other.data, seed.data))
-                {
-                    continue;
-                }
-                if (!exprStructurallyEquivalent(exprStructurallyEquivalent, other.mask, seed.mask))
-                {
-                    continue;
-                }
-                auto otherAddrConst = evalConstInt(plan, lowering, other.address);
-                if (!otherAddrConst)
-                {
-                    continue;
-                }
-                ExprNodeId otherDynamicAddress = kInvalidPlanIndex;
-                std::vector<ExprNodeId> otherEnableTerms;
-                if (!matchIndexedWriteGuard(other.updateCond,
-                                            *otherAddrConst,
-                                            otherDynamicAddress,
-                                            otherEnableTerms))
-                {
-                    continue;
-                }
-                if (!exprStructurallyEquivalent(exprStructurallyEquivalent,
-                                                otherDynamicAddress,
-                                                seedDynamicAddress))
-                {
-                    continue;
-                }
-                candidates.push_back(IndexedMemoryWriteMergeCandidate{
-                    .writeIndex = j,
-                    .addressConst = *otherAddrConst,
-                    .dynamicAddress = otherDynamicAddress,
-                    .enableTerms = otherEnableTerms,
-                });
-            }
-            if (candidates.size() < 8)
-            {
-                merged.push_back(seed);
-                consumed[i] = 1;
-                continue;
-            }
-            std::vector<IndexedMemoryWriteMergeCandidate> sorted =
-                sortedCandidatesByAddress(candidates);
-            bool coversContiguousRange = true;
-            for (std::size_t idx = 0; idx < sorted.size(); ++idx)
-            {
-                if (sorted[idx].addressConst != static_cast<int64_t>(idx))
-                {
-                    coversContiguousRange = false;
-                    break;
-                }
-            }
-            if (!coversContiguousRange)
-            {
-                merged.push_back(seed);
-                consumed[i] = 1;
-                continue;
-            }
-            std::vector<ExprNodeId> enableTerms = commonEnableTerms(candidates);
-            ExprNodeId priorityConflict =
-                buildPriorityConflictExpr(candidates, enableTerms);
-            if (priorityConflict != kInvalidPlanIndex)
-            {
-                ExprNodeId notConflict = makeLogicNot(priorityConflict, seed.location);
-                if (notConflict != kInvalidPlanIndex)
-                {
-                    enableTerms.push_back(notConflict);
-                }
-            }
-            if (enableTerms.empty())
-            {
-                merged.push_back(seed);
-                consumed[i] = 1;
-                continue;
-            }
-            MemoryWritePort combined = seed;
-            combined.address = seedDynamicAddress;
-            combined.updateCond = buildEnableFromTerms(enableTerms, seed.location);
-            for (const auto& candidate : candidates)
-            {
-                consumed[candidate.writeIndex] = 1;
-            }
-            merged.push_back(std::move(combined));
-        }
-        lowering.memoryWrites = std::move(merged);
-    };
-
-    mergeSameAddressMemoryWrites();
-    mergeIndexedMemoryWrites();
 
     if (!lowering.memoryReads.empty() && !lowering.memoryWrites.empty())
     {
@@ -16805,7 +16266,6 @@ public:
         symbolIds_.assign(plan_.symbolTable.size(), wolvrix::lib::grh::SymbolId::invalid());
         valueBySymbol_.assign(plan_.symbolTable.size(), wolvrix::lib::grh::ValueId::invalid());
         valueByExpr_.assign(lowering_.values.size(), wolvrix::lib::grh::ValueId::invalid());
-        packedAggregateWholeReadBySymbol_.assign(plan_.symbolTable.size(), wolvrix::lib::grh::ValueId::invalid());
         memoryOpBySymbol_.assign(plan_.symbolTable.size(), wolvrix::lib::grh::OperationId::invalid());
         memorySymbolName_.assign(plan_.symbolTable.size(), std::string());
         storageBySymbol_.assign(plan_.symbolTable.size(), StorageKind::None);
@@ -17057,16 +16517,74 @@ private:
         {
             return wolvrix::lib::grh::ValueId::invalid();
         }
-        if (!valueBySymbol_[id.index].valid() && isMemoryBackedPackedAggregate(id))
-        {
-            return emitPackedAggregateWholeRead(id, slang::SourceLocation{});
-        }
         if (!valueBySymbol_[id.index].valid() && isStorageSymbol(id))
         {
             return ensureStorageReadValue(id, storageBySymbol_[id.index],
                                           storageLocation_[id.index]);
         }
+        if (!valueBySymbol_[id.index].valid() && isArrayStateSymbol(id))
+        {
+            return ensureMemoryReadValue(id, slang::SourceLocation{});
+        }
         return valueBySymbol_[id.index];
+    }
+
+    // stage-04: is this symbol an array-state signal (backed by a kRegister
+    // with a shape attr rather than a plain signal value)?
+    bool isArrayStateSymbol(PlanSymbolId id) const
+    {
+        const SignalInfo* signal = findSignalInfo(id);
+        return signal && signal->kind != SignalKind::Net && signal->memoryRows > 0;
+    }
+
+    // Lazily create the whole-array read port (kRegisterReadPort) for an
+    // array-state signal; the result carries the declaration shape.
+    wolvrix::lib::grh::ValueId ensureMemoryReadValue(PlanSymbolId id,
+                                                     slang::SourceLocation location)
+    {
+        if (!id.valid() || id.index >= valueBySymbol_.size())
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        if (valueBySymbol_[id.index].valid())
+        {
+            return valueBySymbol_[id.index];
+        }
+        const SignalId signalId = findSignalId(id);
+        if (signalId == kInvalidPlanIndex)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        const SignalInfo& signal = plan_.signals[signalId];
+        if (!ensureMemoryOp(id, signalId, location))
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        if (valueBySymbol_[id.index].valid())
+        {
+            return valueBySymbol_[id.index];
+        }
+        std::string_view name = memorySymbolText(id);
+        if (name.empty())
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        const int32_t width =
+            normalizeWidth(static_cast<int32_t>(signalTotalWidth(signal)));
+        wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol();
+        wolvrix::lib::grh::OperationId op =
+            createOp(wolvrix::lib::grh::OperationKind::kRegisterReadPort, opSym, location);
+        wolvrix::lib::grh::SymbolId valSym = makeInternalValueSymbol();
+        wolvrix::lib::grh::ValueId value =
+            graph_.createValue(valSym, width, signal.isSigned, signal.valueType);
+        if (!signal.shape.empty())
+        {
+            graph_.setValueShape(value, signal.shape);
+        }
+        graph_.addResult(op, value);
+        graph_.setAttr(op, "regSymbol", std::string(name));
+        valueBySymbol_[id.index] = value;
+        return value;
     }
 
     wolvrix::lib::grh::ValueId createValue(PlanSymbolId id, int32_t width, bool isSigned,
@@ -17397,13 +16915,23 @@ private:
                 }
                 else
                 {
+                    // stage-04: only an indexed-access array signal reads the
+                    // port through the whole-array read port; anything else is
+                    // a plain port value (the signal may still be a packed
+                    // aggregate that never became array state).
                     if (isMemoryBackedPackedAggregate(port.symbol))
                     {
-                        value = emitPackedAggregateWholeRead(port.symbol, slang::SourceLocation{});
+                        value = valueForSymbol(port.symbol);
                     }
                     else
                     {
                         value = createValue(port.symbol, width, port.isSigned, port.valueType);
+                    }
+                    if (value.valid() && !port.shape.empty() &&
+                        graph_.getValue(value).shape().empty())
+                    {
+                        // stage-04: array output ports carry the declared shape.
+                        graph_.setValueShape(value, port.shape);
                     }
                 }
                 if (value.valid())
@@ -17574,101 +17102,7 @@ private:
                 return true;
             }
         }
-        for (const auto& fill : lowering_.memoryFills)
-        {
-            if (fill.memory.index == symbol.index)
-            {
-                return true;
-            }
-        }
         return false;
-    }
-
-    wolvrix::lib::grh::ValueId emitPackedAggregateWholeRead(PlanSymbolId symbol,
-                                                            slang::SourceLocation location)
-    {
-        if (!symbol.valid() || symbol.index >= packedAggregateWholeReadBySymbol_.size())
-        {
-            return wolvrix::lib::grh::ValueId::invalid();
-        }
-        if (packedAggregateWholeReadBySymbol_[symbol.index].valid())
-        {
-            return packedAggregateWholeReadBySymbol_[symbol.index];
-        }
-        const SignalId signalId = findSignalId(symbol);
-        if (signalId == kInvalidPlanIndex)
-        {
-            return wolvrix::lib::grh::ValueId::invalid();
-        }
-        const SignalInfo& signal = plan_.signals[signalId];
-        if (!isPackedAggregateVariable(signal) || signal.memoryRows <= 0)
-        {
-            return wolvrix::lib::grh::ValueId::invalid();
-        }
-        if (!ensureMemoryOp(symbol, signalId, location))
-        {
-            return wolvrix::lib::grh::ValueId::invalid();
-        }
-        std::string_view memSymbol = memorySymbolText(symbol);
-        if (memSymbol.empty())
-        {
-            return wolvrix::lib::grh::ValueId::invalid();
-        }
-
-        const int32_t rowWidth = normalizeWidth(signal.width);
-        const int64_t rowCount = signal.memoryRows;
-        std::vector<wolvrix::lib::grh::ValueId> rowValues;
-        rowValues.reserve(static_cast<std::size_t>(rowCount));
-        for (int64_t row = 0; row < rowCount; ++row)
-        {
-            ExprNode addressNode;
-            addressNode.kind = ExprNodeKind::Constant;
-            addressNode.literal = std::to_string(row);
-            addressNode.widthHint = 32;
-            addressNode.location = location;
-            wolvrix::lib::grh::ValueId addressValue = emitConstant(addressNode);
-            if (!addressValue.valid())
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-
-            wolvrix::lib::grh::ValueId dataValue =
-                graph_.createValue(makeInternalValueSymbol(), rowWidth,
-                                   signal.isSigned, signal.valueType);
-            wolvrix::lib::grh::OperationId readOp =
-                createOp(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort,
-                         makeInternalOpSymbol(), location);
-            graph_.addOperand(readOp, addressValue);
-            graph_.setAttr(readOp, "regSymbol", std::string(memSymbol));
-            graph_.addResult(readOp, dataValue);
-            rowValues.push_back(dataValue);
-        }
-        if (rowValues.empty())
-        {
-            return wolvrix::lib::grh::ValueId::invalid();
-        }
-        if (rowValues.size() == 1)
-        {
-            packedAggregateWholeReadBySymbol_[symbol.index] = rowValues.front();
-            return rowValues.front();
-        }
-
-        wolvrix::lib::grh::OperationId concatOp =
-            createOp(wolvrix::lib::grh::OperationKind::kConcat,
-                     wolvrix::lib::grh::SymbolId::invalid(),
-                     location);
-        for (auto it = rowValues.rbegin(); it != rowValues.rend(); ++it)
-        {
-            graph_.addOperand(concatOp, *it);
-        }
-        const int32_t aggregateWidth =
-            normalizeWidth(static_cast<int32_t>(flattenedAggregateWidth(signal)));
-        wolvrix::lib::grh::ValueId result =
-            graph_.createValue(makeInternalValueSymbol(), aggregateWidth,
-                               signal.isSigned, signal.valueType);
-        graph_.addResult(concatOp, result);
-        packedAggregateWholeReadBySymbol_[symbol.index] = result;
-        return result;
     }
 
     const slang::ast::Type* lookupPlanSymbolType(PlanSymbolId symbol) const
@@ -17921,8 +17355,10 @@ private:
         {
             context_.diagnostics->warn(location, "Memory width missing, defaulting to 1");
         }
-        const int64_t totalWidth = width * static_cast<int64_t>(info->memoryRows);
-        const std::vector<int64_t> shape{static_cast<int64_t>(info->memoryRows)};
+        // stage-04: the declaration shape is the full array view (all dims),
+        // and the register width is the total flat width.
+        const int64_t totalWidth = signalTotalWidth(*info);
+        const std::vector<int64_t> shape(info->shape.begin(), info->shape.end());
 
         std::string finalName = name;
         wolvrix::lib::grh::SymbolId sym = graph_.lookupSymbol(finalName);
@@ -18036,18 +17472,6 @@ private:
                 }
                 if (!usedAsMemory)
                 {
-                    for (const auto& fill : lowering_.memoryFills)
-                    {
-                        if (fill.memory.valid() &&
-                            fill.memory.index == signal.symbol.index)
-                        {
-                            usedAsMemory = true;
-                            break;
-                        }
-                    }
-                }
-                if (!usedAsMemory)
-                {
                     continue;
                 }
             }
@@ -18074,7 +17498,6 @@ private:
             }
             emitMemoryRead(id);
         }
-        emitMemoryFills();
         emitMemoryWrites();
     }
 
@@ -18127,28 +17550,47 @@ private:
         wolvrix::lib::grh::ValueId dataValue = findReusableMemoryRead(entry);
         if (!dataValue.valid())
         {
-            const int32_t width = normalizeWidth(info->width);
+            // stage-04: k indices (1..rank) read the addressed element, or the
+            // addressed sub-array when fewer than rank indices are given.
+            const std::size_t indexCount = entry.addressIndices.size();
+            int64_t resultWidth = info->width > 0 ? info->width : 1;
+            std::vector<int64_t> resultShape;
+            for (std::size_t i = indexCount; i < info->shape.size(); ++i)
+            {
+                const int64_t dim = info->shape[i] > 0 ? info->shape[i] : 1;
+                resultShape.push_back(dim);
+                const int64_t maxWidth =
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+                resultWidth = resultWidth > maxWidth / dim ? maxWidth : resultWidth * dim;
+            }
+            const int32_t width = normalizeWidth(static_cast<int32_t>(resultWidth));
             wolvrix::lib::grh::SymbolId dataSym = makeInternalValueSymbol();
             dataValue =
                 graph_.createValue(dataSym, width, info->isSigned, info->valueType);
-
-            wolvrix::lib::grh::ValueId addressValue = emitExpr(entry.address);
-            if (!addressValue.valid())
+            if (!resultShape.empty())
             {
-                return wolvrix::lib::grh::ValueId::invalid();
+                graph_.setValueShape(dataValue, resultShape);
             }
 
             wolvrix::lib::grh::SymbolId readSym = makeInternalOpSymbol();
             wolvrix::lib::grh::OperationId readOp =
                 createOp(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort, readSym, entry.location);
-            graph_.addOperand(readOp, addressValue);
+            for (const ExprNodeId indexId : entry.addressIndices)
+            {
+                wolvrix::lib::grh::ValueId indexValue = emitExpr(indexId);
+                if (!indexValue.valid())
+                {
+                    return wolvrix::lib::grh::ValueId::invalid();
+                }
+                graph_.addOperand(readOp, indexValue);
+            }
             graph_.setAttr(readOp, "regSymbol", std::string(memSymbol));
 
             graph_.addResult(readOp, dataValue);
             emittedMemoryReads_.push_back(EmittedMemoryRead{
                 .memory = entry.memory,
                 .signal = entry.signal,
-                .address = entry.address,
+                .addressIndices = entry.addressIndices,
                 .isSync = entry.isSync,
                 .updateCond = entry.updateCond,
                 .eventEdges = entry.eventEdges,
@@ -18172,7 +17614,7 @@ private:
             {
                 continue;
             }
-            if (!exprEquivalent(emitted.address, entry.address) ||
+            if (!exprListEquivalent(emitted.addressIndices, entry.addressIndices) ||
                 !exprEquivalent(emitted.updateCond, entry.updateCond) ||
                 !exprListEquivalent(emitted.eventOperands, entry.eventOperands))
             {
@@ -18289,80 +17731,51 @@ private:
                 continue;
             }
             wolvrix::lib::grh::ValueId updateCond = emitExpr(entry.updateCond);
-            wolvrix::lib::grh::ValueId address = emitExpr(entry.address);
-            wolvrix::lib::grh::ValueId data = emitExpr(entry.data);
-            wolvrix::lib::grh::ValueId mask = emitExpr(entry.mask);
-            if (!updateCond.valid() || !address.valid() || !data.valid() || !mask.valid())
-            {
-                continue;
-            }
-
-            wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol();
-            wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort, opSym, entry.location);
-            graph_.addOperand(op, updateCond);
-            graph_.addOperand(op, address);
-            graph_.addOperand(op, data);
-            graph_.addOperand(op, mask);
-            for (ExprNodeId evtId : entry.eventOperands)
-            {
-                wolvrix::lib::grh::ValueId evt = emitExpr(evtId);
-                if (!evt.valid())
-                {
-                    continue;
-                }
-                graph_.addOperand(op, evt);
-            }
-            std::vector<std::string> edges;
-            edges.reserve(entry.eventEdges.size());
-            for (EventEdge edge : entry.eventEdges)
-            {
-                edges.push_back(edgeText(edge));
-            }
-            graph_.setAttr(op, "eventEdge", std::move(edges));
-            graph_.setAttr(op, "regSymbol", std::string(memSymbol));
-        }
-    }
-
-    void emitMemoryFills()
-    {
-        for (const auto& entry : lowering_.memoryFills)
-        {
-            if (!entry.memory.valid())
-            {
-                continue;
-            }
-            if (entry.eventEdges.empty())
-            {
-                if (context_.diagnostics)
-                {
-                    context_.diagnostics->warn(
-                        entry.location,
-                        "Skipping memory fill without edge-sensitive timing control");
-                }
-                continue;
-            }
-            if (!ensureMemoryOp(entry.memory, entry.signal, entry.location))
-            {
-                continue;
-            }
-            std::string_view memSymbol = memorySymbolText(entry.memory);
-            if (memSymbol.empty())
-            {
-                continue;
-            }
-            wolvrix::lib::grh::ValueId updateCond = emitExpr(entry.updateCond);
             wolvrix::lib::grh::ValueId data = emitExpr(entry.data);
             if (!updateCond.valid() || !data.valid())
             {
                 continue;
             }
+            wolvrix::lib::grh::ValueId mask = wolvrix::lib::grh::ValueId::invalid();
+            if (entry.mask != kInvalidPlanIndex)
+            {
+                mask = emitExpr(entry.mask);
+                if (!mask.valid())
+                {
+                    continue;
+                }
+            }
 
+            // stage-04: empty indices = whole-array kRegisterWritePort;
+            // indices without mask = kRegisterWriteArrayPort; with mask =
+            // kRegisterWriteArrayMaskPort.
+            wolvrix::lib::grh::OperationKind kind =
+                wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort;
+            if (entry.addressIndices.empty())
+            {
+                kind = wolvrix::lib::grh::OperationKind::kRegisterWritePort;
+            }
+            else if (!mask.valid())
+            {
+                kind = wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort;
+            }
             wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol();
-            wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kRegisterFillPort, opSym, entry.location);
+            wolvrix::lib::grh::OperationId op = createOp(kind, opSym, entry.location);
             graph_.addOperand(op, updateCond);
+            for (const ExprNodeId indexId : entry.addressIndices)
+            {
+                wolvrix::lib::grh::ValueId indexValue = emitExpr(indexId);
+                if (!indexValue.valid())
+                {
+                    continue;
+                }
+                graph_.addOperand(op, indexValue);
+            }
             graph_.addOperand(op, data);
+            if (mask.valid())
+            {
+                graph_.addOperand(op, mask);
+            }
             for (ExprNodeId evtId : entry.eventOperands)
             {
                 wolvrix::lib::grh::ValueId evt = emitExpr(evtId);
@@ -19712,20 +19125,24 @@ private:
             }
             const SignalInfo& signal = plan_.signals[signalId];
             if (!isPackedAggregateVariable(signal) || signal.memoryRows <= 0 ||
-                !isMemoryBackedPackedAggregate(target))
+                !isMemoryBackedPackedAggregate(target) || signal.shape.size() != 1)
             {
                 return false;
             }
             const int64_t laneWidth = signal.width > 0 ? signal.width : 1;
-            if (targetWidth != laneWidth * signal.memoryRows)
+            if (targetWidth != signalTotalWidth(signal))
             {
                 return false;
             }
+            // stage-04: the whole-read artifact is a kRegisterReadPort result
+            // (a kConcat from the retired row-concat read is also accepted).
             const wolvrix::lib::grh::OperationId targetDef =
                 graph_.getValue(targetValue).definingOp();
             if (!targetDef.valid() ||
-                graph_.getOperation(targetDef).kind() !=
-                    wolvrix::lib::grh::OperationKind::kConcat)
+                (graph_.getOperation(targetDef).kind() !=
+                     wolvrix::lib::grh::OperationKind::kConcat &&
+                 graph_.getOperation(targetDef).kind() !=
+                     wolvrix::lib::grh::OperationKind::kRegisterReadPort))
             {
                 return false;
             }
@@ -19738,8 +19155,12 @@ private:
                 {
                     continue;
                 }
-                const auto address = evalConstInt(plan_, lowering_, read.address);
-                if (!address || *address < 0 || *address >= signal.memoryRows)
+                if (read.addressIndices.size() != 1)
+                {
+                    continue;
+                }
+                const auto address = evalConstInt(plan_, lowering_, read.addressIndices.front());
+                if (!address || *address < 0 || *address >= signal.shape.front())
                 {
                     continue;
                 }
@@ -19771,11 +19192,6 @@ private:
             {
                 graph_.replaceAllUses(targetValue, fullValue);
                 valueBySymbol_[target.index] = fullValue;
-                if (target.index < packedAggregateWholeReadBySymbol_.size() &&
-                    packedAggregateWholeReadBySymbol_[target.index] == targetValue)
-                {
-                    packedAggregateWholeReadBySymbol_[target.index] = fullValue;
-                }
             }
             instanceMergedTargets_.insert(target.index);
             return true;
@@ -20146,19 +19562,90 @@ private:
             std::reverse(selectSteps.begin(), selectSteps.end());
         }
 
-        const auto& dims = plan_.signals[signal].unpackedDims;
-        const std::size_t addressCount = dims.empty() ? 1 : dims.size();
-        if (selectSteps.size() < addressCount)
+        const SignalInfo& info = plan_.signals[signal];
+        // stage-04: rank comes from the declaration shape; 1..rank indices
+        // (fewer than rank reads a sub-array), levels beyond rank stay above
+        // the replaced expression.
+        const std::size_t rank = info.shape.size();
+        if (rank == 0)
         {
             return;
         }
+        const std::size_t indexCount = std::min(selectSteps.size(), rank);
+
+        auto addExprNode = [&](ExprNode node) -> ExprNodeId {
+            const ExprNodeId newId =
+                static_cast<ExprNodeId>(lowering_.values.size());
+            lowering_.values.push_back(std::move(node));
+            registerExprNode();
+            return newId;
+        };
+        auto addConst = [&](int64_t literal) -> ExprNodeId {
+            ExprNode node;
+            node.kind = ExprNodeKind::Constant;
+            node.literal = std::to_string(literal);
+            node.location = location;
+            return addExprNode(std::move(node));
+        };
+        auto addOp = [&](wolvrix::lib::grh::OperationKind op,
+                         std::vector<ExprNodeId> ops) -> ExprNodeId {
+            for (ExprNodeId opId : ops)
+            {
+                if (opId == kInvalidPlanIndex)
+                {
+                    return kInvalidPlanIndex;
+                }
+            }
+            ExprNode node;
+            node.kind = ExprNodeKind::Operation;
+            node.op = op;
+            node.operands = std::move(ops);
+            node.location = location;
+            return addExprNode(std::move(node));
+        };
+
         std::vector<ExprNodeId> indices;
-        indices.reserve(addressCount);
-        for (std::size_t i = 0; i < addressCount; ++i)
+        indices.reserve(indexCount);
+        for (std::size_t i = 0; i < indexCount; ++i)
         {
-            indices.push_back(selectSteps[i].index);
+            ExprNodeId term = selectSteps[i].index;
+            if (i < info.unpackedDims.size())
+            {
+                const UnpackedDimInfo& dim = info.unpackedDims[i];
+                if (dim.left < dim.right)
+                {
+                    if (dim.left != 0)
+                    {
+                        ExprNodeId offset = addConst(dim.left);
+                        term = addOp(wolvrix::lib::grh::OperationKind::kSub,
+                                     {term, offset});
+                    }
+                }
+                else
+                {
+                    ExprNodeId offset = addConst(dim.left);
+                    term = addOp(wolvrix::lib::grh::OperationKind::kSub,
+                                 {offset, term});
+                }
+            }
+            else
+            {
+                // Packed dim: kSliceArray steps are already lane-normalized by
+                // the connection lowerer; a kSliceDynamic step is a flattened
+                // bit select, not an element select.
+                const ExprNode& stepNode = lowering_.values[selectSteps[i].node];
+                if (stepNode.op == wolvrix::lib::grh::OperationKind::kSliceDynamic)
+                {
+                    return;
+                }
+            }
+            if (term == kInvalidPlanIndex)
+            {
+                return;
+            }
+            indices.push_back(term);
         }
-        const ExprNodeId dataId = selectSteps[addressCount - 1].node;
+        const ExprNodeId dataId = selectSteps[indexCount - 1].node;
         if (dataId == kInvalidPlanIndex ||
             dataId >= static_cast<ExprNodeId>(memoryReadIndexByExpr_.size()))
         {
@@ -20169,116 +19656,10 @@ private:
             return;
         }
 
-        ExprNodeId address = kInvalidPlanIndex;
-        if (dims.empty())
-        {
-            address = indices.front();
-        }
-        else
-        {
-            auto addExprNode = [&](ExprNode node) -> ExprNodeId {
-                const ExprNodeId newId =
-                    static_cast<ExprNodeId>(lowering_.values.size());
-                lowering_.values.push_back(std::move(node));
-                registerExprNode();
-                return newId;
-            };
-            auto addConst = [&](int64_t literal) -> ExprNodeId {
-                ExprNode node;
-                node.kind = ExprNodeKind::Constant;
-                node.literal = std::to_string(literal);
-                node.location = location;
-                return addExprNode(std::move(node));
-            };
-            auto addOp = [&](wolvrix::lib::grh::OperationKind op,
-                             std::vector<ExprNodeId> ops) -> ExprNodeId {
-                for (ExprNodeId opId : ops)
-                {
-                    if (opId == kInvalidPlanIndex)
-                    {
-                        return kInvalidPlanIndex;
-                    }
-                }
-                ExprNode node;
-                node.kind = ExprNodeKind::Operation;
-                node.op = op;
-                node.operands = std::move(ops);
-                node.location = location;
-                return addExprNode(std::move(node));
-            };
-            auto buildLinearAddress =
-                [&](const std::vector<ExprNodeId>& idx,
-                    const std::vector<UnpackedDimInfo>& dimsIn) -> ExprNodeId {
-                if (idx.size() < dimsIn.size())
-                {
-                    return kInvalidPlanIndex;
-                }
-                int64_t stride = 1;
-                std::vector<int64_t> strides(dimsIn.size(), 1);
-                for (std::size_t i = dimsIn.size(); i-- > 0;)
-                {
-                    strides[i] = stride;
-                    const int32_t extent = dimsIn[i].extent;
-                    if (extent > 0 &&
-                        stride <= std::numeric_limits<int64_t>::max() / extent)
-                    {
-                        stride *= extent;
-                    }
-                }
-                ExprNodeId addressId = kInvalidPlanIndex;
-                for (std::size_t i = 0; i < dimsIn.size(); ++i)
-                {
-                    ExprNodeId term = idx[i];
-                    const UnpackedDimInfo& dim = dimsIn[i];
-                    if (dim.left < dim.right)
-                    {
-                        if (dim.left != 0)
-                        {
-                            ExprNodeId offset = addConst(dim.left);
-                            term = addOp(wolvrix::lib::grh::OperationKind::kSub,
-                                         {term, offset});
-                        }
-                    }
-                    else
-                    {
-                        ExprNodeId offset = addConst(dim.left);
-                        term = addOp(wolvrix::lib::grh::OperationKind::kSub,
-                                     {offset, term});
-                    }
-                    if (strides[i] != 1)
-                    {
-                        ExprNodeId strideId = addConst(strides[i]);
-                        term = addOp(wolvrix::lib::grh::OperationKind::kMul,
-                                     {term, strideId});
-                    }
-                    if (addressId == kInvalidPlanIndex)
-                    {
-                        addressId = term;
-                    }
-                    else
-                    {
-                        addressId = addOp(wolvrix::lib::grh::OperationKind::kAdd,
-                                          {addressId, term});
-                    }
-                }
-                return addressId;
-            };
-            address = buildLinearAddress(indices, dims);
-            if (address == kInvalidPlanIndex)
-            {
-                return;
-            }
-        }
-
-        if (address == kInvalidPlanIndex)
-        {
-            return;
-        }
-
         MemoryReadPort entry;
         entry.memory = baseNode.symbol;
         entry.signal = signal;
-        entry.address = address;
+        entry.addressIndices = std::move(indices);
         entry.data = dataId;
         entry.replacement = dataId;
         entry.isSync = false;
@@ -21367,10 +20748,7 @@ private:
         }
         if (node.kind == ExprNodeKind::Symbol)
         {
-            wolvrix::lib::grh::ValueId value =
-                isMemoryBackedPackedAggregate(node.symbol)
-                    ? emitPackedAggregateWholeRead(node.symbol, node.location)
-                    : valueForSymbol(node.symbol);
+            wolvrix::lib::grh::ValueId value = valueForSymbol(node.symbol);
             if (!value.valid() && context_.diagnostics)
             {
                 context_.diagnostics->error(node.location,
@@ -21868,7 +21246,6 @@ private:
     std::vector<wolvrix::lib::grh::SymbolId> symbolIds_;
     std::vector<wolvrix::lib::grh::ValueId> valueBySymbol_;
     std::vector<wolvrix::lib::grh::ValueId> valueByExpr_;
-    std::vector<wolvrix::lib::grh::ValueId> packedAggregateWholeReadBySymbol_;
     std::vector<wolvrix::lib::grh::OperationId> memoryOpBySymbol_;
     std::vector<std::string> memorySymbolName_;
     std::vector<StorageKind> storageBySymbol_;
@@ -21879,7 +21256,7 @@ private:
     struct EmittedMemoryRead {
         PlanSymbolId memory;
         SignalId signal = kInvalidPlanIndex;
-        ExprNodeId address = kInvalidPlanIndex;
+        std::vector<ExprNodeId> addressIndices;
         bool isSync = false;
         ExprNodeId updateCond = kInvalidPlanIndex;
         std::vector<EventEdge> eventEdges;

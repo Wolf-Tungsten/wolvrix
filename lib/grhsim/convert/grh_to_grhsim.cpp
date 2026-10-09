@@ -428,7 +428,69 @@ namespace wolvrix::lib::grhsim
             return value;
         };
 
+        std::unordered_map<int64_t, grhsim::ValueId> constValueCache;
+        auto constValueFor = [&](int64_t literal) -> grhsim::ValueId {
+            auto [it, inserted] = constValueCache.try_emplace(literal);
+            if (!inserted)
+                return it->second;
+            const grhsim::ValueId value = model->addValue(
+                model->logicType(32, false, options.logicDomain), {}, {});
+            const std::array results{value};
+            const std::array parameters{
+                Parameter{model->intern("constValue"), std::to_string(literal)}};
+            model->addOperation("core.compute.constant", {}, results, {}, parameters, {}, {});
+            it->second = value;
+            return value;
+        };
+        auto addComputeOp = [&](std::string_view name, std::vector<grhsim::ValueId> inputs,
+                                int64_t resultWidth, bool isSigned,
+                                std::vector<Parameter> parameters = {}) -> grhsim::ValueId {
+            const grhsim::ValueId result = model->addValue(
+                model->logicType(static_cast<uint32_t>(std::max<int64_t>(1, resultWidth)),
+                                 isSigned, options.logicDomain),
+                {}, {});
+            const std::array results{result};
+            model->addOperation(name, inputs, results, {}, parameters, {}, {});
+            return result;
+        };
+        // stage-04 transition: flat = sum(idx_j * stride_j), stride_j =
+        // product(shape[j+1:]) (row-major, dim 0 outermost).
+        auto linearizedIndex = [&](std::span<const grh::ValueId> grhIndices,
+                                   const std::vector<int64_t> &shape, auto &&mapFn,
+                                   std::string_view context) -> grhsim::ValueId {
+            grhsim::ValueId flat;
+            for (std::size_t i = 0; i < grhIndices.size(); ++i)
+            {
+                int64_t stride = 1;
+                for (std::size_t j = i + 1; j < shape.size(); ++j)
+                    stride *= std::max<int64_t>(1, shape[j]);
+                grhsim::ValueId term = mapFn(grhIndices[i], context);
+                if (!term.valid())
+                    return {};
+                if (stride != 1)
+                    term = addComputeOp("core.compute.mul", {term, constValueFor(stride)}, 32, false);
+                flat = flat.valid() ? addComputeOp("core.compute.add", {flat, term}, 32, false)
+                                    : term;
+            }
+            return flat;
+        };
+        auto sliceElement = [&](grhsim::ValueId base, int64_t elemWidth, int64_t index,
+                                bool isSigned) -> grhsim::ValueId {
+            const int64_t lo = index * elemWidth;
+            const int64_t hi = lo + elemWidth - 1;
+            return addComputeOp("core.compute.sliceStatic", {base}, elemWidth, isSigned,
+                                {Parameter{model->intern("sliceStart"), lo},
+                                 Parameter{model->intern("sliceEnd"), hi}});
+        };
+
+        struct ArrayStateInfo {
+            std::vector<int64_t> shape;
+            int64_t elementWidth = 1;
+            bool isSigned = false;
+        };
+        std::unordered_map<std::string, ArrayStateInfo> arrayShapeBySymbol;
         std::unordered_map<std::string, StateId> statesBySymbol;
+        std::unordered_set<std::string> arrayRegisterSymbols;
         std::unordered_map<std::string, ValueType> storageReadKinds;
         for (grh::OperationId opId : graph->operations())
         {
@@ -460,29 +522,32 @@ namespace wolvrix::lib::grhsim
             const auto shape = attr<std::vector<int64_t>>(op, "shape").value_or(std::vector<int64_t>{});
             if (op.kind() == OperationKind::kRegister && !shape.empty())
             {
-                // Array register: nest core.array types innermost-dimension
-                // first; `width` is the total bit width across all dims.
+                // stage-04 transition: an array register maps to one FLAT
+                // core.array state of product(shape) elements; multi-dim
+                // index tuples are linearized at this boundary (row-major)
+                // until the stage-06 backend rework natively supports
+                // multi-dim states. `width` is the total bit width.
                 int64_t elementCount = 1;
-                for (const int64_t dim : shape) elementCount *= dim;
-                if (width <= 0 || elementCount <= 0 || width % elementCount != 0)
+                for (const int64_t dim : shape)
+                {
+                    if (dim <= 0)
+                    {
+                        diagnostics.error("array register declaration has a non-positive dimension", symbol);
+                        elementCount = 0;
+                        break;
+                    }
+                    elementCount *= dim;
+                }
+                if (elementCount <= 0 || width <= 0 || width % elementCount != 0)
                 {
                     diagnostics.error("array register declaration has invalid width or shape", symbol);
                     continue;
                 }
-                TypeId element = model->logicType(static_cast<uint32_t>(width / elementCount),
+                const int64_t elementWidth = width / elementCount;
+                TypeId element = model->logicType(static_cast<uint32_t>(elementWidth),
                                                   isSigned, options.logicDomain);
-                type = element;
-                for (auto dimIt = shape.rbegin(); dimIt != shape.rend(); ++dimIt)
-                {
-                    if (*dimIt <= 0)
-                    {
-                        diagnostics.error("array register declaration has a non-positive dimension", symbol);
-                        type = {};
-                        break;
-                    }
-                    type = model->arrayType(type, static_cast<uint64_t>(*dimIt));
-                }
-                if (!type.valid()) continue;
+                type = model->arrayType(element, static_cast<uint64_t>(elementCount));
+                arrayShapeBySymbol.emplace(symbol, ArrayStateInfo{shape, elementWidth, isSigned});
             }
             else
             {
@@ -496,6 +561,8 @@ namespace wolvrix::lib::grhsim
                                                symbol, opId.index, op.srcLoc());
             const StateId state = model->addState(symbol, type, origin);
             statesBySymbol.emplace(symbol, state);
+            if (op.kind() == OperationKind::kRegister && !shape.empty())
+                arrayRegisterSymbols.insert(symbol);
             storageDeclarations.emplace_back(opId, state);
         }
 
@@ -619,7 +686,213 @@ namespace wolvrix::lib::grhsim
         {
             const Operation op = graph->getOperation(opId);
             if (isDeclaration(op.kind())) continue;
-            const auto opName = loweredOpName(op.kind());
+
+            // ---- stage-04 transition: array-state ports on flat states ----
+            const auto arrayTargetInfo = [&]() ->
+                std::optional<std::pair<ArrayStateInfo, StateId>> {
+                const auto symbol = attr<std::string>(op, "regSymbol");
+                if (!symbol) return std::nullopt;
+                auto infoIt = arrayShapeBySymbol.find(*symbol);
+                if (infoIt == arrayShapeBySymbol.end()) return std::nullopt;
+                auto stateIt = statesBySymbol.find(*symbol);
+                if (stateIt == statesBySymbol.end()) return std::nullopt;
+                return std::pair{infoIt->second, stateIt->second};
+            }();
+
+            // Whole-array read (kRegisterReadPort on an array register):
+            // unroll to per-element memReads + row-major concat.
+            if (op.kind() == OperationKind::kRegisterReadPort && arrayTargetInfo &&
+                !op.results().empty())
+            {
+                const auto &[info, state] = *arrayTargetInfo;
+                int64_t total = 1;
+                for (const int64_t dim : info.shape) total *= std::max<int64_t>(1, dim);
+                std::vector<grhsim::ValueId> elems;
+                elems.reserve(static_cast<std::size_t>(total));
+                for (int64_t j = 0; j < total; ++j)
+                {
+                    grhsim::ValueId elem = model->addValue(
+                        model->logicType(static_cast<uint32_t>(info.elementWidth),
+                                         info.isSigned, options.logicDomain),
+                        {}, {});
+                    const std::array results{elem};
+                    const std::array refs{ObjectRef::state(state)};
+                    const std::array operands{constValueFor(j)};
+                    model->addOperation("core.state.memRead", operands, results, refs,
+                                        {}, {}, {});
+                    elems.push_back(elem);
+                }
+                const grhsim::ValueId result = mappedValue(op.results().front(), op.symbolText());
+                if (!result.valid()) continue;
+                if (elems.size() == 1)
+                {
+                    const std::array operands{elems.front()};
+                    const std::array results{result};
+                    model->addOperation("core.compute.assign", operands, results, {}, {}, {}, {});
+                }
+                else
+                {
+                    std::reverse(elems.begin(), elems.end());
+                    const std::array results{result};
+                    model->addOperation("core.compute.concat", elems, results, {}, {}, {}, {});
+                }
+                continue;
+            }
+
+            // Array read port with 1..rank indices: linearize the index
+            // tuple; fewer than rank indices unroll the addressed sub-array.
+            if (op.kind() == OperationKind::kRegisterReadArrayPort && arrayTargetInfo &&
+                !op.results().empty())
+            {
+                const auto &[info, state] = *arrayTargetInfo;
+                const std::size_t rank = info.shape.size();
+                std::vector<grh::ValueId> grhIndices(op.operands().begin(), op.operands().end());
+                if (grhIndices.empty() || grhIndices.size() > rank)
+                {
+                    diagnostics.error("array read port index count out of range",
+                                      std::string(op.symbolText()));
+                    continue;
+                }
+                grhsim::ValueId flat =
+                    linearizedIndex(grhIndices, info.shape, mappedValue, op.symbolText());
+                if (!flat.valid()) continue;
+                const grhsim::ValueId result = mappedValue(op.results().front(), op.symbolText());
+                if (!result.valid()) continue;
+                if (grhIndices.size() == rank)
+                {
+                    const std::array operands{flat};
+                    const std::array results{result};
+                    const std::array refs{ObjectRef::state(state)};
+                    model->addOperation("core.state.memRead", operands, results, refs, {}, {}, {});
+                    continue;
+                }
+                int64_t sub = 1;
+                for (std::size_t i = grhIndices.size(); i < rank; ++i)
+                    sub *= std::max<int64_t>(1, info.shape[i]);
+                std::vector<grhsim::ValueId> elems;
+                elems.reserve(static_cast<std::size_t>(sub));
+                for (int64_t j = 0; j < sub; ++j)
+                {
+                    grhsim::ValueId addr =
+                        j == 0 ? flat
+                               : addComputeOp("core.compute.add", {flat, constValueFor(j)}, 32, false);
+                    grhsim::ValueId elem = model->addValue(
+                        model->logicType(static_cast<uint32_t>(info.elementWidth),
+                                         info.isSigned, options.logicDomain),
+                        {}, {});
+                    const std::array results{elem};
+                    const std::array refs{ObjectRef::state(state)};
+                    const std::array operands{addr};
+                    model->addOperation("core.state.memRead", operands, results, refs, {}, {}, {});
+                    elems.push_back(elem);
+                }
+                std::reverse(elems.begin(), elems.end());
+                const std::array results{result};
+                model->addOperation("core.compute.concat", elems, results, {}, {}, {}, {});
+                continue;
+            }
+
+            // Array write port with fewer than rank indices: unroll the
+            // addressed sub-array into per-element memWrites with sliced
+            // data/mask. Full-rank writes fall through to the generic path
+            // (single linearized memWrite is handled there too — but the
+            // generic path passes the raw indices, so intercept all array
+            // write ports here).
+            if ((op.kind() == OperationKind::kRegisterWriteArrayPort ||
+                 op.kind() == OperationKind::kRegisterWriteArrayMaskPort) &&
+                arrayTargetInfo)
+            {
+                const auto &[info, state] = *arrayTargetInfo;
+                const std::size_t rank = info.shape.size();
+                const std::optional<std::size_t> eventStart = grh::firstEventOperandIndex(op);
+                const bool hasMask =
+                    op.kind() == OperationKind::kRegisterWriteArrayMaskPort;
+                const std::size_t fixedCount = 2 + (hasMask ? 1 : 0);  // cond+data(+mask)
+                if (!eventStart || *eventStart < fixedCount + 1)
+                {
+                    diagnostics.error("array write port layout does not locate event operands",
+                                      std::string(op.symbolText()));
+                    continue;
+                }
+                const std::size_t indexCount = *eventStart - fixedCount;
+                if (indexCount < 1 || indexCount > rank)
+                {
+                    diagnostics.error("array write port index count out of range",
+                                      std::string(op.symbolText()));
+                    continue;
+                }
+                const grh::ValueId grhCond = op.operands()[0];
+                const grh::ValueId grhData = op.operands()[1 + indexCount];
+                std::vector<grh::ValueId> grhIndices(
+                    op.operands().begin() + 1, op.operands().begin() + 1 + indexCount);
+                grhsim::ValueId flat =
+                    linearizedIndex(grhIndices, info.shape, mappedValue, op.symbolText());
+                grhsim::ValueId cond = mappedValue(grhCond, op.symbolText());
+                grhsim::ValueId data = mappedValue(grhData, op.symbolText());
+                if (!flat.valid() || !cond.valid() || !data.valid()) continue;
+                grhsim::ValueId mask;
+                if (hasMask)
+                {
+                    mask = mappedValue(op.operands()[*eventStart - 1], op.symbolText());
+                    if (!mask.valid()) continue;
+                }
+                std::vector<grhsim::ValueId> events;
+                bool eventsOk = true;
+                for (std::size_t i = *eventStart; i < op.operands().size(); ++i)
+                {
+                    grhsim::ValueId evt = mappedValue(op.operands()[i], op.symbolText());
+                    if (!evt.valid()) { eventsOk = false; break; }
+                    events.push_back(evt);
+                }
+                if (!eventsOk) continue;
+                const auto edges = attr<std::vector<std::string>>(op, "eventEdge").value_or(
+                    std::vector<std::string>{});
+                std::vector<Parameter> writeParams;
+                if (!edges.empty())
+                    writeParams.push_back(Parameter{model->intern("event_edges"),
+                                                    ParameterValue(edges)});
+                int64_t sub = 1;
+                for (std::size_t i = indexCount; i < rank; ++i)
+                    sub *= std::max<int64_t>(1, info.shape[i]);
+                for (int64_t j = 0; j < sub; ++j)
+                {
+                    grhsim::ValueId addr =
+                        j == 0 ? flat
+                               : addComputeOp("core.compute.add", {flat, constValueFor(j)}, 32, false);
+                    grhsim::ValueId dataJ =
+                        sub == 1 ? data
+                                 : sliceElement(data, info.elementWidth, j, info.isSigned);
+                    grhsim::ValueId maskJ =
+                        hasMask ? (sub == 1 ? mask
+                                            : sliceElement(mask, info.elementWidth, j, info.isSigned))
+                                : allOnesMaskFor(static_cast<uint32_t>(info.elementWidth));
+                    if (!dataJ.valid() || !maskJ.valid()) break;
+                    std::vector<grhsim::ValueId> operands;
+                    operands.reserve(4 + events.size());
+                    operands.push_back(cond);
+                    operands.push_back(addr);
+                    operands.push_back(dataJ);
+                    operands.push_back(maskJ);
+                    operands.insert(operands.end(), events.begin(), events.end());
+                    const std::array refs{ObjectRef::state(state)};
+                    model->addOperation("core.state.memWrite", operands, {}, refs, writeParams,
+                                        {}, {});
+                }
+                continue;
+            }
+
+            // stage-04: a whole write (kRegisterWritePort) targeting an array
+            // register is the packed full-width fill form — lower to memFill
+            // (which slices the packed value row-major) instead of regWrite.
+            const bool isArrayWholeWrite =
+                op.kind() == OperationKind::kRegisterWritePort &&
+                [&] {
+                    const auto symbol = attr<std::string>(op, "regSymbol");
+                    return symbol && arrayRegisterSymbols.contains(*symbol);
+                }();
+            const std::optional<std::string_view> opName =
+                isArrayWholeWrite ? std::optional<std::string_view>{"core.state.memFill"}
+                                  : loweredOpName(op.kind());
             if (!opName)
             {
                 diagnostics.error("GRH operation has no core lowering: " +
@@ -629,7 +902,7 @@ namespace wolvrix::lib::grhsim
             std::vector<grhsim::ValueId> operands;
             operands.reserve(op.operands().size() + 1);
             for (grh::ValueId value : op.operands()) operands.push_back(mappedValue(value, op.symbolText()));
-            if (op.kind() == OperationKind::kRegisterWritePort ||
+            if ((op.kind() == OperationKind::kRegisterWritePort && !isArrayWholeWrite) ||
                 op.kind() == OperationKind::kRegisterWriteArrayPort)
             {
                 // Insert the synthesized full mask right before the events.

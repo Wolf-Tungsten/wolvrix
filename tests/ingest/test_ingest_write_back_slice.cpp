@@ -604,33 +604,36 @@ int testOldestArbiterResetPackedArray(const std::filesystem::path& sourcePath,
         return fail("Missing priorityVecReg symbol for " + std::string(moduleName));
     }
 
-    const wolvrix::lib::ingest::MemoryFillPort* priorityFill = nullptr;
-    for (const auto& fill : lowering.memoryFills) {
-        if (fill.memory.index == prioritySymbol.index) {
-            priorityFill = &fill;
+    // stage-04: the whole-array reset write is a write port with empty
+    // addressIndices (kRegisterWritePort), not a memory fill.
+    const wolvrix::lib::ingest::MemoryWritePort* priorityWholeWrite = nullptr;
+    for (const auto& write : lowering.memoryWrites) {
+        if (write.memory.index == prioritySymbol.index && write.addressIndices.empty()) {
+            priorityWholeWrite = &write;
             break;
         }
     }
-    if (!priorityFill) {
-        return fail("Missing priorityVecReg whole-array memory fill for " + std::string(moduleName));
+    if (!priorityWholeWrite) {
+        return fail("Missing priorityVecReg whole-array memory write for " + std::string(moduleName));
     }
-    if (priorityFill->eventEdges.size() != 2 || priorityFill->eventOperands.size() != 2) {
-        return fail("priorityVecReg fill should preserve clock/reset edge events for " +
+    if (priorityWholeWrite->eventEdges.size() != 2 ||
+        priorityWholeWrite->eventOperands.size() != 2) {
+        return fail("priorityVecReg whole write should preserve clock/reset edge events for " +
                     std::string(moduleName));
     }
-    if (exprUsesSymbol(lowering, priorityFill->data, prioritySymbol)) {
-        return fail("priorityVecReg reset fill still depends on itself for " +
+    if (exprUsesSymbol(lowering, priorityWholeWrite->data, prioritySymbol)) {
+        return fail("priorityVecReg reset whole write still depends on itself for " +
                     std::string(moduleName));
     }
-    if (!exprHasOpWidth(lowering, priorityFill->data, wolvrix::lib::grh::OperationKind::kConcat,
-                        priorityWidth)) {
-        return fail("priorityVecReg fill is missing packed-array concat width " +
+    if (!exprHasOpWidth(lowering, priorityWholeWrite->data,
+                        wolvrix::lib::grh::OperationKind::kConcat, priorityWidth)) {
+        return fail("priorityVecReg whole write is missing packed-array concat width " +
                     std::to_string(priorityWidth) + " for " + std::string(moduleName));
     }
 
     std::size_t priorityWrites = 0;
     for (const auto& write : lowering.memoryWrites) {
-        if (write.memory.index != prioritySymbol.index) {
+        if (write.memory.index != prioritySymbol.index || write.addressIndices.empty()) {
             continue;
         }
         ++priorityWrites;
@@ -680,27 +683,20 @@ int testOldestArbiterResetGraphWholeRead(const std::filesystem::path& sourcePath
                     std::string(moduleName));
     }
     const wolvrix::lib::grh::ValueId aggregateValue = assignOp.operands().front();
-    const wolvrix::lib::grh::OperationId concatId =
+    const wolvrix::lib::grh::OperationId readId =
         graph->getValue(aggregateValue).definingOp();
-    if (!concatId.valid()) {
+    if (!readId.valid()) {
         return fail("priority_flat aggregate whole read has no defining op for " +
                     std::string(moduleName));
     }
-    const wolvrix::lib::grh::Operation concatOp = graph->getOperation(concatId);
-    if (concatOp.kind() != wolvrix::lib::grh::OperationKind::kConcat ||
-        concatOp.operands().size() != static_cast<std::size_t>(expectedRows)) {
-        return fail("priority_flat aggregate whole read should concat memory rows for " +
+    // stage-04: whole read of an array-state signal is a single
+    // kRegisterReadPort, not a per-row concat.
+    const wolvrix::lib::grh::Operation readOp = graph->getOperation(readId);
+    if (readOp.kind() != wolvrix::lib::grh::OperationKind::kRegisterReadPort) {
+        return fail("priority_flat aggregate whole read should be a register read port for " +
                     std::string(moduleName));
     }
-    for (wolvrix::lib::grh::ValueId operand : concatOp.operands()) {
-        const wolvrix::lib::grh::OperationId readId = graph->getValue(operand).definingOp();
-        if (!readId.valid() ||
-            graph->getOperation(readId).kind() !=
-                wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort) {
-            return fail("priority_flat aggregate concat operand is not an array read for " +
-                        std::string(moduleName));
-        }
-    }
+    (void)expectedRows;
     return 0;
 }
 

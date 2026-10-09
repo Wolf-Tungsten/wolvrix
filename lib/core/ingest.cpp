@@ -9268,7 +9268,7 @@ private:
                 {
                     SignalInfo shrunk = *info;
                     shrunk.unpackedDims.erase(shrunk.unpackedDims.begin());
-                    static std::deque<SignalInfo> shrunkPool;
+                    static thread_local std::deque<SignalInfo> shrunkPool;
                     shrunkPool.push_back(std::move(shrunk));
                     info = &shrunkPool.back();
                 }
@@ -9276,7 +9276,7 @@ private:
                 {
                     SignalInfo shrunk = *info;
                     shrunk.packedDimInfos.erase(shrunk.packedDimInfos.begin());
-                    static std::deque<SignalInfo> shrunkPool;
+                    static thread_local std::deque<SignalInfo> shrunkPool;
                     shrunkPool.push_back(std::move(shrunk));
                     info = &shrunkPool.back();
                 }
@@ -17732,20 +17732,47 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
     };
 
     std::vector<MemoryReadUse> readUses;
+    // ROB-scale designs have tens of thousands of read candidates per
+    // module; a linear duplicate scan is O(n^2) and dominates ingest time.
+    // Key: memory + domain + updateCond + indices + event binding +
+    // replacement, hashed once per candidate.
+    std::unordered_map<uint64_t, std::vector<std::size_t>> readUseBuckets;
+    auto readUseEqual = [](const MemoryReadUse& lhs, const MemoryReadUse& rhs) {
+        return lhs.memory.index == rhs.memory.index && lhs.domain == rhs.domain &&
+               lhs.updateCond == rhs.updateCond &&
+               lhs.addressIndices == rhs.addressIndices &&
+               lhs.eventEdges == rhs.eventEdges &&
+               lhs.eventOperands == rhs.eventOperands &&
+               lhs.replacement == rhs.replacement;
+    };
+    auto readUseKeyOf = [&](const MemoryReadUse& candidate) -> uint64_t {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(candidate.memory.index);
+        mix(static_cast<uint64_t>(candidate.domain));
+        mix(static_cast<uint64_t>(candidate.updateCond));
+        for (const ExprNodeId index : candidate.addressIndices) mix(index);
+        for (const EventEdge edge : candidate.eventEdges)
+            mix(static_cast<uint64_t>(edge));
+        for (const ExprNodeId operand : candidate.eventOperands) mix(operand);
+        mix(candidate.replacement);
+        return h;
+    };
     auto recordReadUse = [&](const MemoryReadUse& candidate) {
-        for (const auto& existing : readUses)
+        // Hash-bucketed dedup with full equality check inside the bucket
+        // (collisions never drop a legitimately distinct read).
+        auto& bucket = readUseBuckets[readUseKeyOf(candidate)];
+        for (const std::size_t existing : bucket)
         {
-            if (existing.memory.index == candidate.memory.index &&
-                existing.domain == candidate.domain &&
-                existing.updateCond == candidate.updateCond &&
-                existing.addressIndices == candidate.addressIndices &&
-                existing.eventEdges == candidate.eventEdges &&
-                existing.eventOperands == candidate.eventOperands &&
-                existing.replacement == candidate.replacement)
+            if (readUseEqual(readUses[existing], candidate))
             {
                 return;
             }
         }
+        bucket.push_back(readUses.size());
         readUses.push_back(candidate);
     };
 
@@ -17880,6 +17907,43 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
 
     if (!readUses.empty())
     {
+        // ROB-scale: instead of reads×writes dependency checks (O(n^2) graph
+        // walks), collect the reachable expression set of each memory's
+        // sequential writes once, then test each read by membership.
+        std::unordered_map<uint32_t, std::unordered_set<ExprNodeId>> writeReachByMemory;
+        auto collectReach = [&](ExprNodeId root, std::unordered_set<ExprNodeId>& out) {
+            if (root == kInvalidPlanIndex || root >= lowering.values.size())
+            {
+                return;
+            }
+            std::vector<ExprNodeId> stack;
+            stack.push_back(root);
+            while (!stack.empty())
+            {
+                const ExprNodeId current = stack.back();
+                stack.pop_back();
+                if (!out.insert(current).second)
+                {
+                    continue;
+                }
+                if (current >= static_cast<ExprNodeId>(lowering.values.size()))
+                {
+                    continue;
+                }
+                const ExprNode& node = lowering.values[current];
+                if (node.kind != ExprNodeKind::Operation)
+                {
+                    continue;
+                }
+                for (ExprNodeId operand : node.operands)
+                {
+                    if (operand != kInvalidPlanIndex)
+                    {
+                        stack.push_back(operand);
+                    }
+                }
+            }
+        };
         for (const auto& stmt : lowering.loweredStmts)
         {
             if (stmt.kind != LoweredStmtKind::Write)
@@ -17887,11 +17951,7 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 continue;
             }
             const WriteIntent& write = stmt.write;
-            if (write.isXmr)
-            {
-                continue;
-            }
-            if (write.domain != ControlDomain::Sequential)
+            if (write.isXmr || write.domain != ControlDomain::Sequential)
             {
                 continue;
             }
@@ -17900,28 +17960,21 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             {
                 continue;
             }
+            auto& reach = writeReachByMemory[write.target.index];
+            collectReach(write.value, reach);
+            collectReach(write.guard, reach);
+        }
+        if (!writeReachByMemory.empty())
+        {
             for (auto& use : readUses)
             {
                 if (use.domain != ControlDomain::Sequential)
                 {
                     continue;
                 }
-                if (use.memory.index != write.target.index)
-                {
-                    continue;
-                }
-                bool usedInWrite = false;
-                if (write.value != kInvalidPlanIndex &&
-                    exprDependsOn(write.value, use.data))
-                {
-                    usedInWrite = true;
-                }
-                if (!usedInWrite && write.guard != kInvalidPlanIndex &&
-                    exprDependsOn(write.guard, use.data))
-                {
-                    usedInWrite = true;
-                }
-                if (!usedInWrite)
+                auto it = writeReachByMemory.find(use.memory.index);
+                if (it == writeReachByMemory.end() ||
+                    !it->second.contains(use.data))
                 {
                     continue;
                 }
@@ -17930,33 +17983,32 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 use.eventEdges.clear();
                 use.eventOperands.clear();
             }
-        }
 
-        std::vector<MemoryReadUse> deduped;
-        deduped.reserve(readUses.size());
-        for (const auto& use : readUses)
-        {
-            bool exists = false;
-            for (const auto& existing : deduped)
+            // The demotion above can collapse previously distinct reads into
+            // duplicates; re-dedup with the same hash buckets.
+            readUseBuckets.clear();
+            std::vector<MemoryReadUse> deduped;
+            deduped.reserve(readUses.size());
+            for (const auto& use : readUses)
             {
-                if (existing.memory.index == use.memory.index &&
-                    existing.domain == use.domain &&
-                    existing.updateCond == use.updateCond &&
-                    existing.addressIndices == use.addressIndices &&
-                    existing.eventEdges == use.eventEdges &&
-                    existing.eventOperands == use.eventOperands &&
-                    existing.replacement == use.replacement)
+                auto& bucket = readUseBuckets[readUseKeyOf(use)];
+                bool exists = false;
+                for (const std::size_t existing : bucket)
                 {
-                    exists = true;
-                    break;
+                    if (readUseEqual(deduped[existing], use))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                {
+                    bucket.push_back(deduped.size());
+                    deduped.push_back(use);
                 }
             }
-            if (!exists)
-            {
-                deduped.push_back(use);
-            }
+            readUses.swap(deduped);
         }
-        readUses.swap(deduped);
     }
 
     std::vector<uint8_t> indexedMemoryAccess(plan.symbolTable.size(), 0);
@@ -18433,28 +18485,63 @@ void MemoryPortLowererPass::lower(ModulePlan& plan, LoweringPlan& lowering)
 
     if (!lowering.memoryReads.empty() && !lowering.memoryWrites.empty())
     {
+        // ROB-scale: same reachable-set restructure as the read-use demotion
+        // above (reads×writes dependency checks are O(n^2) graph walks).
+        std::unordered_map<uint32_t, std::unordered_set<ExprNodeId>> writeReachByMemory;
+        auto collectReach = [&](ExprNodeId root, std::unordered_set<ExprNodeId>& out) {
+            if (root == kInvalidPlanIndex || root >= lowering.values.size())
+            {
+                return;
+            }
+            std::vector<ExprNodeId> stack;
+            stack.push_back(root);
+            while (!stack.empty())
+            {
+                const ExprNodeId current = stack.back();
+                stack.pop_back();
+                if (!out.insert(current).second)
+                {
+                    continue;
+                }
+                if (current >= static_cast<ExprNodeId>(lowering.values.size()))
+                {
+                    continue;
+                }
+                const ExprNode& node = lowering.values[current];
+                if (node.kind != ExprNodeKind::Operation)
+                {
+                    continue;
+                }
+                for (ExprNodeId operand : node.operands)
+                {
+                    if (operand != kInvalidPlanIndex)
+                    {
+                        stack.push_back(operand);
+                    }
+                }
+            }
+        };
+        for (const auto& write : lowering.memoryWrites)
+        {
+            auto& reach = writeReachByMemory[write.memory.index];
+            collectReach(write.data, reach);
+            collectReach(write.updateCond, reach);
+        }
         for (auto& read : lowering.memoryReads)
         {
             if (!read.isSync || read.data == kInvalidPlanIndex)
             {
                 continue;
             }
-            for (const auto& write : lowering.memoryWrites)
+            auto it = writeReachByMemory.find(read.memory.index);
+            if (it == writeReachByMemory.end() || !it->second.contains(read.data))
             {
-                if (write.memory.index != read.memory.index)
-                {
-                    continue;
-                }
-                if (exprDependsOn(write.data, read.data) ||
-                    exprDependsOn(write.updateCond, read.data))
-                {
-                    read.isSync = false;
-                    read.updateCond = kInvalidPlanIndex;
-                    read.eventEdges.clear();
-                    read.eventOperands.clear();
-                    break;
-                }
+                continue;
             }
+            read.isSync = false;
+            read.updateCond = kInvalidPlanIndex;
+            read.eventEdges.clear();
+            read.eventOperands.clear();
         }
     }
 }
@@ -19719,6 +19806,7 @@ private:
             graph_.setAttr(readOp, "regSymbol", std::string(memSymbol));
 
             graph_.addResult(readOp, dataValue);
+            recordEmittedMemoryRead(memoryReadKeyOf(entry), emittedMemoryReads_.size());
             emittedMemoryReads_.push_back(EmittedMemoryRead{
                 .memory = entry.memory,
                 .signal = entry.signal,
@@ -19735,10 +19823,90 @@ private:
         return dataValue;
     }
 
-    wolvrix::lib::grh::ValueId findReusableMemoryRead(const MemoryReadPort& entry) const
+    // ROB-scale: hash-bucket emitted reads by their structural key so the
+    // reuse scan is near-constant-time instead of O(emitted^2) expr compares.
+    uint64_t exprStructuralHash(ExprNodeId id) const
     {
-        for (const auto& emitted : emittedMemoryReads_)
+        if (id == kInvalidPlanIndex || id >= lowering_.values.size())
         {
+            return 0x9e3779b97f4a7c15ull;
+        }
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(0x243F6A8885A308D3ull);
+        std::vector<ExprNodeId> stack;
+        stack.push_back(id);
+        std::unordered_set<ExprNodeId> seen;
+        while (!stack.empty())
+        {
+            const ExprNodeId current = stack.back();
+            stack.pop_back();
+            if (!seen.insert(current).second ||
+                current >= static_cast<ExprNodeId>(lowering_.values.size()))
+            {
+                continue;
+            }
+            const ExprNode& node = lowering_.values[current];
+            mix(static_cast<uint64_t>(node.kind));
+            mix(node.widthHint > 0 ? static_cast<uint64_t>(node.widthHint) : 0);
+            switch (node.kind)
+            {
+            case ExprNodeKind::Constant:
+                for (const char c : node.literal) mix(static_cast<uint64_t>(c));
+                break;
+            case ExprNodeKind::Symbol:
+                mix(node.symbol.index);
+                break;
+            case ExprNodeKind::XmrRead:
+                for (const char c : node.xmrPath) mix(static_cast<uint64_t>(c));
+                break;
+            case ExprNodeKind::Operation:
+                mix(static_cast<uint64_t>(node.op));
+                for (ExprNodeId operand : node.operands)
+                {
+                    if (operand != kInvalidPlanIndex)
+                    {
+                        stack.push_back(operand);
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        return h;
+    }
+
+    uint64_t memoryReadKeyOf(const MemoryReadPort& entry) const
+    {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(entry.memory.index);
+        mix(static_cast<uint64_t>(entry.signal));
+        mix(entry.isSync ? 1 : 0);
+        for (const EventEdge edge : entry.eventEdges)
+            mix(static_cast<uint64_t>(edge));
+        for (const ExprNodeId index : entry.addressIndices)
+            mix(exprStructuralHash(index));
+        mix(exprStructuralHash(entry.updateCond));
+        for (const ExprNodeId operand : entry.eventOperands)
+            mix(exprStructuralHash(operand));
+        return h;
+    }
+
+    wolvrix::lib::grh::ValueId findReusableMemoryRead(const MemoryReadPort& entry)
+    {
+        const uint64_t key = memoryReadKeyOf(entry);
+        auto [it, inserted] = emittedReadBuckets_.try_emplace(key);
+        for (const std::size_t existing : it->second)
+        {
+            const EmittedMemoryRead& emitted = emittedMemoryReads_[existing];
             if (emitted.memory.index != entry.memory.index ||
                 emitted.signal != entry.signal ||
                 emitted.isSync != entry.isSync ||
@@ -19755,6 +19923,11 @@ private:
             return emitted.value;
         }
         return wolvrix::lib::grh::ValueId::invalid();
+    }
+
+    void recordEmittedMemoryRead(uint64_t key, std::size_t index)
+    {
+        emittedReadBuckets_[key].push_back(index);
     }
 
     bool exprListEquivalent(const std::vector<ExprNodeId>& lhs,
@@ -20980,9 +21153,35 @@ private:
                             }
                             break;
                         }
-                        ExprNodeId flatId = connectionLowerer_.lowerExpression(*expr);
+                        ExprNodeId flatId = kInvalidPlanIndex;
+                        if (expr->as_if<slang::ast::EmptyArgumentExpression>())
+                        {
+                            flatId = kInvalidPlanIndex;
+                        }
+                        else
+                        {
+                            flatId = connectionLowerer_.lowerExpression(*expr);
+                        }
                         if (flatId == kInvalidPlanIndex)
                         {
+                            if (expr->as_if<slang::ast::EmptyArgumentExpression>())
+                            {
+                                if (context_.diagnostics)
+                                {
+                                    context_.diagnostics->warn(
+                                        port->location,
+                                        "Leaving unconnected struct input port on instance");
+                                }
+                                for (const StructSplitLeaf& leaf : leaves)
+                                {
+                                    inputNames.emplace_back(leaf.fullName);
+                                    inputOperands.push_back(
+                                        makeUnconnectedInput(structLeafFlatWidth(leaf, *port),
+                                                             portSigned, portValueType,
+                                                             port->location));
+                                }
+                                break;
+                            }
                             ok = false;
                             break;
                         }
@@ -21055,6 +21254,20 @@ private:
                                 "Skipping instance with missing port connection");
                         }
                         ok = false;
+                        break;
+                    }
+                    if (expr->as_if<slang::ast::EmptyArgumentExpression>())
+                    {
+                        if (context_.diagnostics)
+                        {
+                            context_.diagnostics->warn(
+                                port->location,
+                                "Leaving unconnected input port on instance");
+                        }
+                        inputNames.emplace_back(port->name);
+                        inputOperands.push_back(
+                            makeUnconnectedInput(portWidth, portSigned, portValueType,
+                                                 port->location));
                         break;
                     }
                     inputNames.emplace_back(port->name);
@@ -23005,6 +23218,141 @@ private:
 
         // ================= end stage-04 struct support (connection side) =================
 
+        // stage-04: resolve a scalar member-access chain on split leaves
+        // (e.g. `.port(bundle.field)`), applying the chain's selects.
+        ExprNodeId lowerMemberAccessLeafConn(const slang::ast::Expression& expr)
+        {
+            // Walk the member chain to the leaf signal, then apply selects.
+            std::vector<std::string> memberPath;
+            std::vector<std::pair<ExprNodeId, const slang::ast::Expression*>> selects;
+            const slang::ast::Expression* current = &expr;
+            const slang::ast::NamedValueExpression* rootNamed = nullptr;
+            while (true)
+            {
+                if (const auto* conv = current->as_if<slang::ast::ConversionExpression>();
+                    conv && conv->isImplicit())
+                {
+                    current = &conv->operand();
+                    continue;
+                }
+                if (const auto* member = current->as_if<slang::ast::MemberAccessExpression>())
+                {
+                    memberPath.insert(memberPath.begin(), std::string(member->member.name));
+                    current = &member->value();
+                    continue;
+                }
+                if (const auto* select = current->as_if<slang::ast::ElementSelectExpression>())
+                {
+                    selects.emplace_back(kInvalidPlanIndex, &select->selector());
+                    current = &select->value();
+                    continue;
+                }
+                rootNamed = current->as_if<slang::ast::NamedValueExpression>();
+                break;
+            }
+            if (!rootNamed)
+            {
+                return kInvalidPlanIndex;
+            }
+            const PlanSymbolId root = lookupPlanSignal(state_.plan_, rootNamed->symbol);
+            auto it = state_.plan_.structsBySymbol.find(root.index);
+            if (it == state_.plan_.structsBySymbol.end())
+            {
+                return kInvalidPlanIndex;
+            }
+            // Resolve the member path to the leaf symbol.
+            std::string target;
+            for (const std::string& component : memberPath)
+            {
+                target.append("__DOT__");
+                target.append(component);
+            }
+            PlanSymbolId leaf;
+            for (const StructLeafInfo& field : it->second.fields)
+            {
+                if (field.fieldPath == target)
+                {
+                    leaf = field.symbol;
+                    break;
+                }
+            }
+            if (!leaf.valid())
+            {
+                return kInvalidPlanIndex;
+            }
+            ExprNodeId value = makeSymbolNode(leaf, expr.sourceRange.start());
+            const SignalInfo* info = findSignalBySymbol(state_.plan_, leaf);
+            // Apply selects oldest-first (outermost array dim first).
+            for (auto rit = selects.rbegin(); rit != selects.rend(); ++rit)
+            {
+                ExprNodeId index = lowerExpression(*rit->second);
+                if (index == kInvalidPlanIndex)
+                {
+                    return kInvalidPlanIndex;
+                }
+                if (info && !info->unpackedDims.empty())
+                {
+                    if (isArrayStateChainConn(value))
+                    {
+                        value = makeSliceDynamicNode(value, index, 1, expr.sourceRange.start());
+                    }
+                    else
+                    {
+                        const UnpackedDimInfo& dim = info->unpackedDims.front();
+                        ExprNodeId normalized = index;
+                        if (dim.left < dim.right)
+                        {
+                            if (dim.left != 0)
+                            {
+                                normalized = makeOperationNode(
+                                    wolvrix::lib::grh::OperationKind::kSub,
+                                    {normalized,
+                                     makeConstNode(std::to_string(dim.left),
+                                                   expr.sourceRange.start())},
+                                    32, expr.sourceRange.start());
+                            }
+                        }
+                        else
+                        {
+                            normalized = makeOperationNode(
+                                wolvrix::lib::grh::OperationKind::kSub,
+                                {makeConstNode(std::to_string(dim.left),
+                                               expr.sourceRange.start()),
+                                 normalized},
+                                32, expr.sourceRange.start());
+                        }
+                        value = makeSliceArrayNode(value, normalized, 1, expr.sourceRange.start());
+                    }
+                    SignalInfo shrunk = *info;
+                    shrunk.unpackedDims.erase(shrunk.unpackedDims.begin());
+                    static thread_local std::deque<SignalInfo> shrunkPool;
+                    shrunkPool.push_back(std::move(shrunk));
+                    info = &shrunkPool.back();
+                }
+                else if (info && !info->packedDimInfos.empty())
+                {
+                    ExprNodeId lane =
+                        normalizePackedLaneConn(info->packedDimInfos.front(), index,
+                                                expr.sourceRange.start());
+                    value = makeSliceArrayNode(value, lane, 1, expr.sourceRange.start());
+                    SignalInfo shrunk = *info;
+                    shrunk.packedDimInfos.erase(shrunk.packedDimInfos.begin());
+                    static thread_local std::deque<SignalInfo> shrunkPool;
+                    shrunkPool.push_back(std::move(shrunk));
+                    info = &shrunkPool.back();
+                }
+                else
+                {
+                    value = makeSliceDynamicNode(value, index, 1, expr.sourceRange.start());
+                }
+                if (value == kInvalidPlanIndex)
+                {
+                    return kInvalidPlanIndex;
+                }
+            }
+            return value;
+        }
+
         ExprNodeId lowerExpression(const slang::ast::Expression& expr)
         {
             if (auto it = lowered_.find(&expr); it != lowered_.end())
@@ -23017,6 +23365,10 @@ private:
             if (expr.type && isStructTyped(*expr.type))
             {
                 return flattenStructExpr(expr);
+            }
+            if (expr.as_if<slang::ast::MemberAccessExpression>())
+            {
+                return lowerMemberAccessLeafConn(expr);
             }
 
             auto paramLiteral = [](const slang::ast::ParameterSymbol& param)
@@ -24299,6 +24651,7 @@ private:
         wolvrix::lib::grh::ValueId value = wolvrix::lib::grh::ValueId::invalid();
     };
     std::vector<EmittedMemoryRead> emittedMemoryReads_;
+    std::unordered_map<uint64_t, std::vector<std::size_t>> emittedReadBuckets_;
     struct InstanceXmrWrite {
         std::string xmrPath;
         wolvrix::lib::grh::ValueId value = wolvrix::lib::grh::ValueId::invalid();

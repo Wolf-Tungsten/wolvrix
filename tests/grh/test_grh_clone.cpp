@@ -99,15 +99,6 @@ int main()
         src.addOperand(packedConcat, lane1);
         src.addOperand(packedConcat, lane0);
         src.addResult(packedConcat, packed);
-        src.setAttr(packedConcat, "svPackedArray.version", AttributeValue(int64_t(1)));
-        src.setAttr(packedConcat, "svPackedArray.elementWidth", AttributeValue(int64_t(3)));
-        src.setAttr(packedConcat, "svPackedArray.elementCount", AttributeValue(int64_t(2)));
-        src.setAttr(packedConcat, "svPackedArray.indexLow", AttributeValue(int64_t(0)));
-        src.setAttr(packedConcat, "svPackedArray.indexHigh", AttributeValue(int64_t(1)));
-        src.setAttr(packedConcat, "svPackedArray.indexDirection", AttributeValue(std::string("downto")));
-        src.setAttr(packedConcat, "svPackedArray.laneOrder", AttributeValue(std::string("lsb_index_low")));
-        src.setAttr(packedConcat, "svPackedArray.concat.operand0Index", AttributeValue(int64_t(1)));
-        src.setAttr(packedConcat, "svPackedArray.concat.operandStride", AttributeValue(int64_t(-1)));
 
         OperationId packedSlice = src.createOperation(OperationKind::kSliceArray, src.internSymbol("packed_slice"));
         src.addOperand(packedSlice, packed);

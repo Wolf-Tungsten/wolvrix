@@ -792,6 +792,53 @@ namespace wolvrix::lib::grhsim
                 continue;
             }
 
+            // stage-04: multi-index kSliceArray (1 < k <= rank) linearizes to
+            // a lane index and becomes one sliceDynamic over the flat base;
+            // fewer than rank indices slices the addressed sub-array by its
+            // flat width. The single-index form keeps the transitional
+            // sliceArray mapping below.
+            if (op.kind() == OperationKind::kSliceArray && op.operands().size() > 2)
+            {
+                const std::span<const int64_t> baseShape =
+                    graph->valueShape(op.operands().front());
+                const std::size_t indexCount = op.operands().size() - 1;
+                const grhsim::ValueId base = mappedValue(op.operands().front(), op.symbolText());
+                if (baseShape.empty() || indexCount > baseShape.size() || op.results().empty() ||
+                    !base.valid())
+                {
+                    diagnostics.error("multi-index kSliceArray has an invalid base shape",
+                                      std::string(op.symbolText()));
+                    continue;
+                }
+                const int64_t resultWidth =
+                    static_cast<int64_t>(std::max<int32_t>(1, graph->valueWidth(op.results().front())));
+                grhsim::ValueId lane;
+                for (std::size_t i = 0; i < indexCount; ++i)
+                {
+                    int64_t stride = 1;
+                    for (std::size_t j = i + 1; j < indexCount; ++j)
+                        stride *= std::max<int64_t>(1, baseShape[j]);
+                    grhsim::ValueId term = mappedValue(op.operands()[1 + i], op.symbolText());
+                    if (!term.valid()) { lane = {}; break; }
+                    if (stride != 1)
+                        term = addComputeOp("core.compute.mul", {term, constValueFor(stride)}, 32, false);
+                    lane = lane.valid() ? addComputeOp("core.compute.add", {lane, term}, 32, false)
+                                        : term;
+                }
+                if (!lane.valid()) continue;
+                grhsim::ValueId offset = lane;
+                if (resultWidth > 1)
+                    offset = addComputeOp("core.compute.mul", {lane, constValueFor(resultWidth)}, 32, false);
+                const grhsim::ValueId result = mappedValue(op.results().front(), op.symbolText());
+                if (!result.valid()) continue;
+                const std::array sliceOperands{base, offset};
+                const std::array results{result};
+                const std::array parameters{Parameter{model->intern("sliceWidth"), resultWidth}};
+                model->addOperation("core.compute.sliceDynamic", sliceOperands, results, {},
+                                    parameters, {}, {});
+                continue;
+            }
+
             // Array write port with fewer than rank indices: unroll the
             // addressed sub-array into per-element memWrites with sliced
             // data/mask. Full-rank writes fall through to the generic path

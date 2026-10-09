@@ -229,6 +229,7 @@ namespace wolvrix::lib::transform
             std::string portName;
             int32_t width = 0;
             bool isSigned = false;
+            std::vector<int64_t> shape;
         };
         std::vector<PendingPort> pendingOutputPorts;
         std::vector<PendingPort> pendingInputPorts;
@@ -421,7 +422,8 @@ namespace wolvrix::lib::transform
                                    const std::string &portName,
                                    int32_t width,
                                    bool isSigned,
-                                   bool *added) -> wolvrix::lib::grh::ValueId {
+                                   bool *added,
+                                   std::span<const int64_t> shape = {}) -> wolvrix::lib::grh::ValueId {
             if (added)
             {
                 *added = false;
@@ -442,6 +444,11 @@ namespace wolvrix::lib::transform
                 }
                 value = createValue(graph, sym, normalizeWidth(width), isSigned,
                                     wolvrix::lib::grh::ValueType::Logic, "input_port");
+                if (!shape.empty() && graph.getValue(value).shape().empty() &&
+                    graph.getValue(value).width() == normalizeWidth(width))
+                {
+                    graph.setValueShape(value, shape);
+                }
             }
             graph.bindInputPort(portName, value);
             result.changed = true;
@@ -483,7 +490,8 @@ namespace wolvrix::lib::transform
                                         wolvrix::lib::grh::OperationId opId,
                                         const std::string &portName,
                                         int32_t width,
-                                        bool isSigned) -> wolvrix::lib::grh::ValueId {
+                                        bool isSigned,
+                                        std::span<const int64_t> shape = {}) -> wolvrix::lib::grh::ValueId {
             const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
             auto names = getAttrStrings(op, "outputPortName");
             const auto inoutNames = getAttrStrings(op, "inoutPortName");
@@ -500,6 +508,11 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueId value =
                 createValue(graph, sym, normalizeWidth(width), isSigned,
                             wolvrix::lib::grh::ValueType::Logic, "instance_out");
+            if (!shape.empty() && graph.getValue(value).shape().empty() &&
+                graph.getValue(value).width() == normalizeWidth(width))
+            {
+                graph.setValueShape(value, shape);
+            }
             const std::size_t inoutCount = inoutNames.size();
             const std::size_t resultCount = resultsSpan.size();
             const std::size_t outputLimit =
@@ -580,6 +593,10 @@ namespace wolvrix::lib::transform
                 wolvrix::lib::grh::ValueId replacement =
                     createValue(graph, sym, normalizeWidth(value.width()), value.isSigned(),
                                 value.type(), "override_input");
+                if (!value.shape().empty() && graph.getValue(replacement).shape().empty())
+                {
+                    graph.setValueShape(replacement, value.shape());
+                }
                 graph.replaceAllUses(target, replacement);
                 result.changed = true;
                 return replacement;
@@ -604,6 +621,10 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueId replacement =
                 createValue(graph, sym, normalizeWidth(value.width()), value.isSigned(),
                             value.type(), "rebind_output");
+            if (!value.shape().empty() && graph.getValue(replacement).shape().empty())
+            {
+                graph.setValueShape(replacement, value.shape());
+            }
             graph.replaceAllUses(target, replacement);
             for (const auto &name : outputNames)
             {
@@ -745,7 +766,8 @@ namespace wolvrix::lib::transform
                 }
                 wolvrix::lib::grh::ValueId parentValue =
                     ensureInstanceOutput(*parentGraph, instOp, portName,
-                                         childValue.width(), childValue.isSigned());
+                                         childValue.width(), childValue.isSigned(),
+                                         childValue.shape());
                 propagated = parentValue;
             }
 
@@ -923,12 +945,13 @@ namespace wolvrix::lib::transform
                     bool newPort = false;
                     wolvrix::lib::grh::ValueId childPort =
                         ensureInputPort(*hop.child, portName, driverValue.width(),
-                                        driverValue.isSigned(), &newPort);
+                                        driverValue.isSigned(), &newPort, driverValue.shape());
                     if (newPort)
                     {
                         pendingInputPorts.push_back(
                             PendingPort{hop.child->symbol(), portName,
-                                        driverValue.width(), driverValue.isSigned()});
+                                        driverValue.width(), driverValue.isSigned(),
+                                        {driverValue.shape().begin(), driverValue.shape().end()}});
                     }
                     ensureInstanceInput(*hop.parent, hop.instOp, portName, drivers[idx]);
                     drivers[idx] = childPort;
@@ -1174,7 +1197,7 @@ namespace wolvrix::lib::transform
                     for (const PendingPort *pending : pendingPorts)
                     {
                         ensureInstanceOutput(*inst.graph, inst.opId, pending->portName,
-                                             pending->width, pending->isSigned);
+                                             pending->width, pending->isSigned, pending->shape);
                     }
                 }
                 ++moduleIndex;

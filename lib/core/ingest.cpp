@@ -5840,7 +5840,13 @@ private:
             return false;
         }
 
-        const int64_t elementWidth = chain.signal->width > 0 ? chain.signal->width : 1;
+        // stage-04: width is the innermost element width; a row (one
+        // unpacked lane) additionally spans the trailing packed shape dims.
+        int64_t elementWidth = chain.signal->width > 0 ? chain.signal->width : 1;
+        for (std::size_t i = dims.size(); i < chain.signal->shape.size(); ++i)
+        {
+            elementWidth *= std::max<int64_t>(1, chain.signal->shape[i]);
+        }
         int64_t subarrayRows = 1;
         for (std::size_t i = chain.selectors.size(); i < dims.size(); ++i)
         {
@@ -6013,6 +6019,90 @@ private:
             bitIndex = makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kMul,
                                               {bitIndex, widthExpr}, mulWidth,
                                               location);
+        }
+        return true;
+    }
+
+    // stage-04: read path for unpacked net arrays — collect per-dim
+    // normalized index expressions (no bit-offset linearization); the
+    // multi-index kSliceArray consumes them directly.
+    bool buildNetArrayIndices(const NetArraySelectChain& chain,
+                              std::vector<ExprNodeId>& indices,
+                              int64_t& sliceWidth,
+                              slang::SourceLocation location)
+    {
+        const auto& dims = chain.signal->unpackedDims;
+        if (chain.selectors.empty() || dims.empty() ||
+            chain.selectors.size() > dims.size())
+        {
+            return false;
+        }
+
+        // Flat width of the selected element/sub-array: total width divided
+        // by the indexed leading shape dims.
+        int64_t width = signalTotalWidth(*chain.signal);
+        for (std::size_t i = 0; i < chain.selectors.size(); ++i)
+        {
+            const int64_t dim =
+                i < chain.signal->shape.size() ? std::max<int64_t>(1, chain.signal->shape[i]) : 1;
+            if (dim <= 0 || width % dim != 0)
+            {
+                return false;
+            }
+            width /= dim;
+        }
+        if (width <= 0)
+        {
+            return false;
+        }
+        sliceWidth = std::min<int64_t>(
+            width, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+
+        for (std::size_t i = 0; i < chain.selectors.size(); ++i)
+        {
+            auto clampIndexWidth = [](uint64_t w) -> int32_t {
+                if (w == 0)
+                {
+                    return 0;
+                }
+                const uint64_t maxValue =
+                    static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+                return w > maxValue ? std::numeric_limits<int32_t>::max()
+                                    : static_cast<int32_t>(w);
+            };
+            int32_t indexWidth = clampIndexWidth(computeExprWidth(*chain.selectors[i]));
+            if (indexWidth <= 0)
+            {
+                indexWidth = 32;
+            }
+            ExprNodeId indexExpr = kInvalidPlanIndex;
+            {
+                WidthContextScope widthScope(*this, indexWidth);
+                indexExpr = lowerExpression(*chain.selectors[i]);
+            }
+            if (indexExpr == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            const auto& dim = dims[i];
+            if (dim.left < dim.right)
+            {
+                if (dim.left != 0)
+                {
+                    ExprNodeId offset =
+                        addConstantLiteral(std::to_string(dim.left), location);
+                    indexExpr = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                              {indexExpr, offset}, location);
+                }
+            }
+            else
+            {
+                ExprNodeId offset =
+                    addConstantLiteral(std::to_string(dim.left), location);
+                indexExpr = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                          {offset, indexExpr}, location);
+            }
+            indices.push_back(indexExpr);
         }
         return true;
     }
@@ -8534,20 +8624,25 @@ private:
         {
             if (auto chain = collectNetArraySelectChain(expr))
             {
-                ExprNodeId bitIndex = kInvalidPlanIndex;
+                // stage-04: unpacked net array reads become one multi-index
+                // kSliceArray on the shaped value (no bit-offset arithmetic).
+                std::vector<ExprNodeId> indices;
                 int64_t sliceWidth = 0;
-                if (buildNetArraySlice(*chain, bitIndex, sliceWidth,
-                                       select->sourceRange.start()))
+                if (buildNetArrayIndices(*chain, indices, sliceWidth,
+                                         select->sourceRange.start()))
                 {
                     ExprNodeId base = lowerExpression(*chain->baseExpr);
-                    if (base != kInvalidPlanIndex && bitIndex != kInvalidPlanIndex)
+                    if (base != kInvalidPlanIndex)
                     {
-                        const int64_t maxWidth =
-                            static_cast<int64_t>(std::numeric_limits<int32_t>::max());
-                        const int32_t width =
-                            static_cast<int32_t>(std::min<int64_t>(sliceWidth, maxWidth));
-                        return makeSliceDynamic(base, bitIndex, width,
-                                                select->sourceRange.start());
+                        node.kind = ExprNodeKind::Operation;
+                        node.op = wolvrix::lib::grh::OperationKind::kSliceArray;
+                        node.operands = {base};
+                        node.operands.insert(node.operands.end(), indices.begin(), indices.end());
+                        node.location = select->sourceRange.start();
+                        node.tempSymbol = makeTempSymbol();
+                        node.widthHint = static_cast<int32_t>(sliceWidth);
+                        node.sliceWidth = node.widthHint;
+                        return addNode(nullptr, std::move(node));
                     }
                 }
             }
@@ -16894,6 +16989,12 @@ private:
                 }
                 wolvrix::lib::grh::ValueId value =
                     createValue(port.symbol, width, port.isSigned, port.valueType);
+                if (value.valid() && !port.shape.empty() &&
+                    graph_.getValue(value).shape().empty())
+                {
+                    // stage-04: array input ports carry the declared shape.
+                    graph_.setValueShape(value, port.shape);
+                }
                 if (value.valid())
                 {
                     graph_.bindInputPort(portName, value);
@@ -17009,7 +17110,15 @@ private:
                 normalizeWidth(static_cast<int32_t>(
                     isPackedAggregateVariable(signal) ? flattenedAggregateWidth(signal)
                                                       : flattenedNetWidth(signal)));
-            createValue(signal.symbol, width, signal.isSigned, signal.valueType);
+            wolvrix::lib::grh::ValueId value =
+                createValue(signal.symbol, width, signal.isSigned, signal.valueType);
+            // stage-04: array values carry the declaration shape (the shape
+            // is a pure structural view; flat semantics stay valid).
+            if (value.valid() && !signal.shape.empty() &&
+                graph_.getValue(value).shape().empty())
+            {
+                graph_.setValueShape(value, signal.shape);
+            }
         }
     }
 
@@ -17105,108 +17214,6 @@ private:
         return false;
     }
 
-    const slang::ast::Type* lookupPlanSymbolType(PlanSymbolId symbol) const
-    {
-        if (!symbol.valid() || !plan_.body)
-        {
-            return nullptr;
-        }
-        const std::string_view name = plan_.symbolTable.text(symbol);
-        if (name.empty())
-        {
-            return nullptr;
-        }
-        const slang::ast::Symbol* astSymbol = plan_.body->find(name);
-        if (!astSymbol)
-        {
-            return nullptr;
-        }
-        if (const auto* value = astSymbol->as_if<slang::ast::ValueSymbol>())
-        {
-            return &value->getType();
-        }
-        return nullptr;
-    }
-
-    void annotatePackedArrayConcatDefop(PlanSymbolId target,
-                                        wolvrix::lib::grh::ValueId value)
-    {
-        if (!target.valid() || !value.valid())
-        {
-            return;
-        }
-        const SignalInfo* signal = findSignalInfo(target);
-        if (!signal || signal->packedDims.size() < 2)
-        {
-            return;
-        }
-        const slang::ast::Type* type = lookupPlanSymbolType(target);
-        if (!type || !plan_.body)
-        {
-            return;
-        }
-        const auto& canonical = type->getCanonicalType();
-        if (canonical.kind != slang::ast::SymbolKind::PackedArrayType)
-        {
-            return;
-        }
-        const auto& packed = canonical.as<slang::ast::PackedArrayType>();
-        const uint64_t countRaw = packed.range.fullWidth();
-        const uint64_t elementWidthRaw =
-            computeFixedWidth(packed.elementType, *plan_.body, context_.diagnostics);
-        if (countRaw == 0 || elementWidthRaw == 0 ||
-            countRaw > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-            elementWidthRaw > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-        {
-            return;
-        }
-        const int64_t elementCount = static_cast<int64_t>(countRaw);
-        const int64_t elementWidth = static_cast<int64_t>(elementWidthRaw);
-        if (elementCount <= 1 || elementWidth <= 0)
-        {
-            return;
-        }
-
-        const wolvrix::lib::grh::Value resultValue = graph_.getValue(value);
-        const wolvrix::lib::grh::OperationId defOpId = resultValue.definingOp();
-        if (!defOpId.valid())
-        {
-            return;
-        }
-        const wolvrix::lib::grh::Operation defOp = graph_.getOperation(defOpId);
-        if (defOp.kind() != wolvrix::lib::grh::OperationKind::kConcat ||
-            defOp.results().size() != 1 ||
-            static_cast<int64_t>(defOp.operands().size()) != elementCount ||
-            resultValue.width() != elementCount * elementWidth)
-        {
-            return;
-        }
-        for (const auto operand : defOp.operands())
-        {
-            if (!operand.valid() || graph_.getValue(operand).width() != elementWidth)
-            {
-                return;
-            }
-        }
-
-        const int64_t indexLow = std::min<int64_t>(packed.range.left, packed.range.right);
-        const int64_t indexHigh = std::max<int64_t>(packed.range.left, packed.range.right);
-        const bool indexDownto = packed.range.left > packed.range.right;
-        graph_.setAttr(defOpId, "svPackedArray.version", static_cast<int64_t>(1));
-        graph_.setAttr(defOpId, "svPackedArray.elementWidth", elementWidth);
-        graph_.setAttr(defOpId, "svPackedArray.elementCount", elementCount);
-        graph_.setAttr(defOpId, "svPackedArray.indexLow", indexLow);
-        graph_.setAttr(defOpId, "svPackedArray.indexHigh", indexHigh);
-        graph_.setAttr(defOpId, "svPackedArray.indexDirection",
-                       std::string(indexDownto ? "downto" : "upto"));
-        graph_.setAttr(defOpId, "svPackedArray.laneOrder",
-                       std::string(indexDownto ? "lsb_index_low" : "lsb_index_high"));
-        graph_.setAttr(defOpId, "svPackedArray.concat.operand0Index",
-                       indexDownto ? indexHigh : indexLow);
-        graph_.setAttr(defOpId, "svPackedArray.concat.operandStride",
-                       static_cast<int64_t>(indexDownto ? -1 : 1));
-    }
-
     const InoutSignalInfo* findInoutSignalInfo(PlanSymbolId symbol) const
     {
         if (!symbol.valid())
@@ -17243,9 +17250,23 @@ private:
                     slang::SourceLocation{},
                     "Inout signals for real/string are unsupported; treating as logic");
             }
-            createValue(info.binding.outSymbol, width, signal->isSigned,
-                        wolvrix::lib::grh::ValueType::Logic);
-            createValue(info.binding.oeSymbol, width, false, wolvrix::lib::grh::ValueType::Logic);
+            wolvrix::lib::grh::ValueId outValue =
+                createValue(info.binding.outSymbol, width, signal->isSigned,
+                            wolvrix::lib::grh::ValueType::Logic);
+            wolvrix::lib::grh::ValueId oeValue =
+                createValue(info.binding.oeSymbol, width, false,
+                            wolvrix::lib::grh::ValueType::Logic);
+            if (!signal->shape.empty())
+            {
+                if (outValue.valid() && graph_.getValue(outValue).shape().empty())
+                {
+                    graph_.setValueShape(outValue, signal->shape);
+                }
+                if (oeValue.valid() && graph_.getValue(oeValue).shape().empty())
+                {
+                    graph_.setValueShape(oeValue, signal->shape);
+                }
+            }
         }
     }
 
@@ -20893,10 +20914,11 @@ private:
 
         if (node.op == wolvrix::lib::grh::OperationKind::kSliceArray && operands.size() >= 2)
         {
-            // stage-02: kSliceArray carries no sliceWidth attr; the element
-            // width comes from the base value's shape. Bridge (until
-            // stage-04): backfill a 1-D shape [elementCount] on bases that
-            // have none yet (e.g. temps of non-array expressions).
+            // stage-02/04: kSliceArray carries no sliceWidth attr; geometry
+            // comes from the base value's shape. 1..k index operands select
+            // along the leading shape dims; fewer than rank indices yields
+            // the sub-array baseShape[k:]. Bases without a shape keep the
+            // stage-02 1-D bridge backfill (e.g. temps of non-array exprs).
             const int32_t width = normalizeWidth(node.sliceWidth > 0 ? node.sliceWidth
                                                                      : node.widthHint);
             const wolvrix::lib::grh::ValueId baseValue = operands[0];
@@ -20918,13 +20940,59 @@ private:
                             " is not divisible by element width " + std::to_string(width));
                 }
             }
-            std::optional<int64_t> staticIndex =
-                evalConstInt(plan_, lowering_, node.operands[1]);
-            if (staticIndex && *staticIndex >= 0)
+            const std::size_t indexCount = operands.size() - 1;
+            if (indexCount > baseShape.size())
             {
-                const int64_t start = *staticIndex * static_cast<int64_t>(width);
-                const int64_t end = start + static_cast<int64_t>(width) - 1;
-                if (baseWidth <= 0 || (end >= start && end < baseWidth))
+                if (context_.diagnostics)
+                {
+                    context_.diagnostics->error(
+                        node.location, "kSliceArray index count exceeds base shape rank");
+                }
+                valueByExpr_[id] = wolvrix::lib::grh::ValueId::invalid();
+                return wolvrix::lib::grh::ValueId::invalid();
+            }
+            // Flat width of the selected element/sub-array, and per-dim lane
+            // strides (dim-major: lane = sum(i_j * stride_j)).
+            int64_t subWidth = baseWidth;
+            std::vector<int64_t> strides(indexCount, 1);
+            for (std::size_t i = 0; i < indexCount; ++i)
+            {
+                const int64_t dim = baseShape[i] > 0 ? baseShape[i] : 1;
+                if (subWidth > 0 && dim > 0 && subWidth % dim == 0)
+                {
+                    subWidth /= dim;
+                }
+            }
+            // lane strides run over the indexed dims only (i+1..k-1); the
+            // remaining dims are covered by subWidth.
+            for (std::size_t i = indexCount; i-- > 0;)
+            {
+                int64_t stride = 1;
+                for (std::size_t j = i + 1; j < indexCount; ++j)
+                {
+                    stride *= baseShape[j] > 0 ? baseShape[j] : 1;
+                }
+                strides[i] = stride;
+            }
+            // All-constant indices fold to one static bit slice.
+            int64_t lane = 0;
+            bool allConst = true;
+            for (std::size_t i = 0; i < indexCount && allConst; ++i)
+            {
+                std::optional<int64_t> staticIndex =
+                    evalConstInt(plan_, lowering_, node.operands[1 + i]);
+                if (!staticIndex || *staticIndex < 0)
+                {
+                    allConst = false;
+                    break;
+                }
+                lane += *staticIndex * strides[i];
+            }
+            if (allConst)
+            {
+                const int64_t start = lane * subWidth;
+                const int64_t end = start + subWidth - 1;
+                if (subWidth > 0 && (baseWidth <= 0 || (end >= start && end < baseWidth)))
                 {
                     wolvrix::lib::grh::ValueId result =
                         createStaticSliceValue(operands[0], start, end,
@@ -20942,17 +21010,18 @@ private:
                          wolvrix::lib::grh::SymbolId::invalid(),
                          node.location);
             graph_.addOperand(op, operands[0]);
-            graph_.addOperand(op, operands[1]);
+            for (std::size_t i = 0; i < indexCount; ++i)
+            {
+                graph_.addOperand(op, operands[1 + i]);
+            }
             wolvrix::lib::grh::SymbolId sym =
                 makeInternalValueSymbol();
-            const int64_t resultWidth =
-                (!baseShape.empty() && baseShape.front() > 0) ? baseWidth / baseShape.front()
-                                                              : static_cast<int64_t>(width);
             const std::span<const int64_t> resultShape =
-                baseShape.size() > 1 ? baseShape.subspan(1) : std::span<const int64_t>{};
+                baseShape.size() > indexCount ? baseShape.subspan(indexCount)
+                                              : std::span<const int64_t>{};
             wolvrix::lib::grh::ValueId result =
-                graph_.createValue(sym, static_cast<int32_t>(resultWidth), false, node.valueType,
-                                   resultShape);
+                graph_.createValue(sym, static_cast<int32_t>(subWidth > 0 ? subWidth : width),
+                                   false, node.valueType, resultShape);
             graph_.addResult(op, result);
             valueByExpr_[id] = result;
             return result;
@@ -21109,7 +21178,6 @@ private:
                 {
                     continue;
                 }
-                annotatePackedArrayConcatDefop(entry.target, nextValue);
                 wolvrix::lib::grh::OperationId op =
                     createOp(wolvrix::lib::grh::OperationKind::kAssign,
                              wolvrix::lib::grh::SymbolId::invalid(),

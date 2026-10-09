@@ -254,6 +254,26 @@ namespace wolvrix::lib::transform
                                  const ValueMap &portMap,
                                  InlineState &state);
 
+        // stage-04: when the child port value carries an array shape and the
+        // parent-side connection value has none (same flat width), propagate
+        // the shape so child-internal array accesses survive the flatten.
+        void propagatePortShape(wolvrix::lib::grh::Graph &target,
+                                wolvrix::lib::grh::ValueId childValue,
+                                wolvrix::lib::grh::ValueId targetValue,
+                                const wolvrix::lib::grh::Graph &childGraph)
+        {
+            const std::span<const int64_t> childShape = childGraph.valueShape(childValue);
+            if (childShape.empty() || !target.valueShape(targetValue).empty())
+            {
+                return;
+            }
+            if (target.getValue(targetValue).width() != childGraph.getValue(childValue).width())
+            {
+                return;
+            }
+            target.setValueShape(targetValue, childShape);
+        }
+
         bool inlineInstanceInfo(const wolvrix::lib::grh::Graph &sourceGraph,
                                 const InstanceInfo &info,
                                 const ValueMap &valueMap,
@@ -435,6 +455,7 @@ namespace wolvrix::lib::transform
                     state.graphError(sourceGraph, "Flatten missing mapping for instance input operand");
                     return false;
                 }
+                propagatePortShape(target, childValue, *targetValue, *child);
                 maybeRenameMappedValue(childValue, *targetValue, portName);
                 childPortMap.emplace(childValue, *targetValue);
             }
@@ -475,6 +496,7 @@ namespace wolvrix::lib::transform
                     state.graphError(sourceGraph, "Flatten missing mapping for instance output result");
                     return false;
                 }
+                propagatePortShape(target, childValue, *targetValue, *child);
                 maybeRenameMappedValue(childValue, *targetValue, portName);
                 auto [it, inserted] = childPortMap.emplace(childValue, *targetValue);
                 if (!inserted && it->second != *targetValue)
@@ -534,6 +556,9 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 const auto &childInout = childInouts[childIndex];
+                propagatePortShape(target, childInout.out, *outValue, *child);
+                propagatePortShape(target, childInout.oe, *oeValue, *child);
+                propagatePortShape(target, childInout.in, *inValue, *child);
                 maybeRenameMappedValue(childInout.out, *outValue, std::string_view());
                 maybeRenameMappedValue(childInout.oe, *oeValue, std::string_view());
                 maybeRenameMappedValue(childInout.in, *inValue, std::string_view());
@@ -759,8 +784,10 @@ namespace wolvrix::lib::transform
                 {
                     newSym = target.makeInternalValSym();
                 }
+                // stage-04: preserve the array view on cloned values.
                 wolvrix::lib::grh::ValueId newValue =
-                    target.createValue(newSym, value.width(), value.isSigned(), value.type());
+                    target.createValue(newSym, value.width(), value.isSigned(), value.type(),
+                                       value.shape());
                 if (value.srcLoc())
                 {
                     target.setValueSrcLoc(newValue, *value.srcLoc());

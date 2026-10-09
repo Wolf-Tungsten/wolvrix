@@ -110,15 +110,6 @@ int main()
         graph.addOperand(packedConcat, lane1);
         graph.addOperand(packedConcat, lane0);
         graph.addResult(packedConcat, packed);
-        graph.setAttr(packedConcat, "svPackedArray.version", AttributeValue(int64_t(1)));
-        graph.setAttr(packedConcat, "svPackedArray.elementWidth", AttributeValue(int64_t(3)));
-        graph.setAttr(packedConcat, "svPackedArray.elementCount", AttributeValue(int64_t(2)));
-        graph.setAttr(packedConcat, "svPackedArray.indexLow", AttributeValue(int64_t(0)));
-        graph.setAttr(packedConcat, "svPackedArray.indexHigh", AttributeValue(int64_t(1)));
-        graph.setAttr(packedConcat, "svPackedArray.indexDirection", AttributeValue(std::string("downto")));
-        graph.setAttr(packedConcat, "svPackedArray.laneOrder", AttributeValue(std::string("lsb_index_low")));
-        graph.setAttr(packedConcat, "svPackedArray.concat.operand0Index", AttributeValue(int64_t(1)));
-        graph.setAttr(packedConcat, "svPackedArray.concat.operandStride", AttributeValue(int64_t(-1)));
 
         OperationId packedSlice = graph.createOperation(OperationKind::kSliceArray, graph.internSymbol("packed_slice"));
         graph.addOperand(packedSlice, packed);
@@ -504,16 +495,6 @@ int main()
             return fail("Parsed packed concat operation missing");
         }
         const Operation parsedPackedConcat = parsedGraph->getOperation(parsedPackedConcatId);
-        auto parsedElementWidth = parsedPackedConcat.attr("svPackedArray.elementWidth");
-        auto parsedElementCount = parsedPackedConcat.attr("svPackedArray.elementCount");
-        auto parsedLaneOrder = parsedPackedConcat.attr("svPackedArray.laneOrder");
-        if (!parsedElementWidth || !parsedElementCount || !parsedLaneOrder ||
-            *parsedElementWidth != AttributeValue(int64_t(3)) ||
-            *parsedElementCount != AttributeValue(int64_t(2)) ||
-            *parsedLaneOrder != AttributeValue(std::string("lsb_index_low")))
-        {
-            return fail("Packed array producer attrs did not round-trip");
-        }
         const OperationId parsedPackedSliceId = parsedGraph->findOperation("packed_slice");
         if (!parsedPackedSliceId.valid())
         {

@@ -167,6 +167,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/latch_transparent_read.cpp
     lib/transform/slice_index_const.cpp
     lib/transform/strip_debug.cpp
+    lib/transform/verify.cpp
     lib/transform/repcut.cpp
 )
 
@@ -597,6 +598,17 @@ target_link_libraries(transform-pass-manager
 )
 
 register_test_exe(transform-pass-manager)
+
+add_executable(transform-verify
+    tests/transform/test_verify_pass.cpp
+)
+
+target_link_libraries(transform-verify
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-verify)
 
 add_executable(transform-dead-code-elim
     tests/transform/test_dead_code_elim_pass.cpp

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -61,6 +62,41 @@ namespace wolvrix::lib::grh
         std::string symbolTextOrEmpty(const GraphSymbolTable &symbols, SymbolId sym)
         {
             return sym.valid() ? std::string(symbols.text(sym)) : std::string();
+        }
+
+        // Hard invariant for array values (see docs/grh/grh-ir.md "数组类型"):
+        // `width` is the total bit width, every shape dimension is positive,
+        // the dimension product must not overflow int64 and must divide the
+        // total width, and only Logic values may carry a shape.
+        void validateValueShape(int32_t width, ValueType type, std::span<const int64_t> shape,
+                                std::string_view context)
+        {
+            if (shape.empty())
+            {
+                return;
+            }
+            if (type != ValueType::Logic)
+            {
+                throw std::runtime_error(std::string(context) + " shape requires a Logic value");
+            }
+            int64_t elementCount = 1;
+            for (const int64_t dim : shape)
+            {
+                if (dim <= 0)
+                {
+                    throw std::runtime_error(std::string(context) + " shape dimensions must be positive");
+                }
+                if (elementCount > std::numeric_limits<int64_t>::max() / dim)
+                {
+                    throw std::runtime_error(std::string(context) + " shape dimension product overflows int64");
+                }
+                elementCount *= dim;
+            }
+            if (width <= 0 || elementCount > width || width % elementCount != 0)
+            {
+                throw std::runtime_error(std::string(context) +
+                                         " shape dimension product must divide the total width");
+            }
         }
 
         std::string formatSrcLocForDebug(const std::optional<SrcLoc> &srcLoc)
@@ -167,7 +203,8 @@ namespace wolvrix::lib::grh
                 ValueId dstValue = clone.createValue(dstSym,
                                                      srcValue.width(),
                                                      srcValue.isSigned(),
-                                                     srcValue.type());
+                                                     srcValue.type(),
+                                                     srcValue.shape());
                 if (srcValue.srcLoc())
                 {
                     clone.setValueSrcLoc(dstValue, *srcValue.srcLoc());
@@ -593,6 +630,15 @@ namespace wolvrix::lib::grh
         return static_cast<ValueType>(valueTypes_[idx]);
     }
 
+    std::span<const int64_t> GraphView::valueShape(ValueId value) const
+    {
+        if (valueShapeRanges_.empty())
+        {
+            return {};
+        }
+        return spanForRange(valueShapeDims_, valueShapeRanges_[valueIndex(value)]);
+    }
+
     bool GraphView::valueIsInput(ValueId value) const
     {
         return valueIsInput_[valueIndex(value)] != 0;
@@ -751,6 +797,10 @@ namespace wolvrix::lib::grh
         {
             require(view.valueTypes_.size() == valueCount, "GraphView value metadata size mismatch");
         }
+        if (!view.valueShapeRanges_.empty())
+        {
+            require(view.valueShapeRanges_.size() == valueCount, "GraphView value shape range size mismatch");
+        }
         require(view.valueIsInput_.size() == valueCount, "GraphView value metadata size mismatch");
         require(view.valueIsOutput_.size() == valueCount, "GraphView value metadata size mismatch");
         require(view.valueIsInout_.size() == valueCount, "GraphView value metadata size mismatch");
@@ -837,6 +887,13 @@ namespace wolvrix::lib::grh
             data.width = width > 0 ? width : 1;
             data.isSigned = view.valueSigned_[i] != 0;
             data.type = type;
+            if (!view.valueShapeRanges_.empty())
+            {
+                const std::span<const int64_t> shape =
+                    spanForRange(view.valueShapeDims_, view.valueShapeRanges_[i]);
+                validateValueShape(data.width, type, shape, "GraphView value");
+                data.shape.assign(shape.begin(), shape.end());
+            }
             data.isInput = false;
             data.isOutput = false;
             data.isInout = false;
@@ -1044,7 +1101,8 @@ namespace wolvrix::lib::grh
         return builder;
     }
 
-    ValueId GraphBuilder::addValue(SymbolId sym, int32_t width, bool isSigned, ValueType type)
+    ValueId GraphBuilder::addValue(SymbolId sym, int32_t width, bool isSigned, ValueType type,
+                                   std::span<const int64_t> shape)
     {
         if (type == ValueType::Logic && width <= 0)
         {
@@ -1054,6 +1112,7 @@ namespace wolvrix::lib::grh
         {
             width = 1;
         }
+        validateValueShape(width, type, shape, "Value");
         validateSymbol(sym, "Value");
 
         ValueId id;
@@ -1066,6 +1125,7 @@ namespace wolvrix::lib::grh
         data.width = width;
         data.isSigned = isSigned;
         data.type = type;
+        data.shape.assign(shape.begin(), shape.end());
         values_.push_back(std::move(data));
         valueUsers_.emplace_back();
         return id;
@@ -2009,6 +2069,22 @@ namespace wolvrix::lib::grh
         values_[valIdx].srcLoc = std::move(loc);
     }
 
+    void GraphBuilder::setValueShape(ValueId value, std::span<const int64_t> shape)
+    {
+        const std::size_t valIdx = valueIndex(value);
+        ValueData &data = values_[valIdx];
+        if (!data.alive)
+        {
+            throw std::runtime_error("ValueId refers to erased value");
+        }
+        if (!data.shape.empty())
+        {
+            throw std::runtime_error("Value shape is already set");
+        }
+        validateValueShape(data.width, data.type, shape, "Value");
+        data.shape.assign(shape.begin(), shape.end());
+    }
+
     void GraphBuilder::setOpSrcLoc(OperationId op, SrcLoc loc)
     {
         const std::size_t opIdx = opIndex(op);
@@ -2214,6 +2290,7 @@ namespace wolvrix::lib::grh
         view.valueWidths_.reserve(valueCount);
         view.valueSigned_.reserve(valueCount);
         view.valueTypes_.reserve(valueCount);
+        view.valueShapeRanges_.reserve(valueCount);
         view.valueIsInput_.reserve(valueCount);
         view.valueIsOutput_.reserve(valueCount);
         view.valueIsInout_.reserve(valueCount);
@@ -2237,6 +2314,9 @@ namespace wolvrix::lib::grh
             view.valueWidths_.push_back(valueData.width);
             view.valueSigned_.push_back(valueData.isSigned ? 1 : 0);
             view.valueTypes_.push_back(static_cast<uint8_t>(valueData.type));
+            view.valueShapeRanges_.push_back(Range{view.valueShapeDims_.size(), valueData.shape.size()});
+            view.valueShapeDims_.insert(view.valueShapeDims_.end(), valueData.shape.begin(),
+                                        valueData.shape.end());
             view.valueIsInput_.push_back(valueData.isInput ? 1 : 0);
             view.valueIsOutput_.push_back(valueData.isOutput ? 1 : 0);
             view.valueIsInout_.push_back(valueData.isInout ? 1 : 0);
@@ -2863,7 +2943,7 @@ namespace wolvrix::lib::grh
     }
 
     Value::Value(ValueId id, SymbolId symbol, std::string symbolText, int32_t width, bool isSigned,
-                 ValueType type, bool isInput, bool isOutput, bool isInout,
+                 ValueType type, std::vector<int64_t> shape, bool isInput, bool isOutput, bool isInout,
                  OperationId definingOp, std::span<const ValueUser> users,
                  std::optional<SrcLoc> srcLoc, const Graph *owner, bool usersLoaded)
         : id_(id),
@@ -2872,6 +2952,7 @@ namespace wolvrix::lib::grh
           width_(width),
           isSigned_(isSigned),
           type_(type),
+          shape_(std::move(shape)),
           isInput_(isInput),
           isOutput_(isOutput),
           isInout_(isInout),
@@ -3251,10 +3332,11 @@ namespace wolvrix::lib::grh
         return std::span<const InoutPort>(inoutPortsCache_.data(), inoutPortsCache_.size());
     }
 
-    ValueId Graph::createValue(SymbolId symbol, int32_t width, bool isSigned, ValueType type)
+    ValueId Graph::createValue(SymbolId symbol, int32_t width, bool isSigned, ValueType type,
+                               std::span<const int64_t> shape)
     {
         GraphBuilder &builder = ensureBuilder();
-        ValueId id = builder.addValue(symbol, width, isSigned, type);
+        ValueId id = builder.addValue(symbol, width, isSigned, type, shape);
         // Incremental update: directly append to cache without full rebuild
         if (!valuesCacheDirty_)
         {
@@ -3263,9 +3345,10 @@ namespace wolvrix::lib::grh
         return id;
     }
 
-    ValueId Graph::createValue(int32_t width, bool isSigned, ValueType type)
+    ValueId Graph::createValue(int32_t width, bool isSigned, ValueType type,
+                               std::span<const int64_t> shape)
     {
-        return createValue(makeInternalValSym(), width, isSigned, type);
+        return createValue(makeInternalValSym(), width, isSigned, type, shape);
     }
 
     OperationId Graph::createOperation(OperationKind kind, SymbolId symbol)
@@ -3459,6 +3542,30 @@ namespace wolvrix::lib::grh
         if (view_)
         {
             return view_->valueType(id);
+        }
+        throw std::runtime_error("GraphView is not available; freeze the graph first");
+    }
+
+    std::span<const int64_t> Graph::valueShape(ValueId id) const
+    {
+        if (builder_)
+        {
+            id.assertGraph(graphId_);
+            if (id.index == 0 || id.index > builder_->values_.size())
+            {
+                throw std::runtime_error("ValueId out of range");
+            }
+            const std::size_t idx = static_cast<std::size_t>(id.index - 1);
+            const auto &data = builder_->values_[idx];
+            if (!data.alive)
+            {
+                throw std::runtime_error("ValueId refers to erased value");
+            }
+            return data.shape;
+        }
+        if (view_)
+        {
+            return view_->valueShape(id);
         }
         throw std::runtime_error("GraphView is not available; freeze the graph first");
     }
@@ -4057,6 +4164,13 @@ namespace wolvrix::lib::grh
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
+    void Graph::setValueShape(ValueId value, std::span<const int64_t> shape)
+    {
+        GraphBuilder &builder = ensureBuilder();
+        builder.setValueShape(value, shape);
+        // No cache invalidation needed - doesn't affect value/op/port lists
+    }
+
     void Graph::setOpSrcLoc(OperationId op, SrcLoc loc)
     {
         GraphBuilder &builder = ensureBuilder();
@@ -4186,6 +4300,16 @@ namespace wolvrix::lib::grh
             writer.writeValue(value.isOutput());
             writer.writeProperty("inout");
             writer.writeValue(value.isInout());
+            if (!value.shape().empty())
+            {
+                writer.writeProperty("shape");
+                writer.startArray();
+                for (const int64_t dim : value.shape())
+                {
+                    writer.writeValue(dim);
+                }
+                writer.endArray();
+            }
             if (value.definingOp().valid())
             {
                 Operation defOp = getOperation(value.definingOp());
@@ -4503,6 +4627,7 @@ namespace wolvrix::lib::grh
                      graphView.valueWidth(id),
                      graphView.valueSigned(id),
                      graphView.valueType(id),
+                     std::vector<int64_t>(graphView.valueShape(id).begin(), graphView.valueShape(id).end()),
                      graphView.valueIsInput(id),
                      graphView.valueIsOutput(id),
                      graphView.valueIsInout(id),
@@ -4538,6 +4663,7 @@ namespace wolvrix::lib::grh
                      data.width,
                      data.isSigned,
                      data.type,
+                     data.shape,
                      data.isInput,
                      data.isOutput,
                      data.isInout,

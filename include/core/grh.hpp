@@ -86,6 +86,10 @@ enum class OperationKind {
 std::string_view toString(OperationKind kind) noexcept;
 std::optional<OperationKind> parseOperationKind(std::string_view text) noexcept;
 
+// Legacy kMemoryWritePort collision-priority attrs. In the array-type
+// refactor these retire together with kMemory in stage-03: all write ports of
+// one kRegister form a single group and priority is the ports' declaration
+// order, so no priority attrs exist anymore.
 inline constexpr std::string_view kMemoryWritePriorityGroupAttr = "memoryWrite.priorityGroup";
 inline constexpr std::string_view kMemoryWritePriorityAttr = "memoryWrite.priority";
 
@@ -397,6 +401,10 @@ public:
     int32_t valueWidth(ValueId value) const;
     bool valueSigned(ValueId value) const;
     ValueType valueType(ValueId value) const;
+    // Packed-first structural view of an array value; empty span = scalar.
+    // `valueWidth` always reports the total bit width; element width is
+    // valueWidth / product(valueShape).
+    std::span<const int64_t> valueShape(ValueId value) const;
     bool valueIsInput(ValueId value) const;
     bool valueIsOutput(ValueId value) const;
     bool valueIsInout(ValueId value) const;
@@ -439,6 +447,8 @@ private:
     std::vector<int32_t> valueWidths_;
     std::vector<uint8_t> valueSigned_;
     std::vector<uint8_t> valueTypes_;
+    std::vector<Range> valueShapeRanges_;
+    std::vector<int64_t> valueShapeDims_;
     std::vector<uint8_t> valueIsInput_;
     std::vector<uint8_t> valueIsOutput_;
     std::vector<uint8_t> valueIsInout_;
@@ -465,7 +475,8 @@ public:
     void reserveOpAttrs(OperationId op, std::size_t count);
 
     ValueId addValue(SymbolId sym, int32_t width, bool isSigned,
-                     ValueType type = ValueType::Logic);
+                     ValueType type = ValueType::Logic,
+                     std::span<const int64_t> shape = {});
     OperationId addOp(OperationKind kind, SymbolId sym);
     void addOperand(OperationId op, ValueId value);
     void addResult(OperationId op, ValueId value);
@@ -494,6 +505,11 @@ public:
     void setOpKind(OperationId op, OperationKind kind);
     bool eraseAttr(OperationId op, std::string_view key);
     void setValueSrcLoc(ValueId value, SrcLoc loc);
+    // Backfill the array shape of a value created scalar. Only allowed while
+    // the current shape is empty; the new shape must satisfy the usual
+    // invariants (positive dims, product divides width, Logic only). Shape is
+    // a pure structural view and never changes op semantics.
+    void setValueShape(ValueId value, std::span<const int64_t> shape);
     void setOpSrcLoc(OperationId op, SrcLoc loc);
     void setOpSymbol(OperationId op, SymbolId sym);
     void setValueSymbol(ValueId value, SymbolId sym);
@@ -506,9 +522,14 @@ private:
 
     struct ValueData {
         SymbolId symbol;
-        int32_t width = 0;
+        int32_t width = 0; // total bit width, including every array dimension
         bool isSigned = false;
         ValueType type = ValueType::Logic;
+        // Packed-first structural view of an array value; empty = scalar.
+        // Row-major element layout with canonical index 0 at the lowest
+        // element address; element width = width / product(shape). Logic
+        // values only; never changes op semantics (see docs/grh/grh-ir.md).
+        std::vector<int64_t> shape;
         bool isInput = false;
         bool isOutput = false;
         bool isInout = false;
@@ -576,6 +597,9 @@ public:
     int32_t width() const noexcept { return width_; }
     bool isSigned() const noexcept { return isSigned_; }
     ValueType type() const noexcept { return type_; }
+    // Array structural view; empty = scalar. `width()` stays the total bit
+    // width, so element width = width() / product(shape()).
+    std::span<const int64_t> shape() const noexcept { return shape_; }
     bool isInput() const noexcept { return isInput_; }
     bool isOutput() const noexcept { return isOutput_; }
     bool isInout() const noexcept { return isInout_; }
@@ -587,7 +611,7 @@ private:
     friend class Graph;
 
     Value(ValueId id, SymbolId symbol, std::string symbolText, int32_t width, bool isSigned,
-          ValueType type, bool isInput, bool isOutput, bool isInout,
+          ValueType type, std::vector<int64_t> shape, bool isInput, bool isOutput, bool isInout,
           OperationId definingOp, std::span<const ValueUser> users,
           std::optional<SrcLoc> srcLoc, const Graph* owner, bool usersLoaded);
 
@@ -597,6 +621,7 @@ private:
     int32_t width_ = 0;
     bool isSigned_ = false;
     ValueType type_ = ValueType::Logic;
+    std::vector<int64_t> shape_;
     bool isInput_ = false;
     bool isOutput_ = false;
     bool isInout_ = false;
@@ -723,9 +748,11 @@ public:
     std::span<const InoutPort> inoutPorts() const;
 
     ValueId createValue(SymbolId symbol, int32_t width, bool isSigned,
-                        ValueType type = ValueType::Logic);
+                        ValueType type = ValueType::Logic,
+                        std::span<const int64_t> shape = {});
     ValueId createValue(int32_t width, bool isSigned,
-                        ValueType type = ValueType::Logic);
+                        ValueType type = ValueType::Logic,
+                        std::span<const int64_t> shape = {});
     OperationId createOperation(OperationKind kind, SymbolId symbol);
     OperationId createOperation(OperationKind kind);
 
@@ -738,6 +765,9 @@ public:
     int32_t valueWidth(ValueId value) const;
     bool valueSigned(ValueId value) const;
     ValueType valueType(ValueId value) const;
+    // Array structural view of a value; empty span = scalar. See
+    // GraphView::valueShape for the layout contract.
+    std::span<const int64_t> valueShape(ValueId value) const;
     bool valueIsInput(ValueId value) const;
     bool valueIsOutput(ValueId value) const;
     bool valueIsInout(ValueId value) const;
@@ -781,6 +811,8 @@ public:
     void setOpKind(OperationId op, OperationKind kind);
     bool eraseAttr(OperationId op, std::string_view key);
     void setValueSrcLoc(ValueId value, SrcLoc loc);
+    // See GraphBuilder::setValueShape.
+    void setValueShape(ValueId value, std::span<const int64_t> shape);
     void setOpSrcLoc(OperationId op, SrcLoc loc);
     void setOpSymbol(OperationId op, SymbolId sym);
     void setValueSymbol(ValueId value, SymbolId sym);

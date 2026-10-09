@@ -181,6 +181,7 @@ Value 支持三种数据类型：
 - 对应 SystemVerilog 的 `logic`/`wire`/`reg`
 - 支持四态：0、1、x（未知）、z（高阻）
 - 必须指定位宽（`width > 0`）和是否有符号（`isSigned`）
+- 可为数组：`shape` 字段声明维度结构，`width` 恒为总位宽（见 §2.3）
 
 **Real**
 - 对应 SystemVerilog 的 `real`
@@ -223,27 +224,62 @@ Value 支持三种数据类型：
 - `definingOp` 为 invalid（不由 Operation 定义）
 - 由外部驱动（input/inout）或驱动外部（output/inout）
 
-## 2.3 数组扁平化
+## 2.3 数组类型（shape）
 
-SystemVerilog 的 packed array、struct、union 等复合类型在 GRH 中被扁平化为单个 Logic Value。
+GRH 的 Value 原生支持**单一元素类型、一维到多维、每维长度编译期确定**的数组，类型记作
+`UInt8[x][y]` 形式（元素类型 + 维度表 `[x, y]`）。数组 Value 仍服从 SSA：一个数组 Value
+只有一个定义 Operation。
 
-**扁平化规则**：
-- 多维数组按 packed 布局展开为单个大位宽
-- 高位维度在前，低位维度在后
-- 结构体按字段声明顺序拼接
+**类型模型**：
 
-**示例**：`input [3:0][7:0] arr`
+- `width` 恒为**总位宽**（含全部维度），与标量语义一致；所有按总位宽消费 `width` 的
+  现存代码对数组 Value 自动正确。
+- `shape` 是 packed 优先的纯结构视图：`std::vector<int64_t>`，空 = 标量，各维 > 0。
+- 元素位宽 `elementWidth = width / ∏shape`，必须整除（构造期与 verifier 双重强制）。
+- `shape` 只配 `ValueType::Logic`；`Real`/`String` 不数组化。
 
-扁平化为 32 位的 Logic Value：
-```
-位范围        对应元素
-[31:24]  →  arr[3]
-[23:16]  →  arr[2]
-[15:8]   →  arr[1]
-[7:0]    →  arr[0]
-```
+**行主序布局**：元素 `(i0, i1, ..., in-1)` 的线性位偏移为
+`(i0*d1*...*dn-1 + i1*d2*...*dn-1 + ... + in-1) * elementWidth`。
+shape 恒对应 "canonical index 0 = 最低元素地址" 的布局；SV 源中的维度方向
+（`[4:7]`、`[0:3]` 升序等）不进 shape，由 ingest 在下标归一化时映射掉。
 
-元素访问通过 `kSliceStatic`（常量索引）或 `kSliceDynamic`（变量索引）Operation 实现。
+**width / shape 判定规则**：最内层 packed 维是元素位宽本身，不进 shape；shape 的每一维
+都是"多少个元素"。unpacked 维折平后排在 packed 维外层（SV 语法天然 unpacked 在外）：
+
+| SV 声明 | width | shape | elementWidth |
+|---------|-------|-------|--------------|
+| `logic [7:0] a` | 8 | `[]`（标量） | 8 |
+| `logic [3:0][7:0] b` | 32 | `[4]` | 8 |
+| `logic [1:0][3:0][7:0] c` | 64 | `[2,4]` | 8 |
+| `logic [3:0][7:0] d [0:5]` | 192 | `[6,4]` | 8（unpacked 维 6 在外层） |
+| `logic [7:0] e [0:3][0:5]` | 192 | `[4,6]` | 8（unpacked 二维） |
+
+位布局与 SV 完全一致：如 `b[i]` = `bits[8i+7 : 8i]`，`b[0]` 是最低字节。
+
+**shape 不改变任何 op 语义**（核心原则）：任何 op 对带 shape Value 的语义 ≡ 对其
+`width` 位扁平位向量的语义。这正是 SV 对 packed 聚合的 integral 语义（算术进位跨元素
+边界合法）；合法 SV 源中 unpacked 数组不可能参与算术/移位/归约（前端直接拒绝），因此
+**不设 op 白名单/黑名单**。
+
+shape 感知点（真正读 shape 的地方）只有四个：
+
+- `kSliceArray`：输入 Value 必须 shape 非空（见 §6.2.8）；
+- 声明 op 的 `shape` 属性（§6.4）与读口 result 的 shape 继承；
+- `kRegister` 数组端口族（索引读/写、部分索引、掩码、填充，§6.4）；
+- 实例端口连接的 shape 匹配（totalBits 必须一致，shape 不一致给 warning）。
+
+**shape 推导惯例**（供 ingest/pass 构造 result Value 时使用，不是 verifier 约束；
+shape 缺失/未传播只损失结构信息，不影响正确性）：
+
+- `kConcat`：操作数全同形 `[s..]` → result `[n, s..]`（n=操作数个数，沿 leading 维拼接）；
+  其余组合 → 标量。
+- `kMux` / `kRegisterReadPort` / `kLatchReadPort`：result 继承相应 shape。
+- `kSliceStatic` / `kSliceDynamic`：result 默认标量；需要时可在 totalBits 一致下声明 shape
+  （把位段重解释为数组视图）。
+- 其余 op：result 默认标量（shape 不传播）。
+
+结构体等异构聚合不产生 GRH Value：ingest 字段级拆分为 `c__DOT__a[n]` 形态的同构数组，
+类型系统无需承接异构。
 
 ---
 
@@ -943,10 +979,23 @@ GRH IR 使用**声明 + ReadPort + WritePort**的组合建模寄存器。所有�
 
 **results**: 无
 
-**attrs**:
-- `width` (int64_t): 位宽
+**attrs**（类型契约，与 value 的 width/shape 对应）:
+- `width` (int64_t): 位宽（数组寄存器为总位宽，含全部维度）
 - `isSigned` (bool): 是否有符号
-- `initValue` (string, 可选): 初始化值
+- `shape` (int64[], 可选): 数组形状（见 §2.3），非空时声明一个数组寄存器；
+  与 `width` 同属声明的类型契约，不是可选注解
+
+**可选初始化属性**:
+- `initValue` (string): 单值初始化
+- `initKind` / `initFile` / `initValue` / `initStart` / `initLen`（数组形态）:
+  从 kMemory 并入的分段初始化族，仅当 `shape` 非空时可用，编码语义与 kMemory 相同
+  （initValue 按线性行主序位串编码）
+
+**shape 语义**:
+
+`shape` 非空时，寄存器是 `width / ∏shape` 位元素的多维数组（行主序，canonical index 0 =
+最低元素地址，见 §2.3）。数组寄存器的整体读写仍使用 kRegisterReadPort/kRegisterWritePort；
+按维度的索引端口族由后续阶段引入（见 stage-03 计划文档）。
 
 **初始化语义**:
 

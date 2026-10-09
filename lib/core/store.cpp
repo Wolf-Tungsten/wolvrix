@@ -1125,6 +1125,25 @@ namespace wolvrix::lib::store
                                        { out.append(value.isOutput() ? "true" : "false"); });
                                   prop("inout", [&]
                                        { out.append(value.isInout() ? "true" : "false"); });
+                                  if (!value.shape().empty())
+                                  {
+                                      prop("shape", [&]
+                                           {
+                                               out.push_back('[');
+                                               const char *comma = commaToken(mode);
+                                               bool firstDim = true;
+                                               for (const int64_t dim : value.shape())
+                                               {
+                                                   if (!firstDim)
+                                                   {
+                                                       out.append(comma);
+                                                   }
+                                                   out.append(std::to_string(dim));
+                                                   firstDim = false;
+                                               }
+                                               out.push_back(']');
+                                           });
+                                  }
                                   if (value.definingOp())
                                   {
                                       prop("def", [&]

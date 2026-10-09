@@ -49,6 +49,10 @@ namespace
         graph.addOperand(assign, sum);
         graph.addResult(assign, out);
 
+        const std::vector<int64_t> memShape{4, 2};
+        ValueId arr = graph.createValue(graph.internSymbol("arr"), 64, false, ValueType::Logic, memShape);
+        (void)arr;
+
         design.registerGraphAlias("demo_alias", graph);
         design.markAsTop(graph.symbol());
         return design;
@@ -138,6 +142,21 @@ int main()
     if (!aliasGraph || aliasGraph->symbol() != "demo")
     {
         return fail("Round-trip parsed design missing alias mapping");
+    }
+    Graph *parsedDemo = parsed.findGraph("demo");
+    ValueId parsedArr = parsedDemo->findValue("arr");
+    if (!parsedArr.valid())
+    {
+        return fail("Round-trip parsed design missing arr value");
+    }
+    const std::span<const int64_t> parsedShape = parsedDemo->valueShape(parsedArr);
+    if (parsedShape.size() != 2 || parsedShape[0] != 4 || parsedShape[1] != 2)
+    {
+        return fail("Round-trip parsed design lost the arr shape");
+    }
+    if (prettyCompactJson.find("\"shape\"") == std::string::npos)
+    {
+        return fail("Shape key missing in prettyCompact JSON");
     }
 
     // Case 3: compact mode should differ from prettyCompact output and avoid newlines.

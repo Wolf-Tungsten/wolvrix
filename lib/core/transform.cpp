@@ -16,6 +16,7 @@
 #include "transform/simplify.hpp"
 #include "transform/slice_index_const.hpp"
 #include "transform/strip_debug.hpp"
+#include "transform/verify.hpp"
 #include "transform/xmr_resolve.hpp"
 
 #include <chrono>
@@ -412,6 +413,7 @@ namespace wolvrix::lib::transform
             "comb-loop-elim",
             "dead-code-elim",
             "activity-schedule",
+            "grh.verify",
             "latch-transparent-read",
             "memory-read-retime",
             "slice-index-const",
@@ -458,6 +460,15 @@ namespace wolvrix::lib::transform
                 return nullptr;
             }
             return std::make_unique<BlackboxGuardPass>();
+        }
+        if (normalized == "grh.verify")
+        {
+            if (!args.empty())
+            {
+                error = "grh.verify does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<GrhVerifyPass>();
         }
         if (normalized == "comb-lane-pack")
         {

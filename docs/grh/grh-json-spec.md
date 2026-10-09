@@ -20,8 +20,10 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `symbols`: 按 elaboration 顺序排列的副本符号名（如 `gen_loop$0$sig`；flatten 后为 `u_inst$gen_loop$0$sig`）。
 - `vals`: 值列表，保持创建顺序。每个值包含：
   - `sym`: 符号名（必需，缺失视为错误）。
-  - `w`: 位宽。
+  - `w`: 位宽（数组值为总位宽，含全部维度）。
   - `sgn`: 是否有符号。
+  - `shape`: 可选，int64 数组，非空时写出（见 grh-ir.md §2.3 的数组类型模型；
+    元素位宽 = `w / ∏shape`，必须整除）。
   - `in` / `out` / `inout`: 输入/输出/inout 标记（`inout` 不可与 `in/out` 同时为真）。
   - `def`: 可选，定义该值的 Operation 符号。
   - `users`: 使用者数组 `{ op, idx }`，描述操作与操作数索引。
@@ -44,6 +46,7 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `out`: 为空
   - `attrs.width`: int
   - `attrs.isSigned`: bool
+  - `attrs.shape`: int[]，可选，数组寄存器的形状（非空数组）
 - `kRegisterReadPort`
   - `in`: 为空
   - `out`: 单个 result（读值）

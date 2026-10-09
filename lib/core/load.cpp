@@ -1031,7 +1031,16 @@ namespace wolvrix::lib::load
                 {
                     valueCreateStart = TimingClock::now();
                 }
-                ValueId valueId = graph.createValue(valueSym, static_cast<int32_t>(width), isSigned, valueType);
+                std::vector<int64_t> valueShape;
+                if (auto shapeIt = valueObj.find("shape"); shapeIt != valueObj.end())
+                {
+                    for (const auto &dimEntry : shapeIt->second.asArray("value.shape"))
+                    {
+                        valueShape.push_back(dimEntry.asInt("value.shape[]"));
+                    }
+                }
+                ValueId valueId = graph.createValue(valueSym, static_cast<int32_t>(width), isSigned, valueType,
+                                                    valueShape);
                 if (timingEnabled)
                 {
                     const auto now = TimingClock::now();

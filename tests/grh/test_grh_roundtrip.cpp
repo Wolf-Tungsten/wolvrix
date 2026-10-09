@@ -1,5 +1,6 @@
 #include "core/grh.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -184,6 +185,13 @@ namespace
             {
                 return "valueSigned mismatch";
             }
+            auto lhsShape = lhs.valueShape(valueId);
+            auto rhsShape = rhs.valueShape(valueId);
+            if (lhsShape.size() != rhsShape.size() ||
+                !std::equal(lhsShape.begin(), lhsShape.end(), rhsShape.begin()))
+            {
+                return "valueShape mismatch";
+            }
             if (lhs.valueIsInput(valueId) != rhs.valueIsInput(valueId))
             {
                 return "valueIsInput mismatch";
@@ -239,6 +247,8 @@ int main()
         auto symB = graphSymbols.intern("b");
         auto symTmp = graphSymbols.intern("tmp");
         auto symOutVal = graphSymbols.intern("out_val");
+        auto symArr = graphSymbols.intern("arr");
+        auto symArr2 = graphSymbols.intern("arr2");
         auto symAdd = graphSymbols.intern("add0");
         auto symAssign = graphSymbols.intern("assign0");
 
@@ -246,6 +256,12 @@ int main()
         auto vB = builder.addValue(symB, 8, false);
         auto vTmp = builder.addValue(symTmp, 8, true);
         auto vOut = builder.addValue(symOutVal, 8, false);
+        const std::vector<int64_t> arrShape{4};
+        const std::vector<int64_t> arr2Shape{2, 4};
+        auto vArr = builder.addValue(symArr, 32, false, ValueType::Logic, arrShape);
+        auto vArr2 = builder.addValue(symArr2, 64, true, ValueType::Logic, arr2Shape);
+        (void)vArr;
+        (void)vArr2;
 
         auto opAdd = builder.addOp(OperationKind::kAdd, symAdd);
         builder.addOperand(opAdd, vA);

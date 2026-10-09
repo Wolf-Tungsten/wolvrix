@@ -228,6 +228,10 @@ sess.run_pass(
 
 There is no separate pipeline API. A pipeline is simply multiple `run_pass(...)` calls in sequence.
 
+`run_pass("grh.verify")` runs the structural GRH verifier (array shape invariants, declaration
+op attributes, instance port width/shape matching). It is read-only and reports violations as
+diagnostics.
+
 ### Store And Emit
 
 ```python

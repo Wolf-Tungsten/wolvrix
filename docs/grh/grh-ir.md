@@ -257,6 +257,12 @@ shape 恒对应 "canonical index 0 = 最低元素地址" 的布局；SV 源中�
 
 位布局与 SV 完全一致：如 `b[i]` = `bits[8i+7 : 8i]`，`b[0]` 是最低字节。
 
+**ingest 视角**（stage-04）：声明层的数组维度全部进 shape（unpacked 前导、packed 内层、
+最内层 packed 维为元素位宽）；数组状态统一为 kRegister+shape 与端口族（"reg 还是 mem"
+由 grhsim 后端分类，与 ingest 无关）。struct 一律字段级拆分（SoA，`c__DOT__a` 命名、
+维度迁移到叶子字段），永不成为 GRH value；struct 端口同样拆分。规则细节见
+`docs/ingest/aggregate-types.md`。
+
 **shape 不改变任何 op 语义**（核心原则）：任何 op 对带 shape Value 的语义 ≡ 对其
 `width` 位扁平位向量的语义。这正是 SV 对 packed 聚合的 integral 语义（算术进位跨元素
 边界合法）；合法 SV 源中 unpacked 数组不可能参与算术/移位/归约（前端直接拒绝），因此

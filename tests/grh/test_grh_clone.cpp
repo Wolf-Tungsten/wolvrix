@@ -67,7 +67,8 @@ int main()
         ValueId out = src.createValue(symOut, 8, false);
         ValueId lane1 = src.createValue(symLane1, 3, false);
         ValueId lane0 = src.createValue(symLane0, 3, false);
-        ValueId packed = src.createValue(symPacked, 6, false);
+        const std::vector<int64_t> packedShape{2};
+        ValueId packed = src.createValue(symPacked, 6, false, ValueType::Logic, packedShape);
         ValueId packedIndex = src.createValue(symPackedIndex, 1, false);
         ValueId packedOut = src.createValue(symPackedOut, 3, false);
         ValueId ioIn = src.createValue(src.internSymbol("io__in"), 1, false);
@@ -112,7 +113,6 @@ int main()
         src.addOperand(packedSlice, packed);
         src.addOperand(packedSlice, packedIndex);
         src.addResult(packedSlice, packedOut);
-        src.setAttr(packedSlice, "sliceWidth", AttributeValue(int64_t(3)));
 
         SrcLoc opLoc;
         opLoc.file = "clone.sv";

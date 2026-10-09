@@ -283,5 +283,99 @@ int main()
         }
     }
 
+    // Case: kSliceArray with constant indices folds using the base value's
+    // shape (row-major multi-index linearization).
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_slice_array");
+        const std::vector<int64_t> shape{2, 4};
+        wolvrix::lib::grh::ValueId base =
+            graph.createValue(graph.internSymbol("arr"), 64, false,
+                              wolvrix::lib::grh::ValueType::Logic, shape);
+        wolvrix::lib::grh::OperationId baseConst =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
+                                  graph.internSymbol("arr_op"));
+        graph.addResult(baseConst, base);
+        graph.setAttr(baseConst, "constValue",
+                          std::string("64'h0102030405060708"));
+
+        wolvrix::lib::grh::ValueId i0 = makeConst(graph, "i0", "i0_op", 4, false, "4'h1");
+        wolvrix::lib::grh::ValueId i1 = makeConst(graph, "i1", "i1_op", 4, false, "4'h2");
+        const std::vector<int64_t> resultShape{4};
+        wolvrix::lib::grh::ValueId row =
+            graph.createValue(graph.internSymbol("row"), 32, false,
+                              wolvrix::lib::grh::ValueType::Logic, resultShape);
+        wolvrix::lib::grh::OperationId sliceRow =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                  graph.internSymbol("slice_row"));
+        graph.addOperand(sliceRow, base);
+        graph.addOperand(sliceRow, i0);
+        graph.addResult(sliceRow, row);
+
+        wolvrix::lib::grh::ValueId elem = graph.createValue(graph.internSymbol("elem"), 8, false);
+        wolvrix::lib::grh::OperationId sliceElem =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                  graph.internSymbol("slice_elem"));
+        graph.addOperand(sliceElem, base);
+        graph.addOperand(sliceElem, i0);
+        graph.addOperand(sliceElem, i1);
+        graph.addResult(sliceElem, elem);
+
+        wolvrix::lib::grh::ValueId outRow = graph.createValue(graph.internSymbol("out_row"), 32, false);
+        graph.bindOutputPort("out_row", outRow);
+        wolvrix::lib::grh::OperationId assignRow =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                  graph.internSymbol("assign_row"));
+        graph.addOperand(assignRow, row);
+        graph.addResult(assignRow, outRow);
+
+        wolvrix::lib::grh::ValueId out = graph.createValue(graph.internSymbol("out"), 8, false);
+        graph.bindOutputPort("out", out);
+        wolvrix::lib::grh::OperationId assignOut =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                  graph.internSymbol("assign_out"));
+        graph.addOperand(assignOut, elem);
+        graph.addResult(assignOut, out);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<ConstantFoldPass>());
+        PassDiagnostics diags;
+        PassManagerResult res = manager.run(design, diags);
+        if (!res.success || diags.hasError())
+        {
+            return fail("kSliceArray folding failed to run");
+        }
+
+        // Row slice (k=1 < rank): linear index 1 -> bits [63:32].
+        wolvrix::lib::grh::Value outRowValue = graph.getValue(graph.outputPortValue("out_row"));
+        if (!outRowValue.definingOp().valid() ||
+            graph.getOperation(outRowValue.definingOp()).kind() !=
+                wolvrix::lib::grh::OperationKind::kConstant)
+        {
+            return fail("Row slice was not folded to a constant");
+        }
+        auto rowLiteral = getConstLiteral(graph, graph.getOperation(outRowValue.definingOp()));
+        slang::SVInt expectedRow = slang::SVInt::fromString("32'h01020304").resize(32);
+        if (!rowLiteral || !static_cast<bool>((*rowLiteral == expectedRow)))
+        {
+            return fail("Row slice constant mismatch");
+        }
+
+        // Element slice (k=2 == rank): linear index 1*4+2=6 -> bits [55:48].
+        wolvrix::lib::grh::Value outElemValue = graph.getValue(graph.outputPortValue("out"));
+        if (!outElemValue.definingOp().valid() ||
+            graph.getOperation(outElemValue.definingOp()).kind() !=
+                wolvrix::lib::grh::OperationKind::kConstant)
+        {
+            return fail("Element slice was not folded to a constant");
+        }
+        auto elemLiteral = getConstLiteral(graph, graph.getOperation(outElemValue.definingOp()));
+        slang::SVInt expectedElem = slang::SVInt::fromString("8'h02").resize(8);
+        if (!elemLiteral || !static_cast<bool>((*elemLiteral == expectedElem)))
+        {
+            return fail("Element slice constant mismatch");
+        }
+    }
+
     return 0;
 }

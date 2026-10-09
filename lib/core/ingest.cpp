@@ -21480,13 +21480,35 @@ private:
 
         if (node.op == wolvrix::lib::grh::OperationKind::kSliceArray && operands.size() >= 2)
         {
+            // stage-02: kSliceArray carries no sliceWidth attr; the element
+            // width comes from the base value's shape. Bridge (until
+            // stage-04): backfill a 1-D shape [elementCount] on bases that
+            // have none yet (e.g. temps of non-array expressions).
             const int32_t width = normalizeWidth(node.sliceWidth > 0 ? node.sliceWidth
                                                                      : node.widthHint);
+            const wolvrix::lib::grh::ValueId baseValue = operands[0];
+            const int64_t baseWidth = graph_.getValue(baseValue).width();
+            std::span<const int64_t> baseShape = graph_.valueShape(baseValue);
+            if (baseShape.empty())
+            {
+                if (baseWidth > 0 && width > 0 && baseWidth % width == 0)
+                {
+                    const std::array<int64_t, 1> bridgeShape{baseWidth / width};
+                    graph_.setValueShape(baseValue, bridgeShape);
+                    baseShape = graph_.valueShape(baseValue);
+                }
+                else if (context_.diagnostics)
+                {
+                    context_.diagnostics->error(
+                        node.location,
+                        "kSliceArray base width " + std::to_string(baseWidth) +
+                            " is not divisible by element width " + std::to_string(width));
+                }
+            }
             std::optional<int64_t> staticIndex =
                 evalConstInt(plan_, lowering_, node.operands[1]);
             if (staticIndex && *staticIndex >= 0)
             {
-                const int64_t baseWidth = graph_.getValue(operands[0]).width();
                 const int64_t start = *staticIndex * static_cast<int64_t>(width);
                 const int64_t end = start + static_cast<int64_t>(width) - 1;
                 if (baseWidth <= 0 || (end >= start && end < baseWidth))
@@ -21508,11 +21530,16 @@ private:
                          node.location);
             graph_.addOperand(op, operands[0]);
             graph_.addOperand(op, operands[1]);
-            graph_.setAttr(op, "sliceWidth", static_cast<int64_t>(width));
             wolvrix::lib::grh::SymbolId sym =
                 makeInternalValueSymbol();
+            const int64_t resultWidth =
+                (!baseShape.empty() && baseShape.front() > 0) ? baseWidth / baseShape.front()
+                                                              : static_cast<int64_t>(width);
+            const std::span<const int64_t> resultShape =
+                baseShape.size() > 1 ? baseShape.subspan(1) : std::span<const int64_t>{};
             wolvrix::lib::grh::ValueId result =
-                graph_.createValue(sym, width, false, node.valueType);
+                graph_.createValue(sym, static_cast<int32_t>(resultWidth), false, node.valueType,
+                                   resultShape);
             graph_.addResult(op, result);
             valueByExpr_[id] = result;
             return result;

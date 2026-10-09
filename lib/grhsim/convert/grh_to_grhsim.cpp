@@ -618,6 +618,23 @@ namespace wolvrix::lib::grhsim
                 parameters.push_back(Parameter{model->intern(normalizedParameterName(entry.key)),
                                                copyAttribute(entry.value)});
             }
+            if (op.kind() == OperationKind::kSliceArray)
+            {
+                // stage-02: GRH kSliceArray no longer carries sliceWidth; the
+                // grhsim core.compute.sliceArray op keeps its sliceWidth
+                // parameter (= element width) until the stage-06 multi-index
+                // rework. Only single-index form is supported here.
+                if (operands.size() != 2 || results.empty())
+                {
+                    diagnostics.error("kSliceArray with != 1 index operands is not supported by the "
+                                      "grhsim lowering yet (stage-06)",
+                                      std::string(op.symbolText()));
+                    continue;
+                }
+                parameters.push_back(Parameter{
+                    model->intern("sliceWidth"),
+                    static_cast<int64_t>(graph->valueWidth(op.results().front()))});
+            }
 
             // Event-sensitive ops carry the raw event annotation for
             // grhsim.lower-edge-detect: the trailing len(event_edges) operands

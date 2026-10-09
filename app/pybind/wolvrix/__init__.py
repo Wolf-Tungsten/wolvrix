@@ -479,8 +479,6 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
     compiled = list(args)
     if canonical_name == "hier-flatten":
         compiled.extend(_compile_hier_flatten_kwargs(named))
-    elif canonical_name == "comb-lane-pack":
-        compiled.extend(_compile_comb_lane_pack_kwargs(named))
     elif canonical_name == "comb-loop-elim":
         compiled.extend(_compile_comb_loop_elim_kwargs(named))
     elif canonical_name == "simplify":
@@ -550,46 +548,6 @@ def _compile_comb_loop_elim_kwargs(named: dict[str, Any]) -> list[str]:
     if output_key is not None:
         out.extend(["-output-key", str(output_key)])
     _ensure_no_extra_named("comb-loop-elim", local)
-    return out
-
-
-def _compile_comb_lane_pack_kwargs(named: dict[str, Any]) -> list[str]:
-    local = dict(named)
-    out: list[str] = []
-    min_group_size = _pop_named(local, "min_group_size", None)
-    if min_group_size is not None:
-        out.extend(["-min-group-size", str(min_group_size)])
-    max_group_size = _pop_named(local, "max_group_size", None)
-    if max_group_size is not None:
-        out.extend(["-max-group-size", str(max_group_size)])
-    min_packed_width = _pop_named(local, "min_packed_width", None)
-    if min_packed_width is not None:
-        out.extend(["-min-packed-width", str(min_packed_width)])
-    max_packed_width = _pop_named(local, "max_packed_width", None)
-    if max_packed_width is not None:
-        out.extend(["-max-packed-width", str(max_packed_width)])
-    max_tree_nodes = _pop_named(local, "max_tree_nodes", None)
-    if max_tree_nodes is not None:
-        out.extend(["-max-tree-nodes", str(max_tree_nodes)])
-    max_root_gap = _pop_named(local, "max_root_gap", None)
-    if max_root_gap is not None:
-        out.extend(["-max-root-gap", str(max_root_gap)])
-    require_declared_roots = _pop_named(local, "require_declared_roots", None)
-    if require_declared_roots is not None:
-        out.extend(["-require-declared-roots", "true" if require_declared_roots else "false"])
-    enable_declared_roots = _pop_named(local, "enable_declared_roots", None)
-    if enable_declared_roots is not None:
-        out.extend(["-enable-declared-roots", "true" if enable_declared_roots else "false"])
-    enable_storage_data_roots = _pop_named(local, "enable_storage_data_roots", None)
-    if enable_storage_data_roots is not None:
-        out.extend(["-enable-storage-data-roots", "true" if enable_storage_data_roots else "false"])
-    enable_mux = _pop_named(local, "enable_mux", None)
-    if enable_mux is not None:
-        out.extend(["-enable-mux", "true" if enable_mux else "false"])
-    output_key = _pop_named(local, "out_comb_lane_pack_report", None)
-    if output_key is not None:
-        out.extend(["-output-key", str(output_key)])
-    _ensure_no_extra_named("comb-lane-pack", local)
     return out
 
 

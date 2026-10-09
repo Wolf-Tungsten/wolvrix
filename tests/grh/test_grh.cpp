@@ -60,7 +60,8 @@ int main()
         ValueId sumCopy = graph.createValue(symSumCopy, 8, false);
         ValueId lane1 = graph.createValue(symLane1, 3, false);
         ValueId lane0 = graph.createValue(symLane0, 3, false);
-        ValueId packed = graph.createValue(symPacked, 6, false);
+        const std::vector<int64_t> packedShape{2};
+        ValueId packed = graph.createValue(symPacked, 6, false, ValueType::Logic, packedShape);
         ValueId packedIndex = graph.createValue(symPackedIndex, 1, false);
         ValueId packedOut = graph.createValue(symPackedOut, 3, false);
 
@@ -123,7 +124,6 @@ int main()
         graph.addOperand(packedSlice, packed);
         graph.addOperand(packedSlice, packedIndex);
         graph.addResult(packedSlice, packedOut);
-        graph.setAttr(packedSlice, "sliceWidth", AttributeValue(int64_t(3)));
 
         const Value aValue = graph.getValue(a);
         const auto aUsers = aValue.users();
@@ -520,12 +520,12 @@ int main()
             return fail("Parsed packed slice operation missing");
         }
         const Operation parsedPackedSlice = parsedGraph->getOperation(parsedPackedSliceId);
-        auto parsedSliceWidth = parsedPackedSlice.attr("sliceWidth");
+        const wolvrix::lib::grh::ValueId parsedPackedBase = parsedPackedSlice.operands().front();
+        const auto parsedBaseShape = parsedGraph->valueShape(parsedPackedBase);
         if (parsedPackedSlice.kind() != OperationKind::kSliceArray ||
             parsedPackedSlice.operands().size() != 2 ||
             parsedPackedSlice.results().size() != 1 ||
-            !parsedSliceWidth ||
-            *parsedSliceWidth != AttributeValue(int64_t(3)))
+            parsedBaseShape.size() != 1 || parsedBaseShape.front() != 2)
         {
             return fail("Packed kSliceArray did not round-trip");
         }

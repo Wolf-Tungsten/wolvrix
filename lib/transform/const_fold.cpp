@@ -527,7 +527,6 @@ namespace wolvrix::lib::transform
                 break;
             }
             case wolvrix::lib::grh::OperationKind::kSliceDynamic:
-            case wolvrix::lib::grh::OperationKind::kSliceArray:
             {
                 auto widthOpt = getIntAttr(graph, op, "sliceWidth");
                 if (!widthOpt)
@@ -545,6 +544,61 @@ namespace wolvrix::lib::transform
                 const slang::SVInt &offset = operands[1];
                 slang::SVInt shifted = input.lshr(offset);
                 folded = shifted.trunc(static_cast<slang::bitwidth_t>(width));
+                break;
+            }
+            case wolvrix::lib::grh::OperationKind::kSliceArray:
+            {
+                // stage-02: no sliceWidth attr; geometry comes from the base
+                // value's shape. All operands are constants here.
+                const auto baseId = op.operands().front();
+                const std::span<const int64_t> shape = graph.valueShape(baseId);
+                if (shape.empty())
+                {
+                    onError("kSliceArray base value must carry a shape");
+                    return std::nullopt;
+                }
+                const int64_t baseWidth = graph.valueWidth(baseId);
+                int64_t elementCount = 1;
+                for (const int64_t dim : shape)
+                {
+                    elementCount *= dim;
+                }
+                if (elementCount <= 0 || baseWidth % elementCount != 0)
+                {
+                    onError("kSliceArray base shape does not divide its width");
+                    return std::nullopt;
+                }
+                const int64_t elementWidth = baseWidth / elementCount;
+                const std::size_t indexCount = operands.size() - 1;
+                if (indexCount < 1 || indexCount > shape.size())
+                {
+                    onError("kSliceArray index count out of range for base rank");
+                    return std::nullopt;
+                }
+                int64_t linearIndex = 0;
+                for (std::size_t i = 0; i < indexCount; ++i)
+                {
+                    auto idx = operands[i + 1].as<uint64_t>();
+                    if (!idx)
+                    {
+                        return std::nullopt;
+                    }
+                    linearIndex = linearIndex * shape[i] + static_cast<int64_t>(*idx);
+                }
+                int64_t subVolume = elementWidth;
+                for (std::size_t i = indexCount; i < shape.size(); ++i)
+                {
+                    subVolume *= shape[i];
+                }
+                const int64_t resultWidth = graph.valueWidth(op.results().front());
+                if (subVolume != resultWidth)
+                {
+                    onError("kSliceArray result width does not match the sliced sub-volume");
+                    return std::nullopt;
+                }
+                folded = operands[0]
+                             .lshr(static_cast<slang::bitwidth_t>(linearIndex * subVolume))
+                             .trunc(static_cast<slang::bitwidth_t>(resultWidth));
                 break;
             }
             default:

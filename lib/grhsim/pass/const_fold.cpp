@@ -199,7 +199,12 @@ namespace wolvrix::lib::grhsim
                 if (operands.size() != 2) return {};
                 const auto width = intParameter(model, params, "sliceWidth");
                 if (!width || *width <= 0) return {};
-                folded = operands[0].lshr(operands[1]).trunc(static_cast<slang::bitwidth_t>(*width));
+                // sliceDynamic offsets are bit offsets; sliceArray offsets are
+                // element indices and must be scaled by the element width.
+                const slang::SVInt offset =
+                    kind == "sliceArray" ? operands[1] * slang::SVInt(static_cast<uint64_t>(*width))
+                                         : operands[1];
+                folded = operands[0].lshr(offset).trunc(static_cast<slang::bitwidth_t>(*width));
             }
             else return {};
             if (folded.hasUnknown()) return {};

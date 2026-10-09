@@ -850,24 +850,35 @@ res[0] = oper[0] ? oper[1] : oper[2]
 
 
 
-**kSliceArray**（数组元素访问）
+**kSliceArray**（数组元素访问，stage-02 重定义）
 
 **operands**:
-- `oper[0]`: 扁平化数组信号（位宽 `W`）
-- `oper[1]`: 数组下标（无符号解释）
+- `oper[0]`: 数组 value（`shape = [d0, d1, ..., dn-1]` 非空，位宽 `W`）
+- `oper[1]`..`oper[k]` (`i0`..`ik-1`): 下标（标量 value，按无符号解释），`1 <= k <= n`
 
 **results**:
-- `res[0]`: 数组元素，位宽 `sliceWidth`
+- `res[0]`: 当 `k == n` 时为元素标量；当 `k < n` 时为 shape = `[dk, ..., dn-1]` 的子数组
 
-**attrs**:
-- `sliceWidth` (int64_t): 单个元素位宽，必须整除 `W`
+**attrs**: 无（不再有 `sliceWidth`；元素几何完全来自 oper[0] 的 shape）
 
 **语义**:
+
+元素位宽 `E = W / ∏shape`，结果等价于从 oper[0] 的扁平位表示中取出自
+`offset = (i0*d1*...*dn-1 + i1*d2*...*dn-1 + ... + ik-1*dk*...*dn-1) * E`
+开始的 `res[0].width` 位（行主序，见 §2.3）。
+
+任一下标 >= 对应维长度时行为为实现定义（仿真端按实现截断/钳位，不做跨实现约定）。
+
+**示例**（`a` 为 `UInt8[4][6]`，即 width=192、shape=[4,6]）：
 ```
-res[0] = oper[0][oper[1] * sliceWidth +: sliceWidth]
+%e = kSliceArray(%a, %i, %j)   // k=2=n，结果标量，width=8
+%r = kSliceArray(%a, %i)       // k=1<n，结果 width=48、shape=[6]（子数组）
 ```
 
-**说明**: 多维数组访问通过 `kSliceArray` 级联实现
+**分工惯例**：数组元素访问一律用 kSliceArray；纯位段访问用 kSliceStatic/kSliceDynamic
+（后者可用于任何 value，含带 shape 的——packed 扁平语义下合法）。verifier（`grh.verify`）
+强制：kSliceArray 的 oper[0] 必须 shape 非空、索引数 `1 <= k <= rank`、索引为标量、
+结果 width/shape 与 shape 几何一致。
 
 
 

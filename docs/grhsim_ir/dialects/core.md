@@ -113,7 +113,7 @@ operands、results 或运算语义。当前直接承接以下关键结构：
 | `kConcat` | `core.compute.concat` |
 | `kSliceStatic` | `core.compute.sliceStatic` |
 | `kSliceDynamic` | `core.compute.sliceDynamic` |
-| `kSliceArray` | `core.compute.sliceArray` |
+| `kSliceArray` | `core.compute.sliceArray`（过渡形态：转换层补 `sliceWidth` 参数 = 元素宽，仅支持单索引；多维索引承接待 stage-06） |
 | `kEq` | `core.compute.eq` |
 | `kLogicAnd` | `core.compute.logicAnd` |
 

@@ -339,6 +339,84 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceArray)
+                {
+                    // stage-02: array element select with all-constant indices
+                    // folds to a static bit slice; geometry comes from the
+                    // base value's shape (no sliceWidth attr anymore).
+                    const auto operands = op.operands();
+                    const auto results = op.results();
+                    if (operands.size() < 2 || results.size() != 1)
+                    {
+                        continue;
+                    }
+                    const wolvrix::lib::grh::ValueId base = operands[0];
+                    const std::span<const int64_t> shape = graph.valueShape(base);
+                    if (shape.empty())
+                    {
+                        continue;
+                    }
+                    const int64_t baseWidth = graph.getValue(base).width();
+                    int64_t elementCount = 1;
+                    for (const int64_t dim : shape)
+                    {
+                        elementCount *= dim;
+                    }
+                    if (elementCount <= 0 || baseWidth % elementCount != 0)
+                    {
+                        continue;
+                    }
+                    const int64_t elementWidth = baseWidth / elementCount;
+                    const std::size_t indexCount = operands.size() - 1;
+                    if (indexCount > shape.size())
+                    {
+                        continue;
+                    }
+                    int64_t linearIndex = 0;
+                    bool allConst = true;
+                    for (std::size_t i = 0; i < indexCount; ++i)
+                    {
+                        auto indexConst = getConstIntValue(graph, operands[i + 1]);
+                        if (!indexConst || *indexConst < 0)
+                        {
+                            allConst = false;
+                            break;
+                        }
+                        linearIndex = linearIndex * shape[i] + *indexConst;
+                    }
+                    if (!allConst)
+                    {
+                        continue;
+                    }
+                    int64_t subVolume = elementWidth;
+                    for (std::size_t i = indexCount; i < shape.size(); ++i)
+                    {
+                        subVolume *= shape[i];
+                    }
+                    const int64_t resultWidth = graph.getValue(results[0]).width();
+                    if (resultWidth != subVolume)
+                    {
+                        continue;
+                    }
+                    const int64_t start = linearIndex * subVolume;
+                    const int64_t end = start + subVolume - 1;
+                    if (start < 0 || end < start || end >= baseWidth)
+                    {
+                        continue;
+                    }
+
+                    graph.setAttr(opId, "sliceStart", start);
+                    graph.setAttr(opId, "sliceEnd", end);
+                    graph.setOpKind(opId, wolvrix::lib::grh::OperationKind::kSliceStatic);
+                    for (std::size_t i = operands.size(); i-- > 1;)
+                    {
+                        graph.eraseOperand(opId, i);
+                    }
+
+                    result.changed = true;
+                    logDebug("slice-index-const: converted array select to static range");
+                    continue;
+                }
                 if (op.kind() != wolvrix::lib::grh::OperationKind::kSliceDynamic)
                 {
                     continue;

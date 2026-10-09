@@ -2855,29 +2855,67 @@ namespace wolvrix::lib::emit
                 {
                     if (ops.size() >= 2)
                     {
-                        auto width = getAttribute<int64_t>(*graph, defOp, "sliceWidth");
-                        if (width)
+                        // stage-02: geometry comes from the base value's shape
+                        // (no sliceWidth attr); emit a row-major linearized
+                        // flat part-select.
+                        const std::span<const int64_t> shape = graph->valueShape(ops[0]);
+                        if (!shape.empty())
                         {
                             const int64_t operandWidth = graph->valueWidth(ops[0]);
-                            std::ostringstream exprStream;
-                            if (*width == 1 && operandWidth == 1)
+                            int64_t elementCount = 1;
+                            bool shapeOk = true;
+                            for (const int64_t dim : shape)
                             {
-                                exprStream << inlineExpr.valueExpr(ops[0]);
-                            }
-                            else
-                            {
-                                exprStream << parenIfNeeded(inlineExpr.valueExpr(ops[0])) << "[";
-                                if (*width == 1)
+                                if (dim <= 0 || elementCount > operandWidth)
                                 {
-                                    exprStream << parenIfNeeded(inlineExpr.valueExpr(ops[1]));
+                                    shapeOk = false;
+                                    break;
+                                }
+                                elementCount *= dim;
+                            }
+                            if (shapeOk && elementCount > 0 && operandWidth % elementCount == 0)
+                            {
+                                const int64_t elementWidth = operandWidth / elementCount;
+                                const std::size_t indexCount = ops.size() - 1;
+                                std::ostringstream offset;
+                                for (std::size_t i = 0; i < indexCount; ++i)
+                                {
+                                    int64_t stride = elementWidth;
+                                    for (std::size_t j = i + 1; j < shape.size(); ++j)
+                                    {
+                                        stride *= shape[j];
+                                    }
+                                    if (i != 0)
+                                    {
+                                        offset << " + ";
+                                    }
+                                    offset << parenIfNeeded(inlineExpr.valueExpr(ops[i + 1]));
+                                    if (stride != 1)
+                                    {
+                                        offset << " * " << stride;
+                                    }
+                                }
+                                const int64_t resultWidth = graph->valueWidth(defOp.results().front());
+                                std::ostringstream exprStream;
+                                if (resultWidth == operandWidth && elementCount == 1)
+                                {
+                                    exprStream << inlineExpr.valueExpr(ops[0]);
                                 }
                                 else
                                 {
-                                    exprStream << parenIfNeeded(inlineExpr.valueExpr(ops[1])) << " * " << *width << " +: " << *width;
+                                    exprStream << parenIfNeeded(inlineExpr.valueExpr(ops[0])) << "[";
+                                    if (resultWidth == 1)
+                                    {
+                                        exprStream << offset.str();
+                                    }
+                                    else
+                                    {
+                                        exprStream << offset.str() << " +: " << resultWidth;
+                                    }
+                                    exprStream << "]";
                                 }
-                                exprStream << "]";
+                                expr = exprStream.str();
                             }
-                            expr = exprStream.str();
                         }
                     }
                     break;
@@ -4125,13 +4163,39 @@ namespace wolvrix::lib::emit
                         reportError("kSliceArray missing operands or results", opContext);
                         break;
                     }
-                    auto width = getAttribute<int64_t>(*graph, op, "sliceWidth");
-                    if (!width)
+                    // stage-02: no sliceWidth attr; the element geometry comes
+                    // from the base value's shape. Values are declared flat,
+                    // so the multi-index select is linearized row-major into a
+                    // plain part-select.
+                    const std::span<const int64_t> shape = graph->valueShape(operands[0]);
+                    if (shape.empty())
                     {
-                        reportError("kSliceArray missing sliceWidth", opContext);
+                        reportError("kSliceArray base value has no shape", opContext);
                         break;
                     }
                     const int64_t operandWidth = graph->valueWidth(operands[0]);
+                    int64_t elementCount = 1;
+                    for (const int64_t dim : shape)
+                    {
+                        if (dim <= 0 || elementCount > operandWidth)
+                        {
+                            elementCount = 0;
+                            break;
+                        }
+                        elementCount *= dim;
+                    }
+                    if (elementCount <= 0 || operandWidth % elementCount != 0)
+                    {
+                        reportError("kSliceArray base shape does not divide its width", opContext);
+                        break;
+                    }
+                    const int64_t elementWidth = operandWidth / elementCount;
+                    const std::size_t indexCount = operands.size() - 1;
+                    if (indexCount > shape.size())
+                    {
+                        reportError("kSliceArray index count exceeds base rank", opContext);
+                        break;
+                    }
                     auto indexExpr = [&](wolvrix::lib::grh::ValueId indexId) -> std::string
                     {
                         if (auto literal = inlineConstExprFor(indexId))
@@ -4140,21 +4204,40 @@ namespace wolvrix::lib::emit
                         }
                         return valueExpr(indexId);
                     };
+                    std::ostringstream offset;
+                    for (std::size_t i = 0; i < indexCount; ++i)
+                    {
+                        int64_t stride = elementWidth;
+                        for (std::size_t j = i + 1; j < shape.size(); ++j)
+                        {
+                            stride *= shape[j];
+                        }
+                        if (i != 0)
+                        {
+                            offset << " + ";
+                        }
+                        offset << parenIfNeeded(indexExpr(operands[i + 1]));
+                        if (stride != 1)
+                        {
+                            offset << " * " << stride;
+                        }
+                    }
+                    const int64_t resultWidth = graph->valueWidth(results[0]);
                     std::ostringstream expr;
-                    if (*width == 1 && operandWidth == 1)
+                    if (resultWidth == operandWidth && indexCount == shape.size() && elementCount == 1)
                     {
                         expr << valueExpr(operands[0]);
                     }
                     else
                     {
                         expr << parenIfNeeded(valueExpr(operands[0])) << "[";
-                        if (*width == 1)
+                        if (resultWidth == 1)
                         {
-                            expr << parenIfNeeded(indexExpr(operands[1]));
+                            expr << offset.str();
                         }
                         else
                         {
-                            expr << parenIfNeeded(indexExpr(operands[1])) << " * " << *width << " +: " << *width;
+                            expr << offset.str() << " +: " << resultWidth;
                         }
                         expr << "]";
                     }

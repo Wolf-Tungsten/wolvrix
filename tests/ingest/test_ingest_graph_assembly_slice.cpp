@@ -154,17 +154,19 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
         case wolvrix::lib::grh::OperationKind::kSliceArray:
             if (op.operands().size() == 2) {
                 const wolvrix::lib::grh::Value operand = graph->getValue(op.operands()[0]);
-                const auto sliceWidth = intAttr(op, "sliceWidth");
-                if (operand.symbolText() == "packed_data" &&
-                    sliceWidth && *sliceWidth == 8) {
+                const auto baseShape = graph->valueShape(op.operands()[0]);
+                if (baseShape.empty() || baseShape.front() <= 0 ||
+                    operand.width() % baseShape.front() != 0) {
+                    break;
+                }
+                const int64_t elementWidth = operand.width() / baseShape.front();
+                if (operand.symbolText() == "packed_data" && elementWidth == 8) {
                     hasPackedDynamicLaneSliceArray = true;
                 }
-                if (operand.symbolText() == "small_lanes" &&
-                    sliceWidth && *sliceWidth == 3) {
+                if (operand.symbolText() == "small_lanes" && elementWidth == 3) {
                     hasSmallDynamicLaneSliceArray = true;
                 }
-                if (operand.symbolText() == "upto_lanes" &&
-                    sliceWidth && *sliceWidth == 3) {
+                if (operand.symbolText() == "upto_lanes" && elementWidth == 3) {
                     const wolvrix::lib::grh::Value index =
                         graph->getValue(op.operands()[1]);
                     const wolvrix::lib::grh::OperationId def = index.definingOp();
@@ -270,10 +272,10 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
         return fail("Missing packed_data[9] kSliceStatic [72:79]");
     }
     if (!hasPackedDynamicLaneSliceArray) {
-        return fail("Missing packed_data[dyn_idx] kSliceArray with sliceWidth=8");
+        return fail("Missing packed_data[dyn_idx] kSliceArray with element width 8 from shape");
     }
     if (!hasSmallDynamicLaneSliceArray) {
-        return fail("Missing small_lanes[small_idx] kSliceArray with sliceWidth=3");
+        return fail("Missing small_lanes[small_idx] kSliceArray with element width 3 from shape");
     }
     if (!hasUptoDynamicLaneSliceArray) {
         return fail("Missing upto_lanes[upto_idx] kSliceArray with high-index lane adjustment");

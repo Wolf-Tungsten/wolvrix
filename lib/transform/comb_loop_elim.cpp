@@ -40,6 +40,7 @@ namespace wolvrix::lib::transform
             bool isFalseLoop = false;
             bool wasFalseLoopCandidate = false;
             bool analysisIncomplete = false;
+            bool hasDynamicArrayRead = false;
         };
 
         struct Scc
@@ -498,6 +499,105 @@ namespace wolvrix::lib::transform
             return static_cast<int64_t>(*value);
         }
 
+        // Geometry of a kSliceArray op (stage-02 semantics: operands
+        // [array, i0..ik-1], no attrs; row-major flat layout over the base
+        // shape). `selectable` is true when every index resolved to an
+        // in-bounds constant, in which case `offset`/`subVolume` give the
+        // exact selected bit range of the base. Otherwise the read is treated
+        // as dynamic: it may touch the whole array.
+        struct SliceArrayGeometry
+        {
+            int64_t elementWidth = 0;
+            int64_t subVolume = 0;
+            std::size_t indexCount = 0;
+            bool selectable = false;
+            int64_t offset = 0;
+        };
+
+        std::optional<SliceArrayGeometry> getSliceArrayGeometry(const Graph &graph, const Operation &op)
+        {
+            if (op.kind() != OperationKind::kSliceArray)
+            {
+                return std::nullopt;
+            }
+            const auto &operands = op.operands();
+            const auto &results = op.results();
+            if (operands.size() < 2 || results.size() != 1 ||
+                !operands[0].valid() || !results[0].valid())
+            {
+                return std::nullopt;
+            }
+            const ValueId baseId = operands[0];
+            const Value baseValue = graph.getValue(baseId);
+            const std::span<const int64_t> shape = baseValue.shape();
+            const int64_t baseWidth = baseValue.width();
+            if (shape.empty() || baseWidth <= 0)
+            {
+                return std::nullopt;
+            }
+            int64_t elementCount = 1;
+            for (const int64_t dim : shape)
+            {
+                if (dim <= 0 || elementCount > std::numeric_limits<int64_t>::max() / dim)
+                {
+                    return std::nullopt;
+                }
+                elementCount *= dim;
+            }
+            if (elementCount <= 0 || baseWidth % elementCount != 0)
+            {
+                return std::nullopt;
+            }
+            const std::size_t indexCount = operands.size() - 1;
+            if (indexCount < 1 || indexCount > shape.size())
+            {
+                return std::nullopt;
+            }
+            SliceArrayGeometry geometry;
+            geometry.elementWidth = baseWidth / elementCount;
+            geometry.indexCount = indexCount;
+            int64_t subVolume = geometry.elementWidth;
+            for (std::size_t i = indexCount; i < shape.size(); ++i)
+            {
+                subVolume *= shape[static_cast<std::size_t>(i)];
+            }
+            geometry.subVolume = subVolume;
+            if (subVolume <= 0 ||
+                graph.getValue(results[0]).width() != subVolume)
+            {
+                return std::nullopt;
+            }
+
+            int64_t linearIndex = 0;
+            for (std::size_t i = 0; i < indexCount; ++i)
+            {
+                const ValueId indexId = operands[i + 1];
+                if (!indexId.valid())
+                {
+                    return std::nullopt; // dynamic: invalid index operand
+                }
+                auto indexValue = getConstIntValue(graph, indexId);
+                if (!indexValue)
+                {
+                    return geometry; // dynamic index: whole-array interval
+                }
+                const int64_t dim = shape[i];
+                if (*indexValue < 0 || *indexValue >= dim)
+                {
+                    return geometry; // out-of-bounds constant: implementation-defined, be conservative
+                }
+                linearIndex = linearIndex * dim + *indexValue;
+            }
+            const int64_t offset = linearIndex * subVolume;
+            if (offset < 0 || offset > baseWidth - subVolume)
+            {
+                return geometry; // out of flat range: conservative
+            }
+            geometry.selectable = true;
+            geometry.offset = offset;
+            return geometry;
+        }
+
         bool dependsTransitivelyOn(const Graph &graph, ValueId valueId, ValueId targetId)
         {
             if (!valueId.valid() || !targetId.valid())
@@ -735,14 +835,50 @@ namespace wolvrix::lib::transform
             return true;
         }
 
-        bool buildRangeGraph(const LoopInfo &loop,
+        bool buildRangeGraph(LoopInfo &loop,
                              const Graph &graph,
+                             const CombLoopElimOptions &options,
                              RangeSuccMap &succ,
                              std::vector<RangeNode> &nodes,
                              bool &uncertain)
         {
             RangeNodeSet nodeSet;
             std::unordered_set<ValueId, ValueIdHash> loopSet(loop.loopValues.begin(), loop.loopValues.end());
+
+            // stage-05: arrays read through a dynamic (or out-of-bounds)
+            // kSliceArray index may touch any element, so for analysis the
+            // base value collapses to a single whole-array interval. Collect
+            // those bases up front so every range node of the same value is
+            // normalized consistently below.
+            std::unordered_set<ValueId, ValueIdHash> wholeIntervalValues;
+            if (options.enableArrayFragmentation && options.fixDynamicArrayLoops)
+            {
+                for (OperationId opId : loop.loopOps)
+                {
+                    if (!opId.valid())
+                    {
+                        continue;
+                    }
+                    const Operation op = graph.getOperation(opId);
+                    if (op.kind() != OperationKind::kSliceArray)
+                    {
+                        continue;
+                    }
+                    auto geometry = getSliceArrayGeometry(graph, op);
+                    if (geometry && geometry->selectable)
+                    {
+                        continue;
+                    }
+                    const auto &operands = op.operands();
+                    const auto &results = op.results();
+                    if (operands.size() >= 2 && results.size() == 1 &&
+                        loopSet.find(operands[0]) != loopSet.end() &&
+                        loopSet.find(results[0]) != loopSet.end())
+                    {
+                        wholeIntervalValues.insert(operands[0]);
+                    }
+                }
+            }
 
             for (OperationId opId : loop.loopOps)
             {
@@ -879,8 +1015,90 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kSliceArray:
-                    uncertain = true;
-                    return false;
+                {
+                    // stage-05: array element reads are no longer an analysis
+                    // black hole. Constant in-bounds indices map to an exact
+                    // row-major bit range of the base; a dynamic index is
+                    // modeled conservatively as a whole-array interval.
+                    if (!options.enableArrayFragmentation)
+                    {
+                        uncertain = true;
+                        return false;
+                    }
+                    auto geometry = getSliceArrayGeometry(graph, op);
+                    if (!geometry)
+                    {
+                        uncertain = true;
+                        return false;
+                    }
+                    ValueId base = operands[0];
+                    ValueId resultId = results[0];
+                    const bool baseInLoop = loopSet.find(base) != loopSet.end();
+                    const bool resultInLoop = loopSet.find(resultId) != loopSet.end();
+                    if (!geometry->selectable)
+                    {
+                        if (baseInLoop && resultInLoop)
+                        {
+                            loop.hasDynamicArrayRead = true;
+                            if (!options.fixDynamicArrayLoops)
+                            {
+                                uncertain = true;
+                                return false;
+                            }
+                            BitRange baseRange{};
+                            BitRange resultRange{};
+                            if (!getFullRange(graph, base, baseRange) ||
+                                !getFullRange(graph, resultId, resultRange))
+                            {
+                                uncertain = true;
+                                return false;
+                            }
+                            addRangeEdge(succ, nodeSet, RangeNode{base, baseRange},
+                                         RangeNode{resultId, resultRange});
+                            // The selected element depends on the index value
+                            // itself; keep that dependency visible.
+                            for (std::size_t i = 1; i < operands.size(); ++i)
+                            {
+                                const ValueId indexId = operands[i];
+                                if (!indexId.valid() ||
+                                    loopSet.find(indexId) == loopSet.end())
+                                {
+                                    continue;
+                                }
+                                BitRange indexRange{};
+                                if (!getFullRange(graph, indexId, indexRange))
+                                {
+                                    uncertain = true;
+                                    return false;
+                                }
+                                addRangeEdge(succ, nodeSet, RangeNode{indexId, indexRange},
+                                             RangeNode{resultId, resultRange});
+                            }
+                        }
+                        break;
+                    }
+                    if (baseInLoop && resultInLoop)
+                    {
+                        BitRange baseRange{};
+                        BitRange resultRange{};
+                        if (!getFullRange(graph, base, baseRange) ||
+                            !getFullRange(graph, resultId, resultRange))
+                        {
+                            uncertain = true;
+                            return false;
+                        }
+                        BitRange sliceRange{geometry->offset,
+                                            geometry->offset + geometry->subVolume - 1};
+                        if (!rangeWithin(sliceRange, baseRange))
+                        {
+                            uncertain = true;
+                            return false;
+                        }
+                        addRangeEdge(succ, nodeSet, RangeNode{base, sliceRange},
+                                     RangeNode{resultId, resultRange});
+                    }
+                    break;
+                }
                 case OperationKind::kAssign:
                 {
                     if (operands.size() != 1 || results.size() != 1)
@@ -962,6 +1180,43 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            if (!wholeIntervalValues.empty())
+            {
+                // Collapse every range node of a dynamically-read array to its
+                // whole-value interval so the SCC check sees the conservative
+                // dependency as one node.
+                auto normalizeNode = [&](const RangeNode &node) -> RangeNode
+                {
+                    if (wholeIntervalValues.find(node.value) == wholeIntervalValues.end())
+                    {
+                        return node;
+                    }
+                    BitRange full{};
+                    if (!getFullRange(graph, node.value, full))
+                    {
+                        return node;
+                    }
+                    return RangeNode{node.value, full};
+                };
+                RangeSuccMap normalizedSucc;
+                normalizedSucc.reserve(succ.size());
+                RangeNodeSet normalizedNodes;
+                for (const auto &entry : succ)
+                {
+                    const RangeNode src = normalizeNode(entry.first);
+                    auto &dstList = normalizedSucc[src];
+                    normalizedNodes.insert(src);
+                    for (const RangeNode &dst : entry.second)
+                    {
+                        const RangeNode normalizedDst = normalizeNode(dst);
+                        dstList.push_back(normalizedDst);
+                        normalizedNodes.insert(normalizedDst);
+                    }
+                }
+                succ = std::move(normalizedSucc);
+                nodeSet = std::move(normalizedNodes);
+            }
+
             nodes.assign(nodeSet.begin(), nodeSet.end());
             return true;
         }
@@ -1004,12 +1259,15 @@ namespace wolvrix::lib::transform
             return false;
         }
 
-        bool classifyFalseLoop(const LoopInfo &loop, const Graph &graph, bool &analysisIncomplete)
+        bool classifyFalseLoop(LoopInfo &loop,
+                               const Graph &graph,
+                               const CombLoopElimOptions &options,
+                               bool &analysisIncomplete)
         {
             RangeSuccMap rangeSucc;
             std::vector<RangeNode> rangeNodes;
             bool uncertain = false;
-            if (!buildRangeGraph(loop, graph, rangeSucc, rangeNodes, uncertain))
+            if (!buildRangeGraph(loop, graph, options, rangeSucc, rangeNodes, uncertain))
             {
                 analysisIncomplete = true;
                 return false;
@@ -1036,6 +1294,13 @@ namespace wolvrix::lib::transform
                 }
                 if (scc.nodes.size() == 1 && hasSelfLoop(scc.nodes.front(), rangeSucc))
                 {
+                    return false;
+                }
+                if (loop.hasDynamicArrayRead)
+                {
+                    // A dynamic array read may observe any element of its
+                    // base, so a residual range-level cycle is undecidable
+                    // rather than a fixable false loop.
                     return false;
                 }
                 if (hasOverlapOnSameValue(scc))
@@ -1719,6 +1984,25 @@ namespace wolvrix::lib::transform
                     edges.push_back(MappingEdge{operands[0], resultId, sliceLow, 0, sliceWidth});
                     break;
                 }
+                case OperationKind::kSliceArray:
+                {
+                    // stage-05: constant in-bounds indices are a plain copy
+                    // edge from the selected base range. A dynamic index has
+                    // no static mapping; the op contributes no cut points so
+                    // its result stays one whole fragment.
+                    auto geometry = getSliceArrayGeometry(graph, op);
+                    if (!geometry)
+                    {
+                        return false;
+                    }
+                    if (!geometry->selectable)
+                    {
+                        break;
+                    }
+                    edges.push_back(MappingEdge{operands[0], resultId, geometry->offset, 0,
+                                                geometry->subVolume});
+                    break;
+                }
                 case OperationKind::kConcat:
                 {
                     if (operands.empty())
@@ -1850,9 +2134,13 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        // `unsplittable` values (e.g. results of dynamic-index kSliceArray
+        // reads) are defined monolithically and must stay a single
+        // whole-value fragment; no cut points are ever inserted into them.
         bool buildLoopPartitions(const Graph &graph,
                                  const std::vector<ValueId> &loopValues,
                                  const std::vector<MappingEdge> &edges,
+                                 const std::unordered_set<ValueId, ValueIdHash> &unsplittable,
                                  std::unordered_map<ValueId, std::vector<BitRange>, ValueIdHash> &segments)
         {
             std::unordered_set<ValueId, ValueIdHash> loopSet(loopValues.begin(), loopValues.end());
@@ -1872,13 +2160,15 @@ namespace wolvrix::lib::transform
 
             for (const auto &edge : edges)
             {
-                if (loopSet.find(edge.dst) != loopSet.end())
+                if (loopSet.find(edge.dst) != loopSet.end() &&
+                    unsplittable.find(edge.dst) == unsplittable.end())
                 {
                     auto &cuts = boundaries[edge.dst];
                     cuts.insert(edge.dstLow);
                     cuts.insert(edge.dstLow + edge.width);
                 }
-                if (loopSet.find(edge.src) != loopSet.end())
+                if (loopSet.find(edge.src) != loopSet.end() &&
+                    unsplittable.find(edge.src) == unsplittable.end())
                 {
                     auto &cuts = boundaries[edge.src];
                     cuts.insert(edge.srcLow);
@@ -1902,24 +2192,32 @@ namespace wolvrix::lib::transform
                     {
                         auto &srcCuts = boundaries[edge.src];
                         auto &dstCuts = boundaries[edge.dst];
+                        const bool srcMutable = unsplittable.find(edge.src) == unsplittable.end();
+                        const bool dstMutable = unsplittable.find(edge.dst) == unsplittable.end();
                         const int64_t srcEnd = edge.srcLow + edge.width;
                         const int64_t dstEnd = edge.dstLow + edge.width;
-                        for (auto it = srcCuts.lower_bound(edge.srcLow);
-                             it != srcCuts.end() && *it <= srcEnd; ++it)
+                        if (dstMutable)
                         {
-                            const int64_t mapped = edge.dstLow + (*it - edge.srcLow);
-                            if (dstCuts.insert(mapped).second)
+                            for (auto it = srcCuts.lower_bound(edge.srcLow);
+                                 it != srcCuts.end() && *it <= srcEnd; ++it)
                             {
-                                changed = true;
+                                const int64_t mapped = edge.dstLow + (*it - edge.srcLow);
+                                if (dstCuts.insert(mapped).second)
+                                {
+                                    changed = true;
+                                }
                             }
                         }
-                        for (auto it = dstCuts.lower_bound(edge.dstLow);
-                             it != dstCuts.end() && *it <= dstEnd; ++it)
+                        if (srcMutable)
                         {
-                            const int64_t mapped = edge.srcLow + (*it - edge.dstLow);
-                            if (srcCuts.insert(mapped).second)
+                            for (auto it = dstCuts.lower_bound(edge.dstLow);
+                                 it != dstCuts.end() && *it <= dstEnd; ++it)
                             {
-                                changed = true;
+                                const int64_t mapped = edge.srcLow + (*it - edge.dstLow);
+                                if (srcCuts.insert(mapped).second)
+                                {
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -1966,8 +2264,10 @@ namespace wolvrix::lib::transform
 
         bool splitFalseLoop(Graph &graph,
                             const LoopInfo &loop,
+                            const CombLoopElimOptions &options,
                             std::size_t &valuesSplit,
                             std::size_t &opsRewritten,
+                            bool &hitFragmentCap,
                             const std::function<void(const Operation &, std::string)> &onError)
         {
             std::vector<MappingEdge> edges;
@@ -1976,13 +2276,55 @@ namespace wolvrix::lib::transform
                 return false;
             }
 
+            std::unordered_set<ValueId, ValueIdHash> loopSet(loop.loopValues.begin(), loop.loopValues.end());
+
+            // stage-05: results of dynamic-index kSliceArray reads are defined
+            // monolithically (the selected element is not statically known),
+            // so they must stay one whole fragment.
+            std::unordered_set<ValueId, ValueIdHash> unsplittable;
+            for (OperationId opId : loop.loopOps)
+            {
+                if (!opId.valid())
+                {
+                    continue;
+                }
+                const Operation op = graph.getOperation(opId);
+                if (op.kind() != OperationKind::kSliceArray)
+                {
+                    continue;
+                }
+                const auto &results = op.results();
+                if (results.size() != 1 || !results[0].valid() ||
+                    loopSet.find(results[0]) == loopSet.end())
+                {
+                    continue;
+                }
+                auto geometry = getSliceArrayGeometry(graph, op);
+                if (!geometry || !geometry->selectable)
+                {
+                    unsplittable.insert(results[0]);
+                }
+            }
+
             std::unordered_map<ValueId, std::vector<BitRange>, ValueIdHash> segments;
-            if (!buildLoopPartitions(graph, loop.loopValues, edges, segments))
+            if (!buildLoopPartitions(graph, loop.loopValues, edges, unsplittable, segments))
             {
                 return false;
             }
 
-            std::unordered_set<ValueId, ValueIdHash> loopSet(loop.loopValues.begin(), loop.loopValues.end());
+            hitFragmentCap = false;
+            if (options.maxFragmentsPerValue > 0)
+            {
+                for (const auto &entry : segments)
+                {
+                    if (entry.second.size() > options.maxFragmentsPerValue)
+                    {
+                        hitFragmentCap = true;
+                        return false;
+                    }
+                }
+            }
+
             std::unordered_map<RangeNode, ValueId, RangeNodeHash> fragmentMap;
             fragmentMap.reserve(loop.loopValues.size() * 2);
 
@@ -2006,9 +2348,25 @@ namespace wolvrix::lib::transform
                     {
                         return false;
                     }
-                    ValueId frag = graph.createValue(static_cast<int32_t>(width),
-                                                     baseValue.isSigned(),
-                                                     baseValue.type());
+                    // A fragment that still covers a shaped value as a whole
+                    // keeps the array shape (e.g. as a kSliceArray result or
+                    // base); sub-range fragments are plain scalar views.
+                    const bool coversWholeValue =
+                        range.low == 0 && range.high + 1 == baseValue.width();
+                    ValueId frag = ValueId::invalid();
+                    if (coversWholeValue && !baseValue.shape().empty())
+                    {
+                        frag = graph.createValue(static_cast<int32_t>(width),
+                                                 baseValue.isSigned(),
+                                                 baseValue.type(),
+                                                 baseValue.shape());
+                    }
+                    else
+                    {
+                        frag = graph.createValue(static_cast<int32_t>(width),
+                                                 baseValue.isSigned(),
+                                                 baseValue.type());
+                    }
                     fragmentMap.emplace(RangeNode{valueId, range}, frag);
                 }
             }
@@ -2165,7 +2523,8 @@ namespace wolvrix::lib::transform
                     graph.addOperand(concatOp, entry.second);
                 }
                 const Value value = graph.getValue(valueId);
-                ValueId fullView = graph.createValue(value.width(), value.isSigned(), value.type());
+                ValueId fullView = graph.createValue(value.width(), value.isSigned(), value.type(),
+                                                     value.shape());
                 graph.addResult(concatOp, fullView);
                 fullViewCache.emplace(valueId, fullView);
                 return fullView;
@@ -2373,6 +2732,86 @@ namespace wolvrix::lib::transform
                             return false;
                         }
                     }
+                    break;
+                }
+                case OperationKind::kSliceArray:
+                {
+                    // stage-05: constant in-bounds indices behave like a
+                    // static slice at the selected element range. A dynamic
+                    // index cannot be split per element: the result stays one
+                    // whole fragment and the read is re-pointed at the
+                    // reassembled full view of the (possibly split) base.
+                    auto geometry = getSliceArrayGeometry(graph, op);
+                    if (!geometry)
+                    {
+                        return false;
+                    }
+                    const ValueId baseId = operands[0];
+                    if (geometry->selectable)
+                    {
+                        const int64_t subVolume = geometry->subVolume;
+                        for (const auto &seg : resultSegments)
+                        {
+                            if (seg.low < 0 || seg.high < seg.low || seg.high >= subVolume)
+                            {
+                                return false;
+                            }
+                            BitRange baseRange{geometry->offset + seg.low,
+                                               geometry->offset + seg.high};
+                            auto srcFrag = getFragment(baseId, baseRange);
+                            auto dstFrag = getFragment(resultId, seg);
+                            if (!srcFrag || !dstFrag || !addPair(opId, *srcFrag, *dstFrag))
+                            {
+                                return false;
+                            }
+                        }
+                        break;
+                    }
+                    if (resultSegments.size() != 1)
+                    {
+                        return false;
+                    }
+                    const auto &seg = resultSegments.front();
+                    const int64_t resultWidth = graph.getValue(resultId).width();
+                    if (seg.low != 0 || seg.high + 1 != resultWidth)
+                    {
+                        return false;
+                    }
+                    std::vector<ValueId> newOperands;
+                    newOperands.reserve(operands.size());
+                    auto baseView = getFullView(baseId);
+                    if (!baseView)
+                    {
+                        return false;
+                    }
+                    newOperands.push_back(*baseView);
+                    for (std::size_t i = 1; i < operands.size(); ++i)
+                    {
+                        if (!operands[i].valid())
+                        {
+                            return false;
+                        }
+                        auto indexView = getFullView(operands[i]);
+                        if (!indexView)
+                        {
+                            return false;
+                        }
+                        newOperands.push_back(*indexView);
+                    }
+                    auto dstFrag = getFragment(resultId, seg);
+                    if (!dstFrag)
+                    {
+                        return false;
+                    }
+                    if (!definedFragments.insert(*dstFrag).second)
+                    {
+                        return false;
+                    }
+                    customOps.emplace(opId, CustomRewrite{op.kind(),
+                                                          std::move(newOperands),
+                                                          resultId,
+                                                          resultSegments,
+                                                          op.srcLoc()});
                     break;
                 }
                 case OperationKind::kConcat:
@@ -2936,8 +3375,10 @@ namespace wolvrix::lib::transform
             {
                 const OperationId opId = entry.first;
                 const auto &custom = entry.second;
-                if (isCompareOp(custom.kind))
+                if (isCompareOp(custom.kind) || custom.kind == OperationKind::kSliceArray)
                 {
+                    // kSliceArray (dynamic index) and compares share the
+                    // "rewrite in place with reassembled operands" shape.
                     auto dstFrag = getFragment(custom.result, custom.resultSegments.front());
                     if (!dstFrag)
                     {
@@ -3107,7 +3548,11 @@ namespace wolvrix::lib::transform
                     {
                         graph.addOperand(concatOp, entry.second);
                     }
-                    viewValue = graph.createValue(value.width(), value.isSigned(), value.type());
+                    // Keep the original array shape on the reassembled view so
+                    // downstream shape-aware users (kSliceArray, ports) stay
+                    // verifier-legal.
+                    viewValue = graph.createValue(value.width(), value.isSigned(), value.type(),
+                                                  value.shape());
                     graph.addResult(concatOp, viewValue);
                 }
                 viewMap.emplace(valueId, viewValue);
@@ -3218,6 +3663,8 @@ namespace wolvrix::lib::transform
         std::size_t totalTrueLoops = 0;
         std::size_t totalFalseLoops = 0;
         std::size_t totalFalseLoopsFixed = 0;
+        std::size_t totalDynArrayLoops = 0;
+        std::size_t totalFragCapped = 0;
         std::vector<CombLoopReport> sessionReports;
 
         for (const auto &entry : design().graphs())
@@ -3273,6 +3720,7 @@ namespace wolvrix::lib::transform
                     {
                         loop.isFalseLoop = false;
                         loop.analysisIncomplete = false;
+                        loop.hasDynamicArrayRead = false;
                     }
                     trueLoops = loops.size();
                     return;
@@ -3280,7 +3728,8 @@ namespace wolvrix::lib::transform
                 for (auto &loop : loops)
                 {
                     bool incomplete = false;
-                    loop.isFalseLoop = classifyFalseLoop(loop, graph, incomplete);
+                    loop.hasDynamicArrayRead = false;
+                    loop.isFalseLoop = classifyFalseLoop(loop, graph, options_, incomplete);
                     loop.analysisIncomplete = incomplete;
                     (void)incomplete;
                     if (loop.isFalseLoop)
@@ -3362,6 +3811,14 @@ namespace wolvrix::lib::transform
                 {
                     analysisNote = "analysis=incomplete";
                 }
+                if (loop.hasDynamicArrayRead)
+                {
+                    if (!analysisNote.empty())
+                    {
+                        analysisNote.push_back(' ');
+                    }
+                    analysisNote.append("dynamic-array-read");
+                }
                 report.description = describeLoop(loop, graph, report.sourceLocation, status, analysisNote);
                 if (loop.wasFalseLoopCandidate || loop.isFalseLoop)
                 {
@@ -3389,10 +3846,12 @@ namespace wolvrix::lib::transform
             std::size_t totalValuesSplit = 0;
             std::size_t totalOpsRewritten = 0;
             std::size_t totalSliceRetargeted = 0;
+            std::size_t totalFragCappedLoops = 0;
             std::size_t falseLoopsFixed = 0;
             std::size_t initialLoopsDetected = 0;
             std::size_t initialTrueLoops = 0;
             std::size_t initialFalseLoops = 0;
+            std::size_t initialDynArrayLoops = 0;
             bool graphChanged = false;
 
             {
@@ -3407,6 +3866,13 @@ namespace wolvrix::lib::transform
                     initialLoopsDetected = initialLoops.size();
                     initialTrueLoops = trueLoops;
                     initialFalseLoops = falseLoops;
+                    for (const auto &loop : initialLoops)
+                    {
+                        if (loop.hasDynamicArrayRead)
+                        {
+                            ++initialDynArrayLoops;
+                        }
+                    }
                 }
             }
 
@@ -3450,8 +3916,10 @@ namespace wolvrix::lib::transform
                         }
                         std::size_t loopValuesSplit = 0;
                         std::size_t loopOpsRewritten = 0;
+                        bool hitFragmentCap = false;
                         std::optional<SrcLoc> loopLoc = findLoopSrcLoc(graph, loop.loopValues, loop.loopOps);
-                        if (splitFalseLoop(graph, loop, loopValuesSplit, loopOpsRewritten, onError))
+                        if (splitFalseLoop(graph, loop, options_, loopValuesSplit, loopOpsRewritten,
+                                           hitFragmentCap, onError))
                         {
                             changedThisIter = true;
                             totalValuesSplit += loopValuesSplit;
@@ -3467,6 +3935,15 @@ namespace wolvrix::lib::transform
                             detail.append(std::to_string(loopOpsRewritten));
                             detail.append(" iter=");
                             detail.append(std::to_string(iter));
+                            logDebug(std::move(detail));
+                        }
+                        else if (hitFragmentCap)
+                        {
+                            ++totalFragCappedLoops;
+                            std::string detail = "comb-loop-elim skipped split (fragment cap exceeded) graph=";
+                            detail.append(graph.symbol());
+                            detail.append(" max-fragments-per-value=");
+                            detail.append(std::to_string(options_.maxFragmentsPerValue));
                             logDebug(std::move(detail));
                         }
                     }
@@ -3566,6 +4043,10 @@ namespace wolvrix::lib::transform
                 stats.append(std::to_string(totalOpsRewritten));
                 stats.append(" fix-iters=");
                 stats.append(std::to_string(fixIterations));
+                stats.append(" dyn-array=");
+                stats.append(std::to_string(initialDynArrayLoops));
+                stats.append(" frag-capped=");
+                stats.append(std::to_string(totalFragCappedLoops));
                 logInfo(std::move(stats));
             }
 
@@ -3573,6 +4054,8 @@ namespace wolvrix::lib::transform
             totalTrueLoops += initialTrueLoops;
             totalFalseLoops += initialFalseLoops;
             totalFalseLoopsFixed += falseLoopsFixed;
+            totalDynArrayLoops += initialDynArrayLoops;
+            totalFragCapped += totalFragCappedLoops;
         }
 
         std::string summary = "comb-loop-elim summary";
@@ -3584,6 +4067,10 @@ namespace wolvrix::lib::transform
         summary.append(std::to_string(totalFalseLoops));
         summary.append(" false-fixed=");
         summary.append(std::to_string(totalFalseLoopsFixed));
+        summary.append(" dyn-array=");
+        summary.append(std::to_string(totalDynArrayLoops));
+        summary.append(" frag-capped=");
+        summary.append(std::to_string(totalFragCapped));
         if (totalLoopsDetected > 0)
         {
             info(summary);

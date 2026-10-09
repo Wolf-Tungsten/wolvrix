@@ -38,10 +38,50 @@ At a high level, the pass:
 
 1. builds a dependency graph over values
 2. runs Tarjan SCC detection
-3. treats constants, register read ports, latch read ports, and DPI-C calls as boundaries
+3. treats constants, register read ports (including `kRegisterReadArrayPort`), latch read ports, and DPI-C calls as boundaries
 4. performs a finer-grained bit-range analysis for possible false loops
 
 If the apparent loop is only caused by non-overlapping bit usage, the pass can split values and repair it. That is considered a false loop.
+
+## Array Values And Fragmentation
+
+Array values (values with a non-empty `shape`) participate in loops like any
+other value: shape is a pure structural view, so the bit-range machinery works
+on the flattened bits. The array-specific rules are:
+
+- `kSliceArray` with constant in-bounds indices is analyzed exactly: the
+  selected element/sub-array maps to a row-major bit range of the base value,
+  so cross-element false loops such as `a[i] -> b[i] -> a[j]` (with disjoint
+  elements) are classified and repaired like scalar bit-slice false loops.
+- `kSliceArray` with a dynamic (or out-of-bounds) index is modeled
+  conservatively: the read may touch **any** element, so the base array
+  collapses to a single whole-array interval in the range analysis. A loop
+  that still shows a range-level cycle under this model is reported as
+  undecidable (`dynamic-array-read` note) instead of being split blindly.
+- When such a loop is acyclic at range granularity (the read result never
+  feeds back into the base array), the split repairs it: the dynamic read
+  result stays one whole fragment and the read is re-pointed at the
+  reassembled full view of the split base ("whole fragment + dynamic read
+  merge"). This is recorded in the stats as `dyn-array=N`.
+
+Fragmentation details:
+
+- fragments of scalar values are bit ranges (the pre-existing mechanism);
+  element boundaries of arrays simply become cut points
+- a fragment that still covers a shaped value as a whole keeps the array
+  shape, and reassembled full-view values inherit the original shape, so
+  downstream `kSliceArray` users and port bindings stay verifier-legal
+- `max-fragments-per-value` (default 4096) bounds fragmentation; a loop that
+  would exceed the cap is left intact and reported unresolved
+  (`frag-capped=N` in the stats line)
+- `-no-array-fragmentation` restores the pre-stage-05 behavior (any
+  `kSliceArray` aborts the loop analysis as incomplete);
+  `-no-fix-dynamic-array-loops` keeps the analysis but never rewrites loops
+  that contain a dynamic array read
+
+Splitting is always equivalence-preserving; a true loop whose bits genuinely
+feed back survives splitting and is re-detected on the next iteration, then
+reported as a true loop per `-fail-on-true-loop`.
 
 ## False-Loop Repair Strategy
 
@@ -366,7 +406,13 @@ This is mainly for later inspection or debugging. The primary output of the pass
 | `-fix-false-loops` / `-no-fix-false-loops` | true | whether to repair resolvable false loops |
 | `-max-fix-iterations` | `100` | maximum repair iterations |
 | `-fail-on-true-loop` | false | treat true loops as pass failure |
+| `-enable-array-fragmentation` / `-no-array-fragmentation` | true | array-aware loop analysis (`kSliceArray`); off restores the legacy "uncertain" behavior |
+| `-fix-dynamic-array-loops` / `-no-fix-dynamic-array-loops` | true | attempt whole-fragment repair of loops containing a dynamic-index `kSliceArray`; off reports them as undecidable |
+| `-max-fragments-per-value` | `4096` | fragment cap per value while splitting; `0` means unlimited; capped loops are left intact |
 | `-output-key` | empty | session key for an explicit loop report |
+
+The Python bindings expose the same knobs as `enable_array_fragmentation`,
+`fix_dynamic_array_loops`, and `max_fragments_per_value` named arguments.
 
 ## Diagnostic Raise-Level Interaction
 

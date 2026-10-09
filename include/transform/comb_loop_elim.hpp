@@ -39,6 +39,21 @@ namespace wolvrix::lib::transform
         // Treat true loops as pass failures.
         bool failOnTrueLoop = false;
 
+        // Enable array-aware loop analysis and fragmentation (kSliceArray
+        // leaves the "uncertain" black hole). When false, kSliceArray keeps
+        // the legacy behavior (analysis gives up on the loop).
+        bool enableArrayFragmentation = true;
+
+        // Maximum number of fragments produced per value while splitting a
+        // loop (0 means no limit). Loops exceeding the cap are left intact
+        // and reported as unresolved.
+        std::size_t maxFragmentsPerValue = 4096;
+
+        // Attempt to fix loops that contain a dynamic-index kSliceArray
+        // (whole-interval conservative analysis + full-view re-merge). When
+        // false, such loops are reported as undecidable without rewriting.
+        bool fixDynamicArrayLoops = true;
+
         // Optional session key used to store loop reports for later inspection.
         std::string outputKey;
     };

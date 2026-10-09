@@ -542,6 +542,19 @@ def _compile_comb_loop_elim_kwargs(named: dict[str, Any]) -> list[str]:
     max_fix_iterations = _pop_named(local, "max_fix_iterations", None)
     if max_fix_iterations is not None:
         out.extend(["-max-fix-iterations", str(max_fix_iterations)])
+    enable_array_fragmentation = _pop_named(local, "enable_array_fragmentation", None)
+    if enable_array_fragmentation is True:
+        out.append("-enable-array-fragmentation")
+    elif enable_array_fragmentation is False:
+        out.append("-no-array-fragmentation")
+    max_fragments_per_value = _pop_named(local, "max_fragments_per_value", None)
+    if max_fragments_per_value is not None:
+        out.extend(["-max-fragments-per-value", str(max_fragments_per_value)])
+    fix_dynamic_array_loops = _pop_named(local, "fix_dynamic_array_loops", None)
+    if fix_dynamic_array_loops is True:
+        out.append("-fix-dynamic-array-loops")
+    elif fix_dynamic_array_loops is False:
+        out.append("-no-fix-dynamic-array-loops")
     if _pop_named(local, "fail_on_true_loop", False):
         out.append("-fail-on-true-loop")
     output_key = _pop_named(local, "out_comb_loop_report", None)

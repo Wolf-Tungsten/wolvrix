@@ -1230,6 +1230,48 @@ namespace wolvrix::lib::transform
                 {
                     options.failOnTrueLoop = true;
                 }
+                else if (arg == "-enable-array-fragmentation" || arg == "-array-fragmentation")
+                {
+                    options.enableArrayFragmentation = true;
+                }
+                else if (arg == "-no-array-fragmentation" || arg == "-disable-array-fragmentation")
+                {
+                    options.enableArrayFragmentation = false;
+                }
+                else if (arg == "-fix-dynamic-array-loops")
+                {
+                    options.fixDynamicArrayLoops = true;
+                }
+                else if (arg == "-no-fix-dynamic-array-loops")
+                {
+                    options.fixDynamicArrayLoops = false;
+                }
+                else if (arg == "-max-fragments-per-value" || arg.starts_with("-max-fragments-per-value="))
+                {
+                    std::string_view value;
+                    if (arg == "-max-fragments-per-value")
+                    {
+                        if (i + 1 >= args.size())
+                        {
+                            error = "-max-fragments-per-value expects a value";
+                            return nullptr;
+                        }
+                        value = args[++i];
+                    }
+                    else
+                    {
+                        value = arg.substr(std::string_view("-max-fragments-per-value=").size());
+                    }
+                    try
+                    {
+                        options.maxFragmentsPerValue = static_cast<std::size_t>(std::stoull(std::string(value)));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -max-fragments-per-value value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-output-key")
                 {
                     if (i + 1 >= args.size())

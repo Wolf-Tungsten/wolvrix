@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "transform/comb_loop_elim.hpp"
 #include "core/transform.hpp"
+#include "transform/verify.hpp"
 
 #include <iostream>
 #include <string>
@@ -651,6 +652,658 @@ namespace
         return 0;
     }
 
+    wolvrix::lib::grh::ValueId makeArrayValue(wolvrix::lib::grh::Graph &graph,
+                                              const std::string &name,
+                                              int32_t elementWidth,
+                                              std::vector<int64_t> shape)
+    {
+        int64_t total = elementWidth;
+        for (const int64_t dim : shape)
+        {
+            total *= dim;
+        }
+        const wolvrix::lib::grh::SymbolId sym = graph.internSymbol(name);
+        return graph.createValue(sym, static_cast<int32_t>(total), false,
+                                 wolvrix::lib::grh::ValueType::Logic, shape);
+    }
+
+    wolvrix::lib::grh::OperationId makeSliceArray(wolvrix::lib::grh::Graph &graph,
+                                                  wolvrix::lib::grh::ValueId base,
+                                                  const std::vector<wolvrix::lib::grh::ValueId> &indices,
+                                                  wolvrix::lib::grh::ValueId result,
+                                                  const std::string &name)
+    {
+        const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                              graph.internSymbol(name));
+        graph.addOperand(op, base);
+        for (const auto index : indices)
+        {
+            graph.addOperand(op, index);
+        }
+        graph.addResult(op, result);
+        return op;
+    }
+
+    wolvrix::lib::grh::OperationId makeUnaryOp(wolvrix::lib::grh::Graph &graph,
+                                               wolvrix::lib::grh::OperationKind kind,
+                                               wolvrix::lib::grh::ValueId operand,
+                                               wolvrix::lib::grh::ValueId result,
+                                               const std::string &name)
+    {
+        const auto op = graph.createOperation(kind, graph.internSymbol(name));
+        graph.addOperand(op, operand);
+        graph.addResult(op, result);
+        return op;
+    }
+
+    wolvrix::lib::grh::OperationId makeBinaryOp(wolvrix::lib::grh::Graph &graph,
+                                                wolvrix::lib::grh::OperationKind kind,
+                                                wolvrix::lib::grh::ValueId lhs,
+                                                wolvrix::lib::grh::ValueId rhs,
+                                                wolvrix::lib::grh::ValueId result,
+                                                const std::string &name)
+    {
+        const auto op = graph.createOperation(kind, graph.internSymbol(name));
+        graph.addOperand(op, lhs);
+        graph.addOperand(op, rhs);
+        graph.addResult(op, result);
+        return op;
+    }
+
+    // Shared checker: a second pass run with fixing disabled must observe no
+    // remaining loop, and the graph must stay verifier-clean.
+    int verifyLoopFreeAndLegal(wolvrix::lib::grh::Design &design, const std::string &caseName)
+    {
+        CombLoopElimOptions verifyOptions;
+        verifyOptions.fixFalseLoops = false;
+        PassManager verifyManager;
+        verifyManager.addPass(std::make_unique<CombLoopElimPass>(verifyOptions));
+        PassDiagnostics verifyDiags;
+        try
+        {
+            const PassManagerResult verifyRes = verifyManager.run(design, verifyDiags);
+            if (!verifyRes.success || verifyDiags.hasError())
+            {
+                return fail(caseName + ": verify run failed");
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(caseName + ": exception during verify run: " + ex.what());
+        }
+        for (const auto &msg : verifyDiags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" &&
+                msg.message.find("comb loop detected") != std::string::npos)
+            {
+                return fail(caseName + ": expected no comb-loop warnings after split");
+            }
+        }
+
+        PassManager grhVerifyManager;
+        grhVerifyManager.addPass(std::make_unique<wolvrix::lib::transform::GrhVerifyPass>());
+        PassDiagnostics grhVerifyDiags;
+        try
+        {
+            const PassManagerResult verifyRes = grhVerifyManager.run(design, grhVerifyDiags);
+            if (!verifyRes.success || grhVerifyDiags.hasError())
+            {
+                return fail(caseName + ": grh.verify failed after comb-loop-elim");
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(caseName + ": exception during grh.verify: " + ex.what());
+        }
+        return 0;
+    }
+
+    // stage-05: arrays whose value-level SCC is bit-disjoint at element
+    // granularity are false loops; constant kSliceArray indices participate
+    // in the exact bit-range analysis.
+    //
+    //   r1    = b[1]            (kSliceArray const)
+    //   xv    = r1 ^ in0        (a[0])
+    //   a     = {a1in, xv}      (concat + assign, shape [2])
+    //   r2    = a[0]            (kSliceArray const)
+    //   yv    = r2 | in0        (b[0])
+    //   b     = {b1in, yv}      (shape [2])
+    //
+    // Value cycle b -> r1 -> xv -> a -> r2 -> yv -> b, but element-wise
+    // b[1] -> a[0] -> b[0] is acyclic (a[1]/b[1] come from outside).
+    int test_array_false_loop_const_index_fixed()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_array_const_false");
+
+        const auto in0 = makeValue(graph, "in0", 8);
+        const auto a1in = makeValue(graph, "a1in", 8);
+        const auto b1in = makeValue(graph, "b1in", 8);
+        graph.bindInputPort("in0", in0);
+        graph.bindInputPort("a1in", a1in);
+        graph.bindInputPort("b1in", b1in);
+        const auto idx0 = makeConst(graph, "idx0", 32, "32'd0");
+        const auto idx1 = makeConst(graph, "idx1", 32, "32'd1");
+
+        const auto a = makeArrayValue(graph, "a", 8, {2});
+        const auto b = makeArrayValue(graph, "b", 8, {2});
+        const auto r1 = makeValue(graph, "r1", 8);
+        const auto xv = makeValue(graph, "xv", 8);
+        const auto aflat = makeValue(graph, "aflat", 16);
+        const auto r2 = makeValue(graph, "r2", 8);
+        const auto yv = makeValue(graph, "yv", 8);
+        const auto bflat = makeValue(graph, "bflat", 16);
+
+        makeSliceArray(graph, b, {idx1}, r1, "read_b1");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
+        makeConcat(graph, "concat_a", {a1in, xv}, aflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeSliceArray(graph, a, {idx0}, r2, "read_a0");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
+        makeConcat(graph, "concat_b", {b1in, yv}, bflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+
+        // External consumers keep using the array values (exercise the
+        // shape-carrying reassembly view).
+        const auto e0 = makeValue(graph, "e0", 8);
+        const auto e1 = makeValue(graph, "e1", 8);
+        const auto outv = makeValue(graph, "outv", 8);
+        makeSliceArray(graph, a, {idx0}, e0, "ext_read_a0");
+        makeSliceArray(graph, b, {idx1}, e1, "ext_read_b1");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, e0, e1, outv, "xor_out");
+        graph.bindOutputPort("out", outv);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during array const-index false-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected array const-index false-loop case to succeed");
+        }
+        if (!res.changed)
+        {
+            return fail("Expected array const-index false-loop case to report changes");
+        }
+        bool foundSplitInfo = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName != "comb-loop-elim")
+            {
+                continue;
+            }
+            if (msg.kind == PassDiagnosticKind::Warning)
+            {
+                return fail("Expected array const-index false-loop case to avoid warnings: " + msg.message);
+            }
+            if (msg.kind == PassDiagnosticKind::Info &&
+                msg.message.find("resolved false loops") != std::string::npos &&
+                msg.message.find("split-values=0") == std::string::npos)
+            {
+                foundSplitInfo = true;
+            }
+        }
+        if (!foundSplitInfo)
+        {
+            return fail("Expected array const-index false loop to use value splitting");
+        }
+        return verifyLoopFreeAndLegal(design, "array-const-false");
+    }
+
+    // stage-05: a dynamic-index kSliceArray inside a loop keeps its result as
+    // one whole fragment and reads the reassembled base view; when no fragment
+    // of the base depends on the read result, the loop is fixed.
+    //
+    //   r1 = b[idx]   (dynamic)
+    //   xv = r1 ^ in0           (a[0])
+    //   a  = {a1in, xv}
+    //   r2 = a[1]             (const kSliceArray, = a1in, outside the cycle)
+    //   yv = r2 | in0           (b[0])
+    //   b  = {b1in, yv}
+    //
+    // The back-edge uses a constant kSliceArray (not kSliceStatic) so the
+    // slice-retarget fast path cannot dissolve the loop and the generic split
+    // path is exercised.
+    int test_array_false_loop_dynamic_index_fixed()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_array_dyn_false");
+
+        const auto in0 = makeValue(graph, "in0", 8);
+        const auto a1in = makeValue(graph, "a1in", 8);
+        const auto b1in = makeValue(graph, "b1in", 8);
+        const auto idx = makeValue(graph, "idx", 1);
+        graph.bindInputPort("in0", in0);
+        graph.bindInputPort("a1in", a1in);
+        graph.bindInputPort("b1in", b1in);
+        graph.bindInputPort("idx", idx);
+        const auto idx1 = makeConst(graph, "idx1", 32, "32'd1");
+
+        const auto a = makeArrayValue(graph, "a", 8, {2});
+        const auto b = makeArrayValue(graph, "b", 8, {2});
+        const auto r1 = makeValue(graph, "r1", 8);
+        const auto xv = makeValue(graph, "xv", 8);
+        const auto aflat = makeValue(graph, "aflat", 16);
+        const auto s2 = makeValue(graph, "s2", 8);
+        const auto yv = makeValue(graph, "yv", 8);
+        const auto bflat = makeValue(graph, "bflat", 16);
+
+        makeSliceArray(graph, b, {idx}, r1, "read_b_dyn");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
+        makeConcat(graph, "concat_a", {a1in, xv}, aflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeSliceArray(graph, a, {idx1}, s2, "read_a1");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, s2, in0, yv, "or_s2");
+        makeConcat(graph, "concat_b", {b1in, yv}, bflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+
+        const auto e0 = makeValue(graph, "e0", 8);
+        const auto outv = makeValue(graph, "outv", 8);
+        makeSliceArray(graph, a, {idx}, e0, "ext_read_a_dyn");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, e0, outv, "assign_out");
+        graph.bindOutputPort("out", outv);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during array dynamic-index false-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected array dynamic-index false-loop case to succeed");
+        }
+        if (!res.changed)
+        {
+            return fail("Expected array dynamic-index false-loop case to report changes");
+        }
+        bool foundSplitInfo = false;
+        bool foundDynStat = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName != "comb-loop-elim")
+            {
+                continue;
+            }
+            if (msg.kind == PassDiagnosticKind::Warning)
+            {
+                return fail("Expected array dynamic-index false-loop case to avoid warnings: " + msg.message);
+            }
+            if (msg.kind == PassDiagnosticKind::Info &&
+                msg.message.find("resolved false loops") != std::string::npos &&
+                msg.message.find("split-values=0") == std::string::npos)
+            {
+                foundSplitInfo = true;
+            }
+            if (msg.kind == PassDiagnosticKind::Info &&
+                msg.message.find("dyn-array=1") != std::string::npos)
+            {
+                foundDynStat = true;
+            }
+        }
+        if (!foundSplitInfo)
+        {
+            return fail("Expected array dynamic-index false loop to use value splitting");
+        }
+        if (!foundDynStat)
+        {
+            return fail("Expected dyn-array=1 in the comb-loop-elim summary");
+        }
+        return verifyLoopFreeAndLegal(design, "array-dyn-false");
+    }
+
+    // stage-05: a dynamic read whose result feeds back into the base array is
+    // a real (undecidable) loop: reported with the dynamic-array-read note and
+    // never silently eliminated.
+    //
+    //   r1 = b[idx]   (dynamic)
+    //   xv = r1 ^ in0           (a[0])
+    //   a  = {a1in, xv}
+    //   s2 = a[7:0]             (= xv, real feedback when idx == 0)
+    //   yv = s2 | in0           (b[0])
+    //   b  = {b1in, yv}
+    int test_array_true_loop_dynamic_index_reported()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_array_dyn_true");
+
+        const auto in0 = makeValue(graph, "in0", 8);
+        const auto a1in = makeValue(graph, "a1in", 8);
+        const auto b1in = makeValue(graph, "b1in", 8);
+        const auto idx = makeValue(graph, "idx", 1);
+        graph.bindInputPort("in0", in0);
+        graph.bindInputPort("a1in", a1in);
+        graph.bindInputPort("b1in", b1in);
+        graph.bindInputPort("idx", idx);
+
+        const auto a = makeArrayValue(graph, "a", 8, {2});
+        const auto b = makeArrayValue(graph, "b", 8, {2});
+        const auto r1 = makeValue(graph, "r1", 8);
+        const auto xv = makeValue(graph, "xv", 8);
+        const auto aflat = makeValue(graph, "aflat", 16);
+        const auto s2 = makeValue(graph, "s2", 8);
+        const auto yv = makeValue(graph, "yv", 8);
+        const auto bflat = makeValue(graph, "bflat", 16);
+
+        makeSliceArray(graph, b, {idx}, r1, "read_b_dyn");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
+        makeConcat(graph, "concat_a", {a1in, xv}, aflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeSliceStatic(graph, a, s2, 0, 7, "read_a0");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, s2, in0, yv, "or_s2");
+        makeConcat(graph, "concat_b", {b1in, yv}, bflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+
+        const auto e0 = makeValue(graph, "e0", 8);
+        makeSliceArray(graph, a, {idx}, e0, "ext_read_a_dyn");
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during array dynamic true-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected array dynamic true-loop case to succeed (warning expected)");
+        }
+        bool foundWarning = false;
+        bool foundDynNote = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName != "comb-loop-elim" || msg.kind != PassDiagnosticKind::Warning)
+            {
+                continue;
+            }
+            if (msg.message.find("comb loop detected") != std::string::npos)
+            {
+                foundWarning = true;
+                if (msg.message.find("dynamic-array-read") != std::string::npos)
+                {
+                    foundDynNote = true;
+                }
+            }
+        }
+        if (!foundWarning)
+        {
+            return fail("Expected a comb-loop warning for the dynamic true loop");
+        }
+        if (!foundDynNote)
+        {
+            return fail("Expected the dynamic-array-read note in the true-loop warning");
+        }
+
+        // The graph must stay verifier-clean even though a warning remains.
+        PassManager grhVerifyManager;
+        grhVerifyManager.addPass(std::make_unique<wolvrix::lib::transform::GrhVerifyPass>());
+        PassDiagnostics verifyDiags;
+        try
+        {
+            const PassManagerResult verifyRes = grhVerifyManager.run(design, verifyDiags);
+            if (!verifyRes.success || verifyDiags.hasError())
+            {
+                return fail("grh.verify failed after the dynamic true-loop run");
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during grh.verify: ") + ex.what());
+        }
+        return 0;
+    }
+
+    // stage-05: loops whose fragmentation would exceed maxFragmentsPerValue
+    // are left intact (the value stays whole) and reported unresolved.
+    int test_array_fragment_cap_blocks_split()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_array_cap");
+
+        const auto in0 = makeValue(graph, "in0", 8);
+        const auto a1in = makeValue(graph, "a1in", 8);
+        const auto b1in = makeValue(graph, "b1in", 8);
+        graph.bindInputPort("in0", in0);
+        graph.bindInputPort("a1in", a1in);
+        graph.bindInputPort("b1in", b1in);
+        const auto idx0 = makeConst(graph, "idx0", 32, "32'd0");
+        const auto idx1 = makeConst(graph, "idx1", 32, "32'd1");
+
+        const auto a = makeArrayValue(graph, "a", 8, {2});
+        const auto b = makeArrayValue(graph, "b", 8, {2});
+        const auto r1 = makeValue(graph, "r1", 8);
+        const auto xv = makeValue(graph, "xv", 8);
+        const auto aflat = makeValue(graph, "aflat", 16);
+        const auto r2 = makeValue(graph, "r2", 8);
+        const auto yv = makeValue(graph, "yv", 8);
+        const auto bflat = makeValue(graph, "bflat", 16);
+
+        makeSliceArray(graph, b, {idx1}, r1, "read_b1");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
+        makeConcat(graph, "concat_a", {a1in, xv}, aflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeSliceArray(graph, a, {idx0}, r2, "read_a0");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
+        makeConcat(graph, "concat_b", {b1in, yv}, bflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+
+        CombLoopElimOptions options;
+        options.maxFragmentsPerValue = 1;
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>(options));
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during fragment-cap run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected fragment-cap case to succeed (warning expected)");
+        }
+        if (res.changed)
+        {
+            return fail("Expected the capped split to leave the graph unchanged");
+        }
+        bool foundWarning = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" && msg.kind == PassDiagnosticKind::Warning &&
+                msg.message.find("comb loop detected") != std::string::npos)
+            {
+                foundWarning = true;
+            }
+        }
+        if (!foundWarning)
+        {
+            return fail("Expected the capped loop to be reported as unresolved");
+        }
+        return 0;
+    }
+
+    // stage-05: with enableArrayFragmentation=false the pass keeps the legacy
+    // behavior (kSliceArray aborts the bit-range analysis as incomplete).
+    int test_array_fragmentation_disabled()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_array_off");
+
+        const auto in0 = makeValue(graph, "in0", 8);
+        const auto a1in = makeValue(graph, "a1in", 8);
+        const auto b1in = makeValue(graph, "b1in", 8);
+        graph.bindInputPort("in0", in0);
+        graph.bindInputPort("a1in", a1in);
+        graph.bindInputPort("b1in", b1in);
+        const auto idx0 = makeConst(graph, "idx0", 32, "32'd0");
+        const auto idx1 = makeConst(graph, "idx1", 32, "32'd1");
+
+        const auto a = makeArrayValue(graph, "a", 8, {2});
+        const auto b = makeArrayValue(graph, "b", 8, {2});
+        const auto r1 = makeValue(graph, "r1", 8);
+        const auto xv = makeValue(graph, "xv", 8);
+        const auto aflat = makeValue(graph, "aflat", 16);
+        const auto r2 = makeValue(graph, "r2", 8);
+        const auto yv = makeValue(graph, "yv", 8);
+        const auto bflat = makeValue(graph, "bflat", 16);
+
+        makeSliceArray(graph, b, {idx1}, r1, "read_b1");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
+        makeConcat(graph, "concat_a", {a1in, xv}, aflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeSliceArray(graph, a, {idx0}, r2, "read_a0");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
+        makeConcat(graph, "concat_b", {b1in, yv}, bflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+
+        CombLoopElimOptions options;
+        options.enableArrayFragmentation = false;
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>(options));
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during disabled-fragmentation run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected disabled-fragmentation case to succeed (warning expected)");
+        }
+        if (res.changed)
+        {
+            return fail("Expected no changes when array fragmentation is disabled");
+        }
+        bool foundIncomplete = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" && msg.kind == PassDiagnosticKind::Warning &&
+                msg.message.find("analysis=incomplete") != std::string::npos)
+            {
+                foundIncomplete = true;
+            }
+        }
+        if (!foundIncomplete)
+        {
+            return fail("Expected the legacy analysis=incomplete warning when disabled");
+        }
+        return 0;
+    }
+
+    // stage-05: a real element-level cycle through constant indices (a[0] and
+    // b[0] genuinely feed each other) must remain reported; splitting is
+    // equivalence-preserving and the residual loop re-appears as a warning.
+    int test_array_true_loop_const_index_reported()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_array_const_true");
+
+        const auto in0 = makeValue(graph, "in0", 8);
+        const auto a1in = makeValue(graph, "a1in", 8);
+        const auto b1in = makeValue(graph, "b1in", 8);
+        graph.bindInputPort("in0", in0);
+        graph.bindInputPort("a1in", a1in);
+        graph.bindInputPort("b1in", b1in);
+        const auto idx0 = makeConst(graph, "idx0", 32, "32'd0");
+
+        const auto a = makeArrayValue(graph, "a", 8, {2});
+        const auto b = makeArrayValue(graph, "b", 8, {2});
+        const auto r1 = makeValue(graph, "r1", 8);
+        const auto xv = makeValue(graph, "xv", 8);
+        const auto aflat = makeValue(graph, "aflat", 16);
+        const auto r2 = makeValue(graph, "r2", 8);
+        const auto yv = makeValue(graph, "yv", 8);
+        const auto bflat = makeValue(graph, "bflat", 16);
+
+        makeSliceArray(graph, b, {idx0}, r1, "read_b0");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
+        makeConcat(graph, "concat_a", {a1in, xv}, aflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeSliceArray(graph, a, {idx0}, r2, "read_a0");
+        makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
+        makeConcat(graph, "concat_b", {b1in, yv}, bflat);
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during array const-index true-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected array const-index true-loop case to succeed (warning expected)");
+        }
+        bool foundWarning = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" && msg.kind == PassDiagnosticKind::Warning &&
+                msg.message.find("comb loop detected") != std::string::npos)
+            {
+                foundWarning = true;
+            }
+        }
+        if (!foundWarning)
+        {
+            return fail("Expected a comb-loop warning for the const-index true loop");
+        }
+
+        PassManager grhVerifyManager;
+        grhVerifyManager.addPass(std::make_unique<wolvrix::lib::transform::GrhVerifyPass>());
+        PassDiagnostics verifyDiags;
+        try
+        {
+            const PassManagerResult verifyRes = grhVerifyManager.run(design, verifyDiags);
+            if (!verifyRes.success || verifyDiags.hasError())
+            {
+                return fail("grh.verify failed after the const-index true-loop run");
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during grh.verify: ") + ex.what());
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -680,6 +1333,30 @@ int main()
         return rc;
     }
     if (int rc = test_false_loop_reduce_split(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_array_false_loop_const_index_fixed(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_array_false_loop_dynamic_index_fixed(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_array_true_loop_dynamic_index_reported(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_array_fragment_cap_blocks_split(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_array_fragmentation_disabled(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_array_true_loop_const_index_reported(); rc != 0)
     {
         return rc;
     }

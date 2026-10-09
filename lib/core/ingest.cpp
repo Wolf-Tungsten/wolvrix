@@ -37,6 +37,7 @@
 #include <cctype>
 #include <chrono>
 #include <iomanip>
+#include <functional>
 #include <future>
 #include <iterator>
 #include <limits>
@@ -45,6 +46,9 @@
 #include <optional>
 #include <span>
 #include <thread>
+#if defined(__unix__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -14709,7 +14713,10 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 return result;
             };
 
-            const ExprNode& node = lowering.values[id];
+            // Copy the node: the recursion below grows lowering.values via
+            // builder calls, which can relocate the vector and dangle a
+            // reference held across the recursive call.
+            const ExprNode node = lowering.values[id];
             if (!usesTarget(id))
             {
                 return finish(makeStaticSlice(id, low, width, currentWidth, node.location));
@@ -14993,7 +15000,9 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 replaceMemo[id] = id;
                 return id;
             }
-            const ExprNode& node = lowering.values[id];
+            // Copy the node: replace/projectRange recursion can grow
+            // lowering.values (builder calls) and relocate the vector.
+            const ExprNode node = lowering.values[id];
             if (node.kind == ExprNodeKind::Symbol)
             {
                 if (node.symbol.index == target.index)
@@ -15353,7 +15362,10 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 return result;
             };
 
-            const ExprNode& node = lowering.values[id];
+            // Copy the node: the recursion below grows lowering.values via
+            // builder calls, which can relocate the vector and dangle a
+            // reference held across the recursive call.
+            const ExprNode node = lowering.values[id];
             if (!usesTargets(id))
             {
                 return finish(makeStaticSlice(id, low, width, currentWidth, node.location));
@@ -15632,7 +15644,9 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 replaceMemo[id] = id;
                 return id;
             }
-            const ExprNode& node = lowering.values[id];
+            // Copy the node: replace/projectRange recursion can grow
+            // lowering.values (builder calls) and relocate the vector.
+            const ExprNode node = lowering.values[id];
             if (node.kind == ExprNodeKind::Symbol)
             {
                 if (node.symbol.valid() &&
@@ -24070,6 +24084,25 @@ private:
         {
             return valueByExpr_[id];
         }
+        // A revisit of an in-flight node means the expression graph has a
+        // combinational cycle; plain recursion overflows the stack on such
+        // inputs (observed on preserve-aggregate XiangShan Phr).
+        if (!emitExprInFlight_.insert(id).second)
+        {
+            if (context_.diagnostics)
+            {
+                context_.diagnostics->error(lowering_.values[id].location,
+                                            "Combinational cycle in expression graph");
+            }
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        struct EmitExprInFlightGuard
+        {
+            std::unordered_set<ExprNodeId>& set;
+            ExprNodeId id;
+            ~EmitExprInFlightGuard() { set.erase(id); }
+        };
+        EmitExprInFlightGuard inFlightGuard{emitExprInFlight_, id};
         if (memoryReadIndexByExpr_[id] != kInvalidMemoryReadIndex)
         {
             wolvrix::lib::grh::ValueId value = emitMemoryRead(id);
@@ -24632,6 +24665,7 @@ private:
     std::vector<wolvrix::lib::grh::SymbolId> symbolIds_;
     std::vector<wolvrix::lib::grh::ValueId> valueBySymbol_;
     std::vector<wolvrix::lib::grh::ValueId> valueByExpr_;
+    std::unordered_set<ExprNodeId> emitExprInFlight_;
     std::vector<wolvrix::lib::grh::OperationId> memoryOpBySymbol_;
     std::vector<std::string> memorySymbolName_;
     std::vector<StorageKind> storageBySymbol_;
@@ -25184,6 +25218,60 @@ void runPlanQueueParallel(PlanTaskQueue& queue, std::size_t threadCount,
         queue.close();
     }
 
+#if defined(__unix__) || defined(__APPLE__)
+    // Expression chains can nest hundreds of thousands of operands deep
+    // (preserve-aggregate XiangShan Phr) and emitExpr recurses natively;
+    // the default 8 MiB pthread stack overflows. 512 MiB stacks commit
+    // lazily, so idle workers cost nothing.
+    {
+        std::function<void()> workerFn = worker;
+        auto trampoline = +[](void* arg) -> void* {
+            (*static_cast<std::function<void()>*>(arg))();
+            return nullptr;
+        };
+        pthread_attr_t attr;
+        bool attrOk = pthread_attr_init(&attr) == 0;
+        if (attrOk)
+        {
+            attrOk = pthread_attr_setstacksize(&attr, 512ull * 1024 * 1024) == 0;
+        }
+        std::vector<pthread_t> pthreads;
+        pthreads.reserve(threadCount);
+        for (std::size_t i = 0; i < threadCount; ++i)
+        {
+            pthread_t tid;
+            if (attrOk && pthread_create(&tid, &attr, trampoline, &workerFn) == 0)
+            {
+                pthreads.push_back(tid);
+            }
+            else
+            {
+                threads.emplace_back(worker);
+            }
+        }
+        if (attrOk)
+        {
+            pthread_attr_destroy(&attr);
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(state.doneMutex);
+            state.doneCv.wait(lock, [&]() {
+                return state.pending.load(std::memory_order_relaxed) == 0;
+            });
+        }
+
+        queue.close();
+        for (pthread_t tid : pthreads)
+        {
+            pthread_join(tid, nullptr);
+        }
+        for (auto& thread : threads)
+        {
+            thread.join();
+        }
+    }
+#else
     for (std::size_t i = 0; i < threadCount; ++i)
     {
         threads.emplace_back(worker);
@@ -25201,6 +25289,7 @@ void runPlanQueueParallel(PlanTaskQueue& queue, std::size_t threadCount,
     {
         thread.join();
     }
+#endif
     if (diagnostics)
     {
         diagnostics->flushThreadLocal();

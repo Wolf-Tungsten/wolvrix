@@ -101,7 +101,7 @@ std::vector<std::string> generateGroupTexts(const wolvrix::lib::grh::Graph &grap
     return out;
 }
 
-// leaf: declared wire w (in -> w -> out) plus a declared kMemory op.
+// leaf: declared wire w (in -> w -> out) plus a declared array register op.
 // mid: instantiates leaf as u_leaf with declared wires mw/mo around it.
 // top: instantiates mid twice (u_m1/u_m2) and pre-claims "u_m1$u_leaf$w"
 // (8-bit) to force `_N` dedup against leaf's 1-bit w during flatten.
@@ -123,10 +123,10 @@ void buildNestedDesign(wolvrix::lib::grh::Design &design)
     const auto leafMemSym = leaf.internSymbol("mem");
     leaf.addDeclaredSymbol(leafMemSym);
     const auto leafMem =
-        leaf.createOperation(wolvrix::lib::grh::OperationKind::kMemory, leafMemSym);
-    leaf.setAttr(leafMem, "width", static_cast<int64_t>(8));
-    leaf.setAttr(leafMem, "row", static_cast<int64_t>(16));
+        leaf.createOperation(wolvrix::lib::grh::OperationKind::kRegister, leafMemSym);
+    leaf.setAttr(leafMem, "width", static_cast<int64_t>(128));
     leaf.setAttr(leafMem, "isSigned", false);
+    leaf.setAttr(leafMem, "shape", std::vector<int64_t>{16});
     const auto leafDriveW = leaf.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
                                                  leaf.makeInternalOpSym());
     leaf.addOperand(leafDriveW, leafIn);
@@ -258,7 +258,7 @@ int testNestedFlattenDeclared()
     return 0;
 }
 
-// child: declared wire cw (ci -> cw -> co) and a declared kMemory op.
+// child: declared wire cw (ci -> cw -> co) and a declared array register op.
 // top: instance u_c driven through an undeclared link value so the
 // All/Hierarchy parent-side port rename stays observable.
 void buildPortRenameDesign(wolvrix::lib::grh::Design &design)
@@ -278,10 +278,10 @@ void buildPortRenameDesign(wolvrix::lib::grh::Design &design)
     const auto memSym = child.internSymbol("mem");
     child.addDeclaredSymbol(memSym);
     const auto mem =
-        child.createOperation(wolvrix::lib::grh::OperationKind::kMemory, memSym);
-    child.setAttr(mem, "width", static_cast<int64_t>(8));
-    child.setAttr(mem, "row", static_cast<int64_t>(16));
+        child.createOperation(wolvrix::lib::grh::OperationKind::kRegister, memSym);
+    child.setAttr(mem, "width", static_cast<int64_t>(128));
     child.setAttr(mem, "isSigned", false);
+    child.setAttr(mem, "shape", std::vector<int64_t>{16});
     const auto driveW = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
                                               child.makeInternalOpSym());
     child.addOperand(driveW, childIn);
@@ -594,18 +594,18 @@ int main()
 
     const auto memSym = child.internSymbol("mem");
     child.addDeclaredSymbol(memSym);
-    const auto memOp = child.createOperation(wolvrix::lib::grh::OperationKind::kMemory, memSym);
-    child.setAttr(memOp, "width", static_cast<int64_t>(8));
-    child.setAttr(memOp, "row", static_cast<int64_t>(16));
+    const auto memOp = child.createOperation(wolvrix::lib::grh::OperationKind::kRegister, memSym);
+    child.setAttr(memOp, "width", static_cast<int64_t>(128));
     child.setAttr(memOp, "isSigned", false);
+    child.setAttr(memOp, "shape", std::vector<int64_t>{16});
 
     const auto memReadVal = child.createValue(child.makeInternalValSym(), 8, false);
     const auto memReadOp =
-        child.createOperation(wolvrix::lib::grh::OperationKind::kMemoryReadPort,
+        child.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort,
                               child.makeInternalOpSym());
     child.addOperand(memReadOp, childAddr);
     child.addResult(memReadOp, memReadVal);
-    child.setAttr(memReadOp, "memSymbol", std::string("mem"));
+    child.setAttr(memReadOp, "regSymbol", std::string("mem"));
 
     const auto dpiSym = child.internSymbol("dpi_add");
     const auto dpiImport =
@@ -706,14 +706,13 @@ int main()
         const wolvrix::lib::grh::Operation op = top.getOperation(opId);
         switch (op.kind())
         {
-        case wolvrix::lib::grh::OperationKind::kMemory:
-            foundMem = opId;
-            if (std::string(op.symbolText()) != expectedMem)
+        case wolvrix::lib::grh::OperationKind::kRegister:
+            if (std::string(op.symbolText()) == expectedMem)
             {
-                return fail("Flattened memory symbol mismatch");
+                foundMem = opId;
             }
             break;
-        case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+        case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
             foundRead = opId;
             break;
         case wolvrix::lib::grh::OperationKind::kDpicImport:
@@ -740,13 +739,13 @@ int main()
 
     if (!foundMem.valid() || !foundRead.valid())
     {
-        return fail("Flattened memory ops missing");
+        return fail("Flattened array register ops missing");
     }
     const auto memReadOpResolved = top.getOperation(foundRead);
-    const auto memSymbol = getAttrString(memReadOpResolved, "memSymbol");
+    const auto memSymbol = getAttrString(memReadOpResolved, "regSymbol");
     if (!memSymbol || *memSymbol != expectedMem)
     {
-        return fail("memSymbol not rewritten during flatten");
+        return fail("regSymbol not rewritten during flatten");
     }
     if (memReadOpResolved.operands().size() != 1 ||
         memReadOpResolved.operands()[0] != topAddrInternal)

@@ -2410,10 +2410,11 @@ namespace wolvrix::lib::grhsim
                 // memAssign's data is a whole-array value indexed per row.
                 const std::string data = read(operands[1]);
                 // A whole packed-array write (ingest lowers packed-aggregate
-                // whole writes to kMemoryFillPort) arrives as a memFill whose
-                // data is the packed row-major value (element.width * count
-                // bits); slice it per row — the legacy emit's isPackedFill
-                // semantics. Element-width data keeps the plain broadcast fill.
+                // whole writes to kRegisterFillPort, surfaced here as memFill)
+                // arrives with data as the packed row-major value
+                // (element.width * count bits); slice it per row — the legacy
+                // emit's isPackedFill semantics. Element-width data keeps the
+                // plain broadcast fill.
                 const auto &dataType = type(operands[1]);
                 const uint64_t packedWidth = static_cast<uint64_t>(element.width) * array.count;
                 const bool packedFill = !assign && dataType.kind == TypeKind::Logic &&

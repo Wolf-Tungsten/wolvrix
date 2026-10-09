@@ -68,11 +68,12 @@ enum class OperationKind {
     kLatchWritePort,
     kRegister,
     kRegisterReadPort,
+    kRegisterReadArrayPort,
     kRegisterWritePort,
-    kMemory,
-    kMemoryReadPort,
-    kMemoryWritePort,
-    kMemoryFillPort,
+    kRegisterWriteMaskPort,
+    kRegisterWriteArrayPort,
+    kRegisterWriteArrayMaskPort,
+    kRegisterFillPort,
     kInstance,
     kBlackbox,
     kSystemFunction,
@@ -85,13 +86,6 @@ enum class OperationKind {
 
 std::string_view toString(OperationKind kind) noexcept;
 std::optional<OperationKind> parseOperationKind(std::string_view text) noexcept;
-
-// Legacy kMemoryWritePort collision-priority attrs. In the array-type
-// refactor these retire together with kMemory in stage-03: all write ports of
-// one kRegister form a single group and priority is the ports' declaration
-// order, so no priority attrs exist anymore.
-inline constexpr std::string_view kMemoryWritePriorityGroupAttr = "memoryWrite.priorityGroup";
-inline constexpr std::string_view kMemoryWritePriorityAttr = "memoryWrite.priority";
 
 enum class ValueType : uint8_t {
     Logic,
@@ -660,6 +654,28 @@ private:
     std::vector<AttrKV> attrs_;
     std::optional<SrcLoc> srcLoc_;
 };
+
+// Register port-family helpers (see docs/grh/grh-ir.md "Registers").
+//
+// `isRegisterReadPortKind` covers kRegisterReadPort (whole read) and
+// kRegisterReadArrayPort (indexed read). `isRegisterWritePortKind` covers
+// kRegisterWritePort / kRegisterWriteMaskPort / kRegisterWriteArrayPort /
+// kRegisterWriteArrayMaskPort / kRegisterFillPort.
+[[nodiscard]] bool isRegisterReadPortKind(OperationKind kind) noexcept;
+[[nodiscard]] bool isRegisterWritePortKind(OperationKind kind) noexcept;
+// Operand index where the event operands of a write-port op begin. Event
+// operands always trail and correspond one-to-one to the `eventEdge` attr;
+// for the array write ports the index count varies with partial indexing, so
+// the boundary is recovered from the eventEdge count (it is not derivable
+// from the declaration rank alone). Fixed-header kinds return their constant
+// header size. Returns nullopt for non-write-port kinds and for malformed
+// array write ports (missing eventEdge attr or too few operands).
+[[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const Operation &op);
+[[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const GraphView &view, OperationId op);
+// Number of index operands of an array port op (kRegisterReadArrayPort /
+// kRegisterWriteArrayPort / kRegisterWriteArrayMaskPort); nullopt otherwise.
+[[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const Operation &op);
+[[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const GraphView &view, OperationId op);
 
 class Design;
 

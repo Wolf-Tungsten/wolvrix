@@ -254,7 +254,7 @@ void collectMemoryReadAddresses(const wolvrix::lib::grh::Graph& graph,
         return;
     }
     const wolvrix::lib::grh::Operation op = graph.getOperation(defId);
-    if (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort) {
+    if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort) {
         if (op.operands().empty()) {
             addresses.push_back(std::nullopt);
         }
@@ -696,8 +696,8 @@ int testOldestArbiterResetGraphWholeRead(const std::filesystem::path& sourcePath
         const wolvrix::lib::grh::OperationId readId = graph->getValue(operand).definingOp();
         if (!readId.valid() ||
             graph->getOperation(readId).kind() !=
-                wolvrix::lib::grh::OperationKind::kMemoryReadPort) {
-            return fail("priority_flat aggregate concat operand is not a memory read for " +
+                wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort) {
+            return fail("priority_flat aggregate concat operand is not an array read for " +
                         std::string(moduleName));
         }
     }
@@ -733,13 +733,14 @@ int testOldestArbiterInitialResetMemoryInit(const std::filesystem::path& sourceP
             return fail("reset input should not be converted to kRegister for " +
                         std::string(moduleName));
         }
-        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory &&
-            op.symbolText() == std::string_view("priorityVecReg")) {
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister &&
+            op.symbolText() == std::string_view("priorityVecReg") &&
+            getAttrInts(op, "shape")) {
             priorityMemory = op;
         }
     }
     if (!priorityMemory) {
-        return fail("Missing priorityVecReg kMemory for " + std::string(moduleName));
+        return fail("Missing priorityVecReg array register for " + std::string(moduleName));
     }
 
     auto kinds = getAttrStrings(*priorityMemory, "initKind");
@@ -747,11 +748,11 @@ int testOldestArbiterInitialResetMemoryInit(const std::filesystem::path& sourceP
     auto starts = getAttrInts(*priorityMemory, "initStart");
     auto lens = getAttrInts(*priorityMemory, "initLen");
     if (!kinds || !values || !starts || !lens) {
-        return fail("priorityVecReg missing memory init attrs for " + std::string(moduleName));
+        return fail("priorityVecReg missing array init attrs for " + std::string(moduleName));
     }
     if (kinds->size() != values->size() || values->size() != starts->size() ||
         starts->size() != lens->size()) {
-        return fail("priorityVecReg memory init attr size mismatch for " +
+        return fail("priorityVecReg array init attr size mismatch for " +
                     std::string(moduleName));
     }
 
@@ -779,13 +780,13 @@ int testOldestArbiterInitialResetMemoryInit(const std::filesystem::path& sourceP
     }
 
     if (rows.size() != expectedRows.size()) {
-        return fail("priorityVecReg memory init row count mismatch for " +
+        return fail("priorityVecReg array init row count mismatch for " +
                     std::string(moduleName));
     }
     for (std::size_t row = 0; row < expectedRows.size(); ++row) {
         auto it = rows.find(static_cast<int64_t>(row));
         if (it == rows.end() || it->second != expectedRows[row]) {
-            return fail("priorityVecReg memory init row mismatch for " +
+            return fail("priorityVecReg array init row mismatch for " +
                         std::string(moduleName));
         }
     }

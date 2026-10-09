@@ -161,60 +161,63 @@ int testGraphAssemblyMemory(const std::filesystem::path& sourcePath) {
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
         switch (op.kind()) {
-        case wolvrix::lib::grh::OperationKind::kMemory: {
+        case wolvrix::lib::grh::OperationKind::kRegister: {
+            if (op.symbolText() != std::string_view("mem")) {
+                break;
+            }
             ++memoryOps;
             auto width = getAttrInt(op, "width");
-            auto rows = getAttrInt(op, "row");
+            auto shape = getAttrInts(op, "shape");
             auto isSigned = getAttrBool(op, "isSigned");
-            if (!width || !rows || !isSigned) {
-                return fail("kMemory missing width/row/isSigned attributes");
+            if (!width || !shape || !isSigned) {
+                return fail("array register missing width/shape/isSigned attributes");
             }
-            if (*width != 8 || *rows != 16 || *isSigned) {
-                return fail("kMemory attributes do not match expected width/row/isSigned");
+            if (*width != 128 || shape->size() != 1 || (*shape)[0] != 16 || *isSigned) {
+                return fail("array register attributes do not match expected width/shape/isSigned");
             }
             auto initKinds = getAttrStrings(op, "initKind");
             auto initFiles = getAttrStrings(op, "initFile");
             auto starts = getAttrInts(op, "initStart");
             auto lens = getAttrInts(op, "initLen");
             if (!initKinds || !initFiles || !starts || !lens) {
-                return fail("kMemory missing init attributes");
+                return fail("array register missing init attributes");
             }
             if (initKinds->size() != 2 || initFiles->size() != 2 || starts->size() != 2 ||
                 lens->size() != 2) {
-                return fail("kMemory init attribute sizes do not match expected count");
+                return fail("array register init attribute sizes do not match expected count");
             }
             if ((*initKinds)[0] != "readmemh" || (*initKinds)[1] != "readmemb") {
-                return fail("kMemory initKind order mismatch");
+                return fail("array register initKind order mismatch");
             }
             if ((*initFiles)[0] != "mem_init.hex" || (*initFiles)[1] != "mem_init.bin") {
-                return fail("kMemory initFile order mismatch");
+                return fail("array register initFile order mismatch");
             }
             if ((*starts)[0] != -1 || (*lens)[0] != 0) {
-                return fail("kMemory initStart/initLen mismatch for readmemh");
+                return fail("array register initStart/initLen mismatch for readmemh");
             }
             if ((*starts)[1] != 2 || (*lens)[1] != 6) {
-                return fail("kMemory initStart/initLen mismatch for readmemb");
+                return fail("array register initStart/initLen mismatch for readmemb");
             }
             memoryAttrsOk = true;
             break;
         }
-        case wolvrix::lib::grh::OperationKind::kMemoryReadPort: {
+        case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort: {
             ++readOps;
-            auto memSymbol = getAttrString(op, "memSymbol");
-            if (!memSymbol || *memSymbol != "mem") {
-                return fail("kMemoryReadPort missing or unexpected memSymbol");
+            auto regSymbol = getAttrString(op, "regSymbol");
+            if (!regSymbol || *regSymbol != "mem") {
+                return fail("kRegisterReadArrayPort missing or unexpected regSymbol");
             }
             break;
         }
-        case wolvrix::lib::grh::OperationKind::kMemoryWritePort: {
+        case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort: {
             ++writeOps;
-            auto memSymbol = getAttrString(op, "memSymbol");
-            if (!memSymbol || *memSymbol != "mem") {
-                return fail("kMemoryWritePort missing or unexpected memSymbol");
+            auto regSymbol = getAttrString(op, "regSymbol");
+            if (!regSymbol || *regSymbol != "mem") {
+                return fail("kRegisterWriteArrayMaskPort missing or unexpected regSymbol");
             }
             auto edges = getAttrStrings(op, "eventEdge");
             if (!edges || edges->empty() || (*edges)[0] != "posedge") {
-                return fail("kMemoryWritePort missing eventEdge attribute");
+                return fail("kRegisterWriteArrayMaskPort missing eventEdge attribute");
             }
             break;
         }
@@ -224,13 +227,13 @@ int testGraphAssemblyMemory(const std::filesystem::path& sourcePath) {
     }
 
     if (!memoryAttrsOk || memoryOps != 1) {
-        return fail("Expected exactly one kMemory op with valid attributes");
+        return fail("Expected exactly one array register op with valid attributes");
     }
     if (readOps < 2) {
-        return fail("Expected at least two kMemoryReadPort ops");
+        return fail("Expected at least two kRegisterReadArrayPort ops");
     }
     if (writeOps != 1) {
-        return fail("Expected exactly one kMemoryWritePort op");
+        return fail("Expected exactly one kRegisterWriteArrayMaskPort op");
     }
 
     return 0;
@@ -257,14 +260,14 @@ int testGraphAssemblyPackedAggregateReg(const std::filesystem::path& sourcePath)
     bool sawWideR1Read = false;
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
-        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory) {
-            ++memoryOps;
-            continue;
-        }
         if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
             auto width = getAttrInt(op, "width");
             if (!width) {
                 return fail("Packed aggregate register missing width attribute");
+            }
+            if (getAttrInts(op, "shape")) {
+                ++memoryOps;
+                continue;
             }
             if (op.symbolText() == std::string_view("r0")) {
                 ++r0Regs;
@@ -296,7 +299,7 @@ int testGraphAssemblyPackedAggregateReg(const std::filesystem::path& sourcePath)
     }
 
     if (memoryOps != 0) {
-        return fail("Whole packed aggregate registers should not create kMemory ops");
+        return fail("Whole packed aggregate registers should stay scalar (no shape attr)");
     }
     if (r0Regs != 1 || r1Regs != 1 || !sawWideR0Read || !sawWideR1Read) {
         return fail("Expected flattened packed aggregate register/read ports for r0/r1");
@@ -322,11 +325,11 @@ int testGraphAssemblyMemoryReadCoalesce(const std::filesystem::path& sourcePath)
     int sliceOps = 0;
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
-        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort) {
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort) {
             ++readOps;
-            auto memSymbol = getAttrString(op, "memSymbol");
-            if (!memSymbol || *memSymbol != "mem") {
-                return fail("Coalesced kMemoryReadPort missing memSymbol");
+            auto regSymbol = getAttrString(op, "regSymbol");
+            if (!regSymbol || *regSymbol != "mem") {
+                return fail("Coalesced kRegisterReadArrayPort missing regSymbol");
             }
         }
         if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceStatic ||
@@ -367,14 +370,14 @@ int testGraphAssemblyPackedAggregateInstanceSink(const std::filesystem::path& so
     int laneSliceOps = 0;
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
-        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory) {
-            ++memoryOps;
-            continue;
-        }
         if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
             auto width = getAttrInt(op, "width");
             if (!width) {
                 return fail("Packed aggregate instance-sink register missing width");
+            }
+            if (getAttrInts(op, "shape")) {
+                ++memoryOps;
+                continue;
             }
             if (op.symbolText() == std::string_view("t1")) {
                 ++t1Regs;
@@ -390,7 +393,8 @@ int testGraphAssemblyPackedAggregateInstanceSink(const std::filesystem::path& so
             }
             continue;
         }
-        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
+            op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort) {
             auto regSymbol = getAttrString(op, "regSymbol");
             if (regSymbol && *regSymbol == "t1") {
                 sawT1Write = true;
@@ -417,7 +421,7 @@ int testGraphAssemblyPackedAggregateInstanceSink(const std::filesystem::path& so
     }
 
     if (memoryOps != 0) {
-        return fail("Packed aggregate instance input slices should not create anonymous memory");
+        return fail("Packed aggregate instance input slices should not create array registers");
     }
     if (t1Regs != 1 || t2Regs != 1 || !sawT1Write || !sawT2Write) {
         return fail("Expected flattened packed aggregate t1/t2 registers and writes");

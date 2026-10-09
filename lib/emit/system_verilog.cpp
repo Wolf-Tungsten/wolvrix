@@ -1413,10 +1413,28 @@ namespace wolvrix::lib::emit
                 }
                 return key.str();
             };
+            // A register declaration carrying a non-empty shape attr is an
+            // array register; its SV form is an unpacked array, so reads and
+            // output ports cannot alias the bare declaration name.
+            auto registerHasArrayShape = [&](const std::string &symbol) -> bool
+            {
+                const wolvrix::lib::grh::OperationId declId = graph->findOperation(symbol);
+                if (!declId.valid())
+                {
+                    return false;
+                }
+                const wolvrix::lib::grh::Operation decl = graph->getOperation(declId);
+                if (decl.kind() != wolvrix::lib::grh::OperationKind::kRegister)
+                {
+                    return false;
+                }
+                auto shape = getAttribute<std::vector<int64_t>>(*graph, decl, "shape");
+                return shape && !shape->empty();
+            };
             for (const auto opId : graph->operations())
             {
                 const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kRegisterWritePort)
+                if (!wolvrix::lib::grh::isRegisterWritePortKind(op.kind()))
                 {
                     continue;
                 }
@@ -1425,7 +1443,13 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                auto key = writePortEventKey(op, 3);
+                const std::optional<std::size_t> eventStart =
+                    wolvrix::lib::grh::firstEventOperandIndex(op);
+                if (!eventStart)
+                {
+                    continue;
+                }
+                auto key = writePortEventKey(op, *eventStart);
                 if (!key)
                 {
                     continue;
@@ -1446,6 +1470,10 @@ namespace wolvrix::lib::emit
                 }
                 auto regSymbolAttr = getAttribute<std::string>(*graph, op, "regSymbol");
                 if (!regSymbolAttr)
+                {
+                    continue;
+                }
+                if (registerHasArrayShape(*regSymbolAttr))
                 {
                     continue;
                 }
@@ -1562,6 +1590,17 @@ namespace wolvrix::lib::emit
                     opKind != wolvrix::lib::grh::OperationKind::kLatch)
                 {
                     continue;
+                }
+                if (opKind == wolvrix::lib::grh::OperationKind::kRegister)
+                {
+                    const wolvrix::lib::grh::Operation regOp = graph->getOperation(opId);
+                    auto shapeAttr = getAttribute<std::vector<int64_t>>(*graph, regOp, "shape");
+                    if (shapeAttr && !shapeAttr->empty())
+                    {
+                        // Array registers keep an internal unpacked
+                        // declaration; output ports bind a materialized read.
+                        continue;
+                    }
                 }
                 const wolvrix::lib::grh::SymbolId opSym = graph->operationSymbol(opId);
                 if (!opSym.valid())
@@ -1847,60 +1886,6 @@ namespace wolvrix::lib::emit
                 });
             };
 
-            auto orderSequentialStmts = [&](const std::vector<SeqStmt> &source) {
-                struct Entry
-                {
-                    std::size_t slot = 0;
-                    SeqStmt stmt;
-                    int64_t priority = 0;
-                };
-                std::vector<SeqStmt> ordered = source;
-                std::unordered_map<std::string, std::vector<Entry>> entriesByGroup;
-                for (std::size_t slot = 0; slot < source.size(); ++slot)
-                {
-                    if (!source[slot].op.valid())
-                    {
-                        continue;
-                    }
-                    const auto op = graph->getOperation(source[slot].op);
-                    const auto group = getAttribute<std::string>(
-                        *graph, op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
-                    const auto priority = getAttribute<int64_t>(
-                        *graph, op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
-                    if (!group || !priority)
-                    {
-                        continue;
-                    }
-                    entriesByGroup[*group].push_back(Entry{
-                        .slot = slot,
-                        .stmt = source[slot],
-                        .priority = *priority,
-                    });
-                }
-                for (auto &[group, entries] : entriesByGroup)
-                {
-                    (void)group;
-                    std::vector<std::size_t> slots;
-                    slots.reserve(entries.size());
-                    for (const Entry &entry : entries)
-                    {
-                        slots.push_back(entry.slot);
-                    }
-                    std::sort(entries.begin(), entries.end(), [](const Entry &lhs, const Entry &rhs) {
-                        if (lhs.priority != rhs.priority)
-                        {
-                            return lhs.priority > rhs.priority;
-                        }
-                        return lhs.stmt.op.index < rhs.stmt.op.index;
-                    });
-                    for (std::size_t index = 0; index < entries.size(); ++index)
-                    {
-                        ordered[slots[index]] = std::move(entries[index].stmt);
-                    }
-                }
-                return ordered;
-            };
-
             auto addLatchBlock = [&](std::string stmt, wolvrix::lib::grh::OperationId sourceOp)
             {
                 latchBlocks.emplace_back(std::move(stmt), sourceOp);
@@ -1911,9 +1896,11 @@ namespace wolvrix::lib::emit
                 switch (kind)
                 {
                 case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
                 case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-                case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-                case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+                case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                     return true;
                 default:
                     return false;
@@ -2238,8 +2225,10 @@ namespace wolvrix::lib::emit
                 const wolvrix::lib::grh::ValueId dpiUpdateCond = operands[0];
                 bool updateCondOk = true;
                 if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
-                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort ||
-                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort)
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort)
                 {
                     const auto &sinkOperands = sinkOp.operands();
                     if (sinkOperands.empty())
@@ -2260,7 +2249,7 @@ namespace wolvrix::lib::emit
                         }
                     }
                 }
-                else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort)
                 {
                     if (!isConstOneValue(dpiUpdateCond))
                     {
@@ -2276,7 +2265,9 @@ namespace wolvrix::lib::emit
 
                 bool eventOk = true;
                 if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
-                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort)
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort ||
+                    sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort)
                 {
                     auto eventEdges = getAttribute<std::vector<std::string>>(*graph, op, "eventEdge");
                     if (!eventEdges)
@@ -2286,10 +2277,12 @@ namespace wolvrix::lib::emit
                     }
                     const std::size_t eventStart = operands.size() - eventEdges->size();
                     auto dpiKey = computeEventKey(op, eventStart, opContext);
-                    auto sinkKey = computeEventKey(
-                        sinkOp,
-                        sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ? 3U : 4U,
-                        std::string(sinkOp.symbolText()));
+                    const std::optional<std::size_t> sinkEventStart =
+                        wolvrix::lib::grh::firstEventOperandIndex(sinkOp);
+                    auto sinkKey = sinkEventStart
+                                       ? computeEventKey(sinkOp, *sinkEventStart,
+                                                         std::string(sinkOp.symbolText()))
+                                       : std::nullopt;
                     if (!dpiKey || !sinkKey || !sameSeqKey(*dpiKey, *sinkKey))
                     {
                         reportError("kDpicCall eventEdge does not match sink eventEdge for inline",
@@ -2298,7 +2291,7 @@ namespace wolvrix::lib::emit
                     }
                 }
                 else if (sinkOp.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort ||
-                         sinkOp.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                         sinkOp.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort)
                 {
                     auto eventEdges = getAttribute<std::vector<std::string>>(*graph, op, "eventEdge");
                     if (eventEdges && !eventEdges->empty())
@@ -3226,30 +3219,6 @@ namespace wolvrix::lib::emit
                 }
             };
 
-            auto resolveMemorySymbol = [&](const wolvrix::lib::grh::Operation &userOp) -> std::optional<std::string>
-            {
-                auto attr = getAttribute<std::string>(*graph, userOp, "memSymbol");
-                if (attr)
-                {
-                    return attr;
-                }
-
-                std::optional<std::string> candidate;
-                for (const auto maybeId : graph->operations())
-                {
-                    const wolvrix::lib::grh::Operation maybeOp = graph->getOperation(maybeId);
-                    if (maybeOp.kind() == wolvrix::lib::grh::OperationKind::kMemory)
-                    {
-                        if (candidate)
-                        {
-                            return std::nullopt;
-                        }
-                        candidate = std::string(maybeOp.symbolText());
-                    }
-                }
-                return candidate;
-            };
-
             std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> elidedConstValues;
             auto maskAllOnesLiteral = [&](std::string_view literal, int64_t width) -> bool
             {
@@ -3286,6 +3255,23 @@ namespace wolvrix::lib::emit
                 }
                 return width;
             };
+            // Array view of a register declaration: nullopt when the symbol
+            // does not name a kRegister, otherwise the (possibly empty) shape.
+            auto registerShapeForSymbol = [&](const std::string &symbol) -> std::optional<std::vector<int64_t>>
+            {
+                const wolvrix::lib::grh::OperationId regOpId = graph->findOperation(symbol);
+                if (!regOpId.valid())
+                {
+                    return std::nullopt;
+                }
+                const wolvrix::lib::grh::Operation regOp = graph->getOperation(regOpId);
+                if (regOp.kind() != wolvrix::lib::grh::OperationKind::kRegister)
+                {
+                    return std::nullopt;
+                }
+                return getAttribute<std::vector<int64_t>>(*graph, regOp, "shape")
+                    .value_or(std::vector<int64_t>{});
+            };
             auto latchWidthForSymbol = [&](const std::string &symbol,
                                            wolvrix::lib::grh::ValueId nextValue) -> int64_t
             {
@@ -3298,21 +3284,6 @@ namespace wolvrix::lib::emit
                     {
                         width = getAttribute<int64_t>(*graph, latchOp, "width").value_or(width);
                     }
-                }
-                if (width <= 0)
-                {
-                    width = 1;
-                }
-                return width;
-            };
-            auto memoryWidthForSymbol = [&](const std::string &symbol) -> int64_t
-            {
-                int64_t width = 1;
-                const wolvrix::lib::grh::OperationId memOpId = graph->findOperation(symbol);
-                if (memOpId.valid())
-                {
-                    const wolvrix::lib::grh::Operation memOp = graph->getOperation(memOpId);
-                    width = getAttribute<int64_t>(*graph, memOp, "width").value_or(width);
                 }
                 if (width <= 0)
                 {
@@ -3370,7 +3341,7 @@ namespace wolvrix::lib::emit
                     };
                     switch (userOpKind)
                     {
-                    case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+                    case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
                     {
                         if (ops.size() < 3 || !usedOnlyAt(2))
                         {
@@ -3412,21 +3383,18 @@ namespace wolvrix::lib::emit
                         }
                         break;
                     }
-                    case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+                    case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
                     {
-                        if (ops.size() < 4 || !usedOnlyAt(3))
-                        {
-                            allUsesAreFullMask = false;
-                            break;
-                        }
                         const wolvrix::lib::grh::Operation userOp = graph->getOperation(userOpId);
-                        auto memSymbolAttr = resolveMemorySymbol(userOp);
-                        if (!memSymbolAttr)
+                        const std::optional<std::size_t> eventStart =
+                            wolvrix::lib::grh::firstEventOperandIndex(userOp);
+                        // Mask trails the data operand right before events.
+                        if (!eventStart || *eventStart < 4 || !usedOnlyAt(*eventStart - 1))
                         {
                             allUsesAreFullMask = false;
                             break;
                         }
-                        const int64_t width = memoryWidthForSymbol(*memSymbolAttr);
+                        const int64_t width = graph->valueWidth(ops[*eventStart - 2]);
                         if (!maskAllOnesLiteral(*literalAttr, width))
                         {
                             allUsesAreFullMask = false;
@@ -3623,6 +3591,67 @@ namespace wolvrix::lib::emit
             // -------------------------
             // Operation traversal
             // -------------------------
+            // Flat-bit read expression for the (sub-)array at `base` whose
+            // remaining unpacked dimensions are `dims`; element order follows
+            // the canonical row-major layout (index 0 at the lowest address =
+            // lowest bits), so the concat lists the highest index first.
+            std::function<std::string(const std::string &, std::span<const int64_t>)> flattenArrayRead =
+                [&](const std::string &base, std::span<const int64_t> dims) -> std::string
+            {
+                if (dims.empty())
+                {
+                    return base;
+                }
+                std::ostringstream oss;
+                oss << "{";
+                for (int64_t i = dims.front() - 1; i >= 0; --i)
+                {
+                    if (i != dims.front() - 1)
+                    {
+                        oss << ", ";
+                    }
+                    oss << flattenArrayRead(base + "[" + std::to_string(i) + "]", dims.subspan(1));
+                }
+                oss << "}";
+                return oss.str();
+            };
+            // Emits nested for-loops over the remaining unpacked dims of a
+            // sub-array write. body(indent, targetSuffix, bitOffsetExpr)
+            // receives the index suffix (e.g. "[__w0][__w1]") and the
+            // linearized element offset expression in canonical order.
+            auto emitSubArrayWriteLoops =
+                [&](std::ostringstream &stmt, int indent, std::span<const int64_t> dims,
+                    const std::function<void(int, const std::string &, const std::string &)> &body)
+            {
+                std::function<void(int, std::size_t, std::string, std::string)> recurse =
+                    [&](int levelIndent, std::size_t dimIndex, std::string suffix, std::string offset)
+                {
+                    if (dimIndex == dims.size())
+                    {
+                        body(levelIndent, suffix, offset);
+                        return;
+                    }
+                    const std::string var = "__w" + std::to_string(dimIndex);
+                    int64_t stride = 1;
+                    for (std::size_t d = dimIndex + 1; d < dims.size(); ++d)
+                    {
+                        stride *= dims[d];
+                    }
+                    std::string term = var;
+                    if (stride != 1)
+                    {
+                        term += " * " + std::to_string(stride);
+                    }
+                    const std::string nextOffset = offset.empty() ? term : offset + " + " + term;
+                    appendIndented(stmt, levelIndent,
+                                   "for (int " + var + " = 0; " + var + " < " +
+                                       std::to_string(dims[dimIndex]) + "; " + var + " = " + var +
+                                       " + 1) begin");
+                    recurse(levelIndent + 1, dimIndex + 1, suffix + "[" + var + "]", nextOffset);
+                    appendIndented(stmt, levelIndent, "end");
+                };
+                recurse(indent, 0, "", "");
+            };
             for (const auto opId : graph->operations())
             {
                 const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
@@ -4270,6 +4299,135 @@ namespace wolvrix::lib::emit
                         reportError("kRegister width must be > 0", opContext);
                         width = 1;
                     }
+                    auto shapeAttr = getAttribute<std::vector<int64_t>>(*graph, op, "shape");
+                    if (shapeAttr && !shapeAttr->empty())
+                    {
+                        // Array register: unpacked declaration, one dimension
+                        // per shape entry; `width` is the total bit width.
+                        int64_t elementCount = 1;
+                        for (const int64_t dim : *shapeAttr)
+                        {
+                            elementCount *= dim;
+                        }
+                        if (elementCount <= 0 || width % elementCount != 0)
+                        {
+                            reportError("kRegister shape does not divide width", opContext);
+                            break;
+                        }
+                        const int64_t elemWidth = width / elementCount;
+                        std::ostringstream decl;
+                        decl << "reg " << (*isSignedAttr ? "signed " : "") << "[" << (elemWidth - 1)
+                             << ":0] " << opContext;
+                        for (const int64_t dim : *shapeAttr)
+                        {
+                            decl << " [0:" << (dim - 1) << "]";
+                        }
+                        decl << ";";
+                        memoryDecls.emplace_back(decl.str(), opId);
+                        declaredNames.insert(opContext);
+
+                        auto initKinds = getAttribute<std::vector<std::string>>(*graph, op, "initKind");
+                        auto initFiles = getAttribute<std::vector<std::string>>(*graph, op, "initFile");
+                        auto initValues = getAttribute<std::vector<std::string>>(*graph, op, "initValue");
+                        if (initKinds || initFiles)
+                        {
+                            if (!initKinds || !initFiles || initKinds->size() != initFiles->size())
+                            {
+                                reportError("kRegister initKind/initFile size mismatch", opContext);
+                                break;
+                            }
+                            const std::size_t count = initKinds->size();
+                            auto starts = getAttribute<std::vector<int64_t>>(*graph, op, "initStart");
+                            auto lens = getAttribute<std::vector<int64_t>>(*graph, op, "initLen");
+                            if (!starts || !lens || starts->size() != count || lens->size() != count)
+                            {
+                                reportError("kRegister initStart/initLen size mismatch", opContext);
+                                break;
+                            }
+                            const std::vector<int64_t> &localStarts = *starts;
+                            const std::vector<int64_t> &localLens = *lens;
+                            for (std::size_t i = 0; i < count; ++i)
+                            {
+                                const std::string& kind = (*initKinds)[i];
+                                std::string stmt;
+
+                                if (kind == "readmemh" || kind == "readmemb")
+                                {
+                                    // readmemh/readmemb: $readmemh("file", memory, start, finish);
+                                    stmt = "$" + kind + "(\"" + escapeSvString((*initFiles)[i]) + "\", " + opContext;
+                                    if (localStarts[i] >= 0)
+                                    {
+                                        stmt.append(", ");
+                                        stmt.append(std::to_string(localStarts[i]));
+                                        if (localLens[i] > 0)
+                                        {
+                                            stmt.append(", ");
+                                            stmt.append(std::to_string(localStarts[i] + localLens[i] - 1));
+                                        }
+                                    }
+                                    stmt.append(");");
+                                }
+                                else if (kind == "literal")
+                                {
+                                    // Direct assignment: memory[addr] = value;
+                                    std::string value = (initValues && i < initValues->size()) ? (*initValues)[i] : "0";
+                                    if (localStarts[i] < 0)
+                                    {
+                                        // Full init
+                                        stmt = "for (int __i = 0; __i < " + std::to_string(elementCount) + "; __i = __i + 1) " +
+                                               opContext + "[__i] = " + value + ";";
+                                    }
+                                    else if (localLens[i] <= 0)
+                                    {
+                                        reportError("kRegister literal initLen must be > 0", opContext);
+                                        break;
+                                    }
+                                    else if (localLens[i] == 1)
+                                    {
+                                        // Specific address
+                                        stmt = opContext + "[" + std::to_string(localStarts[i]) + "] = " + value + ";";
+                                    }
+                                    else
+                                    {
+                                        // Address range init
+                                        stmt = "for (int __i = " + std::to_string(localStarts[i]) + "; __i < " +
+                                               std::to_string(localStarts[i] + localLens[i]) +
+                                               "; __i = __i + 1) " + opContext + "[__i] = " + value + ";";
+                                    }
+                                }
+                                else
+                                {
+                                    // Unknown kind, skip
+                                    continue;
+                                }
+
+                                std::ostringstream oss;
+                                appendIndented(oss, 2, stmt);
+                                addSimpleStmt("initial", oss.str(), opId);
+                            }
+                        }
+                        // Scalar initValue on an array register is a whole-array
+                        // flat literal; distribute it across elements.
+                        auto scalarInit = getAttribute<std::string>(*graph, op, "initValue");
+                        if (scalarInit)
+                        {
+                            std::ostringstream oss;
+                            if (shapeAttr->size() == 1)
+                            {
+                                appendIndented(oss, 2,
+                                               "for (int __i = 0; __i < " + std::to_string(elementCount) +
+                                                   "; __i = __i + 1) " + opContext + "[__i] = (" + *scalarInit +
+                                                   ") >> (__i * " + std::to_string(elemWidth) + ");");
+                                addSimpleStmt("initial", oss.str(), opId);
+                            }
+                            else
+                            {
+                                reportWarning("kRegister scalar initValue on a multi-dimensional array is unsupported",
+                                              opContext);
+                            }
+                        }
+                        break;
+                    }
                     if (storageBackedPorts.find(opContext) == storageBackedPorts.end())
                     {
                         ensureRegDecl(opContext, width, *isSignedAttr, wolvrix::lib::grh::ValueType::Logic,
@@ -4335,12 +4493,64 @@ namespace wolvrix::lib::emit
                         break;
                     }
                     const std::string &regName = *regSymbolAttr;
+                    if (auto shape = registerShapeForSymbol(regName); shape && !shape->empty())
+                    {
+                        // Whole read of an array register: flatten the
+                        // unpacked declaration into canonical bit order.
+                        addAssign("assign " + valueName(results[0]) + " = " +
+                                      flattenArrayRead(regName, *shape) + ";",
+                                  opId);
+                        ensureWireDecl(results[0]);
+                        break;
+                    }
                     if (valueName(results[0]) == regName)
                     {
                         markPortAsRegIfNeeded(results[0]);
                         break;
                     }
                     addAssign("assign " + valueName(results[0]) + " = " + regName + ";", opId);
+                    ensureWireDecl(results[0]);
+                    break;
+                }
+                case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
+                {
+                    if (operands.empty() || results.empty())
+                    {
+                        reportError("kRegisterReadArrayPort missing operands or results", opContext);
+                        break;
+                    }
+                    auto regSymbolAttr = getAttribute<std::string>(*graph, op, "regSymbol");
+                    if (!regSymbolAttr)
+                    {
+                        reportError("kRegisterReadArrayPort missing regSymbol", opContext);
+                        break;
+                    }
+                    const std::string &regName = *regSymbolAttr;
+                    std::string readExpr = regName;
+                    for (const wolvrix::lib::grh::ValueId index : operands)
+                    {
+                        std::string indexExpr;
+                        if (dpiDrivenStateOps.find(opId) != dpiDrivenStateOps.end())
+                        {
+                            withDpiInlineSink(opId, [&]() {
+                                indexExpr = valueExprSeq(index);
+                            });
+                        }
+                        else
+                        {
+                            indexExpr = valueExprSeq(index);
+                        }
+                        readExpr += "[" + indexExpr + "]";
+                    }
+                    if (auto shape = registerShapeForSymbol(regName);
+                        shape && operands.size() < shape->size())
+                    {
+                        // Partial index: the addressed element is itself an
+                        // array; flatten it into canonical bit order.
+                        readExpr = flattenArrayRead(
+                            readExpr, std::span<const int64_t>(*shape).subspan(operands.size()));
+                    }
+                    addAssign("assign " + valueName(results[0]) + " = " + readExpr + ";", opId);
                     ensureWireDecl(results[0]);
                     break;
                 }
@@ -4373,15 +4583,15 @@ namespace wolvrix::lib::emit
                 }
                 case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
                 {
-                    if (operands.size() < 3)
+                    // [updateCond, nextValue, events...] — whole write.
+                    if (operands.size() < 2)
                     {
                         reportError("kRegisterWritePort missing operands", opContext);
                         break;
                     }
                     const wolvrix::lib::grh::ValueId updateCond = operands[0];
                     const wolvrix::lib::grh::ValueId nextValue = operands[1];
-                    const wolvrix::lib::grh::ValueId mask = operands[2];
-                    if (!updateCond.valid() || !nextValue.valid() || !mask.valid())
+                    if (!updateCond.valid() || !nextValue.valid())
                     {
                         reportError("kRegisterWritePort missing operands", opContext);
                         break;
@@ -4398,26 +4608,123 @@ namespace wolvrix::lib::emit
                         break;
                     }
                     const std::string &regName = *regSymbolAttr;
+                    auto seqKey = buildEventKey(op, 2);
+                    if (!seqKey)
+                    {
+                        break;
+                    }
+
+                    int64_t regWidth = registerWidthForSymbol(*regSymbolAttr, nextValue);
+
+                    std::string updateExpr;
+                    std::string nextExpr;
+                    std::string nextExprFull;
+                    auto extendSeqOperand = [&](wolvrix::lib::grh::ValueId valueId, int64_t targetWidth) -> std::string
+                    {
+                        ExprTools seqExpr = baseExpr;
+                        seqExpr.valueExpr = valueExprSeq;
+                        return seqExpr.extendOperand(valueId, targetWidth);
+                    };
+                    if (dpiDrivenStateOps.find(opId) != dpiDrivenStateOps.end())
+                    {
+                        withDpiInlineSink(opId, [&]() {
+                            updateExpr = valueExprSeq(updateCond);
+                            nextExpr = valueExprSeq(nextValue);
+                            nextExprFull = extendSeqOperand(nextValue, regWidth);
+                        });
+                    }
+                    else
+                    {
+                        updateExpr = valueExprSeq(updateCond);
+                        nextExpr = valueExprSeq(nextValue);
+                        nextExprFull = extendSeqOperand(nextValue, regWidth);
+                    }
+                    if (auto inlineUpdate = inlineConstExprFor(updateCond))
+                    {
+                        updateExpr = *inlineUpdate;
+                    }
+                    if (nextExprFull.empty())
+                    {
+                        nextExprFull = extendSeqOperand(nextValue, regWidth);
+                    }
+
+                    const bool guardUpdate = !isConstOne(updateCond);
+                    const int baseIndent = guardUpdate ? 3 : 2;
+                    const int64_t dataWidth = graph->valueWidth(nextValue);
+                    if (dataWidth > 0 && regWidth > 0 && dataWidth != regWidth)
+                    {
+                        reportWarning("kRegisterWritePort data width does not match register width", opContext);
+                    }
+                    std::ostringstream stmt;
+                    if (guardUpdate)
+                    {
+                        appendIndented(stmt, 2, "if (" + updateExpr + ") begin");
+                    }
+                    if (auto shape = registerShapeForSymbol(regName); shape && !shape->empty())
+                    {
+                        // Whole write of an array register: loop over the
+                        // unpacked dimensions with canonical bit offsets.
+                        int64_t elementCount = 1;
+                        for (const int64_t dim : *shape)
+                        {
+                            elementCount *= dim;
+                        }
+                        const int64_t elemWidth = elementCount > 0 ? regWidth / elementCount : 1;
+                        emitSubArrayWriteLoops(
+                            stmt, baseIndent, *shape,
+                            [&](int loopIndent, const std::string &suffix, const std::string &offset) {
+                                appendIndented(stmt, loopIndent,
+                                               regName + suffix + " <= " + nextExpr + "[(" + offset + ") * " +
+                                                   std::to_string(elemWidth) + " +: " +
+                                                   std::to_string(elemWidth) + "];");
+                            });
+                    }
+                    else
+                    {
+                        appendIndented(stmt, baseIndent, regName + " <= " + nextExprFull + ";");
+                    }
+                    if (guardUpdate)
+                    {
+                        appendIndented(stmt, 2, "end");
+                    }
+                    addSequentialStmt(*seqKey, stmt.str(), opId);
+                    break;
+                }
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+                {
+                    // [updateCond, nextValue, mask, events...] — whole write with bit mask.
+                    if (operands.size() < 3)
+                    {
+                        reportError("kRegisterWriteMaskPort missing operands", opContext);
+                        break;
+                    }
+                    const wolvrix::lib::grh::ValueId updateCond = operands[0];
+                    const wolvrix::lib::grh::ValueId nextValue = operands[1];
+                    const wolvrix::lib::grh::ValueId mask = operands[2];
+                    if (!updateCond.valid() || !nextValue.valid() || !mask.valid())
+                    {
+                        reportError("kRegisterWriteMaskPort missing operands", opContext);
+                        break;
+                    }
+                    if (graph->valueWidth(updateCond) != 1)
+                    {
+                        reportError("kRegisterWriteMaskPort updateCond must be 1 bit", opContext);
+                        break;
+                    }
+                    auto regSymbolAttr = getAttribute<std::string>(*graph, op, "regSymbol");
+                    if (!regSymbolAttr)
+                    {
+                        reportError("kRegisterWriteMaskPort missing regSymbol", opContext);
+                        break;
+                    }
+                    const std::string &regName = *regSymbolAttr;
                     auto seqKey = buildEventKey(op, 3);
                     if (!seqKey)
                     {
                         break;
                     }
 
-                    int64_t regWidth = graph->valueWidth(nextValue);
-                    const wolvrix::lib::grh::OperationId regOpId = graph->findOperation(*regSymbolAttr);
-                    if (regOpId.valid())
-                    {
-                        const wolvrix::lib::grh::Operation regOp = graph->getOperation(regOpId);
-                        if (regOp.kind() == wolvrix::lib::grh::OperationKind::kRegister)
-                        {
-                            regWidth = getAttribute<int64_t>(*graph, regOp, "width").value_or(regWidth);
-                        }
-                    }
-                    if (regWidth <= 0)
-                    {
-                        regWidth = 1;
-                    }
+                    int64_t regWidth = registerWidthForSymbol(*regSymbolAttr, nextValue);
 
                     std::string updateExpr;
                     std::string nextExpr;
@@ -4480,12 +4787,52 @@ namespace wolvrix::lib::emit
                     const bool maskAllOnes = maskBits ? maskAll(1) : false;
                     if (dataWidth > 0 && regWidth > 0 && dataWidth != regWidth && !maskAllOnes)
                     {
-                        reportWarning("kRegisterWritePort data width does not match register width", opContext);
+                        reportWarning("kRegisterWriteMaskPort data width does not match register width", opContext);
                     }
                     std::ostringstream stmt;
                     if (guardUpdate)
                     {
                         appendIndented(stmt, 2, "if (" + updateExpr + ") begin");
+                    }
+                    if (auto shape = registerShapeForSymbol(regName); shape && !shape->empty())
+                    {
+                        // Masked whole write of an array register: per-element
+                        // read-modify-write with canonical bit offsets.
+                        if (maskBits && maskAll(0))
+                        {
+                            break;
+                        }
+                        int64_t elementCount = 1;
+                        for (const int64_t dim : *shape)
+                        {
+                            elementCount *= dim;
+                        }
+                        const int64_t elemWidth = elementCount > 0 ? regWidth / elementCount : 1;
+                        emitSubArrayWriteLoops(
+                            stmt, baseIndent, *shape,
+                            [&](int loopIndent, const std::string &suffix, const std::string &offset) {
+                                const std::string slice = "[(" + offset + ") * " +
+                                                          std::to_string(elemWidth) + " +: " +
+                                                          std::to_string(elemWidth) + "]";
+                                if (maskAllOnes)
+                                {
+                                    appendIndented(stmt, loopIndent,
+                                                   regName + suffix + " <= " + nextExpr + slice + ";");
+                                }
+                                else
+                                {
+                                    appendIndented(stmt, loopIndent,
+                                                   regName + suffix + " <= (" + regName + suffix + " & ~(" +
+                                                       maskExpr + slice + ")) | (" + nextExpr + slice + " & " +
+                                                       maskExpr + slice + ");");
+                                }
+                            });
+                        if (guardUpdate)
+                        {
+                            appendIndented(stmt, 2, "end");
+                        }
+                        addSequentialStmt(*seqKey, stmt.str(), opId);
+                        break;
                     }
                     if (maskBits)
                     {
@@ -4745,203 +5092,117 @@ namespace wolvrix::lib::emit
                     }
                     break;
                 }
-                case wolvrix::lib::grh::OperationKind::kMemory:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
                 {
-                    auto widthAttr = getAttribute<int64_t>(*graph, op, "width");
-                    auto rowAttr = getAttribute<int64_t>(*graph, op, "row");
-                    auto isSignedAttr = getAttribute<bool>(*graph, op, "isSigned");
-                    if (!widthAttr || !rowAttr || !isSignedAttr)
+                    // kRegisterWriteArrayPort:     [updateCond, i0..ik-1, data, events...]
+                    // kRegisterWriteArrayMaskPort: [updateCond, i0..ik-1, data, mask, events...]
+                    const bool withMask =
+                        op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort;
+                    const char *opName = withMask ? "kRegisterWriteArrayMaskPort" : "kRegisterWriteArrayPort";
+                    const std::optional<std::size_t> eventStartOpt =
+                        wolvrix::lib::grh::firstEventOperandIndex(op);
+                    if (!eventStartOpt)
                     {
-                        reportError("kMemory missing width/row/isSigned", opContext);
+                        reportError(std::string(opName) + " cannot locate event operands", opContext);
                         break;
                     }
-                    std::ostringstream decl;
-                    decl << "reg " << (*isSignedAttr ? "signed " : "") << "[" << (*widthAttr - 1) << ":0] " << opContext << " [0:" << (*rowAttr - 1) << "];";
-                    memoryDecls.emplace_back(decl.str(), opId);
-                    declaredNames.insert(opContext);
-
-                    auto initKinds = getAttribute<std::vector<std::string>>(*graph, op, "initKind");
-                    auto initFiles = getAttribute<std::vector<std::string>>(*graph, op, "initFile");
-                    auto initValues = getAttribute<std::vector<std::string>>(*graph, op, "initValue");
-                    if (initKinds || initFiles)
-                    {
-                        if (!initKinds || !initFiles || initKinds->size() != initFiles->size())
-                        {
-                            reportError("kMemory initKind/initFile size mismatch", opContext);
-                            break;
-                        }
-                        const std::size_t count = initKinds->size();
-                        auto starts = getAttribute<std::vector<int64_t>>(*graph, op, "initStart");
-                        auto lens = getAttribute<std::vector<int64_t>>(*graph, op, "initLen");
-                        if (!starts || !lens || starts->size() != count || lens->size() != count)
-                        {
-                            reportError("kMemory initStart/initLen size mismatch", opContext);
-                            break;
-                        }
-                        const std::vector<int64_t> &localStarts = *starts;
-                        const std::vector<int64_t> &localLens = *lens;
-                        for (std::size_t i = 0; i < count; ++i)
-                        {
-                            const std::string& kind = (*initKinds)[i];
-                            std::string stmt;
-                            
-                            if (kind == "readmemh" || kind == "readmemb")
-                            {
-                                // readmemh/readmemb: $readmemh("file", memory, start, finish);
-                                stmt = "$" + kind + "(\"" + escapeSvString((*initFiles)[i]) + "\", " + opContext;
-                                if (localStarts[i] >= 0)
-                                {
-                                    stmt.append(", ");
-                                    stmt.append(std::to_string(localStarts[i]));
-                                    if (localLens[i] > 0)
-                                    {
-                                        stmt.append(", ");
-                                        stmt.append(std::to_string(localStarts[i] + localLens[i] - 1));
-                                    }
-                                }
-                                stmt.append(");");
-                            }
-                            else if (kind == "literal")
-                            {
-                                // Direct assignment: memory[addr] = value;
-                                std::string value = (initValues && i < initValues->size()) ? (*initValues)[i] : "0";
-                                if (localStarts[i] < 0)
-                                {
-                                    // Full init
-                                    stmt = "for (int __i = 0; __i < " + std::to_string(*rowAttr) + "; __i = __i + 1) " +
-                                           opContext + "[__i] = " + value + ";";
-                                }
-                                else if (localLens[i] <= 0)
-                                {
-                                    reportError("kMemory literal initLen must be > 0", opContext);
-                                    break;
-                                }
-                                else if (localLens[i] == 1)
-                                {
-                                    // Specific address
-                                    stmt = opContext + "[" + std::to_string(localStarts[i]) + "] = " + value + ";";
-                                }
-                                else
-                                {
-                                    // Address range init
-                                    stmt = "for (int __i = " + std::to_string(localStarts[i]) + "; __i < " +
-                                           std::to_string(localStarts[i] + localLens[i]) +
-                                           "; __i = __i + 1) " + opContext + "[__i] = " + value + ";";
-                                }
-                            }
-                            else
-                            {
-                                // Unknown kind, skip
-                                continue;
-                            }
-                            
-                            std::ostringstream oss;
-                            appendIndented(oss, 2, stmt);
-                            addSimpleStmt("initial", oss.str(), opId);
-                        }
-                    }
-                    break;
-                }
-                case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-                {
-                    if (operands.size() < 1 || results.empty())
-                    {
-                        reportError("kMemoryReadPort missing operands or results", opContext);
-                        break;
-                    }
-                    auto memSymbolAttr = resolveMemorySymbol(op);
-                    if (!memSymbolAttr)
-                    {
-                        reportError("kMemoryReadPort missing memSymbol", opContext);
-                        break;
-                    }
-                    std::string addrExpr;
-                    if (dpiDrivenStateOps.find(opId) != dpiDrivenStateOps.end())
-                    {
-                        withDpiInlineSink(opId, [&]() {
-                            addrExpr = valueExprSeq(operands[0]);
-                        });
-                    }
-                    else
-                    {
-                        addrExpr = valueExprSeq(operands[0]);
-                    }
-                    addAssign("assign " + valueName(results[0]) + " = " + *memSymbolAttr + "[" +
-                                  addrExpr + "];",
-                              opId);
-                    ensureWireDecl(results[0]);
-                    break;
-                }
-                case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-                {
-                    if (operands.size() < 5)
-                    {
-                        reportError("kMemoryWritePort missing operands", opContext);
-                        break;
-                    }
+                    const std::size_t eventStart = *eventStartOpt;
+                    const std::size_t indexCount = eventStart - (withMask ? 3 : 2);
                     const wolvrix::lib::grh::ValueId updateCond = operands[0];
-                    const wolvrix::lib::grh::ValueId addr = operands[1];
-                    const wolvrix::lib::grh::ValueId data = operands[2];
-                    const wolvrix::lib::grh::ValueId mask = operands[3];
-                    if (!updateCond.valid() || !addr.valid() || !data.valid() || !mask.valid())
+                    const wolvrix::lib::grh::ValueId data = operands[eventStart - (withMask ? 2 : 1)];
+                    const wolvrix::lib::grh::ValueId mask =
+                        withMask ? operands[eventStart - 1] : wolvrix::lib::grh::ValueId::invalid();
+                    if (!updateCond.valid() || !data.valid() || (withMask && !mask.valid()))
                     {
-                        reportError("kMemoryWritePort missing operands", opContext);
+                        reportError(std::string(opName) + " missing operands", opContext);
                         break;
                     }
                     if (graph->valueWidth(updateCond) != 1)
                     {
-                        reportError("kMemoryWritePort updateCond must be 1 bit", opContext);
+                        reportError(std::string(opName) + " updateCond must be 1 bit", opContext);
                         break;
                     }
-                    auto memSymbolAttr = resolveMemorySymbol(op);
-                    if (!memSymbolAttr)
+                    auto regSymbolAttr = getAttribute<std::string>(*graph, op, "regSymbol");
+                    if (!regSymbolAttr)
                     {
-                        reportError("kMemoryWritePort missing memSymbol", opContext);
+                        reportError(std::string(opName) + " missing regSymbol", opContext);
                         break;
                     }
-                    auto seqKey = buildEventKey(op, 4);
+                    auto seqKey = buildEventKey(op, eventStart);
                     if (!seqKey)
                     {
                         break;
                     }
 
-                    const std::string &memSymbol = *memSymbolAttr;
-                    const wolvrix::lib::grh::OperationId memOpId = graph->findOperation(memSymbol);
-                    int64_t memWidth = 1;
-                    if (memOpId.valid())
+                    const std::string &regName = *regSymbolAttr;
+                    int64_t totalWidth = 1;
+                    std::vector<int64_t> shape;
+                    const wolvrix::lib::grh::OperationId declOpId = graph->findOperation(regName);
+                    if (declOpId.valid())
                     {
-                        const wolvrix::lib::grh::Operation memOp = graph->getOperation(memOpId);
-                        memWidth = getAttribute<int64_t>(*graph, memOp, "width").value_or(1);
+                        const wolvrix::lib::grh::Operation declOp = graph->getOperation(declOpId);
+                        if (declOp.kind() == wolvrix::lib::grh::OperationKind::kRegister)
+                        {
+                            totalWidth = getAttribute<int64_t>(*graph, declOp, "width").value_or(1);
+                            shape = getAttribute<std::vector<int64_t>>(*graph, declOp, "shape")
+                                        .value_or(std::vector<int64_t>{});
+                        }
                     }
+                    if (totalWidth <= 0)
+                    {
+                        totalWidth = 1;
+                    }
+                    int64_t elementCount = 1;
+                    for (const int64_t dim : shape)
+                    {
+                        elementCount *= dim;
+                    }
+                    if (elementCount <= 0)
+                    {
+                        elementCount = 1;
+                    }
+                    const int64_t elemWidth = totalWidth / elementCount;
+                    int64_t prefixCount = 1;
+                    for (std::size_t i = 0; i < indexCount && i < shape.size(); ++i)
+                    {
+                        prefixCount *= shape[i];
+                    }
+                    const int64_t subWidth = prefixCount > 0 ? totalWidth / prefixCount : totalWidth;
 
                     std::string updateExpr;
-                    std::string addrExpr;
                     std::string dataExpr;
                     std::string maskExpr;
                     std::string dataExprFull;
+                    std::vector<std::string> indexExprs;
+                    indexExprs.reserve(indexCount);
                     auto extendSeqOperand = [&](wolvrix::lib::grh::ValueId valueId, int64_t targetWidth) -> std::string
                     {
                         ExprTools seqExpr = baseExpr;
                         seqExpr.valueExpr = valueExprSeq;
                         return seqExpr.extendOperand(valueId, targetWidth);
                     };
+                    auto formatOperands = [&]() {
+                        updateExpr = valueExprSeq(updateCond);
+                        dataExpr = valueExprSeq(data);
+                        if (withMask)
+                        {
+                            maskExpr = valueExprSeq(mask);
+                        }
+                        dataExprFull = extendSeqOperand(data, subWidth);
+                        indexExprs.clear();
+                        for (std::size_t i = 0; i < indexCount; ++i)
+                        {
+                            indexExprs.push_back(valueExprSeq(operands[1 + i]));
+                        }
+                    };
                     if (dpiDrivenStateOps.find(opId) != dpiDrivenStateOps.end())
                     {
-                        withDpiInlineSink(opId, [&]() {
-                            updateExpr = valueExprSeq(updateCond);
-                            addrExpr = valueExprSeq(addr);
-                            dataExpr = valueExprSeq(data);
-                            maskExpr = valueExprSeq(mask);
-                            dataExprFull = extendSeqOperand(data, memWidth);
-                        });
+                        withDpiInlineSink(opId, formatOperands);
                     }
                     else
                     {
-                        updateExpr = valueExprSeq(updateCond);
-                        addrExpr = valueExprSeq(addr);
-                        dataExpr = valueExprSeq(data);
-                        maskExpr = valueExprSeq(mask);
-                        dataExprFull = extendSeqOperand(data, memWidth);
+                        formatOperands();
                     }
                     if (auto inlineUpdate = inlineConstExprFor(updateCond))
                     {
@@ -4949,15 +5210,23 @@ namespace wolvrix::lib::emit
                     }
                     if (dataExprFull.empty())
                     {
-                        dataExprFull = extendSeqOperand(data, memWidth);
+                        dataExprFull = extendSeqOperand(data, subWidth);
+                    }
+                    std::string target = regName;
+                    for (const std::string &indexExpr : indexExprs)
+                    {
+                        target += "[" + indexExpr + "]";
                     }
 
                     const bool guardUpdate = !isConstOne(updateCond);
                     const int baseIndent = guardUpdate ? 3 : 2;
                     std::optional<std::vector<uint8_t>> maskBits;
-                    if (auto maskLiteral = constLiteralFor(mask))
+                    if (withMask)
                     {
-                        maskBits = parseConstMaskBits(*maskLiteral, memWidth);
+                        if (auto maskLiteral = constLiteralFor(mask))
+                        {
+                            maskBits = parseConstMaskBits(*maskLiteral, subWidth);
+                        }
                     }
                     auto maskAll = [&](uint8_t value) -> bool
                     {
@@ -4976,14 +5245,60 @@ namespace wolvrix::lib::emit
                     };
                     const int64_t dataWidth = graph->valueWidth(data);
                     const bool maskAllOnes = maskBits ? maskAll(1) : false;
-                    if (dataWidth > 0 && memWidth > 0 && dataWidth != memWidth && !maskAllOnes)
+                    if (dataWidth > 0 && subWidth > 0 && dataWidth != subWidth && !maskAllOnes)
                     {
-                        reportWarning("kMemoryWritePort data width does not match memory width", opContext);
+                        reportWarning(std::string(opName) + " data width does not match the addressed sub-array width",
+                                      opContext);
                     }
                     std::ostringstream stmt;
                     if (guardUpdate)
                     {
                         appendIndented(stmt, 2, "if (" + updateExpr + ") begin");
+                    }
+                    if (indexCount < shape.size())
+                    {
+                        // Partial index write: loop over the remaining
+                        // dimensions with canonical bit offsets.
+                        if (maskBits && maskAll(0))
+                        {
+                            break;
+                        }
+                        emitSubArrayWriteLoops(
+                            stmt, baseIndent,
+                            std::span<const int64_t>(shape).subspan(indexCount),
+                            [&](int loopIndent, const std::string &suffix, const std::string &offset) {
+                                const std::string slice = "[(" + offset + ") * " +
+                                                          std::to_string(elemWidth) + " +: " +
+                                                          std::to_string(elemWidth) + "]";
+                                if (!withMask || maskAllOnes)
+                                {
+                                    appendIndented(stmt, loopIndent,
+                                                   target + suffix + " <= " + dataExpr + slice + ";");
+                                }
+                                else
+                                {
+                                    appendIndented(stmt, loopIndent,
+                                                   target + suffix + " <= (" + target + suffix + " & ~(" +
+                                                       maskExpr + slice + ")) | (" + dataExpr + slice + " & " +
+                                                       maskExpr + slice + ");");
+                                }
+                            });
+                        if (guardUpdate)
+                        {
+                            appendIndented(stmt, 2, "end");
+                        }
+                        addSequentialStmt(*seqKey, stmt.str(), opId);
+                        break;
+                    }
+                    if (!withMask)
+                    {
+                        appendIndented(stmt, baseIndent, target + " <= " + dataExprFull + ";");
+                        if (guardUpdate)
+                        {
+                            appendIndented(stmt, 2, "end");
+                        }
+                        addSequentialStmt(*seqKey, stmt.str(), opId);
+                        break;
                     }
                     if (maskBits)
                     {
@@ -4993,18 +5308,18 @@ namespace wolvrix::lib::emit
                         {
                             break;
                         }
-                        if (allOnes || memWidth <= 1)
+                        if (allOnes || subWidth <= 1)
                         {
-                            appendIndented(stmt, baseIndent, memSymbol + "[" + addrExpr + "] <= " + dataExprFull + ";");
+                            appendIndented(stmt, baseIndent, target + " <= " + dataExprFull + ";");
                         }
                         else
                         {
-                            for (int64_t bit = 0; bit < memWidth; ++bit)
+                            for (int64_t bit = 0; bit < subWidth; ++bit)
                             {
                                 if ((*maskBits)[static_cast<std::size_t>(bit)] != 0)
                                 {
                                     appendIndented(stmt, baseIndent,
-                                                   memSymbol + "[" + addrExpr + "][" + std::to_string(bit) + "] <= " +
+                                                   target + "[" + std::to_string(bit) + "] <= " +
                                                        dataExpr + "[" + std::to_string(bit) + "];");
                                 }
                             }
@@ -5016,10 +5331,10 @@ namespace wolvrix::lib::emit
                         addSequentialStmt(*seqKey, stmt.str(), opId);
                         break;
                     }
-                    if (memWidth <= 1)
+                    if (subWidth <= 1)
                     {
                         appendIndented(stmt, baseIndent, "if (" + maskExpr + ") begin");
-                        appendIndented(stmt, baseIndent + 1, memSymbol + "[" + addrExpr + "] <= " + dataExprFull + ";");
+                        appendIndented(stmt, baseIndent + 1, target + " <= " + dataExprFull + ";");
                         appendIndented(stmt, baseIndent, "end");
                         if (guardUpdate)
                         {
@@ -5028,13 +5343,13 @@ namespace wolvrix::lib::emit
                         addSequentialStmt(*seqKey, stmt.str(), opId);
                         break;
                     }
-                    appendIndented(stmt, baseIndent, "if (" + maskExpr + " == {" + std::to_string(memWidth) + "{1'b1}}) begin");
-                    appendIndented(stmt, baseIndent + 1, memSymbol + "[" + addrExpr + "] <= " + dataExprFull + ";");
+                    appendIndented(stmt, baseIndent, "if (" + maskExpr + " == {" + std::to_string(subWidth) + "{1'b1}}) begin");
+                    appendIndented(stmt, baseIndent + 1, target + " <= " + dataExprFull + ";");
                     appendIndented(stmt, baseIndent, "end else begin");
                     appendIndented(stmt, baseIndent + 1, "integer i;");
-                    appendIndented(stmt, baseIndent + 1, "for (i = 0; i < " + std::to_string(memWidth) + "; i = i + 1) begin");
+                    appendIndented(stmt, baseIndent + 1, "for (i = 0; i < " + std::to_string(subWidth) + "; i = i + 1) begin");
                     appendIndented(stmt, baseIndent + 2, "if (" + maskExpr + "[i]) begin");
-                    appendIndented(stmt, baseIndent + 3, memSymbol + "[" + addrExpr + "][i] <= " + dataExpr + "[i];");
+                    appendIndented(stmt, baseIndent + 3, target + "[i] <= " + dataExpr + "[i];");
                     appendIndented(stmt, baseIndent + 2, "end");
                     appendIndented(stmt, baseIndent + 1, "end");
                     appendIndented(stmt, baseIndent, "end");
@@ -5045,29 +5360,30 @@ namespace wolvrix::lib::emit
                     addSequentialStmt(*seqKey, stmt.str(), opId);
                     break;
                 }
-                case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
                 {
-                    if (operands.size() < 3)
+                    // [updateCond, data, events...] — broadcast fill of every element.
+                    if (operands.size() < 2)
                     {
-                        reportError("kMemoryFillPort missing operands", opContext);
+                        reportError("kRegisterFillPort missing operands", opContext);
                         break;
                     }
                     const wolvrix::lib::grh::ValueId updateCond = operands[0];
                     const wolvrix::lib::grh::ValueId data = operands[1];
                     if (!updateCond.valid() || !data.valid())
                     {
-                        reportError("kMemoryFillPort missing operands", opContext);
+                        reportError("kRegisterFillPort missing operands", opContext);
                         break;
                     }
                     if (graph->valueWidth(updateCond) != 1)
                     {
-                        reportError("kMemoryFillPort updateCond must be 1 bit", opContext);
+                        reportError("kRegisterFillPort updateCond must be 1 bit", opContext);
                         break;
                     }
-                    auto memSymbolAttr = resolveMemorySymbol(op);
-                    if (!memSymbolAttr)
+                    auto regSymbolAttr = getAttribute<std::string>(*graph, op, "regSymbol");
+                    if (!regSymbolAttr)
                     {
-                        reportError("kMemoryFillPort missing memSymbol", opContext);
+                        reportError("kRegisterFillPort missing regSymbol", opContext);
                         break;
                     }
                     auto seqKey = buildEventKey(op, 2);
@@ -5076,21 +5392,34 @@ namespace wolvrix::lib::emit
                         break;
                     }
 
-                    const std::string &memSymbol = *memSymbolAttr;
-                    const wolvrix::lib::grh::OperationId memOpId = graph->findOperation(memSymbol);
-                    int64_t memWidth = 1;
-                    int64_t rowCount = 0;
-                    if (memOpId.valid())
+                    const std::string &regName = *regSymbolAttr;
+                    int64_t totalWidth = 1;
+                    std::vector<int64_t> shape;
+                    const wolvrix::lib::grh::OperationId declOpId = graph->findOperation(regName);
+                    if (declOpId.valid())
                     {
-                        const wolvrix::lib::grh::Operation memOp = graph->getOperation(memOpId);
-                        memWidth = getAttribute<int64_t>(*graph, memOp, "width").value_or(1);
-                        rowCount = getAttribute<int64_t>(*graph, memOp, "row").value_or(0);
+                        const wolvrix::lib::grh::Operation declOp = graph->getOperation(declOpId);
+                        if (declOp.kind() == wolvrix::lib::grh::OperationKind::kRegister)
+                        {
+                            totalWidth = getAttribute<int64_t>(*graph, declOp, "width").value_or(1);
+                            shape = getAttribute<std::vector<int64_t>>(*graph, declOp, "shape")
+                                        .value_or(std::vector<int64_t>{});
+                        }
                     }
-                    if (rowCount <= 0)
+                    if (totalWidth <= 0)
                     {
-                        reportError("kMemoryFillPort target memory missing row attr", opContext);
-                        break;
+                        totalWidth = 1;
                     }
+                    int64_t elementCount = 1;
+                    for (const int64_t dim : shape)
+                    {
+                        elementCount *= dim;
+                    }
+                    if (elementCount <= 0)
+                    {
+                        elementCount = 1;
+                    }
+                    const int64_t elemWidth = totalWidth / elementCount;
 
                     std::string updateExpr;
                     std::string dataExprFull;
@@ -5104,13 +5433,13 @@ namespace wolvrix::lib::emit
                     {
                         withDpiInlineSink(opId, [&]() {
                             updateExpr = valueExprSeq(updateCond);
-                            dataExprFull = extendSeqOperand(data, memWidth);
+                            dataExprFull = extendSeqOperand(data, elemWidth);
                         });
                     }
                     else
                     {
                         updateExpr = valueExprSeq(updateCond);
-                        dataExprFull = extendSeqOperand(data, memWidth);
+                        dataExprFull = extendSeqOperand(data, elemWidth);
                     }
                     if (auto inlineUpdate = inlineConstExprFor(updateCond))
                     {
@@ -5118,30 +5447,67 @@ namespace wolvrix::lib::emit
                     }
                     if (dataExprFull.empty())
                     {
-                        dataExprFull = extendSeqOperand(data, memWidth);
+                        dataExprFull = extendSeqOperand(data, elemWidth);
                     }
-                    if (graph->valueWidth(data) > 0 && memWidth > 0 && graph->valueWidth(data) != memWidth)
+                    if (graph->valueWidth(data) > 0 && elemWidth > 0 && graph->valueWidth(data) != elemWidth)
                     {
-                        reportWarning("kMemoryFillPort data width does not match memory width", opContext);
+                        reportWarning("kRegisterFillPort data width does not match the element width", opContext);
                     }
 
                     std::ostringstream stmt;
+                    if (shape.empty())
+                    {
+                        // Scalar register: a fill degenerates to a whole write.
+                        if (!isConstOne(updateCond))
+                        {
+                            appendIndented(stmt, 2, "if (" + updateExpr + ") begin");
+                            appendIndented(stmt, 3, regName + " <= " + dataExprFull + ";");
+                            appendIndented(stmt, 2, "end");
+                        }
+                        else
+                        {
+                            appendIndented(stmt, 2, regName + " <= " + dataExprFull + ";");
+                        }
+                        addSequentialStmt(*seqKey, stmt.str(), opId);
+                        break;
+                    }
+                    if (shape.size() > 1)
+                    {
+                        // Multi-dimensional fill: nested loops over all dims.
+                        const int baseIndent = !isConstOne(updateCond) ? 3 : 2;
+                        if (!isConstOne(updateCond))
+                        {
+                            appendIndented(stmt, 2, "if (" + updateExpr + ") begin");
+                        }
+                        emitSubArrayWriteLoops(stmt, baseIndent, shape,
+                                               [&](int loopIndent, const std::string &suffix,
+                                                   const std::string &) {
+                                                   appendIndented(stmt, loopIndent,
+                                                                  regName + suffix + " <= " + dataExprFull + ";");
+                                               });
+                        if (!isConstOne(updateCond))
+                        {
+                            appendIndented(stmt, 2, "end");
+                        }
+                        addSequentialStmt(*seqKey, stmt.str(), opId);
+                        break;
+                    }
                     if (!isConstOne(updateCond))
                     {
                         appendIndented(stmt, 2, "if (" + updateExpr + ") begin");
                         appendIndented(stmt, 3, "integer __fill_i;");
-                        appendIndented(stmt, 3, "for (__fill_i = 0; __fill_i < " + std::to_string(rowCount) +
+                        appendIndented(stmt, 3, "for (__fill_i = 0; __fill_i < " + std::to_string(elementCount) +
                                                    "; __fill_i = __fill_i + 1) begin");
-                        appendIndented(stmt, 4, memSymbol + "[__fill_i] <= " + dataExprFull + ";");
+                        appendIndented(stmt, 4, regName + "[__fill_i] <= " + dataExprFull + ";");
                         appendIndented(stmt, 3, "end");
                         appendIndented(stmt, 2, "end");
                     }
                     else
                     {
                         appendIndented(stmt, 2, "integer __fill_i;");
-                        appendIndented(stmt, 2, "for (__fill_i = 0; __fill_i < " + std::to_string(rowCount) +
+                        appendIndented(stmt, 2, "for (__fill_i = 0; __fill_i < " + std::to_string(elementCount) +
                                                    "; __fill_i = __fill_i + 1) begin");
-                        appendIndented(stmt, 3, memSymbol + "[__fill_i] <= " + dataExprFull + ";");
+                        appendIndented(stmt, 3, regName + "[__fill_i] <= " + dataExprFull + ";");
                         appendIndented(stmt, 2, "end");
                     }
                     addSequentialStmt(*seqKey, stmt.str(), opId);
@@ -6060,7 +6426,7 @@ namespace wolvrix::lib::emit
                         out << "  " << attr << "\n";
                     }
                     out << "  always " << sens << " begin\n";
-                    for (const auto &stmt : orderSequentialStmts(seq.stmts))
+                    for (const auto &stmt : seq.stmts)
                     {
                         out << stmt.text;
                         if (!stmt.text.empty() && stmt.text.back() != '\n')

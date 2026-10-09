@@ -2728,11 +2728,12 @@ namespace wolvrix::lib::grh
             "kLatchWritePort",
             "kRegister",
             "kRegisterReadPort",
+            "kRegisterReadArrayPort",
             "kRegisterWritePort",
-            "kMemory",
-            "kMemoryReadPort",
-            "kMemoryWritePort",
-            "kMemoryFillPort",
+            "kRegisterWriteMaskPort",
+            "kRegisterWriteArrayPort",
+            "kRegisterWriteArrayMaskPort",
+            "kRegisterFillPort",
             "kInstance",
             "kBlackbox",
             "kSystemFunction",
@@ -2908,6 +2909,138 @@ namespace wolvrix::lib::grh
             }
         }
         return std::nullopt;
+    }
+
+    bool isRegisterReadPortKind(OperationKind kind) noexcept
+    {
+        return kind == OperationKind::kRegisterReadPort ||
+               kind == OperationKind::kRegisterReadArrayPort;
+    }
+
+    bool isRegisterWritePortKind(OperationKind kind) noexcept
+    {
+        switch (kind)
+        {
+        case OperationKind::kRegisterWritePort:
+        case OperationKind::kRegisterWriteMaskPort:
+        case OperationKind::kRegisterWriteArrayPort:
+        case OperationKind::kRegisterWriteArrayMaskPort:
+        case OperationKind::kRegisterFillPort:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    namespace
+    {
+        std::optional<std::size_t> eventEdgeAttrCount(const std::optional<AttributeValue> &attr)
+        {
+            if (!attr)
+            {
+                return std::nullopt;
+            }
+            if (const auto *edges = std::get_if<std::vector<std::string>>(&*attr))
+            {
+                return edges->size();
+            }
+            return std::nullopt;
+        }
+
+        std::optional<std::size_t> firstEventOperandIndexImpl(OperationKind kind,
+                                                              std::size_t operandCount,
+                                                              std::optional<std::size_t> eventCount)
+        {
+            switch (kind)
+            {
+            case OperationKind::kRegisterWritePort:
+            case OperationKind::kRegisterFillPort:
+                // [updateCond, nextValue|data, events...]
+                if (operandCount < 2)
+                {
+                    return std::nullopt;
+                }
+                return std::size_t{2};
+            case OperationKind::kRegisterWriteMaskPort:
+            case OperationKind::kLatchWritePort:
+                // [updateCond, nextValue, mask, events...] (latch writes carry no events)
+                if (operandCount < 3)
+                {
+                    return std::nullopt;
+                }
+                return std::size_t{3};
+            case OperationKind::kRegisterWriteArrayPort:
+                // [updateCond, i0..ik-1, data, events...]; k >= 1 needs >= 3 head operands
+                if (!eventCount || *eventCount > operandCount || operandCount - *eventCount < 3)
+                {
+                    return std::nullopt;
+                }
+                return operandCount - *eventCount;
+            case OperationKind::kRegisterWriteArrayMaskPort:
+                // [updateCond, i0..ik-1, data, mask, events...]; k >= 1 needs >= 4 head operands
+                if (!eventCount || *eventCount > operandCount || operandCount - *eventCount < 4)
+                {
+                    return std::nullopt;
+                }
+                return operandCount - *eventCount;
+            default:
+                return std::nullopt;
+            }
+        }
+
+        std::optional<std::size_t> arrayPortIndexCountImpl(OperationKind kind,
+                                                           std::size_t operandCount,
+                                                           std::optional<std::size_t> eventCount)
+        {
+            switch (kind)
+            {
+            case OperationKind::kRegisterReadArrayPort:
+                if (operandCount < 1)
+                {
+                    return std::nullopt;
+                }
+                return operandCount;
+            case OperationKind::kRegisterWriteArrayPort:
+            case OperationKind::kRegisterWriteArrayMaskPort:
+            {
+                const std::optional<std::size_t> eventStart =
+                    firstEventOperandIndexImpl(kind, operandCount, eventCount);
+                if (!eventStart)
+                {
+                    return std::nullopt;
+                }
+                const std::size_t fixedTail =
+                    kind == OperationKind::kRegisterWriteArrayPort ? 2 : 3;
+                return *eventStart - fixedTail;
+            }
+            default:
+                return std::nullopt;
+            }
+        }
+    } // namespace
+
+    std::optional<std::size_t> firstEventOperandIndex(const Operation &op)
+    {
+        return firstEventOperandIndexImpl(op.kind(), op.operands().size(),
+                                          eventEdgeAttrCount(op.attr("eventEdge")));
+    }
+
+    std::optional<std::size_t> firstEventOperandIndex(const GraphView &view, OperationId op)
+    {
+        return firstEventOperandIndexImpl(view.opKind(op), view.opOperands(op).size(),
+                                          eventEdgeAttrCount(view.opAttr(op, "eventEdge")));
+    }
+
+    std::optional<std::size_t> arrayPortIndexCount(const Operation &op)
+    {
+        return arrayPortIndexCountImpl(op.kind(), op.operands().size(),
+                                       eventEdgeAttrCount(op.attr("eventEdge")));
+    }
+
+    std::optional<std::size_t> arrayPortIndexCount(const GraphView &view, OperationId op)
+    {
+        return arrayPortIndexCountImpl(view.opKind(op), view.opOperands(op).size(),
+                                       eventEdgeAttrCount(view.opAttr(op, "eventEdge")));
     }
 
     std::string_view toString(ValueType type) noexcept

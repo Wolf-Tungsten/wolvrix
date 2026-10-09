@@ -113,7 +113,6 @@ namespace wolvrix::lib::transform
             {
             case OperationKind::kRegister:
             case OperationKind::kLatch:
-            case OperationKind::kMemory:
                 return true;
             default:
                 return false;
@@ -125,8 +124,8 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case OperationKind::kRegisterReadPort:
+            case OperationKind::kRegisterReadArrayPort:
             case OperationKind::kLatchReadPort:
-            case OperationKind::kMemoryReadPort:
                 return true;
             default:
                 return false;
@@ -138,9 +137,11 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case OperationKind::kRegisterWritePort:
+            case OperationKind::kRegisterWriteMaskPort:
+            case OperationKind::kRegisterWriteArrayPort:
+            case OperationKind::kRegisterWriteArrayMaskPort:
+            case OperationKind::kRegisterFillPort:
             case OperationKind::kLatchWritePort:
-            case OperationKind::kMemoryWritePort:
-            case OperationKind::kMemoryFillPort:
                 return true;
             default:
                 return false;
@@ -176,24 +177,23 @@ namespace wolvrix::lib::transform
         std::unordered_map<std::string, StorageInfo> *storageMapForKind(
             OperationKind kind,
             std::unordered_map<std::string, StorageInfo> &regInfos,
-            std::unordered_map<std::string, StorageInfo> &latchInfos,
-            std::unordered_map<std::string, StorageInfo> &memInfos)
+            std::unordered_map<std::string, StorageInfo> &latchInfos)
         {
             switch (kind)
             {
             case OperationKind::kRegister:
             case OperationKind::kRegisterReadPort:
+            case OperationKind::kRegisterReadArrayPort:
             case OperationKind::kRegisterWritePort:
+            case OperationKind::kRegisterWriteMaskPort:
+            case OperationKind::kRegisterWriteArrayPort:
+            case OperationKind::kRegisterWriteArrayMaskPort:
+            case OperationKind::kRegisterFillPort:
                 return &regInfos;
             case OperationKind::kLatch:
             case OperationKind::kLatchReadPort:
             case OperationKind::kLatchWritePort:
                 return &latchInfos;
-            case OperationKind::kMemory:
-            case OperationKind::kMemoryReadPort:
-            case OperationKind::kMemoryWritePort:
-            case OperationKind::kMemoryFillPort:
-                return &memInfos;
             default:
                 return nullptr;
             }
@@ -205,22 +205,22 @@ namespace wolvrix::lib::transform
             {
             case OperationKind::kRegister:
             case OperationKind::kLatch:
-            case OperationKind::kMemory:
                 if (!op.symbolText().empty())
                 {
                     return std::string(op.symbolText());
                 }
                 return std::nullopt;
             case OperationKind::kRegisterReadPort:
+            case OperationKind::kRegisterReadArrayPort:
             case OperationKind::kRegisterWritePort:
+            case OperationKind::kRegisterWriteMaskPort:
+            case OperationKind::kRegisterWriteArrayPort:
+            case OperationKind::kRegisterWriteArrayMaskPort:
+            case OperationKind::kRegisterFillPort:
                 return getAttrString(op, "regSymbol");
             case OperationKind::kLatchReadPort:
             case OperationKind::kLatchWritePort:
                 return getAttrString(op, "latchSymbol");
-            case OperationKind::kMemoryReadPort:
-            case OperationKind::kMemoryWritePort:
-            case OperationKind::kMemoryFillPort:
-                return getAttrString(op, "memSymbol");
             default:
                 return std::nullopt;
             }
@@ -452,10 +452,8 @@ namespace wolvrix::lib::transform
 
             std::unordered_map<std::string, StorageInfo> regInfos;
             std::unordered_map<std::string, StorageInfo> latchInfos;
-            std::unordered_map<std::string, StorageInfo> memInfos;
             regInfos.reserve(1024);
             latchInfos.reserve(128);
-            memInfos.reserve(256);
 
             for (const auto &info : ops)
             {
@@ -463,25 +461,26 @@ namespace wolvrix::lib::transform
                 switch (info.kind)
                 {
                 case OperationKind::kRegister:
-                case OperationKind::kLatch:
-                case OperationKind::kMemory: {
+                case OperationKind::kLatch: {
                     auto sym = getStorageSymbol(op);
                     if (sym)
                     {
-                        ensureStorage(*storageMapForKind(info.kind, regInfos, latchInfos, memInfos), *sym).declOp = info.id;
+                        ensureStorage(*storageMapForKind(info.kind, regInfos, latchInfos), *sym).declOp = info.id;
                     }
                     break;
                 }
                 case OperationKind::kRegisterReadPort:
+                case OperationKind::kRegisterReadArrayPort:
                 case OperationKind::kLatchReadPort:
-                case OperationKind::kMemoryReadPort:
                     break;
                 case OperationKind::kRegisterWritePort:
-                case OperationKind::kLatchWritePort:
-                case OperationKind::kMemoryWritePort:
-                case OperationKind::kMemoryFillPort: {
+                case OperationKind::kRegisterWriteMaskPort:
+                case OperationKind::kRegisterWriteArrayPort:
+                case OperationKind::kRegisterWriteArrayMaskPort:
+                case OperationKind::kRegisterFillPort:
+                case OperationKind::kLatchWritePort: {
                     auto sym = getStorageSymbol(op);
-                    auto *map = storageMapForKind(info.kind, regInfos, latchInfos, memInfos);
+                    auto *map = storageMapForKind(info.kind, regInfos, latchInfos);
                     if (sym && map)
                     {
                         ensureStorage(*map, *sym).writePorts.push_back(info.id);
@@ -574,7 +573,7 @@ namespace wolvrix::lib::transform
                     }
                     const Operation op = graph.getOperation(opId);
                     auto symText = getStorageSymbol(op);
-                    auto *map = storageMapForKind(op.kind(), regInfos, latchInfos, memInfos);
+                    auto *map = storageMapForKind(op.kind(), regInfos, latchInfos);
                     if (symText && map)
                     {
                         ensureStorage(*map, *symText).declaredRoot = true;
@@ -613,13 +612,6 @@ namespace wolvrix::lib::transform
                 if (info.declaredRoot)
                 {
                     markStorageLive(latchInfos, sym, kRootDeclaredStorage, liveOpWorklist);
-                }
-            }
-            for (auto &[sym, info] : memInfos)
-            {
-                if (info.declaredRoot)
-                {
-                    markStorageLive(memInfos, sym, kRootDeclaredStorage, liveOpWorklist);
                 }
             }
 
@@ -673,7 +665,7 @@ namespace wolvrix::lib::transform
                     if (isStateReadOp(info.kind) || isStateWriteOp(info.kind) || isStateDeclOp(info.kind))
                     {
                         auto sym = getStorageSymbol(op);
-                        auto *map = storageMapForKind(info.kind, regInfos, latchInfos, memInfos);
+                        auto *map = storageMapForKind(info.kind, regInfos, latchInfos);
                         if (sym && map)
                         {
                             markStorageLive(*map, *sym, item.deltaMask, liveOpWorklist);

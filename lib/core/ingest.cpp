@@ -17636,10 +17636,10 @@ private:
                 graph_.createValue(makeInternalValueSymbol(), rowWidth,
                                    signal.isSigned, signal.valueType);
             wolvrix::lib::grh::OperationId readOp =
-                createOp(wolvrix::lib::grh::OperationKind::kMemoryReadPort,
+                createOp(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort,
                          makeInternalOpSymbol(), location);
             graph_.addOperand(readOp, addressValue);
-            graph_.setAttr(readOp, "memSymbol", std::string(memSymbol));
+            graph_.setAttr(readOp, "regSymbol", std::string(memSymbol));
             graph_.addResult(readOp, dataValue);
             rowValues.push_back(dataValue);
         }
@@ -17916,10 +17916,51 @@ private:
             }
             return false;
         }
+        const int64_t width = normalizeWidth(info->width);
+        if (info->width <= 0 && context_.diagnostics)
+        {
+            context_.diagnostics->warn(location, "Memory width missing, defaulting to 1");
+        }
+        const int64_t totalWidth = width * static_cast<int64_t>(info->memoryRows);
+        const std::vector<int64_t> shape{static_cast<int64_t>(info->memoryRows)};
+
         std::string finalName = name;
         wolvrix::lib::grh::SymbolId sym = graph_.lookupSymbol(finalName);
         if (sym.valid())
         {
+            // stage-03: array state is a kRegister with a shape attr. A signal
+            // that also receives whole writes already has a scalar kRegister
+            // from createStorageDeclarations; reuse it when the total width
+            // matches so both write families target one declaration.
+            if (wolvrix::lib::grh::OperationId existing = graph_.findOperation(sym);
+                existing.valid() &&
+                graph_.getOperation(existing).kind() == wolvrix::lib::grh::OperationKind::kRegister)
+            {
+                const auto existingWidth =
+                    graph_.getOperation(existing).attr("width");
+                const auto* widthValue =
+                    existingWidth ? std::get_if<int64_t>(&*existingWidth) : nullptr;
+                if (widthValue && *widthValue == totalWidth)
+                {
+                    if (!graph_.getOperation(existing).attr("shape"))
+                    {
+                        graph_.setAttr(existing, "shape", shape);
+                    }
+                    // The storage read value may already exist (created scalar
+                    // by createStorageDeclarations); backfill its shape so the
+                    // whole read carries the declaration's array view.
+                    if (memory.index < valueBySymbol_.size() &&
+                        valueBySymbol_[memory.index].valid() &&
+                        graph_.getValue(valueBySymbol_[memory.index]).shape().empty())
+                    {
+                        graph_.setValueShape(valueBySymbol_[memory.index], shape);
+                    }
+                    applyMemoryInit(existing, memory);
+                    memoryOpBySymbol_[memory.index] = existing;
+                    memorySymbolName_[memory.index] = finalName;
+                    return true;
+                }
+            }
             if (graph_.findValue(sym).valid() || graph_.findOperation(sym).valid())
             {
                 sym = makeInternalOpSymbol();
@@ -17936,17 +17977,11 @@ private:
             }
         }
 
-        const int64_t width = normalizeWidth(info->width);
-        if (info->width <= 0 && context_.diagnostics)
-        {
-            context_.diagnostics->warn(location, "Memory width missing, defaulting to 1");
-        }
-
         wolvrix::lib::grh::OperationId op =
-            createOp(wolvrix::lib::grh::OperationKind::kMemory, sym, location);
-        graph_.setAttr(op, "width", width);
-        graph_.setAttr(op, "row", static_cast<int64_t>(info->memoryRows));
+            createOp(wolvrix::lib::grh::OperationKind::kRegister, sym, location);
+        graph_.setAttr(op, "width", totalWidth);
         graph_.setAttr(op, "isSigned", info->isSigned);
+        graph_.setAttr(op, "shape", shape);
         applyMemoryInit(op, memory);
         memoryOpBySymbol_[memory.index] = op;
         memorySymbolName_[memory.index] = finalName;
@@ -18105,9 +18140,9 @@ private:
 
             wolvrix::lib::grh::SymbolId readSym = makeInternalOpSymbol();
             wolvrix::lib::grh::OperationId readOp =
-                createOp(wolvrix::lib::grh::OperationKind::kMemoryReadPort, readSym, entry.location);
+                createOp(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort, readSym, entry.location);
             graph_.addOperand(readOp, addressValue);
-            graph_.setAttr(readOp, "memSymbol", std::string(memSymbol));
+            graph_.setAttr(readOp, "regSymbol", std::string(memSymbol));
 
             graph_.addResult(readOp, dataValue);
             emittedMemoryReads_.push_back(EmittedMemoryRead{
@@ -18264,7 +18299,7 @@ private:
 
             wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol();
             wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kMemoryWritePort, opSym, entry.location);
+                createOp(wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort, opSym, entry.location);
             graph_.addOperand(op, updateCond);
             graph_.addOperand(op, address);
             graph_.addOperand(op, data);
@@ -18285,7 +18320,7 @@ private:
                 edges.push_back(edgeText(edge));
             }
             graph_.setAttr(op, "eventEdge", std::move(edges));
-            graph_.setAttr(op, "memSymbol", std::string(memSymbol));
+            graph_.setAttr(op, "regSymbol", std::string(memSymbol));
         }
     }
 
@@ -18325,7 +18360,7 @@ private:
 
             wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol();
             wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kMemoryFillPort, opSym, entry.location);
+                createOp(wolvrix::lib::grh::OperationKind::kRegisterFillPort, opSym, entry.location);
             graph_.addOperand(op, updateCond);
             graph_.addOperand(op, data);
             for (ExprNodeId evtId : entry.eventOperands)
@@ -18344,7 +18379,7 @@ private:
                 edges.push_back(edgeText(edge));
             }
             graph_.setAttr(op, "eventEdge", std::move(edges));
-            graph_.setAttr(op, "memSymbol", std::string(memSymbol));
+            graph_.setAttr(op, "regSymbol", std::string(memSymbol));
         }
     }
 
@@ -21755,11 +21790,18 @@ private:
                 maskLow = entry.sliceLow;
                 maskSpan = entry.sliceWidth;
             }
-            wolvrix::lib::grh::ValueId maskValue =
-                makeMaskValue(targetWidth, maskLow, maskSpan, entry.location);
-            if (!maskValue.valid())
+            // stage-03: the register write family splits whole writes
+            // (kRegisterWritePort, no mask operand) from masked writes
+            // (kRegisterWriteMaskPort); latch writes keep the built-in mask.
+            const bool wholeWrite = maskLow == 0 && maskSpan == targetWidth;
+            wolvrix::lib::grh::ValueId maskValue;
+            if (!wholeWrite || !isSequential)
             {
-                continue;
+                maskValue = makeMaskValue(targetWidth, maskLow, maskSpan, entry.location);
+                if (!maskValue.valid())
+                {
+                    continue;
+                }
             }
 
             if (isSequential)
@@ -21771,11 +21813,15 @@ private:
                 }
                 wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol();
                 wolvrix::lib::grh::OperationId op =
-                    createOp(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                    createOp(wholeWrite ? wolvrix::lib::grh::OperationKind::kRegisterWritePort
+                                        : wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort,
                              opSym, entry.location);
                 graph_.addOperand(op, updateCond);
                 graph_.addOperand(op, nextValue);
-                graph_.addOperand(op, maskValue);
+                if (!wholeWrite)
+                {
+                    graph_.addOperand(op, maskValue);
+                }
                 for (ExprNodeId evtId : entry.eventOperands)
                 {
                     wolvrix::lib::grh::ValueId evt = emitExpr(evtId);

@@ -2,11 +2,12 @@
 
 ## 功能概述
 
-`memory-init-check` pass 验证存储器（Memory）初始化属性的一致性，确保合并的存储器具有兼容的初始化配置。
+`memory-init-check` pass 验证数组寄存器（带 `shape` 属性的 kRegister）初始化属性的一致性，
+确保合并的数组寄存器具有兼容的初始化配置。
 
 ## 详细说明
 
-在硬件设计中，存储器可以通过多种方式初始化（如文件加载、常量填充等）。当多个存储器实例被合并时，它们的初始化配置必须一致。该 pass 检测配置不一致的情况。
+在硬件设计中，数组状态可以通过多种方式初始化（如文件加载、常量填充等）。当多个数组寄存器实例被合并时，它们的初始化配置必须一致。该 pass 检测配置不一致的情况。
 
 ### 检查的属性
 
@@ -41,13 +42,13 @@ wolvrix --pass=simplify --pass=memory-init-check input.sv
 
 ```
 # 属性不完整
-kMemory init attributes are incomplete (missing initKind/initFile)
+array register init attributes are incomplete (missing initKind/initFile)
 
 # 数组长度不匹配
-kMemory initKind/initFile size mismatch
+array register initKind/initFile size mismatch
 
 # 初始化配置不一致
-kMemory init attributes differ for merged memory '<symbol>'
+array register init attributes differ for merged register '<symbol>'
 ```
 
 ## 注意事项

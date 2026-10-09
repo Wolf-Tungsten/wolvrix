@@ -130,7 +130,7 @@ int main()
     for (const auto opId : top.operations())
     {
         const wolvrix::lib::grh::Operation op = top.getOperation(opId);
-        if (op.kind() != wolvrix::lib::grh::OperationKind::kRegisterWritePort)
+        if (op.kind() != wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort)
         {
             continue;
         }

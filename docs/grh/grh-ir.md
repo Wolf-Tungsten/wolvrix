@@ -37,12 +37,13 @@ GRH（Graph RTL Hierarchy）是基于 SSA 的 RTL 中间表示，用于表示 Sy
 
 **字段**：
 - `symbol` (`SymbolId`)：信号名（字符串）。Symbol 由 Graph 符号表驻留管理，Value 和 Operation 共享同一符号表，因此信号名不能与 Operation 的符号名冲突
-- `width` (`int32_t`)：位宽，仅 Logic 类型有效，必须 > 0
+- `width` (`int32_t`)：位宽，仅 Logic 类型有效，必须 > 0（数组 Value 为总位宽，含全部维度）
 - `type` (`ValueType`)：数据类型
   - `Logic`：四态逻辑（0/1/x/z）
   - `Real`：实数
   - `String`：字符串
 - `isSigned` (`bool`)：是否有符号，仅 Logic 类型有效
+- `shape` (`int64[]`)：数组形状，空 = 标量（仅 Logic；行主序纯结构视图，元素宽 = width / ∏shape，见 §2.3）
 - `isInput/Output/Inout` (`bool`)：端口标记，通过 `bindXxxPort` 设置
 - `definingOp` (`OperationId`)：定义该 Value 的 Operation，端口 Value 为 invalid
 - `users` (`ValueUser[]`)：使用该 Value 的 Operation 列表及操作数位置
@@ -55,7 +56,7 @@ GRH（Graph RTL Hierarchy）是基于 SSA 的 RTL 中间表示，用于表示 Sy
 - `kind` (`OperationKind`)：操作类型，决定语义。例如
   - 组合运算：`kAdd`, `kMul`, `kAnd`, `kMux` 等
   - 数据搬运：`kConcat`, `kSliceStatic`, `kAssign` 等
-  - 存储访问：`kRegister`, `kMemoryReadPort` 等
+  - 存储访问：`kRegister`, `kRegisterReadArrayPort` 等
   - 层次调用：`kInstance`, `kBlackbox` 等
 - `symbol` (`SymbolId`)：符号名（字符串）。Symbol 由 Graph 符号表驻留管理，Value 和 Operation 共享同一符号表，因此符号名不能与 Value 的信号名冲突
 - `operands` (`ValueId[]`)：输入值列表，作为操作数的 Value 必须已定义
@@ -273,7 +274,11 @@ shape 缺失/未传播只损失结构信息，不影响正确性）：
 
 - `kConcat`：操作数全同形 `[s..]` → result `[n, s..]`（n=操作数个数，沿 leading 维拼接）；
   其余组合 → 标量。
-- `kMux` / `kRegisterReadPort` / `kLatchReadPort`：result 继承相应 shape。
+- `kMux` / `kRegisterReadPort` / `kLatchReadPort`：result 继承相应 shape（整体读 =
+  声明的完整 shape）。
+- `kRegisterReadArrayPort`：索引数 k==rank → 标量（元素）；k<rank → result shape =
+  声明 shape 的剩余维（§6.4 端口族规则，该规则是 verifier 强制的）。
+- `kSliceArray`：result shape = base shape 的剩余维（§6.2.8，verifier 强制）。
 - `kSliceStatic` / `kSliceDynamic`：result 默认标量；需要时可在 totalBits 一致下声明 shape
   （把位段重解释为数组视图）。
 - 其余 op：result 默认标量（shape 不传播）。
@@ -304,7 +309,7 @@ Operation 的核心特性：
 
 - **组合运算**：`kAdd`, `kSub`, `kMul`, `kAnd`, `kOr`, `kMux` 等，输出仅取决于输入
 - **数据搬运**：`kConcat`, `kSliceStatic`, `kSliceDynamic`, `kAssign` 等，重组或传递数据
-- **时序存储**：`kRegister`, `kMemory`, `kLatch` 及其读写端口，涉及状态保持
+- **时序存储**：`kRegister`（含数组寄存器）, `kLatch` 及其读写端口，涉及状态保持
 - **层次调用**：`kInstance`, `kBlackbox`, `kXMRRead/Write`，与外部模块交互
 - **系统调用**：`kSystemFunction`, `kSystemTask`, `kDpicCall`，副作用明确
 
@@ -980,7 +985,10 @@ always_latch
 
 ## 6.4 寄存器
 
-GRH IR 使用**声明 + ReadPort + WritePort**的组合建模寄存器。所有对寄存器的访问必须通过对应的 ReadPort/WritePort。
+GRH IR 使用**声明 + 端口族**的组合建模全部时序状态。数组状态（含原"存储器"形态）
+统一由带 `shape` 的 kRegister 声明承接——**IR 层不存在独立的 memory 概念**；reg/mem 的
+存储分类（双缓冲逐行检测 vs 边界采样原地提交）是仿真后端的实现策略，由 grhsim 的
+A7 select-state-stores 重新推导，不属于 IR 语义。
 
 ### kRegister
 
@@ -997,47 +1005,107 @@ GRH IR 使用**声明 + ReadPort + WritePort**的组合建模寄存器。所有�
   与 `width` 同属声明的类型契约，不是可选注解
 
 **可选初始化属性**:
-- `initValue` (string): 单值初始化
+- `initValue` (string): 单值初始化（标量寄存器；数组寄存器上表示摊平后的整数组位串）
 - `initKind` / `initFile` / `initValue` / `initStart` / `initLen`（数组形态）:
-  从 kMemory 并入的分段初始化族，仅当 `shape` 非空时可用，编码语义与 kMemory 相同
-  （initValue 按线性行主序位串编码）
+  分段初始化族，仅当 `shape` 非空时可用。地址空间按行主序摊平（第 0 维最外，
+  下标不足时作用于高维子数组，与端口族的索引规则一致）
 
 **shape 语义**:
 
 `shape` 非空时，寄存器是 `width / ∏shape` 位元素的多维数组（行主序，canonical index 0 =
-最低元素地址，见 §2.3）。数组寄存器的整体读写仍使用 kRegisterReadPort/kRegisterWritePort；
-按维度的索引端口族由后续阶段引入（见 stage-03 计划文档）。
+最低元素地址，见 §2.3）。整体读写使用 kRegisterReadPort/kRegisterWritePort 族，
+按维度的索引读写使用 kRegisterReadArrayPort/kRegisterWriteArrayPort 族。
 
 **初始化语义**:
 
-`initValue` 为单值，表示寄存器的初始赋值。若源设计存在多条 initial 赋值，应在构建 IR 前规整为单值。
+单值 `initValue` 表示寄存器的初始赋值。若源设计存在多条 initial 赋值，应在构建 IR 前
+规整为单值。`initKind` 族为数组、支持多种初始化方式混合：第 `i` 个元素按索引顺序执行，
+越靠后的优先级越高。
 
-**语义示例**：
-```
+**分段初始化族的编码约定**：
+- `initKind` 与 `initFile` **必须同时存在且长度相同**，即使 `initKind` 是 `literal`
+  也需要占位的 `initFile` 项。
+- `initStart`/`initLen` **必须存在且长度等于 `initKind`**。
+- `initStart < 0`：readmem 省略范围参数；literal 表示全量初始化。
+- `initStart >= 0` 且 `initLen <= 0`：readmem 仅给起始地址（读到末尾）；literal 视为非法。
+- `initValue` 缺省或长度不足时默认 `"0"`。若需要随机初始化，请显式写成 `$random`
+  或 `$random(seed)`。
+
+| `initKind[i]` | 所需 attr | 等价 SV 片段 |
+|---------------|-----------|----------|
+| `readmemh` | `initFile[i]`, `initStart[i]`, `initLen[i]` | `$readmemh("<initFile[i]>", <symbol>[, start[, finish]]);` |
+| `readmemb` | `initFile[i]`, `initStart[i]`, `initLen[i]` | `$readmemb("<initFile[i]>", <symbol>[, start[, finish]]);` |
+| `literal` | `initValue[i]`, `initStart[i]`, `initLen[i]` | `<symbol>[<addr>] = <initValue[i]>;` / 区间 `for` 循环 |
+
+**示例**（标量寄存器，`initValue` = `$random`）：
+```sv
 initial begin
-    <symbol> = <initValue>;
+    reg_name = $random;
 end
 ```
 
-**示例**（`initValue` = `$random`）：
-- `initValue` = "$random"
+**示例**（数组寄存器：从文件初始化，再用 `$random` 覆盖部分地址）：
+- kRegister `mem`，`width` = 128，`shape` = [16]（16 行 × 8 位）
+- `initKind` = ["readmemh", "literal"]，`initFile` = ["mem.hex", ""]
+- `initValue` = ["", "$random"]，`initStart` = [-1, 0]，`initLen` = [0, 1]
 - 语义示例：
   ```sv
   initial begin
-      reg_name = $random;
+      $readmemh("mem.hex", mem);  // initKind[0]
+      mem[0] = $random;            // initKind[1]，覆盖地址 0
   end
   ```
 
 
 
+### 端口族总览与公共约定
+
+读端口：
+
+| op | operands | results |
+|----|----------|---------|
+| kRegisterReadPort | 无 | 全数组 value（shape 继承声明） |
+| kRegisterReadArrayPort | `[i0, ..., ik-1]`，1 ≤ k ≤ rank | k==rank → 元素标量；k<rank → 子数组 value（shape=剩余维） |
+
+写端口（均带 1-bit `updateCond` 与事件尾；attrs 均为 `regSymbol` + `eventEdge`）：
+
+| op | operands | 语义 |
+|----|----------|------|
+| kRegisterWritePort | `[updateCond, nextValue, events...]` | 整体写（nextValue=全数组 value） |
+| kRegisterWriteMaskPort | `[updateCond, nextValue, mask, events...]` | 整体写+位掩码（mask 宽=总位宽） |
+| kRegisterWriteArrayPort | `[updateCond, i0..ik-1, data, events...]` | 索引写（k ≥ 1；k<rank 时 data 为子数组） |
+| kRegisterWriteArrayMaskPort | `[updateCond, i0..ik-1, data, mask, events...]` | 索引写+位掩码（mask 宽=data 宽） |
+| kRegisterFillPort | `[updateCond, data, events...]` | 广播填充（data=元素宽，写满全部 ∏shape 元素） |
+
+公共约定：
+
+- **`regSymbol` 必须指向同图的 kRegister**（全部写端口必然与声明同图）。
+- **部分索引规则与 kSliceArray 完全对齐**（§6.2.8）：下标数 k < rank 时作用在高维
+  子数组上——kSliceArray 作用于组合 value，数组端口作用于状态，共享同一套
+  "下标不足 = 高维子数组"语义。线性位偏移一律按行主序公式（§2.3），IR 层不出现
+  kMul/kAdd 寻址树。
+- 索引操作数必须是标量（无 shape）。越界索引行为与 kSliceArray 同条款（实现定义）。
+- **事件操作数起始下标由 `firstEventOperandIndex(op)` helper 集中计算**（grh.hpp）：
+  事件尾与 `eventEdge` attr 一一对应，数组写端口的索引数随部分索引变化，边界由
+  `eventEdge` 数量反推（声明的 rank 无法唯一确定部分索引数）。写端口的 `eventEdge`
+  必须非空——没有边沿事件的"写"应建模为组合逻辑。
+- mask 语义唯一：**位掩码**（mask[i]=1 时写入第 i 位）。不提供元素粒度掩码。
+- **写端口优先级**：组 = 同 regSymbol 的全部写端口（含 kRegisterFillPort），
+  不要求相同事件/边沿。同轮同时激活时按**op 声明顺序**依次应用，后声明者覆盖同地址
+  先写者。**同 regSymbol 写端口 op 的相对顺序是 IR 语义的一部分——pass 不得重排**
+  （JSON ops 数组有序，持久化免费；grh.verify 校验端口与声明同图兜底）。
+  SV emitter 在同 always 块内按声明顺序排列（天然后写覆盖先写）；跨事件写端口的顺序
+  无法被 SV 表达，emitter 报 warning 并按事件分块、块内按声明顺序输出（best-effort，
+  语义以 grhsim 后端为准）。
+
 ### kRegisterReadPort
 
-寄存器读端口。
+寄存器整体读端口。
 
 **operands**: 无
 
 **results**:
-- `res[0]`: 读出的寄存器值，位宽同目标 kRegister
+- `res[0]`: 读出的寄存器值，宽度与 shape 同目标 kRegister（数组寄存器读出全数组 value）
 
 **attrs**:
 - `regSymbol` (string): 指向目标 kRegister 的 symbol
@@ -1049,17 +1117,39 @@ res[0] = <regSymbol>
 
 
 
+### kRegisterReadArrayPort
+
+寄存器索引读端口（状态的组合读，含原"异步存储器读"语义）。
+
+**operands**:
+- `oper[0]`..`oper[k-1]` (i0..ik-1): 索引（标量），1 ≤ k ≤ 声明 rank
+
+**results**:
+- `res[0]` (data): k==rank → 元素标量（宽=元素宽）；k<rank → 子数组 value
+  （shape=声明 shape 的剩余维，宽=子数组总宽）
+
+**attrs**:
+- `regSymbol` (string): 指向目标 kRegister 的 symbol
+
+**语义**（声明 `width=128, shape=[4,4]`，元素 8 位）:
+```
+kRegisterReadArrayPort(%i)     → value width=32 shape=[4]   // 读一行（子数组）
+kRegisterReadArrayPort(%i, %j) → value width=8              // 读一个元素
+```
+
+**说明**: 同步读通过 kRegister 捕获本端口的输出实现（memory-read-retime pass 识别
+该模式并改写为数据侧寄存器）。
+
+
+
 ### kRegisterWritePort
 
-寄存器写端口。支持多事件触发（如时钟上升沿 + 异步复位下降沿）。
-
-**注意**: 同一个 kRegister 可以拥有多个 kRegisterWritePort，用于保留完整的语义信息（如时钟域分离、异步复位单独建模等）。
+寄存器整体写端口。支持多事件触发（如时钟上升沿 + 异步复位下降沿）。
 
 **operands**:
 - `oper[0]` (updateCond): 更新使能条件（1-bit），为 1 时允许更新
-- `oper[1]` (nextValue): 更新值（位宽同目标 kRegister），reset/enable 优先级需通过 `kMux` 在外部编码
-- `oper[2]` (mask): 逐位写掩码（位宽同目标 kRegister），`mask[i]=1` 时写入第 `i` 位
-- `oper[3]`..`oper[N-1]` (events): 触发事件信号（如时钟、复位）
+- `oper[1]` (nextValue): 更新值（宽度同目标 kRegister），reset/enable 优先级需通过 `kMux` 在外部编码
+- `oper[2]`..`oper[N-1]` (events): 触发事件信号（如时钟、复位）
 
 **results**: 无
 
@@ -1067,36 +1157,22 @@ res[0] = <regSymbol>
 - `regSymbol` (string): 指向目标 kRegister 的 symbol
 - `eventEdge` (string[]): 触发边沿列表，`"posedge"` 或 `"negedge"`，长度等于事件信号数
 
-**语义**:
-
-设目标 kRegister 位宽为 `W`。按 `eventEdge`/`events` 构建敏感列表，`updateCond` 控制是否更新，`nextValue` 为新值。
-
 **案例 1：只有时钟**
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = 1'b1, `nextValue` = d
+- `events` = [clk], `eventEdge` = ["posedge"], `updateCond` = 1'b1, `nextValue` = d
 ```sv
 always @(posedge clk)
     reg_q <= d;
 ```
 
 **案例 2：带使能**
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = en, `nextValue` = d
+- `events` = [clk], `eventEdge` = ["posedge"], `updateCond` = en, `nextValue` = d
 ```sv
 always @(posedge clk)
     if (en)
         reg_q <= d;
 ```
 
-**案例 3：带同步复位**
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = 1'b1, `nextValue` = rst ? 0 : d
-```sv
-always @(posedge clk)
-    reg_q <= rst ? 0 : d;
-```
-
-**案例 4：带异步复位（低有效）**
+**案例 3：带异步复位（低有效）**
 - `events` = [clk, rst_n], `eventEdge` = ["posedge", "negedge"]
 - `updateCond` = !rst_n || en, `nextValue` = !rst_n ? 0 : d
 ```sv
@@ -1107,10 +1183,26 @@ always @(posedge clk or negedge rst_n)
         reg_q <= d;
 ```
 
-**案例 5：带写掩码**
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = 1'b1, `nextValue` = new_val
-- `mask` 为变量，位宽 `W`
+
+
+### kRegisterWriteMaskPort
+
+寄存器整体写端口 + 逐位掩码。
+
+**operands**:
+- `oper[0]` (updateCond): 更新使能条件（1-bit）
+- `oper[1]` (nextValue): 更新值（宽度同目标 kRegister）
+- `oper[2]` (mask): 逐位写掩码（宽度同目标 kRegister），`mask[i]=1` 时写入第 `i` 位
+- `oper[3]`..`oper[N-1]` (events): 触发事件信号
+
+**results**: 无
+
+**attrs**:
+- `regSymbol` (string): 指向目标 kRegister 的 symbol
+- `eventEdge` (string[]): 触发边沿列表，长度等于事件信号数
+
+**案例**（变量掩码，寄存器位宽 W）：
+- `events` = [clk], `eventEdge` = ["posedge"], `updateCond` = 1'b1
 ```sv
 always @(posedge clk)
     for (int i = 0; i < W; i++)
@@ -1118,165 +1210,91 @@ always @(posedge clk)
             reg_q[i] <= new_val[i];
 ```
 
-## 6.5 存储器
 
-GRH IR 将存储器拆分为声明（kMemory）、读端口（kMemoryReadPort）和写端口（kMemoryWritePort）三种 Operation。所有对存储器的访问必须通过对应的 ReadPort/WritePort。
 
-### kMemory
+### kRegisterWriteArrayPort
 
-存储器声明。Operation 的 symbol 作为存储器名称。
+寄存器索引写端口（含原"存储器写"语义；无掩码变体）。
 
-**operands**: 无
+**operands**:
+- `oper[0]` (updateCond): 更新使能条件（1-bit）
+- `oper[1]`..`oper[k]` (i0..ik-1): 索引（标量），1 ≤ k ≤ 声明 rank
+- `oper[k+1]` (data): 写数据（k==rank → 元素宽；k<rank → 子数组 value）
+- `oper[k+2]`..`oper[N-1]` (events): 触发事件信号
 
 **results**: 无
 
 **attrs**:
-- `width` (int64_t): 每行（word）的位宽
-- `row` (int64_t): 总行数，决定寻址空间
-- `isSigned` (bool): 是否有符号
-- `initKind` (string[], 可选): 初始化类型数组，支持 `readmemh`/`readmemb`/`literal`
-- `initFile` (string[], 可选): 初始化文件数组（`readmemh`/`readmemb` 使用）
-- `initValue` (string[], 可选): 初始化值数组（`literal` 使用）
-- `initStart` (int64_t[], 可选): 初始化起始地址（`<0` 表示省略 readmem 范围 / literal 全量初始化）
-- `initLen` (int64_t[], 可选): 初始化长度（行数）；`initStart < 0` 时忽略；`initStart >= 0` 且 `initLen <= 0` 表示 readmem 仅给 start（读到末尾）
-
-**初始化语义**:
-
-`initKind` 为数组支持多种初始化方式混合。第 `i` 个元素按索引顺序执行，越靠后的优先级越高。
-
-**长度与默认值**：
-- `initKind` 与 `initFile` **必须同时存在且长度相同**，即使 `initKind` 是 `literal` 也需要占位的 `initFile` 项。
-- `initStart`/`initLen` **必须存在且长度等于 `initKind`**。
-- `initStart < 0`：readmem 省略范围参数；literal 表示全量初始化。
-- `initStart >= 0` 且 `initLen <= 0`：readmem 仅给起始地址（读到末尾）；literal 视为非法。
-- `initValue` 缺省或长度不足时默认 `"0"`。  
-  若需要随机初始化，请显式写成 `$random` 或 `$random(seed)`。
-
-| `initKind[i]` | 所需 attr | 等价 SV 片段 |
-|---------------|-----------|----------|
-| `readmemh` | `initFile[i]`, `initStart[i]`, `initLen[i]` | `$readmemh("<initFile[i]>", <symbol>[, start[, finish]]);` |
-| `readmemb` | `initFile[i]`, `initStart[i]`, `initLen[i]` | `$readmemb("<initFile[i]>", <symbol>[, start[, finish]]);` |
-| `literal` | `initValue[i]`, `initStart[i]`, `initLen[i]` | `<symbol>[<addr>] = <initValue[i]>;` / 区间 `for` 循环 |
-
-**示例**（从文件初始化，再用 `$random` 覆盖部分地址）：
-- `initKind` = ["readmemh", "literal"]
-- `initFile` = ["mem.hex", ""]
-- `initValue` = ["", "$random"]
-- `initStart` = [-1, 0]
-- `initLen` = [0, 1]
-- 语义示例：
-  ```sv
-  initial begin
-      $readmemh("mem.hex", mem);  // initKind[0]
-      mem[0] = $random;            // initKind[1]，覆盖地址 0
-  end
-  ```
-
-**示例**（literal 区间初始化）：
-- `initKind` = ["literal"]
-- `initFile` = [""]
-- `initValue` = ["8'hFF"]
-- `initStart` = [16]
-- `initLen` = [8]
-- 语义示例：
-  ```sv
-  initial begin
-      for (int __i = 16; __i < 24; __i = __i + 1)
-          mem[__i] = 8'hFF;
-  end
-  ```
-
-
-
-### kMemoryReadPort
-
-存储器读端口（异步读）。
-
-**operands**:
-- `oper[0]` (addr): 读地址（位宽由寻址空间决定）
-
-**results**:
-- `res[0]` (data): 读出的数据，位宽同目标 kMemory 的 `width`
-
-**attrs**:
-- `memSymbol` (string): 指向目标 kMemory 的 symbol
-
-**语义**:
-```
-res[0] = <memSymbol>[addr]
-```
-
-**说明**: 同步读通过 `kRegister` 捕获 `kMemoryReadPort` 的输出实现。
-
-
-
-### kMemoryWritePort
-
-存储器写端口。写端口不提供复位语义，复位行为由上层逻辑显式控制 `updateCond`/`data`。
-
-**operands**:
-- `oper[0]` (updateCond): 写入条件（1-bit），为 1 时允许写入
-- `oper[1]` (addr): 写地址
-- `oper[2]` (data): 写数据（位宽同目标 kMemory 的 `width`）
-- `oper[3]` (mask): 逐位写掩码（位宽同目标 kMemory 的 `width`）
-- `oper[4]`..`oper[N-1]` (events): 触发事件信号（如时钟）
-
-**results**: 无
-
-**attrs**:
-- `memSymbol` (string): 指向目标 kMemory 的 symbol
+- `regSymbol` (string): 指向目标 kRegister 的 symbol
 - `eventEdge` (string[]): 触发边沿列表，长度等于事件信号数
-- `memoryWrite.priorityGroup` (string, optional): 有序写组名称；同组写端口必须指向同一 kMemory，并使用相同的事件与边沿
-- `memoryWrite.priority` (int64_t, optional): 组内优先级，`0` 为最高优先级
 
-两个 `memoryWrite.priority*` 属性必须同时出现。同组 priority 必须唯一、非负且连续，即恰好为 `[0, N)`。调度与 emitter 必须将同组端口保留在同一顺序域，并按 priority 从大到小执行，使 priority `0` 最后写入。这样，同地址且掩码重叠时由最高优先级端口获胜；地址不同或掩码不重叠的 enabled writes 均生效。没有这两个属性的多个写端口不提供基于普通 Operation 顺序的碰撞优先级保证。
-
-**语义**:
-
-设目标 kMemory 每行位宽为 `W`。
-
-**简单写（时钟上升沿触发，无掩码）**：
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = 1'b1
-- `mask` = {W{1'b1}}
-```sv
-always @(posedge clk)
-    mem[addr] <= data;
+**案例**（声明 `width=128, shape=[4,4]`，元素 8 位）：
 ```
-
-**带写使能**：
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = wen, `mask` = {W{1'b1}}
-```sv
-always @(posedge clk)
-    if (wen)
-        mem[addr] <= data;
+kRegisterWriteArrayPort(%we, %i, %j, %d, %clk)   // d 8 位：写元素 [i][j]
+kRegisterWriteArrayPort(%we, %i, %row, %clk)     // row 32 位 shape=[4]：写一行
 ```
-
-**带写掩码（逐位）**：
-- `events` = [clk], `eventEdge` = ["posedge"]
-- `updateCond` = wen, `mask` 为变量
-```sv
-always @(posedge clk)
-    if (wen)
-        for (int i = 0; i < W; i++)
-            if (mask[i])
-                mem[addr][i] <= data[i];
-```
-
-**两个有序写端口**：
-- low port: `memoryWrite.priorityGroup` = `"writes"`, `memoryWrite.priority` = 1
-- high port: `memoryWrite.priorityGroup` = `"writes"`, `memoryWrite.priority` = 0
+等价 SV：
 ```sv
 always @(posedge clk) begin
-    if (low_wen)
-        mem[low_addr] <= low_data;
-    if (high_wen)
-        mem[high_addr] <= high_data;
+    if (we) r[i][j] <= d;
+    if (we) r[i]    <= row;
 end
 ```
 
-若两个地址相同，后执行的 high port 覆盖 low port；若地址不同，两次写入都保留。
+
+
+### kRegisterWriteArrayMaskPort
+
+寄存器索引写端口 + 逐位掩码（掩码宽 = data 宽）。
+
+**operands**:
+- `oper[0]` (updateCond): 更新使能条件（1-bit）
+- `oper[1]`..`oper[k]` (i0..ik-1): 索引（标量），1 ≤ k ≤ 声明 rank
+- `oper[k+1]` (data): 写数据（同 kRegisterWriteArrayPort 的宽度规则）
+- `oper[k+2]` (mask): 逐位写掩码（宽度同 data）
+- `oper[k+3]`..`oper[N-1]` (events): 触发事件信号
+
+**results**: 无
+
+**attrs**:
+- `regSymbol` (string): 指向目标 kRegister 的 symbol
+- `eventEdge` (string[]): 触发边沿列表，长度等于事件信号数
+
+**案例**（变量掩码写元素，元素宽 8 位）：
+- `events` = [clk], `eventEdge` = ["posedge"], `updateCond` = wen
+```sv
+always @(posedge clk)
+    if (wen)
+        for (int i = 0; i < 8; i++)
+            if (mask[i])
+                r[a][b][i] <= d[i];
+```
+
+
+
+### kRegisterFillPort
+
+寄存器广播填充端口：将 `data` 写满全部 ∏shape 个元素（标量寄存器退化为整体写）。
+
+**operands**:
+- `oper[0]` (updateCond): 更新使能条件（1-bit）
+- `oper[1]` (data): 填充值（宽=元素宽；标量寄存器为寄存器宽）
+- `oper[2]`..`oper[N-1]` (events): 触发事件信号
+
+**results**: 无
+
+**attrs**:
+- `regSymbol` (string): 指向目标 kRegister 的 symbol
+- `eventEdge` (string[]): 触发边沿列表，长度等于事件信号数
+
+**案例**（16 元素数组复位清零）：
+- `events` = [clk], `eventEdge` = ["posedge"], `updateCond` = rst, `data` = 8'h00
+```sv
+always @(posedge clk)
+    if (rst)
+        for (int __i = 0; __i < 16; __i++)
+            r[__i] <= 8'h00;
+```
 
 ## 6.6 层次结构
 
@@ -1411,8 +1429,8 @@ XMR 写。用于写入其他模块层次中的信号或存储单元。
 |----------|----------|
 | 普通信号 | `oper[0]` (data) |
 | kLatch | `oper[0]` (updateCond), `oper[1]` (nextValue), `oper[2]` (mask) |
-| kRegister | `oper[0]` (updateCond), `oper[1]` (nextValue), `oper[2]` (mask), `oper[3]`.. (events) |
-| kMemory | `oper[0]` (updateCond), `oper[1]` (addr), `oper[2]` (data), `oper[3]` (mask), `oper[4]`.. (events) |
+| kRegister（标量） | `oper[0]` (updateCond), `oper[1]` (nextValue), `oper[2]` (mask), `oper[3]`.. (events) |
+| kRegister（数组） | `oper[0]` (updateCond), `oper[1]` (addr), `oper[2]` (data), `oper[3]` (mask), `oper[4]`.. (events) |
 
 **results**: 无
 
@@ -1420,7 +1438,7 @@ XMR 写。用于写入其他模块层次中的信号或存储单元。
 - `xmrPath` (string): 层次路径
 - `eventEdge` (string[], 可选): 触发边沿列表
   - latch 目标: 必须为空
-  - register/memory 目标: 数量需与事件操作数匹配
+  - register（含数组寄存器）目标: 数量需与事件操作数匹配
   - 普通信号目标: 可选
 
 **说明**:

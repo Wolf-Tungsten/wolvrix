@@ -83,6 +83,18 @@ namespace wolvrix::lib::transform
             }
             return std::nullopt;
         };
+        auto getIntArrayAttr = [](std::span<const wolvrix::lib::grh::AttrKV> attrs,
+                                  std::string_view key) -> const std::vector<int64_t> *
+        {
+            for (const auto &attr : attrs)
+            {
+                if (attr.key == key)
+                {
+                    return std::get_if<std::vector<int64_t>>(&attr.value);
+                }
+            }
+            return nullptr;
+        };
 
         auto isCombinationalOp = [](wolvrix::lib::grh::OperationKind kind) -> bool
         {
@@ -90,14 +102,15 @@ namespace wolvrix::lib::transform
             {
             case wolvrix::lib::grh::OperationKind::kRegister:
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatch:
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemory:
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
             case wolvrix::lib::grh::OperationKind::kInstance:
             case wolvrix::lib::grh::OperationKind::kBlackbox:
             case wolvrix::lib::grh::OperationKind::kSystemFunction:
@@ -116,9 +129,11 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
                 return true;
             default:
                 return false;
@@ -301,7 +316,6 @@ namespace wolvrix::lib::transform
                 ++opKindCounts[kindText];
                 const auto attrs = graph->opAttrs(opId);
                 const auto width = getIntAttr(attrs, "width");
-                const auto rows = getIntAttr(attrs, "row");
                 switch (kind)
                 {
                 case wolvrix::lib::grh::OperationKind::kRegister:
@@ -313,6 +327,36 @@ namespace wolvrix::lib::transform
                         if (!maxRegisterWidth.valid || widthValue >= maxRegisterWidth.value)
                         {
                             updateMax(maxRegisterWidth, widthValue, qualifyOpSymbol(graph, opId));
+                        }
+                        // Array registers (shape attr) also feed the memory
+                        // statistics the retired kMemory produced.
+                        if (const auto *shapeAttr = getIntArrayAttr(attrs, "shape"))
+                        {
+                            int64_t elementCount = 1;
+                            for (const int64_t dim : *shapeAttr)
+                            {
+                                elementCount *= dim;
+                            }
+                            if (elementCount > 0 && *width % elementCount == 0)
+                            {
+                                const int64_t elemWidth = *width / elementCount;
+                                ++memoryWidthCounts[elemWidth];
+                                ++memoryRowCounts[elementCount];
+                                if (!maxMemoryWidth.valid ||
+                                    static_cast<uint64_t>(elemWidth) >= maxMemoryWidth.value)
+                                {
+                                    updateMax(maxMemoryWidth, static_cast<uint64_t>(elemWidth),
+                                              qualifyOpSymbol(graph, opId));
+                                }
+                                const uint64_t capacity = widthValue;
+                                memoryCapacityTotal += capacity;
+                                ++memoryCapacityCounts[capacity];
+                                if (!maxMemoryCapacity.valid || capacity >= maxMemoryCapacity.value)
+                                {
+                                    updateMax(maxMemoryCapacity, capacity,
+                                              qualifyOpSymbol(graph, opId));
+                                }
+                            }
                         }
                     }
                     break;
@@ -328,38 +372,7 @@ namespace wolvrix::lib::transform
                         }
                     }
                     break;
-                case wolvrix::lib::grh::OperationKind::kMemory:
-                    if (width && *width > 0)
-                    {
-                        ++memoryWidthCounts[*width];
-                        const uint64_t widthValue = static_cast<uint64_t>(*width);
-                        if (!maxMemoryWidth.valid || widthValue >= maxMemoryWidth.value)
-                        {
-                            updateMax(maxMemoryWidth, widthValue, qualifyOpSymbol(graph, opId));
-                        }
-                    }
-                    if (rows && *rows > 0)
-                    {
-                        ++memoryRowCounts[*rows];
-                    }
-                    if (width && rows && *width > 0 && *rows > 0)
-                    {
-                        const uint64_t w = static_cast<uint64_t>(*width);
-                        const uint64_t r = static_cast<uint64_t>(*rows);
-                        if (w <= std::numeric_limits<uint64_t>::max() / r)
-                        {
-                            const uint64_t capacity = w * r;
-                            memoryCapacityTotal += capacity;
-                            ++memoryCapacityCounts[capacity];
-                            if (!maxMemoryCapacity.valid || capacity >= maxMemoryCapacity.value)
-                            {
-                                updateMax(maxMemoryCapacity, capacity,
-                                          qualifyOpSymbol(graph, opId));
-                            }
-                        }
-                    }
-                    break;
-                case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                     {
                         const auto results = graph->opResults(opId);
                         if (!results.empty())
@@ -373,6 +386,7 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
                 case wolvrix::lib::grh::OperationKind::kLatchWritePort:
                     {
                         const auto operands = graph->opOperands(opId);
@@ -383,12 +397,24 @@ namespace wolvrix::lib::transform
                         }
                     }
                     break;
-                case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-                case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
                     {
                         const auto operands = graph->opOperands(opId);
-                        const std::size_t dataIndex =
-                            kind == wolvrix::lib::grh::OperationKind::kMemoryFillPort ? 1 : 2;
+                        std::size_t dataIndex = 1;
+                        if (kind != wolvrix::lib::grh::OperationKind::kRegisterFillPort)
+                        {
+                            const wolvrix::lib::grh::Operation writeOp = graph->getOperation(opId);
+                            const std::optional<std::size_t> eventStart =
+                                wolvrix::lib::grh::firstEventOperandIndex(writeOp);
+                            if (!eventStart)
+                            {
+                                break;
+                            }
+                            dataIndex = *eventStart -
+                                        (kind == wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort ? 2 : 1);
+                        }
                         if (operands.size() > dataIndex)
                         {
                             const int32_t dataWidth = graph->valueWidth(operands[dataIndex]);
@@ -397,7 +423,7 @@ namespace wolvrix::lib::transform
                                 memoryPortBitwidthTotal += static_cast<uint64_t>(dataWidth);
                             }
                             coneTasks.push_back({graph, operands[0]});
-                            coneTasks.push_back({graph, operands[2]});
+                            coneTasks.push_back({graph, operands[dataIndex]});
                         }
                     }
                     break;
@@ -424,8 +450,8 @@ namespace wolvrix::lib::transform
                 switch (kind)
                 {
                 case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                 case wolvrix::lib::grh::OperationKind::kLatchReadPort:
-                case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
                     readportFanoutTasks.push_back({&ctx, opId});
                     break;
                 default:

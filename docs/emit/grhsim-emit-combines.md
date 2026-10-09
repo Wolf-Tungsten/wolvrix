@@ -41,7 +41,7 @@ Chisel Vec register dynamic read
 
 ## 非目标
 
-- 不把 `kRegister` / `kLatch` 合并成 `kMemory`。
+- 不把标量 `kRegister` / `kLatch` 合并成数组寄存器（kRegister + shape）。
 - 不引入新的公开 GRH dialect。
 - 不要求 ingest、transform pass 或其他 emitter 理解 GrhSIM 专用 combine。
 - 不改变 SV emit 或 JSON store/load 行为。

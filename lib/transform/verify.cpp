@@ -128,6 +128,68 @@ namespace wolvrix::lib::transform
             }
             return true;
         }
+
+        struct RegisterDeclInfo
+        {
+            OperationId id;
+            int64_t width = 0;
+            std::vector<int64_t> shape;
+        };
+
+        // Resolves the kRegister declaration referenced by a port op's
+        // regSymbol attr. On failure `problem` describes why.
+        std::optional<RegisterDeclInfo> registerDeclForPort(Graph &graph, const Operation &op,
+                                                            std::string &problem)
+        {
+            std::optional<std::string> regSymbol = attrAs<std::string>(op, "regSymbol");
+            if (!regSymbol || regSymbol->empty())
+            {
+                problem = "requires a non-empty regSymbol attr";
+                return std::nullopt;
+            }
+            OperationId declId = graph.findOperation(*regSymbol);
+            if (!declId.valid())
+            {
+                problem = "references unknown register '" + *regSymbol + "'";
+                return std::nullopt;
+            }
+            const Operation decl = graph.getOperation(declId);
+            if (decl.kind() != OperationKind::kRegister)
+            {
+                problem = "regSymbol '" + *regSymbol + "' does not name a kRegister";
+                return std::nullopt;
+            }
+            RegisterDeclInfo info;
+            info.id = declId;
+            if (std::optional<int64_t> width = attrAs<int64_t>(decl, "width"))
+            {
+                info.width = *width;
+            }
+            if (std::optional<AttributeValue> shapeAttr = decl.attr("shape"))
+            {
+                if (const auto *dims = std::get_if<std::vector<int64_t>>(&*shapeAttr))
+                {
+                    info.shape = *dims;
+                }
+            }
+            return info;
+        }
+
+        // Element count of shape prefix [0, keptDims); false on overflow.
+        bool shapePrefixProduct(std::span<const int64_t> shape, std::size_t keptDims,
+                                int64_t &product)
+        {
+            product = 1;
+            for (std::size_t i = 0; i < keptDims; ++i)
+            {
+                if (shape[i] <= 0 || product > std::numeric_limits<int64_t>::max() / shape[i])
+                {
+                    return false;
+                }
+                product *= shape[i];
+            }
+            return true;
+        }
     } // namespace
 
     GrhVerifyPass::GrhVerifyPass()
@@ -201,7 +263,6 @@ namespace wolvrix::lib::transform
                 {
                 case OperationKind::kRegister:
                 case OperationKind::kLatch:
-                case OperationKind::kMemory:
                 {
                     if (!op.operands().empty() || !op.results().empty())
                     {
@@ -215,15 +276,6 @@ namespace wolvrix::lib::transform
                     if (!attrAs<bool>(op, "isSigned"))
                     {
                         error(*graph, op, "grh.verify: declaration op requires a bool isSigned attr");
-                    }
-                    if (op.kind() == OperationKind::kMemory)
-                    {
-                        std::optional<int64_t> row = attrAs<int64_t>(op, "row");
-                        if (!row || *row <= 0)
-                        {
-                            error(*graph, op, "grh.verify: kMemory requires a positive int row attr");
-                        }
-                        break;
                     }
                     // `shape` is part of the declaration type contract (like
                     // `width`/`isSigned`), not a free-form attribute.
@@ -257,6 +309,235 @@ namespace wolvrix::lib::transform
                     if (dims->empty())
                     {
                         error(*graph, op, "grh.verify: kRegister shape attr must be non-empty when present");
+                    }
+                    break;
+                }
+                case OperationKind::kRegisterReadPort:
+                case OperationKind::kRegisterReadArrayPort:
+                {
+                    std::string problem;
+                    std::optional<RegisterDeclInfo> decl = registerDeclForPort(*graph, op, problem);
+                    if (!decl)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) + " " + problem);
+                        break;
+                    }
+                    if (op.results().size() != 1)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " must produce exactly one result");
+                        break;
+                    }
+                    const Value result = graph->getValue(op.results().front());
+                    if (op.kind() == OperationKind::kRegisterReadPort)
+                    {
+                        if (!op.operands().empty())
+                        {
+                            error(*graph, op, "grh.verify: kRegisterReadPort takes no operands");
+                            break;
+                        }
+                        if (decl->width > 0 && result.width() != decl->width)
+                        {
+                            error(*graph, op, "grh.verify: kRegisterReadPort result width " +
+                                                  std::to_string(result.width()) +
+                                                  " does not match register width " +
+                                                  std::to_string(decl->width));
+                        }
+                        if (!shapesEqual(result.shape(), decl->shape))
+                        {
+                            error(*graph, op, "grh.verify: kRegisterReadPort result shape " +
+                                                  shapeText(result.shape()) +
+                                                  " does not match register shape " +
+                                                  shapeText(decl->shape));
+                        }
+                        break;
+                    }
+                    // kRegisterReadArrayPort: [i0..ik-1], 1 <= k <= rank; a
+                    // partial index reads the trailing sub-array.
+                    const std::size_t indexCount = op.operands().size();
+                    if (indexCount < 1)
+                    {
+                        error(*graph, op, "grh.verify: kRegisterReadArrayPort expects at least one index operand");
+                        break;
+                    }
+                    if (decl->shape.empty())
+                    {
+                        error(*graph, op, "grh.verify: kRegisterReadArrayPort requires a shaped (array) register");
+                        break;
+                    }
+                    if (indexCount > decl->shape.size())
+                    {
+                        error(*graph, op, "grh.verify: kRegisterReadArrayPort index count " +
+                                              std::to_string(indexCount) + " exceeds register rank " +
+                                              std::to_string(decl->shape.size()));
+                        break;
+                    }
+                    for (const ValueId index : op.operands())
+                    {
+                        if (!graph->valueShape(index).empty())
+                        {
+                            error(*graph, op, "grh.verify: kRegisterReadArrayPort index operands must be scalar");
+                            break;
+                        }
+                    }
+                    int64_t keptProduct = 1;
+                    if (!shapePrefixProduct(decl->shape, indexCount, keptProduct) || decl->width <= 0 ||
+                        decl->width % keptProduct != 0)
+                    {
+                        error(*graph, op, "grh.verify: register shape does not divide its width");
+                        break;
+                    }
+                    const int64_t expectedWidth = decl->width / keptProduct;
+                    if (result.width() != expectedWidth)
+                    {
+                        error(*graph, op, "grh.verify: kRegisterReadArrayPort result width " +
+                                              std::to_string(result.width()) + " does not match expected " +
+                                              std::to_string(expectedWidth));
+                    }
+                    if (!shapesEqual(result.shape(), std::span<const int64_t>(decl->shape).subspan(indexCount)))
+                    {
+                        error(*graph, op, "grh.verify: kRegisterReadArrayPort result shape " +
+                                              shapeText(result.shape()) + " does not match expected sub-array shape");
+                    }
+                    break;
+                }
+                case OperationKind::kRegisterWritePort:
+                case OperationKind::kRegisterWriteMaskPort:
+                case OperationKind::kRegisterWriteArrayPort:
+                case OperationKind::kRegisterWriteArrayMaskPort:
+                case OperationKind::kRegisterFillPort:
+                {
+                    std::string problem;
+                    std::optional<RegisterDeclInfo> decl = registerDeclForPort(*graph, op, problem);
+                    if (!decl)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) + " " + problem);
+                        break;
+                    }
+                    if (!op.results().empty())
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " must not produce results");
+                        break;
+                    }
+                    const auto operands = op.operands();
+                    if (operands.size() < 2)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " expects at least updateCond and a data operand");
+                        break;
+                    }
+                    if (graph->valueWidth(operands[0]) != 1)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " updateCond must be 1 bit");
+                    }
+                    const std::optional<std::size_t> eventStart =
+                        wolvrix::lib::grh::firstEventOperandIndex(op);
+                    if (!eventStart)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " cannot locate event operands (missing eventEdge attr or too few operands)");
+                        break;
+                    }
+                    std::optional<std::vector<std::string>> edges =
+                        attrAs<std::vector<std::string>>(op, "eventEdge");
+                    if (!edges || edges->empty())
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " requires a non-empty eventEdge attr");
+                    }
+                    else if (*eventStart + edges->size() != operands.size())
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " operand count does not match layout (eventEdge count " +
+                                              std::to_string(edges->size()) + ")");
+                    }
+                    if (decl->width <= 0)
+                    {
+                        break;
+                    }
+                    const bool isArrayKind =
+                        op.kind() == OperationKind::kRegisterWriteArrayPort ||
+                        op.kind() == OperationKind::kRegisterWriteArrayMaskPort;
+                    if (isArrayKind && decl->shape.empty())
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                              " requires a shaped (array) register");
+                        break;
+                    }
+                    const std::optional<std::size_t> indexCount =
+                        wolvrix::lib::grh::arrayPortIndexCount(op);
+                    if (isArrayKind)
+                    {
+                        if (!indexCount || *indexCount < 1 || *indexCount > decl->shape.size())
+                        {
+                            error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                                  " index count out of range for register rank " +
+                                                  std::to_string(decl->shape.size()));
+                            break;
+                        }
+                        for (std::size_t i = 0; i < *indexCount; ++i)
+                        {
+                            if (!graph->valueShape(operands[1 + i]).empty())
+                            {
+                                error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                                      " index operands must be scalar");
+                                break;
+                            }
+                        }
+                    }
+                    int64_t keptProduct = 1;
+                    if (!shapePrefixProduct(decl->shape, isArrayKind ? *indexCount : 0, keptProduct))
+                    {
+                        break;
+                    }
+                    const int64_t subWidth = decl->width / keptProduct;
+                    const int64_t elementCount = [&]() {
+                        int64_t count = 1;
+                        for (int64_t dim : decl->shape)
+                        {
+                            count *= dim;
+                        }
+                        return count;
+                    }();
+                    const int64_t elementWidth = decl->width / elementCount;
+                    switch (op.kind())
+                    {
+                    case OperationKind::kRegisterWritePort:
+                        if (graph->valueWidth(operands[1]) != decl->width)
+                        {
+                            error(*graph, op, "grh.verify: kRegisterWritePort nextValue width does not match register width");
+                        }
+                        break;
+                    case OperationKind::kRegisterWriteMaskPort:
+                        if (graph->valueWidth(operands[1]) != decl->width ||
+                            graph->valueWidth(operands[2]) != decl->width)
+                        {
+                            error(*graph, op, "grh.verify: kRegisterWriteMaskPort nextValue/mask widths must match register width");
+                        }
+                        break;
+                    case OperationKind::kRegisterWriteArrayPort:
+                        if (graph->valueWidth(operands[*eventStart - 1]) != subWidth)
+                        {
+                            error(*graph, op, "grh.verify: kRegisterWriteArrayPort data width does not match the addressed sub-array width");
+                        }
+                        break;
+                    case OperationKind::kRegisterWriteArrayMaskPort:
+                        if (graph->valueWidth(operands[*eventStart - 2]) != subWidth ||
+                            graph->valueWidth(operands[*eventStart - 1]) != subWidth)
+                        {
+                            error(*graph, op, "grh.verify: kRegisterWriteArrayMaskPort data/mask widths must match the addressed sub-array width");
+                        }
+                        break;
+                    case OperationKind::kRegisterFillPort:
+                        if (graph->valueWidth(operands[1]) != elementWidth)
+                        {
+                            error(*graph, op, "grh.verify: kRegisterFillPort data width must match the element width");
+                        }
+                        break;
+                    default:
+                        break;
                     }
                     break;
                 }

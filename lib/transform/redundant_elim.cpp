@@ -178,13 +178,14 @@ namespace wolvrix::lib::transform
         {
             switch (kind)
             {
-            case wolvrix::lib::grh::OperationKind::kMemory:
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
             case wolvrix::lib::grh::OperationKind::kRegister:
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatch:
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:

@@ -250,5 +250,214 @@ int main()
         }
     }
 
+    // Case 7: register port family on an array register (stage-03 semantics).
+    {
+        Design design;
+        Graph &graph = design.createGraph("ports_ok");
+        OperationId reg = addRegister(graph, "reg_arr", 128);
+        graph.setAttr(reg, "shape", AttributeValue(std::vector<int64_t>{4, 4}));
+        // element = 8 bit; sub-array at k=1 = 32 bit shape [4]
+        ValueId clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+        ValueId en = graph.createValue(graph.internSymbol("en"), 1, false);
+        ValueId idx = graph.createValue(graph.internSymbol("idx"), 4, false);
+        ValueId idx2 = graph.createValue(graph.internSymbol("idx2"), 4, false);
+        const std::vector<int64_t> wholeShape{4, 4};
+        ValueId whole = graph.createValue(graph.internSymbol("whole"), 128, false,
+                                          ValueType::Logic, wholeShape);
+        OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                 graph.internSymbol("read"));
+        graph.addResult(read, whole);
+        graph.setAttr(read, "regSymbol", std::string("reg_arr"));
+
+        ValueId elem = graph.createValue(graph.internSymbol("elem"), 8, false);
+        OperationId readElem = graph.createOperation(OperationKind::kRegisterReadArrayPort,
+                                                     graph.internSymbol("read_elem"));
+        graph.addOperand(readElem, idx);
+        graph.addOperand(readElem, idx2);
+        graph.addResult(readElem, elem);
+        graph.setAttr(readElem, "regSymbol", std::string("reg_arr"));
+
+        const std::vector<int64_t> rowShape{4};
+        ValueId row = graph.createValue(graph.internSymbol("row"), 32, false, ValueType::Logic,
+                                        rowShape);
+        OperationId readRow = graph.createOperation(OperationKind::kRegisterReadArrayPort,
+                                                    graph.internSymbol("read_row"));
+        graph.addOperand(readRow, idx);
+        graph.addResult(readRow, row);
+        graph.setAttr(readRow, "regSymbol", std::string("reg_arr"));
+
+        OperationId writeRow = graph.createOperation(OperationKind::kRegisterWriteArrayPort,
+                                                     graph.internSymbol("write_row"));
+        graph.addOperand(writeRow, en);
+        graph.addOperand(writeRow, idx);
+        graph.addOperand(writeRow, row);
+        graph.addOperand(writeRow, clk);
+        graph.setAttr(writeRow, "regSymbol", std::string("reg_arr"));
+        graph.setAttr(writeRow, "eventEdge", std::vector<std::string>{"posedge"});
+
+        ValueId mask8 = graph.createValue(graph.internSymbol("mask8"), 8, false);
+        OperationId writeElem = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
+                                                      graph.internSymbol("write_elem"));
+        graph.addOperand(writeElem, en);
+        graph.addOperand(writeElem, idx);
+        graph.addOperand(writeElem, idx2);
+        graph.addOperand(writeElem, elem);
+        graph.addOperand(writeElem, mask8);
+        graph.addOperand(writeElem, clk);
+        graph.setAttr(writeElem, "regSymbol", std::string("reg_arr"));
+        graph.setAttr(writeElem, "eventEdge", std::vector<std::string>{"posedge"});
+
+        OperationId fill = graph.createOperation(OperationKind::kRegisterFillPort,
+                                                 graph.internSymbol("fill"));
+        graph.addOperand(fill, en);
+        graph.addOperand(fill, elem);
+        graph.addOperand(fill, clk);
+        graph.setAttr(fill, "regSymbol", std::string("reg_arr"));
+        graph.setAttr(fill, "eventEdge", std::vector<std::string>{"posedge"});
+
+        ValueId mask128 = graph.createValue(graph.internSymbol("mask128"), 128, false);
+        OperationId writeMask = graph.createOperation(OperationKind::kRegisterWriteMaskPort,
+                                                      graph.internSymbol("write_mask"));
+        graph.addOperand(writeMask, en);
+        graph.addOperand(writeMask, whole);
+        graph.addOperand(writeMask, mask128);
+        graph.addOperand(writeMask, clk);
+        graph.setAttr(writeMask, "regSymbol", std::string("reg_arr"));
+        graph.setAttr(writeMask, "eventEdge", std::vector<std::string>{"posedge"});
+
+        OperationId writeWhole = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                       graph.internSymbol("write_whole"));
+        graph.addOperand(writeWhole, en);
+        graph.addOperand(writeWhole, whole);
+        graph.addOperand(writeWhole, clk);
+        graph.setAttr(writeWhole, "regSymbol", std::string("reg_arr"));
+        graph.setAttr(writeWhole, "eventEdge", std::vector<std::string>{"posedge"});
+        if (!runVerify(design))
+        {
+            return fail("valid register port family graph failed verification");
+        }
+    }
+
+    // Case 8: read array port with more indices than the register rank is rejected.
+    {
+        Design design;
+        Graph &graph = design.createGraph("read_over_rank");
+        OperationId reg = addRegister(graph, "reg_arr", 32);
+        graph.setAttr(reg, "shape", AttributeValue(std::vector<int64_t>{4}));
+        ValueId idx = graph.createValue(graph.internSymbol("idx"), 4, false);
+        ValueId elem = graph.createValue(graph.internSymbol("elem"), 8, false);
+        OperationId read = graph.createOperation(OperationKind::kRegisterReadArrayPort,
+                                                 graph.internSymbol("read"));
+        graph.addOperand(read, idx);
+        graph.addOperand(read, idx);
+        graph.addResult(read, elem);
+        graph.setAttr(read, "regSymbol", std::string("reg_arr"));
+        if (runVerify(design))
+        {
+            return fail("kRegisterReadArrayPort with more indices than rank passed verification");
+        }
+    }
+
+    // Case 9: array write port whose data width does not match the sub-array is rejected.
+    {
+        Design design;
+        Graph &graph = design.createGraph("write_bad_width");
+        OperationId reg = addRegister(graph, "reg_arr", 32);
+        graph.setAttr(reg, "shape", AttributeValue(std::vector<int64_t>{4}));
+        ValueId clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+        ValueId en = graph.createValue(graph.internSymbol("en"), 1, false);
+        ValueId idx = graph.createValue(graph.internSymbol("idx"), 4, false);
+        ValueId data = graph.createValue(graph.internSymbol("data"), 16, false);
+        OperationId write = graph.createOperation(OperationKind::kRegisterWriteArrayPort,
+                                                  graph.internSymbol("write"));
+        graph.addOperand(write, en);
+        graph.addOperand(write, idx);
+        graph.addOperand(write, data);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "regSymbol", std::string("reg_arr"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        if (runVerify(design))
+        {
+            return fail("kRegisterWriteArrayPort with mismatched data width passed verification");
+        }
+    }
+
+    // Case 10: a write port with a multi-bit updateCond is rejected.
+    {
+        Design design;
+        Graph &graph = design.createGraph("write_bad_cond");
+        OperationId reg = addRegister(graph, "reg0", 8);
+        ValueId clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+        ValueId en = graph.createValue(graph.internSymbol("en"), 2, false);
+        ValueId data = graph.createValue(graph.internSymbol("data"), 8, false);
+        OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("write"));
+        graph.addOperand(write, en);
+        graph.addOperand(write, data);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "regSymbol", std::string("reg0"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        if (runVerify(design))
+        {
+            return fail("kRegisterWritePort with a multi-bit updateCond passed verification");
+        }
+    }
+
+    // Case 11: a write port without an eventEdge attr is rejected.
+    {
+        Design design;
+        Graph &graph = design.createGraph("write_no_events");
+        OperationId reg = addRegister(graph, "reg0", 8);
+        ValueId en = graph.createValue(graph.internSymbol("en"), 1, false);
+        ValueId data = graph.createValue(graph.internSymbol("data"), 8, false);
+        OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("write"));
+        graph.addOperand(write, en);
+        graph.addOperand(write, data);
+        graph.setAttr(write, "regSymbol", std::string("reg0"));
+        if (runVerify(design))
+        {
+            return fail("kRegisterWritePort without eventEdge passed verification");
+        }
+    }
+
+    // Case 12: a port that references an unknown register is rejected.
+    {
+        Design design;
+        Graph &graph = design.createGraph("read_unknown_reg");
+        ValueId value = graph.createValue(graph.internSymbol("v"), 8, false);
+        OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                 graph.internSymbol("read"));
+        graph.addResult(read, value);
+        graph.setAttr(read, "regSymbol", std::string("missing_reg"));
+        if (runVerify(design))
+        {
+            return fail("kRegisterReadPort with an unknown regSymbol passed verification");
+        }
+    }
+
+    // Case 13: an array write port on a scalar register is rejected.
+    {
+        Design design;
+        Graph &graph = design.createGraph("array_write_scalar");
+        OperationId reg = addRegister(graph, "reg0", 8);
+        ValueId clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+        ValueId en = graph.createValue(graph.internSymbol("en"), 1, false);
+        ValueId idx = graph.createValue(graph.internSymbol("idx"), 4, false);
+        ValueId data = graph.createValue(graph.internSymbol("data"), 8, false);
+        OperationId write = graph.createOperation(OperationKind::kRegisterWriteArrayPort,
+                                                  graph.internSymbol("write"));
+        graph.addOperand(write, en);
+        graph.addOperand(write, idx);
+        graph.addOperand(write, data);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "regSymbol", std::string("reg0"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        if (runVerify(design))
+        {
+            return fail("kRegisterWriteArrayPort on a scalar register passed verification");
+        }
+    }
+
     return 0;
 }

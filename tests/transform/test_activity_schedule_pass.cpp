@@ -64,9 +64,11 @@ namespace
         switch (op.kind())
         {
         case OperationKind::kRegisterWritePort:
+        case OperationKind::kRegisterWriteMaskPort:
+        case OperationKind::kRegisterWriteArrayPort:
+        case OperationKind::kRegisterWriteArrayMaskPort:
+        case OperationKind::kRegisterFillPort:
         case OperationKind::kLatchWritePort:
-        case OperationKind::kMemoryWritePort:
-        case OperationKind::kMemoryFillPort:
             return true;
         default:
             return false;
@@ -773,15 +775,15 @@ int main()
         const auto a = makeValue(graph, "a", 8);
         graph.bindInputPort("addr", addr);
         graph.bindInputPort("a", a);
-        const auto memDecl = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemory,
+        const auto memDecl = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
                                                    graph.internSymbol("m"));
-        graph.setAttr(memDecl, "width", static_cast<int64_t>(8));
-        graph.setAttr(memDecl, "row", static_cast<int64_t>(4));
+        graph.setAttr(memDecl, "width", static_cast<int64_t>(32));
         graph.setAttr(memDecl, "isSigned", false);
+        graph.setAttr(memDecl, "shape", std::vector<int64_t>{4});
         const auto readValue = makeValue(graph, "r", 8);
-        const auto readOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemoryReadPort,
+        const auto readOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort,
                                                   graph.internSymbol("read"));
-        graph.setAttr(readOp, "memSymbol", std::string("m"));
+        graph.setAttr(readOp, "regSymbol", std::string("m"));
         graph.addOperand(readOp, addr);
         graph.addResult(readOp, readValue);
         const auto y = makeValue(graph, "y", 8);
@@ -814,7 +816,7 @@ int main()
         std::size_t scheduledMemoryReadCount = 0;
         for (const auto opId : graph.operations())
         {
-            if (graph.opKind(opId) == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+            if (graph.opKind(opId) == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort)
             {
                 ++memoryReadCount;
                 if (opId.index > 0 &&
@@ -1633,33 +1635,31 @@ int main()
         graph.bindInputPort("high_data", highData);
         graph.bindInputPort("low_data", lowData);
 
-        const auto memory = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemory,
+        const auto memory = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
                                                   graph.internSymbol("mem"));
-        graph.setAttr(memory, "width", int64_t{8});
-        graph.setAttr(memory, "row", int64_t{4});
+        graph.setAttr(memory, "width", int64_t{32});
         graph.setAttr(memory, "isSigned", false);
+        graph.setAttr(memory, "shape", std::vector<int64_t>{4});
 
+        // stage-03: same-register write ports form one implicit group whose
+        // application order is the op declaration order (later write wins), so
+        // the lower-priority data is declared first.
         const auto addWrite = [&](std::string_view name,
-                                  wolvrix::lib::grh::ValueId data,
-                                  int64_t priority)
+                                  wolvrix::lib::grh::ValueId data)
         {
-            const auto write = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemoryWritePort,
+            const auto write = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort,
                                                      graph.internSymbol(name));
             graph.addOperand(write, en);
             graph.addOperand(write, addr);
             graph.addOperand(write, data);
             graph.addOperand(write, mask);
             graph.addOperand(write, clk);
-            graph.setAttr(write, "memSymbol", std::string("mem"));
+            graph.setAttr(write, "regSymbol", std::string("mem"));
             graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
-            graph.setAttr(write,
-                          wolvrix::lib::grh::kMemoryWritePriorityGroupAttr,
-                          std::string("mem_writes"));
-            graph.setAttr(write, wolvrix::lib::grh::kMemoryWritePriorityAttr, priority);
             return write;
         };
-        const auto highWrite = addWrite("high_write", highData, 0);
-        const auto lowWrite = addWrite("low_write", lowData, 1);
+        const auto lowWrite = addWrite("low_write", lowData);
+        const auto highWrite = addWrite("high_write", highData);
 
         SessionStore session;
         PassManager manager;
@@ -1667,7 +1667,7 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "ordered_memory_write_atomic_chunk",
             .maxOpInComputeSupernode = 1,
-            .maxOpInCommitSupernode = 1,
+            .maxOpInCommitSupernode = 2,
             .enableCoarsen = false,
             .commitGuardEventBuckets = false,
         }));
@@ -1675,7 +1675,12 @@ int main()
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected ordered memory write schedule to succeed");
+            for (const auto &message : diags.messages())
+            {
+                std::cerr << "[activity-schedule-tests] diag: " << message.message << " | "
+                          << message.context << '\n';
+            }
+            return fail("Expected array write schedule to succeed");
         }
         const auto schedule = loadSchedule(session, "ordered_memory_write_atomic_chunk");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
@@ -1686,14 +1691,14 @@ int main()
         const uint32_t lowSupernode = (*schedule.opToSupernode)[lowWrite.index - 1];
         if (highSupernode != lowSupernode)
         {
-            return fail("Ordered memory write group was split by the commit chunk limit");
+            return fail("Same-register array writes did not share a commit supernode");
         }
         const auto &commitOps = (*schedule.supernodeToOps)[highSupernode];
         const auto lowIt = std::find(commitOps.begin(), commitOps.end(), lowWrite);
         const auto highIt = std::find(commitOps.begin(), commitOps.end(), highWrite);
         if (lowIt == commitOps.end() || highIt == commitOps.end() || lowIt >= highIt)
         {
-            return fail("Ordered memory writes were not scheduled from low to high priority");
+            return fail("Array writes were not scheduled in declaration order");
         }
     }
 

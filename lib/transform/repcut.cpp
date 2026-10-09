@@ -285,8 +285,11 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
                 return true;
             default:
                 return isEffectSinkOpKind(kind);
@@ -377,7 +380,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kSliceStatic:
             case wolvrix::lib::grh::OperationKind::kSliceDynamic:
             case wolvrix::lib::grh::OperationKind::kSliceArray:
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                 return true;
             case wolvrix::lib::grh::OperationKind::kSystemFunction:
             {
@@ -1058,9 +1061,9 @@ namespace wolvrix::lib::transform
 
             const wolvrix::lib::grh::OperationId opId = phaseA.nodeToOp[node];
             const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-            if (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort)
             {
-                if (auto sym = getAttrString(op, "memSymbol"))
+                if (auto sym = getAttrString(op, "regSymbol"))
                 {
                     ++stats.memSymbolHits;
                     result.push_back(intern.intern(*sym));
@@ -1431,18 +1434,35 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 const wolvrix::lib::grh::Operation op = graph.getOperation(sink.op);
-                if (auto sym = getAttrString(op, "regSymbol"))
+                switch (op.kind())
                 {
-                    regWriteSinks[*sym].push_back(i);
-                }
-                else if (auto sym = getAttrString(op, "latchSymbol"))
-                {
-                    latchWriteSinks[*sym].push_back(i);
-                }
-                else if (auto sym = getAttrString(op, "memSymbol"))
-                {
-                    const uint32_t symbolId = memSymbolIntern.intern(*sym);
-                    memWriteSinks[symbolId].push_back(i);
+                case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+                    if (auto sym = getAttrString(op, "regSymbol"))
+                    {
+                        regWriteSinks[*sym].push_back(i);
+                    }
+                    break;
+                case wolvrix::lib::grh::OperationKind::kLatchWritePort:
+                    if (auto sym = getAttrString(op, "latchSymbol"))
+                    {
+                        latchWriteSinks[*sym].push_back(i);
+                    }
+                    break;
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
+                    // Indexed/fill writes constrain partitions through the
+                    // same memory-cone machinery the retired kMemory write
+                    // ports used.
+                    if (auto sym = getAttrString(op, "regSymbol"))
+                    {
+                        const uint32_t symbolId = memSymbolIntern.intern(*sym);
+                        memWriteSinks[symbolId].push_back(i);
+                    }
+                    break;
+                default:
+                    break;
                 }
 
                 if (progressLogger && i > 0 && (i % indexProgressEvery) == 0)
@@ -2196,7 +2216,7 @@ namespace wolvrix::lib::transform
                                      " sink_pos=" + std::to_string(sinkPos) +
                                      " sink_index=" + std::to_string(sinkIndex) +
                                      " op=" + formatOperationRef(graph, sink.op) +
-                                     " expected_sink_kind={kRegisterWritePort|kLatchWritePort|kMemoryWritePort|kDpicCall(no-return)|kSystemTask(no-return)}");
+                                     " expected_sink_kind={kRegisterWritePort|kRegisterWriteMaskPort|kRegisterWriteArrayPort|kRegisterWriteArrayMaskPort|kRegisterFillPort|kLatchWritePort|kDpicCall(no-return)|kSystemTask(no-return)}");
                         }
                     }
                     else
@@ -2394,17 +2414,20 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kSliceArray:
                 weight = 1;
                 break;
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                 weight = 4;
                 break;
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
             {
                 const uint32_t nWords = (static_cast<uint32_t>(getOperandWidth(graph, op, 1)) + 63u) / 64u;
                 weight = std::max(2u, nWords + 1u);
                 break;
             }
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             {
                 const uint32_t wrEnWords = (static_cast<uint32_t>(getOperandWidth(graph, op, 0)) + 63u) / 64u;
                 const uint32_t wrDataWords = (static_cast<uint32_t>(getOperandWidth(graph, op, 1)) + 63u) / 64u;
@@ -2617,8 +2640,8 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
                 return true;
             default:
                 return false;
@@ -2630,8 +2653,11 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
                 return true;
             default:
                 return false;
@@ -3706,8 +3732,7 @@ namespace wolvrix::lib::transform
 
         void collectStorageInfos(const wolvrix::lib::grh::Graph &graph,
                                  std::unordered_map<std::string, StorageInfo> &regInfos,
-                                 std::unordered_map<std::string, StorageInfo> &latchInfos,
-                                 std::unordered_map<std::string, StorageInfo> &memInfos)
+                                 std::unordered_map<std::string, StorageInfo> &latchInfos)
         {
             for (const auto opId : graph.operations())
             {
@@ -3724,12 +3749,17 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                     if (auto sym = getAttrString(op, "regSymbol"))
                     {
                         regInfos[*sym].readPorts.push_back(opId);
                     }
                     break;
                 case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+                case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
                     if (auto sym = getAttrString(op, "regSymbol"))
                     {
                         regInfos[*sym].writePorts.push_back(opId);
@@ -3754,27 +3784,6 @@ namespace wolvrix::lib::transform
                     if (auto sym = getAttrString(op, "latchSymbol"))
                     {
                         latchInfos[*sym].writePorts.push_back(opId);
-                    }
-                    break;
-                case wolvrix::lib::grh::OperationKind::kMemory:
-                {
-                    const std::string symbol(op.symbolText());
-                    if (!symbol.empty())
-                    {
-                        memInfos[symbol].declOp = opId;
-                    }
-                    break;
-                }
-                case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-                    if (auto sym = getAttrString(op, "memSymbol"))
-                    {
-                        memInfos[*sym].readPorts.push_back(opId);
-                    }
-                    break;
-                case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-                    if (auto sym = getAttrString(op, "memSymbol"))
-                    {
-                        memInfos[*sym].writePorts.push_back(opId);
                     }
                     break;
                 default:
@@ -4412,7 +4421,6 @@ namespace wolvrix::lib::transform
 
         std::unordered_map<std::string, uint32_t> regPartition;
         std::unordered_map<std::string, uint32_t> latchPartition;
-        std::unordered_map<std::string, uint32_t> memPartition;
         for (AscId aid = 0; aid < phaseB.ascs.size(); ++aid)
         {
             const uint32_t partId = (aid < ascPartition.size()) ? ascPartition[aid] : 0u;
@@ -4432,17 +4440,12 @@ namespace wolvrix::lib::transform
                 {
                     latchPartition[*sym] = partId;
                 }
-                else if (auto sym = getAttrString(op, "memSymbol"))
-                {
-                    memPartition[*sym] = partId;
-                }
             }
         }
 
         std::unordered_map<std::string, StorageInfo> regInfos;
         std::unordered_map<std::string, StorageInfo> latchInfos;
-        std::unordered_map<std::string, StorageInfo> memInfos;
-        collectStorageInfos(*graph, regInfos, latchInfos, memInfos);
+        collectStorageInfos(*graph, regInfos, latchInfos);
 
         const std::size_t inferredRegPartitionCount =
             inferMissingStoragePartitions(*graph, regInfos, regPartition, opPartitionSet);
@@ -4457,7 +4460,6 @@ namespace wolvrix::lib::transform
 
         assignStorageOpsToPartition(regInfos, regPartition, opPartition, opPartitionSet);
         assignStorageOpsToPartition(latchInfos, latchPartition, opPartition, opPartitionSet);
-        assignStorageOpsToPartition(memInfos, memPartition, opPartition, opPartitionSet);
         const uint64_t phaseEMapMs = msSince(phaseEMapStart);
 
         std::unordered_map<wolvrix::lib::grh::ValueId, uint32_t, wolvrix::lib::grh::ValueIdHash> valueDefPartition;
@@ -4548,7 +4550,7 @@ namespace wolvrix::lib::transform
                             allowCross = true;
                             requiresPort = true;
                         }
-                        else if (defKind == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                        else if (defKind == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort)
                         {
                             allowCross = false;
                         }
@@ -4581,7 +4583,7 @@ namespace wolvrix::lib::transform
                         {
                             forbiddenCrossByDefKind[defKind] += 1;
                         }
-                        if (defKindKnown && defKind == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
+                        if (defKindKnown && defKind == wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort)
                         {
                             ++forbiddenMemoryReadCrossCount;
                         }
@@ -4756,7 +4758,6 @@ namespace wolvrix::lib::transform
                       << " op_partitioned=" << opPartition.size()
                       << " reg_partitions=" << regPartition.size()
                       << " latch_partitions=" << latchPartition.size()
-                      << " mem_partitions=" << memPartition.size()
                       << " cross_values_total=" << crossValues.size()
                       << " cross_values_allowed=" << crossAllowedCount
                       << " cross_values_need_ports=" << crossNeedsPortCount

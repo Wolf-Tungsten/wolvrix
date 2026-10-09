@@ -37,7 +37,7 @@ namespace wolvrix::lib::grhsim
         bool isDeclaration(OperationKind kind)
         {
             return kind == OperationKind::kRegister || kind == OperationKind::kLatch ||
-                   kind == OperationKind::kMemory || kind == OperationKind::kDpicImport;
+                   kind == OperationKind::kDpicImport;
         }
 
         bool isForbiddenHierarchy(OperationKind kind)
@@ -101,11 +101,15 @@ namespace wolvrix::lib::grhsim
             {
             case OperationKind::kRegisterReadPort:
             case OperationKind::kLatchReadPort: return "core.state.read";
-            case OperationKind::kRegisterWritePort: return "core.state.regWrite";
+            // stage-03: the GRH kMemory family is unified into kRegister; the
+            // grhsim mem* op names stay until the stage-06 backend rework.
+            case OperationKind::kRegisterReadArrayPort: return "core.state.memRead";
+            case OperationKind::kRegisterWritePort:
+            case OperationKind::kRegisterWriteMaskPort: return "core.state.regWrite";
+            case OperationKind::kRegisterWriteArrayPort:
+            case OperationKind::kRegisterWriteArrayMaskPort: return "core.state.memWrite";
+            case OperationKind::kRegisterFillPort: return "core.state.memFill";
             case OperationKind::kLatchWritePort: return "core.state.latchWrite";
-            case OperationKind::kMemoryReadPort: return "core.state.memRead";
-            case OperationKind::kMemoryWritePort: return "core.state.memWrite";
-            case OperationKind::kMemoryFillPort: return "core.state.memFill";
             case OperationKind::kSystemFunction: return "core.system.function";
             case OperationKind::kSystemTask: return "core.system.task";
             case OperationKind::kDpicCall: return "core.dpi.call";
@@ -118,12 +122,14 @@ namespace wolvrix::lib::grhsim
             switch (kind)
             {
             case OperationKind::kRegisterReadPort:
-            case OperationKind::kRegisterWritePort: return "regSymbol";
+            case OperationKind::kRegisterReadArrayPort:
+            case OperationKind::kRegisterWritePort:
+            case OperationKind::kRegisterWriteMaskPort:
+            case OperationKind::kRegisterWriteArrayPort:
+            case OperationKind::kRegisterWriteArrayMaskPort:
+            case OperationKind::kRegisterFillPort: return "regSymbol";
             case OperationKind::kLatchReadPort:
             case OperationKind::kLatchWritePort: return "latchSymbol";
-            case OperationKind::kMemoryReadPort:
-            case OperationKind::kMemoryWritePort:
-            case OperationKind::kMemoryFillPort: return "memSymbol";
             case OperationKind::kDpicCall: return "targetImportSymbol";
             default: return {};
             }
@@ -132,8 +138,10 @@ namespace wolvrix::lib::grhsim
         bool isEventSensitive(OperationKind kind)
         {
             return kind == OperationKind::kRegisterWritePort ||
-                   kind == OperationKind::kMemoryWritePort ||
-                   kind == OperationKind::kMemoryFillPort ||
+                   kind == OperationKind::kRegisterWriteMaskPort ||
+                   kind == OperationKind::kRegisterWriteArrayPort ||
+                   kind == OperationKind::kRegisterWriteArrayMaskPort ||
+                   kind == OperationKind::kRegisterFillPort ||
                    kind == OperationKind::kSystemTask || kind == OperationKind::kDpicCall;
         }
 
@@ -237,8 +245,10 @@ namespace wolvrix::lib::grhsim
             std::vector<InitStep> steps;
             std::vector<Parameter> parameters;
             const std::string defaultValue = domain == LogicDomain::TwoState ? "0" : "x";
-            if (declaration.kind() == OperationKind::kRegister ||
-                declaration.kind() == OperationKind::kLatch)
+            const bool isArrayRegister =
+                declaration.kind() == OperationKind::kRegister &&
+                declaration.attr("shape").has_value();
+            if (!isArrayRegister)
             {
                 const std::string init = attr<std::string>(declaration, "initValue").value_or(defaultValue);
                 if (init == "$random")
@@ -397,6 +407,27 @@ namespace wolvrix::lib::grhsim
             return valueMap[value.index];
         };
 
+        // stage-03: GRH whole writes (kRegisterWritePort) and unmasked array
+        // writes (kRegisterWriteArrayPort) drop the constant full mask, while
+        // grhsim regWrite/memWrite keep [en, (idx...), data, mask, events...].
+        // Synthesize (cached) all-ones constant values for those masks.
+        std::unordered_map<uint32_t, grhsim::ValueId> allOnesMaskByWidth;
+        auto allOnesMaskFor = [&](uint32_t width) -> grhsim::ValueId {
+            const uint32_t normalized = std::max<uint32_t>(1, width);
+            auto [it, inserted] = allOnesMaskByWidth.try_emplace(normalized);
+            if (!inserted)
+                return it->second;
+            const grhsim::ValueId value = model->addValue(
+                model->logicType(normalized, false, options.logicDomain), {}, {});
+            std::string literal = std::to_string(normalized) + "'b";
+            literal.append(normalized, '1');
+            const std::array results{value};
+            const std::array parameters{Parameter{model->intern("constValue"), std::move(literal)}};
+            model->addOperation("core.compute.constant", {}, results, {}, parameters, {}, {});
+            it->second = value;
+            return value;
+        };
+
         std::unordered_map<std::string, StateId> statesBySymbol;
         std::unordered_map<std::string, ValueType> storageReadKinds;
         for (grh::OperationId opId : graph->operations())
@@ -415,8 +446,7 @@ namespace wolvrix::lib::grhsim
         for (grh::OperationId opId : graph->operations())
         {
             const Operation op = graph->getOperation(opId);
-            if (op.kind() != OperationKind::kRegister && op.kind() != OperationKind::kLatch &&
-                op.kind() != OperationKind::kMemory)
+            if (op.kind() != OperationKind::kRegister && op.kind() != OperationKind::kLatch)
                 continue;
             const std::string symbol(op.symbolText());
             if (symbol.empty() || statesBySymbol.contains(symbol))
@@ -425,24 +455,37 @@ namespace wolvrix::lib::grhsim
                 continue;
             }
             TypeId type;
-            if (op.kind() == OperationKind::kMemory)
+            const int64_t width = attr<int64_t>(op, "width").value_or(0);
+            const bool isSigned = attr<bool>(op, "isSigned").value_or(false);
+            const auto shape = attr<std::vector<int64_t>>(op, "shape").value_or(std::vector<int64_t>{});
+            if (op.kind() == OperationKind::kRegister && !shape.empty())
             {
-                const int64_t width = attr<int64_t>(op, "width").value_or(0);
-                const int64_t rows = attr<int64_t>(op, "row").value_or(-1);
-                if (width <= 0 || rows < 0)
+                // Array register: nest core.array types innermost-dimension
+                // first; `width` is the total bit width across all dims.
+                int64_t elementCount = 1;
+                for (const int64_t dim : shape) elementCount *= dim;
+                if (width <= 0 || elementCount <= 0 || width % elementCount != 0)
                 {
-                    diagnostics.error("memory declaration has invalid width or row count", symbol);
+                    diagnostics.error("array register declaration has invalid width or shape", symbol);
                     continue;
                 }
-                const TypeId element = model->logicType(static_cast<uint32_t>(width),
-                                                        attr<bool>(op, "isSigned").value_or(false),
-                                                        options.logicDomain);
-                type = model->arrayType(element, static_cast<uint64_t>(rows));
+                TypeId element = model->logicType(static_cast<uint32_t>(width / elementCount),
+                                                  isSigned, options.logicDomain);
+                type = element;
+                for (auto dimIt = shape.rbegin(); dimIt != shape.rend(); ++dimIt)
+                {
+                    if (*dimIt <= 0)
+                    {
+                        diagnostics.error("array register declaration has a non-positive dimension", symbol);
+                        type = {};
+                        break;
+                    }
+                    type = model->arrayType(type, static_cast<uint64_t>(*dimIt));
+                }
+                if (!type.valid()) continue;
             }
             else
             {
-                const int64_t width = attr<int64_t>(op, "width").value_or(0);
-                const bool isSigned = attr<bool>(op, "isSigned").value_or(false);
                 const auto kindIt = storageReadKinds.find(symbol);
                 const ValueType storageKind = kindIt == storageReadKinds.end()
                                                       ? ValueType::Logic : kindIt->second;
@@ -584,8 +627,24 @@ namespace wolvrix::lib::grhsim
                 continue;
             }
             std::vector<grhsim::ValueId> operands;
-            operands.reserve(op.operands().size());
+            operands.reserve(op.operands().size() + 1);
             for (grh::ValueId value : op.operands()) operands.push_back(mappedValue(value, op.symbolText()));
+            if (op.kind() == OperationKind::kRegisterWritePort ||
+                op.kind() == OperationKind::kRegisterWriteArrayPort)
+            {
+                // Insert the synthesized full mask right before the events.
+                const std::optional<std::size_t> eventStart = grh::firstEventOperandIndex(op);
+                if (!eventStart || *eventStart < 2 || *eventStart > operands.size())
+                {
+                    diagnostics.error("write port layout does not locate event operands",
+                                      std::string(op.symbolText()));
+                    continue;
+                }
+                const uint32_t dataWidth = static_cast<uint32_t>(std::max<int32_t>(
+                    1, graph->valueWidth(op.operands()[*eventStart - 1])));
+                operands.insert(operands.begin() + static_cast<std::ptrdiff_t>(*eventStart),
+                                allOnesMaskFor(dataWidth));
+            }
             std::vector<grhsim::ValueId> results;
             results.reserve(op.results().size());
             for (grh::ValueId value : op.results()) results.push_back(mappedValue(value, op.symbolText()));
@@ -752,8 +811,7 @@ namespace wolvrix::lib::grhsim
                 else if (const grh::OperationId opId = graph->findOperation(symbol); opId.valid())
                 {
                     const Operation op = graph->getOperation(opId);
-                    if (op.kind() == OperationKind::kRegister || op.kind() == OperationKind::kLatch ||
-                        op.kind() == OperationKind::kMemory)
+                    if (op.kind() == OperationKind::kRegister || op.kind() == OperationKind::kLatch)
                     {
                         const auto stateIt = statesBySymbol.find(std::string(text));
                         if (stateIt == statesBySymbol.end()) continue;

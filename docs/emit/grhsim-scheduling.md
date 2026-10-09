@@ -17,13 +17,13 @@
 代码里存在枚举值 `ActivityOpClass::Source`，本文称它为 `source-class op`。
 
 `source-class op` 只是 `activity-schedule` 的内部分类名。它当前包含
-`kConstant`、`kRegisterReadPort`、`kLatchReadPort`、`kMemoryReadPort`。
-其中 `kMemoryReadPort` 有地址、使能等 operand；这些 operand 仍然是依赖，
+`kConstant`、`kRegisterReadPort`、`kRegisterReadArrayPort`、`kLatchReadPort`。
+其中 `kRegisterReadArrayPort` 有地址等 operand；这些 operand 仍然是依赖，
 仍然会被 compute node builder 处理。也就是说：
 
 ```text
-kMemoryReadPort 属于 ActivityOpClass::Source
-!= kMemoryReadPort 没有 operand 依赖
+kRegisterReadArrayPort 属于 ActivityOpClass::Source
+!= kRegisterReadArrayPort 没有 operand 依赖
 ```
 
 ## 总体模型
@@ -77,17 +77,17 @@ defining op 的 value 通常来自 graph input、inout input 或外部边界。
 
 | Class | 当前包含 | 调度含义 |
 | --- | --- | --- |
-| `Source` | `kConstant`、`kRegisterReadPort`、`kLatchReadPort`、`kMemoryReadPort` | 本文称 `source-class op`。它的 result 在 compute 用户侧会被 clone；builder 可把它吸收到 compute node，或为它建立 owner compute node。这个名字不表示无 operand、无依赖。 |
-| `Sink` | `kRegisterWritePort`、`kLatchWritePort`、`kMemoryWritePort`、`kMemoryFillPort` | 本文称 `sink-class op`。只进入 commit node / commit supernode。 |
+| `Source` | `kConstant`、`kRegisterReadPort`、`kRegisterReadArrayPort`、`kLatchReadPort` | 本文称 `source-class op`。它的 result 在 compute 用户侧会被 clone；builder 可把它吸收到 compute node，或为它建立 owner compute node。这个名字不表示无 operand、无依赖。 |
+| `Sink` | `kRegisterWritePort`、`kRegisterWriteMaskPort`、`kRegisterWriteArrayPort`、`kRegisterWriteArrayMaskPort`、`kRegisterFillPort`、`kLatchWritePort` | 本文称 `sink-class op`。只进入 commit node / commit supernode。 |
 | `Compute` | 普通组合 op、`kSystemTask`、`kDpicCall` 等 | 进入 compute node / compute supernode。是否有 side effect 由 builder 和 emitter 分别处理。 |
-| `Declaration` | `kRegister`、`kMemory`、`kLatch`、`kDpicImport`、层级/XMR 类 op | 不进入 schedule；目标 graph 中不能残留层级类 op。 |
+| `Declaration` | `kRegister`（含数组寄存器）、`kLatch`、`kDpicImport`、层级/XMR 类 op | 不进入 schedule；目标 graph 中不能残留层级类 op。 |
 | `Unsupported` | 索引缺口或异常占位 | 不应作为正常 schedule 输入。 |
 
-`kMemoryReadPort` 的完整语义是：
+`kRegisterReadArrayPort` 的完整语义是：
 
 - 它被分类为 `ActivityOpClass::Source`。
 - 它的 result 对 compute 用户会被 clone。
-- clone 出来的 memory read 保留原 memory read 的 operand。
+- clone 出来的 array read 保留原 array read 的 operand。
 - clone 的 operand 依赖继续由 compute node builder 递归处理。
 - 如果 operand producer 不能被吸收到同一个 compute node，该 operand 会成为
   `boundaryInputs`。
@@ -231,7 +231,7 @@ compute 用户改读 clone result。非 compute 用户不改写：
 compute node，或单独建立 owner compute node。它不改变 source-class op 自身的
 operand 依赖。
 
-对 `kMemoryReadPort`，clone 后仍然有地址、使能等 operand；这些 operand 随后仍按
+对 `kRegisterReadArrayPort`，clone 后仍然有地址等 operand；这些 operand 随后仍按
 普通依赖处理。如果发生 clone，pass 会重新 `freeze()` 并重建 topo / classification。
 
 ### 3. 构造 commit node
@@ -508,8 +508,8 @@ Commit sink 的效果：
 
 ### `ActivityOpClass::Source`
 
-`ActivityOpClass::Source` 是调度内部分类。`kMemoryReadPort` 属于这个分类，同时仍有
-地址、使能等 operand。这些 operand 参与 compute node 构造和 boundary 判定。
+`ActivityOpClass::Source` 是调度内部分类。`kRegisterReadArrayPort` 属于这个分类，同时仍有
+地址等 operand。这些 operand 参与 compute node 构造和 boundary 判定。
 
 ### Batch 调用和 body 执行
 

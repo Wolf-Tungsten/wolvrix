@@ -318,15 +318,13 @@ namespace wolvrix::lib::transform
             StorageInfo info;
             if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister)
             {
-                info.kind = StorageKind::Register;
+                // A register with a non-empty shape attr is an array register
+                // and takes the indexed-write XMR path (retired kMemory role).
+                info.kind = op.attr("shape").has_value() ? StorageKind::Memory : StorageKind::Register;
             }
             else if (op.kind() == wolvrix::lib::grh::OperationKind::kLatch)
             {
                 info.kind = StorageKind::Latch;
-            }
-            else if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory)
-            {
-                info.kind = StorageKind::Memory;
             }
             else
             {
@@ -944,7 +942,7 @@ namespace wolvrix::lib::transform
                 {
                     wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol(*leafGraph);
                     wolvrix::lib::grh::OperationId writeOp =
-                        createOp(*leafGraph, wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                        createOp(*leafGraph, wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort,
                                  opSym, "reg_write_port");
                     for (const auto value : drivers)
                     {
@@ -971,13 +969,13 @@ namespace wolvrix::lib::transform
                 }
                 wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol(*leafGraph);
                 wolvrix::lib::grh::OperationId writeOp =
-                    createOp(*leafGraph, wolvrix::lib::grh::OperationKind::kMemoryWritePort,
+                    createOp(*leafGraph, wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort,
                              opSym, "mem_write_port");
                 for (const auto value : drivers)
                 {
                     leafGraph->addOperand(writeOp, value);
                 }
-                leafGraph->setAttr(writeOp, "memSymbol", leafName);
+                leafGraph->setAttr(writeOp, "regSymbol", leafName);
                 leafGraph->setAttr(writeOp, "eventEdge", *eventEdgesOpt);
                 result.changed = true;
                 return true;

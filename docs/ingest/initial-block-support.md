@@ -5,7 +5,7 @@
 ## 1. 总体原则
 
 - `initial` 主要被当作**初始化信息来源**，而不是时序写端口来源。
-- 能静态归约成初始化值的内容，会写入 `kRegister` / `kMemory` 的初始化属性。
+- 能静态归约成初始化值的内容，会写入 `kRegister`（标量或带 shape 的数组寄存器）的初始化属性。
 - 不能归约成初始化值的 `initial` 赋值，不会变成 `kRegisterWritePort`。
 
 ## 2. 支持矩阵（当前行为）
@@ -16,7 +16,7 @@
 | `initial a = 1;`（简单常量） | 支持 | 记录为 `Register initValue`，不是 write port |
 | `initial a = $random;` | 支持 | 记录为 `initValue="$random"` |
 | `initial a = b;`（非常量 RHS） | 不支持 one-shot 写语义 | 不生成 `kRegisterWritePort`，该赋值最终被忽略并告警 |
-| `initial $readmemh(...)` / `$readmemb(...)` | 支持 | 写入 `kMemory.initKind/initFile/initStart/initLen` |
+| `initial $readmemh(...)` / `$readmemb(...)` | 支持 | 写入数组 `kRegister`（shape 非空）的 `initKind/initFile/initStart/initLen` |
 | `initial $display/...` 等系统任务 | 支持（任务级） | 生成 `kSystemTask`，`procKind="initial"`；通常无 `eventEdge` |
 
 ## 3. `initial` 赋值为何没有 `updateCond/data`

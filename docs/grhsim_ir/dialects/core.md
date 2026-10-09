@@ -384,16 +384,18 @@ core.dpi.call
 | --- | --- |
 | graph input | `InputObject` + `core.input.read` |
 | graph output | `OutputObject` + `core.output.write` |
-| `kRegister` | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
+| `kRegister`（标量） | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
+| `kRegister`（数组，shape 非空） | `StateObject`（`core.array` 类型，多维逐维嵌套）+ `Init` 条目 |
 | `kRegisterReadPort` | `core.state.read` |
-| `kRegisterWritePort` | `core.state.regWrite` |
+| `kRegisterReadArrayPort` | `core.state.memRead`（stage-06 过渡名，见下） |
+| `kRegisterWritePort` | `core.state.regWrite`（转换器补全 1 mask 常量） |
+| `kRegisterWriteMaskPort` | `core.state.regWrite` |
+| `kRegisterWriteArrayPort` | `core.state.memWrite`（转换器补全 1 mask 常量；stage-06 过渡名） |
+| `kRegisterWriteArrayMaskPort` | `core.state.memWrite`（stage-06 过渡名） |
+| `kRegisterFillPort` | `core.state.memFill`（stage-06 过渡名） |
 | `kLatch` | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
 | `kLatchReadPort` | `core.state.read` |
 | `kLatchWritePort` | `core.state.latchWrite` |
-| `kMemory` | `StateObject`（`core.array` 类型）+ `Init` 条目 |
-| `kMemoryReadPort` | `core.state.memRead` |
-| `kMemoryWritePort` | `core.state.memWrite` |
-| `kMemoryFillPort` | `core.state.memFill` |
 | `kSystemFunction` | `core.system.function` |
 | `kSystemTask` | `core.system.task` |
 | `kDpicImport` | `ExternFunction`（`decl = core.dpi`） |
@@ -404,17 +406,21 @@ GRH port 的目标 symbol 转换为目标 StateId，operands 保持原顺序，`
 `targetImportSymbol` 解析为对应 `F` 表项的 FuncId；这两步只改变引用和元数据的表示，不改变
 调用粒度。
 
-`kRegister` 的 `initValue` 转换为一个 `core.init.const` 步骤，`"$random"` 转换为
-`core.init.random`；缺省时按 SV 语义补全 X 的 const 步骤。`kMemory` 的 `initKind` 数组逐项
-转换为 `core.init.readmem`/`core.init.fill` 步骤，保持原顺序；部分覆盖时在序列开头补全 X 的
-const 步骤。转换不得为了实现端口或调用语义增加新的 op。
+标量 `kRegister` 的 `initValue` 转换为一个 `core.init.const` 步骤，`"$random"` 转换为
+`core.init.random`；缺省时按 SV 语义补全 X 的 const 步骤。数组 `kRegister`（shape 非空）的
+`initKind` 数组逐项转换为 `core.init.readmem`/`core.init.fill` 步骤，保持原顺序；部分覆盖时
+在序列开头补全 X 的 const 步骤。转换不得为了实现端口或调用语义增加新的 op。
+
+stage-03 过渡说明：GRH 侧 kMemory 族已删除、数组状态统一为带 shape 的 kRegister；grhsim 侧
+`memRead/memWrite/memFill` 与 `core.array` 类型暂保留作为承接（stage-06 退役并统一为
+read/readArray/write/writeArray/fill 与 width+shape 类型化 state）。
 
 ## 9. 写口转换示例
 
 GRH 写口：
 
 ```text
-kRegisterWritePort @q
+kRegisterWriteMaskPort @q
   operands: [%enable, %d, %mask, %clk]
   eventEdge: [posedge]
 ```

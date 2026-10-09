@@ -72,7 +72,7 @@ namespace
         graph.setAttr(read, "regSymbol", std::string("q"));
         graph.addResult(read, q);
 
-        const auto write = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+        const auto write = graph.createOperation(grh::OperationKind::kRegisterWriteMaskPort,
                                                  graph.internSymbol("q_write"));
         graph.setAttr(write, "regSymbol", std::string("q"));
         graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
@@ -909,10 +909,10 @@ namespace
         graph.setAttr(q, "width", int64_t{8});
         graph.setAttr(q, "isSigned", false);
         graph.setAttr(q, "initValue", std::string("8'h01"));
-        const auto mem = graph.createOperation(grh::OperationKind::kMemory, memSym);
-        graph.setAttr(mem, "width", int64_t{8});
-        graph.setAttr(mem, "row", int64_t{4});
+        const auto mem = graph.createOperation(grh::OperationKind::kRegister, memSym);
+        graph.setAttr(mem, "width", int64_t{32});
         graph.setAttr(mem, "isSigned", false);
+        graph.setAttr(mem, "shape", std::vector<int64_t>{4});
         graph.createOperation(grh::OperationKind::kDpicImport, dpiSym);
         // Declared but detached (no producer, no users, not a port): the value
         // lowering skips it, so it stays a bare anchor without a record.

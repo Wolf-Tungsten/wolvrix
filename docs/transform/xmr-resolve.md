@@ -51,9 +51,9 @@ wolvrix --pass=xmr-resolve --pass=hier-flatten input.sv
 
 XMR 可以指向以下存储元素：
 
-- **寄存器（Register）**：创建 `kRegisterReadPort` 或 `kRegisterWritePort`
+- **寄存器（Register，标量）**：创建 `kRegisterReadPort` 或 `kRegisterWriteMaskPort`
 - **锁存器（Latch）**：创建 `kLatchReadPort` 或 `kLatchWritePort`
-- **存储器（Memory）**：创建 `kMemoryWritePort`（读需要显式地址）
+- **寄存器（Register，数组，shape 非空）**：创建 `kRegisterWriteArrayMaskPort`（读需要显式地址）
 
 ## 注意事项
 

@@ -21,8 +21,8 @@
 
 以下操作类型被视为有副作用，不会被消除：
 
-- `kMemory`, `kMemoryWritePort`
-- `kRegisterWritePort`, `kLatchWritePort`
+- `kRegisterWritePort`, `kRegisterWriteMaskPort`, `kRegisterWriteArrayPort`, `kRegisterWriteArrayMaskPort`, `kRegisterFillPort`
+- `kLatchWritePort`
 - `kInstance`, `kBlackbox`
 - `kSystemFunction`, `kSystemTask`
 - `kDpicImport`, `kDpicCall`

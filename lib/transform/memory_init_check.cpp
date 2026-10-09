@@ -54,7 +54,7 @@ namespace wolvrix::lib::transform
 
     MemoryInitCheckPass::MemoryInitCheckPass()
         : Pass("memory-init-check", "memory-init-check",
-               "Validate kMemory init attribute consistency")
+               "Validate array-register (kRegister with shape) init attribute consistency")
     {
     }
 
@@ -72,7 +72,8 @@ namespace wolvrix::lib::transform
             for (const auto opId : graph.operations())
             {
                 const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kMemory)
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kRegister ||
+                    !op.attr("shape").has_value())
                 {
                     continue;
                 }
@@ -87,12 +88,12 @@ namespace wolvrix::lib::transform
                 const std::size_t count = std::max(kinds.size(), files.size());
                 if (count == 0)
                 {
-                    warning(graph, op, "kMemory init attributes are incomplete (missing initKind/initFile)");
+                    warning(graph, op, "array register init attributes are incomplete (missing initKind/initFile)");
                     continue;
                 }
                 if (kinds.size() != files.size())
                 {
-                    error(graph, op, "kMemory initKind/initFile size mismatch");
+                    error(graph, op, "array register initKind/initFile size mismatch");
                     result.failed = true;
                     continue;
                 }
@@ -101,13 +102,13 @@ namespace wolvrix::lib::transform
                 auto lens = getAttr<std::vector<int64_t>>(op, "initLen");
                 if (!starts || !lens)
                 {
-                    error(graph, op, "kMemory initStart/initLen missing");
+                    error(graph, op, "array register initStart/initLen missing");
                     result.failed = true;
                     continue;
                 }
                 if (starts->size() != count || lens->size() != count)
                 {
-                    error(graph, op, "kMemory initStart/initLen size mismatch");
+                    error(graph, op, "array register initStart/initLen size mismatch");
                     result.failed = true;
                     continue;
                 }
@@ -129,7 +130,7 @@ namespace wolvrix::lib::transform
 
                 if (!initInfoEquals(it->second, info))
                 {
-                    error(graph, op, "kMemory init attributes differ for merged memory '" + symbol + "'");
+                    error(graph, op, "array register init attributes differ for merged register '" + symbol + "'");
                     result.failed = true;
                 }
             }

@@ -118,14 +118,6 @@ namespace wolvrix::lib::transform
             return value.toString(slang::SVInt::MAX_BITS);
         }
 
-        std::string makeFullMaskLiteral(int32_t width)
-        {
-            const int32_t normalizedWidth = width > 0 ? width : 1;
-            std::string literal = std::to_string(normalizedWidth) + "'b";
-            literal.append(static_cast<std::size_t>(normalizedWidth), '1');
-            return literal;
-        }
-
         std::string makeZeroLiteral(int32_t width)
         {
             const int32_t normalizedWidth = width > 0 ? width : 1;
@@ -238,9 +230,9 @@ namespace wolvrix::lib::transform
             const SymbolId valueSym = graph.makeInternalValSym();
             const SymbolId opSym = graph.makeInternalOpSym();
             const ValueId out = graph.createValue(valueSym, width > 0 ? width : 1, isSigned, type);
-            const OperationId op = graph.createOperation(OperationKind::kMemoryReadPort, opSym);
+            const OperationId op = graph.createOperation(OperationKind::kRegisterReadArrayPort, opSym);
             graph.addOperand(op, addr);
-            graph.setAttr(op, "memSymbol", std::string(memSymbol));
+            graph.setAttr(op, "regSymbol", std::string(memSymbol));
             graph.addResult(op, out);
             const SrcLoc srcLoc = makeTransformSrcLoc("memory-read-retime", note);
             graph.setOpSrcLoc(op, srcLoc);
@@ -252,7 +244,6 @@ namespace wolvrix::lib::transform
                                             std::string_view regSymbol,
                                             ValueId updateCond,
                                             ValueId nextValue,
-                                            ValueId mask,
                                             std::span<const ValueId> events,
                                             const std::vector<std::string> &eventEdges,
                                             std::string_view note)
@@ -263,7 +254,6 @@ namespace wolvrix::lib::transform
             graph.setAttr(op, "eventEdge", eventEdges);
             graph.addOperand(op, updateCond);
             graph.addOperand(op, nextValue);
-            graph.addOperand(op, mask);
             for (const ValueId event : events)
             {
                 graph.addOperand(op, event);
@@ -452,10 +442,16 @@ namespace wolvrix::lib::transform
                 switch (op.kind())
                 {
                 case OperationKind::kRegister:
-                    index.registerDecls.emplace(std::string(op.symbolText()), opId);
-                    break;
-                case OperationKind::kMemory:
-                    index.memoryDecls.emplace(std::string(op.symbolText()), opId);
+                    // Array registers (shape attr) play the retired kMemory
+                    // declaration role for this pass.
+                    if (op.attr("shape").has_value())
+                    {
+                        index.memoryDecls.emplace(std::string(op.symbolText()), opId);
+                    }
+                    else
+                    {
+                        index.registerDecls.emplace(std::string(op.symbolText()), opId);
+                    }
                     break;
                 case OperationKind::kRegisterReadPort:
                 {
@@ -467,6 +463,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kRegisterWritePort:
+                case OperationKind::kRegisterWriteMaskPort:
                 {
                     auto regSymbol = getAttr<std::string>(op, "regSymbol");
                     if (regSymbol)
@@ -475,12 +472,13 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
-                case OperationKind::kMemoryWritePort:
+                case OperationKind::kRegisterWriteArrayPort:
+                case OperationKind::kRegisterWriteArrayMaskPort:
                 {
-                    auto memSymbol = getAttr<std::string>(op, "memSymbol");
-                    if (memSymbol)
+                    auto regSymbol = getAttr<std::string>(op, "regSymbol");
+                    if (regSymbol)
                     {
-                        index.memoryWritePorts[*memSymbol].push_back(opId);
+                        index.memoryWritePorts[*regSymbol].push_back(opId);
                     }
                     break;
                 }
@@ -600,7 +598,7 @@ namespace wolvrix::lib::transform
                                                 Stats &stats)
         {
             const Operation readOp = graph.getOperation(readOpId);
-            if (readOp.kind() != OperationKind::kMemoryReadPort ||
+            if (readOp.kind() != OperationKind::kRegisterReadArrayPort ||
                 readOp.operands().size() != 1 ||
                 readOp.results().size() != 1)
             {
@@ -672,18 +670,15 @@ namespace wolvrix::lib::transform
             }
             const OperationId addressWriteId = regWriteIt->second.front();
             const Operation addressWriteOp = graph.getOperation(addressWriteId);
-            if (addressWriteOp.operands().size() < 3)
-            {
-                ++stats.skipMalformed;
-                return std::nullopt;
-            }
-            if (!isFullMaskConst(graph, addressWriteOp.operands()[2], addrWidth))
+            // Only whole writes (no mask operand) keep the retime equivalence.
+            if (addressWriteOp.kind() != OperationKind::kRegisterWritePort ||
+                addressWriteOp.operands().size() < 2)
             {
                 ++stats.skipPartialMask;
                 return std::nullopt;
             }
 
-            auto memorySymbol = getAttr<std::string>(readOp, "memSymbol");
+            auto memorySymbol = getAttr<std::string>(readOp, "regSymbol");
             if (!memorySymbol)
             {
                 ++stats.skipMalformed;
@@ -696,10 +691,19 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             const Operation memoryOp = graph.getOperation(memoryDeclIt->second);
-            const int32_t dataWidth = static_cast<int32_t>(getAttr<int64_t>(memoryOp, "width").value_or(output.width()));
-            const int64_t rowCount = getAttr<int64_t>(memoryOp, "row").value_or(0);
+            const auto memoryShape =
+                getAttr<std::vector<int64_t>>(memoryOp, "shape").value_or(std::vector<int64_t>{});
+            const int64_t memoryTotalWidth = getAttr<int64_t>(memoryOp, "width").value_or(0);
+            if (memoryShape.size() != 1 || memoryShape.front() <= 0 || memoryTotalWidth <= 0 ||
+                memoryTotalWidth % memoryShape.front() != 0)
+            {
+                ++stats.skipMalformed;
+                return std::nullopt;
+            }
+            const int64_t rowCount = memoryShape.front();
+            const int32_t dataWidth = static_cast<int32_t>(memoryTotalWidth / rowCount);
             const bool dataSigned = getAttr<bool>(memoryOp, "isSigned").value_or(output.isSigned());
-            if (dataWidth <= 0 || rowCount <= 0)
+            if (dataWidth <= 0)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
@@ -741,13 +745,13 @@ namespace wolvrix::lib::transform
             }
 
             auto addrEdges = getAttr<std::vector<std::string>>(addressWriteOp, "eventEdge");
-            if (!addrEdges || addrEdges->size() != addressWriteOp.operands().size() - 3)
+            if (!addrEdges || addrEdges->size() != addressWriteOp.operands().size() - 2)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
             candidate.eventEdges = *addrEdges;
-            candidate.events.assign(addressWriteOp.operands().begin() + 3, addressWriteOp.operands().end());
+            candidate.events.assign(addressWriteOp.operands().begin() + 2, addressWriteOp.operands().end());
 
             const auto memWriteIt = index.memoryWritePorts.find(*memorySymbol);
             const std::size_t memWriteCount = memWriteIt == index.memoryWritePorts.end() ? 0 : memWriteIt->second.size();
@@ -769,32 +773,45 @@ namespace wolvrix::lib::transform
 
             const OperationId memoryWriteId = memWriteIt->second.front();
             const Operation memoryWriteOp = graph.getOperation(memoryWriteId);
-            if (memoryWriteOp.operands().size() < 4)
+            const std::optional<std::size_t> memEventStart =
+                wolvrix::lib::grh::firstEventOperandIndex(memoryWriteOp);
+            // One address index is required: layouts are
+            //   WriteArray:     [cond, addr, data, events...]
+            //   WriteArrayMask: [cond, addr, data, mask, events...]
+            if (!memEventStart)
+            {
+                ++stats.skipMalformed;
+                return std::nullopt;
+            }
+            const bool memWriteHasMask =
+                memoryWriteOp.kind() == OperationKind::kRegisterWriteArrayMaskPort;
+            if (*memEventStart != (memWriteHasMask ? 4 : 3))
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
             const auto memEdges = getAttr<std::vector<std::string>>(memoryWriteOp, "eventEdge");
-            if (!memEdges || memEdges->size() != memoryWriteOp.operands().size() - 4)
+            if (!memEdges || memEdges->size() != memoryWriteOp.operands().size() - *memEventStart)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
             if (!valueEq(candidate.events,
-                         std::span<const ValueId>(memoryWriteOp.operands().begin() + 4,
-                                                  memoryWriteOp.operands().size() - 4)) ||
+                         std::span<const ValueId>(memoryWriteOp.operands().begin() + *memEventStart,
+                                                  memoryWriteOp.operands().size() - *memEventStart)) ||
                 *memEdges != candidate.eventEdges)
             {
                 ++stats.skipMismatchedEventDomain;
                 return std::nullopt;
             }
-            if (!isFullMaskConst(graph, memoryWriteOp.operands()[3], dataWidth))
+            if (memWriteHasMask &&
+                !isFullMaskConst(graph, memoryWriteOp.operands()[*memEventStart - 1], dataWidth))
             {
                 ++stats.skipWriteportPartialMask;
                 return std::nullopt;
             }
             if (graph.getValue(memoryWriteOp.operands()[1]).width() != addrWidth ||
-                graph.getValue(memoryWriteOp.operands()[2]).width() != dataWidth)
+                graph.getValue(memoryWriteOp.operands()[*memEventStart - (memWriteHasMask ? 2 : 1)]).width() != dataWidth)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
@@ -804,7 +821,7 @@ namespace wolvrix::lib::transform
             candidate.memoryWriteOp = memoryWriteId;
             candidate.memoryWriteEnable = memoryWriteOp.operands()[0];
             candidate.memoryWriteAddress = memoryWriteOp.operands()[1];
-            candidate.memoryWriteData = memoryWriteOp.operands()[2];
+            candidate.memoryWriteData = memoryWriteOp.operands()[*memEventStart - (memWriteHasMask ? 2 : 1)];
             return candidate;
         }
 
@@ -826,17 +843,10 @@ namespace wolvrix::lib::transform
                                                          candidate.dataSigned,
                                                          candidate.dataType,
                                                          "rom_mem_read");
-            const ValueId fullMask = createConstantValue(graph,
-                                                         candidate.dataWidth,
-                                                         false,
-                                                         ValueType::Logic,
-                                                         makeFullMaskLiteral(candidate.dataWidth),
-                                                         "rom_full_mask");
             createRegisterWritePort(graph,
                                     dataRegSymbol,
                                     candidate.addressEnable,
                                     memData,
-                                    fullMask,
                                     candidate.events,
                                     candidate.eventEdges,
                                     "rom_data_write");
@@ -927,17 +937,10 @@ namespace wolvrix::lib::transform
                                                candidate.dataSigned,
                                                candidate.dataType,
                                                "data_refresh");
-            const ValueId fullMask = createConstantValue(graph,
-                                                         candidate.dataWidth,
-                                                         false,
-                                                         ValueType::Logic,
-                                                         makeFullMaskLiteral(candidate.dataWidth),
-                                                         "ram_full_mask");
             createRegisterWritePort(graph,
                                     dataRegSymbol,
                                     dataEnable,
                                     nextData,
-                                    fullMask,
                                     candidate.events,
                                     candidate.eventEdges,
                                     "ram_data_write");
@@ -977,7 +980,7 @@ namespace wolvrix::lib::transform
             for (const OperationId opId : graph.operations())
             {
                 const Operation op = graph.getOperation(opId);
-                if (op.kind() != OperationKind::kMemoryReadPort)
+                if (op.kind() != OperationKind::kRegisterReadArrayPort)
                 {
                     continue;
                 }

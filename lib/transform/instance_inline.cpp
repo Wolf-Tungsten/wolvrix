@@ -132,7 +132,6 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kRegister:
-            case wolvrix::lib::grh::OperationKind::kMemory:
             case wolvrix::lib::grh::OperationKind::kLatch:
                 return true;
             default:
@@ -550,7 +549,7 @@ namespace wolvrix::lib::transform
                                    const std::string &key,
                                    const wolvrix::lib::grh::AttributeValue &value) {
                 target.setAttr(newOp, key, value);
-                if (key != "regSymbol" && key != "memSymbol" &&
+                if (key != "regSymbol" &&
                     key != "latchSymbol" && key != "targetImportSymbol")
                 {
                     return;

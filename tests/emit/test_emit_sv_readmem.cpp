@@ -35,10 +35,10 @@ Design buildDesign()
     Graph &graph = design.createGraph("mem_init");
     design.markAsTop(graph.symbol());
 
-    OperationId memOp = graph.createOperation(OperationKind::kMemory, graph.internSymbol("mem"));
-    graph.setAttr(memOp, "width", static_cast<int64_t>(8));
-    graph.setAttr(memOp, "row", static_cast<int64_t>(16));
+    OperationId memOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("mem"));
+    graph.setAttr(memOp, "width", static_cast<int64_t>(128));
     graph.setAttr(memOp, "isSigned", false);
+    graph.setAttr(memOp, "shape", std::vector<int64_t>{16});
     graph.setAttr(memOp, "initKind", std::vector<std::string>{"readmemh", "readmemb"});
     graph.setAttr(memOp, "initFile", std::vector<std::string>{"mem_init.hex", "mem_init.bin"});
     graph.setAttr(memOp, "initStart", std::vector<int64_t>{-1, 2});

@@ -51,8 +51,32 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `in`: 为空
   - `out`: 单个 result（读值）
   - `attrs.regSymbol`: string
+- `kRegisterReadArrayPort`
+  - `in`: `[i0, i1, ...]`（1..rank 个索引；不足 rank 时读出高维子数组）
+  - `out`: 单个 result（元素或子数组读值）
+  - `attrs.regSymbol`: string
 - `kRegisterWritePort`
+  - `in`: `[updateCond, nextValue, event0, event1, ...]`
+  - `out`: 为空
+  - `attrs.regSymbol`: string
+  - `attrs.eventEdge`: string[]
+- `kRegisterWriteMaskPort`
   - `in`: `[updateCond, nextValue, mask, event0, event1, ...]`
+  - `out`: 为空
+  - `attrs.regSymbol`: string
+  - `attrs.eventEdge`: string[]
+- `kRegisterWriteArrayPort`
+  - `in`: `[updateCond, i0..ik-1, data, event0, event1, ...]`（1 ≤ k ≤ rank；k<rank 时 data 为子数组）
+  - `out`: 为空
+  - `attrs.regSymbol`: string
+  - `attrs.eventEdge`: string[]
+- `kRegisterWriteArrayMaskPort`
+  - `in`: `[updateCond, i0..ik-1, data, mask, event0, event1, ...]`
+  - `out`: 为空
+  - `attrs.regSymbol`: string
+  - `attrs.eventEdge`: string[]
+- `kRegisterFillPort`
+  - `in`: `[updateCond, data, event0, event1, ...]`（data 为元素宽，广播写满全部元素）
   - `out`: 为空
   - `attrs.regSymbol`: string
   - `attrs.eventEdge`: string[]
@@ -69,21 +93,6 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `in`: `[updateCond, nextValue, mask]`
   - `out`: 为空
   - `attrs.latchSymbol`: string
-- `kMemory`
-  - `in`: 为空
-  - `out`: 为空
-  - `attrs.width`: int
-  - `attrs.row`: int
-  - `attrs.isSigned`: bool
-- `kMemoryReadPort`
-  - `in`: `[addr]`
-  - `out`: 单个 result（读值）
-  - `attrs.memSymbol`: string
-- `kMemoryWritePort`
-  - `in`: `[updateCond, addr, data, mask, event0, event1, ...]`
-  - `out`: 为空
-  - `attrs.memSymbol`: string
-  - `attrs.eventEdge`: string[]
 
 ## XMR 操作
 - `kXMRRead`
@@ -93,12 +102,12 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
 - `kXMRWrite`
   - `in`：
     - 非存储目标：`[data]`
-    - `kRegister`：`[updateCond, nextValue, mask, event0, event1, ...]`
+    - `kRegister`（标量）：`[updateCond, nextValue, mask, event0, event1, ...]`
+    - `kRegister`（数组）：`[updateCond, addr, data, mask, event0, event1, ...]`
     - `kLatch`：`[updateCond, nextValue, mask]`
-    - `kMemory`：`[updateCond, addr, data, mask, event0, event1, ...]`
   - `out`: 为空
   - `attrs.xmrPath`: string，层次路径
-  - `attrs.eventEdge`: string[]，仅 `kRegister/kMemory` 目标必需（长度需匹配事件 operand 数）
+  - `attrs.eventEdge`: string[]，仅 `kRegister` 目标必需（长度需匹配事件 operand 数）
 
 说明：`kXMRRead/kXMRWrite` 是中间表示，必须在 emit 之前被 resolve pass 展开，
 JSON 中若仍保留该 op，表示流程未完成。
@@ -110,6 +119,11 @@ JSON 中若仍保留该 op，表示流程未完成。
 
 ## 排序与布局约定
 - Graph 列表按名称排序；`vals`、`ops` 保留创建顺序；端口数组顺序来自 Graph 端口列表（GraphView 冻结路径会按端口名排序）；`attrs` 保持插入顺序。
+- **op 顺序是语义的一部分**：同一 kRegister 的全部写端口（kRegisterWritePort /
+  kRegisterWriteMaskPort / kRegisterWriteArrayPort / kRegisterWriteArrayMaskPort /
+  kRegisterFillPort）构成唯一写组，同时激活时按 op 声明顺序依次应用、后声明者覆盖
+  （见 grh-ir.md §6.4）。`ops` 数组有序，因此该顺序在 JSON 中免费持久化；
+  任何 pass 不得重排同 regSymbol 写端口的相对顺序。
 - `Compact` 模式无多余空格与换行；`PrettyCompact` 模式下 `vals`、`ports.in/out`、`ops` 数组的元素均单行展示；`Pretty` 模式每个字段独立换行。
 
 ## 兼容性

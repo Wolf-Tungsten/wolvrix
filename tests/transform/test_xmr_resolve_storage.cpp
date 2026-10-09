@@ -205,7 +205,7 @@ int main()
     {
         return fail("Register XMR read port not created");
     }
-    if (!hasPortOp(leaf, wolvrix::lib::grh::OperationKind::kRegisterWritePort, "regSymbol", "reg_a"))
+    if (!hasPortOp(leaf, wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort, "regSymbol", "reg_a"))
     {
         return fail("Register XMR write port not created");
     }

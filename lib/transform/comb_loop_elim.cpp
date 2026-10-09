@@ -113,6 +113,7 @@ namespace wolvrix::lib::transform
             {
             case OperationKind::kConstant:
             case OperationKind::kRegisterReadPort:
+            case OperationKind::kRegisterReadArrayPort:
             case OperationKind::kLatchReadPort:
             case OperationKind::kDpicCall:
                 return true;

@@ -46,6 +46,22 @@ namespace
         return count;
     }
 
+    // Scalar (non-array) registers only; the array register playing the
+    // retired kMemory role carries a shape attr and is not counted.
+    std::size_t countScalarRegisters(const Graph &graph)
+    {
+        std::size_t count = 0;
+        for (const OperationId opId : graph.operations())
+        {
+            const Operation op = graph.getOperation(opId);
+            if (op.kind() == OperationKind::kRegister && !op.attr("shape").has_value())
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     Graph &buildBaseReadPath(Design &design,
                              bool withMemoryWrite,
                              bool secondMemoryWrite,
@@ -60,14 +76,13 @@ namespace
         ValueId addrD = graph.createValue(2, false);
         graph.bindInputPort("addr_d", addrD);
 
-        const ValueId addrMask = makeConst(graph, "addr_mask", "addr_mask_op", 2, false, "2'b11");
         const ValueId memMask = makeConst(graph, "mem_mask", "mem_mask_op", 8, false, "8'hff");
 
         const SymbolId memSym = graph.internSymbol("mem0");
-        const OperationId mem = graph.createOperation(OperationKind::kMemory, memSym);
-        graph.setAttr(mem, "width", static_cast<int64_t>(8));
-        graph.setAttr(mem, "row", static_cast<int64_t>(4));
+        const OperationId mem = graph.createOperation(OperationKind::kRegister, memSym);
+        graph.setAttr(mem, "width", static_cast<int64_t>(32));
         graph.setAttr(mem, "isSigned", false);
+        graph.setAttr(mem, "shape", std::vector<int64_t>{4});
         graph.setAttr(mem, "initKind", std::vector<std::string>{"literal"});
         graph.setAttr(mem, "initFile", std::vector<std::string>{""});
         graph.setAttr(mem, "initValue", std::vector<std::string>{"8'h34"});
@@ -89,7 +104,6 @@ namespace
         graph.setAttr(regWrite, "eventEdge", std::vector<std::string>{"posedge"});
         graph.addOperand(regWrite, en);
         graph.addOperand(regWrite, addrD);
-        graph.addOperand(regWrite, addrMask);
         graph.addOperand(regWrite, clk);
 
         const OperationId regRead = graph.createOperation(OperationKind::kRegisterReadPort,
@@ -98,9 +112,9 @@ namespace
         ValueId addrQ = graph.createValue(graph.internSymbol("addr_q_val"), 2, false);
         graph.addResult(regRead, addrQ);
 
-        const OperationId memRead = graph.createOperation(OperationKind::kMemoryReadPort,
+        const OperationId memRead = graph.createOperation(OperationKind::kRegisterReadArrayPort,
                                                           graph.internSymbol("mem0_read"));
-        graph.setAttr(memRead, "memSymbol", std::string("mem0"));
+        graph.setAttr(memRead, "regSymbol", std::string("mem0"));
         graph.addOperand(memRead, addrQ);
         ValueId data = graph.createValue(graph.internSymbol("data"), 8, false);
         graph.addResult(memRead, data);
@@ -115,9 +129,9 @@ namespace
             ValueId wdata = graph.createValue(8, false);
             graph.bindInputPort("wdata", wdata);
 
-            const OperationId memWrite = graph.createOperation(OperationKind::kMemoryWritePort,
+            const OperationId memWrite = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
                                                                graph.internSymbol("mem0_write"));
-            graph.setAttr(memWrite, "memSymbol", std::string("mem0"));
+            graph.setAttr(memWrite, "regSymbol", std::string("mem0"));
             graph.setAttr(memWrite, "eventEdge", std::vector<std::string>{"posedge"});
             graph.addOperand(memWrite, wen);
             graph.addOperand(memWrite, waddr);
@@ -134,9 +148,9 @@ namespace
                 ValueId wdata2 = graph.createValue(8, false);
                 graph.bindInputPort("wdata2", wdata2);
 
-                const OperationId memWrite2 = graph.createOperation(OperationKind::kMemoryWritePort,
+                const OperationId memWrite2 = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
                                                                     graph.internSymbol("mem0_write_2"));
-                graph.setAttr(memWrite2, "memSymbol", std::string("mem0"));
+                graph.setAttr(memWrite2, "regSymbol", std::string("mem0"));
                 graph.setAttr(memWrite2, "eventEdge", std::vector<std::string>{"posedge"});
                 graph.addOperand(memWrite2, wen2);
                 graph.addOperand(memWrite2, waddr2);
@@ -173,9 +187,9 @@ int main()
         {
             return fail("ROM case should remove original address register");
         }
-        if (countOps(graph, OperationKind::kRegister) != 1)
+        if (countScalarRegisters(graph) != 1)
         {
-            return fail("ROM case should leave exactly one register");
+            return fail("ROM case should leave exactly one scalar register");
         }
         const ValueId out = graph.outputPortValue("data");
         if (!out.valid())
@@ -233,11 +247,11 @@ int main()
         {
             return fail("simple RAM case should keep original address register as shadow state");
         }
-        if (countOps(graph, OperationKind::kRegister) != 2)
+        if (countScalarRegisters(graph) != 2)
         {
             return fail("simple RAM case should contain address and data registers");
         }
-        if (countOps(graph, OperationKind::kMemoryWritePort) != 1)
+        if (countOps(graph, OperationKind::kRegisterWriteArrayMaskPort) != 1)
         {
             return fail("simple RAM case should preserve the original memory write port");
         }
@@ -272,7 +286,7 @@ int main()
         }
         const ValueId out = graph.outputPortValue("data");
         const OperationId outDef = graph.getValue(out).definingOp();
-        if (!outDef.valid() || graph.getOperation(outDef).kind() != OperationKind::kMemoryReadPort)
+        if (!outDef.valid() || graph.getOperation(outDef).kind() != OperationKind::kRegisterReadArrayPort)
         {
             return fail("multi-write skip case should leave original memory read path intact");
         }

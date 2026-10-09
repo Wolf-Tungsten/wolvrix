@@ -106,9 +106,11 @@ namespace wolvrix::lib::transform
             switch (op.kind())
             {
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
                 return true;
             default:
                 return false;
@@ -268,7 +270,6 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kRegister:
-            case wolvrix::lib::grh::OperationKind::kMemory:
             case wolvrix::lib::grh::OperationKind::kLatch:
             case wolvrix::lib::grh::OperationKind::kDpicImport:
                 return true;
@@ -287,11 +288,10 @@ namespace wolvrix::lib::transform
             switch (op.kind())
             {
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                 return getAttrString(op, "regSymbol");
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
                 return getAttrString(op, "latchSymbol");
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
-                return getAttrString(op, "memSymbol");
             default:
                 return std::nullopt;
             }
@@ -513,7 +513,7 @@ namespace wolvrix::lib::transform
                     case wolvrix::lib::grh::OperationKind::kLatchReadPort:
                         stats.stateReadActivationEdges += fanout.size();
                         break;
-                    case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+                    case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
                         stats.memoryReadActivationEdges += fanout.size();
                         break;
                     case wolvrix::lib::grh::OperationKind::kConstant:
@@ -552,7 +552,7 @@ namespace wolvrix::lib::transform
                     valueIndex + 1 >= build.valueSourceKind.size() ||
                     (build.valueSourceKind[valueIndex + 1] != wolvrix::lib::grh::OperationKind::kRegisterReadPort &&
                      build.valueSourceKind[valueIndex + 1] != wolvrix::lib::grh::OperationKind::kLatchReadPort &&
-                     build.valueSourceKind[valueIndex + 1] != wolvrix::lib::grh::OperationKind::kMemoryReadPort &&
+                     build.valueSourceKind[valueIndex + 1] != wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort &&
                      build.valueSourceKind[valueIndex + 1] != wolvrix::lib::grh::OperationKind::kConstant);
                 const uint32_t sourceSupernode =
                     valueIndex + 1 < build.valueSourceSupernode.size() ? build.valueSourceSupernode[valueIndex + 1]
@@ -882,12 +882,22 @@ namespace wolvrix::lib::transform
             switch (op.kind())
             {
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-                eventStart = 3;
+            {
+                // kRegisterFillPort intentionally stays in the default
+                // ("opaque") bucket, mirroring the retired kMemoryFillPort.
+                const std::optional<std::size_t> start =
+                    wolvrix::lib::grh::firstEventOperandIndex(op);
+                if (!start)
+                {
+                    return "opaque";
+                }
+                eventStart = *start;
                 break;
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-                eventStart = 4;
-                break;
+            }
             case wolvrix::lib::grh::OperationKind::kSystemTask:
             case wolvrix::lib::grh::OperationKind::kDpicCall:
                 eventStart = operands.size() >= edges.size() ? operands.size() - edges.size() : operands.size();
@@ -927,174 +937,22 @@ namespace wolvrix::lib::transform
             return key.str();
         }
 
-        struct MemoryWritePriority
-        {
-            std::string group;
-            int64_t priority = 0;
-        };
-
-        std::optional<MemoryWritePriority> memoryWritePriority(
-            const wolvrix::lib::grh::Operation &op)
-        {
-            const auto group = getAttrString(op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
-            const auto priority = getAttrValue<int64_t>(op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
-            if (!group || !priority)
-            {
-                return std::nullopt;
-            }
-            return MemoryWritePriority{.group = *group, .priority = *priority};
-        }
-
-        bool validateMemoryWritePriorityGroups(const wolvrix::lib::grh::Graph &graph,
-                                               std::string &error)
-        {
-            struct GroupInfo
-            {
-                std::string memSymbol;
-                std::string eventKey;
-                std::set<int64_t> priorities;
-            };
-            std::unordered_map<std::string, GroupInfo> groups;
-            for (const auto opId : graph.operations())
-            {
-                const auto op = graph.getOperation(opId);
-                const auto group = getAttrString(op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
-                const auto priority = getAttrValue<int64_t>(op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
-                if (!group && !priority)
-                {
-                    continue;
-                }
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kMemoryWritePort ||
-                    !group || group->empty() || !priority || *priority < 0)
-                {
-                    error = "activity-schedule invalid ordered memory write attrs: " + describeOp(graph, opId);
-                    return false;
-                }
-                const auto memSymbol = getAttrString(op, "memSymbol");
-                if (!memSymbol || memSymbol->empty())
-                {
-                    error = "activity-schedule ordered memory write missing memSymbol: " + describeOp(graph, opId);
-                    return false;
-                }
-                const std::string eventKey = normalizedSinkEventKey(graph, op, nullptr);
-                auto [it, inserted] = groups.try_emplace(*group);
-                if (inserted)
-                {
-                    it->second.memSymbol = *memSymbol;
-                    it->second.eventKey = eventKey;
-                }
-                else if (it->second.memSymbol != *memSymbol || it->second.eventKey != eventKey)
-                {
-                    error = "activity-schedule ordered memory write group crosses memory or event: " + *group;
-                    return false;
-                }
-                if (!it->second.priorities.insert(*priority).second)
-                {
-                    error = "activity-schedule duplicate ordered memory write priority: " + *group;
-                    return false;
-                }
-            }
-            for (const auto &[group, info] : groups)
-            {
-                int64_t expected = 0;
-                for (const int64_t priority : info.priorities)
-                {
-                    if (priority != expected++)
-                    {
-                        error = "activity-schedule non-contiguous ordered memory write priorities: " + group;
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        void orderMemoryWritePriorityGroups(const wolvrix::lib::grh::Graph &graph,
-                                            const ActivityOpData &opData,
-                                            std::vector<uint32_t> &positions)
-        {
-            struct Entry
-            {
-                std::size_t slot = 0;
-                uint32_t topoPosition = 0;
-                int64_t priority = 0;
-            };
-            std::unordered_map<std::string, std::vector<Entry>> entriesByGroup;
-            for (std::size_t slot = 0; slot < positions.size(); ++slot)
-            {
-                const uint32_t topoPosition = positions[slot];
-                const auto op = graph.getOperation(opData.topoOps[topoPosition]);
-                const auto ordered = memoryWritePriority(op);
-                if (!ordered)
-                {
-                    continue;
-                }
-                entriesByGroup[ordered->group].push_back(Entry{
-                    .slot = slot,
-                    .topoPosition = topoPosition,
-                    .priority = ordered->priority,
-                });
-            }
-            for (auto &[group, entries] : entriesByGroup)
-            {
-                (void)group;
-                std::vector<std::size_t> slots;
-                slots.reserve(entries.size());
-                for (const Entry &entry : entries)
-                {
-                    slots.push_back(entry.slot);
-                }
-                std::sort(entries.begin(), entries.end(), [](const Entry &lhs, const Entry &rhs) {
-                    if (lhs.priority != rhs.priority)
-                    {
-                        return lhs.priority > rhs.priority;
-                    }
-                    return lhs.topoPosition < rhs.topoPosition;
-                });
-                for (std::size_t index = 0; index < entries.size(); ++index)
-                {
-                    positions[slots[index]] = entries[index].topoPosition;
-                }
-            }
-        }
-
         std::vector<std::vector<uint32_t>> buildAtomicSinkUnits(
             const wolvrix::lib::grh::Graph &graph,
             const ActivityOpData &opData,
             const std::vector<uint32_t> &positions)
         {
-            std::unordered_map<std::string, std::vector<uint32_t>> orderedGroups;
-            for (const uint32_t topoPosition : positions)
-            {
-                const auto op = graph.getOperation(opData.topoOps[topoPosition]);
-                if (const auto ordered = memoryWritePriority(op))
-                {
-                    orderedGroups[ordered->group].push_back(topoPosition);
-                }
-            }
-            for (auto &[group, groupPositions] : orderedGroups)
-            {
-                (void)group;
-                orderMemoryWritePriorityGroups(graph, opData, groupPositions);
-            }
-
+            // stage-03: the ordered memory-write priority machinery is gone
+            // (same-register write ports form one implicit group ordered by
+            // declaration order, which the backends already honor), so every
+            // sink is its own atomic unit here.
+            (void)graph;
+            (void)opData;
             std::vector<std::vector<uint32_t>> units;
             units.reserve(positions.size());
-            std::unordered_set<std::string> emittedGroups;
             for (const uint32_t topoPosition : positions)
             {
-                const auto op = graph.getOperation(opData.topoOps[topoPosition]);
-                const auto ordered = memoryWritePriority(op);
-                if (!ordered)
-                {
-                    units.push_back(std::vector<uint32_t>{topoPosition});
-                    continue;
-                }
-                if (!emittedGroups.insert(ordered->group).second)
-                {
-                    continue;
-                }
-                units.push_back(orderedGroups.at(ordered->group));
+                units.push_back(std::vector<uint32_t>{topoPosition});
             }
             return units;
         }
@@ -1104,8 +962,10 @@ namespace wolvrix::lib::transform
             switch (op.kind())
             {
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
                 break;
             default:
                 return std::nullopt;
@@ -1126,11 +986,6 @@ namespace wolvrix::lib::transform
         {
             std::ostringstream key;
             key << normalizedSinkEventKey(graph, op, canonicalValues);
-            if (const auto ordered = memoryWritePriority(op))
-            {
-                key << "|ordered:" << ordered->group.size() << ':' << ordered->group;
-                return key.str();
-            }
             const auto updateCond = sinkUpdateCondValue(op);
             if (!updateCond)
             {
@@ -1233,7 +1088,6 @@ namespace wolvrix::lib::transform
                         {
                             continue;
                         }
-                        orderMemoryWritePriorityGroups(graph, opData, guardPositions);
                         if (guardPositions.size() > mergeLimit)
                         {
                             flushPositions();
@@ -1578,13 +1432,15 @@ namespace wolvrix::lib::transform
             {
             case wolvrix::lib::grh::OperationKind::kConstant:
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
                 return ActivityOpClass::Source;
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
                 return ActivityOpClass::Sink;
             default:
                 break;
@@ -1792,12 +1648,14 @@ namespace wolvrix::lib::transform
             {
             case wolvrix::lib::grh::OperationKind::kConstant:
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort:
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
-            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWriteArrayMaskPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterFillPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
-            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
             case wolvrix::lib::grh::OperationKind::kSystemFunction:
             case wolvrix::lib::grh::OperationKind::kSystemTask:
             case wolvrix::lib::grh::OperationKind::kDpicCall:
@@ -4204,11 +4062,6 @@ namespace wolvrix::lib::transform
             out.declaredValueComputeNodeBoundary = options.declaredValueComputeNodeBoundary;
             out.computeNodeOfOp.assign(opClasses.size(), kInvalidActivitySupernodeId);
             ComputeNodeBuilder builder(graph, options, opData, opClasses, out, error);
-
-            if (!validateMemoryWritePriorityGroups(graph, error))
-            {
-                return false;
-            }
 
             const std::size_t maxCommitOps = options.maxOpInCommitSupernode;
             std::vector<uint32_t> sinkTopoPositions;

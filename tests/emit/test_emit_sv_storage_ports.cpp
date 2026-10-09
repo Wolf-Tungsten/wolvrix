@@ -91,11 +91,11 @@ Design buildDesign()
     graph.setAttr(latch, "width", static_cast<int64_t>(4));
     graph.setAttr(latch, "isSigned", false);
 
-    const auto orderedMemory = graph.createOperation(OperationKind::kMemory,
+    const auto orderedMemory = graph.createOperation(OperationKind::kRegister,
                                                      graph.internSymbol("ordered_mem"));
-    graph.setAttr(orderedMemory, "width", static_cast<int64_t>(8));
-    graph.setAttr(orderedMemory, "row", static_cast<int64_t>(4));
+    graph.setAttr(orderedMemory, "width", static_cast<int64_t>(32));
     graph.setAttr(orderedMemory, "isSigned", false);
+    graph.setAttr(orderedMemory, "shape", std::vector<int64_t>{4});
 
     const auto regRead = graph.createOperation(OperationKind::kRegisterReadPort,
                                                graph.internSymbol("_op_emit_reg_read"));
@@ -124,12 +124,11 @@ Design buildDesign()
                                                 graph.internSymbol("_op_emit_reg_write"));
     graph.addOperand(regWrite, en);
     graph.addOperand(regWrite, data);
-    graph.addOperand(regWrite, fullMask);
     graph.addOperand(regWrite, clk);
     graph.setAttr(regWrite, "regSymbol", std::string("reg_full"));
     graph.setAttr(regWrite, "eventEdge", std::vector<std::string>{"posedge"});
 
-    const auto regMaskWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+    const auto regMaskWrite = graph.createOperation(OperationKind::kRegisterWriteMaskPort,
                                                     graph.internSymbol("_op_emit_reg_mask_write"));
     graph.addOperand(regMaskWrite, condAlways);
     graph.addOperand(regMaskWrite, dataMask);
@@ -138,29 +137,27 @@ Design buildDesign()
     graph.setAttr(regMaskWrite, "regSymbol", std::string("reg_mask"));
     graph.setAttr(regMaskWrite, "eventEdge", std::vector<std::string>{"posedge"});
 
-    const auto orderedHighWrite = graph.createOperation(OperationKind::kMemoryWritePort,
-                                                        graph.internSymbol("_op_ordered_high_write"));
-    graph.addOperand(orderedHighWrite, en);
-    graph.addOperand(orderedHighWrite, orderedAddr);
-    graph.addOperand(orderedHighWrite, orderedHighData);
-    graph.addOperand(orderedHighWrite, fullMask);
-    graph.addOperand(orderedHighWrite, clk);
-    graph.setAttr(orderedHighWrite, "memSymbol", std::string("ordered_mem"));
-    graph.setAttr(orderedHighWrite, "eventEdge", std::vector<std::string>{"posedge"});
-    graph.setAttr(orderedHighWrite, kMemoryWritePriorityGroupAttr, std::string("ordered_mem_writes"));
-    graph.setAttr(orderedHighWrite, kMemoryWritePriorityAttr, int64_t{0});
-
-    const auto orderedLowWrite = graph.createOperation(OperationKind::kMemoryWritePort,
+    // stage-03: write ports of one register apply in declaration order and
+    // the later write wins, so the low-priority data is declared first.
+    const auto orderedLowWrite = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
                                                        graph.internSymbol("_op_ordered_low_write"));
     graph.addOperand(orderedLowWrite, en);
     graph.addOperand(orderedLowWrite, orderedAddr);
     graph.addOperand(orderedLowWrite, orderedLowData);
     graph.addOperand(orderedLowWrite, fullMask);
     graph.addOperand(orderedLowWrite, clk);
-    graph.setAttr(orderedLowWrite, "memSymbol", std::string("ordered_mem"));
+    graph.setAttr(orderedLowWrite, "regSymbol", std::string("ordered_mem"));
     graph.setAttr(orderedLowWrite, "eventEdge", std::vector<std::string>{"posedge"});
-    graph.setAttr(orderedLowWrite, kMemoryWritePriorityGroupAttr, std::string("ordered_mem_writes"));
-    graph.setAttr(orderedLowWrite, kMemoryWritePriorityAttr, int64_t{1});
+
+    const auto orderedHighWrite = graph.createOperation(OperationKind::kRegisterWriteArrayMaskPort,
+                                                        graph.internSymbol("_op_ordered_high_write"));
+    graph.addOperand(orderedHighWrite, en);
+    graph.addOperand(orderedHighWrite, orderedAddr);
+    graph.addOperand(orderedHighWrite, orderedHighData);
+    graph.addOperand(orderedHighWrite, fullMask);
+    graph.addOperand(orderedHighWrite, clk);
+    graph.setAttr(orderedHighWrite, "regSymbol", std::string("ordered_mem"));
+    graph.setAttr(orderedHighWrite, "eventEdge", std::vector<std::string>{"posedge"});
 
     const auto latchWrite = graph.createOperation(OperationKind::kLatchWritePort,
                                                   graph.internSymbol("_op_emit_latch_write"));
@@ -258,7 +255,7 @@ int main()
     const std::size_t highWrite = output.find("ordered_mem[ordered_addr] <= ordered_high_data;");
     if (lowWrite == std::string::npos || highWrite == std::string::npos || lowWrite >= highWrite)
     {
-        return fail("Ordered memory writes were not emitted from low to high priority");
+        return fail("Array writes were not emitted in declaration order (later write must win)");
     }
 
     return 0;

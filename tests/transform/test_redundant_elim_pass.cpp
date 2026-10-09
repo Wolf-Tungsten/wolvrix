@@ -113,11 +113,11 @@ int main()
         wolvrix::lib::grh::Graph &fillGraph = fillDesign.createGraph("fill");
 
         wolvrix::lib::grh::OperationId mem =
-            fillGraph.createOperation(wolvrix::lib::grh::OperationKind::kMemory,
+            fillGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
                                       fillGraph.internSymbol("mem"));
-        fillGraph.setAttr(mem, "width", static_cast<int64_t>(8));
-        fillGraph.setAttr(mem, "row", static_cast<int64_t>(4));
+        fillGraph.setAttr(mem, "width", static_cast<int64_t>(32));
         fillGraph.setAttr(mem, "isSigned", false);
+        fillGraph.setAttr(mem, "shape", std::vector<int64_t>{4});
 
         wolvrix::lib::grh::ValueId cond = fillGraph.createValue(fillGraph.internSymbol("cond"), 1, false);
         wolvrix::lib::grh::ValueId data = fillGraph.createValue(fillGraph.internSymbol("data"), 8, false);
@@ -127,12 +127,12 @@ int main()
         fillGraph.bindInputPort("clk", clk);
 
         wolvrix::lib::grh::OperationId fill =
-            fillGraph.createOperation(wolvrix::lib::grh::OperationKind::kMemoryFillPort,
+            fillGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterFillPort,
                                       fillGraph.internSymbol("fill"));
         fillGraph.addOperand(fill, cond);
         fillGraph.addOperand(fill, data);
         fillGraph.addOperand(fill, clk);
-        fillGraph.setAttr(fill, "memSymbol", std::string("mem"));
+        fillGraph.setAttr(fill, "regSymbol", std::string("mem"));
         fillGraph.setAttr(fill, "eventEdge", std::vector<std::string>{"posedge"});
 
         PassManager fillManager;
@@ -154,7 +154,7 @@ int main()
         }
         if (!fillGraph.findOperation("fill").valid())
         {
-            return fail("kMemoryFillPort must not be removed as redundant");
+            return fail("kRegisterFillPort must not be removed as redundant");
         }
     }
 

@@ -780,13 +780,46 @@ wolvrix::lib::grh::ValueType classifyValueType(const slang::ast::Type& type)
 // (with bounds), derive the GRH shape trailing dims and the element/total
 // width. Shared by analyzeSignalType and analyzePortType.
 void analyzePackedPart(const slang::ast::Type& type, const slang::ast::Symbol& origin,
-                       ConvertDiagnostics* diagnostics, TypeResolution& info)
+                       ConvertDiagnostics* diagnostics, TypeResolution& info,
+                       const std::vector<UnpackedDimInfo>* outerPacked = nullptr,
+                       const std::vector<UnpackedDimInfo>* ownPackedOverride = nullptr)
 {
-    collectPackedDims(type, origin, diagnostics, info.packedDims, &info.packedDimInfos);
+    // stage-04: struct-split leaves carry their outer packed dims separately.
+    // Only the leaf's OWN packed dims may be the element bit width; outer
+    // packed dims are always shape dims (a bare-scalar leaf cannot demote an
+    // outer array dim to element bits).
+    std::vector<int32_t> ownPacked;
+    std::vector<UnpackedDimInfo> ownPackedInfos;
+    if (ownPackedOverride)
+    {
+        ownPackedInfos = *ownPackedOverride;
+        for (const UnpackedDimInfo& dim : ownPackedInfos)
+        {
+            ownPacked.push_back(dim.extent);
+        }
+    }
+    else
+    {
+        collectPackedDims(type, origin, diagnostics, ownPacked, &ownPackedInfos);
+    }
+    const std::size_t outerCount = outerPacked ? outerPacked->size() : 0;
+    if (outerPacked && !outerPacked->empty())
+    {
+        info.packedDimInfos.insert(info.packedDimInfos.begin(),
+                                   outerPacked->begin(), outerPacked->end());
+        for (auto it = outerPacked->rbegin(); it != outerPacked->rend(); ++it)
+        {
+            info.packedDims.insert(info.packedDims.begin(), it->extent);
+        }
+    }
+    info.packedDimInfos.insert(info.packedDimInfos.end(),
+                               ownPackedInfos.begin(), ownPackedInfos.end());
+    info.packedDims.insert(info.packedDims.end(), ownPacked.begin(), ownPacked.end());
 
     // Peel aliases + packed layers to find the innermost element type; a
-    // scalar bit element means the innermost packed dim is the element width,
-    // an aggregate (struct/union) element makes every packed dim a shape dim.
+    // scalar bit element means the innermost OWN packed dim is the element
+    // width, an aggregate (struct/union) element makes every packed dim a
+    // shape dim.
     const slang::ast::Type* remainder = &type;
     while (remainder)
     {
@@ -809,28 +842,31 @@ void analyzePackedPart(const slang::ast::Type& type, const slang::ast::Symbol& o
         info.shape.push_back(dim.extent);
     }
     const bool scalarElement = !remainder || isScalarBitType(*remainder);
-    if (!info.packedDims.empty())
+    std::size_t shapePackedCount = 0;
+    if (scalarElement)
     {
-        const std::size_t shapeDims =
-            scalarElement ? info.packedDims.size() - 1 : info.packedDims.size();
-        for (std::size_t i = 0; i < shapeDims; ++i)
-        {
-            info.shape.push_back(info.packedDims[i]);
-        }
+        shapePackedCount = outerCount + (ownPacked.empty() ? 0 : ownPacked.size() - 1);
+    }
+    else
+    {
+        shapePackedCount = outerCount + ownPacked.size();
+    }
+    for (std::size_t i = 0; i < shapePackedCount; ++i)
+    {
+        info.shape.push_back(info.packedDims[i]);
     }
 
     if (!info.shape.empty())
     {
-        // Array: width is the element width (innermost bit type / aggregate).
-        // An unpacked array element may be a bare scalar with no packed dim
-        // at all (e.g. `reg mem [0:N]` or `integer mem [0:N]`).
+        // Array: width is the element width (innermost own bit type /
+        // aggregate).
         uint64_t elementWidth = 0;
         if (scalarElement)
         {
-            elementWidth = info.packedDims.empty()
+            elementWidth = ownPacked.empty()
                                ? (remainder ? computeFixedWidth(*remainder, origin, diagnostics)
                                             : 0)
-                               : static_cast<uint64_t>(info.packedDims.back());
+                               : static_cast<uint64_t>(ownPacked.back());
         }
         else if (remainder)
         {
@@ -844,7 +880,22 @@ void analyzePackedPart(const slang::ast::Type& type, const slang::ast::Symbol& o
     }
     else
     {
-        const uint64_t width = computeFixedWidth(type, origin, diagnostics);
+        // Scalar: the full packed dim list (including any pre-seeded outer
+        // dims) is the bit width; bare remainder types fall back to
+        // computeFixedWidth.
+        uint64_t width = 0;
+        if (scalarElement && !info.packedDims.empty())
+        {
+            width = 1;
+            for (const int32_t dim : info.packedDims)
+            {
+                width *= dim > 0 ? static_cast<uint64_t>(dim) : 1;
+            }
+        }
+        else
+        {
+            width = computeFixedWidth(type, origin, diagnostics);
+        }
         info.width = clampWidth(width, origin, diagnostics, "Signal");
     }
 }
@@ -1029,6 +1080,303 @@ TypeResolution analyzePortType(const slang::ast::Type& type, const slang::ast::S
     analyzePackedPart(*current, origin, diagnostics, info);
     info.isSigned = type.isSigned();
     return info;
+}
+
+// stage-04: field-wise struct splitting (SoA). A struct/union type never
+// becomes a GRH value; declarations are split into leaf field signals named
+// `c__DOT__a` (DOT encoding), with every array dimension (outer and
+// field-local) migrated onto the leaf. Unions are rejected: overlapping
+// fields are incompatible with the split.
+struct StructSplitLeaf {
+    std::string fullName;  // rootName + "__DOT__"-joined field path
+    const slang::ast::Type* type = nullptr;
+    std::vector<UnpackedDimInfo> unpackedDims;   // outer unpacked dims (bounds)
+    std::vector<UnpackedDimInfo> packedDimInfos;  // outer packed dims (bounds)
+    // Packed dims of the leaf's own declared type (below the last struct
+    // boundary): only these may demote to the element bit width.
+    std::vector<UnpackedDimInfo> ownPackedDimInfos;
+};
+
+bool splitStructType(const slang::ast::Type& type, std::string_view rootName,
+                     const slang::ast::Symbol& origin, ConvertDiagnostics* diagnostics,
+                     std::vector<StructSplitLeaf>& out)
+{
+    struct Walker {
+        const slang::ast::Symbol& origin;
+        ConvertDiagnostics* diagnostics;
+        std::vector<StructSplitLeaf>& out;
+        bool isStruct = false;
+        bool failed = false;
+
+        void walk(const slang::ast::Type& type, const std::string& pathPrefix,
+                  std::vector<UnpackedDimInfo> unpackedDims,
+                  std::vector<UnpackedDimInfo> packedDimInfos,
+                  std::size_t packedBoundary = 0)
+        {
+            const slang::ast::Type* current = &type;
+            while (current)
+            {
+                const slang::ast::Type& canonical = current->getCanonicalType();
+                switch (canonical.kind)
+                {
+                case slang::ast::SymbolKind::TypeAlias:
+                    current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+                    continue;
+                case slang::ast::SymbolKind::FixedSizeUnpackedArrayType: {
+                    const auto& unpacked = canonical.as<slang::ast::FixedSizeUnpackedArrayType>();
+                    uint64_t extent = unpacked.range.fullWidth();
+                    UnpackedDimInfo dim;
+                    dim.extent = clampDim(extent, origin, diagnostics,
+                                          "Unpacked array dimension");
+                    dim.left = unpacked.range.left;
+                    dim.right = unpacked.range.right;
+                    unpackedDims.push_back(dim);
+                    current = &unpacked.elementType;
+                    continue;
+                }
+                case slang::ast::SymbolKind::PackedArrayType: {
+                    const auto& packed = canonical.as<slang::ast::PackedArrayType>();
+                    UnpackedDimInfo dim;
+                    dim.extent = clampDim(packed.range.fullWidth(), origin, diagnostics,
+                                          "Packed array dimension");
+                    dim.left = packed.range.left;
+                    dim.right = packed.range.right;
+                    packedDimInfos.push_back(dim);
+                    current = &packed.elementType;
+                    continue;
+                }
+                case slang::ast::SymbolKind::PackedStructType:
+                case slang::ast::SymbolKind::UnpackedStructType: {
+                    isStruct = true;
+                    // Dims accumulated up to (and around) this struct level
+                    // are OUTER dims for every leaf below; the boundary for
+                    // the leaf's own packed dims starts here.
+                    const std::size_t boundary = packedDimInfos.size();
+                    for (const auto& field :
+                         canonical.as<slang::ast::Scope>()
+                             .membersOfType<slang::ast::FieldSymbol>())
+                    {
+                        std::string child = pathPrefix;
+                        child.append("__DOT__");
+                        child.append(field.name);
+                        walk(field.getType(), child, unpackedDims, packedDimInfos, boundary);
+                    }
+                    return;
+                }
+                case slang::ast::SymbolKind::PackedUnionType:
+                case slang::ast::SymbolKind::UnpackedUnionType:
+                    if (diagnostics)
+                    {
+                        diagnostics->error(
+                            origin, "Union types are unsupported in struct splitting (stage-04)");
+                    }
+                    isStruct = true;
+                    failed = true;
+                    return;
+                case slang::ast::SymbolKind::DynamicArrayType:
+                case slang::ast::SymbolKind::AssociativeArrayType:
+                case slang::ast::SymbolKind::QueueType:
+                    if (diagnostics)
+                    {
+                        diagnostics->error(
+                            origin, "Unsupported unpacked array kind in struct splitting");
+                    }
+                    failed = true;
+                    return;
+                default:
+                    out.push_back(StructSplitLeaf{
+                        pathPrefix, current, std::move(unpackedDims),
+                        std::vector<UnpackedDimInfo>(
+                            packedDimInfos.begin(),
+                            packedDimInfos.begin() +
+                                static_cast<std::ptrdiff_t>(packedBoundary)),
+                        std::vector<UnpackedDimInfo>(
+                            packedDimInfos.begin() +
+                                static_cast<std::ptrdiff_t>(packedBoundary),
+                            packedDimInfos.end())});
+                    return;
+                }
+            }
+        }
+    };
+    Walker walker{origin, diagnostics, out};
+    walker.walk(type, std::string(rootName), {}, {});
+    return walker.isStruct && !walker.failed;
+}
+
+// stage-04: is the type struct-typed at the leaf level (arrays of structs
+// included)? Unions are treated as struct-typed here and rejected by the
+// splitter itself.
+bool isStructTyped(const slang::ast::Type& type)
+{
+    const slang::ast::Type* current = &type;
+    while (current)
+    {
+        const slang::ast::Type& canonical = current->getCanonicalType();
+        switch (canonical.kind)
+        {
+        case slang::ast::SymbolKind::TypeAlias:
+            current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+            continue;
+        case slang::ast::SymbolKind::FixedSizeUnpackedArrayType:
+            current = &canonical.as<slang::ast::FixedSizeUnpackedArrayType>().elementType;
+            continue;
+        case slang::ast::SymbolKind::PackedArrayType:
+            current = &canonical.as<slang::ast::PackedArrayType>().elementType;
+            continue;
+        case slang::ast::SymbolKind::PackedStructType:
+        case slang::ast::SymbolKind::UnpackedStructType:
+            return true;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+// Compute the TypeResolution for one split leaf: the leaf's own packed part
+// plus every migrated outer dimension (outer unpacked leading, outer packed
+// trailing).
+TypeResolution analyzeStructLeafType(const StructSplitLeaf& leaf,
+                                     const slang::ast::Symbol& origin,
+                                     ConvertDiagnostics* diagnostics)
+{
+    TypeResolution info{};
+    info.valueType = classifyValueType(*leaf.type);
+    if (info.valueType != wolvrix::lib::grh::ValueType::Logic)
+    {
+        if (diagnostics)
+        {
+            diagnostics->error(origin, "Non-logic field in struct splitting (stage-04)");
+        }
+        info.width = 1;
+        return info;
+    }
+    info.unpackedDims = leaf.unpackedDims;
+    analyzePackedPart(*leaf.type, origin, diagnostics, info, &leaf.packedDimInfos,
+                      &leaf.ownPackedDimInfos);
+    info.isSigned = leaf.type->isSigned();
+    if (!leaf.unpackedDims.empty())
+    {
+        int64_t rows = 1;
+        for (const UnpackedDimInfo& dim : leaf.unpackedDims)
+        {
+            const int64_t extent = dim.extent > 0 ? dim.extent : 1;
+            if (rows > std::numeric_limits<int64_t>::max() / extent)
+            {
+                rows = std::numeric_limits<int64_t>::max();
+                break;
+            }
+            rows *= extent;
+        }
+        info.memoryRows = rows;
+    }
+    return info;
+}
+
+// stage-04: number of split leaves in a type tree (structs recurse; unions
+// and scalars count as one).
+std::size_t countStructLeaves(const slang::ast::Type& type)
+{
+    const slang::ast::Type* current = &type;
+    while (current)
+    {
+        const slang::ast::Type& canonical = current->getCanonicalType();
+        switch (canonical.kind)
+        {
+        case slang::ast::SymbolKind::TypeAlias:
+            current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+            continue;
+        case slang::ast::SymbolKind::FixedSizeUnpackedArrayType:
+            current = &canonical.as<slang::ast::FixedSizeUnpackedArrayType>().elementType;
+            continue;
+        case slang::ast::SymbolKind::PackedArrayType:
+            current = &canonical.as<slang::ast::PackedArrayType>().elementType;
+            continue;
+        case slang::ast::SymbolKind::PackedStructType:
+        case slang::ast::SymbolKind::UnpackedStructType: {
+            std::size_t count = 0;
+            for (const auto& field :
+                 canonical.as<slang::ast::Scope>().membersOfType<slang::ast::FieldSymbol>())
+            {
+                count += countStructLeaves(field.getType());
+            }
+            return count;
+        }
+        default:
+            return 1;
+        }
+    }
+    return 1;
+}
+
+// stage-04: peel aliases to a struct scope (no array peeling — member
+// resolution applies to the struct level directly).
+const slang::ast::Type* peelToStructScope(const slang::ast::Type& type)
+{
+    const slang::ast::Type* current = &type;
+    while (current)
+    {
+        const slang::ast::Type& canonical = current->getCanonicalType();
+        if (canonical.kind == slang::ast::SymbolKind::TypeAlias)
+        {
+            current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+            continue;
+        }
+        if (canonical.kind == slang::ast::SymbolKind::PackedStructType ||
+            canonical.kind == slang::ast::SymbolKind::UnpackedStructType)
+        {
+            return &canonical;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+// stage-04: leaf range [start, end) of a top-level struct member inside the
+// struct type's leaf walk.
+std::optional<std::pair<std::size_t, std::size_t>>
+structMemberLeafRange(const slang::ast::Type& structType, std::string_view member)
+{
+    const slang::ast::Type* scope = peelToStructScope(structType);
+    if (!scope)
+    {
+        return std::nullopt;
+    }
+    std::size_t start = 0;
+    for (const auto& field :
+         scope->as<slang::ast::Scope>().membersOfType<slang::ast::FieldSymbol>())
+    {
+        const std::size_t count = countStructLeaves(field.getType());
+        if (field.name == member)
+        {
+            return std::pair{start, start + count};
+        }
+        start += count;
+    }
+    return std::nullopt;
+}
+
+// stage-04: element (innermost) width of one split leaf: the leaf's own
+// type width after outer-dim migration (1 for bare scalar leaves).
+int64_t structLeafElementWidth(const StructSplitLeaf& leaf,
+                               const slang::ast::Symbol& origin,
+                               ConvertDiagnostics* diagnostics)
+{
+    uint64_t width = computeFixedWidth(*leaf.type, origin, diagnostics);
+    return static_cast<int64_t>(width > 0 ? width : 1);
+}
+
+// stage-04: total flat width of one split leaf (element width × all dims).
+int64_t structLeafFlatWidth(const StructSplitLeaf& leaf, const slang::ast::Symbol& origin)
+{
+    TypeResolution info = analyzeStructLeafType(leaf, origin, nullptr);
+    int64_t total = info.width > 0 ? info.width : 1;
+    for (const int64_t dim : info.shape)
+    {
+        total *= dim > 0 ? dim : 1;
+    }
+    return total;
 }
 
 const slang::ast::TimingControl* findTimingControl(const slang::ast::Statement& stmt)
@@ -2344,6 +2692,13 @@ struct StmtLowererState {
         }
         const ControlDomain saved = domain;
         domain = ControlDomain::Combinational;
+        if (isStructTyped(net.getType()))
+        {
+            handleStructRootInitializer(lookupPlanSignal(plan, net), net.getType(), *init,
+                                        net.location);
+            domain = saved;
+            return;
+        }
         int32_t targetWidth = 0;
         const uint64_t widthRaw =
             computeFixedWidth(net.getType(), net, diagnostics);
@@ -2406,6 +2761,12 @@ struct StmtLowererState {
                 diagnostics->error(variable.location,
                                    "Unresolved target of variable initializer");
             }
+            return;
+        }
+        // stage-04: struct-typed variable initializers expand per leaf.
+        if (isStructTyped(variable.getType()))
+        {
+            handleStructRootInitializer(target, variable.getType(), *init, variable.location);
             return;
         }
         const SignalInfo* signal = findSignalBySymbol(plan, target);
@@ -2506,8 +2867,285 @@ struct StmtLowererState {
         }
     }
 
+    // stage-04: decompose a whole-struct LHS into per-leaf targets (leaf
+    // signal + slices), mirroring the declaration split.
+    bool resolveStructLValueLeaves(const slang::ast::Expression& expr,
+                                   std::vector<LValueTarget>& out)
+    {
+        if (const auto* conversion = expr.as_if<slang::ast::ConversionExpression>())
+        {
+            if (conversion->isImplicit())
+            {
+                return resolveStructLValueLeaves(conversion->operand(), out);
+            }
+            return false;
+        }
+        if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
+        {
+            const StructTypeInfo* info = findStructInfo(lookupPlanSignal(plan, named->symbol));
+            if (!info)
+            {
+                return false;
+            }
+            for (const StructLeafInfo& leaf : info->fields)
+            {
+                LValueTarget target;
+                target.target = leaf.symbol;
+                target.width = static_cast<uint64_t>(leaf.flatWidth > 0 ? leaf.flatWidth : 1);
+                target.location = expr.sourceRange.start();
+                out.push_back(std::move(target));
+            }
+            return true;
+        }
+        if (const auto* member = expr.as_if<slang::ast::MemberAccessExpression>())
+        {
+            std::vector<WriteSlice> slices;
+            std::string xmrPath;
+            std::vector<std::string> memberPath;
+            PlanSymbolId base = resolveLValueSymbol(*member, slices, &xmrPath, &memberPath);
+            if (!base.valid() || !xmrPath.empty() || memberPath.empty())
+            {
+                return false;
+            }
+            const StructTypeInfo* info = findStructInfo(base);
+            if (!info)
+            {
+                return false;
+            }
+            std::string prefix;
+            for (const std::string& component : memberPath)
+            {
+                prefix.append("__DOT__");
+                prefix.append(component);
+            }
+            bool any = false;
+            for (const StructLeafInfo& leaf : info->fields)
+            {
+                if (leaf.fieldPath.size() > prefix.size() &&
+                    leaf.fieldPath.compare(0, prefix.size(), prefix) == 0 &&
+                    leaf.fieldPath.compare(prefix.size(), 7, "__DOT__") == 0)
+                {
+                    LValueTarget target;
+                    target.target = leaf.symbol;
+                    target.slices = slices;
+                    target.width = static_cast<uint64_t>(leaf.flatWidth > 0 ? leaf.flatWidth : 1);
+                    target.location = expr.sourceRange.start();
+                    out.push_back(std::move(target));
+                    any = true;
+                }
+            }
+            return any;
+        }
+        if (const auto* select = expr.as_if<slang::ast::ElementSelectExpression>())
+        {
+            std::vector<LValueTarget> base;
+            if (!resolveStructLValueLeaves(select->value(), base))
+            {
+                return false;
+            }
+            ExprNodeId index = lowerExpression(select->selector());
+            if (index == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            for (auto& target : base)
+            {
+                WriteSlice slice;
+                slice.kind = WriteSliceKind::BitSelect;
+                slice.index = index;
+                slice.location = select->sourceRange.start();
+                target.slices.push_back(slice);
+                out.push_back(std::move(target));
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // stage-04: lower a struct-typed RHS (pattern, aggregate expression, or
+    // flat value) into per-leaf values of the given struct type.
+    bool lowerStructRhsValues(const slang::ast::Type& lhsType,
+                              const slang::ast::Expression& rhs,
+                              std::vector<ExprNodeId>& out)
+    {
+        if (rhs.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+            rhs.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+        {
+            return lowerPatternComponents(lhsType, rhs, out);
+        }
+        if (auto aggregate = lowerAggregateValues(rhs))
+        {
+            out = std::move(aggregate->values);
+            return true;
+        }
+        // Flat-typed RHS (literal/cast/concat): slice each leaf out of the
+        // packed layout.
+        ExprNodeId flat = kInvalidPlanIndex;
+        {
+            WidthContextScope widthScope(*this, 0);
+            flat = lowerExpression(rhs);
+        }
+        if (flat == kInvalidPlanIndex)
+        {
+            return false;
+        }
+        std::vector<StructSplitLeaf> leaves;
+        if (!splitStructType(lhsType, "", *plan.body, diagnostics, leaves))
+        {
+            return false;
+        }
+        std::vector<int64_t> offsets = aggregateLeafOffsets(leaves);
+        int64_t total = 0;
+        for (const StructSplitLeaf& leaf : leaves)
+        {
+            total += aggregateLeafFlatWidth(leaf);
+        }
+        flat = resizeValueToWidth(
+            flat,
+            static_cast<int32_t>(std::min<int64_t>(
+                total > 0 ? total : 1, std::numeric_limits<int32_t>::max())),
+            false, rhs.sourceRange.start());
+        if (flat == kInvalidPlanIndex)
+        {
+            return false;
+        }
+        for (std::size_t i = 0; i < leaves.size(); ++i)
+        {
+            const int64_t width = aggregateLeafFlatWidth(leaves[i]);
+            ExprNodeId offset =
+                addConstantLiteral(std::to_string(offsets[i]), rhs.sourceRange.start());
+            out.push_back(makeSliceDynamic(
+                flat, offset, static_cast<int32_t>(std::max<int64_t>(1, width)),
+                rhs.sourceRange.start()));
+        }
+        return true;
+    }
+
+    // stage-04: whole-struct initializer on a split root (net/variable
+    // declaration initializer): per-leaf write intents.
+    void handleStructRootInitializer(PlanSymbolId root, const slang::ast::Type& type,
+                                     const slang::ast::Expression& init,
+                                     slang::SourceLocation location)
+    {
+        const StructTypeInfo* info = findStructInfo(root);
+        if (!info)
+        {
+            reportUnsupported(init, "Unresolved struct target of initializer");
+            return;
+        }
+        std::vector<ExprNodeId> values;
+        if (!lowerStructRhsValues(type, init, values) || values.size() != info->fields.size())
+        {
+            reportUnsupported(init, "Unsupported struct initializer");
+            return;
+        }
+        ExprNodeId guard = currentGuard(init.sourceRange.start());
+        for (std::size_t i = 0; i < info->fields.size(); ++i)
+        {
+            const StructLeafInfo& leaf = info->fields[i];
+            ExprNodeId value = values[i];
+            if (leaf.flatWidth > 0)
+            {
+                value = resizeValueToWidth(
+                    value, static_cast<int32_t>(std::min<int64_t>(
+                               leaf.flatWidth,
+                               static_cast<int64_t>(std::numeric_limits<int32_t>::max()))),
+                    false, init.sourceRange.start());
+                if (value == kInvalidPlanIndex)
+                {
+                    continue;
+                }
+            }
+            WriteIntent intent;
+            intent.target = leaf.symbol;
+            intent.value = value;
+            intent.guard = guard;
+            intent.domain = domain;
+            intent.isNonBlocking = false;
+            intent.location = init.sourceRange.start();
+            recordWriteIntent(std::move(intent));
+        }
+    }
+
+    void handleStructAssignment(const slang::ast::AssignmentExpression& expr)
+    {
+        std::vector<LValueTarget> leafTargets;
+        if (!resolveStructLValueLeaves(expr.left(), leafTargets) || leafTargets.empty())
+        {
+            reportUnsupported(expr, "Unsupported struct LHS in assignment");
+            return;
+        }
+
+        std::vector<ExprNodeId> values;
+        const bool rhsOk = lowerStructRhsValues(*expr.left().type, expr.right(), values);
+        if (!rhsOk || values.size() != leafTargets.size())
+        {
+            reportUnsupported(expr, "Unsupported struct assignment RHS");
+            return;
+        }
+
+        ExprNodeId guard = currentGuard(expr.sourceRange.start());
+        for (std::size_t i = 0; i < leafTargets.size(); ++i)
+        {
+            LValueTarget& target = leafTargets[i];
+            ExprNodeId value = values[i];
+            // Resize to the ADDRESSED width: the whole leaf when no slices,
+            // otherwise the sub-array addressed by the leading index slices
+            // (mirrors the pass-4 sub-width computation).
+            int64_t addressedWidth = static_cast<int64_t>(target.width);
+            if (!target.slices.empty())
+            {
+                if (const SignalInfo* info = findSignalBySymbol(plan, target.target))
+                {
+                    std::size_t dimCount = 0;
+                    while (dimCount < target.slices.size() &&
+                           dimCount < info->shape.size() &&
+                           target.slices[dimCount].kind == WriteSliceKind::BitSelect)
+                    {
+                        ++dimCount;
+                    }
+                    int64_t subWidth = info->width > 0 ? info->width : 1;
+                    for (std::size_t d = dimCount; d < info->shape.size(); ++d)
+                    {
+                        subWidth *= info->shape[d] > 0 ? info->shape[d] : 1;
+                    }
+                    addressedWidth = subWidth;
+                }
+            }
+            if (addressedWidth > 0)
+            {
+                value = resizeValueToWidth(
+                    value, static_cast<int32_t>(std::min<int64_t>(
+                               addressedWidth,
+                               static_cast<int64_t>(std::numeric_limits<int32_t>::max()))),
+                    false, expr.sourceRange.start());
+                if (value == kInvalidPlanIndex)
+                {
+                    continue;
+                }
+            }
+            WriteIntent intent;
+            intent.target = target.target;
+            intent.slices = std::move(target.slices);
+            intent.value = value;
+            intent.guard = guard;
+            intent.domain = domain;
+            intent.isNonBlocking = expr.isNonBlocking();
+            intent.isXmr = target.isXmr;
+            intent.xmrPath = std::move(target.xmrPath);
+            intent.location = expr.sourceRange.start();
+            recordWriteIntent(std::move(intent));
+        }
+    }
+
     void handleAssignment(const slang::ast::AssignmentExpression& expr)
     {
+        // stage-04: whole-struct assignments expand field-wise.
+        if (!expr.op && expr.left().type && isStructTyped(*expr.left().type))
+        {
+            handleStructAssignment(expr);
+            return;
+        }
         std::vector<LValueTarget> targets;
         LValueCompositeInfo composite;
         if (!resolveLValueTargets(expr.left(), targets, composite))
@@ -7468,6 +8106,1248 @@ private:
         return combined;
     }
 
+    // ================= stage-04 struct aggregate support =================
+
+    const StructTypeInfo* findStructInfo(PlanSymbolId symbol) const
+    {
+        if (!symbol.valid())
+        {
+            return nullptr;
+        }
+        auto it = plan.structsBySymbol.find(symbol.index);
+        return it == plan.structsBySymbol.end() ? nullptr : &it->second;
+    }
+
+    // One leaf of an aggregate value's type tree (same walk order as
+    // splitStructType; fullName unused on the expression side).
+    struct AggregateExpr {
+        const slang::ast::Type* type = nullptr;
+        std::vector<StructSplitLeaf> leafTypes;
+        std::vector<ExprNodeId> values;
+    };
+
+    int64_t aggregateLeafFlatWidth(const StructSplitLeaf& leaf) const
+    {
+        return structLeafFlatWidth(leaf, *plan.body);
+    }
+
+    // LSB-based flat offsets of the leaves inside the aggregate's flat value
+    // (packed layout: the first field occupies the MSB side).
+    std::vector<int64_t> aggregateLeafOffsets(const std::vector<StructSplitLeaf>& leafTypes) const
+    {
+        std::vector<int64_t> widths;
+        widths.reserve(leafTypes.size());
+        int64_t total = 0;
+        for (const StructSplitLeaf& leaf : leafTypes)
+        {
+            const int64_t width = aggregateLeafFlatWidth(leaf);
+            widths.push_back(width);
+            total += width;
+        }
+        std::vector<int64_t> offsets(widths.size(), 0);
+        int64_t acc = total;
+        for (std::size_t i = 0; i < widths.size(); ++i)
+        {
+            acc -= widths[i];
+            offsets[i] = acc;
+        }
+        return offsets;
+    }
+
+    std::vector<int64_t> aggregateLeafOffsets(const AggregateExpr& aggregate) const
+    {
+        return aggregateLeafOffsets(aggregate.leafTypes);
+    }
+
+    ExprNodeId normalizePackedLaneIndexForDim(const UnpackedDimInfo& dim, ExprNodeId index,
+                                              slang::SourceLocation location)
+    {
+        const int64_t low = std::min<int32_t>(dim.left, dim.right);
+        const int64_t high = std::max<int32_t>(dim.left, dim.right);
+        if (dim.left > dim.right)
+        {
+            if (low != 0)
+            {
+                ExprNodeId offset = addConstantLiteral(std::to_string(low), location);
+                index = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                      {index, offset}, location);
+            }
+        }
+        else
+        {
+            ExprNodeId offset = addConstantLiteral(std::to_string(high), location);
+            index = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                  {offset, index}, location);
+        }
+        return index;
+    }
+
+    // The SignalInfo of the symbol at the bottom of a slice chain (nullptr
+    // when the chain is not symbol-rooted).
+    const SignalInfo* chainBaseSignalInfo(ExprNodeId id) const
+    {
+        ExprNodeId current = id;
+        std::unordered_set<ExprNodeId> seen;
+        while (current != kInvalidPlanIndex && current < lowering.values.size() &&
+               seen.insert(current).second)
+        {
+            const ExprNode& node = lowering.values[current];
+            if (node.kind == ExprNodeKind::Symbol)
+            {
+                return findSignalBySymbol(plan, node.symbol);
+            }
+            if (node.kind != ExprNodeKind::Operation || node.operands.empty())
+            {
+                return nullptr;
+            }
+            if (node.op != wolvrix::lib::grh::OperationKind::kSliceDynamic &&
+                node.op != wolvrix::lib::grh::OperationKind::kSliceArray &&
+                node.op != wolvrix::lib::grh::OperationKind::kAssign)
+            {
+                return nullptr;
+            }
+            current = node.operands.front();
+        }
+        return nullptr;
+    }
+
+    // Does this value chain bottom out at an array-state signal Symbol?
+    bool isArrayStateChain(ExprNodeId id) const
+    {
+        const SignalInfo* info = chainBaseSignalInfo(id);
+        return info && info->kind != SignalKind::Net && info->memoryRows > 0;
+    }
+
+    // Apply one element select along dim0 of one aggregate leaf.
+    ExprNodeId elementSelectOnLeaf(ExprNodeId value, const StructSplitLeaf& leaf,
+                                   ExprNodeId index, slang::SourceLocation location)
+    {
+        // stage-04: a folded-scalar leaf (array view folded back to a flat
+        // vector, e.g. an array of 1-bit elements) takes a plain bit slice
+        // instead of a shape-based kSliceArray.
+        if (const SignalInfo* baseInfo = chainBaseSignalInfo(value);
+            baseInfo && baseInfo->memoryRows == 0 && baseInfo->shape.empty() &&
+            !leaf.packedDimInfos.empty())
+        {
+            ExprNodeId lane =
+                normalizePackedLaneIndexForDim(leaf.packedDimInfos.front(), index, location);
+            // The select yields a sub-array spanning the element width and
+            // every remaining packed dim after the selected one.
+            int64_t subWidth = structLeafElementWidth(leaf, *plan.body, diagnostics);
+            for (std::size_t d = 1; d < leaf.packedDimInfos.size(); ++d)
+            {
+                subWidth *= std::max<int32_t>(1, leaf.packedDimInfos[d].extent);
+            }
+            ExprNodeId bitIndex = lane;
+            if (subWidth > 1)
+            {
+                ExprNodeId scale = addConstantLiteral(std::to_string(subWidth), location);
+                bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
+                                         {lane, scale}, location);
+            }
+            return makeSliceDynamic(value, bitIndex, static_cast<int32_t>(subWidth), location);
+        }
+        const bool stateChain = isArrayStateChain(value);
+        if (!leaf.unpackedDims.empty())
+        {
+            if (stateChain)
+            {
+                // pass4 normalizes raw unpacked indices on state reads.
+                return makeSliceDynamic(value, index, 1, location);
+            }
+            const UnpackedDimInfo& dim = leaf.unpackedDims.front();
+            ExprNodeId normalized = index;
+            if (dim.left < dim.right)
+            {
+                if (dim.left != 0)
+                {
+                    ExprNodeId offset =
+                        addConstantLiteral(std::to_string(dim.left), location);
+                    normalized = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                               {normalized, offset}, location);
+                }
+            }
+            else
+            {
+                ExprNodeId offset =
+                    addConstantLiteral(std::to_string(dim.left), location);
+                normalized = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                           {offset, normalized}, location);
+            }
+            return makeSliceArray(value, normalized, 1, location);
+        }
+        if (!leaf.packedDimInfos.empty())
+        {
+            ExprNodeId lane =
+                normalizePackedLaneIndexForDim(leaf.packedDimInfos.front(), index, location);
+            return makeSliceArray(value, lane, 1, location);
+        }
+        reportUnsupportedLocation(location,
+                                  "Element select on scalar struct leaf in aggregate");
+        return kInvalidPlanIndex;
+    }
+
+    // Flatten an aggregate to one flat bit vector (packed layout, first
+    // field at the MSB side).
+    ExprNodeId flattenAggregateValues(const AggregateExpr& aggregate,
+                                      slang::SourceLocation location)
+    {
+        if (aggregate.values.empty())
+        {
+            return kInvalidPlanIndex;
+        }
+        if (aggregate.values.size() == 1)
+        {
+            return aggregate.values.front();
+        }
+        std::vector<ExprNodeId> operands;
+        operands.reserve(aggregate.values.size());
+        int64_t total = 0;
+        for (std::size_t i = 0; i < aggregate.values.size(); ++i)
+        {
+            const int64_t leafWidth =
+                i < aggregate.leafTypes.size() ? aggregateLeafFlatWidth(aggregate.leafTypes[i]) : 0;
+            ExprNodeId value = aggregate.values[i];
+            if (leafWidth > 0)
+            {
+                value = resizeValueToWidth(value, static_cast<int32_t>(
+                                                      std::min<int64_t>(
+                                                          leafWidth,
+                                                          std::numeric_limits<int32_t>::max())),
+                                           false, location);
+            }
+            if (value == kInvalidPlanIndex)
+            {
+                return kInvalidPlanIndex;
+            }
+            const ExprNode& node = lowering.values[value];
+            total += node.widthHint > 0 ? node.widthHint : leafWidth;
+            operands.push_back(value);
+        }
+        ExprNode node;
+        node.kind = ExprNodeKind::Operation;
+        node.op = wolvrix::lib::grh::OperationKind::kConcat;
+        node.operands = std::move(operands);
+        node.location = location;
+        node.widthHint = static_cast<int32_t>(std::min<int64_t>(
+            total > 0 ? total : 1, std::numeric_limits<int32_t>::max()));
+        return addNode(nullptr, std::move(node));
+    }
+
+    // Per-top-level-component values of a pattern on `type`; each component
+    // value may itself aggregate into several leaves (the caller flattens).
+    // Lower one pattern component (struct field or scalar) into per-leaf
+    // values of the component type.
+    // Lower an assignment pattern on a fixed-size array type to one flat
+    // value: per-element values concatenated row-major (packed arrays in
+    // positional order, unpacked arrays in reversed positional order so that
+    // index 0 lands on the LSB side). Returns invalid on failure.
+    ExprNodeId lowerArrayPatternValue(const slang::ast::Type& arrayType,
+                                      const slang::ast::Expression& expr,
+                                      slang::SourceLocation location)
+    {
+        // Peel to the fixed array + element type.
+        const slang::ast::Type* current = &arrayType;
+        const slang::ast::Type* elementType = nullptr;
+        bool isUnpacked = false;
+        int64_t extent = 0;
+        while (current && !elementType)
+        {
+            const slang::ast::Type& canonical = current->getCanonicalType();
+            switch (canonical.kind)
+            {
+            case slang::ast::SymbolKind::TypeAlias:
+                current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+                continue;
+            case slang::ast::SymbolKind::FixedSizeUnpackedArrayType: {
+                const auto& unpacked = canonical.as<slang::ast::FixedSizeUnpackedArrayType>();
+                isUnpacked = true;
+                extent = static_cast<int64_t>(unpacked.range.fullWidth());
+                elementType = &unpacked.elementType;
+                break;
+            }
+            case slang::ast::SymbolKind::PackedArrayType: {
+                const auto& packed = canonical.as<slang::ast::PackedArrayType>();
+                extent = static_cast<int64_t>(packed.range.fullWidth());
+                elementType = &packed.elementType;
+                break;
+            }
+            default:
+                return lowerExpression(expr);
+            }
+        }
+        if (!elementType || extent <= 0)
+        {
+            return lowerExpression(expr);
+        }
+
+        std::vector<ExprNodeId> elements(static_cast<std::size_t>(extent), kInvalidPlanIndex);
+        auto fillFromComponent = [&](std::size_t position, const slang::ast::Expression& valueExpr) -> bool {
+            std::vector<ExprNodeId> values;
+            if (!lowerPatternComponent(*elementType, valueExpr, values) || values.empty())
+            {
+                return false;
+            }
+            // A scalar element yields exactly one value; a struct element is
+            // flattened by the caller-side aggregate path instead.
+            elements[position] = values.size() == 1
+                                     ? values.front()
+                                     : flattenAggregateValues(
+                                           AggregateExpr{elementType, {}, std::move(values)}, location);
+            return elements[position] != kInvalidPlanIndex;
+        };
+
+        std::size_t positional = 0;
+        bool ok = true;
+        if (const auto* simple = expr.as_if<slang::ast::SimpleAssignmentPatternExpression>())
+        {
+            if (static_cast<int64_t>(simple->elements().size()) != extent)
+            {
+                reportUnsupported(expr, "Array assignment pattern element count mismatch");
+                return kInvalidPlanIndex;
+            }
+            for (const slang::ast::Expression* elementExpr : simple->elements())
+            {
+                ok = fillFromComponent(positional++, *elementExpr) && ok;
+            }
+        }
+        else if (const auto* structured =
+                     expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+        {
+            // Index setters select positions by constant index (normalized
+            // into positional order); the default setter fills the rest.
+            for (const auto& setter : structured->indexSetters)
+            {
+                auto indexConst = std::optional<int64_t>{};
+                if (setter.index)
+                {
+                    if (const slang::ConstantValue* cv = setter.index->getConstant();
+                        cv && cv->isInteger())
+                    {
+                        if (auto v = cv->integer().as<int64_t>())
+                        {
+                            indexConst = *v;
+                        }
+                    }
+                }
+                if (indexConst && *indexConst >= 0 && *indexConst < extent)
+                {
+                    ok = fillFromComponent(static_cast<std::size_t>(*indexConst), *setter.expr) && ok;
+                }
+                else
+                {
+                    ok = false;
+                }
+            }
+            if (structured->defaultSetter)
+            {
+                for (std::size_t i = 0; i < elements.size(); ++i)
+                {
+                    if (elements[i] == kInvalidPlanIndex)
+                    {
+                        ok = fillFromComponent(i, *structured->defaultSetter) && ok;
+                    }
+                }
+            }
+        }
+        else
+        {
+            return lowerExpression(expr);
+        }
+        if (!ok)
+        {
+            reportUnsupported(expr, "Unsupported array assignment pattern");
+            return kInvalidPlanIndex;
+        }
+        for (ExprNodeId element : elements)
+        {
+            if (element == kInvalidPlanIndex)
+            {
+                reportUnsupported(expr, "Array assignment pattern leaves elements unassigned");
+                return kInvalidPlanIndex;
+            }
+        }
+        if (isUnpacked)
+        {
+            // GRH flat layout is row-major with lane 0 at the LSB; unpacked
+            // positional order runs ascending, so reverse for the MSB-first
+            // concat. Packed positional order already runs MSB-first.
+            std::reverse(elements.begin(), elements.end());
+        }
+        int64_t total = 0;
+        for (ExprNodeId element : elements)
+        {
+            const ExprNode& node = lowering.values[element];
+            total += node.widthHint > 0 ? node.widthHint : 1;
+        }
+        ExprNode node;
+        node.kind = ExprNodeKind::Operation;
+        node.op = wolvrix::lib::grh::OperationKind::kConcat;
+        node.operands = std::move(elements);
+        node.location = location;
+        node.widthHint = static_cast<int32_t>(std::min<int64_t>(
+            total > 0 ? total : 1, std::numeric_limits<int32_t>::max()));
+        return addNode(nullptr, std::move(node));
+    }
+
+    bool lowerPatternComponent(const slang::ast::Type& componentType,
+                               const slang::ast::Expression& expr,
+                               std::vector<ExprNodeId>& out)
+    {
+        if (isStructTyped(componentType))
+        {
+            if (expr.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+                expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+            {
+                return lowerPatternComponents(componentType, expr, out);
+            }
+            if (auto aggregate = lowerAggregateValues(expr))
+            {
+                out.insert(out.end(), aggregate->values.begin(), aggregate->values.end());
+                return true;
+            }
+            // Untyped flat value (e.g. '0 as a default setter): slice each
+            // leaf out of the packed layout.
+            ExprNodeId flat = lowerExpression(expr);
+            if (flat == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            std::vector<StructSplitLeaf> leaves;
+            if (!splitStructType(componentType, "", *plan.body, diagnostics, leaves))
+            {
+                return false;
+            }
+            std::vector<int64_t> offsets = aggregateLeafOffsets(leaves);
+            int64_t total = 0;
+            for (const StructSplitLeaf& leaf : leaves)
+            {
+                total += aggregateLeafFlatWidth(leaf);
+            }
+            flat = resizeValueToWidth(
+                flat,
+                static_cast<int32_t>(std::min<int64_t>(
+                    total > 0 ? total : 1, std::numeric_limits<int32_t>::max())),
+                false, expr.sourceRange.start());
+            if (flat == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < leaves.size(); ++i)
+            {
+                const int64_t width = aggregateLeafFlatWidth(leaves[i]);
+                ExprNodeId offset =
+                    addConstantLiteral(std::to_string(offsets[i]), expr.sourceRange.start());
+                out.push_back(makeSliceDynamic(
+                    flat, offset, static_cast<int32_t>(std::max<int64_t>(1, width)),
+                    expr.sourceRange.start()));
+            }
+            return true;
+        }
+        ExprNodeId value = kInvalidPlanIndex;
+        if (expr.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+            expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+        {
+            value = lowerArrayPatternValue(componentType, expr, expr.sourceRange.start());
+        }
+        else
+        {
+            value = lowerExpression(expr);
+        }
+        if (value == kInvalidPlanIndex)
+        {
+            return false;
+        }
+        out.push_back(value);
+        return true;
+    }
+
+    // Concat per-index leaf values into one array value (row-major flat
+    // layout; packed arrays keep positional order, unpacked reverse it).
+    ExprNodeId concatArrayElements(std::vector<ExprNodeId> elements, bool isUnpacked,
+                                   slang::SourceLocation location)
+    {
+        if (isUnpacked)
+        {
+            std::reverse(elements.begin(), elements.end());
+        }
+        int64_t total = 0;
+        for (ExprNodeId element : elements)
+        {
+            const ExprNode& node = lowering.values[element];
+            total += node.widthHint > 0 ? node.widthHint : 1;
+        }
+        ExprNode node;
+        node.kind = ExprNodeKind::Operation;
+        node.op = wolvrix::lib::grh::OperationKind::kConcat;
+        node.operands = std::move(elements);
+        node.location = location;
+        node.widthHint = static_cast<int32_t>(std::min<int64_t>(
+            total > 0 ? total : 1, std::numeric_limits<int32_t>::max()));
+        return addNode(nullptr, std::move(node));
+    }
+
+    // Peel one fixed array level; returns the element type and the dim info.
+    std::optional<std::tuple<const slang::ast::Type*, bool, int64_t, int32_t, int32_t>>
+    peelOneArrayDim(const slang::ast::Type& type) const
+    {
+        const slang::ast::Type* current = &type;
+        while (current)
+        {
+            const slang::ast::Type& canonical = current->getCanonicalType();
+            if (canonical.kind == slang::ast::SymbolKind::TypeAlias)
+            {
+                current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+                continue;
+            }
+            if (canonical.kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType)
+            {
+                const auto& unpacked = canonical.as<slang::ast::FixedSizeUnpackedArrayType>();
+                return std::tuple{&unpacked.elementType, true,
+                                  static_cast<int64_t>(unpacked.range.fullWidth()),
+                                  unpacked.range.left, unpacked.range.right};
+            }
+            if (canonical.kind == slang::ast::SymbolKind::PackedArrayType)
+            {
+                const auto& packed = canonical.as<slang::ast::PackedArrayType>();
+                return std::tuple{&packed.elementType, false,
+                                  static_cast<int64_t>(packed.range.fullWidth()),
+                                  packed.range.left, packed.range.right};
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    // stage-04: pattern on an array-of-struct: per-index components are
+    // lowered through the struct pattern path, then each leaf's values are
+    // concatenated over the array dim (row-major flat layout).
+    bool lowerArrayOfStructPattern(const slang::ast::Type& arrayType,
+                                   const slang::ast::Expression& pattern,
+                                   std::vector<ExprNodeId>& out)
+    {
+        auto dimInfo = peelOneArrayDim(arrayType);
+        if (!dimInfo)
+        {
+            return false;
+        }
+        const auto& [elementType, isUnpacked, extent, dimLeft, dimRight] = *dimInfo;
+        if (!elementType || extent <= 0 || !isStructTyped(*elementType))
+        {
+            return false;
+        }
+        const std::size_t leafCount = countStructLeaves(*elementType);
+        if (leafCount == 0)
+        {
+            return false;
+        }
+
+        // Resolve the component expression for each positional index.
+        std::vector<const slang::ast::Expression*> components(
+            static_cast<std::size_t>(extent), nullptr);
+        auto positionalIndex = [&](int64_t svIndex) -> int64_t {
+            // Positional patterns run from the left bound toward the right.
+            if (dimLeft < dimRight)
+            {
+                return svIndex - dimLeft;
+            }
+            return dimLeft - svIndex;
+        };
+        if (const auto* simple = pattern.as_if<slang::ast::SimpleAssignmentPatternExpression>())
+        {
+            if (static_cast<int64_t>(simple->elements().size()) != extent)
+            {
+                reportUnsupported(pattern, "Array-of-struct pattern element count mismatch");
+                return false;
+            }
+            for (std::size_t i = 0; i < components.size(); ++i)
+            {
+                components[i] = simple->elements()[i];
+            }
+        }
+        else if (const auto* structured =
+                     pattern.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+        {
+            for (const auto& setter : structured->indexSetters)
+            {
+                std::optional<int64_t> indexConst;
+                if (setter.index)
+                {
+                    if (const slang::ConstantValue* cv = setter.index->getConstant();
+                        cv && cv->isInteger())
+                    {
+                        if (auto v = cv->integer().as<int64_t>())
+                        {
+                            indexConst = *v;
+                        }
+                    }
+                }
+                if (!indexConst)
+                {
+                    reportUnsupported(pattern, "Array pattern index must be constant");
+                    return false;
+                }
+                const int64_t position = positionalIndex(*indexConst);
+                if (position < 0 || position >= extent)
+                {
+                    reportUnsupported(pattern, "Array pattern index out of bounds");
+                    return false;
+                }
+                components[static_cast<std::size_t>(position)] = setter.expr;
+            }
+            if (structured->defaultSetter)
+            {
+                for (auto& component : components)
+                {
+                    if (!component)
+                    {
+                        component = structured->defaultSetter;
+                    }
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        std::vector<std::vector<ExprNodeId>> perLeaf(leafCount);
+        for (std::size_t i = 0; i < components.size(); ++i)
+        {
+            if (!components[i])
+            {
+                reportUnsupported(pattern, "Array-of-struct pattern leaves elements unassigned");
+                return false;
+            }
+            std::vector<ExprNodeId> compValues;
+            if (!lowerPatternComponent(*elementType, *components[i], compValues) ||
+                compValues.size() != leafCount)
+            {
+                return false;
+            }
+            for (std::size_t j = 0; j < leafCount; ++j)
+            {
+                perLeaf[j].push_back(compValues[j]);
+            }
+        }
+        for (std::size_t j = 0; j < leafCount; ++j)
+        {
+            out.push_back(concatArrayElements(std::move(perLeaf[j]), isUnpacked,
+                                              pattern.sourceRange.start()));
+        }
+        return true;
+    }
+
+    bool lowerPatternComponents(const slang::ast::Type& type,
+                                const slang::ast::Expression& pattern,
+                                std::vector<ExprNodeId>& out)
+    {
+        // stage-04: array-of-struct patterns route to the per-index walk
+        // (checked first — an array-of-struct has no struct scope).
+        if (!peelToStructScope(type))
+        {
+            return lowerArrayOfStructPattern(type, pattern, out);
+        }
+        if (const auto* simple = pattern.as_if<slang::ast::SimpleAssignmentPatternExpression>())
+        {
+            const slang::ast::Type* scope = peelToStructScope(type);
+            if (scope)
+            {
+                auto fields =
+                    scope->as<slang::ast::Scope>().membersOfType<slang::ast::FieldSymbol>();
+                std::vector<const slang::ast::Type*> fieldTypes;
+                for (const slang::ast::FieldSymbol& field : fields)
+                {
+                    fieldTypes.push_back(&field.getType());
+                }
+                if (simple->elements().size() != fieldTypes.size())
+                {
+                    reportUnsupported(pattern, "Positional assignment pattern field count mismatch");
+                    return false;
+                }
+                for (std::size_t i = 0; i < fieldTypes.size(); ++i)
+                {
+                    if (!lowerPatternComponent(*fieldTypes[i], *simple->elements()[i], out))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            reportUnsupported(pattern, "Positional assignment pattern on non-struct component");
+            return false;
+        }
+        if (const auto* structured =
+                pattern.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+        {
+            const slang::ast::Type* scope = peelToStructScope(type);
+            if (!scope)
+            {
+                reportUnsupported(pattern, "Structured assignment pattern on non-struct component");
+                return false;
+            }
+            for (const auto& field :
+                 scope->as<slang::ast::Scope>().membersOfType<slang::ast::FieldSymbol>())
+            {
+                const slang::ast::Expression* value = nullptr;
+                for (const auto& setter : structured->memberSetters)
+                {
+                    if (setter.member->name == field.name)
+                    {
+                        value = setter.expr;
+                        break;
+                    }
+                }
+                if (!value)
+                {
+                    for (const auto& setter : structured->typeSetters)
+                    {
+                        if (&setter.type->getCanonicalType() ==
+                            &field.getType().getCanonicalType())
+                        {
+                            value = setter.expr;
+                            break;
+                        }
+                    }
+                }
+                if (!value)
+                {
+                    value = structured->defaultSetter;
+                }
+                if (!value)
+                {
+                    reportUnsupported(pattern, "Assignment pattern field has no value");
+                    return false;
+                }
+                if (!lowerPatternComponent(field.getType(), *value, out))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        reportUnsupported(pattern, "Unsupported assignment pattern kind");
+        return false;
+    }
+
+    // Per-leaf values of a struct-typed expression (declaration order).
+    std::optional<AggregateExpr> lowerAggregateValues(const slang::ast::Expression& expr)
+    {
+        if (!expr.type || !isStructTyped(*expr.type))
+        {
+            return std::nullopt;
+        }
+        AggregateExpr out;
+        out.type = expr.type;
+        if (!splitStructType(*expr.type, "", *plan.body, diagnostics, out.leafTypes))
+        {
+            return std::nullopt;
+        }
+        if (lowerAggregateInto(expr, out))
+        {
+            return out;
+        }
+        return std::nullopt;
+    }
+
+    bool lowerAggregateInto(const slang::ast::Expression& expr, AggregateExpr& out)
+    {
+        if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
+        {
+            const PlanSymbolId root = lookupPlanSignal(plan, named->symbol);
+            const StructTypeInfo* info = findStructInfo(root);
+            if (!info)
+            {
+                return false;
+            }
+            for (const StructLeafInfo& leaf : info->fields)
+            {
+                out.values.push_back(makeSymbolExpr(leaf.symbol, expr.sourceRange.start()));
+            }
+            return true;
+        }
+        if (const auto* member = expr.as_if<slang::ast::MemberAccessExpression>())
+        {
+            auto base = lowerAggregateValues(member->value());
+            if (!base)
+            {
+                return false;
+            }
+            auto range = structMemberLeafRange(*base->type, member->member.name);
+            if (!range)
+            {
+                reportUnsupported(expr, "Unknown struct member in aggregate");
+                return false;
+            }
+            out.values.assign(base->values.begin() + static_cast<std::ptrdiff_t>(range->first),
+                              base->values.begin() + static_cast<std::ptrdiff_t>(range->second));
+            return true;
+        }
+        if (const auto* select = expr.as_if<slang::ast::ElementSelectExpression>())
+        {
+            auto base = lowerAggregateValues(select->value());
+            if (!base)
+            {
+                return false;
+            }
+            ExprNodeId index = lowerExpression(select->selector());
+            if (index == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < base->values.size(); ++i)
+            {
+                const StructSplitLeaf* leaf =
+                    i < base->leafTypes.size() ? &base->leafTypes[i] : nullptr;
+                if (!leaf)
+                {
+                    return false;
+                }
+                base->values[i] =
+                    elementSelectOnLeaf(base->values[i], *leaf, index, select->sourceRange.start());
+                if (base->values[i] == kInvalidPlanIndex)
+                {
+                    return false;
+                }
+            }
+            out.values = std::move(base->values);
+            return true;
+        }
+        if (const auto* cond = expr.as_if<slang::ast::ConditionalExpression>())
+        {
+            auto lhs = lowerAggregateValues(cond->left());
+            auto rhs = lowerAggregateValues(cond->right());
+            if (!lhs || !rhs || lhs->values.size() != rhs->values.size())
+            {
+                return false;
+            }
+            if (cond->conditions.size() != 1)
+            {
+                return false;
+            }
+            ExprNodeId guard = lowerExpression(*cond->conditions.front().expr);
+            if (guard == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < lhs->values.size(); ++i)
+            {
+                out.values.push_back(
+                    makeMux(guard, lhs->values[i], rhs->values[i], cond->sourceRange.start()));
+            }
+            return true;
+        }
+        if (const auto* conversion = expr.as_if<slang::ast::ConversionExpression>())
+        {
+            if (conversion->isImplicit())
+            {
+                return lowerAggregateInto(conversion->operand(), out);
+            }
+            // Explicit cast to another struct type with an identical leaf
+            // walk (firtool's /*cast*/ comments): treat as a layout-preserving
+            // reinterpretation when the leaf count matches.
+            if (auto operand = lowerAggregateValues(conversion->operand());
+                operand && operand->values.size() == out.leafTypes.size())
+            {
+                out.values = std::move(operand->values);
+                return true;
+            }
+            return false;
+        }
+        if (const auto* unbased = expr.as_if<slang::ast::UnbasedUnsizedIntegerLiteral>())
+        {
+            // Whole-struct '0/'1: the fill bit replicates into every leaf.
+            bool fillOnes = false;
+            bool supported = false;
+            if (!unbased->getValue().hasUnknown())
+            {
+                if (auto bit = unbased->getValue().as<uint64_t>())
+                {
+                    fillOnes = (*bit & 1) != 0;
+                    supported = true;
+                }
+            }
+            if (!supported)
+            {
+                reportUnsupported(expr, "Unsupported struct literal (only '0/'1 are supported)");
+                return false;
+            }
+            for (const StructSplitLeaf& leaf : out.leafTypes)
+            {
+                const int64_t width = aggregateLeafFlatWidth(leaf);
+                std::string literal;
+                if (fillOnes)
+                {
+                    literal = std::to_string(width) + "'b" + std::string(
+                        static_cast<std::size_t>(std::max<int64_t>(1, width)), '1');
+                }
+                else
+                {
+                    literal = std::to_string(width) + "'h0";
+                }
+                out.values.push_back(addConstantLiteral(std::move(literal),
+                                                        expr.sourceRange.start()));
+            }
+            return true;
+        }
+        if (const auto* integerLiteral = expr.as_if<slang::ast::IntegerLiteral>())
+        {
+            // Flat integer literal for the whole struct: slice each leaf out
+            // of the packed layout.
+            std::vector<int64_t> offsets = aggregateLeafOffsets(out.leafTypes);
+            int64_t total = 0;
+            for (const StructSplitLeaf& leaf : out.leafTypes)
+            {
+                total += aggregateLeafFlatWidth(leaf);
+            }
+            if (total <= 0)
+            {
+                total = 1;
+            }
+            slang::SVInt sized = integerLiteral->getValue().resize(
+                static_cast<slang::bitwidth_t>(total));
+            ExprNodeId flat =
+                addConstantLiteral(formatIntegerLiteral(sized), expr.sourceRange.start());
+            for (std::size_t i = 0; i < out.leafTypes.size(); ++i)
+            {
+                const int64_t width = aggregateLeafFlatWidth(out.leafTypes[i]);
+                ExprNodeId offset =
+                    addConstantLiteral(std::to_string(offsets[i]), expr.sourceRange.start());
+                out.values.push_back(makeSliceDynamic(
+                    flat, offset, static_cast<int32_t>(std::max<int64_t>(1, width)),
+                    expr.sourceRange.start()));
+            }
+            return true;
+        }
+        if (const auto* range = expr.as_if<slang::ast::RangeSelectExpression>())
+        {
+            // stage-04: element-range select on an array-of-struct
+            // (`arr[base +: n]` etc.): slice the selected element range out
+            // of every leaf array (per-leaf sub-array views).
+            auto dimInfo = peelOneArrayDim(*range->value().type);
+            auto base = lowerAggregateValues(range->value());
+            if (!dimInfo || !base)
+            {
+                return false;
+            }
+            const auto& [elementType, isUnpacked, extent, dimLeft, dimRight] = *dimInfo;
+            ExprNodeId left = lowerExpression(range->left());
+            ExprNodeId right = lowerExpression(range->right());
+            if (left == kInvalidPlanIndex || right == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            auto constOf = [&](ExprNodeId id) -> std::optional<int64_t> {
+                return evalConstInt(plan, lowering, id);
+            };
+            const auto selKind = range->getSelectionKind();
+            // Compute (laneBase, count) in the dim's lane space.
+            std::optional<int64_t> constLaneBase;
+            ExprNodeId laneBase = kInvalidPlanIndex;
+            int64_t count = 0;
+            if (selKind == slang::ast::RangeSelectionKind::Simple)
+            {
+                auto leftConst = constOf(left);
+                auto rightConst = constOf(right);
+                if (!leftConst || !rightConst)
+                {
+                    reportUnsupported(expr, "Struct array range bounds must be constant");
+                    return false;
+                }
+                const int64_t lo = std::min(*leftConst, *rightConst);
+                const int64_t hi = std::max(*leftConst, *rightConst);
+                const int64_t low = std::min<int32_t>(dimLeft, dimRight);
+                const int64_t high = std::max<int32_t>(dimLeft, dimRight);
+                const int64_t laneBaseConst =
+                    dimLeft > dimRight ? lo - low : high - hi;
+                constLaneBase = laneBaseConst;
+                count = hi - lo + 1;
+            }
+            else
+            {
+                auto widthConst = constOf(right);
+                if (!widthConst || *widthConst <= 0)
+                {
+                    reportUnsupported(expr, "Struct array part-select width must be constant");
+                    return false;
+                }
+                count = *widthConst;
+                const int64_t low = std::min<int32_t>(dimLeft, dimRight);
+                const int64_t high = std::max<int32_t>(dimLeft, dimRight);
+                auto baseConst = constOf(left);
+                if (selKind == slang::ast::RangeSelectionKind::IndexedUp)
+                {
+                    if (baseConst)
+                    {
+                        constLaneBase = dimLeft > dimRight ? *baseConst - low
+                                                           : high - *baseConst - count + 1;
+                    }
+                    laneBase = left;
+                }
+                else
+                {
+                    if (baseConst)
+                    {
+                        constLaneBase = dimLeft > dimRight ? *baseConst - count + 1 - low
+                                                           : high - *baseConst;
+                    }
+                    laneBase = right;
+                }
+            }
+            if (constLaneBase)
+            {
+                laneBase = addConstantLiteral(std::to_string(*constLaneBase),
+                                              range->sourceRange.start());
+            }
+            if (laneBase == kInvalidPlanIndex)
+            {
+                reportUnsupported(expr, "Struct array part-select base must be resolvable");
+                return false;
+            }
+            for (std::size_t i = 0; i < base->values.size(); ++i)
+            {
+                const StructSplitLeaf* leaf =
+                    i < base->leafTypes.size() ? &base->leafTypes[i] : nullptr;
+                if (!leaf)
+                {
+                    return false;
+                }
+                const int64_t leafElemWidth = structLeafElementWidth(*leaf, *plan.body, diagnostics);
+                int64_t subWidth = leafElemWidth;
+                for (std::size_t d = 1; d < leaf->packedDimInfos.size(); ++d)
+                {
+                    subWidth *= std::max<int32_t>(1, leaf->packedDimInfos[d].extent);
+                }
+                if (subWidth <= 0)
+                {
+                    subWidth = 1;
+                }
+                ExprNodeId bitIndex = laneBase;
+                if (subWidth > 1)
+                {
+                    ExprNodeId scale =
+                        addConstantLiteral(std::to_string(subWidth), range->sourceRange.start());
+                    bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
+                                             {laneBase, scale}, range->sourceRange.start());
+                }
+                const int64_t sliceWidth = subWidth * count;
+                out.values.push_back(makeSliceDynamic(
+                    base->values[i], bitIndex,
+                    static_cast<int32_t>(std::min<int64_t>(
+                        sliceWidth, std::numeric_limits<int32_t>::max())),
+                    range->sourceRange.start()));
+            }
+            return true;
+        }
+        if (expr.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+            expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+        {
+            return lowerPatternComponents(*expr.type, expr, out.values);
+        }
+        return false;
+    }
+
+    // Resolve a scalar (leaf) member access chain to the leaf signal with
+    // the chain's element/bit selects applied. Returns invalid when the
+    // chain does not resolve to a split leaf.
+    ExprNodeId lowerMemberAccessLeaf(const slang::ast::Expression& expr)
+    {
+        // Resolve the member path down to the leaf signal, then apply any
+        // trailing selects. Implemented over the write-path resolver with a
+        // member-path thread.
+        std::vector<WriteSlice> slices;
+        std::string xmrPath;
+        std::vector<std::string> memberPath;
+        PlanSymbolId base = resolveLValueSymbol(expr, slices, &xmrPath, &memberPath);
+        if (!base.valid() || !xmrPath.empty())
+        {
+            return kInvalidPlanIndex;
+        }
+        if (!memberPath.empty())
+        {
+            PlanSymbolId leaf = resolveStructMemberPath(base, memberPath);
+            if (!leaf.valid())
+            {
+                return kInvalidPlanIndex;
+            }
+            base = leaf;
+        }
+        if (const StructTypeInfo* info = findStructInfo(base); info && !memberPath.empty())
+        {
+            return kInvalidPlanIndex;
+        }
+        ExprNodeId value = makeSymbolExpr(base, expr.sourceRange.start());
+        if (!applyReadSlices(value, base, slices, expr.sourceRange.start()))
+        {
+            return kInvalidPlanIndex;
+        }
+        return value;
+    }
+
+    // Apply read slices (element/bit selects collected along a member chain)
+    // on top of a leaf signal reference.
+    bool applyReadSlices(ExprNodeId& value, PlanSymbolId base,
+                         const std::vector<WriteSlice>& slices,
+                         slang::SourceLocation location)
+    {
+        const SignalInfo* info = findSignalBySymbol(plan, base);
+        for (const WriteSlice& slice : slices)
+        {
+            if (slice.kind == WriteSliceKind::BitSelect && slice.index != kInvalidPlanIndex)
+            {
+                if (info && !info->unpackedDims.empty())
+                {
+                    if (isArrayStateChain(value))
+                    {
+                        value = makeSliceDynamic(value, slice.index, 1, location);
+                    }
+                    else
+                    {
+                        const UnpackedDimInfo& dim = info->unpackedDims.front();
+                        ExprNodeId normalized = slice.index;
+                        if (dim.left < dim.right)
+                        {
+                            if (dim.left != 0)
+                            {
+                                ExprNodeId offset =
+                                    addConstantLiteral(std::to_string(dim.left), location);
+                                normalized =
+                                    makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                                  {normalized, offset}, location);
+                            }
+                        }
+                        else
+                        {
+                            ExprNodeId offset =
+                                addConstantLiteral(std::to_string(dim.left), location);
+                            normalized =
+                                makeOperation(wolvrix::lib::grh::OperationKind::kSub,
+                                              {offset, normalized}, location);
+                        }
+                        value = makeSliceArray(value, normalized, 1, location);
+                    }
+                }
+                else if (info && !info->packedDimInfos.empty())
+                {
+                    ExprNodeId lane = normalizePackedLaneIndexForDim(info->packedDimInfos.front(),
+                                                                     slice.index, location);
+                    if (info->memoryRows == 0 && info->shape.empty() &&
+                        !info->packedDimInfos.empty())
+                    {
+                        // stage-04: folded-scalar leaf — plain bit slice of
+                        // the addressed sub-array (element width × remaining
+                        // packed dims).
+                        int64_t subWidth = static_cast<int64_t>(
+                            std::max<int32_t>(1, info->elementWidth));
+                        for (std::size_t d = 1; d < info->packedDimInfos.size(); ++d)
+                        {
+                            subWidth *= std::max<int32_t>(1, info->packedDimInfos[d].extent);
+                        }
+                        ExprNodeId bitIndex = lane;
+                        if (subWidth > 1)
+                        {
+                            ExprNodeId scale =
+                                addConstantLiteral(std::to_string(subWidth), location);
+                            bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
+                                                     {lane, scale}, location);
+                        }
+                        value = makeSliceDynamic(value, bitIndex,
+                                                 static_cast<int32_t>(subWidth), location);
+                    }
+                    else
+                    {
+                        value = makeSliceArray(value, lane, 1, location);
+                    }
+                }
+                else
+                {
+                    value = makeSliceDynamic(value, slice.index, 1, location);
+                }
+                // Track the consumed leading dim for subsequent selects.
+                if (info && !info->unpackedDims.empty())
+                {
+                    SignalInfo shrunk = *info;
+                    shrunk.unpackedDims.erase(shrunk.unpackedDims.begin());
+                    static std::deque<SignalInfo> shrunkPool;
+                    shrunkPool.push_back(std::move(shrunk));
+                    info = &shrunkPool.back();
+                }
+                else if (info && !info->packedDimInfos.empty())
+                {
+                    SignalInfo shrunk = *info;
+                    shrunk.packedDimInfos.erase(shrunk.packedDimInfos.begin());
+                    static std::deque<SignalInfo> shrunkPool;
+                    shrunkPool.push_back(std::move(shrunk));
+                    info = &shrunkPool.back();
+                }
+            }
+            else
+            {
+                reportUnsupportedLocation(location, "Unsupported slice kind on member chain read");
+                return false;
+            }
+            if (value == kInvalidPlanIndex)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Resolve a member path against a struct root's split leaves.
+    PlanSymbolId resolveStructMemberPath(PlanSymbolId root,
+                                         const std::vector<std::string>& memberPath) const
+    {
+        const StructTypeInfo* info = findStructInfo(root);
+        if (!info || memberPath.empty())
+        {
+            return {};
+        }
+        std::string target;
+        for (const std::string& component : memberPath)
+        {
+            target.append("__DOT__");
+            target.append(component);
+        }
+        for (const StructLeafInfo& leaf : info->fields)
+        {
+            if (leaf.fieldPath == target)
+            {
+                return leaf.symbol;
+            }
+        }
+        return {};
+    }
+
+    // Does a member path resolve to a nested struct position (i.e. further
+    // member access may follow)?
+    bool isStructPositionPath(PlanSymbolId root, const std::vector<std::string>& memberPath) const
+    {
+        const StructTypeInfo* info = findStructInfo(root);
+        if (!info)
+        {
+            return false;
+        }
+        std::string target;
+        for (const std::string& component : memberPath)
+        {
+            target.append("__DOT__");
+            target.append(component);
+        }
+        for (const StructLeafInfo& leaf : info->fields)
+        {
+            if (leaf.fieldPath.size() > target.size() &&
+                leaf.fieldPath.compare(0, target.size(), target) == 0 &&
+                leaf.fieldPath.compare(target.size(), 7, "__DOT__") == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ================= end stage-04 struct aggregate support =================
+
     ExprNodeId lowerExpression(const slang::ast::Expression& expr)
     {
         const bool usesLoopLocal = exprUsesLoopLocal(expr);
@@ -7483,6 +9363,49 @@ private:
             {
                 return it->second;
             }
+        }
+
+        // stage-04: assignment patterns on fixed arrays concatenate
+        // per-element values row-major (struct patterns take the aggregate
+        // path below).
+        if ((expr.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+             expr.as_if<slang::ast::StructuredAssignmentPatternExpression>()) &&
+            expr.type && !isStructTyped(*expr.type))
+        {
+            ExprNodeId arrayValue =
+                lowerArrayPatternValue(*expr.type, expr, expr.sourceRange.start());
+            if (arrayValue != kInvalidPlanIndex)
+            {
+                return arrayValue;
+            }
+            reportUnsupported(expr, "Unsupported array assignment pattern");
+            return kInvalidPlanIndex;
+        }
+        // stage-04: struct-typed expressions lower to per-leaf aggregates
+        // and flatten to the packed layout at this boundary. Scalar member
+        // accesses resolve through the split leaf signals.
+        if (expr.type && isStructTyped(*expr.type))
+        {
+            if (auto aggregate = lowerAggregateValues(expr))
+            {
+                ExprNodeId flat = flattenAggregateValues(*aggregate, expr.sourceRange.start());
+                if (flat != kInvalidPlanIndex)
+                {
+                    return flat;
+                }
+            }
+            reportUnsupported(expr, "Unsupported struct expression");
+            return kInvalidPlanIndex;
+        }
+        if (const auto* memberAccess = expr.as_if<slang::ast::MemberAccessExpression>())
+        {
+            ExprNodeId leaf = lowerMemberAccessLeaf(*memberAccess);
+            if (leaf != kInvalidPlanIndex)
+            {
+                return leaf;
+            }
+            reportUnsupported(expr, "Unsupported member access expression");
+            return kInvalidPlanIndex;
         }
 
         auto adjustPackedIndex =
@@ -8997,7 +10920,15 @@ private:
 
         LValueTarget target;
         std::string xmrPath;
-        target.target = resolveLValueSymbol(expr, target.slices, &xmrPath);
+        std::vector<std::string> memberPath;
+        target.target = resolveLValueSymbol(expr, target.slices, &xmrPath, &memberPath);
+        if (!memberPath.empty())
+        {
+            // stage-04: the chain ended on a split struct member — resolve to
+            // the leaf signal (whole-struct lvalues take the struct
+            // assignment path instead).
+            target.target = resolveStructMemberPath(target.target, memberPath);
+        }
         if (!xmrPath.empty())
         {
             target.isXmr = true;
@@ -9020,7 +10951,8 @@ private:
 
     PlanSymbolId resolveLValueSymbol(const slang::ast::Expression& expr,
                                      std::vector<WriteSlice>& slices,
-                                     std::string* xmrPath)
+                                     std::string* xmrPath,
+                                     std::vector<std::string>* memberPath = nullptr)
     {
         if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
         {
@@ -9045,13 +10977,13 @@ private:
         {
             if (conversion->isImplicit())
             {
-                return resolveLValueSymbol(conversion->operand(), slices, xmrPath);
+                return resolveLValueSymbol(conversion->operand(), slices, xmrPath, memberPath);
             }
             return {};
         }
         if (const auto* member = expr.as_if<slang::ast::MemberAccessExpression>())
         {
-            PlanSymbolId base = resolveLValueSymbol(member->value(), slices, xmrPath);
+            PlanSymbolId base = resolveLValueSymbol(member->value(), slices, xmrPath, memberPath);
             if (!base.valid())
             {
                 return {};
@@ -9059,6 +10991,17 @@ private:
             if (member->member.name.empty())
             {
                 return {};
+            }
+            // stage-04: on a struct-split root, accumulate the member path;
+            // the caller resolves it to the leaf signal at the end. When no
+            // member-path thread is active (or the position is already a
+            // leaf), fall back to the legacy MemberSelect slice.
+            if (memberPath &&
+                (memberPath->empty() ? findStructInfo(base) != nullptr
+                                     : isStructPositionPath(base, *memberPath)))
+            {
+                memberPath->push_back(std::string(member->member.name));
+                return base;
             }
             WriteSlice slice;
             slice.kind = WriteSliceKind::MemberSelect;
@@ -9088,10 +11031,27 @@ private:
                     return lookupPlanSignal(plan, chain->baseExpr->symbol);
                 }
             }
-            PlanSymbolId base = resolveLValueSymbol(select->value(), slices, xmrPath);
+            PlanSymbolId base = resolveLValueSymbol(select->value(), slices, xmrPath, memberPath);
             if (!base.valid())
             {
                 return {};
+            }
+            // stage-04: an element select after a member chain applies to
+            // the leaf signal when the path is already at a leaf; nested
+            // struct positions keep accumulating (the select indexes the
+            // shared array dim of every leaf below).
+            if (memberPath && !memberPath->empty())
+            {
+                PlanSymbolId leaf = resolveStructMemberPath(base, *memberPath);
+                if (leaf.valid())
+                {
+                    base = leaf;
+                    memberPath->clear();
+                }
+                else if (!isStructPositionPath(base, *memberPath))
+                {
+                    return {};
+                }
             }
             ExprNodeId index = kInvalidPlanIndex;
             {
@@ -9111,10 +11071,23 @@ private:
         }
         if (const auto* range = expr.as_if<slang::ast::RangeSelectExpression>())
         {
-            PlanSymbolId base = resolveLValueSymbol(range->value(), slices, xmrPath);
+            PlanSymbolId base = resolveLValueSymbol(range->value(), slices, xmrPath, memberPath);
             if (!base.valid())
             {
                 return {};
+            }
+            // stage-04: a range select after a member chain applies to the
+            // leaf signal; on a nested struct position it would be a slice
+            // of the flattened view, which is unsupported for now.
+            if (memberPath && !memberPath->empty())
+            {
+                PlanSymbolId leaf = resolveStructMemberPath(base, *memberPath);
+                if (!leaf.valid())
+                {
+                    return {};
+                }
+                base = leaf;
+                memberPath->clear();
             }
             ExprNodeId left = kInvalidPlanIndex;
             ExprNodeId right = kInvalidPlanIndex;
@@ -9137,6 +11110,14 @@ private:
             return base;
         }
         return {};
+    }
+
+    void reportUnsupportedLocation(slang::SourceLocation location, std::string_view message)
+    {
+        if (diagnostics)
+        {
+            diagnostics->error(location, std::string(message));
+        }
     }
 
     void reportUnsupported(const slang::ast::Expression& expr, std::string_view message)
@@ -10035,6 +12016,8 @@ PlanSymbolId makeInoutAuxSymbol(ModulePlan& plan)
     return makeInternalPlanValueSymbol(plan);
 }
 
+std::size_t rootNameSize(std::string_view name) { return name.size(); }
+
 void collectPorts(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan,
                   ConvertDiagnostics* diagnostics)
 {
@@ -10085,6 +12068,54 @@ void collectPorts(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan,
                     makeInoutAuxSymbol(plan),
                     makeInoutAuxSymbol(plan),
                     makeInoutAuxSymbol(plan)};
+            }
+
+            // stage-04: struct ports split field-wise into leaf ports.
+            {
+                std::vector<StructSplitLeaf> leaves;
+                if (splitStructType(port->getType(), port->name, *port, diagnostics, leaves))
+                {
+                    if (info.direction == PortDirection::Inout)
+                    {
+                        reportUnsupportedPort(*port,
+                                              "struct inout ports are not supported", diagnostics);
+                        continue;
+                    }
+                    StructTypeInfo structInfo;
+                    structInfo.symbol = info.symbol;
+                    structInfo.type = &port->getType();
+                    for (const StructSplitLeaf& leaf : leaves)
+                    {
+                        TypeResolution leafType = analyzeStructLeafType(leaf, *port, diagnostics);
+                        PortInfo leafPort;
+                        leafPort.symbol = plan.symbolTable.intern(leaf.fullName);
+                        leafPort.direction = info.direction;
+                        int64_t total = leafType.width;
+                        for (const int64_t dim : leafType.shape)
+                        {
+                            total *= dim > 0 ? dim : 1;
+                        }
+                        const int64_t maxWidth =
+                            static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+                        leafPort.width =
+                            static_cast<int32_t>(std::min<int64_t>(total, maxWidth));
+                        leafPort.isSigned = leafType.isSigned;
+                        leafPort.valueType = leafType.valueType;
+                        leafPort.shape = std::move(leafType.shape);
+                        leafPort.packedDims = std::move(leafType.packedDims);
+                        leafPort.unpackedDims = std::move(leafType.unpackedDims);
+                        StructLeafInfo leafInfo;
+                        leafInfo.fieldPath = leaf.fullName.substr(rootNameSize(port->name));
+                        leafInfo.symbol = leafPort.symbol;
+                        leafInfo.type = leaf.type;
+                        leafInfo.flatWidth = leafPort.width;
+                        structInfo.totalWidth += leafInfo.flatWidth;
+                        structInfo.fields.push_back(std::move(leafInfo));
+                        plan.ports.push_back(std::move(leafPort));
+                    }
+                    plan.structsBySymbol.emplace(info.symbol.index, std::move(structInfo));
+                    continue;
+                }
             }
 
             TypeResolution typeInfo = analyzePortType(port->getType(), *port, diagnostics);
@@ -10220,6 +12251,76 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
         return id;
     };
 
+    // stage-04: field-wise split a struct-typed declaration into leaf
+    // signals; returns true when the type contains a struct (handled).
+    auto splitStructDecl = [&](const slang::ast::ValueSymbol& symbol, SignalKind kind,
+                               const GenerateScopePath& scope) -> bool {
+        std::string rootName(symbol.name);
+        if (!scope.symbolPrefix.empty())
+        {
+            rootName = appendScope(scope.symbolPrefix, symbol.name);
+        }
+        std::vector<StructSplitLeaf> leaves;
+        if (!splitStructType(symbol.getType(), rootName, symbol, diagnostics, leaves))
+        {
+            return false;
+        }
+        const PlanSymbolId rootId = internSignal(symbol, scope);
+        StructTypeInfo structInfo;
+        structInfo.symbol = rootId;
+        structInfo.type = &symbol.getType();
+        for (const StructSplitLeaf& leaf : leaves)
+        {
+            int32_t leafElementWidth = 0;
+            TypeResolution typeInfo = analyzeStructLeafType(leaf, symbol, diagnostics);
+            // stage-04: unlike plain packed arrays, struct leaves always
+            // become array state when they have any array view (even with
+            // 1-bit elements): leaf element accesses are member-chain
+            // accesses that want the array view, and there is no legacy
+            // flattened-struct behavior to stay compatible with.
+            if (typeInfo.unpackedDims.empty() && !typeInfo.shape.empty() &&
+                typeInfo.shape.front() > 1)
+            {
+                typeInfo.memoryRows = typeInfo.shape.front();
+            }
+            else if (typeInfo.memoryRows == 0 && !typeInfo.shape.empty())
+            {
+                leafElementWidth = typeInfo.width;
+                int64_t total = typeInfo.width;
+                for (const int64_t dim : typeInfo.shape)
+                {
+                    total *= dim > 0 ? dim : 1;
+                }
+                const int64_t maxWidth =
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+                typeInfo.width = static_cast<int32_t>(std::min<int64_t>(total, maxWidth));
+                typeInfo.shape.clear();
+            }
+            SignalInfo info;
+            info.symbol = plan.symbolTable.intern(leaf.fullName);
+            info.kind = kind;
+            info.width = typeInfo.width;
+            info.isSigned = typeInfo.isSigned;
+            info.valueType = typeInfo.valueType;
+            info.memoryRows = typeInfo.memoryRows;
+            info.shape = std::move(typeInfo.shape);
+            info.elementWidth = leafElementWidth;
+            info.packedDims = std::move(typeInfo.packedDims);
+            info.unpackedDims = std::move(typeInfo.unpackedDims);
+            info.packedDimInfos = std::move(typeInfo.packedDimInfos);
+            StructLeafInfo leafInfo;
+            leafInfo.fieldPath = leaf.fullName.substr(rootName.size());
+            leafInfo.symbol = info.symbol;
+            leafInfo.type = leaf.type;
+            leafInfo.flatWidth = signalTotalWidth(info);
+            structInfo.totalWidth += leafInfo.flatWidth;
+            structInfo.fields.push_back(std::move(leafInfo));
+            plan.signals.push_back(std::move(info));
+        }
+        plan.structsBySymbol.emplace(rootId.index, std::move(structInfo));
+        return true;
+    };
+
     std::function<void(const slang::ast::NetSymbol&, const GenerateScopePath&)> collectNet =
         [&](const slang::ast::NetSymbol& net, const GenerateScopePath& scope)
     {
@@ -10229,6 +12330,10 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
             {
                 diagnostics->warn(net, "Skipping anonymous net symbol");
             }
+            return;
+        }
+        if (splitStructDecl(net, SignalKind::Net, scope))
+        {
             return;
         }
         SignalInfo info;
@@ -10266,6 +12371,10 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
             }
             return;
         }
+        if (splitStructDecl(variable, SignalKind::Variable, scope))
+        {
+            return;
+        }
         SignalInfo info;
         info.symbol = internSignal(variable, scope);
         info.kind = SignalKind::Variable;
@@ -10282,7 +12391,9 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
         else if (typeInfo.memoryRows == 0 && !typeInfo.shape.empty())
         {
             // Scalar-classified signal: fold the array view back into a flat
-            // vector (width = total bits, no shape).
+            // vector (width = total bits, no shape; the element width is
+            // preserved for element selects).
+            info.elementWidth = typeInfo.width;
             int64_t total = typeInfo.width;
             for (const int64_t dim : typeInfo.shape)
             {
@@ -18227,6 +20338,30 @@ private:
         }
     }
 
+    // stage-04: LSB-based flat offsets of split leaves (packed layout:
+    // first field at the MSB side).
+    static std::vector<int64_t> structLeafOffsets(const std::vector<StructSplitLeaf>& leaves,
+                                                  const slang::ast::Symbol& origin)
+    {
+        std::vector<int64_t> widths;
+        widths.reserve(leaves.size());
+        int64_t total = 0;
+        for (const StructSplitLeaf& leaf : leaves)
+        {
+            const int64_t width = structLeafFlatWidth(leaf, origin);
+            widths.push_back(width);
+            total += width;
+        }
+        std::vector<int64_t> offsets(widths.size(), 0);
+        int64_t acc = total;
+        for (std::size_t i = 0; i < widths.size(); ++i)
+        {
+            acc -= widths[i];
+            offsets[i] = acc;
+        }
+        return offsets;
+    }
+
     void emitInstances()
     {
         struct OutputBinding {
@@ -18592,6 +20727,136 @@ private:
             return false;
         };
 
+        // stage-04: decompose a struct-typed output connection target into
+        // per-leaf bindings (whole struct nets, member chains, constant
+        // element selects). Indices correspond to the port's leaf order.
+        struct StructOutBinding {
+            PlanSymbolId target;
+            int64_t low = 0;
+            int64_t width = 0;
+        };
+        std::function<bool(const slang::ast::Expression&, std::vector<StructOutBinding>&)>
+            resolveStructOutBindings =
+                [&](const slang::ast::Expression& expr,
+                    std::vector<StructOutBinding>& out) -> bool {
+            // slang wraps port connections in implicit assignments; the
+            // output target is the assignment's left-hand side.
+            if (const auto* assign = expr.as_if<slang::ast::AssignmentExpression>())
+            {
+                return resolveStructOutBindings(assign->left(), out);
+            }
+            if (const auto* conversion = expr.as_if<slang::ast::ConversionExpression>())
+            {
+                if (conversion->isImplicit())
+                {
+                    return resolveStructOutBindings(conversion->operand(), out);
+                }
+                return false;
+            }
+            if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
+            {
+                const PlanSymbolId root = lookupPlanSignal(plan_, named->symbol);
+                auto it = plan_.structsBySymbol.find(root.index);
+                if (it == plan_.structsBySymbol.end())
+                {
+                    return false;
+                }
+                for (const StructLeafInfo& leaf : it->second.fields)
+                {
+                    const SignalInfo* info = findSignalBySymbol(plan_, leaf.symbol);
+                    const int64_t width = info ? signalTotalWidth(*info) : leaf.flatWidth;
+                    out.push_back(StructOutBinding{leaf.symbol, 0, width});
+                }
+                return true;
+            }
+            if (const auto* member = expr.as_if<slang::ast::MemberAccessExpression>())
+            {
+                std::vector<std::string> memberPath;
+                const slang::ast::Expression* current = &expr;
+                const slang::ast::NamedValueExpression* rootNamed = nullptr;
+                while (const auto* access = current->as_if<slang::ast::MemberAccessExpression>())
+                {
+                    memberPath.insert(memberPath.begin(), std::string(access->member.name));
+                    current = &access->value();
+                }
+                if (const auto* conv = current->as_if<slang::ast::ConversionExpression>();
+                    conv && conv->isImplicit())
+                {
+                    current = &conv->operand();
+                }
+                rootNamed = current->as_if<slang::ast::NamedValueExpression>();
+                if (!rootNamed || memberPath.empty())
+                {
+                    return false;
+                }
+                const PlanSymbolId root = lookupPlanSignal(plan_, rootNamed->symbol);
+                auto it = plan_.structsBySymbol.find(root.index);
+                if (it == plan_.structsBySymbol.end())
+                {
+                    return false;
+                }
+                std::string prefix;
+                for (const std::string& component : memberPath)
+                {
+                    prefix.append("__DOT__");
+                    prefix.append(component);
+                }
+                bool any = false;
+                for (const StructLeafInfo& leaf : it->second.fields)
+                {
+                    if (leaf.fieldPath.size() > prefix.size() &&
+                        leaf.fieldPath.compare(0, prefix.size(), prefix) == 0 &&
+                        leaf.fieldPath.compare(prefix.size(), 7, "__DOT__") == 0)
+                    {
+                        const SignalInfo* info = findSignalBySymbol(plan_, leaf.symbol);
+                        const int64_t width = info ? signalTotalWidth(*info) : leaf.flatWidth;
+                        out.push_back(StructOutBinding{leaf.symbol, 0, width});
+                        any = true;
+                    }
+                }
+                return any;
+            }
+            if (const auto* select = expr.as_if<slang::ast::ElementSelectExpression>())
+            {
+                const slang::ConstantValue* cv = select->selector().getConstant();
+                std::optional<int64_t> indexConst;
+                if (cv && cv->isInteger())
+                {
+                    if (auto v = cv->integer().as<int64_t>())
+                    {
+                        indexConst = *v;
+                    }
+                }
+                if (!indexConst || *indexConst < 0)
+                {
+                    return false;
+                }
+                std::vector<StructOutBinding> base;
+                if (!resolveStructOutBindings(select->value(), base))
+                {
+                    return false;
+                }
+                for (StructOutBinding& binding : base)
+                {
+                    const SignalInfo* info = findSignalBySymbol(plan_, binding.target);
+                    int64_t subWidth = binding.width;
+                    if (info && !info->shape.empty())
+                    {
+                        subWidth = info->width > 0 ? info->width : 1;
+                        for (std::size_t d = 1; d < info->shape.size(); ++d)
+                        {
+                            subWidth *= info->shape[d] > 0 ? info->shape[d] : 1;
+                        }
+                    }
+                    binding.low += *indexConst * subWidth;
+                    binding.width = subWidth;
+                    out.push_back(binding);
+                }
+                return true;
+            }
+            return false;
+        };
+
         for (const auto& instanceInfo : plan_.instances)
         {
             if (!instanceInfo.instance)
@@ -18682,6 +20947,91 @@ private:
                     const int64_t portWidth =
                         static_cast<int64_t>(port->getType().getBitstreamWidth());
                     const bool portSigned = port->getType().isSigned();
+                    // stage-04: struct input ports connect per split leaf;
+                    // the connection flattens to the packed layout and each
+                    // leaf port receives its static slice.
+                    if (isStructTyped(port->getType()))
+                    {
+                        std::vector<StructSplitLeaf> leaves;
+                        if (!splitStructType(port->getType(), port->name, *port,
+                                             context_.diagnostics, leaves))
+                        {
+                            context_.diagnostics->error(
+                                port->location,
+                                "Skipping instance with unsupported struct input port");
+                            ok = false;
+                            break;
+                        }
+                        if (!expr || expr->bad())
+                        {
+                            if (context_.diagnostics)
+                            {
+                                context_.diagnostics->warn(
+                                    port->location,
+                                    "Leaving unconnected struct input port on instance");
+                            }
+                            for (const StructSplitLeaf& leaf : leaves)
+                            {
+                                inputNames.emplace_back(leaf.fullName);
+                                inputOperands.push_back(
+                                    makeUnconnectedInput(structLeafFlatWidth(leaf, *port),
+                                                         portSigned, portValueType,
+                                                         port->location));
+                            }
+                            break;
+                        }
+                        ExprNodeId flatId = connectionLowerer_.lowerExpression(*expr);
+                        if (flatId == kInvalidPlanIndex)
+                        {
+                            ok = false;
+                            break;
+                        }
+                        ensureConnectionMemoryRead(flatId, expr->sourceRange.start());
+                        wolvrix::lib::grh::ValueId flat = emitExpr(flatId);
+                        if (!flat.valid())
+                        {
+                            ok = false;
+                            break;
+                        }
+                        int64_t total = 0;
+                        for (const StructSplitLeaf& leaf : leaves)
+                        {
+                            total += structLeafFlatWidth(leaf, *port);
+                        }
+                        if (graph_.getValue(flat).width() != total)
+                        {
+                            flat = resizeValueToWidth(
+                                flat,
+                                static_cast<int32_t>(std::min<int64_t>(
+                                    total > 0 ? total : 1,
+                                    std::numeric_limits<int32_t>::max())),
+                                false, expr->sourceRange.start());
+                            if (!flat.valid())
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        const std::vector<int64_t> offsets = structLeafOffsets(leaves, *port);
+                        for (std::size_t i = 0; i < leaves.size(); ++i)
+                        {
+                            const int64_t width = structLeafFlatWidth(leaves[i], *port);
+                            const int64_t low = offsets[i];
+                            const int64_t high = low + width - 1;
+                            wolvrix::lib::grh::ValueId slice =
+                                low == 0 && high == graph_.getValue(flat).width() - 1
+                                    ? flat
+                                    : makeSliceStatic(flat, low, high, expr->sourceRange.start());
+                            if (!slice.valid())
+                            {
+                                ok = false;
+                                break;
+                            }
+                            inputNames.emplace_back(leaves[i].fullName);
+                            inputOperands.push_back(slice);
+                        }
+                        break;
+                    }
                     if (!expr)
                     {
                         if (context_.diagnostics)
@@ -18721,6 +21071,69 @@ private:
                     const int64_t portWidth =
                         static_cast<int64_t>(port->getType().getBitstreamWidth());
                     const bool portSigned = port->getType().isSigned();
+                    // stage-04: struct output ports produce one result per
+                    // split leaf, bound to the matching parent leaf target.
+                    if (isStructTyped(port->getType()))
+                    {
+                        std::vector<StructSplitLeaf> leaves;
+                        if (!splitStructType(port->getType(), port->name, *port,
+                                             context_.diagnostics, leaves))
+                        {
+                            context_.diagnostics->error(
+                                port->location,
+                                "Skipping instance with unsupported struct output port");
+                            ok = false;
+                            break;
+                        }
+                        if (!expr || expr->bad())
+                        {
+                            if (context_.diagnostics)
+                            {
+                                context_.diagnostics->warn(
+                                    port->location,
+                                    "Skipping unconnected struct output port on instance");
+                            }
+                            for (const StructSplitLeaf& leaf : leaves)
+                            {
+                                outputNames.emplace_back(leaf.fullName);
+                                const int64_t width =
+                                    std::max<int64_t>(1, structLeafFlatWidth(leaf, *port));
+                                wolvrix::lib::grh::SymbolId tempSym =
+                                    makeInternalValueSymbol();
+                                outputResults.push_back(graph_.createValue(
+                                    tempSym, width, portSigned, portValueType));
+                            }
+                            break;
+                        }
+                        std::vector<StructOutBinding> bindings;
+                        if (!resolveStructOutBindings(*expr, bindings) ||
+                            bindings.size() != leaves.size())
+                        {
+                            context_.diagnostics->error(
+                                port->location,
+                                "Skipping instance with unsupported struct output connection");
+                            ok = false;
+                            break;
+                        }
+                        for (std::size_t i = 0; i < leaves.size(); ++i)
+                        {
+                            const StructSplitLeaf& leaf = leaves[i];
+                            const StructOutBinding& binding = bindings[i];
+                            const int64_t width =
+                                std::max<int64_t>(1, structLeafFlatWidth(leaf, *port));
+                            outputNames.emplace_back(leaf.fullName);
+                            wolvrix::lib::grh::SymbolId tempSym =
+                                makeInternalValueSymbol();
+                            wolvrix::lib::grh::ValueId tempValue =
+                                graph_.createValue(tempSym, width, portSigned, portValueType);
+                            outputResults.push_back(tempValue);
+                            instanceSliceWrites_[binding.target.index].push_back(
+                                InstanceSliceWrite{binding.target, binding.low, binding.width,
+                                                   tempValue, expr->sourceRange.start(),
+                                                   /*explicitSlice=*/binding.low != 0});
+                        }
+                        break;
+                    }
                     if (!expr || expr->bad())
                     {
                         if (context_.diagnostics)
@@ -18979,6 +21392,134 @@ private:
         }
     }
 
+    wolvrix::lib::grh::ValueId makeSliceStatic(wolvrix::lib::grh::ValueId base,
+                                               int64_t low, int64_t high,
+                                               slang::SourceLocation location)
+    {
+        const int64_t width = high - low + 1;
+        if (width <= 0)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        wolvrix::lib::grh::OperationId op =
+            createOp(wolvrix::lib::grh::OperationKind::kSliceStatic,
+                     wolvrix::lib::grh::SymbolId::invalid(),
+                     location);
+        graph_.addOperand(op, base);
+        graph_.setAttr(op, "sliceStart", low);
+        graph_.setAttr(op, "sliceEnd", high);
+        wolvrix::lib::grh::SymbolId sym =
+            makeInternalValueSymbol();
+        const wolvrix::lib::grh::ValueType baseType = graph_.getValue(base).type();
+        wolvrix::lib::grh::ValueId result =
+            graph_.createValue(sym, width, false, baseType);
+        graph_.addResult(op, result);
+        return result;
+    }
+
+    wolvrix::lib::grh::ValueId makeZero(int64_t width, slang::SourceLocation location)
+    {
+        if (width <= 0)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        wolvrix::lib::grh::SymbolId sym =
+            makeInternalValueSymbol();
+        wolvrix::lib::grh::ValueId result =
+            graph_.createValue(sym, static_cast<int32_t>(width), false,
+                               wolvrix::lib::grh::ValueType::Logic);
+        wolvrix::lib::grh::OperationId op =
+            createOp(wolvrix::lib::grh::OperationKind::kConstant,
+                     wolvrix::lib::grh::SymbolId::invalid(),
+                     location);
+        graph_.addResult(op, result);
+        graph_.setAttr(op, "constValue",
+                       std::to_string(width) + "'b0");
+        return result;
+    }
+
+    wolvrix::lib::grh::ValueId makeReplicate(wolvrix::lib::grh::ValueId value,
+                                             int64_t count,
+                                             slang::SourceLocation location)
+    {
+        if (!value.valid() || count <= 0)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        const int64_t valueWidth = graph_.getValue(value).width();
+        if (valueWidth <= 0)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        const int64_t width = valueWidth * count;
+        wolvrix::lib::grh::OperationId op =
+            createOp(wolvrix::lib::grh::OperationKind::kReplicate,
+                     wolvrix::lib::grh::SymbolId::invalid(),
+                     location);
+        graph_.addOperand(op, value);
+        graph_.setAttr(op, "rep", count);
+        wolvrix::lib::grh::SymbolId sym =
+            makeInternalValueSymbol();
+        wolvrix::lib::grh::ValueId result =
+            graph_.createValue(sym, static_cast<int32_t>(width), false,
+                               graph_.getValue(value).type());
+        graph_.addResult(op, result);
+        return result;
+    }
+
+    wolvrix::lib::grh::ValueId resizeValueToWidth(wolvrix::lib::grh::ValueId value,
+                                                  int64_t targetWidth,
+                                                  bool signExtend,
+                                                  slang::SourceLocation location)
+    {
+        if (!value.valid() || targetWidth <= 0)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        const int64_t sourceWidth = graph_.getValue(value).width();
+        if (sourceWidth <= 0 || sourceWidth == targetWidth)
+        {
+            return value;
+        }
+        if (targetWidth < sourceWidth)
+        {
+            return makeSliceStatic(value, 0, targetWidth - 1, location);
+        }
+        const int64_t padWidth = targetWidth - sourceWidth;
+        if (padWidth <= 0)
+        {
+            return value;
+        }
+        wolvrix::lib::grh::ValueId padValue = wolvrix::lib::grh::ValueId::invalid();
+        if (signExtend && sourceWidth > 0)
+        {
+            wolvrix::lib::grh::ValueId signBit =
+                makeSliceStatic(value, sourceWidth - 1, sourceWidth - 1, location);
+            padValue = makeReplicate(signBit, padWidth, location);
+        }
+        else
+        {
+            padValue = makeZero(padWidth, location);
+        }
+        if (!padValue.valid())
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        wolvrix::lib::grh::OperationId op =
+            createOp(wolvrix::lib::grh::OperationKind::kConcat,
+                     wolvrix::lib::grh::SymbolId::invalid(),
+                     location);
+        graph_.addOperand(op, padValue);
+        graph_.addOperand(op, value);
+        wolvrix::lib::grh::SymbolId sym =
+            makeInternalValueSymbol();
+        wolvrix::lib::grh::ValueId result =
+            graph_.createValue(sym, static_cast<int32_t>(targetWidth),
+                               signExtend, graph_.getValue(value).type());
+        graph_.addResult(op, result);
+        return result;
+    }
+
     void emitInstanceSliceWrites()
     {
         if (instanceSliceWrites_.empty() && instanceXmrWrites_.empty())
@@ -18986,130 +21527,6 @@ private:
             return;
         }
 
-        auto makeSliceStatic = [&](wolvrix::lib::grh::ValueId base,
-                                   int64_t low,
-                                   int64_t high,
-                                   slang::SourceLocation location) -> wolvrix::lib::grh::ValueId {
-            const int64_t width = high - low + 1;
-            if (width <= 0)
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-            wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kSliceStatic,
-                         wolvrix::lib::grh::SymbolId::invalid(),
-                         location);
-            graph_.addOperand(op, base);
-            graph_.setAttr(op, "sliceStart", low);
-            graph_.setAttr(op, "sliceEnd", high);
-            wolvrix::lib::grh::SymbolId sym =
-                makeInternalValueSymbol();
-            const wolvrix::lib::grh::ValueType baseType = graph_.getValue(base).type();
-            wolvrix::lib::grh::ValueId result =
-                graph_.createValue(sym, width, false, baseType);
-            graph_.addResult(op, result);
-            return result;
-        };
-        auto makeZero = [&](int64_t width,
-                            slang::SourceLocation location) -> wolvrix::lib::grh::ValueId {
-            if (width <= 0)
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-            wolvrix::lib::grh::SymbolId sym =
-                makeInternalValueSymbol();
-            wolvrix::lib::grh::ValueId result =
-                graph_.createValue(sym, static_cast<int32_t>(width), false,
-                                   wolvrix::lib::grh::ValueType::Logic);
-            wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kConstant,
-                         wolvrix::lib::grh::SymbolId::invalid(),
-                         location);
-            graph_.addResult(op, result);
-            graph_.setAttr(op, "constValue",
-                           std::to_string(width) + "'b0");
-            return result;
-        };
-        auto makeReplicate = [&](wolvrix::lib::grh::ValueId value,
-                                 int64_t count,
-                                 slang::SourceLocation location) -> wolvrix::lib::grh::ValueId {
-            if (!value.valid() || count <= 0)
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-            const int64_t valueWidth = graph_.getValue(value).width();
-            if (valueWidth <= 0)
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-            const int64_t width = valueWidth * count;
-            wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kReplicate,
-                         wolvrix::lib::grh::SymbolId::invalid(),
-                         location);
-            graph_.addOperand(op, value);
-            graph_.setAttr(op, "rep", count);
-            wolvrix::lib::grh::SymbolId sym =
-                makeInternalValueSymbol();
-            wolvrix::lib::grh::ValueId result =
-                graph_.createValue(sym, static_cast<int32_t>(width),
-                                   graph_.getValue(value).isSigned(),
-                                   graph_.getValue(value).type());
-            graph_.addResult(op, result);
-            return result;
-        };
-        auto resizeValueToWidth = [&](wolvrix::lib::grh::ValueId value,
-                                      int64_t targetWidth,
-                                      bool signExtend,
-                                      slang::SourceLocation location)
-            -> wolvrix::lib::grh::ValueId {
-            if (!value.valid() || targetWidth <= 0)
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-            const int64_t sourceWidth = graph_.getValue(value).width();
-            if (sourceWidth <= 0 || sourceWidth == targetWidth)
-            {
-                return value;
-            }
-            if (targetWidth < sourceWidth)
-            {
-                return makeSliceStatic(value, 0, targetWidth - 1, location);
-            }
-            const int64_t padWidth = targetWidth - sourceWidth;
-            if (padWidth <= 0)
-            {
-                return value;
-            }
-            wolvrix::lib::grh::ValueId padValue = wolvrix::lib::grh::ValueId::invalid();
-            if (signExtend && sourceWidth > 0)
-            {
-                wolvrix::lib::grh::ValueId signBit =
-                    makeSliceStatic(value, sourceWidth - 1, sourceWidth - 1, location);
-                padValue = makeReplicate(signBit, padWidth, location);
-            }
-            else
-            {
-                padValue = makeZero(padWidth, location);
-            }
-            if (!padValue.valid())
-            {
-                return wolvrix::lib::grh::ValueId::invalid();
-            }
-            wolvrix::lib::grh::OperationId op =
-                createOp(wolvrix::lib::grh::OperationKind::kConcat,
-                         wolvrix::lib::grh::SymbolId::invalid(),
-                         location);
-            graph_.addOperand(op, padValue);
-            graph_.addOperand(op, value);
-            wolvrix::lib::grh::SymbolId sym =
-                makeInternalValueSymbol();
-            wolvrix::lib::grh::ValueId result =
-                graph_.createValue(sym, static_cast<int32_t>(targetWidth),
-                                   signExtend, graph_.getValue(value).type());
-            graph_.addResult(op, result);
-            return result;
-        };
         auto emitAggregateLaneSlice =
             [&](wolvrix::lib::grh::ValueId value,
                 int64_t lane,
@@ -20046,11 +22463,560 @@ private:
                        : static_cast<int32_t>(packedElement->second);
         }
 
+        // ================= stage-04 struct support (connection side) =================
+
+        ExprNodeId makeSymbolNode(PlanSymbolId symbol, slang::SourceLocation location)
+        {
+            ExprNode node;
+            node.kind = ExprNodeKind::Symbol;
+            node.symbol = symbol;
+            node.location = location;
+            return addSyntheticNode(std::move(node));
+        }
+
+        ExprNodeId makeOperationNode(wolvrix::lib::grh::OperationKind op,
+                                     std::vector<ExprNodeId> operands, int32_t widthHint,
+                                     slang::SourceLocation location)
+        {
+            ExprNode node;
+            node.kind = ExprNodeKind::Operation;
+            node.op = op;
+            node.operands = std::move(operands);
+            node.location = location;
+            node.widthHint = widthHint;
+            return addSyntheticNode(std::move(node));
+        }
+
+        ExprNodeId makeConstNode(std::string literal, slang::SourceLocation location)
+        {
+            ExprNode node;
+            node.kind = ExprNodeKind::Constant;
+            node.literal = std::move(literal);
+            node.location = location;
+            return addSyntheticNode(std::move(node));
+        }
+
+        ExprNodeId makeSliceDynamicNode(ExprNodeId value, ExprNodeId index, int32_t width,
+                                        slang::SourceLocation location)
+        {
+            return makeOperationNode(wolvrix::lib::grh::OperationKind::kSliceDynamic,
+                                     {value, index}, width, location);
+        }
+
+        ExprNodeId makeSliceArrayNode(ExprNodeId value, ExprNodeId index, int32_t width,
+                                      slang::SourceLocation location)
+        {
+            return makeOperationNode(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                     {value, index}, width, location);
+        }
+
+        bool isArrayStateChainConn(ExprNodeId id) const
+        {
+            ExprNodeId current = id;
+            std::unordered_set<ExprNodeId> seen;
+            while (current != kInvalidPlanIndex && current < state_.lowering_.values.size() &&
+                   seen.insert(current).second)
+            {
+                const ExprNode& node = state_.lowering_.values[current];
+                if (node.kind == ExprNodeKind::Symbol)
+                {
+                    const SignalInfo* info = findSignalBySymbol(state_.plan_, node.symbol);
+                    return info && info->kind != SignalKind::Net && info->memoryRows > 0;
+                }
+                if (node.kind != ExprNodeKind::Operation || node.operands.empty())
+                {
+                    return false;
+                }
+                if (node.op != wolvrix::lib::grh::OperationKind::kSliceDynamic &&
+                    node.op != wolvrix::lib::grh::OperationKind::kSliceArray &&
+                    node.op != wolvrix::lib::grh::OperationKind::kAssign)
+                {
+                    return false;
+                }
+                current = node.operands.front();
+            }
+            return false;
+        }
+
+        ExprNodeId normalizePackedLaneConn(const UnpackedDimInfo& dim, ExprNodeId index,
+                                           slang::SourceLocation location)
+        {
+            const int64_t low = std::min<int32_t>(dim.left, dim.right);
+            const int64_t high = std::max<int32_t>(dim.left, dim.right);
+            if (dim.left > dim.right)
+            {
+                if (low != 0)
+                {
+                    index = makeOperationNode(wolvrix::lib::grh::OperationKind::kSub,
+                                              {index, makeConstNode(std::to_string(low), location)},
+                                              32, location);
+                }
+            }
+            else
+            {
+                index = makeOperationNode(wolvrix::lib::grh::OperationKind::kSub,
+                                          {makeConstNode(std::to_string(high), location), index},
+                                          32, location);
+            }
+            return index;
+        }
+
+        ExprNodeId elementSelectOnLeafConn(ExprNodeId value, const StructSplitLeaf& leaf,
+                                           ExprNodeId index, int32_t subWidth,
+                                           slang::SourceLocation location)
+        {
+            const bool stateChain = isArrayStateChainConn(value);
+            if (!leaf.unpackedDims.empty())
+            {
+                if (stateChain)
+                {
+                    return makeSliceDynamicNode(value, index, subWidth, location);
+                }
+                const UnpackedDimInfo& dim = leaf.unpackedDims.front();
+                ExprNodeId normalized = index;
+                if (dim.left < dim.right)
+                {
+                    if (dim.left != 0)
+                    {
+                        normalized = makeOperationNode(
+                            wolvrix::lib::grh::OperationKind::kSub,
+                            {normalized, makeConstNode(std::to_string(dim.left), location)},
+                            32, location);
+                    }
+                }
+                else
+                {
+                    normalized = makeOperationNode(
+                        wolvrix::lib::grh::OperationKind::kSub,
+                        {makeConstNode(std::to_string(dim.left), location), normalized},
+                        32, location);
+                }
+                return makeSliceArrayNode(value, normalized, subWidth, location);
+            }
+            if (!leaf.packedDimInfos.empty())
+            {
+                ExprNodeId lane =
+                    normalizePackedLaneConn(leaf.packedDimInfos.front(), index, location);
+                return makeSliceArrayNode(value, lane, subWidth, location);
+            }
+            state_.context_.diagnostics->error(
+                location, "Element select on scalar struct leaf in connection");
+            return kInvalidPlanIndex;
+        }
+
+        bool lowerStructLeavesConn(const slang::ast::Expression& expr,
+                                   std::vector<ExprNodeId>& out)
+        {
+            if (const auto* named = expr.as_if<slang::ast::NamedValueExpression>())
+            {
+                const PlanSymbolId root = lookupPlanSignal(state_.plan_, named->symbol);
+                auto it = state_.plan_.structsBySymbol.find(root.index);
+                if (it == state_.plan_.structsBySymbol.end())
+                {
+                    return false;
+                }
+                for (const StructLeafInfo& leaf : it->second.fields)
+                {
+                    out.push_back(makeSymbolNode(leaf.symbol, expr.sourceRange.start()));
+                }
+                return true;
+            }
+            if (const auto* member = expr.as_if<slang::ast::MemberAccessExpression>())
+            {
+                std::vector<ExprNodeId> base;
+                if (!lowerStructLeavesConn(member->value(), base))
+                {
+                    return false;
+                }
+                auto range = structMemberLeafRange(*member->value().type, member->member.name);
+                if (!range)
+                {
+                    return false;
+                }
+                out.assign(base.begin() + static_cast<std::ptrdiff_t>(range->first),
+                           base.begin() + static_cast<std::ptrdiff_t>(range->second));
+                return true;
+            }
+            if (const auto* select = expr.as_if<slang::ast::ElementSelectExpression>())
+            {
+                std::vector<ExprNodeId> base;
+                if (!lowerStructLeavesConn(select->value(), base))
+                {
+                    return false;
+                }
+                std::vector<StructSplitLeaf> leafTypes;
+                if (!splitStructType(*select->value().type, "", *state_.plan_.body,
+                                     state_.context_.diagnostics, leafTypes) ||
+                    leafTypes.size() != base.size())
+                {
+                    return false;
+                }
+                ExprNodeId index = lowerExpression(select->selector());
+                if (index == kInvalidPlanIndex)
+                {
+                    return false;
+                }
+                for (std::size_t i = 0; i < base.size(); ++i)
+                {
+                    const int64_t flatWidth = structLeafFlatWidth(leafTypes[i], *state_.plan_.body);
+                    const int64_t extent =
+                        !leafTypes[i].unpackedDims.empty()
+                            ? std::max<int64_t>(1, leafTypes[i].unpackedDims.front().extent)
+                            : (!leafTypes[i].packedDimInfos.empty()
+                                   ? std::max<int64_t>(1, leafTypes[i].packedDimInfos.front().extent)
+                                   : 1);
+                    const int32_t subWidth = static_cast<int32_t>(std::max<int64_t>(
+                        1, flatWidth / std::max<int64_t>(1, extent)));
+                    base[i] = elementSelectOnLeafConn(base[i], leafTypes[i], index, subWidth,
+                                                      select->sourceRange.start());
+                    if (base[i] == kInvalidPlanIndex)
+                    {
+                        return false;
+                    }
+                }
+                out = std::move(base);
+                return true;
+            }
+            if (const auto* cond = expr.as_if<slang::ast::ConditionalExpression>())
+            {
+                if (cond->conditions.size() != 1)
+                {
+                    return false;
+                }
+                std::vector<ExprNodeId> lhs;
+                std::vector<ExprNodeId> rhs;
+                if (!lowerStructLeavesConn(cond->left(), lhs) ||
+                    !lowerStructLeavesConn(cond->right(), rhs) || lhs.size() != rhs.size())
+                {
+                    return false;
+                }
+                ExprNodeId guard = lowerExpression(*cond->conditions.front().expr);
+                if (guard == kInvalidPlanIndex)
+                {
+                    return false;
+                }
+                for (std::size_t i = 0; i < lhs.size(); ++i)
+                {
+                    const ExprNode& node = state_.lowering_.values[lhs[i]];
+                    out.push_back(makeOperationNode(wolvrix::lib::grh::OperationKind::kMux,
+                                                    {guard, lhs[i], rhs[i]},
+                                                    node.widthHint, cond->sourceRange.start()));
+                }
+                return true;
+            }
+            if (const auto* conversion = expr.as_if<slang::ast::ConversionExpression>())
+            {
+                return lowerStructLeavesConn(conversion->operand(), out);
+            }
+            if (const auto* unbased = expr.as_if<slang::ast::UnbasedUnsizedIntegerLiteral>())
+            {
+                bool fillOnes = false;
+                bool supported = false;
+                if (!unbased->getValue().hasUnknown())
+                {
+                    if (auto bit = unbased->getValue().as<uint64_t>())
+                    {
+                        fillOnes = (*bit & 1) != 0;
+                        supported = true;
+                    }
+                }
+                if (!supported || !expr.type)
+                {
+                    return false;
+                }
+                std::vector<StructSplitLeaf> leafTypes;
+                if (!splitStructType(*expr.type, "", *state_.plan_.body,
+                                     state_.context_.diagnostics, leafTypes))
+                {
+                    return false;
+                }
+                for (const StructSplitLeaf& leaf : leafTypes)
+                {
+                    const int64_t width = structLeafFlatWidth(leaf, *state_.plan_.body);
+                    std::string literal =
+                        fillOnes
+                            ? std::to_string(width) + "'b" +
+                                  std::string(static_cast<std::size_t>(std::max<int64_t>(1, width)), '1')
+                            : std::to_string(width) + "'h0";
+                    out.push_back(makeConstNode(std::move(literal), expr.sourceRange.start()));
+                }
+                return true;
+            }
+            if (expr.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+                expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+            {
+                return lowerPatternLeavesConn(*expr.type, expr, out);
+            }
+            return false;
+        }
+
+        bool lowerPatternComponentConn(const slang::ast::Type& componentType,
+                                       const slang::ast::Expression& expr,
+                                       std::vector<ExprNodeId>& out)
+        {
+            if (isStructTyped(componentType))
+            {
+                return lowerStructLeavesConn(expr, out);
+            }
+            if (expr.as_if<slang::ast::SimpleAssignmentPatternExpression>() ||
+                expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+            {
+                ExprNodeId flat = lowerArrayPatternConn(componentType, expr);
+                if (flat == kInvalidPlanIndex)
+                {
+                    return false;
+                }
+                out.push_back(flat);
+                return true;
+            }
+            ExprNodeId value = lowerExpression(expr);
+            if (value == kInvalidPlanIndex)
+            {
+                return false;
+            }
+            out.push_back(value);
+            return true;
+        }
+
+        bool lowerPatternLeavesConn(const slang::ast::Type& type,
+                                    const slang::ast::Expression& pattern,
+                                    std::vector<ExprNodeId>& out)
+        {
+            const slang::ast::Type* scope = peelToStructScope(type);
+            if (!scope)
+            {
+                return false;
+            }
+            if (const auto* simple = pattern.as_if<slang::ast::SimpleAssignmentPatternExpression>())
+            {
+                std::vector<const slang::ast::Type*> fieldTypes;
+                for (const slang::ast::FieldSymbol& field :
+                     scope->as<slang::ast::Scope>().membersOfType<slang::ast::FieldSymbol>())
+                {
+                    fieldTypes.push_back(&field.getType());
+                }
+                if (simple->elements().size() != fieldTypes.size())
+                {
+                    return false;
+                }
+                for (std::size_t i = 0; i < fieldTypes.size(); ++i)
+                {
+                    if (!lowerPatternComponentConn(*fieldTypes[i], *simple->elements()[i], out))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            const auto* structured =
+                pattern.as_if<slang::ast::StructuredAssignmentPatternExpression>();
+            if (!structured)
+            {
+                return false;
+            }
+            for (const slang::ast::FieldSymbol& field :
+                 scope->as<slang::ast::Scope>().membersOfType<slang::ast::FieldSymbol>())
+            {
+                const slang::ast::Expression* value = nullptr;
+                for (const auto& setter : structured->memberSetters)
+                {
+                    if (setter.member->name == field.name)
+                    {
+                        value = setter.expr;
+                        break;
+                    }
+                }
+                if (!value)
+                {
+                    for (const auto& setter : structured->typeSetters)
+                    {
+                        if (&setter.type->getCanonicalType() == &field.getType().getCanonicalType())
+                        {
+                            value = setter.expr;
+                            break;
+                        }
+                    }
+                }
+                if (!value)
+                {
+                    value = structured->defaultSetter;
+                }
+                if (!value)
+                {
+                    return false;
+                }
+                if (!lowerPatternComponentConn(field.getType(), *value, out))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        ExprNodeId lowerArrayPatternConn(const slang::ast::Type& arrayType,
+                                         const slang::ast::Expression& expr)
+        {
+            const slang::ast::Type* current = &arrayType;
+            const slang::ast::Type* elementType = nullptr;
+            bool isUnpacked = false;
+            int64_t extent = 0;
+            while (current && !elementType)
+            {
+                const slang::ast::Type& canonical = current->getCanonicalType();
+                switch (canonical.kind)
+                {
+                case slang::ast::SymbolKind::TypeAlias:
+                    current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+                    continue;
+                case slang::ast::SymbolKind::FixedSizeUnpackedArrayType: {
+                    const auto& unpacked = canonical.as<slang::ast::FixedSizeUnpackedArrayType>();
+                    isUnpacked = true;
+                    extent = static_cast<int64_t>(unpacked.range.fullWidth());
+                    elementType = &unpacked.elementType;
+                    break;
+                }
+                case slang::ast::SymbolKind::PackedArrayType: {
+                    const auto& packed = canonical.as<slang::ast::PackedArrayType>();
+                    extent = static_cast<int64_t>(packed.range.fullWidth());
+                    elementType = &packed.elementType;
+                    break;
+                }
+                default:
+                    return lowerExpression(expr);
+                }
+            }
+            if (!elementType || extent <= 0)
+            {
+                return lowerExpression(expr);
+            }
+            std::vector<ExprNodeId> elements(static_cast<std::size_t>(extent), kInvalidPlanIndex);
+            bool ok = true;
+            std::size_t positional = 0;
+            auto fillFrom = [&](std::size_t position, const slang::ast::Expression& valueExpr) {
+                std::vector<ExprNodeId> values;
+                if (!lowerPatternComponentConn(*elementType, valueExpr, values) || values.empty())
+                {
+                    ok = false;
+                    return;
+                }
+                if (values.size() == 1)
+                {
+                    elements[position] = values.front();
+                }
+                else
+                {
+                    elements[position] = makeOperationNode(
+                        wolvrix::lib::grh::OperationKind::kConcat, std::move(values), 0,
+                        valueExpr.sourceRange.start());
+                }
+            };
+            if (const auto* simple = expr.as_if<slang::ast::SimpleAssignmentPatternExpression>())
+            {
+                if (static_cast<int64_t>(simple->elements().size()) != extent)
+                {
+                    return kInvalidPlanIndex;
+                }
+                for (const slang::ast::Expression* elementExpr : simple->elements())
+                {
+                    fillFrom(positional++, *elementExpr);
+                }
+            }
+            else if (const auto* structured =
+                         expr.as_if<slang::ast::StructuredAssignmentPatternExpression>())
+            {
+                for (const auto& setter : structured->indexSetters)
+                {
+                    std::optional<int64_t> indexConst;
+                    if (setter.index)
+                    {
+                        if (const slang::ConstantValue* cv = setter.index->getConstant();
+                            cv && cv->isInteger())
+                        {
+                            if (auto v = cv->integer().as<int64_t>())
+                            {
+                                indexConst = *v;
+                            }
+                        }
+                    }
+                    if (indexConst && *indexConst >= 0 && *indexConst < extent)
+                    {
+                        fillFrom(static_cast<std::size_t>(*indexConst), *setter.expr);
+                    }
+                    else
+                    {
+                        ok = false;
+                    }
+                }
+                if (structured->defaultSetter)
+                {
+                    for (std::size_t i = 0; i < elements.size(); ++i)
+                    {
+                        if (elements[i] == kInvalidPlanIndex)
+                        {
+                            fillFrom(i, *structured->defaultSetter);
+                        }
+                    }
+                }
+            }
+            if (!ok)
+            {
+                return kInvalidPlanIndex;
+            }
+            for (ExprNodeId element : elements)
+            {
+                if (element == kInvalidPlanIndex)
+                {
+                    return kInvalidPlanIndex;
+                }
+            }
+            if (isUnpacked)
+            {
+                std::reverse(elements.begin(), elements.end());
+            }
+            return makeOperationNode(wolvrix::lib::grh::OperationKind::kConcat,
+                                     std::move(elements), 0, expr.sourceRange.start());
+        }
+
+        // Flatten a struct-typed connection expression to one flat value.
+        ExprNodeId flattenStructExpr(const slang::ast::Expression& expr)
+        {
+            std::vector<ExprNodeId> leaves;
+            if (!lowerStructLeavesConn(expr, leaves) || leaves.empty())
+            {
+                return kInvalidPlanIndex;
+            }
+            if (leaves.size() == 1)
+            {
+                return leaves.front();
+            }
+            int64_t total = 0;
+            for (ExprNodeId leaf : leaves)
+            {
+                const ExprNode& node = state_.lowering_.values[leaf];
+                total += node.widthHint > 0 ? node.widthHint : 1;
+            }
+            return makeOperationNode(wolvrix::lib::grh::OperationKind::kConcat,
+                                     std::move(leaves),
+                                     static_cast<int32_t>(std::min<int64_t>(
+                                         total > 0 ? total : 1,
+                                         std::numeric_limits<int32_t>::max())),
+                                     expr.sourceRange.start());
+        }
+
+        // ================= end stage-04 struct support (connection side) =================
+
         ExprNodeId lowerExpression(const slang::ast::Expression& expr)
         {
             if (auto it = lowered_.find(&expr); it != lowered_.end())
             {
                 return it->second;
+            }
+            // stage-04: struct-typed connection expressions flatten to the
+            // packed layout (per-leaf connections are sliced out at the
+            // instance site).
+            if (expr.type && isStructTyped(*expr.type))
+            {
+                return flattenStructExpr(expr);
             }
 
             auto paramLiteral = [](const slang::ast::ParameterSymbol& param)

@@ -649,24 +649,20 @@ int testLhsMemberSelect(const std::filesystem::path& sourcePath) {
                     std::to_string(lowering.writes.size()) + " in " + sourcePath.string());
     }
 
+    // stage-04: member writes on a struct resolve to the split leaf
+    // signals directly — no MemberSelect slices anymore.
     std::unordered_map<std::string, int> memberCounts;
     for (const auto& write : lowering.writes) {
-        if (!write.target.valid() ||
-            plan.symbolTable.text(write.target) != std::string_view("y")) {
+        if (!write.target.valid()) {
             return fail("Unexpected write target in " + sourcePath.string());
         }
-        if (write.slices.size() != 1) {
-            return fail("Expected one member slice per write in " + sourcePath.string());
+        if (!write.slices.empty()) {
+            return fail("Expected no slices on split member writes in " + sourcePath.string());
         }
-        const auto& slice = write.slices.front();
-        if (slice.kind != wolvrix::lib::ingest::WriteSliceKind::MemberSelect ||
-            !slice.member.valid()) {
-            return fail("Missing member select slice in " + sourcePath.string());
-        }
-        memberCounts[std::string(plan.symbolTable.text(slice.member))]++;
+        memberCounts[std::string(plan.symbolTable.text(write.target))]++;
     }
 
-    if (memberCounts["hi"] != 1 || memberCounts["lo"] != 1) {
+    if (memberCounts["y__DOT__hi"] != 1 || memberCounts["y__DOT__lo"] != 1) {
         return fail("Unexpected member select targets in " + sourcePath.string());
     }
     if (diagnostics.hasError()) {

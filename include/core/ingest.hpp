@@ -32,6 +32,7 @@ class InstanceBodySymbol;
 class InstanceSymbol;
 class DefinitionSymbol;
 class Symbol;
+class Type;
 } // namespace slang::ast
 
 namespace wolvrix::lib::ingest {
@@ -204,6 +205,9 @@ struct SignalInfo {
     // (trailing, innermost scalar-element dim excluded). Empty means scalar.
     // Total flat width = width * product(shape).
     std::vector<int64_t> shape;
+    // Element width preserved when the array view is folded back to a flat
+    // vector (shape cleared); 0 means "not folded".
+    int32_t elementWidth = 0;
     std::vector<int32_t> packedDims;
     std::vector<UnpackedDimInfo> unpackedDims;
     // Per-dim bounds of packed array dims (same order as packedDims); used by
@@ -225,6 +229,27 @@ struct InstanceInfo {
     std::string paramSignature;
 };
 
+// stage-04: one leaf field of a field-wise-split struct declaration
+// (SoA split — a struct never becomes a GRH value itself). Field signals are
+// ordinary signals/ports named `c__DOT__a` (DOT encoding); all array
+// dimensions (outer and field-local) migrate onto the leaf.
+struct StructLeafInfo {
+    std::string fieldPath;  // "__DOT__"-joined path from the struct root (e.g. "f__DOT__x")
+    PlanSymbolId symbol;    // plan symbol of the leaf signal/port
+    const slang::ast::Type* type = nullptr;  // slang type of the leaf field
+    int64_t flatWidth = 0;  // total flat width of the leaf
+};
+
+// Registry entry for one struct-typed declaration (signal or port). Fields
+// are in declaration (packed-layout) order, which is also the flatten order
+// used when a whole-struct value must materialize as a bit vector.
+struct StructTypeInfo {
+    PlanSymbolId symbol;  // plan symbol of the struct-typed declaration
+    const slang::ast::Type* type = nullptr;
+    std::vector<StructLeafInfo> fields;
+    int64_t totalWidth = 0;
+};
+
 // Plan-level record of one generate-scope declaration: all elaboration
 // copies of the same declaration, in elaboration (round) order.
 struct GenerateGroupPlan {
@@ -242,6 +267,9 @@ struct ModulePlan {
     std::vector<SignalInfo> signals;
     std::vector<InstanceInfo> instances;
     std::vector<InoutSignalInfo> inoutSignals;
+    // stage-04: field-wise split struct declarations, keyed by the
+    // struct-typed declaration's plan symbol index.
+    std::unordered_map<uint32_t, StructTypeInfo> structsBySymbol;
     // Signals interned under scope-qualified generate names cannot be found by
     // bare-name text lookup; resolve them by slang symbol identity instead.
     std::unordered_map<const slang::ast::Symbol*, PlanSymbolId> signalBySlangSymbol;

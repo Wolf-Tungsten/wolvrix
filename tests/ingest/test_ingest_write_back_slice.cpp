@@ -445,11 +445,16 @@ int testWriteBackSliceMember(const std::filesystem::path& sourcePath) {
         return fail("Failed to build write-back member slice plan for " + sourcePath.string());
     }
 
-    if (writeBack.entries.size() != 1) {
-        return fail("Expected 1 write-back entry for member slices in " + sourcePath.string());
+    // stage-04: member writes on a struct port resolve to the split leaf
+    // signals directly — one write-back entry per leaf, no merge concat.
+    if (writeBack.entries.size() != 2) {
+        return fail("Expected 2 write-back entries for split member writes in " +
+                    sourcePath.string());
     }
-    if (!hasOp(lowering, wolvrix::lib::grh::OperationKind::kConcat)) {
-        return fail("Missing kConcat in member slice write-back");
+    if (!findEntryForSymbol(plan, writeBack, "y__DOT__hi") ||
+        !findEntryForSymbol(plan, writeBack, "y__DOT__lo")) {
+        return fail("Missing split leaf write-back entries for member slices in " +
+                    sourcePath.string());
     }
     if (diagnostics.hasError()) {
         return fail("Unexpected Convert diagnostics errors in " + sourcePath.string());

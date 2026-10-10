@@ -177,10 +177,17 @@ namespace
         return id;
     }
 
+    // Stage-06 array state: an array is a logic type of elementWidth*count
+    // total bits with shape {count}. The init fill step keeps its linear
+    // row-address parameters.
     grhsim::StateId addArrayState(grhsim::GrhSimModel &model, std::string_view name,
                                   grhsim::TypeId element, uint64_t count, std::string fillLiteral)
     {
-        const auto id = model.addState(name, model.arrayType(element, count));
+        const auto &elementType = model.types()[element.index - 1];
+        const std::array<int64_t, 1> shape{static_cast<int64_t>(count)};
+        const auto id = model.addState(name,
+            model.logicType(elementType.width * static_cast<uint32_t>(count),
+                            elementType.isSigned, elementType.domain, shape));
         const std::array params{
             grhsim::Parameter{model.intern("value"), std::move(fillLiteral)},
             grhsim::Parameter{model.intern("start"), int64_t{0}},
@@ -199,45 +206,46 @@ namespace
         return value;
     }
 
-    grhsim::ValueId addMemRead(grhsim::GrhSimModel &model, grhsim::StateId state,
-                               grhsim::ValueId addr, grhsim::TypeId element,
-                               std::string_view name)
+    // Indexed read: single-index readArray on a rank-1 array state.
+    grhsim::ValueId addReadArray(grhsim::GrhSimModel &model, grhsim::StateId state,
+                                 grhsim::ValueId addr, grhsim::TypeId element,
+                                 std::string_view name)
     {
         const auto value = model.addValue(element, name);
-        model.addOperation("core.state.memRead", std::array{addr}, std::array{value},
+        model.addOperation("core.state.readArray", std::array{addr}, std::array{value},
                            std::array{grhsim::ObjectRef::state(state)}, {}, name);
         return value;
     }
 
-    grhsim::OpId addRegWrite(grhsim::GrhSimModel &model, grhsim::StateId state,
-                             grhsim::ValueId enable, grhsim::ValueId data, grhsim::ValueId mask,
-                             bool posedgeClk = false, grhsim::ValueId clk = {})
+    grhsim::OpId addWrite(grhsim::GrhSimModel &model, grhsim::StateId state,
+                          grhsim::ValueId enable, grhsim::ValueId data, grhsim::ValueId mask,
+                          bool posedgeClk = false, grhsim::ValueId clk = {})
     {
         if (!posedgeClk)
         {
-            return model.addOperation("core.state.regWrite", std::array{enable, data, mask}, {},
+            return model.addOperation("core.state.write", std::array{enable, data, mask}, {},
                                       std::array{grhsim::ObjectRef::state(state)});
         }
         const std::array params{grhsim::Parameter{
             model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
-        return model.addOperation("core.state.regWrite", std::array{enable, data, mask, clk}, {},
+        return model.addOperation("core.state.write", std::array{enable, data, mask, clk}, {},
                                   std::array{grhsim::ObjectRef::state(state)}, params);
     }
 
-    grhsim::OpId addMemWrite(grhsim::GrhSimModel &model, grhsim::StateId state,
-                             grhsim::ValueId enable, grhsim::ValueId addr, grhsim::ValueId data,
-                             grhsim::ValueId mask, bool posedgeClk = false,
-                             grhsim::ValueId clk = {})
+    grhsim::OpId addWriteArray(grhsim::GrhSimModel &model, grhsim::StateId state,
+                               grhsim::ValueId enable, grhsim::ValueId addr, grhsim::ValueId data,
+                               grhsim::ValueId mask, bool posedgeClk = false,
+                               grhsim::ValueId clk = {})
     {
         if (!posedgeClk)
         {
-            return model.addOperation("core.state.memWrite",
+            return model.addOperation("core.state.writeArray",
                                       std::array{enable, addr, data, mask}, {},
                                       std::array{grhsim::ObjectRef::state(state)});
         }
         const std::array params{grhsim::Parameter{
             model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
-        return model.addOperation("core.state.memWrite",
+        return model.addOperation("core.state.writeArray",
                                   std::array{enable, addr, data, mask, clk}, {},
                                   std::array{grhsim::ObjectRef::state(state)}, params);
     }
@@ -296,7 +304,8 @@ namespace
             for (const auto &state : m.states())
             {
                 const auto &type = m.types()[state.type.index - 1];
-                states[state.id.index].resize(type.kind == grhsim::TypeKind::Array ? type.count : 1);
+                // Stage-06: one row per shape element (empty shape = scalar).
+                states[state.id.index].resize(grhsim::shapeElementCount(type.shape).value_or(1));
             }
             for (const auto &record : m.initRecords())
                 for (const auto &step : m.steps(record))
@@ -366,9 +375,8 @@ namespace
             for (const auto &op : m.operations())
             {
                 const auto kind = m.text(op.opType);
-                if (kind != "core.state.regWrite" && kind != "core.state.latchWrite" &&
-                    kind != "core.state.memWrite" && kind != "core.state.memWriteSeq" &&
-                    kind != "core.state.memFill")
+                if (kind != "core.state.write" && kind != "core.state.latchWrite" &&
+                    kind != "core.state.writeArray" && kind != "core.state.fill")
                     continue;
                 const auto args = m.operands(op);
                 const auto objects = m.objectRefs(op);
@@ -408,31 +416,65 @@ namespace
                 if (!fire) continue;
                 const auto eventCount = edges ? edges->size() : 0;
                 auto &target = pending.at(objects[0].index);
-                if (kind == "core.state.regWrite" || kind == "core.state.latchWrite")
+                const auto &stateType =
+                    m.types()[m.states()[objects[0].index - 1].type.index - 1];
+                const uint64_t rows = grhsim::shapeElementCount(stateType.shape).value_or(1);
+                const uint64_t elementWidth = stateType.width / rows;
+                const auto laneMask =
+                    elementWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << elementWidth) - 1);
+                if (kind == "core.state.write" || kind == "core.state.latchWrite")
                 {
+                    // [updateCond, nextValue, mask, events...]: the scalar form
+                    // writes slot 0; a whole-array write packs rows row-major.
                     if (eval(args[0]))
                     {
                         const auto mask = eval(args[2]);
-                        target[0] = (target[0] & ~mask) | (eval(args[1]) & mask);
+                        const auto data = eval(args[1]);
+                        for (uint64_t row = 0; row < rows; ++row)
+                        {
+                            const auto shift = row * elementWidth;
+                            const auto lane = (mask >> shift) & laneMask;
+                            target.at(row) =
+                                (target.at(row) & ~lane) | ((data >> shift) & laneMask & lane);
+                        }
                     }
                 }
-                else if (kind == "core.state.memWrite")
+                else if (kind == "core.state.writeArray")
                 {
+                    // [updateCond, i0..ik-1, data, mask, events...]; row-major
+                    // linearized indices (k == rank for these fixtures).
                     if (eval(args[0]))
                     {
-                        auto &cell = target.at(eval(args[1]));
-                        const auto mask = eval(args[3]);
-                        cell = (cell & ~mask) | (eval(args[2]) & mask);
+                        const std::size_t indexCount = args.size() - 3 - eventCount;
+                        uint64_t row = 0;
+                        for (std::size_t d = 0; d < indexCount; ++d)
+                            row = row * static_cast<uint64_t>(stateType.shape.at(d)) +
+                                  eval(args[1 + d]);
+                        const auto mask = eval(args[2 + indexCount]);
+                        const auto data = eval(args[1 + indexCount]);
+                        auto &cell = target.at(row);
+                        cell = (cell & ~mask) | (data & mask);
                     }
-                }
-                else if (kind == "core.state.memFill")
-                {
-                    if (eval(args[0])) std::fill(target.begin(), target.end(), eval(args[1]));
                 }
                 else
                 {
-                    for (std::size_t i = 0; i + 2 < args.size() - eventCount; i += 3)
-                        if (eval(args[i])) target.at(eval(args[i + 1])) = eval(args[i + 2]);
+                    // core.state.fill [updateCond, data, events...]: broadcast
+                    // an element-width value or unpack a full-width one.
+                    if (eval(args[0]))
+                    {
+                        const auto data = eval(args[1]);
+                        const auto dataWidth =
+                            m.types()[m.values()[args[1].index - 1].type.index - 1].width;
+                        if (dataWidth == stateType.width && dataWidth != elementWidth)
+                        {
+                            for (uint64_t row = 0; row < rows; ++row)
+                                target.at(row) = (data >> (row * elementWidth)) & laneMask;
+                        }
+                        else
+                        {
+                            std::fill(target.begin(), target.end(), data & laneMask);
+                        }
+                    }
                 }
             }
             states.swap(pending);
@@ -465,8 +507,33 @@ namespace
             auto a = [&](std::size_t i) { return eval(args[i]); };
             uint64_t result = 0;
             if (kind == "core.input.read") result = inputValues.at(m.objectRefs(op)[0].index - 1);
-            else if (kind == "core.state.read") result = states.at(m.objectRefs(op)[0].index)[0];
-            else if (kind == "core.state.memRead") result = states.at(m.objectRefs(op)[0].index).at(a(0));
+            else if (kind == "core.state.read" || kind == "core.state.readArray")
+            {
+                // Stage-06: read returns the state's full type (rows packed
+                // row-major for an array); readArray linearizes its indices
+                // and packs the remaining-dims sub-array (one row at k == rank).
+                const auto &state = m.states()[m.objectRefs(op)[0].index - 1];
+                const auto &stateType = m.types()[state.type.index - 1];
+                const auto &target = states.at(state.id.index);
+                const uint64_t rows = grhsim::shapeElementCount(stateType.shape).value_or(1);
+                const uint64_t elementWidth = stateType.width / rows;
+                const auto laneMask =
+                    elementWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << elementWidth) - 1);
+                uint64_t first = 0, subRows = rows;
+                if (kind == "core.state.readArray")
+                {
+                    for (std::size_t d = 0; d < args.size(); ++d)
+                        first = first * static_cast<uint64_t>(stateType.shape.at(d)) + a(d);
+                    subRows = 1;
+                    for (std::size_t d = args.size(); d < stateType.shape.size(); ++d)
+                        subRows *= static_cast<uint64_t>(stateType.shape.at(d));
+                }
+                for (uint64_t r = subRows; r-- > 0;)
+                {
+                    const auto cell = target.at(first * subRows + r) & laneMask;
+                    result = (elementWidth >= 64 ? uint64_t{0} : result << elementWidth) | cell;
+                }
+            }
             else if (kind == "core.compute.constant")
             {
                 for (const auto &p : m.parameters(op))
@@ -542,7 +609,7 @@ namespace
         static grhsim::GrhSimModel build()
         {
             grhsim::GrhSimModel model("split-phases-event");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
             const auto addr2 = model.logicType(2, false, grhsim::LogicDomain::TwoState);
@@ -570,17 +637,17 @@ namespace
             const auto nextq = addCompute(model, "core.compute.mux", {rst, zero8, inc}, byte, "nextq");
             const auto nb = addCompute(model, "core.compute.not", {wen2}, bit, "nb");
             const auto qEnable = addCompute(model, "core.compute.or", {nb, rst}, bit, "qen");
-            addRegWrite(model, q, qEnable, nextq, mask8, true, clk);
+            addWrite(model, q, qEnable, nextq, mask8, true, clk);
 
             const auto saddr = addSlice(model, waddr, 0, 1, addr2, "saddr");
             const auto smEnable = addCompute(model, "core.compute.and", {nb, wen}, bit, "smen");
-            addMemWrite(model, smallMem, smEnable, saddr, d, mask8, true, clk);
-            addMemWrite(model, bigMem, wen2, waddr, qv, mask8, true, clk);
+            addWriteArray(model, smallMem, smEnable, saddr, d, mask8, true, clk);
+            addWriteArray(model, bigMem, wen2, waddr, qv, mask8, true, clk);
 
-            const auto smv = addMemRead(model, smallMem, zero2, byte, "smv");
+            const auto smv = addReadArray(model, smallMem, zero2, byte, "smv");
             const auto out1 = addCompute(model, "core.compute.xor", {qv, smv}, byte, "out1v");
             addOutputWrite(model, "out1", out1);
-            const auto bmv = addMemRead(model, bigMem, one6, byte, "bmv");
+            const auto bmv = addReadArray(model, bigMem, one6, byte, "bmv");
             const auto out2 = addCompute(model, "core.compute.add", {bmv, qv}, byte, "out2v");
             addOutputWrite(model, "out2", out2);
             return model;
@@ -626,7 +693,7 @@ namespace
     int testAttribution()
     {
         grhsim::GrhSimModel model("split-phases-attribution");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
         const auto addr2 = model.logicType(2, false, grhsim::LogicDomain::TwoState);
@@ -639,16 +706,16 @@ namespace
         const auto q = addStateInit(model, "q", byte, "8'h00");
         const auto smallMem = addArrayState(model, "smallMem", byte, 4, "8'h00");
         const auto bigMem = addArrayState(model, "bigMem", byte, 64, "8'h00");
-        const auto regOp = addRegWrite(model, q, we, d, mask8);
-        const auto smallOp = addMemWrite(model, smallMem, we, addrS, d, mask8);
-        const auto bigOp = addMemWrite(model, bigMem, we, addrB, d, mask8);
+        const auto regOp = addWrite(model, q, we, d, mask8);
+        const auto smallOp = addWriteArray(model, smallMem, we, addrS, d, mask8);
+        const auto bigOp = addWriteArray(model, bigMem, we, addrB, d, mask8);
 
         runPass(model, "grhsim.select-state-stores");
         const Messages messages = runPass(model, "grhsim.split-phases");
         const auto phaseOf = [&](grhsim::OpId id) {
             return model.operations()[id.index - 1].phase;
         };
-        if (phaseOf(regOp) != grhsim::SimPhase::General) return fail("regWrite not General");
+        if (phaseOf(regOp) != grhsim::SimPhase::General) return fail("write not General");
         if (phaseOf(smallOp) != grhsim::SimPhase::General)
             return fail("regLatch-class mem write not attributed General");
         if (phaseOf(bigOp) != grhsim::SimPhase::Mem)
@@ -677,7 +744,7 @@ namespace
 
         // Legacy fallback: without a classification, mem writes stay Mem.
         grhsim::GrhSimModel legacy("split-phases-legacy");
-        legacy.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        legacy.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto lbit = legacy.logicType(1, false, grhsim::LogicDomain::TwoState);
         const auto lbyte = legacy.logicType(8, false, grhsim::LogicDomain::TwoState);
         const auto laddr = legacy.logicType(2, false, grhsim::LogicDomain::TwoState);
@@ -686,7 +753,7 @@ namespace
         const auto la = addInputRead(legacy, "a", laddr);
         const auto lmask = addConstant(legacy, lbyte, "8'hff");
         const auto lmem = addArrayState(legacy, "mem", lbyte, 4, "8'h00");
-        const auto lop = addMemWrite(legacy, lmem, lwe, la, ld, lmask);
+        const auto lop = addWriteArray(legacy, lmem, lwe, la, ld, lmask);
         runPass(legacy, "grhsim.split-phases");
         if (legacy.operations()[lop.index - 1].phase != grhsim::SimPhase::Mem)
             return fail("unclassified model lost the legacy all-Mem attribution");
@@ -700,7 +767,7 @@ namespace
     {
         const auto build = [] {
             grhsim::GrhSimModel model("split-phases-verifier");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
             const auto addr2 = model.logicType(2, false, grhsim::LogicDomain::TwoState);
@@ -712,8 +779,8 @@ namespace
             const auto mask = addConstant(model, byte, "8'hff");
             const auto smallMem = addArrayState(model, "smallMem", byte, 4, "8'h00");
             const auto bigMem = addArrayState(model, "bigMem", byte, 64, "8'h00");
-            const auto smallOp = addMemWrite(model, smallMem, we, as, d, mask);
-            const auto bigOp = addMemWrite(model, bigMem, we, ab, d, mask);
+            const auto smallOp = addWriteArray(model, smallMem, we, as, d, mask);
+            const auto bigOp = addWriteArray(model, bigMem, we, ab, d, mask);
             runPass(model, "grhsim.select-state-stores");
             return std::tuple<grhsim::GrhSimModel, grhsim::OpId, grhsim::OpId>(std::move(model),
                                                                                smallOp, bigOp);
@@ -770,7 +837,7 @@ namespace
         // Negative: a surviving event_edges parameter fails the seal.
         {
             grhsim::GrhSimModel model("split-phases-seal-raw");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
             const auto clk = addInputRead(model, "clk", bit);
@@ -778,7 +845,7 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const auto mask = addConstant(model, byte, "8'hff");
             const auto q = addStateInit(model, "q", byte, "8'h00");
-            addRegWrite(model, q, one, d, mask, true, clk);
+            addWrite(model, q, one, d, mask, true, clk);
             runPass(model, "grhsim.select-state-stores");
             runPass(model, "grhsim.split-phases");
             if (!verifies(model)) return fail("raw event model rejected by plain verify");
@@ -823,7 +890,7 @@ namespace
     int testPhaseScopeInterface()
     {
         grhsim::GrhSimModel model("split-phases-interface");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
         const auto addr6 = model.logicType(6, false, grhsim::LogicDomain::TwoState);
@@ -842,24 +909,24 @@ namespace
         addCompute(model, "core.compute.assign", {x}, byte, "t");
         const auto t = model.values().back().id;
         addCompute(model, "core.compute.xor", {t, c05}, byte, "u");
-        addRegWrite(model, q, we, model.values().back().id, cff);
+        addWrite(model, q, we, model.values().back().id, cff);
         // Identical adds: dupA/dupC feed only General sinks (CSE merges one
         // away), dupB feeds the Mem write's data operand (guarded, survives).
         addCompute(model, "core.compute.add", {x, c05}, byte, "dupA");
-        addRegWrite(model, q2, we, model.values().back().id, cff);
+        addWrite(model, q2, we, model.values().back().id, cff);
         addCompute(model, "core.compute.add", {x, c05}, byte, "dupB");
         const auto dupB = model.values().back().id;
         addCompute(model, "core.compute.add", {x, c05}, byte, "dupC");
-        addRegWrite(model, q3, we, model.values().back().id, cff);
-        const auto memWrite = model.addOperation(
-            "core.state.memWrite", std::array{we, t, dupB, cff}, {},
+        addWrite(model, q3, we, model.values().back().id, cff);
+        const auto tableWrite = model.addOperation(
+            "core.state.writeArray", std::array{we, t, dupB, cff}, {},
             std::array{grhsim::ObjectRef::state(bigMem)}, {}, "wbig");
-        (void)memWrite;
+        (void)tableWrite;
         // Readers keep every state alive under used-bits.
         addOutputWrite(model, "oQ", addStateRead(model, q, byte, "qv"));
         addOutputWrite(model, "oQ2", addStateRead(model, q2, byte, "q2v"));
         addOutputWrite(model, "oQ3", addStateRead(model, q3, byte, "q3v"));
-        addOutputWrite(model, "oM", addMemRead(model, bigMem, c00, byte, "bmv"));
+        addOutputWrite(model, "oM", addReadArray(model, bigMem, c00, byte, "bmv"));
 
         runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.extract-output-cones");
@@ -949,7 +1016,7 @@ namespace
         // is eliminated.
         {
             grhsim::GrhSimModel model("split-phases-clone-2node");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto src = addInputRead(model, "src", bit);
             const auto one = addConstant(model, bit, "1'b1");
@@ -958,8 +1025,8 @@ namespace
             const auto shared = addCompute(model, "core.compute.not", {src}, bit, "shared.not");
             const auto d1 = addCompute(model, "core.compute.and", {shared, shared}, bit, "d1");
             const auto d2 = addCompute(model, "core.compute.or", {shared, src}, bit, "d2");
-            addRegWrite(model, q1, one, d1, one);
-            addRegWrite(model, q2, one, d2, one);
+            addWrite(model, q1, one, d1, one);
+            addWrite(model, q2, one, d2, one);
             const auto q1v = addStateRead(model, q1, bit, "q1v");
             addOutputWrite(model, "o1", q1v);
             const auto q2v = addStateRead(model, q2, bit, "q2v");
@@ -1015,7 +1082,7 @@ namespace
         // is cloned.
         {
             grhsim::GrhSimModel model("split-phases-clone-1node");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto x = addInputRead(model, "x", bit);
             const auto one = addConstant(model, bit, "1'b1");
@@ -1024,11 +1091,11 @@ namespace
             const auto shared = addCompute(model, "core.compute.not", {x}, bit, "shared.not");
             const auto a = addCompute(model, "core.compute.and", {shared, shared}, bit, "a");
             const auto b = addCompute(model, "core.compute.or", {a, shared}, bit, "b");
-            addRegWrite(model, q, one, b, one);
+            addWrite(model, q, one, b, one);
             // A second user of the varying parent: without it the bijection
             // is not a candidate at all (cloning would just move the
             // boundary to a locally-used input).
-            addRegWrite(model, q2, one, x, one);
+            addWrite(model, q2, one, x, one);
             const auto qv = addStateRead(model, q, bit, "qv");
             addOutputWrite(model, "oQ", qv);
 
@@ -1045,7 +1112,7 @@ namespace
         // cloning would not eliminate the boundary; the pass must skip it.
         {
             grhsim::GrhSimModel model("split-phases-clone-mem");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
             const auto addr6 = model.logicType(6, false, grhsim::LogicDomain::TwoState);
@@ -1057,11 +1124,11 @@ namespace
             const auto bigMem = addArrayState(model, "bigMem", byte, 64, "8'h00");
             const auto shared = addCompute(model, "core.compute.not", {x}, byte, "shared.not");
             const auto data = addCompute(model, "core.compute.and", {shared, x}, byte, "data");
-            addRegWrite(model, q, we, data, cff);
-            addMemWrite(model, bigMem, we, c00, shared, cff);
+            addWrite(model, q, we, data, cff);
+            addWriteArray(model, bigMem, we, c00, shared, cff);
             const auto qv = addStateRead(model, q, byte, "qv");
             addOutputWrite(model, "oQ", qv);
-            const auto bmv = addMemRead(model, bigMem, c00, byte, "bmv");
+            const auto bmv = addReadArray(model, bigMem, c00, byte, "bmv");
             addOutputWrite(model, "oM", bmv);
 
             runPass(model, "grhsim.select-state-stores");
@@ -1077,7 +1144,7 @@ namespace
         // no-op (idle_reason=no_candidates).
         {
             grhsim::GrhSimModel model("split-phases-clone-idle");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto a = addInputRead(model, "a", bit);
             addOutputWrite(model, "o", a);
@@ -1093,7 +1160,7 @@ namespace
         // keeps the boundary.
         {
             grhsim::GrhSimModel model("split-phases-clone-budget");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto x = addInputRead(model, "x", bit);
             const auto a1 = addInputRead(model, "a1", bit);
@@ -1105,17 +1172,17 @@ namespace
             const auto shared = addCompute(model, "core.compute.not", {x}, bit, "shared.not");
             const auto d1 = addCompute(model, "core.compute.and", {shared, a1}, bit, "d1");
             const auto d2 = addCompute(model, "core.compute.and", {shared, a2}, bit, "d2");
-            addRegWrite(model, q1, one, d1, one);
-            addRegWrite(model, q2, one, d2, one);
+            addWrite(model, q1, one, d1, one);
+            addWrite(model, q2, one, d2, one);
             // Second user of the varying parent so the bijection is a candidate.
-            addRegWrite(model, q3, one, x, one);
+            addWrite(model, q3, one, x, one);
             const Messages full = runClonePipeline(model, true);
             if (infoValue(full, passName, "cloned=") != std::optional<uint64_t>(2))
                 return fail("two-target model did not clone into both supernodes");
             if (!verifies(model)) return fail("two-target model rejected");
 
             grhsim::GrhSimModel capped("split-phases-clone-budget-cap");
-            capped.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            capped.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto cbit = capped.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto cx = addInputRead(capped, "x", cbit);
             const auto ca1 = addInputRead(capped, "a1", cbit);
@@ -1127,9 +1194,9 @@ namespace
             const auto cshared = addCompute(capped, "core.compute.not", {cx}, cbit, "shared.not");
             const auto cd1 = addCompute(capped, "core.compute.and", {cshared, ca1}, cbit, "d1");
             const auto cd2 = addCompute(capped, "core.compute.and", {cshared, ca2}, cbit, "d2");
-            addRegWrite(capped, cq1, cone, cd1, cone);
-            addRegWrite(capped, cq2, cone, cd2, cone);
-            addRegWrite(capped, cq3, cone, cx, cone);
+            addWrite(capped, cq1, cone, cd1, cone);
+            addWrite(capped, cq2, cone, cd2, cone);
+            addWrite(capped, cq3, cone, cx, cone);
             const Messages messages = runClonePipeline(
                 capped, true, std::array<std::string_view, 2>{"--max-clones", "1"});
             if (!infoHas(messages, passName, "cloned=0"))
@@ -1142,7 +1209,7 @@ namespace
         // when it crosses supernodes.
         {
             grhsim::GrhSimModel model("split-phases-clone-wide");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto word = model.logicType(128, false, grhsim::LogicDomain::TwoState);
             const auto x = addInputRead(model, "x", word);
@@ -1156,11 +1223,11 @@ namespace
             const auto shared = addCompute(model, "core.compute.not", {x}, word, "shared.not");
             const auto d1 = addCompute(model, "core.compute.and", {shared, a1}, word, "d1");
             const auto d2 = addCompute(model, "core.compute.and", {shared, a2}, word, "d2");
-            addRegWrite(model, q1, one, d1, mask);
-            addRegWrite(model, q2, one, d2, mask);
+            addWrite(model, q1, one, d1, mask);
+            addWrite(model, q2, one, d2, mask);
             // Second user of the varying parent: the width guard (not the
             // candidate gate) is what must reject this fixture.
-            addRegWrite(model, q3, one, x, mask);
+            addWrite(model, q3, one, x, mask);
             const Messages messages = runClonePipeline(model);
             if (!infoHas(messages, passName, "cloned=0"))
                 return fail("a >64-bit shared producer was cloned");
@@ -1218,7 +1285,7 @@ namespace
     int testTimeslotLifecycle()
     {
         grhsim::GrhSimModel model("split-phases-tslot");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
         const auto cond = addConstant(model, bit, "1'h1");

@@ -7,17 +7,17 @@ event inputs so the P_input stage can skip data-activity tracking for them.
 
 A `core.input.read` is a pure event input when its result is used **only** in
 event operand positions — the trailing `len(event_edges)` operand slots of
-event-sensitive ops (`core.state.regWrite`, the four mem writes,
+event-sensitive ops (`core.state.write`, `writeArray` and `fill`,
 `core.system.task`, `core.dpi.call`). Such an op gains a bool parameter
 `event_only=true`:
 
 ```text
 core.input.read @clk                 core.input.read @clk
-  (used only as regWrite event)   =>   parameters: { event_only: true }
+  (used only as write event)   =>   parameters: { event_only: true }
 ```
 
 Inputs with any data-path use stay unmarked — for example `rst` appearing as
-both a `regWrite` event and a mux select keeps its P_input change detection,
+both a `write` event and a mux select keeps its P_input change detection,
 so repeated asynchronous resets are not swallowed by edge gating. Unused
 inputs are not marked either. The pass only ever adds `event_only=true`; it
 never writes an explicit `false`.

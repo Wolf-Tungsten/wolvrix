@@ -13,20 +13,20 @@
 对每个二态 `core.logic` value 和状态计算前缀使用位 `used`（含义：只有位 `[0, used)` 被
 任何 sink 观测）。`used == 0` 即死锥，`used == width` 即全使用。规则按 op kind 反向传播：
 
-- sink 全使用：`output.write`、`system.function/task`、`dpi.call`、全部 memory（array）
-  端口与读写地址、`input.read` 结果、event/条件 operand。
+- sink 全使用：`output.write`、`system.function/task`、`dpi.call`、全部数组（带 shape）
+  状态的读写端口与索引操作数、`input.read` 结果、event/条件 operand。
 - 截断透明族（`assign`、`and/or/xor/xnor/not`、`add/sub/mul`、`shl` 的数据 operand、
   `mux`/`bitSelect` 两臂、`prioritySelect` 臂与默认值、`concat` 按原始布局区间、
   `replicate` 取 `min(k, 源宽)`、`sliceStatic` 取 `start+k`）：operand 继承结果的
   `used` 前缀。左移量、条件 operand 全使用。
 - 非透明族（`div/mod/lshr/ashr`、比较、归约、`logicAnd/Or/Not`、`sliceDynamic/
   sliceArray`）：operand 全使用（结果的低位依赖 operand 的全部位）。
-- `state.read` 把结果的 `used` 并入状态的 `usedState`；`regWrite/latchWrite` 把
+- `state.read` 把结果的 `used` 并入状态的 `usedState`；`write/latchWrite` 把
   `data`/`mask` operand 提升到状态的写口需求：**可收窄状态**（见下）为 `usedState`，
   不可收窄状态一律按 operand 全宽——否则存活写口会引用已被收窄的值。
 
 状态的结构收窄资格（与不动点无关，先于分析计算）：logic 二态、init 全为
-const/random、只以 read/regWrite/latchWrite 目标身份被引用、写口 data/mask 与状态
+const/random、只以 read/write/latchWrite 目标身份被引用、写口 data/mask 与状态
 等宽。event history 身份被引用的状态不满足资格。
 
 前缀性质保证：收窄一个值时，其全部消费者都只需要低 `[0, k)` 位，因此边界处只需截断
@@ -41,12 +41,12 @@ const/random、只以 read/regWrite/latchWrite 目标身份被引用、写口 da
    （emit 内联时按新宽度截断）。
 2. **边界 slice（Case B）**：非透明 op 保持原宽，结果经复用已有或新建的
    `sliceStatic(0, k-1)` 供下游收窄锥使用。
-3. **状态收窄**：logic 二态状态（init 全为 const/random、引用者仅为 read/regWrite/
+3. **状态收窄**：logic 二态状态（init 全为 const/random、引用者仅为 read/write/
    latchWrite、写口 data/mask 与状态等宽）连同读、写、init 一起重建为窄宽度；event
    history 引用不变。
-4. **死锥消除**：结果全死的 `core.compute.*` / `state.read` / `memRead`，以及
-   `usedState == 0` 状态的 `regWrite/latchWrite`；最后清扫不再被任何存活 op 引用的
-   logic 二态状态（含孤儿 event history）。system/dpi/memory 写口等副作用 op 不删除。
+4. **死锥消除**：结果全死的 `core.compute.*` / `state.read` / `readArray`，以及
+   `usedState == 0` 状态的 `write/latchWrite`；最后清扫不再被任何存活 op 引用的
+   logic 二态状态（含孤儿 event history）。system/dpi/数组写口等副作用 op 不删除。
 
 变换后所有存活形态仍走既有 emit 路径：`sliceStatic`、`assign` 与各算术/位运算 op 的
 标量/宽值发射对 operand 与 result 宽度一致或截断关系均有既定处理；mapping 因语义版本

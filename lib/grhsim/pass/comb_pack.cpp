@@ -129,9 +129,11 @@ namespace wolvrix::lib::grhsim
                 const TypeKey resultKey = keyOf(simValue.type);
                 const SimOp *defOp = def(value);
                 const auto leaf = [&]() -> Analysis {
-                    // Only logic values may join a packed word; real/string/array
-                    // values are not leaves and invalidate the whole tree.
-                    if (m_.types()[simValue.type.index - 1].kind != TypeKind::Logic) return {};
+                    // Only scalar logic values may join a packed word;
+                    // real/string/array values are not leaves and invalidate
+                    // the whole tree.
+                    const auto &valueType = m_.types()[simValue.type.index - 1];
+                    if (valueType.kind != TypeKind::Logic || !valueType.shape.empty()) return {};
                     node.valid = true;
                     node.internal = false;
                     node.nodes = 0;
@@ -176,9 +178,16 @@ namespace wolvrix::lib::grhsim
             {
                 const std::string_view name = m_.text(op.opType);
                 if (!isInternalOpName(name)) return false;
+                // A shaped (array) result never joins a packed tree: its flat
+                // TypeKey would be indistinguishable from a scalar of the same
+                // total width.
+                if (!m_.types()[m_.values()[m_.results(op).front().index - 1].type.index - 1]
+                         .shape.empty())
+                    return false;
                 const auto operands = m_.operands(op);
                 const auto logic = [&](ValueId v) {
-                    return m_.types()[m_.values()[v.index - 1].type.index - 1].kind == TypeKind::Logic;
+                    const auto &operandType = m_.types()[m_.values()[v.index - 1].type.index - 1];
+                    return operandType.kind == TypeKind::Logic && operandType.shape.empty();
                 };
                 const auto matches = [&](ValueId v) { return keyOf(m_.values()[v.index - 1].type) == result; };
                 if (name == "core.compute.not" || name == "core.compute.assign")
@@ -521,7 +530,7 @@ namespace wolvrix::lib::grhsim
                     const SimOp *def = analyzer.def(value);
                     if (!def) return;
                     const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];
-                    if (type.kind != TypeKind::Logic || type.width == 0) return;
+                    if (type.kind != TypeKind::Logic || type.width == 0 || !type.shape.empty()) return;
                     const Analysis analysis = analyzer.analyze(value);
                     if (!analysis.valid || !analysis.internal) return;
                     const uint64_t minPacked = uint64_t{type.width} * options_.minGroupSize;
@@ -561,19 +570,19 @@ namespace wolvrix::lib::grhsim
                     const auto dataAt = [&](std::size_t index) {
                         if (index < operands.size()) addCandidate(operands[index], op.id, "storage-data");
                     };
-                    if (name == "core.state.regWrite" || name == "core.state.latchWrite") dataAt(1);
-                    else if (name == "core.state.memWrite") dataAt(2);
-                    else if (name == "core.state.memFill" || name == "core.state.memAssign") dataAt(1);
-                    else if (name == "core.state.memWriteSeq")
+                    if (name == "core.state.write" || name == "core.state.latchWrite") dataAt(1);
+                    else if (name == "core.state.fill") dataAt(1);
+                    else if (name == "core.state.writeArray")
                     {
-                        // Pre-lowering form carries len(event_edges) trailing
-                        // event operands; the lowered form has no tail.
+                        // [en, i0..ik-1, data, mask, events...]: data is the
+                        // penultimate operand before the trailing events. The
+                        // pre-lowering form carries len(event_edges) event
+                        // operands; the lowered event_acts form has no tail.
                         uint64_t events = 0;
                         for (const auto &p : model.parameters(op))
                             if (model.text(p.name) == "event_edges")
                                 events = std::get<std::vector<std::string>>(p.value).size();
-                        const std::size_t triples = (operands.size() - events) / 3;
-                        for (std::size_t k = 0; k < triples; ++k) dataAt(2 + 3 * k);
+                        if (operands.size() >= events + 4) dataAt(operands.size() - events - 2);
                     }
                 }
 

@@ -27,7 +27,7 @@ enable** (`--sink-enable-guard-min-size`, default 8; `0` disables the
 subdivision and restores the pre-A1 mapping):
 
 - A sink node qualifies when it holds exactly one op, that op is
-  `core.state.regWrite(en, next, mask)`, and the producer of `en`
+  `core.state.write(en, next, mask)`, and the producer of `en`
   (`operands[0]`) is **not** a `core.compute.constant`. Qualifying nodes
   group by the value id of `en`.
 - Each group with at least `--sink-enable-guard-min-size` members becomes
@@ -37,7 +37,7 @@ subdivision and restores the pre-A1 mapping):
   (`if(actBitsGuard(sig) && read(enableGuard))`), so the whole cluster is
   skipped when the shared enable is low — sound because every member write
   is individually guarded by exactly that value.
-- Everything else — non-`regWrite` sinks, constant-enable writes, groups
+- Everything else — non-`write` sinks, constant-enable writes, groups
   below the threshold — keeps the previous behavior and lands in the
   signature's ordinary supernode (no `enableGuard`). The escape class
   (empty signature) is never subdivided.

@@ -60,20 +60,26 @@ namespace
     // schedule), closed by the M5d-7 C8 TU planning. allMem forces every
     // array into the mem store class for the P_mem-pinned fixtures; by
     // default small arrays classify regLatch and their writes become
-    // General-phase NBA ops (M5d-6). tinyTu shrinks the C6/C8 size caps so a
-    // small model still exercises chunked functions and multi-TU emit.
-    // sinkGuardMin pins C2's A1 --sink-enable-guard-min-size (the pass
-    // default is 8, so existing callers see no behavior change).
+    // General-phase NBA ops (M5d-6). memMinBytes overrides the classification
+    // threshold directly (e.g. to keep a >512-byte array in the regLatch
+    // store). tinyTu shrinks the C6/C8 size caps so a small model still
+    // exercises chunked functions and multi-TU emit. sinkGuardMin pins C2's
+    // A1 --sink-enable-guard-min-size (the pass default is 8, so existing
+    // callers see no behavior change).
     void runSixPhasePipeline(GrhSimModel &model, bool splitSupernodes, bool allMem = false, bool tinyTu = false,
-                             uint32_t sinkGuardMin = 8)
+                             uint32_t sinkGuardMin = 8, uint64_t memMinBytes = 64)
     {
         runPass(model, "grhsim.classify-event-inputs");
         runPass(model, "grhsim.lower-edge-detect");
         runPass(model, "grhsim.extract-output-cones");
         runPass(model, "grhsim.migrate-timeslot-tasks");
+        const auto memMinText = std::to_string(memMinBytes);
         if (allMem)
             runPass(model, "grhsim.select-state-stores",
                     std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+        else if (memMinBytes != 64)
+            runPass(model, "grhsim.select-state-stores",
+                    std::array<std::string_view, 2>{"--mem-min-bytes", memMinText});
         else
             runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.split-phases");
@@ -168,8 +174,9 @@ namespace
     // operands plus an event_edges parameter; object refs carry no event
     // slots. grhsim.lower-edge-detect rewrites this into edgeDet +
     // event_acts.
-    void addEventWrite(GrhSimModel &model, std::string_view opType, std::vector<ValueId> operands,
-                       StateId target, std::initializer_list<std::pair<ValueId, const char *>> events)
+    OpId addEventWrite(GrhSimModel &model, std::string_view opType, std::vector<ValueId> operands,
+                       StateId target, std::initializer_list<std::pair<ValueId, const char *>> events,
+                       std::string_view opName = {})
     {
         std::vector<ObjectRef> refs{ObjectRef::state(target)};
         std::vector<std::string> edges;
@@ -178,19 +185,15 @@ namespace
             operands.push_back(event);
             edges.push_back(edge);
         }
-        if (edges.empty())
-        {
-            model.addOperation(opType, operands, {}, refs);
-            return;
-        }
+        if (edges.empty()) return model.addOperation(opType, operands, {}, refs, {}, opName);
         const std::array params{Parameter{model.intern("event_edges"), edges}};
-        model.addOperation(opType, operands, {}, refs, params);
+        return model.addOperation(opType, operands, {}, refs, params, opName);
     }
 
-    void addEventRegWrite(GrhSimModel &model, ValueId cond, ValueId next, ValueId mask,
-                          StateId target,
-                          std::initializer_list<std::pair<ValueId, const char *>> events)
-    { addEventWrite(model, "core.state.regWrite", {cond, next, mask}, target, events); }
+    OpId addEventStateWrite(GrhSimModel &model, ValueId cond, ValueId next, ValueId mask,
+                            StateId target,
+                            std::initializer_list<std::pair<ValueId, const char *>> events)
+    { return addEventWrite(model, "core.state.write", {cond, next, mask}, target, events); }
 
     unsigned activationBits(const CpuEventActivation &entry)
     {
@@ -319,7 +322,7 @@ namespace
     void passthroughTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_passthrough");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", bit);
         addOutputWrite(model, "o", bit, a);
@@ -341,7 +344,7 @@ namespace
     void wideAddTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_add128");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto wide = model.logicType(128, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", wide);
         const auto b = addInputRead(model, "b", wide);
@@ -369,8 +372,11 @@ namespace
     void scalarSliceArrayTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_scalar_slice_array");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
-        const auto word = model.logicType(32, false, LogicDomain::TwoState);
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        // Stage-06: sliceArray requires a shaped base — 4 rows x 8 bits packed
+        // into the flat 32-bit port vector; the result type carries the width.
+        const std::array<int64_t, 1> wordShape{4};
+        const auto word = model.logicType(32, false, LogicDomain::TwoState, wordShape);
         const auto indexType = model.logicType(4, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto data = addInputRead(model, "data", word);
@@ -391,7 +397,7 @@ namespace
     void randomSystemFunctionTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_random_function");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto word = model.logicType(32, false, LogicDomain::TwoState);
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         addOutputWrite(model, "echo", bit, addInputRead(model, "input", bit));
@@ -434,7 +440,7 @@ namespace
     void randomSampleIdAfterCompactTest()
     {
         GrhSimModel model("phase_random_sample_ids");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto word = model.logicType(32, false, LogicDomain::TwoState);
         const std::array constParams{Parameter{model.intern("constValue"), std::string("32'd0")}};
         for (int i = 0; i < 2; ++i)
@@ -482,7 +488,7 @@ namespace
     void fanoutTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_fanout");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", bit);
         const auto b = addInputRead(model, "b", bit);
@@ -490,7 +496,7 @@ namespace
         const auto one = addConstant(model, bit, "1'b1");
         const auto s1 = addState(model, "s1", bit, "1'b0");
         const auto s2 = addState(model, "s2", bit, "1'b0");
-        const auto w1 = model.addOperation("core.state.regWrite", std::array{one, x, one}, {},
+        const auto w1 = model.addOperation("core.state.write", std::array{one, x, one}, {},
                                            std::array{ObjectRef::state(s1)});
         // latchWrite shares the event-free emitRegWrite path (latch writes never
         // carry events), so it is covered here rather than by a dedicated model.
@@ -573,7 +579,7 @@ namespace
     void passRegistrationTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_pass_registration");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", bit);
         addOutputWrite(model, "o", bit, a);
@@ -633,7 +639,7 @@ namespace
     void counterTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_counter");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
@@ -643,11 +649,11 @@ namespace
         const auto mask = addConstant(model, byte, "8'hff");
         const auto cntRead = addStateRead(model, cnt, "cnt_r");
         const auto sum = addCompute(model, "core.compute.add", byte, "sum", {cntRead, one8});
-        addEventRegWrite(model, one, sum, mask, cnt, {{clk, "posedge"}});
+        addEventStateWrite(model, one, sum, mask, cnt, {{clk, "posedge"}});
         const auto t = addState(model, "t", bit, "1'b0");
         const auto tRead = addStateRead(model, t, "t_r");
         const auto notT = addCompute(model, "core.compute.not", bit, "not_t", {tRead});
-        addEventRegWrite(model, one, notT, one, t, {{clk, "both"}});
+        addEventStateWrite(model, one, notT, one, t, {{clk, "both"}});
         addOutputWrite(model, "o", byte, cntRead);
         addOutputWrite(model, "ot", bit, tRead);
         require(verifies(model), "counter fixture rejected");
@@ -681,7 +687,7 @@ namespace
     void waveformTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_wave");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto wide = model.logicType(128, false, LogicDomain::TwoState);
@@ -693,7 +699,7 @@ namespace
         const auto mask8 = addConstant(model, byte, "8'hff");
         const auto cntRead = addStateRead(model, cnt, "cnt_r");
         const auto sum = addCompute(model, "core.compute.add", byte, "sum", {cntRead, one8});
-        addEventRegWrite(model, one, sum, mask8, cnt, {{clk, "posedge"}});
+        addEventStateWrite(model, one, sum, mask8, cnt, {{clk, "posedge"}});
         addOutputWrite(model, "o", byte, cntRead);
         for (const char *symbol : {"clk", "a", "cnt", "sum", "o", "ghost"})
             model.addDeclaredSymbol(model.intern(symbol));
@@ -752,7 +758,7 @@ namespace
     void nbaChainTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_nba_chain");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto in = addInputRead(model, "in", bit);
@@ -760,8 +766,8 @@ namespace
         const auto a = addState(model, "a", bit, "1'b0");
         const auto b = addState(model, "b", bit, "1'b0");
         const auto aRead = addStateRead(model, a, "a_r");
-        addEventRegWrite(model, one, in, one, a, {{clk, "posedge"}});
-        addEventRegWrite(model, one, aRead, one, b, {{clk, "posedge"}});
+        addEventStateWrite(model, one, in, one, a, {{clk, "posedge"}});
+        addEventStateWrite(model, one, aRead, one, b, {{clk, "posedge"}});
         addOutputWrite(model, "oa", bit, aRead);
         addOutputWrite(model, "ob", bit, addStateRead(model, b, "b_r"));
         require(verifies(model), "nba chain fixture rejected");
@@ -789,13 +795,13 @@ namespace
     void powerOnTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_power_on");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto one = addConstant(model, bit, "1'b1");
         const auto q = addState(model, "q", bit, "1'b0");
         const auto qRead = addStateRead(model, q, "q_r");
-        addEventRegWrite(model, one, one, one, q, {{clk, "posedge"}});
+        addEventStateWrite(model, one, one, one, q, {{clk, "posedge"}});
         addOutputWrite(model, "o", bit, qRead);
         require(verifies(model), "power-on fixture rejected");
         runSixPhasePipeline(model, false);
@@ -815,7 +821,7 @@ namespace
     void asyncResetTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_async_reset");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto rst = addInputRead(model, "rst", bit);
@@ -825,7 +831,7 @@ namespace
         const auto next = addCompute(model, "core.compute.mux", bit, "next", {rst, d, zero});
         const auto q = addState(model, "q", bit, "1'b0");
         const auto qRead = addStateRead(model, q, "q_r");
-        addEventRegWrite(model, one, next, one, q, {{clk, "posedge"}, {rst, "negedge"}});
+        addEventStateWrite(model, one, next, one, q, {{clk, "posedge"}, {rst, "negedge"}});
         addOutputWrite(model, "o", bit, qRead);
         require(verifies(model), "async reset fixture rejected");
         runSixPhasePipeline(model, false);
@@ -858,7 +864,7 @@ namespace
     void dualClockTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_dual_clock");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto one = addConstant(model, bit, "1'b1");
@@ -869,7 +875,7 @@ namespace
             const auto cnt = addState(model, cntName, byte, "8'h00");
             const auto cntRead = addStateRead(model, cnt, "cnt_r");
             const auto sum = addCompute(model, "core.compute.add", byte, "sum", {cntRead, one8});
-            addEventRegWrite(model, one, sum, mask, cnt, {{clk, "posedge"}});
+            addEventStateWrite(model, one, sum, mask, cnt, {{clk, "posedge"}});
             return cntRead;
         };
         const auto c0 = counter("clk0", "c0");
@@ -910,7 +916,7 @@ namespace
     void glitchClockTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_glitch_clock");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto d = addInputRead(model, "d", bit);
@@ -919,8 +925,8 @@ namespace
         const auto q2 = addState(model, "q2", bit, "1'b0");
         const auto qRead = addStateRead(model, q, "q_r");
         const auto notQ = addCompute(model, "core.compute.not", bit, "not_q", {qRead});
-        addEventRegWrite(model, one, notQ, one, q, {{clk, "posedge"}});
-        addEventRegWrite(model, one, d, one, q2, {{qRead, "posedge"}});
+        addEventStateWrite(model, one, notQ, one, q, {{clk, "posedge"}});
+        addEventStateWrite(model, one, d, one, q2, {{qRead, "posedge"}});
         addOutputWrite(model, "oq", bit, qRead);
         addOutputWrite(model, "oq2", bit, addStateRead(model, q2, "q2_r"));
         require(verifies(model), "glitch clock fixture rejected");
@@ -942,20 +948,24 @@ namespace
         }, false, {}, tinyTu);
     }
 
-    StateId addMemState(GrhSimModel &model, std::string_view name, TypeId arrayType, std::string fillLiteral)
+    StateId addMemState(GrhSimModel &model, std::string_view name, TypeId type, std::string fillLiteral)
     {
-        const auto id = model.addState(name, arrayType);
+        const auto id = model.addState(name, type);
         const std::array params{Parameter{model.intern("value"), std::move(fillLiteral)}};
         const std::array steps{InitStep{model.intern("core.init.fill"), {0, 1}}};
         model.addInit(id, steps, params);
         return id;
     }
 
-    ValueId addMemRead(GrhSimModel &model, StateId mem, TypeId element, ValueId address, std::string_view name)
+    // Indexed state read (stage-06): result is the addressed element (k ==
+    // rank) or remaining-dims sub-array type; indices are the row-major
+    // address operands i0..ik-1.
+    ValueId addArrayRead(GrhSimModel &model, StateId state, TypeId result,
+                         std::initializer_list<ValueId> indices, std::string_view name)
     {
-        const auto value = model.addValue(element, name);
-        model.addOperation("core.state.memRead", std::array{address}, std::array{value},
-                           std::array{ObjectRef::state(mem)});
+        const auto value = model.addValue(result, name);
+        model.addOperation("core.state.readArray", {indices.begin(), indices.size()},
+                           std::array{value}, std::array{ObjectRef::state(state)});
         return value;
     }
 
@@ -967,7 +977,7 @@ namespace
     void latchRingTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_latch_ring");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto setA = addInputRead(model, "setA", bit);
         const auto keepB = addInputRead(model, "keepB", bit);
@@ -1001,18 +1011,19 @@ namespace
     // (SinkEscape, fires every round); the three posedge-gclk writes cluster
     // into one SinkEvent supernode whose scan call site gates on the
     // signature act and whose body carries NO per-op eventActStore guard
-    // (V2-M3 guard drop; the memWrite's reqWrite data condition survives).
+    // (V2-M3 guard drop; the writeArray's reqWrite data condition survives).
     // Functional core: the enable must publish while clk is low so gclk can
     // rise — the pre-v2 activation deadlock held every macro register at its
     // init value forever.
     void icgGatedSramTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_icg_sram");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16); // 16 B: regLatch class
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape); // 16 B: regLatch class
         const auto clk = addInputRead(model, "clk", bit);
         const auto reqRead = addInputRead(model, "reqRead", bit);
         const auto reqWrite = addInputRead(model, "reqWrite", bit);
@@ -1031,12 +1042,12 @@ namespace
                                      {clk, addStateRead(model, EN, "EN_r")});
         model.addOperation("core.state.latchWrite", std::array{notClk, en, one}, {},
                            std::array{ObjectRef::state(EN)});
-        addEventRegWrite(model, one, waddr, mask4, raddrD, {{gclk, "posedge"}});
-        addEventRegWrite(model, one, en, one, renD, {{gclk, "posedge"}});
-        addEventWrite(model, "core.state.memWrite", {reqWrite, waddr, wdata, mask8}, mem,
+        addEventStateWrite(model, one, waddr, mask4, raddrD, {{gclk, "posedge"}});
+        addEventStateWrite(model, one, en, one, renD, {{gclk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {reqWrite, waddr, wdata, mask8}, mem,
                       {{gclk, "posedge"}});
         addOutputWrite(model, "o", word,
-                       addMemRead(model, mem, word, addStateRead(model, raddrD, "raddr_r"), "mread"));
+                       addArrayRead(model, mem, word, {addStateRead(model, raddrD, "raddr_r")}, "mread"));
         addOutputWrite(model, "oren", bit, addStateRead(model, renD, "ren_r"));
         require(verifies(model), "ICG fixture rejected");
         runSixPhasePipeline(model, false);
@@ -1083,7 +1094,7 @@ namespace
                 std::to_string(guards) + " eventActStore guard texts");
     }
 
-    // (7c) A1 sink enable-guard subdivision: eight regWrites sharing one
+    // (7c) A1 sink enable-guard subdivision: eight writes sharing one
     // computed enable and one event signature carve out a guard-gated
     // SinkEvent supernode — the scan call site ANDs one boundary read of the
     // enable into the actBitsGuard gate, while the constant-enabled writes
@@ -1094,7 +1105,7 @@ namespace
     void sinkEnableGuardTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_sink_guard");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto enA = addInputRead(model, "enA", bit);
@@ -1109,14 +1120,14 @@ namespace
         for (uint32_t i = 0; i < 8; ++i)
         {
             const auto q = addState(model, "q" + std::to_string(i), bit, "1'b0");
-            addEventRegWrite(model, en, d, one, q, {{clk, "posedge"}});
+            addEventStateWrite(model, en, d, one, q, {{clk, "posedge"}});
             guardedStates.push_back(q);
             guardedReads.push_back(addStateRead(model, q, "q" + std::to_string(i) + "_r"));
         }
         const auto r0 = addState(model, "r0", bit, "1'b0");
         const auto r1 = addState(model, "r1", bit, "1'b0");
-        addEventRegWrite(model, one, d, one, r0, {{clk, "posedge"}});
-        addEventRegWrite(model, one, d, one, r1, {{clk, "posedge"}});
+        addEventStateWrite(model, one, d, one, r0, {{clk, "posedge"}});
+        addEventStateWrite(model, one, d, one, r1, {{clk, "posedge"}});
         auto any = guardedReads.front(), all = guardedReads.front();
         for (uint32_t i = 1; i < guardedReads.size(); ++i)
         {
@@ -1153,7 +1164,7 @@ namespace
         uint32_t sharedEnIndex = 0;
         for (const auto &op : model.operations())
         {
-            if (model.text(op.opType) != "core.state.regWrite") continue;
+            if (model.text(op.opType) != "core.state.write") continue;
             const auto refs = model.objectRefs(op);
             if (refs.size() != 1) continue;
             bool guardedWrite = false;
@@ -1221,18 +1232,20 @@ namespace
                 std::to_string(guards) + " eventActStore guard texts");
     }
 
-    // (8) Event-free mem writes converge via cell change detection: memWrite
-    // (single cell), memFill (broadcast), memAssign (whole-array copy from an
-    // initialized source). Every write re-runs every round while enabled, so
-    // any missed change detection would loop to MAX_ROUND and throw.
+    // (8) Event-free array writes converge via cell change detection:
+    // writeArray (single row), fill (broadcast), whole-array write (copy from
+    // an initialized source). Every write re-runs every round while enabled,
+    // so any missed change detection would loop to MAX_ROUND and throw.
     void memConvergeTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_mem_converge");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
+        const auto flatMask = model.logicType(128, false, LogicDomain::TwoState);
         const auto wen = addInputRead(model, "wen", bit);
         const auto waddr = addInputRead(model, "waddr", addrType);
         const auto wdata = addInputRead(model, "wdata", word);
@@ -1241,17 +1254,20 @@ namespace
         const auto fdata = addInputRead(model, "fdata", word);
         const auto cen = addInputRead(model, "cen", bit);
         const auto mask = addConstant(model, word, "8'hff");
+        const auto fullMask = addConstant(model, flatMask, "128'hffffffffffffffffffffffffffffffff");
         const auto memA = addMemState(model, "memA", memType, "8'h00");
         const auto memF = addMemState(model, "memF", memType, "8'ha5");
         const auto memC = addMemState(model, "memC", memType, "8'h00");
-        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, memA, {});
-        addEventWrite(model, "core.state.memFill", {fen, fdata}, memF, {});
+        addEventWrite(model, "core.state.writeArray", {wen, waddr, wdata, mask}, memA, {});
+        addEventWrite(model, "core.state.fill", {fen, fdata}, memF, {});
         const auto fRead = model.addValue(memType, "f_read");
         model.addOperation("core.state.read", {}, std::array{fRead}, std::array{ObjectRef::state(memF)});
-        addEventWrite(model, "core.state.memAssign", {cen, fRead}, memC, {});
-        addOutputWrite(model, "o", word, addMemRead(model, memA, word, raddr, "ra"));
-        addOutputWrite(model, "of", word, addMemRead(model, memF, word, raddr, "rf"));
-        addOutputWrite(model, "oc", word, addMemRead(model, memC, word, raddr, "rc"));
+        // Stage-06: the retired whole-array assign op is core.state.write; the
+        // all-ones mask constant folds away in the emission.
+        addEventWrite(model, "core.state.write", {cen, fRead, fullMask}, memC, {});
+        addOutputWrite(model, "o", word, addArrayRead(model, memA, word, {raddr}, "ra"));
+        addOutputWrite(model, "of", word, addArrayRead(model, memF, word, {raddr}, "rf"));
+        addOutputWrite(model, "oc", word, addArrayRead(model, memC, word, {raddr}, "rc"));
         require(verifies(model), "mem converge fixture rejected");
         runSixPhasePipeline(model, false, true);
         const auto &mapping = *model.cpuMapping();
@@ -1274,20 +1290,22 @@ namespace
         });
     }
 
-    // (9) Static/dynamic reader discrimination: an event-gated memWrite with a
-    // dynamic address; one reader reads the constant row 3, one reads a dynamic
-    // address. The write's readers table must carry the static row for the
-    // former (emit: conditional activation on overlap) and none for the latter
-    // (emit: unconditional on any change). Functionally, a write to row 5 must
-    // refresh only the dynamic reader's latch; a write to row 3 refreshes both.
-    void memReaderGatingTest(const std::filesystem::path &root)
+    // (9) Static/dynamic reader discrimination: an event-gated writeArray with
+    // a dynamic address; one reader reads the constant row 3, one reads a
+    // dynamic address. The write's readers table must carry the static row for
+    // the former (emit: conditional activation on overlap) and none for the
+    // latter (emit: unconditional on any change). Functionally, a write to
+    // row 5 must refresh only the dynamic reader's latch; a write to row 3
+    // refreshes both.
+    void arrayReaderGatingTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_mem_gating");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
         const auto clk = addInputRead(model, "clk", bit);
         const auto wen = addInputRead(model, "wen", bit);
         const auto waddr = addInputRead(model, "waddr", addrType);
@@ -1297,9 +1315,9 @@ namespace
         const auto three = addConstant(model, addrType, "4'h3");
         const auto mask = addConstant(model, word, "8'hff");
         const auto mem = addMemState(model, "mem", memType, "8'h00");
-        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, mem, {{clk, "posedge"}});
-        const auto rStatic = addMemRead(model, mem, word, three, "r_static");
-        const auto rDyn = addMemRead(model, mem, word, raddr, "r_dyn");
+        addEventWrite(model, "core.state.writeArray", {wen, waddr, wdata, mask}, mem, {{clk, "posedge"}});
+        const auto rStatic = addArrayRead(model, mem, word, {three}, "r_static");
+        const auto rDyn = addArrayRead(model, mem, word, {raddr}, "r_dyn");
         const auto latchS = addState(model, "latch_s", word, "8'h00");
         const auto latchD = addState(model, "latch_d", word, "8'h00");
         model.addOperation("core.state.latchWrite", std::array{one, rStatic, mask}, {}, std::array{ObjectRef::state(latchS)});
@@ -1348,18 +1366,21 @@ namespace
         require(activations == 2, "write body should activate exactly its two readers");
     }
 
-    // (10) memWriteSeq priority: ports apply in operand order, so the LAST
-    // triple wins an address collision (core.md: the chain head sits last).
-    // Three ports: A writes row 3 a constant 0xaa, B overwrites row 3 with
-    // input data, C (highest) writes input address/data under an enable.
+    // (10) Declaration-order write priority (stage-06: the retired write
+    // sequence op desugars to one writeArray per port; same-state writes apply
+    // in declaration order, so the LAST declared write wins an address
+    // collision). Three ports: A writes row 3 a constant 0xaa, B overwrites
+    // row 3 with input data, C (declared last) writes input address/data under
+    // an enable.
     void memPriorityTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_mem_priority");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
         const auto clk = addInputRead(model, "clk", bit);
         const auto enc = addInputRead(model, "enc", bit);
         const auto bdata = addInputRead(model, "bdata", word);
@@ -1369,14 +1390,29 @@ namespace
         const auto one = addConstant(model, bit, "1'b1");
         const auto three = addConstant(model, addrType, "4'h3");
         const auto aa = addConstant(model, word, "8'haa");
+        const auto mask8 = addConstant(model, word, "8'hff");
         const auto mem = addMemState(model, "mem", memType, "8'h00");
-        addEventWrite(model, "core.state.memWriteSeq", {one, three, aa, one, three, bdata, enc, caddr, cdata},
-                       mem, {{clk, "posedge"}});
-        addOutputWrite(model, "o", word, addMemRead(model, mem, word, raddr, "r"));
+        addEventWrite(model, "core.state.writeArray", {one, three, aa, mask8},
+                      mem, {{clk, "posedge"}}, "wa");
+        addEventWrite(model, "core.state.writeArray", {one, three, bdata, mask8},
+                      mem, {{clk, "posedge"}}, "wb");
+        addEventWrite(model, "core.state.writeArray", {enc, caddr, cdata, mask8},
+                      mem, {{clk, "posedge"}}, "wc");
+        addOutputWrite(model, "o", word, addArrayRead(model, mem, word, {raddr}, "r"));
         require(verifies(model), "mem priority fixture rejected");
         runSixPhasePipeline(model, false, true, tinyTu);
         const auto &mapping = *model.cpuMapping();
-        require(mapping.schedule->memWritePlan->size() == 1, "mem priority should have one write op");
+        // One plan entry per writeArray, in declaration order (priority = rank).
+        // Op ids renumber across the compacting pipeline, so order is checked
+        // through the op names (which survive).
+        const auto &plan = *mapping.schedule->memWritePlan;
+        const auto planNameOf = [&](const CpuMemWritePlanEntry &entry) {
+            return std::string(model.text(model.operations()[entry.writeOp.index - 1].name));
+        };
+        require(plan.size() == 3 && planNameOf(plan[0]) == "wa" && planNameOf(plan[1]) == "wb" &&
+                planNameOf(plan[2]) == "wc", "mem priority should hold the three writes in declaration order");
+        require(plan[0].priority == 0 && plan[1].priority == 1 && plan[2].priority == 2,
+                "mem priority ranks should follow the declaration order");
         compileAndRun(model, root / (tinyTu ? "mem_priority_tu" : "mem_priority"), {
             {{{"clk", "false"}, {"enc", "false"}, {"bdata", "0"}, {"caddr", "0"}, {"cdata", "0"}, {"raddr", "3"}},
              {{"o", "0"}}},
@@ -1402,11 +1438,12 @@ namespace
     void memEnableBitmapTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_mem_bitmap");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
         const auto clk = addInputRead(model, "clk", bit);
         const auto wen = addInputRead(model, "wen", bit);
         const auto bypass = addInputRead(model, "bypass", bit);
@@ -1421,10 +1458,10 @@ namespace
         const auto en = addCompute(model, "core.compute.and", bit, "en", {wen, nb});
         const auto memA = addMemState(model, "memA", memType, "8'h00");
         const auto memB = addMemState(model, "memB", memType, "8'h00");
-        addEventWrite(model, "core.state.memWrite", {en, waddr, wdata, mask}, memA, {{clk, "posedge"}});
-        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, memB, {{clk, "posedge"}});
-        addOutputWrite(model, "oa", word, addMemRead(model, memA, word, raddr, "ra"));
-        addOutputWrite(model, "ob", word, addMemRead(model, memB, word, raddr, "rb"));
+        addEventWrite(model, "core.state.writeArray", {en, waddr, wdata, mask}, memA, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {wen, waddr, wdata, mask}, memB, {{clk, "posedge"}});
+        addOutputWrite(model, "oa", word, addArrayRead(model, memA, word, {raddr}, "ra"));
+        addOutputWrite(model, "ob", word, addArrayRead(model, memB, word, {raddr}, "rb"));
         require(verifies(model), "mem enable bitmap fixture rejected");
         runSixPhasePipeline(model, false, true);
         compileAndRun(model, root / "mem_enable_bitmap", {
@@ -1491,14 +1528,15 @@ namespace
     // per-cell change compare and activate readers in one burst per
     // enable-word run; observable behavior is unchanged (same stimulus
     // vectors as the bitmap test must produce identical outputs).
-    void memWriteOnWriteTest(const std::filesystem::path &root)
+    void writeOnWriteTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_mem_onwrite");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
         const auto clk = addInputRead(model, "clk", bit);
         const auto wen = addInputRead(model, "wen", bit);
         const auto bypass = addInputRead(model, "bypass", bit);
@@ -1510,10 +1548,10 @@ namespace
         const auto en = addCompute(model, "core.compute.and", bit, "en", {wen, nb});
         const auto memA = addMemState(model, "memA", memType, "8'h00");
         const auto memB = addMemState(model, "memB", memType, "8'h00");
-        addEventWrite(model, "core.state.memWrite", {en, waddr, wdata, mask}, memA, {{clk, "posedge"}});
-        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, memB, {{clk, "posedge"}});
-        addOutputWrite(model, "oa", word, addMemRead(model, memA, word, raddr, "ra"));
-        addOutputWrite(model, "ob", word, addMemRead(model, memB, word, raddr, "rb"));
+        addEventWrite(model, "core.state.writeArray", {en, waddr, wdata, mask}, memA, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {wen, waddr, wdata, mask}, memB, {{clk, "posedge"}});
+        addOutputWrite(model, "oa", word, addArrayRead(model, memA, word, {raddr}, "ra"));
+        addOutputWrite(model, "ob", word, addArrayRead(model, memB, word, {raddr}, "rb"));
         require(verifies(model), "mem write on-write fixture rejected");
         runSixPhasePipeline(model, false, true);
         compileAndRun(model, root / "mem_onwrite", {
@@ -1549,11 +1587,12 @@ namespace
     void memActClusterDeadCompareTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_mem_cluster");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
         const auto clk = addInputRead(model, "clk", bit);
         const auto e1 = addInputRead(model, "e1", bit);
         const auto e2 = addInputRead(model, "e2", bit);
@@ -1570,10 +1609,10 @@ namespace
         const auto diff = addCompute(model, "core.compute.sub", word, "diff", {a, b});
         const auto memA = addMemState(model, "memA", memType, "8'h00");
         const auto memB = addMemState(model, "memB", memType, "8'h00");
-        addEventWrite(model, "core.state.memWrite", {en, waddr, sum, mask}, memA, {{clk, "posedge"}});
-        addEventWrite(model, "core.state.memWrite", {en, waddr, diff, mask}, memB, {{clk, "posedge"}});
-        addOutputWrite(model, "oa", word, addMemRead(model, memA, word, raddr, "ra"));
-        addOutputWrite(model, "ob", word, addMemRead(model, memB, word, raddr, "rb"));
+        addEventWrite(model, "core.state.writeArray", {en, waddr, sum, mask}, memA, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {en, waddr, diff, mask}, memB, {{clk, "posedge"}});
+        addOutputWrite(model, "oa", word, addArrayRead(model, memA, word, {raddr}, "ra"));
+        addOutputWrite(model, "ob", word, addArrayRead(model, memB, word, {raddr}, "rb"));
         require(verifies(model), "mem act cluster fixture rejected");
         runSixPhasePipeline(model, false, true);
         compileAndRun(model, root / "mem_act_cluster", {
@@ -1629,7 +1668,7 @@ namespace
     void generalDisplayTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_display");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
@@ -1684,7 +1723,7 @@ namespace
     void monitorFreeTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_monitor_free");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", bit);
         const auto b = addInputRead(model, "b", bit);
@@ -1721,7 +1760,7 @@ namespace
     void monitorEventTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_monitor_event");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto a = addInputRead(model, "a", bit);
@@ -1765,7 +1804,7 @@ namespace
     void dpiSmokeTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_dpi_smoke");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
@@ -1817,7 +1856,7 @@ namespace
     void dpiBitAbiTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_dpi_bit_abi");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto one = addConstant(model, bit, "1'b1");
         const auto input = addInputRead(model, "input", bit);
@@ -1849,7 +1888,7 @@ namespace
     void perfCountersTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_perf");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", bit);
         const auto one = addConstant(model, bit, "1'b1");
@@ -1893,46 +1932,50 @@ namespace
 
     // (16) D3 regression: a whole-array state.read of a runtime-written mem is
     // a dynamic reader in the mem write plan — after each write its supernode
-    // re-publishes the boundary copy and the event-free memAssign downstream
-    // picks up the new contents within the same eval.
-    void memAssignReadbackTest(const std::filesystem::path &root)
+    // re-publishes the boundary copy and the event-free whole-array write
+    // downstream picks up the new contents within the same eval.
+    void wholeWriteReadbackTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_mem_assign_readback");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape);
+        const auto flatMask = model.logicType(128, false, LogicDomain::TwoState);
         const auto wen = addInputRead(model, "wen", bit);
         const auto waddr = addInputRead(model, "waddr", addrType);
         const auto wdata = addInputRead(model, "wdata", word);
         const auto cen = addInputRead(model, "cen", bit);
         const auto raddr = addInputRead(model, "raddr", addrType);
         const auto mask = addConstant(model, word, "8'hff");
+        const auto fullMask = addConstant(model, flatMask, "128'hffffffffffffffffffffffffffffffff");
         const auto memF = addMemState(model, "memF", memType, "8'h00");
         const auto memC = addMemState(model, "memC", memType, "8'h00");
-        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, mask}, memF, {});
+        addEventWrite(model, "core.state.writeArray", {wen, waddr, wdata, mask}, memF, {});
         const auto fRead = model.addValue(memType, "f_read");
         model.addOperation("core.state.read", {}, std::array{fRead}, std::array{ObjectRef::state(memF)});
-        addEventWrite(model, "core.state.memAssign", {cen, fRead}, memC, {});
-        addOutputWrite(model, "oc", word, addMemRead(model, memC, word, raddr, "rc"));
-        require(verifies(model), "memAssign readback fixture rejected");
+        // Stage-06: the retired whole-array assign op is core.state.write.
+        addEventWrite(model, "core.state.write", {cen, fRead, fullMask}, memC, {});
+        addOutputWrite(model, "oc", word, addArrayRead(model, memC, word, {raddr}, "rc"));
+        require(verifies(model), "whole-write readback fixture rejected");
         runSixPhasePipeline(model, false, true);
         const auto &mapping = *model.cpuMapping();
         const auto &plan = *mapping.schedule->memWritePlan;
-        require(plan.size() == 2, "memAssign readback should have two write plan entries");
+        require(plan.size() == 2, "whole-write readback should have two write plan entries");
         // The write into memF must list the whole-array read's supernode as a
-        // dynamic reader (plan order is op-id order: the memWrite precedes the
-        // memAssign, whose target memC has no General readers at all).
+        // dynamic reader (plan order is op-id order: the writeArray precedes
+        // the whole-array write, whose target memC has no General readers).
         require(plan[0].readers.size() == 1 && !plan[0].readers[0].staticRow,
                 "memF write should carry exactly one dynamic whole-array reader");
-        require(plan[1].readers.empty(), "memC assign should have no readers");
+        require(plan[1].readers.empty(), "memC whole write should have no readers");
         compileAndRun(model, root / "mem_assign_readback", {
             {{{"wen", "false"}, {"waddr", "0"}, {"wdata", "0"}, {"cen", "false"}, {"raddr", "0"}}, {{"oc", "0"}}},
             {{{"cen", "true"}}, {{"oc", "0"}}},                       // copy of all-zero memF: no change
             {{{"wen", "true"}, {"waddr", "3"}, {"wdata", "90"}, {"raddr", "3"}}, {{"oc", "90"}}},
-            // ^ write memF[3], reader supernode re-publishes f_read, memAssign
-            // copies it — all within this eval's round loop.
+            // ^ write memF[3], reader supernode re-publishes f_read, the whole
+            // write copies it — all within this eval's round loop.
             {{{"wen", "false"}}, {{"oc", "90"}}},                     // stable
             {{{"wen", "true"}, {"wdata", "119"}}, {{"oc", "119"}}},   // overwrite propagates again
             {{{"wen", "false"}}, {{"oc", "119"}}},
@@ -1940,37 +1983,41 @@ namespace
     }
 
     // (17) Packed fill: a whole packed-array write (ingest lowers packed
-    // aggregate whole-writes to memFill with packed-width data) must slice the
-    // data per row — the legacy isPackedFill semantics — on both the scalar
-    // (<=64-bit) and wide packed-data paths.
+    // aggregate whole-writes to core.state.fill with packed-width data) must
+    // slice the data per row — the legacy isPackedFill semantics — on both the
+    // scalar (<=64-bit) and wide packed-data paths.
     void packedFillTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_packed_fill");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", bit);
         const auto one = addConstant(model, bit, "1'b1");
         // Scalar packed: two 2-bit rows, fill data 4'h9 -> row0=1, row1=2.
         const auto pair = model.logicType(2, false, LogicDomain::TwoState);
         const auto packed4 = model.logicType(4, false, LogicDomain::TwoState);
-        const auto memS = addMemState(model, "memS", model.arrayType(pair, 2), "2'h0");
-        addEventWrite(model, "core.state.memFill", {one, addConstant(model, packed4, "4'h9")},
+        const std::array<int64_t, 1> shapeS{2};
+        const auto memS = addMemState(model, "memS", model.logicType(4, false, LogicDomain::TwoState, shapeS),
+                                      "2'h0");
+        addEventWrite(model, "core.state.fill", {one, addConstant(model, packed4, "4'h9")},
                       memS, {{clk, "posedge"}});
         // Wide packed: sixteen 8-bit rows, fill data 128'h0f0e...0100 -> row i = i.
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto packed128 = model.logicType(128, false, LogicDomain::TwoState);
-        const auto memW = addMemState(model, "memW", model.arrayType(byte, 16), "8'h00");
-        addEventWrite(model, "core.state.memFill",
+        const std::array<int64_t, 1> shapeW{16};
+        const auto memW = addMemState(model, "memW", model.logicType(128, false, LogicDomain::TwoState, shapeW),
+                                      "8'h00");
+        addEventWrite(model, "core.state.fill",
                       {one, addConstant(model, packed128, "128'h0f0e0d0c0b0a09080706050403020100")},
                       memW, {{clk, "posedge"}});
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto row0 = addConstant(model, addrType, "4'h0");
         const auto row1 = addConstant(model, addrType, "4'h1");
         const auto row15 = addConstant(model, addrType, "4'hf");
-        addOutputWrite(model, "s0", pair, addMemRead(model, memS, pair, row0, "s0_r"));
-        addOutputWrite(model, "s1", pair, addMemRead(model, memS, pair, row1, "s1_r"));
-        addOutputWrite(model, "w0", byte, addMemRead(model, memW, byte, row0, "w0_r"));
-        addOutputWrite(model, "w15", byte, addMemRead(model, memW, byte, row15, "w15_r"));
+        addOutputWrite(model, "s0", pair, addArrayRead(model, memS, pair, {row0}, "s0_r"));
+        addOutputWrite(model, "s1", pair, addArrayRead(model, memS, pair, {row1}, "s1_r"));
+        addOutputWrite(model, "w0", byte, addArrayRead(model, memW, byte, {row0}, "w0_r"));
+        addOutputWrite(model, "w15", byte, addArrayRead(model, memW, byte, {row15}, "w15_r"));
         require(verifies(model), "packed fill fixture rejected");
         runSixPhasePipeline(model, false, true);
         compileAndRun(model, root / "packed_fill", {
@@ -1986,7 +2033,7 @@ namespace
     void exprPlaceholderTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_expr_stub");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto a = addInputRead(model, "a", bit);
         const auto x = model.addValue(bit, "x");
@@ -2012,18 +2059,20 @@ namespace
     // (M5d-6) General-phase regLatch-class array writes: with the default
     // classification these small arrays land in the regLatch store and their
     // writes become General-phase NBA ops inside General supernodes (the P_mem
-    // plan stays empty). Covers memWriteSeq port priority (last triple wins),
-    // masked memWrite (merge into the next buffer), event-free memFill
+    // plan stays empty). Covers the declaration-order priority chain (the
+    // retired write-sequence op's shape: the last write wins a row collision),
+    // a masked writeArray (merge into the next buffer), event-free fill
     // convergence, and the NBA visibility contract at eval granularity (the
     // same trace shape as the mem-class equivalents).
     void regLatchArrayWriteTest(const std::filesystem::path &root, bool tinyTu = false)
     {
         GrhSimModel model("phase_reglatch_write");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto addrType = model.logicType(4, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(word, 16); // 16 B: regLatch class
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(128, false, LogicDomain::TwoState, memShape); // 16 B: regLatch class
         const auto clk = addInputRead(model, "clk", bit);
         const auto enc = addInputRead(model, "enc", bit);
         const auto bdata = addInputRead(model, "bdata", word);
@@ -2038,19 +2087,24 @@ namespace
         const auto one = addConstant(model, bit, "1'b1");
         const auto three = addConstant(model, addrType, "4'h3");
         const auto aa = addConstant(model, word, "8'haa");
+        const auto mask8 = addConstant(model, word, "8'hff");
         const auto nibble = addConstant(model, word, "8'h0f");
         const auto tabS = addMemState(model, "tabS", memType, "8'h00");
         const auto tabM = addMemState(model, "tabM", memType, "8'h00");
         const auto tabF = addMemState(model, "tabF", memType, "8'h00");
-        // memWriteSeq priority chain (event-gated), a masked memWrite and an
-        // event-free fill — all on regLatch-class arrays.
-        addEventWrite(model, "core.state.memWriteSeq", {one, three, aa, one, three, bdata, enc, caddr, cdata},
+        // Declaration-order priority chain (event-gated), a masked writeArray
+        // and an event-free fill — all on regLatch-class arrays.
+        addEventWrite(model, "core.state.writeArray", {one, three, aa, mask8},
                       tabS, {{clk, "posedge"}});
-        addEventWrite(model, "core.state.memWrite", {wen, waddr, wdata, nibble}, tabM, {});
-        addEventWrite(model, "core.state.memFill", {fen, fdata}, tabF, {});
-        addOutputWrite(model, "o", word, addMemRead(model, tabS, word, raddr, "rs"));
-        addOutputWrite(model, "om", word, addMemRead(model, tabM, word, raddr, "rm"));
-        addOutputWrite(model, "of", word, addMemRead(model, tabF, word, raddr, "rf"));
+        addEventWrite(model, "core.state.writeArray", {one, three, bdata, mask8},
+                      tabS, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {enc, caddr, cdata, mask8},
+                      tabS, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {wen, waddr, wdata, nibble}, tabM, {});
+        addEventWrite(model, "core.state.fill", {fen, fdata}, tabF, {});
+        addOutputWrite(model, "o", word, addArrayRead(model, tabS, word, {raddr}, "rs"));
+        addOutputWrite(model, "om", word, addArrayRead(model, tabM, word, {raddr}, "rm"));
+        addOutputWrite(model, "of", word, addArrayRead(model, tabF, word, {raddr}, "rf"));
         require(verifies(model), "regLatch write fixture rejected");
         runSixPhasePipeline(model, false, false, tinyTu); // default classification: regLatch
         const auto &mapping = *model.cpuMapping();
@@ -2076,6 +2130,479 @@ namespace
         }, false, {}, tinyTu);
     }
 
+    // ----- Stage-06 multi-dimensional array coverage -----
+
+    const CpuStoreField *findStoreField(const GrhSimModel &model, CpuNamedStoreKind kind,
+                                        std::string_view name)
+    {
+        for (const auto &store : *model.cpuMapping()->dataLayout->namedStores)
+        {
+            if (store.kind != kind) continue;
+            for (const auto &field : store.fields)
+                if (model.text(field.name) == name) return &field;
+        }
+        return nullptr;
+    }
+
+    // The stage-06 layout contract: a shaped logic state lays out as the flat
+    // row-major array Array(element physical type, product(shape)).
+    void requireFlatArrayPhysical(const GrhSimModel &model, const CpuStoreField &field,
+                                  uint64_t rows, uint32_t elementWidth, std::string_view tag)
+    {
+        const auto &types = model.cpuMapping()->dataLayout->types;
+        const auto &physical = types[field.type.index - 1];
+        require(physical.kind == CpuTypeKind::Array && physical.count == rows,
+                std::string(tag) + ": physical type is not the flat row array");
+        const auto &element = types[physical.elementType.index - 1];
+        require(element.kind == CpuTypeKind::UInt && element.width == elementWidth,
+                std::string(tag) + ": physical element type wrong");
+    }
+
+    // (S1) shape [3,4] (12 rows x 8 bits) end to end: a two-index writeArray
+    // write port and a two-index readArray read port, including a masked
+    // write. The row-major linearization (row = i*4 + j) is checked on both
+    // store classes (mem via --mem-min-bytes 0, regLatch via the default
+    // threshold).
+    void multiDimArrayTest(const std::filesystem::path &root, bool allMem)
+    {
+        GrhSimModel model(allMem ? "phase_md_array_mem" : "phase_md_array_reg");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> arrShape{3, 4};
+        const auto arrType = model.logicType(96, false, LogicDomain::TwoState, arrShape);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto wi = addInputRead(model, "wi", idx2);
+        const auto wj = addInputRead(model, "wj", idx2);
+        const auto wdata = addInputRead(model, "wdata", byte);
+        const auto wmask = addInputRead(model, "wmask", byte);
+        const auto ri = addInputRead(model, "ri", idx2);
+        const auto rj = addInputRead(model, "rj", idx2);
+        const auto arr = addMemState(model, "arr", arrType, "8'h00");
+        addEventWrite(model, "core.state.writeArray", {wen, wi, wj, wdata, wmask},
+                      arr, {{clk, "posedge"}}, "w");
+        addOutputWrite(model, "o", byte, addArrayRead(model, arr, byte, {ri, rj}, "r"));
+        require(verifies(model), "multi-dim array fixture rejected");
+        runSixPhasePipeline(model, false, allMem);
+        const auto &mapping = *model.cpuMapping();
+        const auto *arrField = findStoreField(model, allMem ? CpuNamedStoreKind::Mem
+                                                            : CpuNamedStoreKind::RegLatch, "arr");
+        require(bool(arrField) && arrField->state == arr, "multi-dim array: store field missing");
+        requireFlatArrayPhysical(model, *arrField, 12, 8, "multi-dim array");
+        if (allMem)
+        {
+            const auto &plan = *mapping.schedule->memWritePlan;
+            // Op ids renumber across the compacting pipeline; track the write
+            // through its name instead.
+            require(plan.size() == 1 &&
+                        model.text(model.operations()[plan[0].writeOp.index - 1].name) == "w",
+                    "multi-dim array: mem-class write missing from the P_mem plan");
+        }
+        else
+        {
+            require(mapping.schedule->memWritePlan && mapping.schedule->memWritePlan->empty(),
+                    "multi-dim array: regLatch-class write must stay out of the P_mem plan");
+        }
+        compileAndRun(model, root / (allMem ? "md_array_mem" : "md_array_reg"), {
+            {{{"clk", "false"}, {"wen", "false"}, {"wi", "0"}, {"wj", "0"}, {"wdata", "0"},
+              {"wmask", "0xff"}, {"ri", "0"}, {"rj", "0"}}, {{"o", "0"}}},
+            // arr[1][2] (row 6) <= 0x5a on the posedge.
+            {{{"wen", "true"}, {"wi", "1"}, {"wj", "2"}, {"wdata", "0x5a"}}, {{"o", "0"}}},
+            {{{"clk", "true"}}, {{"o", "0"}}},
+            {{{"clk", "false"}, {"ri", "1"}, {"rj", "2"}}, {{"o", "0x5a"}}},
+            // arr[0][3] (row 3) <= 0xa5.
+            {{{"wi", "0"}, {"wj", "3"}, {"wdata", "0xa5"}, {"clk", "true"}}, {{"o", "0x5a"}}},
+            {{{"clk", "false"}, {"ri", "0"}, {"rj", "3"}}, {{"o", "0xa5"}}},
+            // Masked RMW on arr[1][2]: (0x5a & 0xf0) | (0x3c & 0x0f) = 0x5c.
+            {{{"wi", "1"}, {"wj", "2"}, {"wdata", "0x3c"}, {"wmask", "0x0f"}, {"clk", "true"}}, {{"o", "0xa5"}}},
+            {{{"clk", "false"}, {"ri", "1"}, {"rj", "2"}}, {{"o", "0x5c"}}},
+            // An edge with wen low changes nothing.
+            {{{"wen", "false"}, {"clk", "true"}}, {{"o", "0x5c"}}},
+        });
+    }
+
+    // (S2) partial indexing (k < rank): on a shape [2,3] array a single index
+    // addresses the 3-row sub-array (data/mask pack 3 x 8 bits); cross-checked
+    // against full two-index accesses — sub-array block [i] holds rows
+    // 3i..3i+2 with row 3i+j = [i][j] (row-major). Runs on both store classes.
+    void partialIndexArrayTest(const std::filesystem::path &root, bool allMem)
+    {
+        GrhSimModel model(allMem ? "phase_md_partial_mem" : "phase_md_partial_reg");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto flat24 = model.logicType(24, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> arrShape{2, 3};
+        const auto arrType = model.logicType(48, false, LogicDomain::TwoState, arrShape);
+        const std::array<int64_t, 1> rowShape{3};
+        const auto rowType = model.logicType(24, false, LogicDomain::TwoState, rowShape);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto wdata = addInputRead(model, "wdata", rowType);  // packed 3 rows
+        const auto wmask = addInputRead(model, "wmask", flat24);
+        const auto wen2 = addInputRead(model, "wen2", bit);
+        const auto fi = addInputRead(model, "fi", bit);
+        const auto fj = addInputRead(model, "fj", idx2);
+        const auto fdata = addInputRead(model, "fdata", byte);
+        const auto ri = addInputRead(model, "ri", bit);
+        const auto mask8 = addConstant(model, byte, "8'hff");
+        const auto arr = addMemState(model, "arr", arrType, "8'h00");
+        // Constant full-index reads pin the row-major layout.
+        const auto c1 = addConstant(model, bit, "1'b1");
+        const auto c0 = addConstant(model, idx2, "2'h0");
+        const auto c2 = addConstant(model, idx2, "2'h2");
+        // Sub-array (single-index) write into block 1, plus a full-index write
+        // port. The block write keeps a CONSTANT index: the CPU write
+        // emission's single-dynamic-index shortcut returns the bare index
+        // without the prod(shape[1:]) stride (cpu_phase_emit.cpp rowOf), so a
+        // dynamic block index would address the wrong rows — flagged to the
+        // lib owners instead of being covered here.
+        addEventWrite(model, "core.state.writeArray", {wen, c1, wdata, wmask}, arr, {{clk, "posedge"}});
+        addEventWrite(model, "core.state.writeArray", {wen2, fi, fj, fdata, mask8}, arr, {{clk, "posedge"}});
+        addOutputWrite(model, "orow", rowType, addArrayRead(model, arr, rowType, {ri}, "row_r"));
+        addOutputWrite(model, "oc0", byte, addArrayRead(model, arr, byte, {c1, c0}, "c10_r"));
+        addOutputWrite(model, "oc2", byte, addArrayRead(model, arr, byte, {c1, c2}, "c12_r"));
+        require(verifies(model), "partial-index fixture rejected");
+        runSixPhasePipeline(model, false, allMem);
+        compileAndRun(model, root / (allMem ? "md_partial_mem" : "md_partial_reg"), {
+            {{{"clk", "false"}, {"wen", "false"}, {"wdata", "0"},
+              {"wmask", "0xffffff"}, {"wen2", "false"}, {"fi", "false"}, {"fj", "0"},
+              {"fdata", "0"}, {"ri", "false"}}, {{"orow", "0"}, {"oc0", "0"}, {"oc2", "0"}}},
+            // Sub-array write: arr[1][0..2] <= {0x11, 0x22, 0x33}.
+            {{{"wen", "true"}, {"wdata", "0x332211"}}, {{"orow", "0"}}},
+            {{{"clk", "true"}}, {{"orow", "0"}, {"oc0", "0x11"}, {"oc2", "0x33"}}},
+            {{{"clk", "false"}, {"ri", "true"}}, {{"orow", "0x332211"}}},
+            // Masked sub-array write: only the middle row's slice is enabled.
+            {{{"wdata", "0xaa00"}, {"wmask", "0x00ff00"}, {"clk", "true"}}, {{"orow", "0x33aa11"}}},
+            {{{"clk", "false"}}, {{"orow", "0x33aa11"}, {"oc0", "0x11"}, {"oc2", "0x33"}}},
+            // Full-index write into block 0.
+            {{{"wen", "false"}, {"wen2", "true"}, {"fi", "false"}, {"fj", "1"}, {"fdata", "0x5a"},
+              {"clk", "true"}}, {{"orow", "0x33aa11"}}},
+            {{{"clk", "false"}, {"ri", "false"}}, {{"orow", "0x005a00"}}},
+            // Full-index write into block 1 shows up in the sub-array read.
+            {{{"fi", "true"}, {"fdata", "0x77"}, {"clk", "true"}}, {{"orow", "0x005a00"}}},
+            {{{"clk", "false"}, {"ri", "true"}}, {{"orow", "0x337711"}, {"oc0", "0x11"}, {"oc2", "0x33"}}},
+        });
+    }
+
+    // (S3) declaration-order priority: two writeArray ports on the same state
+    // write the same row in the same round; the LATER declared write wins
+    // (stage-03 semantics). Runs on both store classes; the mem-class run also
+    // pins the P_mem plan order/priority ranks.
+    void multiDimPriorityTest(const std::filesystem::path &root, bool allMem)
+    {
+        GrhSimModel model(allMem ? "phase_md_prio_mem" : "phase_md_prio_reg");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> arrShape{4, 4};
+        const auto arrType = model.logicType(128, false, LogicDomain::TwoState, arrShape);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto enb = addInputRead(model, "enb", bit);
+        const auto bdata = addInputRead(model, "bdata", byte);
+        const auto ri = addInputRead(model, "ri", idx2);
+        const auto rj = addInputRead(model, "rj", idx2);
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto ci = addConstant(model, idx2, "2'h1");
+        const auto cj = addConstant(model, idx2, "2'h2");
+        const auto aa = addConstant(model, byte, "8'haa");
+        const auto mask8 = addConstant(model, byte, "8'hff");
+        const auto arr = addMemState(model, "arr", arrType, "8'h00");
+        addEventWrite(model, "core.state.writeArray", {one, ci, cj, aa, mask8},
+                      arr, {{clk, "posedge"}}, "wa");
+        addEventWrite(model, "core.state.writeArray", {enb, ci, cj, bdata, mask8},
+                      arr, {{clk, "posedge"}}, "wb");
+        addOutputWrite(model, "o", byte, addArrayRead(model, arr, byte, {ri, rj}, "r"));
+        require(verifies(model), "multi-dim priority fixture rejected");
+        runSixPhasePipeline(model, false, allMem);
+        const auto &mapping = *model.cpuMapping();
+        if (allMem)
+        {
+            // P_mem commits the state's writes in declaration order: writeA
+            // (priority 0) first, writeB (priority 1) last — the winner. Op
+            // ids renumber across the compacting pipeline; track by name.
+            const auto &plan = *mapping.schedule->memWritePlan;
+            const auto planNameOf = [&](const CpuMemWritePlanEntry &entry) {
+                return std::string(model.text(model.operations()[entry.writeOp.index - 1].name));
+            };
+            require(plan.size() == 2 && planNameOf(plan[0]) == "wa" && plan[0].priority == 0 &&
+                    planNameOf(plan[1]) == "wb" && plan[1].priority == 1,
+                    "multi-dim priority: write plan lost the declaration order");
+        }
+        else
+        {
+            require(mapping.schedule->memWritePlan && mapping.schedule->memWritePlan->empty(),
+                    "multi-dim priority: regLatch-class writes must stay out of the P_mem plan");
+        }
+        compileAndRun(model, root / (allMem ? "md_prio_mem" : "md_prio_reg"), {
+            {{{"clk", "false"}, {"enb", "false"}, {"bdata", "0"}, {"ri", "1"}, {"rj", "2"}}, {{"o", "0"}}},
+            {{{"clk", "true"}}, {{"o", "0xaa"}}},   // only A fires: arr[1][2] <= 0xaa
+            {{{"clk", "false"}}, {{"o", "0xaa"}}},
+            // B (declared later) wins the row-6 collision.
+            {{{"enb", "true"}, {"bdata", "0x5c"}, {"clk", "true"}}, {{"o", "0x5c"}}},
+            {{{"bdata", "0x77"}, {"clk", "false"}}, {{"o", "0x5c"}}},
+            {{{"clk", "true"}}, {{"o", "0x77"}}},   // A writes 0xaa, B overwrites 0x77
+            {{{"enb", "false"}, {"clk", "false"}}, {{"o", "0x77"}}},
+            {{{"clk", "true"}}, {{"o", "0xaa"}}},   // B disabled: A applies alone
+        });
+    }
+
+    // (S4) wide elements x multi-dim: shape [2,3] with 96-bit rows (576 bits
+    // total, 72 bytes). Full two-index writeArray/readArray round trip; runs
+    // mem-class (72 B >= the default 64 B threshold) and regLatch-class
+    // (--mem-min-bytes raised above the state size).
+    void wideElementArrayTest(const std::filesystem::path &root, bool regLatch)
+    {
+        GrhSimModel model(regLatch ? "phase_md_wide_reg" : "phase_md_wide_mem");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto wide = model.logicType(96, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> arrShape{2, 3};
+        const auto arrType = model.logicType(576, false, LogicDomain::TwoState, arrShape);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto wi = addInputRead(model, "wi", bit);
+        const auto wj = addInputRead(model, "wj", idx2);
+        const auto wdata = addInputRead(model, "wdata", wide);
+        const auto ri = addInputRead(model, "ri", bit);
+        const auto rj = addInputRead(model, "rj", idx2);
+        const auto mask96 = addConstant(model, wide, "96'hffffffffffffffffffffffff");
+        const auto arr = addMemState(model, "arr", arrType, "96'h0");
+        addEventWrite(model, "core.state.writeArray", {wen, wi, wj, wdata, mask96}, arr,
+                      {{clk, "posedge"}});
+        addOutputWrite(model, "o", wide, addArrayRead(model, arr, wide, {ri, rj}, "r"));
+        require(verifies(model), "wide-element fixture rejected");
+        runSixPhasePipeline(model, false, false, false, 8, regLatch ? 1024 : 64);
+        const auto &mapping = *model.cpuMapping();
+        const auto *arrField = findStoreField(model, regLatch ? CpuNamedStoreKind::RegLatch
+                                                              : CpuNamedStoreKind::Mem, "arr");
+        require(bool(arrField) && arrField->state == arr, "wide-element: store field missing");
+        // 96-bit rows round up to 16-byte _BitInt cells; the flat array holds 6.
+        requireFlatArrayPhysical(model, *arrField, 6, 96, "wide-element");
+        const auto bits = [](const char *hi, const char *lo) {
+            return "(((unsigned _BitInt(96))UINT64_C(" + std::string(hi) + ")<<64)|UINT64_C(" + lo + "))";
+        };
+        const std::string v1 = bits("0xdead", "0x123456789abcdef0");
+        const std::string v2 = bits("0xbeef", "0x0f1e2d3c4b5a6978");
+        compileAndRun(model, root / (regLatch ? "md_wide_reg" : "md_wide_mem"), {
+            {{{"clk", "false"}, {"wen", "false"}, {"wi", "false"}, {"wj", "0"}, {"wdata", "0"},
+              {"ri", "false"}, {"rj", "0"}}, {{"o", "0"}}},
+            // arr[1][2] (row 5) <= v1.
+            {{{"wen", "true"}, {"wi", "true"}, {"wj", "2"}, {"wdata", v1}}, {{"o", "0"}}},
+            {{{"clk", "true"}}, {{"o", "0"}}},
+            {{{"clk", "false"}, {"ri", "true"}, {"rj", "2"}}, {{"o", v1}}},
+            // arr[0][1] (row 1) <= v2.
+            {{{"wi", "false"}, {"wj", "1"}, {"wdata", v2}, {"clk", "true"}}, {{"o", v1}}},
+            {{{"clk", "false"}, {"ri", "false"}, {"rj", "1"}}, {{"o", v2}}},
+            // An edge with wen low changes nothing.
+            {{{"wen", "false"}, {"clk", "true"}}, {{"o", v2}}},
+        });
+    }
+
+    // (S5) FST per-element registration (stage-06): a shaped regLatch state
+    // registers one var per element (arr[i][j], row-major, referencing the
+    // flat regLatchStore row), while an array whose physical byte volume
+    // exceeds 512 is skipped whole. Follows waveformTest's emit/build/run
+    // shape (the generated Makefile compiles the vendored libfst sources).
+    void waveArrayTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_wave_array");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto word64 = model.logicType(64, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> arrShape{2, 3};
+        const auto arrType = model.logicType(48, false, LogicDomain::TwoState, arrShape);
+        const std::array<int64_t, 2> bigShape{6, 11};
+        const auto bigType = model.logicType(4224, false, LogicDomain::TwoState, bigShape); // 528 B > 512
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto wi = addInputRead(model, "wi", bit);
+        const auto wj = addInputRead(model, "wj", idx2);
+        const auto wdata = addInputRead(model, "wdata", byte);
+        const auto ri = addInputRead(model, "ri", bit);
+        const auto rj = addInputRead(model, "rj", idx2);
+        const auto zero = addConstant(model, bit, "1'b0");
+        const auto zero64 = addConstant(model, word64, "64'h0");
+        const auto mask8 = addConstant(model, byte, "8'hff");
+        const auto arr = addMemState(model, "arr", arrType, "8'h00");
+        const auto big = addMemState(model, "big", bigType, "64'h0");
+        addEventWrite(model, "core.state.writeArray", {wen, wi, wj, wdata, mask8}, arr,
+                      {{clk, "posedge"}});
+        // A never-enabled fill keeps the big array a live regLatch state.
+        addEventWrite(model, "core.state.fill", {zero, zero64}, big, {});
+        addOutputWrite(model, "o", byte, addArrayRead(model, arr, byte, {ri, rj}, "r"));
+        for (const char *symbol : {"clk", "arr", "big", "o"})
+            model.addDeclaredSymbol(model.intern(symbol));
+        require(verifies(model), "wave array fixture rejected");
+        // --mem-min-bytes 1024 keeps the 528-byte big array in the regLatch
+        // store, so its FST exclusion comes from the 512-byte wave cap and
+        // not from the mem-class rule.
+        runSixPhasePipeline(model, false, false, false, 8, 1024);
+        const auto *arrField = findStoreField(model, CpuNamedStoreKind::RegLatch, "arr");
+        const auto *bigField = findStoreField(model, CpuNamedStoreKind::RegLatch, "big");
+        require(bool(arrField) && bool(bigField), "wave array: both arrays must stay regLatch-class");
+        requireFlatArrayPhysical(model, *arrField, 6, 8, "wave array");
+        const auto directory = root / "wave_array";
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        {
+            diag::Diagnostics diagnostics;
+            const auto result = emitSixPhaseCpuCpp(model, directory / "model", diagnostics, true);
+            for (const auto &message : diagnostics.messages())
+                std::cout << message.context << ": " << message.message << '\n';
+            require(result.success && !result.artifacts.empty(), "wave array emit failed");
+        }
+        const auto waveSource = concatModelSources(directory / "model");
+        require(waveSource.find("wave_setup_0") != std::string::npos,
+                "wave array emit produced no setup chunk");
+        // One var per element, row-major: arr[0][0]..arr[0][2], arr[1][0]..
+        // arr[1][2] referencing regLatchStore.arr[0..5].
+        for (const char *name : {"\"arr[0][0]\"", "\"arr[0][1]\"", "\"arr[0][2]\"",
+                                 "\"arr[1][0]\"", "\"arr[1][1]\"", "\"arr[1][2]\""})
+            require(waveSource.find(name) != std::string::npos,
+                    "wave array setup misses the per-element var " + std::string(name));
+        require(waveSource.find("&regLatchStore.arr[0]") != std::string::npos &&
+                waveSource.find("&regLatchStore.arr[5]") != std::string::npos,
+                "wave array setup should reference the flat regLatch rows");
+        require(waveSource.find("wave_add(cpu_w,\"big") == std::string::npos,
+                "the >512-byte array must be skipped whole");
+        {
+            std::ifstream generated(directory / "model" / "Makefile");
+            const std::string text{std::istreambuf_iterator<char>(generated), std::istreambuf_iterator<char>()};
+            require(text.find("fstapi.o") != std::string::npos && text.find("LIBFST_SRC_DIR") != std::string::npos,
+                    "wave array Makefile misses the libfst rules");
+        }
+        {
+            std::ofstream driver(directory / "driver.cpp");
+            driver << "#include \"grhsim_phase_wave_array.hpp\"\n#include <cstdio>\n"
+                      "int main(){\nGrhSIM_phase_wave_array sim;\nsim.init();\n"
+                      "sim.configure_waveform(true,\"wave.fst\");\n"
+                      "if(!sim.waveform_enabled())return 2;\n"
+                      "sim.clk=false;sim.wen=false;sim.wi=false;sim.wj=0;sim.wdata=0;sim.ri=true;sim.rj=2;sim.eval();\n"
+                      "sim.wen=true;sim.wi=true;sim.wj=2;sim.wdata=0x5a;sim.eval();\n"
+                      "sim.clk=true;sim.eval();\n"
+                      "sim.clk=false;sim.eval();\n"
+                      "sim.configure_waveform(false);\n"
+                      "if(sim.o!=0x5a){std::fprintf(stderr,\"arr readback mismatch\\n\");return 1;}\n"
+                      "std::printf(\"PASS\\n\");\nreturn 0;\n}\n";
+        }
+        command("make --no-print-directory -C " + quote((directory / "model").string()) + " -j 2 CXX=" + quote(WOLVRIX_TEST_CXX) +
+                " CXXFLAGS='-std=c++20 -O2 -fsanitize=undefined -fno-sanitize-recover=all'");
+        command(quote(WOLVRIX_TEST_CXX) + " -std=c++20 -O2 -fsanitize=undefined -fno-sanitize-recover=all -I" +
+                quote((directory / "model").string()) + " -I" + quote(WOLVRIX_TEST_LIBFST_INCLUDE_DIR) + " " +
+                quote((directory / "driver.cpp").string()) + " " +
+                quote((directory / "model" / "libgrhsim_phase_wave_array.a").string()) + " -lz -o " +
+                quote((directory / "driver").string()));
+        command("cd " + quote(directory.string()) + " && ./driver");
+        const auto fst = directory / "wave.fst";
+        require(std::filesystem::exists(fst) && !std::filesystem::is_empty(fst),
+                "wave array capture produced no FST output");
+    }
+
+    // (S6) layout contract: a shape [2,3] state maps to the flat row-major
+    // physical array Array(UInt8, 6) in whichever store its class selects, and
+    // a two-index Mem-phase writeArray names its boundary slots
+    // enable/idx0/idx1/data/mask (single-index writes keep the addr name).
+    void multiDimLayoutTest()
+    {
+        const auto build = [](const char *name) {
+            GrhSimModel model(name);
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+            const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+            const std::array<int64_t, 2> arrShape{2, 3};
+            const auto arrType = model.logicType(48, false, LogicDomain::TwoState, arrShape);
+            const auto clk = addInputRead(model, "clk", bit);
+            const auto wen = addInputRead(model, "wen", bit);
+            const auto wi = addInputRead(model, "wi", bit);
+            const auto wj = addInputRead(model, "wj", idx2);
+            const auto wdata = addInputRead(model, "wdata", byte);
+            const auto ri = addInputRead(model, "ri", bit);
+            const auto rj = addInputRead(model, "rj", idx2);
+            const auto mask8 = addConstant(model, byte, "8'hff");
+            const auto arr = addMemState(model, "arr", arrType, "8'h00");
+            addEventWrite(model, "core.state.writeArray", {wen, wi, wj, wdata, mask8}, arr,
+                          {{clk, "posedge"}});
+            addOutputWrite(model, "o", byte, addArrayRead(model, arr, byte, {ri, rj}, "r"));
+            require(verifies(model), "multi-dim layout fixture rejected");
+            return model;
+        };
+        {
+            auto model = build("phase_md_layout_mem");
+            runSixPhasePipeline(model, false, true);
+            const auto *arrField = findStoreField(model, CpuNamedStoreKind::Mem, "arr");
+            require(bool(arrField), "multi-dim layout: mem field missing");
+            requireFlatArrayPhysical(model, *arrField, 6, 8, "multi-dim layout");
+            for (const char *slot : {"arr__w0__enable", "arr__w0__idx0", "arr__w0__idx1",
+                                     "arr__w0__data", "arr__w0__mask"})
+                require(findStoreField(model, CpuNamedStoreKind::Boundary, slot),
+                        "multi-dim layout: writeArray boundary slot missing");
+        }
+        {
+            auto model = build("phase_md_layout_reg");
+            runSixPhasePipeline(model, false);
+            const auto *arrField = findStoreField(model, CpuNamedStoreKind::RegLatch, "arr");
+            require(bool(arrField), "multi-dim layout: reg latch field missing");
+            requireFlatArrayPhysical(model, *arrField, 6, 8, "multi-dim layout");
+        }
+    }
+
+    // (S7) whole-array read/write on a shaped state: core.state.read packs the
+    // flat rows into the total-width value; core.state.write with an all-ones
+    // mask constant writes the packed vector back row-wise (the mask folds
+    // away). Write-then-read equivalence plus per-row cross-checks on both
+    // store classes.
+    void wholeArrayWriteReadTest(const std::filesystem::path &root, bool allMem)
+    {
+        GrhSimModel model(allMem ? "phase_md_whole_mem" : "phase_md_whole_reg");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto idx2 = model.logicType(2, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const auto flat48 = model.logicType(48, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> arrShape{2, 3};
+        const auto arrType = model.logicType(48, false, LogicDomain::TwoState, arrShape);
+        const auto clk = addInputRead(model, "clk", bit);
+        const auto wen = addInputRead(model, "wen", bit);
+        const auto d48 = addInputRead(model, "d48", arrType);
+        const auto ri = addInputRead(model, "ri", bit);
+        const auto rj = addInputRead(model, "rj", idx2);
+        const auto mask48 = addConstant(model, flat48, "48'hffffffffffff");
+        const auto arr = addMemState(model, "arr", arrType, "8'h00");
+        addEventWrite(model, "core.state.write", {wen, d48, mask48}, arr, {{clk, "posedge"}});
+        addOutputWrite(model, "o48", arrType, addStateRead(model, arr, "arr_r"));
+        addOutputWrite(model, "oc", byte, addArrayRead(model, arr, byte, {ri, rj}, "cell_r"));
+        require(verifies(model), "whole-array write/read fixture rejected");
+        runSixPhasePipeline(model, false, allMem);
+        const auto directory = root / (allMem ? "md_whole_mem" : "md_whole_reg");
+        compileAndRun(model, directory, {
+            {{{"clk", "false"}, {"wen", "false"}, {"d48", "0"}, {"ri", "false"}, {"rj", "0"}},
+             {{"o48", "0"}, {"oc", "0"}}},
+            // Whole write: arr <= 0x112233445566 (row-major bytes 66 55 44 | 33 22 11).
+            {{{"wen", "true"}, {"d48", "UINT64_C(0x112233445566)"}}, {{"o48", "0"}}},
+            {{{"clk", "true"}}, {{"o48", "UINT64_C(0x112233445566)"}, {"oc", "0x66"}}},
+            {{{"clk", "false"}, {"ri", "true"}, {"rj", "2"}},
+             {{"o48", "UINT64_C(0x112233445566)"}, {"oc", "0x11"}}},
+            // An edge with wen low changes nothing.
+            {{{"wen", "false"}, {"d48", "0"}, {"clk", "true"}}, {{"oc", "0x11"}}},
+            {{{"clk", "false"}, {"ri", "false"}, {"rj", "1"}},
+             {{"o48", "UINT64_C(0x112233445566)"}, {"oc", "0x55"}}},
+        });
+        // The all-ones mask folded: the whole write is one flat row loop of
+        // per-row stores over the 6 rows.
+        const auto source = concatModelSources(directory / "model");
+        require(source.find("for(std::size_t cpu_row=0;cpu_row<6;++cpu_row)") != std::string::npos,
+                "whole-array write should emit the flat row loop");
+    }
+
     // M5d-7 multi-TU emit: a 128-bit combinational add chain (one big
     // supernode, split into helper chunks by the tiny C6 cap; the chain
     // values cross chunk boundaries through the spill frame), a 12-deep NBA
@@ -2086,7 +2613,7 @@ namespace
     void multiTuTest(const std::filesystem::path &root)
     {
         GrhSimModel model("phase_multi_tu");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto word = model.logicType(128, false, LogicDomain::TwoState);
@@ -2103,7 +2630,7 @@ namespace
         const auto q = addState(model, "q", word, "128'h0");
         const auto one = addConstant(model, bit, "1'b1");
         const auto ones128 = addConstant(model, word, "128'hffffffffffffffffffffffffffffffff");
-        addEventRegWrite(model, one, prev, ones128, q, {{clk, "posedge"}});
+        addEventStateWrite(model, one, prev, ones128, q, {{clk, "posedge"}});
         // 12-deep byte register chain: s_{i+1} <= s_i + 1 at the same edge.
         const auto one8 = addConstant(model, byte, "8'h01");
         const auto mask8 = addConstant(model, byte, "8'hff");
@@ -2113,10 +2640,12 @@ namespace
         {
             const auto read = addStateRead(model, chain[i], "sr" + std::to_string(i));
             const auto next = addCompute(model, "core.compute.add", byte, "sn" + std::to_string(i), {read, one8});
-            addEventRegWrite(model, one, next, mask8, chain[i + 1], {{clk, "posedge"}});
+            addEventStateWrite(model, one, next, mask8, chain[i + 1], {{clk, "posedge"}});
         }
         // Small array state (const init) to populate the init/dump streams.
-        const auto tab = addMemState(model, "tab", model.arrayType(byte, 4), "8'h00");
+        const std::array<int64_t, 1> tabShape{4};
+        const auto tab = addMemState(model, "tab", model.logicType(32, false, LogicDomain::TwoState, tabShape),
+                                     "8'h00");
         (void)tab;
         addOutputWrite(model, "o", byte, [&] {
             // Only the low byte is observable (the driver compares scalars).
@@ -2232,11 +2761,11 @@ int main()
         icgGatedSramTest(root);
         sinkEnableGuardTest(root);
         memConvergeTest(root);
-        memReaderGatingTest(root);
+        arrayReaderGatingTest(root);
         memPriorityTest(root);
         memPriorityTest(root, true);
         memEnableBitmapTest(root);
-        memWriteOnWriteTest(root);
+        writeOnWriteTest(root);
         memActClusterDeadCompareTest(root);
         generalDisplayTest(root);
         monitorFreeTest(root);
@@ -2250,10 +2779,25 @@ int main()
         dpiSmokeTest(root, true);
         dpiBitAbiTest(root);
         perfCountersTest(root);
-        memAssignReadbackTest(root);
+        wholeWriteReadbackTest(root);
         packedFillTest(root);
         regLatchArrayWriteTest(root);
         regLatchArrayWriteTest(root, true);
+        // Stage-06 multi-dimensional arrays: both store classes for the
+        // indexed/partial/priority/whole access patterns, wide elements, the
+        // per-element FST registration and the flat physical layout contract.
+        multiDimArrayTest(root, false);
+        multiDimArrayTest(root, true);
+        partialIndexArrayTest(root, false);
+        partialIndexArrayTest(root, true);
+        multiDimPriorityTest(root, false);
+        multiDimPriorityTest(root, true);
+        wideElementArrayTest(root, false);
+        wideElementArrayTest(root, true);
+        waveArrayTest(root);
+        multiDimLayoutTest();
+        wholeArrayWriteReadTest(root, false);
+        wholeArrayWriteReadTest(root, true);
         multiTuTest(root);
         exprPlaceholderTest(root);
         std::cout << "CPU six-phase emit tests passed\n";

@@ -98,9 +98,9 @@ namespace wolvrix::lib::grhsim
             return nullptr;
         }
 
-        // Linear bit size of a type: arrays flatten row-major (element stride =
-        // element size), non-logic scalars have no bits. Returns false on an
-        // invalid type reference or a 64-bit overflow.
+        // Linear bit size of a type: the width of a Logic type is already the
+        // total across all shape dimensions (stage-06); non-logic scalars have
+        // no bits. Returns false on an invalid type reference.
         bool linearBitSize(const GrhSimModel &model, TypeId typeId, uint64_t &out)
         {
             if (!validId(typeId, model.types().size())) return false;
@@ -114,16 +114,6 @@ namespace wolvrix::lib::grhsim
             case TypeKind::String:
                 out = 0;
                 return true;
-            case TypeKind::Array:
-            {
-                uint64_t element = 0;
-                if (!linearBitSize(model, type.elementType, element)) return false;
-                if (type.count != 0 &&
-                    element > std::numeric_limits<uint64_t>::max() / type.count)
-                    return false;
-                out = type.count * element;
-                return true;
-            }
             }
             return false;
         }
@@ -152,25 +142,9 @@ namespace wolvrix::lib::grhsim
                     error("declaration provenance symbol is not a declared symbol", context);
                 if (record.origin.valid() && !validId(record.origin, model.origins().size()))
                     error("declaration provenance origin is out of range", context);
-                uint64_t declLinear = record.width;
-                bool declOverflow = false;
-                for (const uint64_t dim : record.shape)
-                {
-                    if (dim == 0)
-                    {
-                        error("declaration provenance shape has a zero dimension", context);
-                        declOverflow = true;
-                        break;
-                    }
-                    if (declLinear > std::numeric_limits<uint64_t>::max() / dim)
-                    {
-                        error("declaration provenance shape overflows the 64-bit linear size",
-                              context);
-                        declOverflow = true;
-                        break;
-                    }
-                    declLinear *= dim;
-                }
+                // Stage-06: the declaration shape lives in the type system;
+                // record.width is the total linear bit width.
+                const uint64_t declLinear = record.width;
                 std::vector<std::pair<uint64_t, uint64_t>> declRanges;
                 for (std::size_t j = 0; j < record.slices.size(); ++j)
                 {
@@ -226,7 +200,6 @@ namespace wolvrix::lib::grhsim
                                   sliceContext);
                         continue;
                     }
-                    if (declOverflow) continue;
                     if (targetLinear == 0)
                         error("provenance slice carries bits but its target has none", sliceContext);
                     else if (slice.width > targetLinear || slice.targetOffset > targetLinear - slice.width)
@@ -253,11 +226,14 @@ namespace wolvrix::lib::grhsim
         // (split-phases, layout, emit) must read the annotation instead of
         // re-deriving it from the state's type. Structural rules only:
         // classification is total once present, the mem class requires a
-        // contiguous array state, and a mem-class state's writes must be mem
-        // ops so P_mem can own the in-place commit (regWrite/latchWrite would
-        // bypass it). The per-class NBA contract itself (commit timing,
-        // old-value reads, partial writes, multi-write priority, multi-round
-        // accumulation) is defined by the select-state-stores pass doc.
+        // contiguous shaped (array) state, and a mem-class state's writes go
+        // through the class-aware phase rule so P_mem owns the in-place
+        // commit (stage-06: write absorbs the old whole-array memAssign, so
+        // the write family is class-neutral; latchWrite stays scalar-only and
+        // may never target a mem-class state). The per-class NBA contract
+        // itself (commit timing, old-value reads, partial writes,
+        // declaration-order multi-write priority, multi-round accumulation)
+        // is defined by the select-state-stores pass doc.
         bool verifyStateStores(const GrhSimModel &model, diag::Diagnostics &diagnostics)
         {
             bool ok = true;
@@ -283,8 +259,9 @@ namespace wolvrix::lib::grhsim
                 if (state.storeClass == StateStoreClass::Mem)
                 {
                     if (!validId(state.type, model.types().size())) continue;
-                    if (model.types()[state.type.index - 1].kind != TypeKind::Array)
-                        error("mem store class requires a core.array state", context);
+                    const Type &type = model.types()[state.type.index - 1];
+                    if (type.kind != TypeKind::Logic || type.shape.empty())
+                        error("mem store class requires a shaped (array) state", context);
                 }
             }
             for (std::size_t i = 0; i < model.operations().size(); ++i)
@@ -292,7 +269,7 @@ namespace wolvrix::lib::grhsim
                 const SimOp &op = model.operations()[i];
                 if (!model.strings().valid(op.opType)) continue;
                 const std::string_view name = model.text(op.opType);
-                if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
+                if (name != "core.state.latchWrite") continue;
                 std::span<const ObjectRef> refs;
                 try
                 {
@@ -306,13 +283,88 @@ namespace wolvrix::lib::grhsim
                     !validId(StateId{refs[0].index, 0}, model.states().size()))
                     continue;
                 if (model.states()[refs[0].index - 1].storeClass == StateStoreClass::Mem)
-                    error(std::string(name) + " targets a mem-class state; mem states may only "
-                          "be written by core.state.mem* ops so P_mem owns the commit",
+                    error("core.state.latchWrite targets a mem-class state; mem states may only "
+                          "be written by core.state.write/writeArray/fill ops so P_mem owns "
+                          "the commit",
                           "operations[" + std::to_string(i) + "]");
             }
             return ok;
         }
 
+
+        // Stage-06 state access op helpers. The checks compare type GEOMETRY
+        // (kind + total width + shape) and deliberately ignore sign/domain:
+        // assignment moves bits, and the GRH side does not pin the signedness
+        // of a port's data/result value to the declaration's (widths and
+        // shapes are the contract).
+        const Type *modelType(const GrhSimModel &model, TypeId id) noexcept
+        {
+            if (!validId(id, model.types().size())) return nullptr;
+            return &model.types()[id.index - 1];
+        }
+        const Type *valueType(const GrhSimModel &model, ValueId value) noexcept
+        {
+            if (!validId(value, model.values().size())) return nullptr;
+            return modelType(model, model.values()[value.index - 1].type);
+        }
+        const Type *stateRefType(const GrhSimModel &model, ObjectRef ref) noexcept
+        {
+            if (ref.kind != ObjectKind::State ||
+                !validId(StateId{ref.index, 0}, model.states().size()))
+                return nullptr;
+            return modelType(model, model.states()[ref.index - 1].type);
+        }
+        bool scalarLogic(const Type *type) noexcept
+        {
+            return type && type->kind == TypeKind::Logic && type->shape.empty();
+        }
+        // State-boundary value contract (stage-06): a value read from or
+        // written to a state must carry the same TOTAL bit width; the shape
+        // of the value may differ from the state's (or be absent) — shape is
+        // a structural view over the flat bits (stage-01), and GRH legitimately
+        // hands flat values to array-state ports. Non-logic states keep exact
+        // type identity (they are interned singletons).
+        bool stateValueGeometryOk(const Type *actual, const Type &expected) noexcept
+        {
+            if (!actual) return false;
+            if (expected.kind != TypeKind::Logic) return actual->kind == expected.kind;
+            return actual->kind == TypeKind::Logic && actual->width == expected.width;
+        }
+        // Geometry of a k-index access (1 <= k <= rank) into a shaped type:
+        // the result/data width is elementWidth * product(shape[k:]) and its
+        // shape is the shape[k:] suffix (empty at k == rank).
+        bool indexedAccessGeometry(const Type &arrayType, std::size_t indexCount,
+                                   uint32_t &width, std::span<const int64_t> &shape) noexcept
+        {
+            const std::optional<uint32_t> elementWidth = typeElementWidth(arrayType);
+            if (!elementWidth || indexCount < 1 || indexCount > arrayType.shape.size())
+                return false;
+            uint64_t slots = 1;
+            for (std::size_t dim = indexCount; dim < arrayType.shape.size(); ++dim)
+                slots *= static_cast<uint64_t>(arrayType.shape[dim]);
+            const uint64_t total = slots * *elementWidth;
+            if (total == 0 || total > UINT32_MAX) return false;
+            width = static_cast<uint32_t>(total);
+            shape = std::span<const int64_t>(arrayType.shape).subspan(indexCount);
+            return true;
+        }
+        // Indexed-access result/data contract: the type must be the addressed
+        // element's / remaining-dims sub-array's TOTAL width (shape of the
+        // value itself is a view and may differ; see stateValueGeometryOk).
+        bool indexedAccessTypeMatches(const Type *actual, uint32_t width) noexcept
+        {
+            return actual && actual->kind == TypeKind::Logic && actual->width == width;
+        }
+        // Trailing event operand count of a pre-lowering write op (the
+        // event_edges parameter); 0 for the lowered event_acts form.
+        std::size_t eventOperandCount(const GrhSimModel &model,
+                                      std::span<const Parameter> parameters)
+        {
+            const Parameter *edges = findParameter(model, parameters, "event_edges");
+            if (!edges) return 0;
+            const auto *texts = std::get_if<std::vector<std::string>>(&edges->value);
+            return texts ? texts->size() : 0;
+        }
 
         // M2b exception: latchWrite may also carry Output — the timeslot
         // __tslot_prev_* write-backs live in P_output (verifyOutputLowering
@@ -343,28 +395,41 @@ namespace wolvrix::lib::grhsim
                     unconditional = true;
                 }
                 else if (name == "core.output.write") required = SimPhase::Output;
-                else if (name == "core.state.memWrite" || name == "core.state.memFill" ||
-                         name == "core.state.memAssign" || name == "core.state.memWriteSeq")
+                else if (name == "core.state.write" || name == "core.state.writeArray" ||
+                         name == "core.state.fill")
                 {
+                    // Stage-06 class-aware routing: writes to mem-class states
+                    // commit in P_mem; writes to regLatch-class states take
+                    // the General NBA path. On an unclassified model the
+                    // target's shape decides (shaped = array = legacy Mem
+                    // default); an unresolvable ref falls back the same way
+                    // (the structural checks report it separately).
                     required = SimPhase::Mem;
-                    if (classified)
+                    std::span<const ObjectRef> refs;
+                    try
                     {
-                        std::span<const ObjectRef> refs;
-                        try
+                        refs = model.objectRefs(op);
+                    }
+                    catch (const std::exception &)
+                    {
+                        refs = {};
+                    }
+                    if (!refs.empty() && refs[0].kind == ObjectKind::State &&
+                        validId(StateId{refs[0].index, 0}, model.states().size()))
+                    {
+                        const auto &state = model.states()[refs[0].index - 1];
+                        if (classified)
                         {
-                            refs = model.objectRefs(op);
+                            if (state.storeClass == StateStoreClass::RegLatch)
+                                required = SimPhase::General;
                         }
-                        catch (const std::exception &)
-                        {
-                            refs = {};
-                        }
-                        if (!refs.empty() && refs[0].kind == ObjectKind::State &&
-                            validId(StateId{refs[0].index, 0}, model.states().size()) &&
-                            model.states()[refs[0].index - 1].storeClass == StateStoreClass::RegLatch)
+                        else if (validId(state.type, model.types().size()) &&
+                                 model.types()[state.type.index - 1].shape.empty())
                             required = SimPhase::General;
                     }
+                    else if (name == "core.state.write")
+                        required = SimPhase::General;
                 }
-                else if (name == "core.state.regWrite") required = SimPhase::General;
                 else if (name == "core.state.latchWrite")
                 {
                     required = SimPhase::General;
@@ -585,12 +650,10 @@ namespace wolvrix::lib::grhsim
                                                       ? model.text(op.opType)
                                                       : std::string_view{};
                     bool shapeOk = true;
-                    if (name == "core.state.regWrite") shapeOk = operands.size() == 3;
-                    else if (name == "core.state.memWrite") shapeOk = operands.size() == 4;
-                    else if (name == "core.state.memFill" || name == "core.state.memAssign")
+                    if (name == "core.state.write") shapeOk = operands.size() == 3;
+                    else if (name == "core.state.writeArray") shapeOk = operands.size() >= 4;
+                    else if (name == "core.state.fill")
                         shapeOk = operands.size() == 2;
-                    else if (name == "core.state.memWriteSeq")
-                        shapeOk = !operands.empty() && operands.size() % 3 == 0;
                     else if (name == "core.system.task") shapeOk = refs.empty();
                     else if (name == "core.dpi.call") shapeOk = refs.size() == 1;
                     else shapeOk = false;
@@ -645,9 +708,8 @@ namespace wolvrix::lib::grhsim
                 if (op.phase == SimPhase::Output) hasOutput = true;
 
             const auto stateWriteType = [](std::string_view name) {
-                return name == "core.state.regWrite" || name == "core.state.latchWrite" ||
-                       name == "core.state.memWrite" || name == "core.state.memFill" ||
-                       name == "core.state.memAssign" || name == "core.state.memWriteSeq";
+                return name == "core.state.write" || name == "core.state.writeArray" ||
+                       name == "core.state.fill" || name == "core.state.latchWrite";
             };
 
             for (std::size_t i = 0; i < model.operations().size(); ++i)
@@ -828,21 +890,28 @@ namespace wolvrix::lib::grhsim
                 error("type has an unknown dialect reference", context);
             else if (model.text(type.typeRef).starts_with("cpu."))
                 error("CPU types may only occur in backend mappings", context);
+            // Stage-06 shape rules (isomorphic to the GRH verify pass): every
+            // dimension is positive, the dimension product does not overflow
+            // and divides the total width; only logic types carry a shape.
             switch (type.kind)
             {
             case TypeKind::Logic:
                 if (type.width == 0) error("core.logic width must be greater than zero", context);
-                if (type.elementType.valid() || type.count != 0)
-                    error("core.logic has array-only fields", context);
-                break;
-            case TypeKind::Array:
-                if (!validId(type.elementType, model.types().size()))
-                    error("core.array element type is invalid", context);
-                if (type.width != 0) error("core.array has logic-only width", context);
+                if (!type.shape.empty())
+                {
+                    const std::optional<uint64_t> elements = shapeElementCount(type.shape);
+                    if (!elements)
+                        error("core.logic shape dimensions must be positive and their product "
+                              "must not overflow",
+                              context);
+                    else if (*elements > type.width || type.width % *elements != 0)
+                        error("core.logic shape dimension product must divide the total width",
+                              context);
+                }
                 break;
             case TypeKind::Real:
             case TypeKind::String:
-                if (type.width != 0 || type.elementType.valid() || type.count != 0)
+                if (type.width != 0 || !type.shape.empty())
                     error("scalar non-logic type has incompatible fields", context);
                 break;
             }
@@ -986,7 +1055,9 @@ namespace wolvrix::lib::grhsim
             {
                 int8_t &validity = opReferenceValidity[op.opType.index];
                 if (validity == 0) validity = registry.hasOp(model.text(op.opType)) ? 1 : -1;
-                if (validity < 0) error("operation has an unknown dialect reference", context());
+                if (validity < 0)
+                    error("operation has an unknown dialect reference: " +
+                          std::string(model.text(op.opType)), context());
             }
             if (!validOptionalString(model, op.name)) error("operation name is invalid", context());
             if (op.origin.valid()) verifyOriginRef(op.origin, context());
@@ -1022,12 +1093,236 @@ namespace wolvrix::lib::grhsim
                         refs[0].kind != ObjectKind::Output)
                         error("core.output.write must have 1 operand, 0 results and 1 output ref", context());
                 }
-                else if (opName == "core.state.read" || opName == "core.state.memRead")
+                else if (opName == "core.state.read")
                 {
-                    const std::size_t expectedOperands = opName == "core.state.read" ? 0 : 1;
-                    if (operands.size() != expectedOperands || results.size() != 1 || refs.size() != 1 ||
+                    // Whole read (stage-06 Q4): the result carries the state's
+                    // full type, shape included for array states.
+                    if (!operands.empty() || results.size() != 1 || refs.size() != 1 ||
                         refs[0].kind != ObjectKind::State)
-                        error("core state read operation has an invalid shape", context());
+                        error("core.state.read must have 0 operands, 1 result and 1 state ref",
+                              context());
+                    else
+                    {
+                        const Type *resultType = valueType(model, results[0]);
+                        const Type *stateT = stateRefType(model, refs[0]);
+                        if (!stateT || !stateValueGeometryOk(resultType, *stateT))
+                            error("core.state.read result type must match the state type "
+                                  "(result=" +
+                                      (resultType
+                                           ? std::to_string(resultType->width) + "b shape=[" +
+                                                 [&] {
+                                                     std::string s;
+                                                     for (const int64_t d : resultType->shape)
+                                                         s += (s.empty() ? "" : ",") +
+                                                              std::to_string(d);
+                                                     return s;
+                                                 }() +
+                                                 "]"
+                                           : std::string("?")) +
+                                      " state=" +
+                                      (stateT ? std::to_string(stateT->width) + "b shape=[" +
+                                                    [&] {
+                                                        std::string s;
+                                                        for (const int64_t d : stateT->shape)
+                                                            s += (s.empty() ? "" : ",") +
+                                                                 std::to_string(d);
+                                                        return s;
+                                                    }() +
+                                                    "]"
+                                              : std::string("?")) +
+                                      ")",
+                                  context());
+                    }
+                }
+                else if (opName == "core.state.readArray")
+                {
+                    // Indexed read: 1..rank index operands; the result is the
+                    // element (k == rank) or the remaining-dims sub-array.
+                    const Type *target =
+                        refs.size() == 1 ? stateRefType(model, refs[0]) : nullptr;
+                    uint32_t accessWidth = 0;
+                    std::span<const int64_t> accessShape;
+                    if (results.size() != 1 || refs.size() != 1 ||
+                        refs[0].kind != ObjectKind::State || !target || target->shape.empty())
+                        error("core.state.readArray must have 1 result and 1 shaped state ref",
+                              context());
+                    else if (!indexedAccessGeometry(*target, operands.size(), accessWidth,
+                                                    accessShape))
+                        error("core.state.readArray index count is out of the state rank range",
+                              context());
+                    else
+                    {
+                        for (const ValueId index : operands)
+                            if (!scalarLogic(valueType(model, index)))
+                            {
+                                error("core.state.readArray indices must be scalar logic values",
+                                      context());
+                                break;
+                            }
+                        if (!indexedAccessTypeMatches(valueType(model, results[0]), accessWidth))
+                            error("core.state.readArray result type must be the addressed "
+                                  "element / remaining-dims sub-array type",
+                                  context());
+                    }
+                }
+                else if (opName == "core.state.write" ||
+                         opName == "core.state.writeArray" ||
+                         opName == "core.state.fill" ||
+                         opName == "core.state.latchWrite")
+                {
+                    // write:      [updateCond, nextValue, mask, events...]
+                    // writeArray: [updateCond, i0..ik-1, data, mask, events...]
+                    // fill:       [updateCond, data, events...]
+                    // latchWrite: [updateCond, nextValue, mask] (level-sensitive)
+                    const std::size_t events =
+                        opName == "core.state.latchWrite" ? 0
+                                                          : eventOperandCount(model, parameters);
+                    const Type *target =
+                        refs.size() == 1 ? stateRefType(model, refs[0]) : nullptr;
+                    if (!results.empty() || refs.size() != 1 ||
+                        refs[0].kind != ObjectKind::State || !target)
+                    {
+                        error("core.state write op must have 0 results and 1 state ref",
+                              context());
+                    }
+                    else if (opName == "core.state.write")
+                    {
+                        bool valid = operands.size() == 3 + events &&
+                                     scalarLogic(valueType(model, operands[0])) &&
+                                     stateValueGeometryOk(valueType(model, operands[1]),
+                                                          *target);
+                        const Type *mask = operands.size() >= 3 ? valueType(model, operands[2])
+                                                                : nullptr;
+                        valid = valid && scalarLogic(mask) && mask->width == target->width;
+                        if (!valid)
+                        {
+                            const Type *data = operands.size() >= 2 ? valueType(model, operands[1])
+                                                                    : nullptr;
+                            error("core.state.write must be [updateCond, nextValue(state type), "
+                                  "mask(full-width scalar), events...] (operands=" +
+                                      std::to_string(operands.size()) + " events=" +
+                                      std::to_string(events) + " data=" +
+                                      (data ? std::to_string(data->width) + "b shape=" +
+                                                  std::to_string(data->shape.size()) + "d"
+                                            : std::string("?")) +
+                                      " state=" + std::to_string(target->width) + "b shape=" +
+                                      std::to_string(target->shape.size()) + "d mask=" +
+                                      (mask ? std::to_string(mask->width) : std::string("?")) +
+                                      ")",
+                                  context());
+                        }
+                    }
+                    else if (opName == "core.state.writeArray")
+                    {
+                        uint32_t accessWidth = 0;
+                        std::span<const int64_t> accessShape;
+                        if (target->shape.empty() || operands.size() < 4 + events)
+                        {
+                            error("core.state.writeArray must target a shaped state with "
+                                  "[updateCond, i0..ik-1, data, mask, events...]",
+                                  context());
+                        }
+                        else
+                        {
+                            const std::size_t indexCount = operands.size() - 3 - events;
+                            if (!indexedAccessGeometry(*target, indexCount, accessWidth,
+                                                       accessShape))
+                            {
+                                error("core.state.writeArray index count is out of the state "
+                                      "rank range",
+                                      context());
+                            }
+                            else
+                            {
+                                bool valid = scalarLogic(valueType(model, operands[0]));
+                                for (std::size_t i = 1; i <= indexCount && valid; ++i)
+                                    valid = scalarLogic(valueType(model, operands[i]));
+                                if (valid &&
+                                    !indexedAccessTypeMatches(
+                                        valueType(model, operands[1 + indexCount]),
+                                        accessWidth))
+                                    valid = false;
+                                const Type *mask = valueType(model, operands[2 + indexCount]);
+                                if (valid && (!scalarLogic(mask) || mask->width != accessWidth))
+                                    valid = false;
+                                if (!valid)
+                                    error("core.state.writeArray indices must be scalar logic, "
+                                          "data must be the addressed element / remaining-dims "
+                                          "sub-array type and mask its full-width scalar",
+                                          context());
+                            }
+                        }
+                    }
+                    else if (opName == "core.state.fill")
+                    {
+                        bool valid = operands.size() == 2 + events && !target->shape.empty() &&
+                                     scalarLogic(valueType(model, operands[0]));
+                        if (valid)
+                        {
+                            // Broadcast (element-width data) or packed
+                            // (full-width data sliced row-major) fill.
+                            const Type *data = valueType(model, operands[1]);
+                            const std::optional<uint32_t> elementWidth =
+                                typeElementWidth(*target);
+                            valid = data && data->kind == TypeKind::Logic && elementWidth &&
+                                    (data->width == *elementWidth ||
+                                     data->width == target->width);
+                            if (valid && data->width == *elementWidth)
+                                valid = data->shape.empty();
+                        }
+                        if (!valid)
+                            error("core.state.fill must be [updateCond, data(element-width or "
+                                  "full-width), events...] on a shaped state",
+                                  context());
+                    }
+                    else // latchWrite
+                    {
+                        const Type *mask = operands.size() >= 3 ? valueType(model, operands[2])
+                                                                : nullptr;
+                        const bool valid = operands.size() == 3 && target->shape.empty() &&
+                                           scalarLogic(valueType(model, operands[0])) &&
+                                           stateValueGeometryOk(valueType(model, operands[1]),
+                                                                *target) &&
+                                           scalarLogic(mask) && mask->width == target->width;
+                        if (!valid)
+                            error("core.state.latchWrite must be [updateCond, nextValue(state "
+                                  "type), mask(full-width scalar)] on a scalar state",
+                                  context());
+                    }
+                }
+                else if (opName == "core.compute.sliceArray")
+                {
+                    // Array value access (stage-02/stage-06): [base, i0..ik-1],
+                    // 1 <= k <= rank(base); the result is the element or the
+                    // remaining-dims sub-array.
+                    const Type *base =
+                        operands.empty() ? nullptr : valueType(model, operands.front());
+                    uint32_t accessWidth = 0;
+                    std::span<const int64_t> accessShape;
+                    if (operands.size() < 2 || results.size() != 1 || !refs.empty() || !base ||
+                        base->kind != TypeKind::Logic || base->shape.empty())
+                        error("core.compute.sliceArray requires a shaped logic base value, "
+                              "1..rank index operands and 1 result",
+                              context());
+                    else if (!indexedAccessGeometry(*base, operands.size() - 1, accessWidth,
+                                                    accessShape))
+                        error("core.compute.sliceArray index count is out of the base rank range",
+                              context());
+                    else
+                    {
+                        for (std::size_t i = 1; i < operands.size(); ++i)
+                            if (!scalarLogic(valueType(model, operands[i])))
+                            {
+                                error("core.compute.sliceArray indices must be scalar logic "
+                                      "values",
+                                      context());
+                                break;
+                            }
+                        if (!indexedAccessTypeMatches(valueType(model, results[0]), accessWidth))
+                            error("core.compute.sliceArray result type must be the addressed "
+                                  "element / remaining-dims sub-array type",
+                                  context());
+                    }
                 }
                 else if (opName == "core.system.function" && results.size() != 1)
                 {

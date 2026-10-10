@@ -55,10 +55,6 @@ namespace wolvrix::lib::grhsim
                     branch.attrs.phase != phaseOrder[i])
                     return error("six-phase branch order must be event, general, mem, output");
             }
-            const auto memWrite = [](std::string_view type) {
-                return type == "core.state.memWrite" || type == "core.state.memFill" ||
-                       type == "core.state.memAssign" || type == "core.state.memWriteSeq";
-            };
             std::vector<bool> visited(tree.partitions.size() + 1);
             std::vector<bool> covered(model.operations().size() + 1);
             std::vector<OpId> eventOps, generalOps, memOps, outputOps;
@@ -228,7 +224,7 @@ namespace wolvrix::lib::grhsim
                                           phase == CpuPhase::General ? SimPhase::General :
                                           phase == CpuPhase::Mem ? SimPhase::Mem : SimPhase::Output;
                     if (op.phase != required) return error("op belongs to the wrong phase branch");
-                    if (phase == CpuPhase::Mem && !memWrite(model.text(op.opType)))
+                    if (phase == CpuPhase::Mem && !isCpuPhaseMemWriteOp(model.text(op.opType)))
                         return error("mem branch holds only memory write ops");
                     (phase == CpuPhase::Event ? eventOps : phase == CpuPhase::General ? generalOps :
                      phase == CpuPhase::Mem ? memOps : outputOps).push_back(opId);

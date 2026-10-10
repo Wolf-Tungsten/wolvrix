@@ -13,23 +13,27 @@ namespace wolvrix::lib::grhsim
     {
         std::string error;
         if (!registry.registerDialect(
-                DialectDefinition{"core", "1", "wolvrix.grhsim.core.v1"}, error))
+                DialectDefinition{"core", "1", "wolvrix.grhsim.core.v2"}, error))
         {
             return false;
         }
 
-        constexpr std::array<std::string_view, 4> types = {
-            "core.logic", "core.real", "core.string", "core.array"};
+        constexpr std::array<std::string_view, 3> types = {
+            "core.logic", "core.real", "core.string"};
         for (std::string_view name : types)
         {
             if (!registry.registerType("core", name, error)) return false;
         }
 
-        constexpr std::array<std::string_view, 49> ops = {
+        // Stage-06 state access family: read/readArray (whole / indexed read),
+        // write/writeArray (whole / indexed masked write) and fill (broadcast
+        // or packed whole-array write); same-state writes apply in op
+        // declaration order (stage-03 semantics). The retired regWrite/mem*
+        // names are no longer registered.
+        constexpr std::array<std::string_view, 47> ops = {
             "core.input.read", "core.output.write",
-            "core.state.read", "core.state.regWrite", "core.state.latchWrite",
-            "core.state.memRead", "core.state.memWrite", "core.state.memFill",
-            "core.state.memAssign", "core.state.memWriteSeq",
+            "core.state.read", "core.state.readArray", "core.state.write",
+            "core.state.writeArray", "core.state.fill", "core.state.latchWrite",
             "core.system.function", "core.system.task", "core.dpi.call",
             "core.compute.constant", "core.compute.add", "core.compute.sub",
             "core.compute.mul", "core.compute.div", "core.compute.mod",

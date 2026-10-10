@@ -20,8 +20,9 @@ namespace wolvrix::lib::grhsim
             if (model.text(op.opType) != "core.compute.constant" || results.size() != 1 ||
                 !model.operands(op).empty() || !model.objectRefs(op).empty() || model.parameters(op).size() != 1) return {};
             const auto &type = model.types()[model.values()[results[0].index - 1].type.index - 1];
+            // Scalar only: shaped (array) values are not folded here.
             if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
-                type.width == 0 || type.width > 64) return {};
+                !type.shape.empty() || type.width == 0 || type.width > 64) return {};
             for (const auto &parameter : model.parameters(op))
             {
                 if (model.text(parameter.name) != "constValue" && model.text(parameter.name) != "value") continue;
@@ -55,7 +56,8 @@ namespace wolvrix::lib::grhsim
             if (name == "core.compute.mux" && operands.size() == 3 && sameType(operands[1]) && sameType(operands[2]))
             {
                 const auto &conditionType = model.types()[model.values()[operands[0].index - 1].type.index - 1];
-                if (conditionType.kind != TypeKind::Logic || conditionType.domain != LogicDomain::TwoState) return {};
+                if (conditionType.kind != TypeKind::Logic || conditionType.domain != LogicDomain::TwoState ||
+                    !conditionType.shape.empty()) return {};
                 if (operands[1] == operands[2]) return operands[1];
                 if (const auto condition = constants[operands[0].index]) return *condition ? operands[1] : operands[2];
                 return {};
@@ -168,7 +170,7 @@ namespace wolvrix::lib::grhsim
                     for (auto ref : refs)
                         if (ref.kind == ObjectKind::State) local[ref.index] = 0;
                 if (name == "core.state.read") ++allowed[refs[0].index];
-                else if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                else if (name == "core.state.write" || name == "core.state.latchWrite")
                 { ++allowed[refs[0].index]; ++writers[refs[0].index]; }
             }
             std::vector<StateId> canonical(references.size());
@@ -181,15 +183,19 @@ namespace wolvrix::lib::grhsim
             {
                 if (!scope.inScope(op.phase)) continue;
                 const auto name = model.text(op.opType);
-                if (name != "core.state.regWrite" && name != "core.state.latchWrite") continue;
+                if (name != "core.state.write" && name != "core.state.latchWrite") continue;
                 const auto refs = model.objectRefs(op);
                 const StateId state{refs[0].index, 0};
                 const auto &type = model.types()[model.states()[state.index - 1].type.index - 1];
-                if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
+                // Scalar states only: a shaped (array) state never coalesces
+                // (an array write also covers the retired whole-array assign,
+                // whose targets must keep their identity).
+                if (type.kind != TypeKind::Logic || !type.shape.empty() ||
+                    type.domain != LogicDomain::TwoState ||
                     writers[state.index] != 1 || references[state.index] != allowed[state.index] ||
                     initial[state.index].empty() || !local[state.index]) continue;
                 // The writer's phase belongs to the key: stores written in
-                // different phases (e.g. a General regWrite vs an Output
+                // different phases (e.g. a General write vs an Output
                 // __tslot_prev write-back) live in different named stores and
                 // must not coalesce.
                 std::string key = std::to_string(static_cast<unsigned>(op.phase)) + ':' +
@@ -220,6 +226,9 @@ namespace wolvrix::lib::grhsim
                 const auto state = canonical[model.objectRefs(op)[0].index];
                 if (!sharedTargets[state.index]) continue;
                 const auto type = model.values()[result.index - 1].type;
+                // Conservative: only scalar reads share (the result type is the
+                // state type, so this also excludes shaped states).
+                if (!model.types()[type.index - 1].shape.empty()) continue;
                 const std::tuple key{state.index, type.index, static_cast<unsigned>(op.phase)};
                 const auto [entry, inserted] = reads.emplace(key, result);
                 if (inserted) continue;
@@ -313,6 +322,7 @@ namespace wolvrix::lib::grhsim
                     const auto typeId = model.values()[results[0].index - 1].type;
                     const auto &type = model.types()[typeId.index - 1];
                     if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
+                        type.shape.empty() &&
                         typeId == model.values()[operands[0].index - 1].type &&
                         !outOfScopeConsumer[results[0].index] &&
                         phaseCompatible(op.phase, phaseOf(operands[0])))
@@ -383,7 +393,8 @@ namespace wolvrix::lib::grhsim
                         !model.parameters(op).empty()) continue;
                     const auto resultTypeId = model.values()[results[0].index - 1].type;
                     const auto &resultType = model.types()[resultTypeId.index - 1];
-                    if (resultType.kind != TypeKind::Logic || resultType.domain != LogicDomain::TwoState) continue;
+                    if (resultType.kind != TypeKind::Logic || resultType.domain != LogicDomain::TwoState ||
+                        !resultType.shape.empty()) continue;
                     ValueId source{}; int64_t low = 0, high = -1; bool match = true;
                     for (std::size_t i = 0; i < args.size() && match; ++i)
                     {
@@ -408,6 +419,7 @@ namespace wolvrix::lib::grhsim
                         if (!match || !start || !end || *start < 0 || *end < *start) { match = false; break; }
                         const auto &valueType = model.types()[model.values()[value.index - 1].type.index - 1];
                         if (valueType.kind != TypeKind::Logic || valueType.domain != LogicDomain::TwoState ||
+                            !valueType.shape.empty() ||
                             valueType.width != static_cast<uint64_t>(*end - *start + 1)) { match = false; break; }
                         const auto sliceSource = root(sliceArgs[0]);
                         if (i == 0) { source = sliceSource; high = *end; }
@@ -417,6 +429,7 @@ namespace wolvrix::lib::grhsim
                     if (!match) continue;
                     const auto &sourceType = model.types()[model.values()[source.index - 1].type.index - 1];
                     if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState ||
+                        !sourceType.shape.empty() ||
                         high >= static_cast<int64_t>(sourceType.width) ||
                         high - low + 1 != static_cast<int64_t>(resultType.width)) continue;
                     if (low == 0 && high + 1 == static_cast<int64_t>(sourceType.width) &&
@@ -461,7 +474,8 @@ namespace wolvrix::lib::grhsim
                     {
                         const auto type = model.values()[results[0].index - 1].type;
                         const auto &resultType = model.types()[type.index - 1];
-                        pure = resultType.kind == TypeKind::Logic && resultType.domain == LogicDomain::TwoState;
+                        pure = resultType.kind == TypeKind::Logic && resultType.domain == LogicDomain::TwoState &&
+                               resultType.shape.empty();
                         std::vector<ValueId> operands;
                         for (auto operand : model.operands(op)) operands.push_back(root(operand));
                         if (pure)

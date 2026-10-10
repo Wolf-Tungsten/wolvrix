@@ -154,14 +154,29 @@ namespace wolvrix::lib::grhsim
         // single UInt(width) (emitted as a C23 unsigned _BitInt object —
         // unsigned storage, signedness re-derived at op points); four-state
         // values keep the UInt64 word array and double into a two-element
-        // array.
-        CpuTypeId namedStorePhysicalType(TypeMapper &mapper, const GrhSimModel &model, TypeId semantic)
+        // array. Stage-06: a shaped logic type stores as ONE flat array of
+        // product(shape) rows of the element's physical type (row-major
+        // linearization — byte-identical to the legacy 1-D array layout;
+        // multi-dimensional indexing is linearized at the emit side, the
+        // layout does not nest). A four-state shaped type therefore lays out
+        // as array(elementPhysical4S, rows).
+        CpuTypeId namedStorePhysicalTypeImpl(TypeMapper &mapper, const Type &type)
         {
-            const auto &type = model.types()[semantic.index - 1];
             switch (type.kind)
             {
             case TypeKind::Logic:
             {
+                if (!type.shape.empty())
+                {
+                    const std::optional<uint32_t> elementWidth = typeElementWidth(type);
+                    const std::optional<uint64_t> rows = shapeElementCount(type.shape);
+                    if (!elementWidth || !rows)
+                        throw std::runtime_error("CPU layout requires a valid logic type shape");
+                    Type element = type;
+                    element.width = *elementWidth;
+                    element.shape.clear();
+                    return mapper.array(namedStorePhysicalTypeImpl(mapper, element), *rows);
+                }
                 CpuTypeId base;
                 if (type.width == 1 && !type.isSigned) base = mapper.scalar(CpuTypeKind::Bool);
                 else if (type.width <= 64)
@@ -179,10 +194,13 @@ namespace wolvrix::lib::grhsim
             }
             case TypeKind::Real: return mapper.scalar(CpuTypeKind::F64, 64);
             case TypeKind::String: return mapper.scalar(CpuTypeKind::String);
-            case TypeKind::Array:
-                return mapper.array(namedStorePhysicalType(mapper, model, type.elementType), type.count);
             }
             throw std::logic_error("unknown semantic type kind");
+        }
+
+        CpuTypeId namedStorePhysicalType(TypeMapper &mapper, const GrhSimModel &model, TypeId semantic)
+        {
+            return namedStorePhysicalTypeImpl(mapper, model.types()[semantic.index - 1]);
         }
 
         // Fallback prefix for unnamed values: producer op category + value id.
@@ -190,7 +208,7 @@ namespace wolvrix::lib::grhsim
         {
             if (type == "core.input.read") return "readR";
             if (type == "core.state.read") return "readS";
-            if (type == "core.state.memRead") return "readM";
+            if (type == "core.state.readArray") return "readA";
             if (type == "core.compute.sliceStatic") return "slice";
             if (type == "core.compute.constant") return "cnst";
             const auto at = type.find_last_of('.');
@@ -248,7 +266,7 @@ namespace wolvrix::lib::grhsim
 
             // regLatch / mem: one named field per state, placed by the A7
             // semantic store classification (M5d-4/M5d-6: layout is a pure
-            // consumer — no implicit TypeKind::Array split here anymore).
+            // consumer — no implicit type/shape split here anymore).
             auto &regLatch = stores[0];
             regLatch.kind = CpuNamedStoreKind::RegLatch;
             auto &mem = stores[1];
@@ -298,23 +316,29 @@ namespace wolvrix::lib::grhsim
                         if (!slotNames[value.index])
                             slotNames[value.index] = SlotName{state, writeIndex, std::move(role)};
                     };
-                    if (type == "core.state.memWrite")
+                    // Post-lowering operand layouts (no trailing events):
+                    // write [en, data, mask]; writeArray [en, i0..ik-1, data,
+                    // mask]; fill [en, data].
+                    if (type == "core.state.write")
                     {
-                        slot(0, "enable"); slot(1, "addr"); slot(2, "data"); slot(3, "mask");
+                        slot(0, "enable"); slot(1, "data"); slot(2, "mask");
                     }
-                    else if (type == "core.state.memFill" || type == "core.state.memAssign")
+                    else if (type == "core.state.writeArray")
+                    {
+                        slot(0, "enable");
+                        const auto indexCount = operands.size() >= 3 ?
+                                                    static_cast<uint32_t>(operands.size()) - 3 : 0;
+                        for (uint32_t j = 0; j < indexCount; ++j)
+                            slot(1 + j, indexCount == 1 ? "addr" : "idx" + std::to_string(j));
+                        slot(1 + indexCount, "data");
+                        slot(2 + indexCount, "mask");
+                    }
+                    else if (type == "core.state.fill")
                     {
                         slot(0, "enable"); slot(1, "data");
                     }
-                    else // memWriteSeq: (enable, addr, data) triples
-                    {
-                        for (uint32_t triple = 0; triple * 3 + 2 < operands.size(); ++triple)
-                        {
-                            slot(triple * 3, "enable" + std::to_string(triple));
-                            slot(triple * 3 + 1, "addr" + std::to_string(triple));
-                            slot(triple * 3 + 2, "data" + std::to_string(triple));
-                        }
-                    }
+                    else
+                        throw std::runtime_error("unexpected Mem-phase write op: " + std::string(type));
                 }
             }
             NamedStoreBuilder boundaryBuilder{layout, boundaryStore};
@@ -464,12 +488,26 @@ namespace wolvrix::lib::grhsim
                         return type.id;
                 return found;
             };
-            const std::function<CpuTypeId(TypeId)> physicalType = [&](TypeId semantic) -> CpuTypeId {
-                const auto &type = model.types()[semantic.index - 1];
+            // Verification mirror of namedStorePhysicalType: same shape-driven
+            // mapping (shaped logic -> flat array of the element physical
+            // type), but looks types up with findType instead of creating them.
+            const std::function<CpuTypeId(const Type &)> physicalTypeOf = [&](const Type &type) -> CpuTypeId {
                 switch (type.kind)
                 {
                 case TypeKind::Logic:
                 {
+                    if (!type.shape.empty())
+                    {
+                        const std::optional<uint32_t> elementWidth = typeElementWidth(type);
+                        const std::optional<uint64_t> rows = shapeElementCount(type.shape);
+                        if (!elementWidth || !rows) return {};
+                        Type element = type;
+                        element.width = *elementWidth;
+                        element.shape.clear();
+                        const CpuTypeId elementPhysical = physicalTypeOf(element);
+                        return elementPhysical ? findType(CpuTypeKind::Array, 0, elementPhysical, *rows)
+                                               : CpuTypeId{};
+                    }
                     CpuTypeId base;
                     if (type.width == 1 && !type.isSigned) base = findType(CpuTypeKind::Bool, 0, {}, 0);
                     else if (type.width <= 64)
@@ -493,13 +531,11 @@ namespace wolvrix::lib::grhsim
                 }
                 case TypeKind::Real: return findType(CpuTypeKind::F64, 64, {}, 0);
                 case TypeKind::String: return findType(CpuTypeKind::String, 0, {}, 0);
-                case TypeKind::Array:
-                {
-                    const auto element = physicalType(type.elementType);
-                    return element ? findType(CpuTypeKind::Array, 0, element, type.count) : CpuTypeId{};
-                }
                 }
                 return {};
+            };
+            const auto physicalType = [&](TypeId semantic) -> CpuTypeId {
+                return physicalTypeOf(model.types()[semantic.index - 1]);
             };
             const auto &stores = *layout.namedStores;
             constexpr std::array<CpuNamedStoreKind, 7> kinds{

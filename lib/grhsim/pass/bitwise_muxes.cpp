@@ -21,7 +21,7 @@ namespace wolvrix::lib::grhsim {
             const auto typeId = model.values()[results[0].index - 1].type;
             const auto &type = model.types()[typeId.index - 1];
             if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
-                type.width != 1 || type.isSigned ||
+                !type.shape.empty() || type.width != 1 || type.isSigned ||
                 !std::all_of(operands.begin(), operands.end(), [&](ValueId value) {
                     return model.values()[value.index - 1].type == typeId;
                 })) continue;

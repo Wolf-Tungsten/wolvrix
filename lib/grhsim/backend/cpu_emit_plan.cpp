@@ -43,14 +43,17 @@ namespace wolvrix::lib::grhsim
                 return p ? std::get_if<int64_t>(&p->value) : nullptr;
             };
             const auto &target = model.types()[model.states()[state.index - 1].type.index - 1];
-            const bool array = target.kind == TypeKind::Array;
+            // Stage-06: an array state is a logic type with a non-empty
+            // shape; the row count is the shape's element count.
+            const bool array = !target.shape.empty();
+            const std::optional<uint64_t> rows = shapeElementCount(target.shape);
             const auto kind = model.text(step.kind);
             if (kind == "core.init.const")
             {
                 if (!array) return 3;
                 const Parameter *p = findCpuPhaseParameter(model, model.parameters(step), "value");
                 const auto *values = p ? std::get_if<std::vector<std::string>>(&p->value) : nullptr;
-                return 4 + (values ? values->size() : target.count);
+                return 4 + (values ? values->size() : rows.value_or(0));
             }
             if (kind == "core.init.random") return 4;
             if (kind == "core.init.fill") return 6;
@@ -59,7 +62,8 @@ namespace wolvrix::lib::grhsim
                 const auto *start = intParam("start");
                 const auto *count = intParam("count");
                 const uint64_t first = start && *start > 0 ? uint64_t(*start) : 0;
-                const uint64_t size = count && *count > 0 ? uint64_t(*count) : target.count - first;
+                const uint64_t total = rows.value_or(0);
+                const uint64_t size = count && *count > 0 ? uint64_t(*count) : total - first;
                 return 6 + size;
             }
             return 4;

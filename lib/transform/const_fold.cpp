@@ -32,11 +32,16 @@ namespace wolvrix::lib::transform
         std::string literal;
         int32_t width = 0;
         bool isSigned = false;
+        // Shape is part of the identity: stage-01 values carry it, and
+        // downstream shape-aware consumers (kSliceArray) reject a flat
+        // substitute even when the bits are identical.
+        std::vector<int64_t> shape;
 
         bool operator==(const ConstantKey &other) const
         {
             return width == other.width &&
                    isSigned == other.isSigned &&
+                   shape == other.shape &&
                    literal == other.literal;
         }
     };
@@ -48,6 +53,8 @@ namespace wolvrix::lib::transform
             std::size_t seed = std::hash<std::string>{}(key.literal);
             seed ^= std::hash<int32_t>{}(key.width) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             seed ^= std::hash<bool>{}(key.isSigned) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            for (const int64_t dim : key.shape)
+                seed ^= std::hash<int64_t>{}(dim) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             return seed;
         }
     };
@@ -744,6 +751,7 @@ namespace wolvrix::lib::transform
             ConstantKey key;
             key.width = value.width();
             key.isSigned = value.isSigned();
+            key.shape.assign(value.shape().begin(), value.shape().end());
             key.literal = formatConstLiteral(sv);
             return key;
         }
@@ -768,7 +776,7 @@ namespace wolvrix::lib::transform
             }
             const wolvrix::lib::grh::ValueId newValue =
                 graph.createValue(valueSym, width, resultValue.isSigned(),
-                                  resultValue.type());
+                                  resultValue.type(), resultValue.shape());
             const wolvrix::lib::grh::OperationId constOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant, opSym);
             graph.addResult(constOp, newValue);
             graph.setAttr(constOp, "constValue", formatConstLiteral(value));
@@ -795,7 +803,7 @@ namespace wolvrix::lib::transform
             }
             const wolvrix::lib::grh::ValueId newValue =
                 graph.createValue(valueSym, width, resultValue.isSigned(),
-                                  resultValue.type());
+                                  resultValue.type(), resultValue.shape());
             const wolvrix::lib::grh::OperationId constOp =
                 graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant, opSym);
             graph.addResult(constOp, newValue);

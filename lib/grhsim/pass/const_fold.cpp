@@ -6,6 +6,7 @@
 #include "slang/numeric/SVInt.h"
 
 #include <array>
+#include <cstdint>
 #include <deque>
 #include <optional>
 #include <string>
@@ -29,8 +30,11 @@ namespace wolvrix::lib::grhsim
         bool twoStateLogic(const GrhSimModel &model, TypeId type)
         {
             const auto &resolved = model.types()[type.index - 1];
+            // Scalar only: folding a shaped (array) value's flat bits would be
+            // legal, but there is no consumer for array constants yet — stay
+            // conservative.
             return resolved.kind == TypeKind::Logic && resolved.domain == LogicDomain::TwoState &&
-                   resolved.width > 0;
+                   resolved.width > 0 && resolved.shape.empty();
         }
 
         std::optional<slang::SVInt> constantOf(const GrhSimModel &model, const SimOp &op)
@@ -194,17 +198,57 @@ namespace wolvrix::lib::grhsim
                              .lshr(static_cast<slang::bitwidth_t>(*start))
                              .trunc(static_cast<slang::bitwidth_t>(*end - *start + 1));
             }
-            else if (kind == "sliceDynamic" || kind == "sliceArray")
+            else if (kind == "sliceDynamic")
             {
                 if (operands.size() != 2) return {};
                 const auto width = intParameter(model, params, "sliceWidth");
                 if (!width || *width <= 0) return {};
-                // sliceDynamic offsets are bit offsets; sliceArray offsets are
-                // element indices and must be scaled by the element width.
-                const slang::SVInt offset =
-                    kind == "sliceArray" ? operands[1] * slang::SVInt(static_cast<uint64_t>(*width))
-                                         : operands[1];
-                folded = operands[0].lshr(offset).trunc(static_cast<slang::bitwidth_t>(*width));
+                // sliceDynamic offsets are bit offsets.
+                folded = operands[0].lshr(operands[1]).trunc(static_cast<slang::bitwidth_t>(*width));
+            }
+            else if (kind == "sliceArray")
+            {
+                // Stage-06: [base, i0..ik-1], no sliceWidth parameter — the
+                // block geometry comes from the base type's shape and the
+                // result type's width. Fold only a constant base with every
+                // index constant (the caller has collected all operands).
+                if (operands.size() < 2 || !params.empty()) return {};
+                const auto operandIds = model.operands(op);
+                const auto &baseType =
+                    model.types()[model.values()[operandIds[0].index - 1].type.index - 1];
+                const auto &resultType =
+                    model.types()[model.values()[model.results(op)[0].index - 1].type.index - 1];
+                if (baseType.kind != TypeKind::Logic || baseType.shape.empty() ||
+                    resultType.width == 0)
+                    return {};
+                const std::size_t indexCount = operands.size() - 1;
+                if (indexCount > baseType.shape.size()) return {};
+                // blockIndex = sum_j c_j * product(shape[j+1:indexCount]); the
+                // dims past the index count fold into the result width.
+                uint64_t blockIndex = 0;
+                for (std::size_t j = 0; j < indexCount; ++j)
+                {
+                    uint64_t stride = 1;
+                    for (std::size_t d = j + 1; d < indexCount; ++d)
+                    {
+                        if (baseType.shape[d] <= 0) return {};
+                        const uint64_t dim = static_cast<uint64_t>(baseType.shape[d]);
+                        if (stride > UINT64_MAX / dim) return {};
+                        stride *= dim;
+                    }
+                    const slang::SVInt &index = operands[1 + j];
+                    if (index.getBitWidth() > 64) return {};
+                    const uint64_t indexValue = index.getRawPtr()[0];
+                    if (indexValue > UINT64_MAX / stride) return {};
+                    const uint64_t term = indexValue * stride;
+                    if (blockIndex > UINT64_MAX - term) return {};
+                    blockIndex += term;
+                }
+                if (blockIndex > UINT64_MAX / resultType.width) return {};
+                const uint64_t bitOffset = blockIndex * resultType.width;
+                folded = operands[0]
+                             .lshr(slang::SVInt(bitOffset))
+                             .trunc(static_cast<slang::bitwidth_t>(resultType.width));
             }
             else return {};
             if (folded.hasUnknown()) return {};

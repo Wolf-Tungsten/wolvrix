@@ -19,9 +19,9 @@ core.output.write %q                       core.output.write %q.out    (phase: o
 The original cone is then swept with the shared fixed-point DCE
 (`sweepDeadConeOps`): a cone op whose results lost every user — the read
 above when nothing else consumed `%q` — is removed, while dual-use ops (a
-state read that also feeds a `regWrite`) stay on the general side. Only pure
+state read that also feeds a `write`) stay on the general side. Only pure
 `core.compute.*` ops and the read-only roots (`core.input.read` /
-`core.state.read` / `core.state.memRead`) are ever removed, so the sweep
+`core.state.read` / `core.state.readArray`) are ever removed, so the sweep
 cannot delete side-effecting logic.
 
 The pass is idempotent: an `output.write` whose operand is already produced

@@ -123,10 +123,14 @@ namespace wolvrix::lib::grhsim
     {
         Logic,
         Real,
-        String,
-        Array
+        String
     };
 
+    // Stage-06 array model (mirrors GRH stage-01 §3.1): a type is a total bit
+    // width plus a row-major shape (outermost dimension first; empty = scalar).
+    // elementWidth = width / product(shape). The shape is a pure structural
+    // view: every op's semantics equal those on the flat width-bit vector, and
+    // physical storage stays linear. Only Logic types may carry a shape.
     struct Type
     {
         TypeId id;
@@ -135,9 +139,34 @@ namespace wolvrix::lib::grhsim
         uint32_t width = 0;
         bool isSigned = false;
         LogicDomain domain = LogicDomain::FourState;
-        TypeId elementType;
-        uint64_t count = 0;
+        std::vector<int64_t> shape;
     };
+
+    // Product of the shape dimensions (1 for an empty shape); nullopt when a
+    // dimension is non-positive or the product overflows uint64_t.
+    inline std::optional<uint64_t> shapeElementCount(std::span<const int64_t> shape) noexcept
+    {
+        uint64_t product = 1;
+        for (const int64_t dim : shape)
+        {
+            if (dim <= 0) return std::nullopt;
+            const uint64_t dimValue = static_cast<uint64_t>(dim);
+            if (product > UINT64_MAX / dimValue) return std::nullopt;
+            product *= dimValue;
+        }
+        return product;
+    }
+
+    // Element bit width of a shaped logic type (width / product(shape));
+    // nullopt for non-logic types or an invalid/indivisible shape.
+    inline std::optional<uint32_t> typeElementWidth(const Type &type) noexcept
+    {
+        if (type.kind != TypeKind::Logic) return std::nullopt;
+        const std::optional<uint64_t> count = shapeElementCount(type.shape);
+        if (!count || *count == 0 || *count > type.width || type.width % *count != 0)
+            return std::nullopt;
+        return static_cast<uint32_t>(type.width / *count);
+    }
 
     struct DialectUse
     {
@@ -166,12 +195,14 @@ namespace wolvrix::lib::grhsim
     // the single decision point that assigns every state its store class.
     // None means the model predates classification; consumers must reject
     // None once any state is classified (the verifier enforces totality).
-    // RegLatch states are small/scalar: writes merge into a next buffer and
+    // RegLatch states are small: writes merge into a next buffer and
     // P_publish commits them with one whole-block copy (NBA). Mem states are
     // large contiguous arrays: write parameters are sampled before P_mem,
-    // which commits them in place in priority order. The class is a semantic
-    // annotation; backends must consume it instead of re-deriving the
-    // classification from the state's type (e.g. TypeKind::Array).
+    // which commits them in place in declaration order. Stage-06: the class
+    // criterion is the state's total byte size alone, decoupled from the op
+    // family that accesses it (the same write/writeArray/fill ops serve both
+    // classes). The class is a semantic annotation; backends must consume it
+    // instead of re-deriving the classification from the state's type.
     enum class StateStoreClass : uint8_t
     {
         None,
@@ -528,6 +559,11 @@ namespace wolvrix::lib::grhsim
     struct CpuMemWritePlanEntry
     {
         OpId writeOp;
+        // Stage-06: declaration-order rank of this write among the target
+        // state's Mem-phase writes (stage-03 semantics: same-state writes
+        // apply in declaration order, later writes overwrite earlier ones).
+        // The plan's per-state entry order carries the same information;
+        // the field is kept for checkpoint/debug readability.
         uint32_t priority = 0;
         bool eventFree = false;
         std::vector<CpuMemReader> readers;
@@ -550,7 +586,7 @@ namespace wolvrix::lib::grhsim
         std::vector<CpuFanoutEntry<ValueId>> inputFanout;
         std::vector<CpuFanoutEntry<ValueId>> computeSupernodeFanout;
         // Commit fanout covers every General-phase state read (regLatch-class
-        // memReads included); the key set is no longer limited to the
+        // readArrays included); the key set is no longer limited to the
         // output/event state dependency closure E. V2 (M2): all three fanout
         // tables target NON-SINK supernodes only — sink supernodes fire on
         // their eventActStore signature (SinkEvent) or unconditionally
@@ -700,20 +736,21 @@ namespace wolvrix::lib::grhsim
 
     // Maintainable association between one source declaration and the model
     // entities that currently realize it. One record per declared symbol;
-    // `shape`/`width` describe the declaration itself (shape empty = scalar),
-    // `slices` the current realization: a folded alias redirects the slice to
-    // the surviving value, a merge points multiple records at slices of one
-    // shared target, a split gives one record several slices with disjoint
-    // declOffset ranges. A record with no slices names a declaration that is
-    // currently not realized (optimized away); the name list entry in
-    // declaredSymbols still anchors it. Generate-group membership joins by
-    // symbol name against GenerateGroup::symbols.
+    // `width` is the declaration's total linear bit width (stage-06: the
+    // shape lives in the type system, so array declarations carry their full
+    // product width here), `slices` the current realization: a folded alias
+    // redirects the slice to the surviving value, a merge points multiple
+    // records at slices of one shared target, a split gives one record
+    // several slices with disjoint declOffset ranges. A record with no slices
+    // names a declaration that is currently not realized (optimized away);
+    // the name list entry in declaredSymbols still anchors it.
+    // Generate-group membership joins by symbol name against
+    // GenerateGroup::symbols.
     struct DeclProvenance
     {
         StringId symbol;             // member of GrhSimModel::declaredSymbols
         OriginId origin;             // declaration site; may be invalid
-        uint64_t width = 0;          // scalar / array-element bit width; 0 for non-logic
-        std::vector<uint64_t> shape; // array dimensions, outermost first; empty = scalar
+        uint64_t width = 0;          // total linear bit width; 0 for non-logic
         std::vector<DeclProvenanceSlice> slices;
         friend bool operator==(const DeclProvenance &, const DeclProvenance &) = default;
     };
@@ -783,10 +820,15 @@ namespace wolvrix::lib::grhsim
 
         void addDialect(std::string_view name, std::string_view version,
                         std::string_view schemaFingerprint = {});
-        TypeId logicType(uint32_t width, bool isSigned, LogicDomain domain);
+        // Logic type factory: width is the TOTAL bit width; shape (row-major,
+        // outermost first, empty = scalar) is a structural view over it
+        // (stage-06, mirrors GRH stage-01). Element width = width /
+        // product(shape). The shape must be valid at construction: every
+        // dimension positive, product divides width, no uint64 overflow.
+        TypeId logicType(uint32_t width, bool isSigned, LogicDomain domain,
+                         std::span<const int64_t> shape = {});
         TypeId realType();
         TypeId stringType();
-        TypeId arrayType(TypeId elementType, uint64_t count);
 
         OriginId addOrigin(Origin origin);
         InputId addInput(std::string_view name, TypeId type, OriginId origin = {});
@@ -894,16 +936,18 @@ namespace wolvrix::lib::grhsim
         std::span<const Parameter> parameters(const BackendMapping &mapping) const;
 
     private:
-        struct ArrayTypeKey
+        struct LogicTypeKey
         {
-            uint32_t element = 0;
-            uint64_t count = 0;
-            friend bool operator==(ArrayTypeKey, ArrayTypeKey) noexcept = default;
+            uint32_t width = 0;
+            bool isSigned = false;
+            LogicDomain domain = LogicDomain::FourState;
+            std::vector<int64_t> shape;
+            friend bool operator==(const LogicTypeKey &, const LogicTypeKey &) = default;
         };
 
-        struct ArrayTypeKeyHash
+        struct LogicTypeKeyHash
         {
-            std::size_t operator()(ArrayTypeKey key) const noexcept;
+            std::size_t operator()(const LogicTypeKey &key) const noexcept;
         };
 
         static ModelIdentity nextIdentity() noexcept;
@@ -918,8 +962,7 @@ namespace wolvrix::lib::grhsim
         StringId name_;
         std::vector<DialectUse> dialects_;
         std::vector<Type> types_;
-        std::unordered_map<uint64_t, TypeId> logicTypes_;
-        std::unordered_map<ArrayTypeKey, TypeId, ArrayTypeKeyHash> arrayTypes_;
+        std::unordered_map<LogicTypeKey, TypeId, LogicTypeKeyHash> logicTypes_;
         TypeId realType_;
         TypeId stringType_;
         std::vector<InterfacePort> interfacePorts_;

@@ -124,11 +124,14 @@ namespace wolvrix::lib::grhsim
                         for (const auto operand : operands)
                         {
                             if (producerPhase(operand) != SimPhase::Output) allOutput = false;
-                            if (typeOf(operand).kind != TypeKind::Logic) allLogic = false;
+                            const auto &operandType = typeOf(operand);
+                            if (operandType.kind != TypeKind::Logic || !operandType.shape.empty())
+                                allLogic = false;
                         }
                         if (allOutput) continue;
-                        // ne/latchWrite only make sense for logic values;
-                        // tasks with non-logic arguments stay put.
+                        // ne/latchWrite only make sense for scalar logic values
+                        // (latchWrite targets a scalar state); tasks with
+                        // non-logic or array arguments stay put.
                         if (!allLogic) continue;
                     }
                     candidates.push_back(Candidate{op.id, event});

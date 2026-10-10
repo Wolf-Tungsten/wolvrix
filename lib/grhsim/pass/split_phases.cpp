@@ -7,12 +7,16 @@
 //
 //   - core.event.edgeDet -> Event (defensive; B2 already tags them);
 //   - core.output.write -> Output (defensive; B3 already tags them);
-//   - mem write ops (memWrite/memFill/memAssign/memWriteSeq): the P_mem
-//     write duty follows the TARGET STATE's store class (A7
+//   - state write ops (core.state.write/writeArray/fill): the P_mem write
+//     duty follows the TARGET STATE's store class (A7
 //     grhsim.select-state-stores) — mem-class arrays commit in P_mem, while
 //     writes on regLatch-class states (including small arrays) join General
-//     and take the next-buffer NBA path. Without a classification the
-//     legacy all-Mem attribution applies, so pre-A7 flows are unchanged;
+//     and take the next-buffer NBA path. Stage-06: core.state.write also
+//     covers scalar targets (the retired regWrite), which classify RegLatch
+//     and thus take the General path. Without a classification the legacy
+//     shape-based attribution applies (shaped target = array = Mem, scalar
+//     write = General, matching verifyPhaseAttribution), so pre-A7 flows are
+//     unchanged;
 //   - everything else -> General.
 //
 // The pass only writes SimOp::phase; it adds/removes no ops or values.
@@ -34,18 +38,23 @@ namespace wolvrix::lib::grhsim
 {
     namespace
     {
-        bool isMemWriteOpType(std::string_view type) noexcept
+        bool isStateWriteOpType(std::string_view type) noexcept
         {
-            return type == "core.state.memWrite" || type == "core.state.memFill" ||
-                   type == "core.state.memAssign" || type == "core.state.memWriteSeq";
+            return type == "core.state.write" || type == "core.state.writeArray" ||
+                   type == "core.state.fill";
         }
 
-        // Resolves the mem write's target state; returns StateStoreClass::None
-        // when the model carries no classification or the ref is malformed
-        // (the structural verifier reports the latter separately).
-        StateStoreClass memTargetClass(const GrhSimModel &model, const SimOp &op)
+        // Whether the write commits in P_mem. On a classified model the target
+        // state's store class decides (mem-class arrays commit in place in
+        // P_mem; regLatch-class states — every scalar, including the targets
+        // the retired regWrite served — take the General next-buffer path).
+        // Without a classification the legacy shape-based fallback applies:
+        // shaped targets are arrays and commit in P_mem, scalar writes go to
+        // General. Malformed refs (reported by the structural verifier
+        // separately) mirror verifyPhaseAttribution's fallback: General for a
+        // scalar-capable write, Mem for the array-only writeArray/fill.
+        bool writeCommitsInMem(const GrhSimModel &model, const SimOp &op, std::string_view type)
         {
-            if (!model.hasStateStoreClassification()) return StateStoreClass::None;
             std::span<const ObjectRef> refs;
             try
             {
@@ -53,12 +62,18 @@ namespace wolvrix::lib::grhsim
             }
             catch (const std::exception &)
             {
-                return StateStoreClass::None;
+                refs = {};
             }
             if (refs.empty() || refs[0].kind != ObjectKind::State ||
                 refs[0].index == 0 || refs[0].index > model.states().size())
-                return StateStoreClass::None;
-            return model.states()[refs[0].index - 1].storeClass;
+                return type != "core.state.write";
+            const auto &state = model.states()[refs[0].index - 1];
+            if (model.hasStateStoreClassification())
+                return state.storeClass != StateStoreClass::RegLatch;
+            if (state.type.generation != 0 || !state.type.valid() ||
+                state.type.index > model.types().size())
+                return true;
+            return !model.types()[state.type.index - 1].shape.empty();
         }
 
         class SplitPhasesPass final : public Pass
@@ -90,12 +105,31 @@ namespace wolvrix::lib::grhsim
                         phase = SimPhase::Output;
                         ++attributedOutput;
                     }
-                    else if (isMemWriteOpType(type))
+                    else if (isStateWriteOpType(type))
                     {
-                        if (memTargetClass(model, op) == StateStoreClass::RegLatch)
+                        if (!writeCommitsInMem(model, op, type))
                         {
                             phase = SimPhase::General;
-                            ++memWritesRegLatch;
+                            // memWritesRegLatch keeps its original meaning:
+                            // array (shaped-target) writes taking the regLatch
+                            // path. Scalar writes count as plain General.
+                            bool shaped = false;
+                            try
+                            {
+                                const auto refs = model.objectRefs(op);
+                                shaped = !refs.empty() && refs[0].kind == ObjectKind::State &&
+                                         refs[0].index != 0 && refs[0].index <= model.states().size() &&
+                                         model.states()[refs[0].index - 1].type.index != 0 &&
+                                         model.states()[refs[0].index - 1].type.index <=
+                                             model.types().size() &&
+                                         !model.types()[model.states()[refs[0].index - 1].type.index - 1]
+                                              .shape.empty();
+                            }
+                            catch (const std::exception &)
+                            {
+                                shaped = type != "core.state.write";
+                            }
+                            if (shaped) ++memWritesRegLatch; else ++attributedGeneral;
                         }
                         else
                         {

@@ -38,7 +38,7 @@ namespace wolvrix::lib::grhsim
         {
             const auto name = model.text(op.opType);
             return name.starts_with("core.compute.") || name == "core.input.read" ||
-                   name == "core.state.read" || name == "core.state.memRead";
+                   name == "core.state.read" || name == "core.state.readArray";
         }
     } // namespace
 

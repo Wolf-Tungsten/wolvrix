@@ -23,7 +23,7 @@ namespace wolvrix::lib::grhsim
     };
 
     // Clones the full producer-side transitive closure of `sinks` (roots such as
-    // core.input.read / core.state.read / core.state.memRead /
+    // core.input.read / core.state.read / core.state.readArray /
     // core.compute.constant included) and tags every clone with `phase`.
     // Object refs, parameters, name (plus a phase suffix) and origin are copied
     // unchanged. The caller rewires the sink consumers to the cloned values and
@@ -34,7 +34,7 @@ namespace wolvrix::lib::grhsim
     // Fixed-point dead-cone sweep over candidate original ops: a candidate is
     // removed when none of its results has a remaining user and the op is a
     // pure cone member (core.compute.* or the read-only roots core.input.read /
-    // core.state.read / core.state.memRead; writes, calls and other
+    // core.state.read / core.state.readArray; writes, calls and other
     // side-effecting ops are never removed). Dual-use ops whose results still
     // feed live logic stay. Returns the ops to mask; the caller folds them into
     // its own model.compact call.

@@ -39,8 +39,8 @@ op list and consumed in another chunk become fields of a nested frame struct
 the driver stack-allocates and passes by reference (caller-provided buffer,
 no temporaries — the AGENTS.md helper-performance route). Constants,
 `input.read` results and `state.read` results are re-readable from their
-stores in any chunk and never spill; `memRead` results DO spill like compute
-values (the re-read form would re-evaluate the address operand, whose local
+stores in any chunk and never spill; `readArray` results DO spill like compute
+values (the re-read form would re-evaluate the index operands, whose locals
 may be dead — found and fixed against the XS whole-core model). The Output
 cone additionally frames every cone-produced latchWrite operand (the commit
 point runs in the driver after all chunks) so the staged NBA write-back

@@ -157,17 +157,17 @@ namespace
         return id;
     }
 
-    OpId addRegWrite(GrhSimModel &model, ValueId cond, ValueId next, ValueId mask,
-                     StateId target, std::vector<int64_t> acts)
+    OpId addWrite(GrhSimModel &model, ValueId cond, ValueId next, ValueId mask,
+                  StateId target, std::vector<int64_t> acts)
     {
         const std::array operands{cond, next, mask};
         const std::array refs{ObjectRef::state(target)};
         OpId id;
-        if (acts.empty()) id = model.addOperation("core.state.regWrite", operands, {}, refs);
+        if (acts.empty()) id = model.addOperation("core.state.write", operands, {}, refs);
         else
         {
             const std::array params{Parameter{model.intern("event_acts"), std::move(acts)}};
-            id = model.addOperation("core.state.regWrite", operands, {}, refs, params);
+            id = model.addOperation("core.state.write", operands, {}, refs, params);
         }
         model.setOperationPhase(id, SimPhase::General);
         return id;
@@ -337,7 +337,7 @@ namespace
         OpId det0, det1;
         explicit TwoClockFixture(std::string_view name) : model(std::string(name))
         {
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk0 = addInputRead(model, "clk0", SimPhase::Event);
             const auto clk1 = addInputRead(model, "clk1", SimPhase::Event);
             det0 = addEdgeDet(model, clk0, 0);
@@ -352,7 +352,7 @@ namespace
     void sameDomainMergeTest()
     {
         GrhSimModel model("f1_same_domain");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", SimPhase::Event);
         addEdgeDet(model, clk, 0);
@@ -361,8 +361,8 @@ namespace
         const auto one = addConstant(model, bit, "1'b1");
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, d, x, one, q1, {0});
-        const auto w2 = addRegWrite(model, x, d, one, q2, {0});
+        const auto w1 = addWrite(model, d, x, one, q1, {0});
+        const auto w2 = addWrite(model, x, d, one, q2, {0});
         require(verifies(model), "f1: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
@@ -426,8 +426,8 @@ namespace
         const auto x = addNot(model, fixture.d, "x");
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, fixture.one, x, fixture.one, q1, {0});
-        const auto w2 = addRegWrite(model, fixture.one, fixture.d, fixture.one, q2, {0, 1});
+        const auto w1 = addWrite(model, fixture.one, x, fixture.one, q1, {0});
+        const auto w2 = addWrite(model, fixture.one, fixture.d, fixture.one, q2, {0, 1});
         require(verifies(model), "f2: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
@@ -466,8 +466,8 @@ namespace
         const auto one2 = addConstant(model, bit, "1'b1");
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, fixture.one, x, fixture.one, q1, {0});
-        const auto w2 = addRegWrite(model, one2, x, one2, q2, {1});
+        const auto w1 = addWrite(model, fixture.one, x, fixture.one, q1, {0});
+        const auto w2 = addWrite(model, one2, x, one2, q2, {1});
         require(verifies(model), "f3: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
@@ -513,8 +513,8 @@ namespace
         const auto b = addNot(model, a, "b");
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, fixture.one, b, fixture.one, q1, {0});
-        const auto w2 = addRegWrite(model, fixture.one, b, fixture.one, q2, {1});
+        const auto w1 = addWrite(model, fixture.one, b, fixture.one, q1, {0});
+        const auto w2 = addWrite(model, fixture.one, b, fixture.one, q2, {1});
         require(verifies(model), "f4: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
@@ -548,9 +548,9 @@ namespace
         roundTrip(model);
     }
 
-    // V2-M1 (cross-domain state-read shape): a signature-{0} regWrite W1 -> Q
+    // V2-M1 (cross-domain state-read shape): a signature-{0} write W1 -> Q
     // whose Q state.read feeds, through a combinational cone, a signature-{1}
-    // regWrite W2. State readers are ordinary value-producing ops: the read
+    // write W2. State readers are ordinary value-producing ops: the read
     // cone lands in the non-sink frame while W1/W2 cluster by signature.
     void crossDomainStateReadTest()
     {
@@ -559,10 +559,10 @@ namespace
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, fixture.one, fixture.d, fixture.one, q1, {0});
+        const auto w1 = addWrite(model, fixture.one, fixture.d, fixture.one, q1, {0});
         const auto qr = addStateRead(model, q1, "qr");
         const auto y = addNot(model, qr, "y");
-        const auto w2 = addRegWrite(model, fixture.one, y, fixture.one, q2, {1});
+        const auto w2 = addWrite(model, fixture.one, y, fixture.one, q2, {1});
         require(verifies(model), "f9: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
@@ -592,16 +592,19 @@ namespace
         roundTrip(model);
     }
 
-    // The four mem-write kinds split into the flat Mem branch (op-id order)
-    // while their operand cones stay on the General side; the reg write
-    // (signature {0}) and the event-free latch write (escape class) each
-    // anchor their own sink supernode, cones remaining in the non-sink frame.
-    void memWriteSplitTest()
+    // The array-write kinds (writeArray / fill / whole-array write, plus the
+    // declaration-order writeArray pair that absorbs the retired write
+    // sequence op) split into the flat Mem branch (op-id order) while their
+    // operand cones stay on the General side; the scalar write (signature {0})
+    // and the event-free latch write (escape class) each anchor their own sink
+    // supernode, cones remaining in the non-sink frame.
+    void arrayWriteSplitTest()
     {
         GrhSimModel model("f5_mem_split");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(bit, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
         const auto clk = addInputRead(model, "clk", SimPhase::Event);
         addEdgeDet(model, clk, 0);
         const auto a = addInputRead(model, "a");
@@ -611,6 +614,8 @@ namespace
         const auto one = addConstant(model, bit, "1'b1");
         const auto zero = addConstant(model, bit, "1'b0");
         const auto row = addConstant(model, memType, "16'h0000");
+        const auto rowMask = addConstant(model, model.logicType(16, false, LogicDomain::TwoState),
+                                         "16'hffff");
         const auto qr = addState(model, "qr", bit, "1'b0");
         const auto ql = addState(model, "ql", bit, "1'b0");
         const auto mem1 = addState(model, "mem1", memType, "0");
@@ -619,30 +624,36 @@ namespace
         const auto mem4 = addState(model, "mem4", memType, "0");
         const auto rc = addAnd(model, a, b, "rc");
         const auto rn = addNot(model, a, "rn");
-        const auto wr = addRegWrite(model, rc, rn, one, qr, {0});
+        const auto wr = addWrite(model, rc, rn, one, qr, {0});
         const auto lc = addOr(model, a, b, "lc");
         const auto ln = addNot(model, b, "ln");
         const std::array latchRefs{ObjectRef::state(ql)};
         const auto wl = model.addOperation("core.state.latchWrite", std::array{lc, ln, one}, {}, latchRefs);
-        // Mem-write operand cones are exclusive single-use chains.
+        // Array-write operand cones are exclusive single-use chains.
         const auto mwC = addAnd(model, a, c, "mw_c");
         const auto mwD = addNot(model, a, "mw_d");
-        const std::array memWriteRefs{ObjectRef::state(mem1)};
-        const auto mw = model.addOperation("core.state.memWrite", std::array{mwC, one, mwD, one}, {},
-                                           memWriteRefs);
+        const std::array mwRefs{ObjectRef::state(mem1)};
+        const auto mw = model.addOperation("core.state.writeArray", std::array{mwC, one, mwD, one}, {},
+                                           mwRefs);
         const auto mfC = addOr(model, b, c, "mf_c");
-        const std::array memFillRefs{ObjectRef::state(mem2)};
-        const auto mf = model.addOperation("core.state.memFill", std::array{mfC, zero}, {}, memFillRefs);
+        const std::array mfRefs{ObjectRef::state(mem2)};
+        const auto mf = model.addOperation("core.state.fill", std::array{mfC, zero}, {}, mfRefs);
         const auto maC = addAnd(model, b, d4, "ma_c");
-        const std::array memAssignRefs{ObjectRef::state(mem3)};
-        const auto ma = model.addOperation("core.state.memAssign", std::array{maC, row}, {}, memAssignRefs);
+        const std::array maRefs{ObjectRef::state(mem3)};
+        const auto ma = model.addOperation("core.state.write", std::array{maC, row, rowMask}, {},
+                                           maRefs);
         const auto ms1 = addOr(model, a, d4, "ms_1");
         const auto ms2 = addNot(model, b, "ms_2");
         const auto ms3 = addAnd(model, c, d4, "ms_3");
         const auto ms4 = addNot(model, c, "ms_4");
-        const std::array memSeqRefs{ObjectRef::state(mem4)};
-        const auto mws = model.addOperation("core.state.memWriteSeq",
-                                            std::array{ms1, one, ms2, ms3, zero, ms4}, {}, memSeqRefs);
+        // Stage-06: the retired write sequence op desugars to one writeArray
+        // per port; same-state writes apply in declaration order (the later
+        // write wins a row collision).
+        const std::array msRefs{ObjectRef::state(mem4)};
+        const auto mws0 = model.addOperation("core.state.writeArray", std::array{ms1, one, ms2, one},
+                                             {}, msRefs);
+        const auto mws1 = model.addOperation("core.state.writeArray", std::array{ms3, zero, ms4, one},
+                                             {}, msRefs);
         require(verifies(model), "f5: fixture rejected");
 
         // f5 pins the P_mem shape: B5 runs before any classification, so its
@@ -650,12 +661,12 @@ namespace
         // phase; the classification forced to all-mem below keeps C3
         // consistent with that attribution.
         const auto split = runPass(model, "grhsim.split-phases");
-        require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(4),
+        require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(5),
                 "f5: mem attribution count wrong");
         requirePhases(model);
         runPass(model, "cpu.st.build-general-nodes");
         const auto &mapping = *model.cpuMapping();
-        const std::vector<OpId> memOrder{mw, mf, ma, mws};
+        const std::vector<OpId> memOrder{mw, mf, ma, mws0, mws1};
         require(branch(mapping, CpuPhase::Mem).ops == memOrder, "f5: mem branch is not flat op-id order");
         for (auto opId : memOrder)
             require(model.operations()[opId.index - 1].phase == SimPhase::Mem,
@@ -670,13 +681,13 @@ namespace
         const auto &memBranch = branch(packed, CpuPhase::Mem);
         require(memBranch.children.size() == 1 && memBranch.ops.empty(), "f5: mem branch shape wrong");
         require(flatOps(packed, memBranch.children.front()) == memOrder,
-                "f5: mem function does not hold exactly the four writes");
+                "f5: mem function does not hold exactly the five writes");
         const auto *regPack = supernodeOf(packed, wr);
         require(regPack && flatOps(packed, regPack->id) == std::vector<OpId>{wr},
-                "f5: regWrite sink cluster must hold the write alone");
+                "f5: scalar write sink cluster must hold the write alone");
         requireCategory(*regPack, CpuSupernodeCategory::SinkEvent, "f5");
         require(regPack->attrs.eventActs && *regPack->attrs.eventActs == std::vector<int64_t>{0},
-                "f5: regWrite supernode signature wrong");
+                "f5: write supernode signature wrong");
         const auto *latchPack = supernodeOf(packed, wl);
         require(latchPack && flatOps(packed, latchPack->id) == std::vector<OpId>{wl},
                 "f5: latchWrite sink cluster must hold the write alone");
@@ -703,7 +714,7 @@ namespace
     void flatBranchesTest()
     {
         GrhSimModel model("f6_flat_branches");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clkPort = model.addInput("clk", bit);
         const auto clk = model.addValue(bit, "clk");
@@ -718,11 +729,12 @@ namespace
         const auto d = addInputRead(model, "d");
         const auto one = addConstant(model, bit, "1'b1");
         const auto q = addState(model, "q", bit, "1'b0");
-        addRegWrite(model, one, d, one, q, {0});
-        const auto memType = model.arrayType(bit, 16);
+        addWrite(model, one, d, one, q, {0});
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
         const auto mem = addState(model, "mem", memType, "0");
         const std::array memRefs{ObjectRef::state(mem)};
-        const auto mw = model.addOperation("core.state.memWrite", std::array{one, one, d, one}, {}, memRefs);
+        const auto mw = model.addOperation("core.state.writeArray", std::array{one, one, d, one}, {}, memRefs);
         // Output cone, also inserted write-before-read.
         const auto outPort = model.addOutput("o", bit);
         const auto os = addState(model, "os", bit, "1'b0");
@@ -823,8 +835,8 @@ namespace
         const auto one2 = addConstant(model, bit, "1'b1");
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, fixture.one, x, fixture.one, q1, {0});
-        const auto w2 = addRegWrite(model, one2, x, one2, q2, {1});
+        const auto w1 = addWrite(model, fixture.one, x, fixture.one, q1, {0});
+        const auto w2 = addWrite(model, one2, x, one2, q2, {1});
         require(verifies(model), "f7: fixture rejected");
         runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.split-phases");
@@ -918,7 +930,7 @@ namespace
         std::string error;
         {
             GrhSimModel unattributed("f7_unattributed");
-            unattributed.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            unattributed.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             addInputRead(unattributed, "d");
             auto pass = defaultPassRegistry().create("cpu.st.build-general-nodes", {}, error);
             require(bool(pass), error);
@@ -927,7 +939,7 @@ namespace
                     "build-general-nodes accepted an unattributed model");
         }
         GrhSimModel fresh("f7_fresh");
-        fresh.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        fresh.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         for (auto name : {"cpu.st.merge-general-supernodes", "cpu.st.pack-general-functions"})
         {
             auto pass = defaultPassRegistry().create(name, {}, error);
@@ -988,7 +1000,7 @@ namespace
     void emptyModelTest()
     {
         GrhSimModel model("f8_empty");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
         advanceToFunctions(model);
@@ -1003,16 +1015,18 @@ namespace
         }
         roundTrip(model);
     }
-    // M5d-6 C1 contract: a regLatch-class array's mem writes are General-phase
-    // ops (B5's class-aware attribution), anchor their own nodes inside the
-    // General branch, and leave the flat Mem branch empty — the mapping
-    // verifier accepts them there (op/branch phase agreement is by SimPhase).
+    // M5d-6 C1 contract: a regLatch-class array's writeArray ops are
+    // General-phase ops (B5's class-aware attribution), anchor their own
+    // nodes inside the General branch, and leave the flat Mem branch empty —
+    // the mapping verifier accepts them there (op/branch phase agreement is
+    // by SimPhase).
     void regLatchMemWriteTest()
     {
         GrhSimModel model("f10_reglatch_mem_write");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
-        const auto tabType = model.arrayType(bit, 4); // 4 x 1 bit: regLatch class
+        const std::array<int64_t, 1> tabShape{4};
+        const auto tabType = model.logicType(4, false, LogicDomain::TwoState, tabShape); // 4 x 1 bit: regLatch class
         const auto clk = addInputRead(model, "clk", SimPhase::Event);
         addEdgeDet(model, clk, 0);
         const auto en = addInputRead(model, "en");
@@ -1022,7 +1036,7 @@ namespace
         const auto tab = addState(model, "tab", tabType, "0");
         const std::array writeRefs{ObjectRef::state(tab)};
         const std::array writeParams{Parameter{model.intern("event_acts"), std::vector<int64_t>{0}}};
-        const auto write = model.addOperation("core.state.memWrite", std::array{en, addr, data, one}, {},
+        const auto write = model.addOperation("core.state.writeArray", std::array{en, addr, data, one}, {},
                                               writeRefs, writeParams);
         require(verifies(model), "f10: fixture rejected");
 
@@ -1068,7 +1082,7 @@ namespace
     void translationUnitsTest()
     {
         GrhSimModel model("f11_translation_units");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", SimPhase::Event);
         addEdgeDet(model, clk, 0);
@@ -1076,10 +1090,11 @@ namespace
         const auto x = addNot(model, d, "x");
         const auto one = addConstant(model, bit, "1'b1");
         const auto q = addState(model, "q", bit, "1'b0");
-        addRegWrite(model, one, x, one, q, {0});
-        const auto memType = model.arrayType(bit, 16);
+        addWrite(model, one, x, one, q, {0});
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
         const auto mem = addState(model, "mem", memType, "0");
-        model.addOperation("core.state.memWrite", std::array{one, one, d, one}, {},
+        model.addOperation("core.state.writeArray", std::array{one, one, d, one}, {},
                            std::array{ObjectRef::state(mem)});
         const auto outPort = model.addOutput("o", bit);
         const auto os = addState(model, "os", bit, "1'b0");
@@ -1203,16 +1218,16 @@ namespace
     void translationUnitsSplitTest()
     {
         GrhSimModel model("f13_tu_split");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto d = addInputRead(model, "d");
         // 24-deep compute cone -> one non-sink supernode well over the tiny
-        // unit cap; the sink regWrite stays a separate singleton supernode.
+        // unit cap; the sink write stays a separate singleton supernode.
         ValueId cur = d;
         for (int i = 0; i < 24; ++i) cur = addNot(model, cur, "x" + std::to_string(i));
         const auto one = addConstant(model, bit, "1'b1");
         const auto q = addState(model, "q", bit, "1'b0");
-        addRegWrite(model, one, cur, one, q, {});
+        addWrite(model, one, cur, one, q, {});
         require(verifies(model), "f13: fixture rejected");
 
         attributeAndInit(model);
@@ -1292,7 +1307,7 @@ namespace
     void latchIcgShapeTest()
     {
         GrhSimModel model("f12_latch_icg");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk");
         const auto rckEn = addInputRead(model, "rckEn");
@@ -1310,8 +1325,8 @@ namespace
         addEdgeDet(model, cgRead, 0);
         const auto q1 = addState(model, "q1", bit, "1'b0");
         const auto q2 = addState(model, "q2", bit, "1'b0");
-        const auto w1 = addRegWrite(model, one, d, one, q1, {0});
-        const auto w2 = addRegWrite(model, one, d, one, q2, {0});
+        const auto w1 = addWrite(model, one, d, one, q1, {0});
+        const auto w2 = addWrite(model, one, d, one, q2, {0});
         require(verifies(model), "f12: fixture rejected");
 
         attributeAndInit(model);
@@ -1350,7 +1365,7 @@ namespace
     }
 
     // A1: a nonempty signature cluster subdivides by shared write enable.
-    // Singleton regWrite nodes with a non-constant en group by en value id;
+    // Singleton write nodes with a non-constant en group by en value id;
     // a group reaching --sink-enable-guard-min-size becomes its own
     // SinkEvent supernode carrying attrs.enableGuard, while small groups,
     // constant-enable writes and the escape class keep the previous
@@ -1364,7 +1379,7 @@ namespace
             ValueId enA, enB;
         };
         const auto buildFixture = [](GrhSimModel &model) {
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto clk = addInputRead(model, "clk", SimPhase::Event);
             addEdgeDet(model, clk, 0);
@@ -1378,14 +1393,14 @@ namespace
                 for (uint32_t i = 0; i < count; ++i)
                 {
                     const std::string name = prefix + std::to_string(i);
-                    target.push_back(addRegWrite(model, en, d, one, addState(model, name.c_str(), bit, "1'b0"), {0}));
+                    target.push_back(addWrite(model, en, d, one, addState(model, name.c_str(), bit, "1'b0"), {0}));
                 }
             };
             addWrites(fixture.groupA, fixture.enA, 5, "qa");
             addWrites(fixture.groupB, fixture.enB, 4, "qb");
             addWrites(fixture.groupC, enC, 3, "qc");
             addWrites(fixture.constEn, one, 2, "qd");
-            fixture.escapeWrite = addRegWrite(model, fixture.enA, d, one, addState(model, "qe", bit, "1'b0"), {});
+            fixture.escapeWrite = addWrite(model, fixture.enA, d, one, addState(model, "qe", bit, "1'b0"), {});
             return fixture;
         };
 
@@ -1490,7 +1505,7 @@ namespace
     void sinkEnableGuardCloneRemapTest()
     {
         GrhSimModel model("f14_guard_clone_remap");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = addInputRead(model, "clk", SimPhase::Event);
         addEdgeDet(model, clk, 0);
@@ -1511,7 +1526,7 @@ namespace
         for (uint32_t i = 0; i < 5; ++i)
         {
             const std::string name = "q" + std::to_string(i);
-            addRegWrite(model, en, d, one, addState(model, name.c_str(), bit, "1'b0"), {0});
+            addWrite(model, en, d, one, addState(model, name.c_str(), bit, "1'b0"), {0});
         }
         require(verifies(model), "f14: fixture rejected");
         runPass(model, "grhsim.select-state-stores");
@@ -1536,8 +1551,8 @@ namespace
             for (auto opId : flatOps(mapping, supernode.id))
             {
                 const auto &op = model.operations()[opId.index - 1];
-                require(model.text(op.opType) == "core.state.regWrite",
-                        "f14: guard supernode holds a non-regWrite op");
+                require(model.text(op.opType) == "core.state.write",
+                        "f14: guard supernode holds a non-write op");
                 const auto enIndex = model.operands(op).front().index;
                 if (!sharedIndex) sharedIndex = enIndex;
                 require(enIndex == sharedIndex, "f14: guard members disagree on the enable value");
@@ -1585,7 +1600,7 @@ int main()
         subsetDomainBlockedTest();
         crossDomainBlockedTest();
         combExemptTest();
-        memWriteSplitTest();
+        arrayWriteSplitTest();
         flatBranchesTest();
         verifierRejectsTest();
         emptyModelTest();

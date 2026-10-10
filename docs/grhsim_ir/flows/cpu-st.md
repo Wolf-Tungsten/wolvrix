@@ -47,7 +47,8 @@ value 继续跳过。四态或非 logic 的 undriven value 仍报错，不默认
 lower 还把 GRH 图的 `declaredSymbols` 与 `generateGroups` 原样携带为模型的只读
 metadata（见 [Overview](../overview.md) 第 3.4 节；`keep_declared_symbols=False` 可关闭，
 与 `keep_origins` 独立），并为每个能解析到存活 value/state/function 的声明建立
-`declProvenance` 记录（direct 全覆盖 slice，数组声明保留形状；见 Overview 第 3.4.1 节）。
+`declProvenance` 记录（direct 全覆盖 slice；stage-06 起数组声明的形状由类型系统承接，
+`declProvenance` 只记声明的总线性位宽，见 Overview 第 3.4.1 节）。
 名字清单是来源注解，不参与仿真语义，cpu.st 各 pass 对它们没有维护义务；
 `declProvenance` 持有实体下标，`compact()` 会重映射并丢弃已删除目标的 slice，
 改写被声明实体的 pass 负责在删除前重定向。checkpoint 往返对两者保持不变。
@@ -67,8 +68,8 @@ event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全
 `grhsim.classify-event-inputs`（B1）、`grhsim.lower-edge-detect`（B2）、
 `grhsim.extract-output-cones`（B3）、`grhsim.migrate-timeslot-tasks`（B4）完成事件/输出/
 time-slot 结构降级；[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5）按
-A7 分类完成类感知相位归属（`mem` 类数组的写归 P_mem，`regLatch` 类状态的写——含小数组
-上的 mem op——归 P_general），`grhsim.simplify(scope=phase)`（B6）逐分区独立化简
+A7 分类完成类感知相位归属（`mem` 类状态的写归 P_mem，`regLatch` 类状态——含小数组——
+的写归 P_general），`grhsim.simplify(scope=phase)`（B6）逐分区独立化简
 （保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），最后
 `grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
 P_mem 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clone-shared-compute`）撤除：
@@ -94,11 +95,11 @@ op 消费的 op（越界消费者永不重接，删除会使其悬空），mem �
 op 不得带 objectRefs 或 parameters。例如：
 
 ```text
-x:u8 -> assign y:u8 -> assign z:u8 -> regWrite(enable, z, mask, clk)
-                                 => regWrite(enable, x, mask, clk)
+x:u8 -> assign y:u8 -> assign z:u8 -> write(enable, z, mask, clk)
+                                 => write(enable, x, mask, clk)
 ```
 
-`regWrite` 的 operands 依次为 enable、写入数据、位掩码和事件值。重写只将数据
+`write` 的 operands 依次为 enable、写入数据、位掩码和事件值。重写只将数据
 从 z 接回 x；原 history 对象、初始化和事件边沿参数不变。若赋值连接不同位宽、
 signedness 或 logic domain，则保留转换；string、real、四态值也不消除。同类型
 宽 logic 可消除，因为不存在截断或扩展。赋值环保持，不为环构造常量或任意根。
@@ -201,9 +202,9 @@ event/output 锥，[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B
 存储分类完成总归属，B8 封板。C 段只消费 `SimOp::phase`，不重新归因；C1 发现 `none`
 op 即报错并指向 B5。
 
-写 op 集合为 `core.state.regWrite`、`latchWrite`、`memWrite`、`memFill`、`memAssign`、
-`memWriteSeq`：reg/latch 写与 `regLatch` 类状态（含小数组）上的 mem 写在 General 相，
-`mem` 类数组的写在 Mem 相。其他 op 归 General（含 `core.system.task` 和
+写 op 集合为 `core.state.write`、`writeArray`、`fill`、`latchWrite`：标量目标的
+`write` 与全部 `latchWrite`，以及 `regLatch` 类状态（含小数组）上的写在 General 相，
+`mem` 类状态的写在 Mem 相。其他 op 归 General（含 `core.system.task` 和
 `core.dpi.call`），事件锥与输出锥分别归 Event/Output。
 
 事件在 B2 已降级为聚类形态：每个 `(event, edge)` 去重聚类对应一个
@@ -213,8 +214,9 @@ op 即报错并指向 B5。
 数据；即使 enable 为假，prevEvent 仍逐轮采样。
 
 不得预设 XiangShan 只有一个事件聚类，也不得假设同一 state 只有一个写口；多个写口完整
-保留，合法性和覆盖规则遵守 core 方言。`memWriteSeq` 的有序三元组在同一个 op 内处理，
-分区或函数打包不得拆散它。
+保留，合法性和覆盖规则遵守 core 方言。同一 state 的多个写 op 按 op 声明顺序应用、后写
+覆盖先写（stage-06 起 `memWriteSeq` 退役，有序覆盖由声明顺序表达）；该相对顺序是 IR
+语义，分区或函数打包不得重排同 state 的写 op。
 
 DPI 保持 `callCond && event guard` 语义：有无返回值不决定其相位，没有结果的调用不能被
 删除，没有 event 时 guard 为真；未触发时结果保持。
@@ -251,7 +253,7 @@ C7 的单核 task 序列为：P_event（`AlwaysScanCommit`）→ P_general 各 E
 | --- | --- |
 | `inputFanout` | General 相输入 read value 的任意变化，激活所属超节点；纯事件输入无条目（由 P_event 覆盖） |
 | `computeSupernodeFanout` | boundary value 真变化，激活跨超节点非 sink 消费者（Mem 相写消费者除外，P_mem 每轮运行；sink 消费者过滤后无条目） |
-| `commitStateFanout` | reg/latch 状态真变化，激活 General 读者超节点并决定继续迭代；General 相、目标为 regLatch 类数组的 memRead 读者同标量一样经本表激活 |
+| `commitStateFanout` | reg/latch 状态真变化，激活 General 读者超节点并决定继续迭代；General 相、目标为 regLatch 类数组的 `readArray` 读者同标量一样经本表激活 |
 
 activate 目标只指向 General 超节点；mem 类数组的读者不在此表，由 C5 写计划的读者表
 激活。posedge 聚类也必须观察下降沿，以便 prevEvent 回到 0；不能只在所需边沿方向上
@@ -272,8 +274,9 @@ activate 目标只指向 General 超节点；mem 类数组的读者不在此表�
     （非 sink：dataActiveFlag 点火并清零；SinkEvent 簇：eventActStore 签名
     组合门控；SinkEscape 簇：每轮无条件；sink 簇体内不再重复判断事件——
     V2-M3，非 sink 体内事件 op 与 P_mem 写口保留逐 op guard；regLatch 类写
-    在超节点内 NBA 提交 regLatchStoreNext；memRead 读当前值）
-  P_mem：按 C5 计划逐写原地提交 mem 类数组（同地址后写覆盖先写）
+    在超节点内 NBA 提交 regLatchStoreNext；readArray 读当前值）
+  P_mem：按 C5 计划逐写原地提交 mem 类数组（计划按写 op 声明顺序生成，
+    同地址后写覆盖先写）
   P_publish：regLatchStoreNext 整块提交回 regLatchStore；状态真变化经
     commitStateFanout 把读者激活进 dataActiveFlagNext，并决定是否继续迭代
   若 E 未变化，退出轮次循环
@@ -297,13 +300,17 @@ act 位，引用该聚类的 SinkEvent 写簇在 P_general 经签名组合门控
 
 emit 可以改变 C++ 形态，但不能改变上述 G 转移、E 或调用语义。当前 emitter 的关键结构：
 
-- General 相 regLatch 类数组写（memWrite/memFill/memAssign/memWriteSeq）在所属超节点内
+- General 相 regLatch 类数组写（`write`/`writeArray`/`fill`）在所属超节点内
   NBA 提交 regLatchStoreNext：merge 基为 next 行（同轮多写口读改写叠加）、对 cur 行做
   真变化检测，经 commitStateFanout 把读者激活进 dataActiveFlagNext，与标量 reg/latch
-  路径一致；memRead 对 regLatch 类数组读 regLatchStore 当前值；init 写 cur 后由
+  路径一致；`readArray` 对 regLatch 类数组读 regLatchStore 当前值；init 写 cur 后由
   initGlue 同步 next。
-- mem 类数组写在 P_mem 按 C5 优先级原地提交（同地址后写覆盖先写）；常量地址的读者按
-  精确 staticRow 激活，动态地址保守地在任意写时激活。
+- mem 类数组写在 P_mem 按 C5 计划原地提交：计划按写 op 的**声明顺序**生成（`priority`
+  字段 = 该写在目标 state 的 Mem 相写中的声明顺序位次，保留为检查/调试可读性），原地
+  提交天然后写覆盖先写；跨事件写端口不受同顺序域限制——P_mem 在 P_general 之后统一
+  提交，同轮多个事件聚类命中的写口按 plan 顺序应用。常量地址的读者按精确 staticRow
+  激活（`readArray` 的全 rank 索引全部为常量时按行主序折叠为线性行号；任一非常量索引
+  或 k<rank 的部分索引一律视为动态读者），动态地址保守地在任意写时激活。
 - 宽位 helper 沿用 legacy 的指针式、调用者提供 out-buffer 的原地计算 ABI，不增加整块
   旧值快照。
 - dumpState 对 regLatch 类大数组（count>64）与 memStore 一样走 fnv1a 哈希。

@@ -9,7 +9,7 @@ quiescence projection, or private per-event history states — none of those exi
 on the whole graph. It does not match object names.
 
 Each candidate target must be an unsigned two-state one-bit logic state with
-exactly one `core.state.regWrite` writer and at least one ordinary,
+exactly one `core.state.write` writer and at least one ordinary,
 parameterless `core.state.read` of the exact state type. No other references to
 the target are allowed (a state used anywhere except those plain reads and its
 one write is rejected). The writer must have no results, exactly one object ref
@@ -46,18 +46,18 @@ the pass performs no I/O and behaves exactly as before.
 For example, two registers with initial values `q0=0`, `q1=1`:
 
 ```text
-regWrite(en, d0, mask, clk), refs=[q0], event_edges=[posedge]
-regWrite(en, d1, mask, clk), refs=[q1], event_edges=[posedge]
+write(en, d0, mask, clk), refs=[q0], event_edges=[posedge]
+write(en, d1, mask, clk), refs=[q1], event_edges=[posedge]
 
 => initial packed = 2'd2
    data = concat(d1,d0)
    masks = replicate(mask, rep=2)
-   regWrite(en, data, masks, clk), refs=[packed], event_edges=[posedge]
+   write(en, data, masks, clk), refs=[packed], event_edges=[posedge]
    read(q0) => sliceStatic(read(packed), sliceStart=0, sliceEnd=0)
    read(q1) => sliceStatic(read(packed), sliceStart=1, sliceEnd=1)
 ```
 
-`regWrite` operands are enable, new data, write mask, then one value per event;
+`write` operands are enable, new data, write mask, then one value per event;
 the object ref is the target. `concat` operands run from most to least
 significant; `replicate` repeats its only operand; slice bounds are inclusive.
 All new ops inherit the phase of the grouped writers (always `none` at the A5

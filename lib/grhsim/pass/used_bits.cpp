@@ -33,15 +33,17 @@ namespace wolvrix::lib::grhsim
 
         UseRule ruleFor(std::string_view name)
         {
+            // writeArray/fill/readArray are array accesses: their operands and
+            // results stay fully used (a shaped value has no used-bits width
+            // and is never narrowed, so this is a conservative full-use sink).
             if (name == "core.output.write" || name == "core.system.task" ||
-                name == "core.dpi.call" || name == "core.state.memWrite" ||
-                name == "core.state.memFill" || name == "core.state.memWriteSeq" ||
-                name == "core.state.memAssign" || name == "core.state.memRead" ||
+                name == "core.dpi.call" || name == "core.state.writeArray" ||
+                name == "core.state.fill" || name == "core.state.readArray" ||
                 name == "core.system.function" ||
                 name == "core.event.edgeDet") return UseRule::sinkFull;
             if (name == "core.input.read") return UseRule::inputRead;
             if (name == "core.state.read") return UseRule::stateRead;
-            if (name == "core.state.regWrite" || name == "core.state.latchWrite") return UseRule::stateWrite;
+            if (name == "core.state.write" || name == "core.state.latchWrite") return UseRule::stateWrite;
             if (!name.starts_with("core.compute.")) return UseRule::none;
             const auto kind = name.substr(std::string_view("core.compute.").size());
             if (kind == "constant") return UseRule::none;
@@ -76,11 +78,16 @@ namespace wolvrix::lib::grhsim
             std::vector<uint32_t> usedState;
             std::vector<uint32_t> widthValue;
             std::vector<uint32_t> widthState;
+            // Stage-06: liveness pin for values without a width entry (shaped
+            // arrays, real, string). Monotone (once set, never cleared), so
+            // the fixpoint terminates; pinning queues the producer once so
+            // the cone-pinning rule keeps its input cone alive.
+            std::vector<uint8_t> pinned;
             std::vector<uint32_t> producer; // value index -> op index + 1
             std::vector<uint8_t> rules;
             // Structural narrowing eligibility, independent of the fixpoint:
-            // logic two-state, const/random init only, referenced only as
-            // read/regWrite/latchWrite target, write data/mask as wide as state.
+            // scalar logic two-state, const/random init only, referenced only as
+            // read/write/latchWrite target, write data/mask as wide as state.
             std::vector<uint8_t> stateEligible;
             std::vector<std::vector<uint32_t>> opsByState;
 
@@ -95,16 +102,22 @@ namespace wolvrix::lib::grhsim
                 producer.assign(model.values().size() + 1, 0);
                 rules.assign(ops.size() + 1, 0);
                 opsByState.assign(model.states().size() + 1, {});
+                pinned.assign(model.values().size() + 1, 0);
                 for (const auto &value : model.values())
                 {
                     const auto &type = types[value.type.index - 1];
-                    if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState)
+                    // Shaped (array) values carry no used-bits width: a prefix
+                    // narrowing of an array's flat bits is not expressible.
+                    if (type.kind == TypeKind::Logic && type.shape.empty() &&
+                        type.domain == LogicDomain::TwoState)
                         widthValue[value.id.index] = type.width;
                 }
                 for (const auto &state : model.states())
                 {
                     const auto &type = types[state.type.index - 1];
-                    if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState)
+                    // Shaped (array) states are never prefix-narrowed.
+                    if (type.kind == TypeKind::Logic && type.shape.empty() &&
+                        type.domain == LogicDomain::TwoState)
                         widthState[state.id.index] = type.width;
                 }
                 std::deque<uint32_t> queue;
@@ -123,6 +136,8 @@ namespace wolvrix::lib::grhsim
                 stateEligible.assign(model.states().size() + 1, 0);
                 for (const auto &state : model.states())
                 {
+                    // widthState is nonzero only for scalar two-state logic
+                    // states, so shaped (array) states are never eligible.
                     if (!widthState[state.id.index]) continue;
                     bool eligible = true;
                     for (const auto &record : model.initRecords())
@@ -169,7 +184,20 @@ namespace wolvrix::lib::grhsim
                 auto raiseValue = [&](ValueId value, uint32_t request) {
                     if (!value.valid()) return;
                     const uint32_t cap = widthValue[value.index];
-                    if (cap == 0) return;
+                    if (cap == 0)
+                    {
+                        // Non-tracked results (shaped arrays, real, string)
+                        // never narrow. Pin the value monotonically (the
+                        // fixpoint stays terminating) and queue its producer
+                        // once, so the cone-pinning rule raises the producer's
+                        // own operand cone — the op itself is protected from
+                        // the dead sweep by the widthValue != 0 gate.
+                        if (pinned[value.index]) return;
+                        pinned[value.index] = 1;
+                        const uint32_t op = producer[value.index];
+                        if (op && !queued[op]) { queued[op] = 1; queue.push_back(op); }
+                        return;
+                    }
                     request = std::min(request, cap);
                     if (request <= used[value.index]) return;
                     used[value.index] = request;
@@ -199,6 +227,23 @@ namespace wolvrix::lib::grhsim
                     const auto results = model.results(op);
                     const auto refs = model.objectRefs(op);
                     const auto rule = static_cast<UseRule>(rules[opIndex]);
+                    // Stage-06 cone pinning: an op whose result does not
+                    // participate in width tracking (shaped array, real,
+                    // string) survives the dead sweep unconditionally, so its
+                    // whole operand cone must stay fully used — otherwise the
+                    // flat producers feeding it would be swept while the
+                    // reference remains (dangling). Treat it as a full-use
+                    // sink regardless of the compute rule it carries.
+                    bool pinsCone = false;
+                    for (auto result : results)
+                        if (widthValue[result.index] == 0) pinsCone = true;
+                    if (pinsCone && rule != UseRule::none && rule != UseRule::opaque &&
+                        rule != UseRule::sinkFull && rule != UseRule::inputRead &&
+                        rule != UseRule::stateRead && rule != UseRule::stateWrite)
+                    {
+                        for (auto value : operands) raiseValue(value, widthValue[value.index]);
+                        continue;
+                    }
                     switch (rule)
                     {
                     case UseRule::none:
@@ -219,22 +264,41 @@ namespace wolvrix::lib::grhsim
                         break;
                     case UseRule::stateRead:
                         if (!refs.empty() && refs[0].kind == ObjectKind::State && !results.empty())
-                            raiseState(refs[0].index, used[results[0].index]);
+                        {
+                            // A pinned result (shaped array view of a flat
+                            // state, or any non-tracked read) marks the state
+                            // fully used: its bits all flow through the
+                            // packed value even though used[] stays 0.
+                            const uint32_t demand = pinned[results[0].index]
+                                ? widthState[refs[0].index] : used[results[0].index];
+                            raiseState(refs[0].index, demand);
+                        }
                         break;
                     case UseRule::stateWrite:
                     {
                         if (refs.empty() || refs[0].kind != ObjectKind::State) break;
-                        // Ineligible states never narrow, so their write data/mask
-                        // stay fully used; only narrowable states propagate the
-                        // state's own used prefix.
-                        const uint32_t request = stateEligible[refs[0].index]
-                            ? usedState[refs[0].index]
-                            : widthValue[operands.size() > 1 ? operands[1].index : 0];
+                        // write/latchWrite layout: [updateCond, data, mask,
+                        // events...]. Ineligible states never narrow, so their
+                        // write data/mask stay fully used; only narrowable
+                        // states propagate the state's own used prefix. A
+                        // shaped (array) target is never eligible: its data is
+                        // an array value (no widthValue entry, retained by
+                        // construction) but its full-width scalar mask must
+                        // still be raised to full use.
                         if (operands.size() >= 3)
                         {
                             raiseValue(operands[0], widthValue[operands[0].index]);
-                            raiseValue(operands[1], request);
-                            raiseValue(operands[2], request);
+                            if (stateEligible[refs[0].index])
+                            {
+                                const uint32_t request = usedState[refs[0].index];
+                                raiseValue(operands[1], request);
+                                raiseValue(operands[2], request);
+                            }
+                            else
+                            {
+                                raiseValue(operands[1], widthValue[operands[1].index]);
+                                raiseValue(operands[2], widthValue[operands[2].index]);
+                            }
                             for (auto value : operands.subspan(3))
                                 raiseValue(value, widthValue[value.index]);
                         }
@@ -835,21 +899,22 @@ namespace wolvrix::lib::grhsim
                     if (!scope.inScope(op.phase)) continue;
                     const auto name = model.text(op.opType);
                     const auto results = model.results(op);
-                    // Only two-state logic results participate in used-bits;
-                    // string/real/array results (e.g. $display literals) never
-                    // have a width and must never count as dead.
+                    // Only scalar two-state logic results participate in
+                    // used-bits; string/real/shaped results (e.g. $display
+                    // literals, array reads) never have a width and must never
+                    // count as dead.
                     bool dead = !results.empty();
                     for (auto result : results)
                         dead = dead && analysis.widthValue[result.index] != 0 &&
                                analysis.used[result.index] == 0;
                     if (dead && (name.starts_with("core.compute.") || name == "core.state.read" ||
-                                 name == "core.state.memRead"))
+                                 name == "core.state.readArray"))
                     {
                         removeOps[i + 1] = 1;
                         ++stats.deadOps;
                         continue;
                     }
-                    if (name == "core.state.regWrite" || name == "core.state.latchWrite")
+                    if (name == "core.state.write" || name == "core.state.latchWrite")
                     {
                         const auto refs = model.objectRefs(op);
                         if (!refs.empty() && refs[0].kind == ObjectKind::State &&

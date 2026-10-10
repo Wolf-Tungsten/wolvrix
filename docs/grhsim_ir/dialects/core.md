@@ -22,34 +22,56 @@ DPI call 不能按参数方向拆成多个调用或写回 op，system task 也�
 ## 2. 类型
 
 ```text
-core.logic<width, signed, domain>
+core.logic<width, signed, domain>   // 另带 shape: int64[]（见下）
 core.real
 core.string
-core.array<element_type, count>
 ```
 
 - `core.logic` 表示固定位宽逻辑值：`width` 必须大于零，`signed` 表示算术解释是否有符号，
   `domain` 为 `2-state` 或 `4-state`；
 - `core.real` 和 `core.string` 分别直接承接 GRH 的 `Real` 和 `String`，没有 `width`、
-  `signed` 或 `domain` 参数；
-- `core.array` 是定长同类型序列，`count` 必须非负。
+  `signed` 或 `domain` 参数。
 
-这四个类型同时用于 `I`、`O`、graph value 和 `S` 对象：状态的类型就是它保存的内容的
-类型。寄存器、锁存器、memory 和边沿历史的区别体现在读写状态的 op 上（见第 5、6 节），
-不由状态的类型区分。core 为全部四个类型定义 `InitSpec`（见第 2.1 节）。方言扩展可以
-增加其他类型，但不能改变已有 core 类型的含义。
+**数组形状（shape，stage-06 起与 [GRH 的数组类型](../../grh/grh-ir.md) §2.3 完全同构）**：
+一个 `core.logic` 类型的完整描述是 `width`（**总位宽**，含全部维度）加 `shape`
+（`int64[]`，行主序、最外维在前，空 = 标量）；数组的元素位宽
+`elementWidth = width / ∏shape`。shape 挂在**类型**上，value 与 state 一视同仁：状态的
+类型就是它保存的内容的类型，数组状态就是 shape 非空的 `core.logic` 状态。只有
+`core.logic` 可以携带 shape；`core.real`/`core.string` 不数组化。
+
+**shape 是纯结构视图，不改变任何 op 的扁平位语义**：任何 op 对带 shape value 的语义等同
+于对其 `width` 位扁平位向量的语义；物理存储保持线性（元素按行主序摊平、连续存放），
+shape 只影响数组寻址与语义校验。元素 `(i0, i1, ..., in-1)` 的线性位偏移为
+`(i0*d1*...*dn-1 + i1*d2*...*dn-1 + ... + in-1) * elementWidth`，canonical index 0 对应
+最低元素地址。shape 感知点只有 `core.compute.sliceArray` 与第 5 节的索引访问 op
+（readArray/writeArray/fill）；其余 op 对 shape 透明。
+
+verifier 对 shape 的强制规则（与 GRH verify pass 同构）：各维必须大于 0；各维乘积不得
+溢出 uint64；`width % ∏shape == 0`（必须整除）。非 logic 类型不得携带 shape。
+
+> 演进说明（stage-06）：旧的一维构造子 `core.array<element_type, count>` 已退役，由
+> `width = 元素宽 × count`、`shape = [count]` 的 `core.logic` 表达；多维数组同理由
+> 多维 shape 表达。JSON 格式相应演进为 `wolvrix.grhsim.v3`（类型条目携带 shape，
+> v2 checkpoint 拒绝；core 方言指纹为 `wolvrix.grhsim.core.v2`）。
+
+这些类型同时用于 `I`、`O`、graph value 和 `S` 对象。寄存器、锁存器、memory（数组状态）
+和边沿历史的区别体现在读写状态的 op 上（见第 5、6 节），不由状态的类型区分。core 为
+全部类型定义 `InitSpec`（见第 2.1 节）。方言扩展可以增加其他类型，但不能改变已有
+core 类型的含义。
 
 GRH 数据类型到 core 的转换是一一对应的：`Logic` 转换为 `core.logic`，`Real` 转换为
-`core.real`，`String` 转换为 `core.string`。GRH 已经扁平化的 packed array、struct 和 union
-继续表示为一个 `core.logic`，转换不得恢复出 `core.array` 或其他聚合类型。
+`core.real`，`String` 转换为 `core.string`。GRH 声明/value 上的 shape 是 GRH 的一等信息，
+**必须原样保留并直接承接为 core 类型的 shape**（stage-06 起翻转了旧契约）；只有 GRH 侧
+已经扁平化、不带 shape 的聚合（packed array、struct 和 union）继续表示为一个无 shape 的
+`core.logic`，转换不得为它们重新捏造 shape 或其他聚合类型。
 
 `core.init.const` 步骤中的 `value` 按状态内容的类型书写：`core.logic` 用等宽的 2-state 或
-4-state logic 值，`core.real` 用实数值，`core.string` 用字符串值，`core.array` 用恰好包含
-`count` 个元素的序列。
+4-state logic 值（数组状态即为总位宽的单个值，不逐元素书写），`core.real` 用实数值，
+`core.string` 用字符串值。
 
 ### 2.1 初始化描述 `InitSpec`
 
-core 方言为全部四个类型定义 `InitSpec`：一个**非空**的初始化步骤序列，按序应用，后者覆盖
+core 方言为全部类型定义 `InitSpec`：一个**非空**的初始化步骤序列，按序应用，后者覆盖
 前者：
 
 ```text
@@ -58,24 +80,27 @@ InitSpec = InitStep[]
 InitStep =
   core.init.const    { value }                          // 全量赋值
   core.init.random   { seed: Integer? }                 // 对应 $random / $random(seed)
-  core.init.readmem  { file, format: hex|bin, start?, count? }  // 仅 core.array
-  core.init.fill     { value 或 random, start?, count? }          // 仅 core.array
+  core.init.readmem  { file, format: hex|bin, start?, count? }  // 仅数组状态
+  core.init.fill     { value 或 random, start?, count? }          // 仅数组状态
 ```
 
 - `core.init.const` 适用于所有类型：`value` 是一个目标状态类型的值。
 - `core.init.random` 仅适用于 `core.logic` 状态，对整个状态赋予随机值；`seed` 缺省时对应
   无参 `$random`。
-- `core.init.readmem` 仅适用于 `core.array` 状态，对应 `$readmemh`/`$readmemb`：`file` 为
-  数据文件路径，`start` 缺省为 0，`count` 缺省为从 `start` 读到末尾。
-- `core.init.fill` 仅适用于 `core.array` 状态，对应一段地址的重复赋值：`value` 为静态元素
-  值，`random` 表示每行独立采样 `$random`；`start` 缺省为 0，`count` 缺省为覆盖到末尾。
+- `core.init.readmem` 仅适用于数组状态（shape 非空的 `core.logic` 状态），对应
+  `$readmemh`/`$readmemb`：`file` 为数据文件路径，`start` 缺省为 0，`count` 缺省为从
+  `start` 读到末尾。`start`/`count` 是**线性行地址**（行主序摊平后的元素下标），不引入
+  多维 init 寻址。
+- `core.init.fill` 仅适用于数组状态，对应一段地址的重复赋值：`value` 为静态元素值，
+  `random` 表示每行独立采样 `$random`；`start`/`count` 同为线性行地址，缺省为 0 和覆盖
+  到末尾。
 
-非 array 状态的 `InitSpec` 只允许一个全量步骤（const 或 random）。`core.array` 状态允许
+标量（shape 为空）状态的 `InitSpec` 只允许一个全量步骤（const 或 random）。数组状态允许
 多个 readmem/fill 步骤组合。
 
 core 方言不为缺失的初值指定隐式默认值。`InitSpec` 应用后必须覆盖状态对象的全部内容；GRH 未
 显式给出初值时（如无 `initValue` 的寄存器或锁存器），转换必须按 SV 语义显式补一个全量
-`core.init.const` 步骤（4-state 为全 X）。array 状态的 readmem/fill 步骤只覆盖部分地址时，
+`core.init.const` 步骤（4-state 为全 X）。数组状态的 readmem/fill 步骤只覆盖部分地址时，
 序列必须以这样的全量步骤打底，未覆盖地址按 SV 语义保持全 X。
 
 ## 3. Op 命名与公共约定
@@ -113,7 +138,7 @@ operands、results 或运算语义。当前直接承接以下关键结构：
 | `kConcat` | `core.compute.concat` |
 | `kSliceStatic` | `core.compute.sliceStatic` |
 | `kSliceDynamic` | `core.compute.sliceDynamic` |
-| `kSliceArray` | `core.compute.sliceArray`（过渡形态：转换层补 `sliceWidth` 参数 = 元素宽，仅支持单索引；多维索引承接待 stage-06） |
+| `kSliceArray` | `core.compute.sliceArray`（多索引承接：operands 为 `[base, i0..ik-1]`，`1 <= k <= rank(base.shape)`；结果为元素或带剩余维 shape 的子数组。语义是**数组值访问**，对应 GRH stage-02 的 kSliceArray 重定义——不再有 `sliceWidth` 参数，元素几何完全来自 base 的 shape；物理上等价于行主序位段选取，但不是 packed 位向量切片 op） |
 | `kEq` | `core.compute.eq` |
 | `kLogicAnd` | `core.compute.logicAnd` |
 
@@ -138,49 +163,71 @@ mux 转为此 op，保留原 producer 求值与依赖。GRH lowering 不直接�
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
 | `core.state.read` | 无 | 一个 `S` 对象 | 无 | 一个与目标状态同类型的值 |
-| `core.state.regWrite` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象 | `event_edges` | 无 |
-| `core.state.latchWrite` | `%updateCond, %nextValue, %mask` | 一个 `S` 对象 | 无 | 无 |
-| `core.state.memRead` | `%address` | 一个 `core.array` 类型的 `S` 对象 | 无 | 一个元素类型的值 |
-| `core.state.memWrite` | `%updateCond, %address, %data, %mask, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
-| `core.state.memFill` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
-| `core.state.memAssign` | `%updateCond, %data, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
-| `core.state.memWriteSeq` | `%updateCond_0, %address_0, %data_0, ..., %updateCond_{N-1}, %address_{N-1}, %data_{N-1}, %events...` | 一个 `core.array` 类型的 `S` 对象 | `event_edges` | 无 |
+| `core.state.readArray` | `%i0, ..., %ik-1`（`1 <= k <= rank`） | 一个带 shape 的 `S` 对象 | 无 | `k == rank` → 元素类型的值；`k < rank` → 带剩余维 shape 的子数组值 |
+| `core.state.write` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象 | `event_edges` | 无 |
+| `core.state.writeArray` | `%updateCond, %i0..%ik-1, %data, %mask, %events...`（`1 <= k <= rank`） | 一个带 shape 的 `S` 对象 | `event_edges` | 无 |
+| `core.state.fill` | `%updateCond, %data, %events...` | 一个带 shape 的 `S` 对象 | `event_edges` | 无 |
+| `core.state.latchWrite` | `%updateCond, %nextValue, %mask` | 一个标量 `S` 对象 | 无 | 无 |
 
-`updateCond` 和每个 event 必须是一位 logic。`mask` 与目标状态的 logic 位宽相同；mask 位为
-1 的部分允许更新，其他部分保持原值。
+命名约定为**访问形态命名 + `Array` 后缀标记索引变体**：`read`/`readArray` 和
+`write`/`writeArray` 两对分别是整体访问与索引访问，`fill` 是整体广播写，`latchWrite`
+是唯一的例外——latch 是电平敏感的不同状态种类，值得独立名字。时钟/电平差异由 event
+操作数表达而非名字前缀：`write`/`writeArray`/`fill` 至少携带一个 event（`event_edges`
+逐一标注边沿），`latchWrite` 无 event、电平敏感。访问形态（整体/索引/掩码/填充）是 op
+语义，状态的存储分类（regLatch/mem，见 [Overview](../overview.md) 第 3.5 节）是后端
+策略，二者完全解耦。
 
-`core.state.read` 返回目标状态的当前值。`memRead` 返回目标状态中 `%address` 指定的元素，
-地址必须小于目标状态的元素个数。
+公共约定：
 
-`latchWrite` 在 `%updateCond` 为真时，用 `%nextValue` 的被 mask 选中部分更新目标状态。
-`regWrite` 和 `memWrite` 还要求至少一个 event 命中对应边沿；`memWrite` 只更新 `%address`
-指定的元素。条件不成立时目标状态保持原值。
+- `updateCond` 和每个 event 必须是一位 logic；索引操作数 `%i0..%ik-1` 必须是标量 logic
+  （无 shape）。越界索引的行为是实现定义（仿真端按实现截断/钳位，不做跨实现约定）。
+- `mask` 是**位掩码**（`mask[i]=1` 时写入第 `i` 位，不提供元素粒度掩码）：
+  `write`/`latchWrite` 的 mask 宽等于目标状态的总位宽，`writeArray` 的 mask 宽等于
+  `%data` 的总位宽。mask 位为 1 的部分允许更新，其他部分保持原值。
 
-`memFill` 在 `%updateCond` 为真且 event 命中时，把 `%data` 广播写入目标状态的全部元素；
-`%data` 通常是元素类型；作为例外，`%data` 可以是 `元素位宽 × 元素个数` 位的打包 logic
-值（packed fill，来自整宽聚合写），此时按行主序切片，第 `i` 个元素取
-`%data[i*元素位宽 +: 元素位宽]`。`memAssign` 在同样条件下把 `%data` 整体赋给目标状态；
-`%data` 必须是与目标状态同类型的 `core.array` 值。
+`core.state.read` 返回目标状态的当前值，结果类型就是目标状态的类型——数组状态读出带全
+shape 的整体值。
 
-`memWriteSeq` 把对同一 array 状态的一组**有序**条件索引写表达为单个 op。operands 末尾的
-`%events...` 是整个 op 的事件列表，至少一个，不与单个写口关联：任一 event 命中对应边沿即
-触发整个 op，触发后按写口在 operands 中的顺序依次应用——`%updateCond_k` 为真则把 `%data_k`
-写入 `%address_k` 指定的元素，地址相同时后应用的写覆盖先应用的写；无 event 命中时状态
-保持不变。写口数 `N = (|operands| - |events|) / 3`，必须整除；`N = 1` 时语义退化为
-`memWrite`。该 op 承接
-GRH/SV 中由 if/else-if 链表达的多端口优先级写：链序对应 operand 顺序，链头（最高优先级）
-排在 operands 最后。CPU 后端可以把它直接生成为顺序 store（gsim 形态），其他后端也可以
-展开为优先级选择逻辑。不同写口需要不同事件的情况不属于该 op 的承接范围，保持显式多 op
-形态。
+`core.state.readArray` 返回目标状态中 `%i0..%ik-1` 寻址到的元素或子数组。记目标状态的
+shape 为 `[d0, ..., dn-1]`（rank = n），索引数 `k` 满足 `1 <= k <= n`：`k == n` 时结果为
+元素类型（宽 `elementWidth`，无 shape）；`k < n` 时结果为带剩余维 shape 的子数组（宽
+`elementWidth × ∏shape[k:]`，shape 为 `shape[k:]`）。
 
-同一个 array 状态可以有多个写 op，但任意两个写 op 不能在同一次 `G` 应用中写入同一 bit；
-op 的排列顺序不产生覆盖语义。需要有序覆盖的多写口必须收进单个 `memWriteSeq`，由 operand
-顺序表达覆盖关系。
+`core.state.write` 在 `%updateCond` 为真且至少一个 event 命中对应边沿时，用 `%nextValue`
+被 mask 选中的部分更新目标状态；`%nextValue` 的类型必须等于目标状态的类型。它承接旧
+`regWrite`（标量写）与旧 `memAssign`（数组整体写 = mask 全 1、`%nextValue` 带全 shape
+的 `write`）。条件不成立时目标状态保持原值。
+
+`core.state.latchWrite` 的更新规则与 `write` 相同，但无 event、电平敏感，且目标必须是
+标量状态（shape 为空）。
+
+`core.state.writeArray` 在 `write` 的同样条件下更新 `%i0..%ik-1` 寻址到的元素或子数组；
+`%data` 的类型规则与 `readArray` 的结果几何对称（`k == rank` → 元素类型；`k < rank` →
+带剩余维 shape 的子数组类型）。
+
+`core.state.fill` 在 `%updateCond` 为真且 event 命中时，把 `%data` 写入目标状态的全部
+元素：`%data` 通常是元素宽度的标量（广播填充）；作为例外，`%data` 可以是目标状态总位宽
+的打包 logic 值（packed fill，来自整宽聚合写），此时按行主序逐行切片，线性行号为 `i`
+的元素取 `%data[i*elementWidth +: elementWidth]`。
+
+**同一状态的多个写 op（`write`/`writeArray`/`fill` 的任意组合）按 op 声明顺序应用：
+同轮同时激活时按声明顺序依次生效，后声明的写覆盖先声明的写**（与 GRH stage-03 §3.4 的
+同 regSymbol 写端口优先级规则同构；转换层 1:1 保序生成）。**同 state 写 op 的相对顺序
+是 IR 语义的一部分，pass 不得重排**（verifier 断言兜底）。跨事件的写口同样适用该规则，
+不再有任何"同顺序域"限制。
+
+> 演进说明（stage-06）：旧 op 族 `regWrite`/`memRead`/`memWrite`/`memFill`/`memAssign`/
+> `memWriteSeq` 已整体退役，由上面的统一族取代（对应关系：`regWrite`→`write`，
+> `memRead`→`readArray`，`memWrite`→`writeArray`，`memFill`→`fill`，`memAssign`→数组
+> 整体 `write`）。旧约束"同一 array 状态的任意两个写 op 不能在同一次 `G` 应用中写入同一
+> bit，需要有序覆盖的多写口必须收进单个 `memWriteSeq`（operand 顺序表达覆盖关系）"随之
+> 删除——有序覆盖现在由声明顺序语义表达，`memWriteSeq` 的"全部写口须同事件"限制也不复
+> 存在。
 
 ## 6. Event 与边沿标注
 
 `event_edges` 与事件敏感 op 尾部的 event operands 一一对应，每项只能是 `posedge` 或
-`negedge`。事件敏感 op 包括 register/memory 写口、memory fill/assign、system task 和
+`negedge`。事件敏感 op 包括状态写口（`write`/`writeArray`/`fill`）、system task 和
 DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份原始标注（M5 起不再
 附带每 event 的 `__event_*` 历史状态对象）；边沿判定全部由六阶段 lowering
 （`grhsim.lower-edge-detect`，见 [lower-edge-detect](../passes/lower-edge-detect.md)）
@@ -199,10 +246,11 @@ DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份�
 > 摘除、`event_edges` 参数替换为 `event_acts`（int64 数组，
 > 元素为聚类下标、保持原顺序）。
 > `core.system.task` 改写后不再持有 object refs，`core.dpi.call` 只保留首部 Function
-> 引用；`regWrite`/`system.task`/`dpi.call` 的 phase 置为 `general`，四种 mem 写在语义
-> 归类前保持无 phase。verifier 在模型出现 `event_acts` 后禁止任何 `event_edges` 残留。
-> M5d-5 起四种 mem 写由语义层 `grhsim.split-phases`（B5）归类：按目标状态的存储分类，
-> `mem` 类数组的写归 `mem` 相、`regLatch` 类状态的写归 `general` 相（见
+> 引用；`write`/`latchWrite`/`system.task`/`dpi.call` 的 phase 置为 `general`，
+> `writeArray`/`fill` 与目标是数组状态的 `write` 在语义归类前保持无 phase。verifier
+> 在模型出现 `event_acts` 后禁止任何 `event_edges` 残留。
+> M5d-5 起这些写由语义层 `grhsim.split-phases`（B5）归类：按目标状态的存储分类，
+> `mem` 类状态的写归 `mem` 相、`regLatch` 类状态的写归 `general` 相（见
 > [grhsim.split-phases](../passes/grhsim-split-phases.md)）。
 > M5 起 GRH 转换不再产出 `__event_*` 历史状态；lower-edge-detect 会顺带清理
 > M5 前 checkpoint 里残留的此类未引用状态。
@@ -239,11 +287,11 @@ P_event 覆盖重算，不粘滞）；无论是否命中，prev 都立刻更新�
 `(%event, edge)` 二元组互不相同（去重聚类的正确性）；edgeDet 的 phase 归属必须为
 `event`。
 
-例：两个 regWrite 共享 `(clk, posedge)` 聚类，另一个 rst 同时有 posedge/negedge 两个
+例：两个 write 共享 `(clk, posedge)` 聚类，另一个 rst 同时有 posedge/negedge 两个
 edgeDet：
 
 ```text
-; q1/q2 的 regWrite 都消费 (clk, posedge)，共享一个检测器：
+; q1/q2 的 write 都消费 (clk, posedge)，共享一个检测器：
 core.event.edgeDet
   operands: [%clk_ev]
   parameters: { edge: posedge, act: 0, prev: 0, prevInit: 1'h0 }
@@ -385,14 +433,14 @@ core.dpi.call
 | graph input | `InputObject` + `core.input.read` |
 | graph output | `OutputObject` + `core.output.write` |
 | `kRegister`（标量） | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
-| `kRegister`（数组，shape 非空） | `StateObject`（`core.array` 类型，多维逐维嵌套）+ `Init` 条目 |
+| `kRegister`（数组，shape 非空） | `StateObject`（`core.logic` 类型直接继承 GRH 的 width+shape）+ `Init` 条目 |
 | `kRegisterReadPort` | `core.state.read` |
-| `kRegisterReadArrayPort` | `core.state.memRead`（stage-06 过渡名，见下） |
-| `kRegisterWritePort` | `core.state.regWrite`（转换器补全 1 mask 常量） |
-| `kRegisterWriteMaskPort` | `core.state.regWrite` |
-| `kRegisterWriteArrayPort` | `core.state.memWrite`（转换器补全 1 mask 常量；stage-06 过渡名） |
-| `kRegisterWriteArrayMaskPort` | `core.state.memWrite`（stage-06 过渡名） |
-| `kRegisterFillPort` | `core.state.memFill`（stage-06 过渡名） |
+| `kRegisterReadArrayPort` | `core.state.readArray` |
+| `kRegisterWritePort` | `core.state.write`（转换器补全 1 mask 常量） |
+| `kRegisterWriteMaskPort` | `core.state.write` |
+| `kRegisterWriteArrayPort` | `core.state.writeArray`（转换器补全 1 mask 常量） |
+| `kRegisterWriteArrayMaskPort` | `core.state.writeArray` |
+| `kRegisterFillPort` | `core.state.fill` |
 | `kLatch` | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
 | `kLatchReadPort` | `core.state.read` |
 | `kLatchWritePort` | `core.state.latchWrite` |
@@ -401,8 +449,11 @@ core.dpi.call
 | `kDpicImport` | `ExternFunction`（`decl = core.dpi`） |
 | `kDpicCall` | `core.dpi.call` |
 
-GRH port 的目标 symbol 转换为目标 StateId，operands 保持原顺序，`eventEdge` 转换为
-`event_edges`。GRH DPI import 的并行属性数组规范化为一个 `DpiSignature`，DPI call 的
+GRH port 的目标 symbol 转换为目标 StateId，operands 保持原顺序（数组端口的多索引操作数
+原样保留，线性化推迟到后端 mapping——转换契约是逐 op 承接、不在转换时引入新计算），
+`eventEdge` 转换为 `event_edges`。**同一 regSymbol 的多个写端口各成一个 op、按声明顺序
+保序生成**——声明顺序即写优先级语义（见第 5 节），转换层不丢失也不重建排序信息。GRH
+DPI import 的并行属性数组规范化为一个 `DpiSignature`，DPI call 的
 `targetImportSymbol` 解析为对应 `F` 表项的 FuncId；这两步只改变引用和元数据的表示，不改变
 调用粒度。
 
@@ -410,10 +461,6 @@ GRH port 的目标 symbol 转换为目标 StateId，operands 保持原顺序，`
 `core.init.random`；缺省时按 SV 语义补全 X 的 const 步骤。数组 `kRegister`（shape 非空）的
 `initKind` 数组逐项转换为 `core.init.readmem`/`core.init.fill` 步骤，保持原顺序；部分覆盖时
 在序列开头补全 X 的 const 步骤。转换不得为了实现端口或调用语义增加新的 op。
-
-stage-03 过渡说明：GRH 侧 kMemory 族已删除、数组状态统一为带 shape 的 kRegister；grhsim 侧
-`memRead/memWrite/memFill` 与 `core.array` 类型暂保留作为承接（stage-06 退役并统一为
-read/readArray/write/writeArray/fill 与 width+shape 类型化 state）。
 
 ## 9. 写口转换示例
 
@@ -428,7 +475,7 @@ kRegisterWriteMaskPort @q
 对应的 core op：
 
 ```text
-core.state.regWrite
+core.state.write
   object_refs: [@S.q]
   operands: [%enable, %d, %mask, %clk]
   event_edges: [posedge]
@@ -442,17 +489,26 @@ core.state.regWrite
 
 Core 模型必须满足：
 
-- `memRead`/`memWrite`/`memFill`/`memAssign`/`memWriteSeq` 的目标是 `core.array` 类型的状态；
-- read result、data、mask 和目标状态的类型及位宽匹配；
-- mem 地址落在目标状态的元素个数范围内；`memFill` 的 `%data` 为元素类型或整宽打包值
-  （见第 5 节），`memAssign` 的 `%data` 与目标状态同类型；
-- `memWriteSeq` 的 operands 数量减去 event 数后必须能被 3 整除；
-- 同一 array 状态的多个写 op 不会在同一次 `G` 应用中写入同一 bit；
+- 类型合法：`core.logic` 的 `width` 大于零；`shape` 各维大于 0、乘积不溢出 uint64 且
+  整除 `width`；非 logic 类型不得携带 shape；
+- `readArray`/`writeArray`/`fill` 的目标是带 shape 的（数组）状态，`latchWrite` 的目标是
+  标量状态；
+- `read` 的 result 类型等于目标状态的类型（数组状态读出带全 shape 的整体值）；
+- `readArray`/`writeArray` 的索引数满足 `1 <= k <= rank`，索引操作数都是标量 logic；
+  `readArray` 的 result 与 `writeArray` 的 `%data` 类型为寻址到的元素（`k == rank`）或
+  带剩余维 shape 的子数组（`k < rank`，宽 `elementWidth × ∏shape[k:]`、shape 为
+  `shape[k:]`）；
+- `write` 的 `%nextValue` 类型等于目标状态类型；`write`/`latchWrite` 的 `%mask` 是宽等于
+  目标状态总位宽的标量 logic，`writeArray` 的 `%mask` 是宽等于 `%data` 总位宽的标量
+  logic；
+- `fill` 的 `%data` 为元素宽度的标量，或目标状态总位宽的打包值（packed fill，见第 5 节）；
+- 同一状态的多个写 op 的相对顺序即覆盖优先级（声明顺序语义，见第 5 节），转换与 pass
+  不得重排；
 - system function 有且只有一个 result，system task 的条件、参数和 event 分段合法；
 - `F` 表项的 FuncId 唯一、`signature` 完整，DPI call 的目标、operands 和 results 与 signature
   的方向、顺序和类型一致；
 - 每个 `S` 对象的 `InitSpec` 非空，步骤种类与目标状态的类型匹配（readmem/fill 仅用于
-  array 状态），范围和值类型合法，且应用后完整覆盖目标状态的全部内容；
+  数组状态），范围和值类型合法，且应用后完整覆盖目标状态的全部内容；
 - 所有事件敏感 op 的 events 与 `event_edges` 数量一致、类型为一位 logic；
 - 一个 GRH storage port、system call 或 DPI call 只对应一个 core op。
 

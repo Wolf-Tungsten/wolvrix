@@ -264,7 +264,7 @@ namespace wolvrix::lib::grhsim
                 const auto &op = model.operations()[it->index - 1];
                 const auto type = model.text(op.opType);
                 bool absorb = type.starts_with("core.compute.") || type == "core.input.read" ||
-                              type == "core.state.read" || type == "core.state.memRead";
+                              type == "core.state.read" || type == "core.state.readArray";
                 if (semantic)
                     for (auto value : model.results(op))
                         if (anchored[value.index]) { absorb = false; break; }
@@ -498,12 +498,12 @@ namespace wolvrix::lib::grhsim
         // empty signature forms the escape class (SinkEscape, fires every
         // round), nonempty signatures form SinkEvent supernodes. A1: a
         // nonempty signature cluster is further subdivided by shared write
-        // enable — singleton regWrite nodes with a non-constant en group by
-        // en value id, and a group reaching --sink-enable-guard-min-size
-        // (default 8, 0 disables) becomes its own SinkEvent supernode with
-        // attrs.enableGuard set (the call site ANDs one enable read into
-        // the signature gate); the rest keeps the plain per-signature
-        // supernode. Every
+        // enable — singleton scalar-write (core.state.write) nodes with a
+        // non-constant en group by en value id, and a group reaching
+        // --sink-enable-guard-min-size (default 8, 0 disables) becomes its
+        // own SinkEvent supernode with attrs.enableGuard set (the call site
+        // ANDs one enable read into the signature gate); the rest keeps the
+        // plain per-signature supernode. Every
         // supernode records attrs.eventActs (the act union; for sinks that IS
         // the signature) and attrs.supernodeCategory. Child order: non-sink
         // supernodes first (frame/topological order), sink supernodes after
@@ -615,12 +615,13 @@ namespace wolvrix::lib::grhsim
             for (const auto &[signature, members] : signatureGroups)
             {
                 // A1: inside a nonempty signature, subdivide by shared write
-                // enable. A singleton regWrite node whose en (operands[0])
-                // producer is not a constant joins the group of its en value
-                // id; a group of at least guardMinSize nodes becomes its own
-                // SinkEvent supernode carrying attrs.enableGuard (the call
-                // site ANDs one read of the enable into the signature gate).
-                // Everything else — non-regWrite sinks, constant enables,
+                // enable. A singleton core.state.write node whose en
+                // (operands[0]) producer is not a constant joins the group of
+                // its en value id; a group of at least guardMinSize nodes
+                // becomes its own SinkEvent supernode carrying
+                // attrs.enableGuard (the call site ANDs one read of the
+                // enable into the signature gate).
+                // Everything else — non-write sinks, constant enables,
                 // small groups — keeps the previous behavior and lands in
                 // the signature's ordinary supernode. The escape class
                 // (empty signature) is never subdivided. guardMinSize == 0
@@ -635,7 +636,7 @@ namespace wolvrix::lib::grhsim
                         if (ops.size() != 1) { ordinary.push_back(index); continue; }
                         const auto &op = model.operations()[ops.front().index - 1];
                         const auto operands = model.operands(op);
-                        if (model.text(op.opType) != "core.state.regWrite" || operands.size() != 3)
+                        if (model.text(op.opType) != "core.state.write" || operands.size() != 3)
                         { ordinary.push_back(index); continue; }
                         const auto producer = graph.producer[operands[0].index];
                         if (!producer ||

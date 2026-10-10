@@ -43,7 +43,8 @@ public:
             for (auto result : m.results(op)) defs[result.index] = op.id;
         for (const auto &state : m.states()) {
             const auto &type = m.types()[state.type.index - 1];
-            states[state.id.index].resize(type.kind == TypeKind::Array ? type.count : 1);
+            // Stage-06: one row per shape element (empty shape = scalar).
+            states[state.id.index].resize(shapeElementCount(type.shape).value_or(1));
         }
         for (const auto &record : m.initRecords()) for (const auto &step : m.steps(record)) {
             uint64_t value = 0, start = 0, count = 1;
@@ -65,9 +66,8 @@ public:
         std::unordered_map<uint32_t, uint64_t> nextEvents;
         for (const auto &op : m.operations()) {
             const auto kind = m.text(op.opType);
-            if (kind != "core.state.regWrite" && kind != "core.state.memWrite" &&
-                kind != "core.state.memWriteSeq" && kind != "core.state.memFill" &&
-                kind != "core.dpi.call") continue;
+            if (kind != "core.state.write" && kind != "core.state.writeArray" &&
+                kind != "core.state.fill" && kind != "core.dpi.call") continue;
             auto args = m.operands(op);
             auto objects = m.objectRefs(op);
             const std::vector<std::string> *edges=nullptr;
@@ -97,22 +97,53 @@ public:
                 continue;
             }
             auto &target = pending.at(objects[0].index);
-            if (kind == "core.state.regWrite") {
+            const auto &stateType = m.types()[m.states()[objects[0].index - 1].type.index - 1];
+            const uint64_t rows = shapeElementCount(stateType.shape).value_or(1);
+            const uint64_t elementWidth = stateType.width / rows;
+            const auto laneMask = elementWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << elementWidth) - 1);
+            if (kind == "core.state.write") {
+                // [updateCond, nextValue, mask, events...]: the scalar form
+                // writes slot 0; the whole-array form packs rows row-major.
                 if (eval(args[0])) {
-                    const auto mask = eval(args[2]);
-                    target[0] = (target[0] & ~mask) | (eval(args[1]) & mask);
+                    const auto mask = eval(args[2]), data = eval(args[1]);
+                    check(stateType.width <= 64, "test evaluator only supports narrow states");
+                    for (uint64_t row = 0; row < rows; ++row) {
+                        const auto shift = row * elementWidth;
+                        const auto lane = (mask >> shift) & laneMask;
+                        target.at(row) = (target.at(row) & ~lane) | ((data >> shift) & laneMask & lane);
+                    }
                 }
-            } else if (kind == "core.state.memWrite") {
+            } else if (kind == "core.state.writeArray") {
+                // [updateCond, i0..ik-1, data, mask, events...]; row-major
+                // linearized indices; k < rank writes a sub-array of rows.
                 if (eval(args[0])) {
-                    auto &cell = target.at(eval(args[1]));
-                    const auto mask = eval(args[3]);
-                    cell = (cell & ~mask) | (eval(args[2]) & mask);
+                    const std::size_t indexCount = args.size() - 3 - eventCount;
+                    uint64_t row = 0, subRows = 1;
+                    for (std::size_t d = 0; d < indexCount; ++d)
+                        row = row * static_cast<uint64_t>(stateType.shape.at(d)) + eval(args[1 + d]);
+                    for (std::size_t d = indexCount; d < stateType.shape.size(); ++d)
+                        subRows *= static_cast<uint64_t>(stateType.shape.at(d));
+                    const auto data = eval(args[1 + indexCount]), mask = eval(args[2 + indexCount]);
+                    for (uint64_t r = 0; r < subRows; ++r) {
+                        const auto shift = r * elementWidth;
+                        const auto lane = (mask >> shift) & laneMask;
+                        auto &cell = target.at(row * subRows + r);
+                        cell = (cell & ~lane) | ((data >> shift) & laneMask & lane);
+                    }
                 }
-            } else if (kind == "core.state.memFill") {
-                if (eval(args[0])) std::fill(target.begin(), target.end(), eval(args[1]));
             } else {
-                for (std::size_t i = 0; i + 2 < args.size()-eventCount; i += 3)
-                    if (eval(args[i])) target.at(eval(args[i + 1])) = eval(args[i + 2]);
+                // core.state.fill [updateCond, data, events...]: broadcast an
+                // element-width value or unpack a full-width packed value.
+                if (eval(args[0])) {
+                    const auto data = eval(args[1]);
+                    const auto dataWidth = m.types()[m.values()[args[1].index - 1].type.index - 1].width;
+                    if (dataWidth == stateType.width && dataWidth != elementWidth) {
+                        for (uint64_t row = 0; row < rows; ++row)
+                            target.at(row) = (data >> (row * elementWidth)) & laneMask;
+                    } else {
+                        std::fill(target.begin(), target.end(), data & laneMask);
+                    }
+                }
             }
         }
         states.swap(pending);
@@ -143,8 +174,29 @@ private:
         auto a = [&](std::size_t i) { return eval(args[i]); };
         uint64_t result = 0;
         if (kind == "core.input.read") result = inputValues.at(m.objectRefs(op)[0].index - 1);
-        else if (kind == "core.state.read") result = states.at(m.objectRefs(op)[0].index)[0];
-        else if (kind == "core.state.memRead") result = states.at(m.objectRefs(op)[0].index).at(a(0));
+        else if (kind == "core.state.read" || kind == "core.state.readArray") {
+            // Stage-06: read returns the state's full type (rows packed
+            // row-major for an array); readArray linearizes its indices and
+            // packs the remaining-dims sub-array (a single row at k == rank).
+            const auto &state = m.states()[m.objectRefs(op)[0].index - 1];
+            const auto &stateType = m.types()[state.type.index - 1];
+            const auto &target = states.at(state.id.index);
+            const uint64_t rows = shapeElementCount(stateType.shape).value_or(1);
+            const uint64_t elementWidth = stateType.width / rows;
+            const auto laneMask = elementWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << elementWidth) - 1);
+            uint64_t first = 0, subRows = rows;
+            if (kind == "core.state.readArray") {
+                for (std::size_t d = 0; d < args.size(); ++d)
+                    first = first * static_cast<uint64_t>(stateType.shape.at(d)) + a(d);
+                subRows = 1;
+                for (std::size_t d = args.size(); d < stateType.shape.size(); ++d)
+                    subRows *= static_cast<uint64_t>(stateType.shape.at(d));
+            }
+            for (uint64_t r = subRows; r-- > 0;) {
+                const auto cell = target.at(first * subRows + r) & laneMask;
+                result = (elementWidth >= 64 ? uint64_t{0} : result << elementWidth) | cell;
+            }
+        }
         else if (kind == "core.compute.constant") {
             for (const auto &p : m.parameters(op))
                 if (m.text(p.name) == "value" || m.text(p.name) == "constValue") result = literal(std::get<std::string>(p.value));
@@ -202,7 +254,7 @@ private:
 
 GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
     GrhSimModel m("decoded-updates");
-    m.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+    m.addDialect("core", "1", "wolvrix.grhsim.core.v2");
     const auto domain=mode==14?LogicDomain::FourState:LogicDomain::TwoState;
     const auto bit = m.logicType(1, false, domain);
     const auto word = m.logicType(mode==19?1:2, false, domain);
@@ -273,7 +325,7 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
         next = compute("core.compute.mux", word, {high, d1, next});
         if (mode == 22) {
             // Both fills write zero in the first row, but disagree elsewhere.
-            // The higher-priority fill must not be reordered before memFill.
+            // The higher-priority fill must not be reordered before fill.
             const auto fill = compute("core.compute.logicAnd", bit, {reset, e0});
             next = compute("core.compute.mux", word, {fill, constant(word, row), next});
         }
@@ -300,7 +352,7 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
         }
         if(mode==17) m.addOperation("core.state.latchWrite",std::array{update,next,mask},{},
             std::array{ObjectRef::state(q)});
-        else m.addOperation("core.state.regWrite",operands,{},objects,
+        else m.addOperation("core.state.write",operands,{},objects,
             std::array{Parameter{m.intern("event_edges"),edges}});
     }
     return m;
@@ -309,7 +361,7 @@ GrhSimModel fixture(unsigned mode,unsigned rowCount=4,bool opaqueNames=false) {
 // OR collision semantics differ from priority muxes even with identical ports.
 GrhSimModel orFixture(unsigned mode = 0) {
     GrhSimModel m("or-writes");
-    m.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+    m.addDialect("core", "1", "wolvrix.grhsim.core.v2");
     const auto bit = m.logicType(1, false, LogicDomain::TwoState);
     const auto word = m.logicType(mode == 4 ? 1 : mode == 13 ? 64 : 2, false, LogicDomain::TwoState);
     const auto address = m.logicType(3, false, LogicDomain::TwoState);
@@ -368,7 +420,7 @@ GrhSimModel orFixture(unsigned mode = 0) {
             update = compute("core.compute.reduceOr", bit, {compute("core.compute.concat", address, hits)});
         if (mode == 2) update = compute("core.compute.and", bit, {global, update});
         if (mode == 5) update = compute("core.compute.or", bit, {global, update});
-        m.addOperation("core.state.regWrite", std::array{update, next, mask, mode == 10 && row == 4 ? global : clock}, {},
+        m.addOperation("core.state.write", std::array{update, next, mask, mode == 10 && row == 4 ? global : clock}, {},
             std::array{ObjectRef::state(q)},
             std::array{Parameter{m.intern("event_edges"), std::vector<std::string>{"posedge"}}});
     }
@@ -449,7 +501,7 @@ void addDpiProbe(GrhSimModel &model) {
 GrhSimModel readFixture(bool readOnly, bool repeated, unsigned window=0, unsigned viewStyle=0,
                        unsigned elementWidth=0) {
     GrhSimModel m("shared-reads");
-    m.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+    m.addDialect("core", "1", "wolvrix.grhsim.core.v2");
     const auto bit=m.logicType(1,false,LogicDomain::TwoState);
     if(!elementWidth) elementWidth=window?1:2;
     const auto word=m.logicType(elementWidth,false,LogicDomain::TwoState);
@@ -481,7 +533,7 @@ GrhSimModel readFixture(bool readOnly, bool repeated, unsigned window=0, unsigne
         if(readOnly) continue;
         const auto next=m.addValue(word);
         m.addOperation("core.compute.xor",std::array{old,data},std::array{next});
-        m.addOperation("core.state.regWrite",std::array{enable,next,mask,event},{},
+        m.addOperation("core.state.write",std::array{enable,next,mask,event},{},
             std::array{ObjectRef::state(q)},
             std::array{Parameter{m.intern("event_edges"),std::vector<std::string>{"posedge"}}});
     }
@@ -489,7 +541,10 @@ GrhSimModel readFixture(bool readOnly, bool repeated, unsigned window=0, unsigne
     if(repeated) lanes.insert(lanes.end(),reads.rbegin(),reads.rend());
     if(viewStyle==1) lanes={reads[3],reads[3],reads[2],reads[1],reads[0],reads[0]};
     if(viewStyle==2) lanes={reads[3],reads[2],reads[1],reads[2],reads[1],reads[0]};
-    const auto packedType=m.logicType(lanes.size()*elementWidth,false,LogicDomain::TwoState);
+    // Stage-06: sliceArray requires a shaped base — the packed view is a
+    // rank-1 array of lanes.size() elements (sliceDynamic keeps sliceWidth).
+    const std::array<int64_t,1> packedShape{static_cast<int64_t>(lanes.size())};
+    const auto packedType=m.logicType(lanes.size()*elementWidth,false,LogicDomain::TwoState,packedShape);
     const auto packed=m.addValue(packedType);
     m.addOperation("core.compute.concat",lanes,std::array{packed});
     for(auto index:{index0,index1}) {
@@ -500,8 +555,9 @@ GrhSimModel readFixture(bool readOnly, bool repeated, unsigned window=0, unsigne
             m.addOperation("core.compute.lshr",std::array{packed,index},std::array{shifted});
             m.addOperation("core.compute.sliceStatic",std::array{shifted},std::array{selected},{},
                 std::array{Parameter{m.intern("sliceStart"),int64_t{1}},Parameter{m.intern("sliceEnd"),int64_t{3}}});
-        } else m.addOperation(window?"core.compute.sliceDynamic":"core.compute.sliceArray",std::array{packed,index},std::array{selected},{},
-            std::array{Parameter{m.intern("sliceWidth"),int64_t{window?3:elementWidth}}});
+        } else if(window) m.addOperation("core.compute.sliceDynamic",std::array{packed,index},std::array{selected},{},
+            std::array{Parameter{m.intern("sliceWidth"),int64_t{3}}});
+        else m.addOperation("core.compute.sliceArray",std::array{packed,index},std::array{selected});
         const auto output=m.addOutput("selected"+std::to_string(index.index),outputType);
         m.addOperation("core.output.write",std::array{selected},{},std::array{ObjectRef::output(output)});
     }
@@ -531,7 +587,10 @@ void regToMemSemanticsTests() {
         unsigned arrays=0;
         for(const auto &state:rewritten.states()) {
             const auto &type=rewritten.types()[state.type.index-1];
-            if(type.kind==TypeKind::Array) {++arrays;check(type.count==4,"invented a writable row zero");}
+            if(type.kind==TypeKind::Logic && !type.shape.empty()) {
+                ++arrays;
+                check(type.shape==std::vector<int64_t>{4},"invented a writable row zero");
+            }
         }
         check(arrays==1,"renamed rows did not form one table");
         Simulation reference(original),candidate(rewritten);
@@ -610,10 +669,12 @@ void regToMemSemanticsTests() {
             throw std::runtime_error("decoded write family was not recovered, mode=" + std::to_string(mode));
         check(verifyGrhSimModel(rewritten, defaultDialectRegistry(), diagnostics), "invalid rewritten semantics fixture");
         if(mode==20) {
-            unsigned triples=0;
-            for(const auto &op:rewritten.operations()) if(rewritten.text(op.opType)=="core.state.memWriteSeq")
-                triples+=(rewritten.operands(op).size()-1)/3;
-            check(triples==3,"same-address fusion crossed an intervening aliasing write");
+            // Stage-06: each fused write triple is one writeArray op; the
+            // intervening aliasing write must keep three separate ops.
+            unsigned writes=0;
+            for(const auto &op:rewritten.operations())
+                writes+=rewritten.text(op.opType)=="core.state.writeArray";
+            check(writes==3,"same-address fusion crossed an intervening aliasing write");
         }
         check(!pass.run(rewritten, diagnostics).changed, "reg-to-mem is not idempotent");
         Simulation reference(original), candidate(rewritten);
@@ -650,7 +711,7 @@ void regToMemSemanticsTests() {
     for (bool rowConstantFill : {false, true}) {
         // NO00022: identity-init reset writes the row number, so the fill data
         // is a per-row constant.  The family must stay scalar without the gate
-        // and merge into one static-triple sequence with it.
+        // and merge into one ordered writeArray group with it.
         auto original = fixture(21), rewritten = fixture(21, 4, true);
         diag::Diagnostics diagnostics;
         RegToMemOptions options;
@@ -687,29 +748,48 @@ void regToMemSemanticsTests() {
                 }
             return std::nullopt;
         };
-        unsigned sequences = 0, fills = 0;
+        // Stage-06: the merged family's write sequence is one writeArray op
+        // per triple, in declaration (low-to-high priority) order, sharing one
+        // all-ones mask.
+        unsigned fills = 0;
+        std::vector<const SimOp *> writes;
         for (const auto &op : rewritten.operations()) {
             const auto kind = rewritten.text(op.opType);
-            fills += kind == "core.state.memFill";
-            if (kind != "core.state.memWriteSeq") continue;
-            ++sequences;
-            const auto args = rewritten.operands(op);
-            std::size_t events = 0;
-            for (const auto &p : rewritten.parameters(op))
-                if (rewritten.text(p.name) == "event_edges")
-                    events = std::get<std::vector<std::string>>(p.value).size();
-            const std::size_t triples = (args.size() - events) / 3;
-            check(triples == 6, "row-constant fill did not emit 4 static + 2 port triples");
-            const auto sharedEnable = args[0];
-            for (std::size_t row = 0; row < 4; ++row) {
-                check(args[row * 3] == sharedEnable, "static fill triples lost the shared fill enable");
-                check(constValue(args[row * 3 + 1]) == std::optional<uint64_t>(row),
-                    "static fill triple address is not the row position");
-                check(constValue(args[row * 3 + 2]) == std::optional<uint64_t>(row),
-                    "static fill triple data is not the per-row constant");
-            }
+            fills += kind == "core.state.fill";
+            if (kind == "core.state.writeArray") writes.push_back(&op);
         }
-        check(sequences == 1 && fills == 0, "row-constant fill left a memFill or extra sequence");
+        check(writes.size() == 6, "row-constant fill did not emit 4 static + 2 port writeArray ops");
+        // The mask constant is a binary all-ones literal (the pass's allOnes
+        // helper); parse with SVInt instead of the decimal constValue.
+        const auto maskIsAllOnes = [&](ValueId v) {
+            for (const auto &op : rewritten.operations())
+                for (auto result : rewritten.results(op)) {
+                    if (result != v || rewritten.text(op.opType) != "core.compute.constant") continue;
+                    for (const auto &p : rewritten.parameters(op))
+                        if (rewritten.text(p.name) == "value")
+                            return exactlyEqual(slang::SVInt::fromString(std::get<std::string>(p.value)),
+                                                slang::SVInt::fromString("2'b11"));
+                }
+            return false;
+        };
+        for (const auto *write : writes) {
+            const auto args = rewritten.operands(*write);
+            // [enable, address, data, mask, events...] for this rank-1 table.
+            check(args.size() == 5, "writeArray layout lost the shared mask or event");
+            check(args[3] == rewritten.operands(*writes.front())[3],
+                "writeArray ops lost the shared all-ones mask");
+            check(maskIsAllOnes(args[3]), "writeArray mask is not the all-ones element mask");
+        }
+        const auto sharedEnable = rewritten.operands(*writes.front())[0];
+        for (std::size_t row = 0; row < 4; ++row) {
+            const auto args = rewritten.operands(*writes[row]);
+            check(args[0] == sharedEnable, "static fill writes lost the shared fill enable");
+            check(constValue(args[1]) == std::optional<uint64_t>(row),
+                "static fill write address is not the row position");
+            check(constValue(args[2]) == std::optional<uint64_t>(row),
+                "static fill write data is not the per-row constant");
+        }
+        check(fills == 0, "row-constant fill left a core.state.fill");
         check(!pass.run(rewritten, diagnostics).changed, "row-constant fill is not idempotent");
         Simulation reference(original), candidate(rewritten);
         for (uint64_t a0 = 0; a0 < 8; ++a0) for (uint64_t a1 = 0; a1 < 8; ++a1)
@@ -753,7 +833,7 @@ void regToMemSemanticsTests() {
                     model.text(model.inputs()[model.objectRefs(op)[0].index-1].name)=="enable")
                     alternateEvent=model.results(op)[0];
                 if(model.text(op.opType)=="core.compute.concat") packed=model.results(op)[0];
-                if(model.text(op.opType)=="core.state.regWrite") writes.push_back(op.id);
+                if(model.text(op.opType)=="core.state.write") writes.push_back(op.id);
             }
             for(std::size_t i=1;i<writes.size();i+=2) {
                 const auto op=model.operations()[writes[i].index-1];
@@ -761,7 +841,7 @@ void regToMemSemanticsTests() {
                 std::vector<ObjectRef> refs(model.objectRefs(op).begin(),model.objectRefs(op).end());
                 std::vector<Parameter> params(model.parameters(op).begin(),model.parameters(op).end());
                 args.back()=alternateEvent;
-                model.replaceOperation(op.id,"core.state.regWrite",args,{},refs,params);
+                model.replaceOperation(op.id,"core.state.write",args,{},refs,params);
             }
             const auto output=model.addOutput("whole-packed-view",model.values()[packed.index-1].type);
             model.addOperation("core.output.write",std::array{packed},{},std::array{ObjectRef::output(output)});
@@ -931,12 +1011,12 @@ void regToMemSemanticsTests() {
                 address = model.results(op)[0];
         }
         std::reverse(reads.begin(), reads.end());
-        const auto packed = model.addValue(model.logicType(8, false, LogicDomain::TwoState));
+        const std::array<int64_t, 1> packedShape{4};
+        const auto packed = model.addValue(model.logicType(8, false, LogicDomain::TwoState, packedShape));
         model.addOperation("core.compute.concat", reads, std::array{packed});
         const auto element = model.logicType(2, false, LogicDomain::TwoState);
         const auto selected = model.addValue(element);
-        model.addOperation("core.compute.sliceArray", std::array{packed, address}, std::array{selected}, {},
-            std::array{Parameter{model.intern("sliceWidth"), int64_t{2}}});
+        model.addOperation("core.compute.sliceArray", std::array{packed, address}, std::array{selected});
         const auto output = model.addOutput("indexed", element);
         model.addOperation("core.output.write", std::array{selected}, {}, std::array{ObjectRef::output(output)});
         diag::Diagnostics diagnostics;

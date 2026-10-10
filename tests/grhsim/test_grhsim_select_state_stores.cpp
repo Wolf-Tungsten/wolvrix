@@ -165,11 +165,17 @@ namespace
         return id;
     }
 
-    // Array states initialize through one full-coverage fill step.
+    // Array states initialize through one full-coverage fill step. Stage-06:
+    // an array is a logic type of elementWidth*count total bits with shape
+    // {count}; the fill step keeps its linear row-address parameters.
     grhsim::StateId addArrayState(grhsim::GrhSimModel &model, std::string_view name,
                                   grhsim::TypeId element, uint64_t count, std::string fillLiteral)
     {
-        const auto id = model.addState(name, model.arrayType(element, count));
+        const auto &elementType = model.types()[element.index - 1];
+        const std::array<int64_t, 1> shape{static_cast<int64_t>(count)};
+        const auto id = model.addState(name,
+            model.logicType(elementType.width * static_cast<uint32_t>(count),
+                            elementType.isSigned, elementType.domain, shape));
         const std::array params{
             grhsim::Parameter{model.intern("value"), std::move(fillLiteral)},
             grhsim::Parameter{model.intern("start"), int64_t{0}},
@@ -202,7 +208,8 @@ namespace
             for (const auto &state : m.states())
             {
                 const auto &type = m.types()[state.type.index - 1];
-                states[state.id.index].resize(type.kind == grhsim::TypeKind::Array ? type.count : 1);
+                // Stage-06: one row per shape element (empty shape = scalar).
+                states[state.id.index].resize(grhsim::shapeElementCount(type.shape).value_or(1));
             }
             for (const auto &record : m.initRecords())
                 for (const auto &step : m.steps(record))
@@ -230,8 +237,8 @@ namespace
             for (const auto &op : m.operations())
             {
                 const auto kind = m.text(op.opType);
-                if (kind != "core.state.regWrite" && kind != "core.state.memWrite" &&
-                    kind != "core.state.memWriteSeq" && kind != "core.state.memFill")
+                if (kind != "core.state.write" && kind != "core.state.writeArray" &&
+                    kind != "core.state.fill")
                     continue;
                 const auto args = m.operands(op);
                 const auto objects = m.objectRefs(op);
@@ -254,31 +261,65 @@ namespace
                 }
                 if (!edge) continue;
                 auto &target = pending.at(objects[0].index);
-                if (kind == "core.state.regWrite")
+                const auto &stateType =
+                    m.types()[m.states()[objects[0].index - 1].type.index - 1];
+                const uint64_t rows = grhsim::shapeElementCount(stateType.shape).value_or(1);
+                const uint64_t elementWidth = stateType.width / rows;
+                const auto laneMask =
+                    elementWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << elementWidth) - 1);
+                if (kind == "core.state.write")
                 {
+                    // [updateCond, nextValue, mask, events...]: the scalar form
+                    // writes slot 0; a whole-array write packs rows row-major.
                     if (eval(args[0]))
                     {
                         const auto mask = eval(args[2]);
-                        target[0] = (target[0] & ~mask) | (eval(args[1]) & mask);
+                        const auto data = eval(args[1]);
+                        for (uint64_t row = 0; row < rows; ++row)
+                        {
+                            const auto shift = row * elementWidth;
+                            const auto lane = (mask >> shift) & laneMask;
+                            target.at(row) =
+                                (target.at(row) & ~lane) | ((data >> shift) & laneMask & lane);
+                        }
                     }
                 }
-                else if (kind == "core.state.memWrite")
+                else if (kind == "core.state.writeArray")
                 {
+                    // [updateCond, i0..ik-1, data, mask, events...]; row-major
+                    // linearized indices (k == rank for these fixtures).
                     if (eval(args[0]))
                     {
-                        auto &cell = target.at(eval(args[1]));
-                        const auto mask = eval(args[3]);
-                        cell = (cell & ~mask) | (eval(args[2]) & mask);
+                        const std::size_t indexCount = args.size() - 3 - eventCount;
+                        uint64_t row = 0;
+                        for (std::size_t d = 0; d < indexCount; ++d)
+                            row = row * static_cast<uint64_t>(stateType.shape.at(d)) +
+                                  eval(args[1 + d]);
+                        const auto mask = eval(args[2 + indexCount]);
+                        const auto data = eval(args[1 + indexCount]);
+                        auto &cell = target.at(row);
+                        cell = (cell & ~mask) | (data & mask);
                     }
-                }
-                else if (kind == "core.state.memFill")
-                {
-                    if (eval(args[0])) std::fill(target.begin(), target.end(), eval(args[1]));
                 }
                 else
                 {
-                    for (std::size_t i = 0; i + 2 < args.size() - eventCount; i += 3)
-                        if (eval(args[i])) target.at(eval(args[i + 1])) = eval(args[i + 2]);
+                    // core.state.fill [updateCond, data, events...]: broadcast
+                    // an element-width value or unpack a full-width one.
+                    if (eval(args[0]))
+                    {
+                        const auto data = eval(args[1]);
+                        const auto dataWidth =
+                            m.types()[m.values()[args[1].index - 1].type.index - 1].width;
+                        if (dataWidth == stateType.width && dataWidth != elementWidth)
+                        {
+                            for (uint64_t row = 0; row < rows; ++row)
+                                target.at(row) = (data >> (row * elementWidth)) & laneMask;
+                        }
+                        else
+                        {
+                            std::fill(target.begin(), target.end(), data & laneMask);
+                        }
+                    }
                 }
             }
             states.swap(pending);
@@ -311,8 +352,33 @@ namespace
             auto a = [&](std::size_t i) { return eval(args[i]); };
             uint64_t result = 0;
             if (kind == "core.input.read") result = inputValues.at(m.objectRefs(op)[0].index - 1);
-            else if (kind == "core.state.read") result = states.at(m.objectRefs(op)[0].index)[0];
-            else if (kind == "core.state.memRead") result = states.at(m.objectRefs(op)[0].index).at(a(0));
+            else if (kind == "core.state.read" || kind == "core.state.readArray")
+            {
+                // Stage-06: read returns the state's full type (rows packed
+                // row-major for an array); readArray linearizes its indices
+                // and packs the remaining-dims sub-array (one row at k == rank).
+                const auto &state = m.states()[m.objectRefs(op)[0].index - 1];
+                const auto &stateType = m.types()[state.type.index - 1];
+                const auto &target = states.at(state.id.index);
+                const uint64_t rows = grhsim::shapeElementCount(stateType.shape).value_or(1);
+                const uint64_t elementWidth = stateType.width / rows;
+                const auto laneMask =
+                    elementWidth >= 64 ? ~uint64_t{0} : ((uint64_t{1} << elementWidth) - 1);
+                uint64_t first = 0, subRows = rows;
+                if (kind == "core.state.readArray")
+                {
+                    for (std::size_t d = 0; d < args.size(); ++d)
+                        first = first * static_cast<uint64_t>(stateType.shape.at(d)) + a(d);
+                    subRows = 1;
+                    for (std::size_t d = args.size(); d < stateType.shape.size(); ++d)
+                        subRows *= static_cast<uint64_t>(stateType.shape.at(d));
+                }
+                for (uint64_t r = subRows; r-- > 0;)
+                {
+                    const auto cell = target.at(first * subRows + r) & laneMask;
+                    result = (elementWidth >= 64 ? uint64_t{0} : result << elementWidth) | cell;
+                }
+            }
             else if (kind == "core.compute.constant")
             {
                 for (const auto &p : m.parameters(op))
@@ -350,9 +416,10 @@ namespace
     };
 
     // Contract fixture covering the four NBA contract aspects named by the
-    // M5d-4 checkpoint: old-value reads (memRead sees the pre-write cell),
-    // partial writes (masked memWrite), multi-write priority (memWriteSeq
-    // operand order) and multi-round updates (the self-feedback counter).
+    // M5d-4 checkpoint: old-value reads (readArray sees the pre-write cell),
+    // partial writes (masked writeArray), multi-write priority (two writeArray
+    // ops on one state apply in declaration order, the later one wins) and
+    // multi-round updates (the self-feedback counter).
     // Store classes: smallMem (4 bytes) -> regLatch; bigMem/seqMem (512
     // bytes) and fillMem (128 bytes) -> mem; the scalars -> regLatch.
     struct ContractFixture
@@ -362,7 +429,7 @@ namespace
 
         ContractFixture()
         {
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
             word = model.logicType(32, false, grhsim::LogicDomain::TwoState);
@@ -403,49 +470,53 @@ namespace
                                std::array{grhsim::ObjectRef::state(cnt)});
             const auto cntNext = model.addValue(byte);
             model.addOperation("core.compute.add", std::array{cntRead, d}, std::array{cntNext});
-            model.addOperation("core.state.regWrite", std::array{one, cntNext, mask8, clk}, {},
+            model.addOperation("core.state.write", std::array{one, cntNext, mask8, clk}, {},
                                std::array{grhsim::ObjectRef::state(cnt)}, posedge);
             addOutputWrite(model, "oCnt", cntRead);
 
             // Large array with a masked (partial) write and a same-round
             // old-value read.
             const auto bigMem = addArrayState(model, "bigMem", wide, 64, "64'h0");
-            model.addOperation("core.state.memWrite", std::array{one, a6, wdata, wmask, clk}, {},
+            model.addOperation("core.state.writeArray", std::array{one, a6, wdata, wmask, clk}, {},
                                std::array{grhsim::ObjectRef::state(bigMem)}, posedge);
             const auto bigRead = model.addValue(wide);
-            model.addOperation("core.state.memRead", std::array{a6}, std::array{bigRead},
+            model.addOperation("core.state.readArray", std::array{a6}, std::array{bigRead},
                                std::array{grhsim::ObjectRef::state(bigMem)});
             addOutputWrite(model, "oBig", bigRead);
 
-            // Large array with an ordered two-port sequence write: the later
-            // triple overrides the earlier one on the same address.
+            // Large array with an ordered two-write sequence: the later
+            // writeArray overrides the earlier one on the same address.
             const auto seqMem = addArrayState(model, "seqMem", wide, 64, "64'h0");
+            const auto mask64 = addConstant(model, wide, "64'hffffffffffffffff");
             const auto notData = model.addValue(wide);
             model.addOperation("core.compute.not", std::array{wdata}, std::array{notData});
-            model.addOperation("core.state.memWriteSeq",
-                               std::array{one, a6, wdata, one, a6, notData, clk}, {},
+            model.addOperation("core.state.writeArray",
+                               std::array{one, a6, wdata, mask64, clk}, {},
+                               std::array{grhsim::ObjectRef::state(seqMem)}, posedge);
+            model.addOperation("core.state.writeArray",
+                               std::array{one, a6, notData, mask64, clk}, {},
                                std::array{grhsim::ObjectRef::state(seqMem)}, posedge);
             const auto seqRead = model.addValue(wide);
-            model.addOperation("core.state.memRead", std::array{a6}, std::array{seqRead},
+            model.addOperation("core.state.readArray", std::array{a6}, std::array{seqRead},
                                std::array{grhsim::ObjectRef::state(seqMem)});
             addOutputWrite(model, "oSeq", seqRead);
 
             // Large array filled on the falling edge.
             const auto fillMem = addArrayState(model, "fillMem", word, 32, "32'h0");
             const auto w32 = slice(wdata, word);
-            model.addOperation("core.state.memFill", std::array{one, w32, clk}, {},
+            model.addOperation("core.state.fill", std::array{one, w32, clk}, {},
                                std::array{grhsim::ObjectRef::state(fillMem)}, negedge);
             const auto fillRead = model.addValue(word);
-            model.addOperation("core.state.memRead", std::array{a5}, std::array{fillRead},
+            model.addOperation("core.state.readArray", std::array{a5}, std::array{fillRead},
                                std::array{grhsim::ObjectRef::state(fillMem)});
             addOutputWrite(model, "oFill", fillRead);
 
             // Small array (4 bytes): addressed write and read, regLatch class.
             const auto smallMem = addArrayState(model, "smallMem", byte, 4, "8'h0");
-            model.addOperation("core.state.memWrite", std::array{one, a2, d, mask8, clk}, {},
+            model.addOperation("core.state.writeArray", std::array{one, a2, d, mask8, clk}, {},
                                std::array{grhsim::ObjectRef::state(smallMem)}, posedge);
             const auto smallRead = model.addValue(byte);
-            model.addOperation("core.state.memRead", std::array{a2}, std::array{smallRead},
+            model.addOperation("core.state.readArray", std::array{a2}, std::array{smallRead},
                                std::array{grhsim::ObjectRef::state(smallMem)});
             addOutputWrite(model, "oSmall", smallRead);
         }
@@ -635,7 +706,7 @@ namespace
             if (!messagesContain(verifyMessages(model), "store classification is not total"))
                 return fail("partial classification was not rejected");
         }
-        // The mem class requires an array state.
+        // The mem class requires a shaped (array) state.
         {
             ContractFixture fixture;
             auto &model = fixture.model;
@@ -646,28 +717,60 @@ namespace
                     model.setStateStoreClass(state.id, StateStoreClass::Mem);
                     break;
                 }
-            if (!messagesContain(verifyMessages(model), "mem store class requires a core.array"))
+            if (!messagesContain(verifyMessages(model),
+                                 "mem store class requires a shaped (array) state"))
                 return fail("mem class on a scalar state was not rejected");
         }
-        // A mem-class state may not be written by regWrite/latchWrite.
+        // A mem-class state may not be written by latchWrite (P_mem owns the
+        // commit); a whole-array write is class-neutral and only needs the
+        // class-consistent phase.
         {
             grhsim::GrhSimModel model("select-state-stores-badwrite");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto wide = model.logicType(64, false, grhsim::LogicDomain::TwoState);
-            const auto arrayType = model.arrayType(wide, 64);
             const auto mem = addArrayState(model, "mem", wide, 64, "64'h0");
+            const auto memType = model.states()[mem.index - 1].type;
             const auto one = addConstant(model, bit, "1'h1");
-            const auto data = model.addValue(arrayType);
+            const auto data = model.addValue(memType);
             model.addOperation("core.compute.constant", {}, std::array{data}, {},
                                std::array{grhsim::Parameter{model.intern("constValue"),
                                                             std::string("0")}});
-            model.addOperation("core.state.regWrite", std::array{one, data, data}, {},
+            model.addOperation("core.state.latchWrite", std::array{one, data, data}, {},
                                std::array{grhsim::ObjectRef::state(mem)});
             model.setStateStoreClass(mem, StateStoreClass::Mem);
             const Messages messages = verifyMessages(model);
             if (!messagesContain(messages, "targets a mem-class state"))
-                return fail("regWrite on a mem-class state was not rejected");
+                return fail("latchWrite on a mem-class state was not rejected");
+        }
+        // The write family is class-neutral (stage-06): a whole-array write of
+        // a mem-class state passes phase attribution as a P_mem write instead
+        // of raising a mem-class error.
+        {
+            grhsim::GrhSimModel model("select-state-stores-arraywrite");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
+            const auto wide = model.logicType(64, false, grhsim::LogicDomain::TwoState);
+            const auto mem = addArrayState(model, "mem", wide, 64, "64'h0");
+            const auto memType = model.states()[mem.index - 1].type;
+            const auto one = addConstant(model, bit, "1'h1");
+            const auto data = model.addValue(memType);
+            model.addOperation("core.compute.constant", {}, std::array{data}, {},
+                               std::array{grhsim::Parameter{model.intern("constValue"),
+                                                            std::string("0")}});
+            const auto totalWidth = model.types()[memType.index - 1].width;
+            const auto maskType = model.logicType(totalWidth, false, grhsim::LogicDomain::TwoState);
+            const auto mask = addConstant(model, maskType, "0");
+            const auto write = model.addOperation("core.state.write", std::array{one, data, mask},
+                                                  {}, std::array{grhsim::ObjectRef::state(mem)});
+            model.setStateStoreClass(mem, StateStoreClass::Mem);
+            // Wrong phase first: a mem-class write must commit in P_mem.
+            model.setOperationPhase(write, grhsim::SimPhase::General);
+            if (verifies(model))
+                return fail("General-phase whole-array write on a mem-class state was accepted");
+            model.setOperationPhase(write, grhsim::SimPhase::Mem);
+            if (!verifies(model))
+                return fail("Mem-phase whole-array write on a mem-class state was rejected");
         }
         return 0;
     }
@@ -675,7 +778,7 @@ namespace
     int testCloneAndCompact()
     {
         grhsim::GrhSimModel model("select-state-stores-compact");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
         const auto wide = model.logicType(64, false, grhsim::LogicDomain::TwoState);
         addStateInit(model, "q", bit, "1'h0");
@@ -707,7 +810,7 @@ namespace
         using grhsim::StateStoreClass;
         const auto buildModel = [] {
             grhsim::GrhSimModel model("select-state-stores-tslot");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, grhsim::LogicDomain::TwoState);
             const auto cond = addConstant(model, bit, "1'h1");
@@ -756,7 +859,7 @@ namespace
     int testIncrementalUsedBits()
     {
         grhsim::GrhSimModel model("select-state-stores-used-bits");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
         const auto word = model.logicType(32, false, grhsim::LogicDomain::TwoState);
         const auto nibble = model.logicType(4, false, grhsim::LogicDomain::TwoState);

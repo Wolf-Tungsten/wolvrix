@@ -14,8 +14,8 @@ carry no event slots.)
 The pass has nine steps, in order:
 
 1. Collect every op carrying an `event_edges` parameter (the event-sensitive
-   kinds: `core.state.regWrite`, `core.state.memWrite`, `core.state.memFill`,
-   `core.state.memAssign`, `core.state.memWriteSeq`, `core.system.task`,
+   kinds: `core.state.write`, `core.state.writeArray`, `core.state.fill`,
+   `core.system.task`,
    `core.dpi.call`; `latchWrite` has no events). Anything else carrying the
    parameter, a non-string-array value, an edge outside
    `posedge`/`negedge`/`both`, or more edges than operands fails the pass.
@@ -27,7 +27,7 @@ The pass has nine steps, in order:
    the shared [`extractCone`](../../include/grhsim/pass/cone_extract.hpp)
    helper, which `grhsim.extract-output-cones` and
    `grhsim.migrate-timeslot-tasks` reuse for their own cones. Roots
-   (`core.input.read` / `core.state.read` / `core.state.memRead` /
+   (`core.input.read` / `core.state.read` / `core.state.readArray` /
    `core.compute.constant`) are cloned like any other cone op; object refs,
    parameters, name (plus a `.ev` suffix) and origin are copied unchanged.
 4. Create one `core.event.edgeDet` per cluster on the cloned event value, with
@@ -39,7 +39,7 @@ The pass has nine steps, in order:
    width, otherwise the value falls back to zero), `core.input.read` is `0`,
    `core.compute.constant` is its literal, and `not`/`and`/`or`/`xor`/`xnor`/
    `logicAnd`/`logicOr`/`logicNot`/`mux`/`sliceStatic`/`bitSelect`/`concat`
-   evaluate recursively up to 64 bits. Anything else (random init, memRead,
+   evaluate recursively up to 64 bits. Anything else (random init, readArray,
    arithmetic, unknown ops) falls back to a same-width zero literal and is
    counted in `prev_init_fallbacks`. Literals render in the `init.const`
    `constValue` style (`1'h0`, `8'h00`).
@@ -47,15 +47,17 @@ The pass has nine steps, in order:
    no event slots: `core.system.task` has no refs, `core.dpi.call` keeps the
    leading Function ref, state writes keep the target state), delete
    the `event_edges` parameter and append `event_acts` (int64 array of cluster
-   indices in the original event order). `regWrite`, `system.task` and
-   `dpi.call` get phase `general`; the four mem writes stay phase-less (`None`)
+   indices in the original event order). `write` on a scalar target,
+   `system.task` and
+   `dpi.call` get phase `general`; `writeArray`/`fill` and `write` on an array
+   (shaped) target stay phase-less (`None`)
    until the semantic split ([`grhsim.split-phases`](grhsim-split-phases.md), B5,
    M5d-5) attributes them class-aware — P_mem for `mem`-class targets, P_general
    for `regLatch`-class targets.
 7. Sweep any unreferenced `__event_*` history state left over from a pre-M5
    checkpoint together with its InitRecord, and sweep the dead original cone
    ops to a fixed point (`sweepDeadConeOps`): only `core.compute.*` and the
-   read-only roots `input.read`/`state.read`/`memRead` with no remaining users
+   read-only roots `input.read`/`state.read`/`readArray` with no remaining users
    are removed — dual-use logic whose results still feed live consumers stays
    put. One `model.compact` rebuilds dense ids.
 8. The verifier's M2 checks hold on the result: no `event_edges` survives,
@@ -71,7 +73,7 @@ For example, the dut_081 fragment
 op1 core.input.read -> %clk                 (pure event input)
 op2 core.input.read -> %d
 op4 core.compute.constant -> %one (1'b1)
-op5 core.state.regWrite operands=[%one, %d, %one, %clk]
+op5 core.state.write operands=[%one, %d, %one, %clk]
     object_refs=[@q]  parameters={ event_edges: [posedge] }
 ```
 
@@ -81,7 +83,7 @@ becomes
 op1' core.input.read -> %clk.ev   phase=event   (clone, keeps event_only)
 op7  core.event.edgeDet operands=[%clk.ev]  phase=event
      parameters={ edge: posedge, act: 0, prev: 0, prevInit: 1'h0 }
-op5  core.state.regWrite operands=[%one, %d, %one]  phase=general
+op5  core.state.write operands=[%one, %d, %one]  phase=general
      object_refs=[@q]  parameters={ event_acts: [0] }
 ; op1 is swept.
 ```

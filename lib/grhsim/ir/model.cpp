@@ -128,10 +128,14 @@ namespace wolvrix::lib::grhsim
         return ModelIdentity{now ^ (addressSalt << 1), low};
     }
 
-    std::size_t GrhSimModel::ArrayTypeKeyHash::operator()(ArrayTypeKey key) const noexcept
+    std::size_t GrhSimModel::LogicTypeKeyHash::operator()(const LogicTypeKey &key) const noexcept
     {
-        std::size_t seed = std::hash<uint64_t>{}(key.count);
-        seed ^= std::hash<uint32_t>{}(key.element) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+        std::size_t seed = std::hash<uint32_t>{}(key.width);
+        seed ^= std::hash<bool>{}(key.isSigned) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<uint8_t>{}(static_cast<uint8_t>(key.domain)) + 0x9e3779b9u +
+                (seed << 6) + (seed >> 2);
+        for (const int64_t dim : key.shape)
+            seed ^= std::hash<int64_t>{}(dim) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
         return seed;
     }
 
@@ -152,7 +156,6 @@ namespace wolvrix::lib::grhsim
         result.dialects_ = dialects_;
         result.types_ = types_;
         result.logicTypes_ = logicTypes_;
-        result.arrayTypes_ = arrayTypes_;
         result.realType_ = realType_;
         result.stringType_ = stringType_;
         result.interfacePorts_ = interfacePorts_;
@@ -193,7 +196,6 @@ namespace wolvrix::lib::grhsim
         dialects_.reserve(counts.dialects);
         types_.reserve(counts.types);
         logicTypes_.reserve(counts.types);
-        arrayTypes_.reserve(counts.types);
         inputs_.reserve(counts.inputs);
         outputs_.reserve(counts.outputs);
         states_.reserve(counts.states);
@@ -246,11 +248,11 @@ namespace wolvrix::lib::grhsim
         dialects_.push_back(DialectUse{nameId, intern(version), intern(schemaFingerprint)});
     }
 
-    TypeId GrhSimModel::logicType(uint32_t width, bool isSigned, LogicDomain domain)
+    TypeId GrhSimModel::logicType(uint32_t width, bool isSigned, LogicDomain domain,
+                                  std::span<const int64_t> shape)
     {
-        const uint64_t key = (static_cast<uint64_t>(width) << 2) |
-                             (static_cast<uint64_t>(isSigned) << 1) |
-                             static_cast<uint64_t>(domain == LogicDomain::FourState);
+        const LogicTypeKey key{width, isSigned, domain,
+                               std::vector<int64_t>(shape.begin(), shape.end())};
         if (auto it = logicTypes_.find(key); it != logicTypes_.end()) return it->second;
         Type type;
         type.id = nextId<TypeId>(types_.size(), "type table");
@@ -259,9 +261,10 @@ namespace wolvrix::lib::grhsim
         type.width = width;
         type.isSigned = isSigned;
         type.domain = domain;
-        types_.push_back(type);
-        logicTypes_.emplace(key, type.id);
-        return type.id;
+        type.shape = key.shape;
+        types_.push_back(std::move(type));
+        logicTypes_.emplace(std::move(key), types_.back().id);
+        return types_.back().id;
     }
 
     TypeId GrhSimModel::realType()
@@ -286,21 +289,6 @@ namespace wolvrix::lib::grhsim
         types_.push_back(type);
         stringType_ = type.id;
         return stringType_;
-    }
-
-    TypeId GrhSimModel::arrayType(TypeId elementType, uint64_t count)
-    {
-        const ArrayTypeKey key{elementType.index, count};
-        if (auto it = arrayTypes_.find(key); it != arrayTypes_.end()) return it->second;
-        Type type;
-        type.id = nextId<TypeId>(types_.size(), "type table");
-        type.typeRef = intern("core.array");
-        type.kind = TypeKind::Array;
-        type.elementType = elementType;
-        type.count = count;
-        types_.push_back(type);
-        arrayTypes_.emplace(key, type.id);
-        return type.id;
     }
 
     OriginId GrhSimModel::addOrigin(Origin origin)
@@ -706,7 +694,6 @@ namespace wolvrix::lib::grhsim
         case TypeKind::Logic: return "logic";
         case TypeKind::Real: return "real";
         case TypeKind::String: return "string";
-        case TypeKind::Array: return "array";
         }
         return "unknown";
     }
@@ -716,7 +703,6 @@ namespace wolvrix::lib::grhsim
         if (text == "logic") return TypeKind::Logic;
         if (text == "real") return TypeKind::Real;
         if (text == "string") return TypeKind::String;
-        if (text == "array") return TypeKind::Array;
         return std::nullopt;
     }
 

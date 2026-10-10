@@ -18,7 +18,11 @@ namespace wolvrix::lib::grhsim
     // declaredSymbols / generateGroups / declProvenance metadata keys in that
     // order; a state's store class (M5d-4) is the optional fifth states item,
     // written only once the model is classified; v1 checkpoints are rejected.
-    inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v2";
+    // v3 (stage-06): types carry width + shape (the core.array constructor,
+    // elementType/count items and declProvenance.shape are retired) and the
+    // state access ops are read/readArray/write/writeArray/fill (the mem*
+    // family is retired); v2 checkpoints are rejected.
+    inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v3";
 
     bool writeGrhSimJson(const GrhSimModel &model,
                          std::ostream &output,

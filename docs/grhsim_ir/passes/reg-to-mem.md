@@ -1,42 +1,50 @@
 # Recovering scalarized tables
 
 `grhsim.reg-to-mem` is a semantic pass run after GRH-to-GrhSIM lowering and before CPU
-split-phase and mapping. It creates core array states from compatible scalar states
-without depending on RTL module names.
+split-phase and mapping. It creates array states (one shaped `core.logic` state per
+family) from compatible scalar states without depending on RTL module names.
 
 For example, with `hit_k(i) = enable_k && address_k == i`:
 
 ```text
 q_i.next = hit_1(i) ? data_1 : hit_0(i) ? data_0 : q_i
 
-=> core.state.memWriteSeq @table
-     (enable_0, address_0, data_0, enable_1, address_1, data_1, clock)
+=> core.state.writeArray @table  (enable_0, address_0, data_0, maskAllOnes, clock)
      event_edges = ["posedge"]
+   core.state.writeArray @table  (enable_1, address_1, data_1, maskAllOnes, clock)
+     event_edges = ["posedge"]
+   ; emitted in this declaration order: the later write wins an address collision
 ```
 
-Each triple is an enable, element address and element data value. Triples execute in
-low-to-high priority order: different addresses both update; the last enabled write
-to an address wins. All operands use pre-commit state. The trailing clock operand
-carries the raw event annotation (`event_edges`), independently of the write
-enables; `grhsim.lower-edge-detect` later turns it into an edge detector.
+Each recovered write carries an enable, an element address and an element data value,
+plus a mask operand (a multi-write sequence shares one all-ones mask constant). The
+writes are emitted in low-to-high priority order: op declaration order is the
+application order (stage-06 semantics; `memWriteSeq` is retired), so different
+addresses both update and the last enabled write to an address wins. All operands use
+pre-commit state. The trailing clock operand carries the raw event annotation
+(`event_edges`), independently of the write enables; `grhsim.lower-edge-detect` later
+turns it into an edge detector.
 
-The pass preserves a separate `regWrite` update condition unless implication is
+The pass preserves a separate `write` update condition unless implication is
 proved. It also preserves uncovered default-value branches. Identical broadcast
-updates can become `memFill(enable, data, events...)`, provided they do not overlap
+updates can become `fill(enable, data, events...)`, provided they do not overlap
 other writes. With `--enable-row-constant-fill`, a default branch whose data is a
 compile-time constant that differs per row (for example an identity-init reset
 writing the row number) no longer fragments the family key; the branch expands to
-one static-address sequence triple per row at the lowest priority instead of a
-`memFill`. The usual overlap proof still applies, so those triples stay exclusive
-with every decoded write. A single indexed update uses `memWrite(enable, address,
-data, mask, events...)`. Multi-bit masked sequences are rejected because
-`memWriteSeq` has no mask.
+one static-address `writeArray` per row at the lowest priority (first in
+declaration order) instead of a
+`fill`. The usual overlap proof still applies, so those writes stay exclusive
+with every decoded write. A single indexed update uses `writeArray(enable, address,
+data, mask, events...)`. Multi-bit masked sequences are rejected because the
+ordered multi-write form shares one all-ones mask and cannot express per-port
+masks.
 
 For example, `if (reset) q[row] = row; else if (en && addr == row)
-q[row] = data` becomes one array and a `memWriteSeq` with triples
-`(reset, 0, 0), (reset, 1, 1), ..., (!reset && en, addr, data)`. Each triple
+q[row] = data` becomes one array and one `writeArray` per recovered write —
+`(reset, 0, 0), (reset, 1, 1), ..., (!reset && en, addr, data)` — emitted in that
+declaration order. Each write
 contains an enable, an array index relative to the recovered row base, and the
-data to write; event operands follow the triples. Later triples win on an
+data to write; event operands follow. Later writes win on an
 address collision. Overlapping fill branches may be combined only when their
 data agree in every row; equality in the first row alone is insufficient.
 
@@ -59,9 +67,10 @@ merged_0 = data_0
 merged_1 = data_1 | (enable_0 && address_0 == address_1 ? data_0 : 0)
 merged_2 = data_2 | (enable_0 && address_0 == address_2 ? data_0 : 0)
                  | (enable_1 && address_1 == address_2 ? data_1 : 0)
-memWriteSeq(table, (enable_0, address_0, merged_0),
-                  (enable_1, address_1, merged_1),
-                  (enable_2, address_2, merged_2), clock)
+writeArray(table, enable_0, address_0, merged_0, maskAllOnes, clock)
+writeArray(table, enable_1, address_1, merged_1, maskAllOnes, clock)
+writeArray(table, enable_2, address_2, merged_2, maskAllOnes, clock)
+; declaration order = priority
 ```
 
 The last enabled port at each address contains all enabled data for that
@@ -79,7 +88,7 @@ initialization, ownership and cost checks still apply. The cost
 estimate charges the pairwise collision logic; it is not a runtime prediction.
 
 Tables can be discovered from writes without a packed read anchor, or from concat
-read views. Compatible shared `sliceArray` users become indexed `memRead`.
+read views. Compatible shared `sliceArray` users become indexed `readArray`.
 `sliceDynamic` windows up to 64 bits and `sliceStatic(lshr(...))` windows become a
 concat of indexed bit reads. For multi-bit elements, each bit offset is divided into
 an element index and an intra-element bit offset; the latter selects a bit from the
@@ -89,8 +98,9 @@ Repeated sequential views share one array. Nonperiodic views use up to eight run
 of sequential rows or repetitions of one row; larger mappings retain packed access.
 For example, low-to-high lanes `[q0,q0,q1,q2,q3,q3]` map to three runs rather than
 using the incorrect formula `index % 4`. The index is clamped before memory access.
-Extra scalar read users remain connected through fixed-address memory reads. When
-only the indexed read is optimized, original writes remain fixed-address memory writes.
+Extra scalar read users remain connected through fixed-address `readArray` ops. When
+only the indexed read is optimized, original writes remain fixed-address `writeArray`
+ops.
 
 The initial implementation requires two-state element types and constant initializers.
 Each array row retains its original initializer. Unknown state
@@ -153,7 +163,8 @@ row-major linearization of the indices. A family `tbl_0..tbl_63` reports shape
 with `@` at the varying token positions (for example
 `__reg_to_mem_cpu$rob$robEntries_@_vls__12345`); otherwise the name stays
 `__reg_to_mem_<firstRowId>`. The shape only annotates naming and reporting — the
-table type stays a flat one-dimensional array whose element order is the
+table type stays a flat one-dimensional array (a `core.logic` state whose shape is
+`[rows]`) whose element order is the
 row-major linearization of the declaration grid, matching the declProvenance
 linearization convention. Diagnostics report `declared_families` and
 `max_array_dims`; the TSV report carries a trailing `shape` column (`-` when no

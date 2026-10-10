@@ -20,8 +20,9 @@ Each state carries a `StateStoreClass` (see the IR overview §3.5):
   keep accumulating into next and are committed at each round's publish.
 - `mem` — large contiguous arrays. Write parameters (enable/address/data/
   mask) are sampled during the Event/General compute phases; `P_mem` then
-  applies the writes **in place** in static priority order (op order;
-  `memWriteSeq` keeps its internal operand order). Only addressed cells are
+  applies the writes **in place** in declaration order (the state's write ops
+  apply in op declaration order, later writes overwriting earlier ones —
+  stage-06 semantics; `memWriteSeq` is retired). Only addressed cells are
   touched, so partial and sparse writes cost proportionally — no whole-block
   copy. Readers in the compute phases see the store as of the previous
   round's `P_mem` commit; `P_mem` runs after `P_general` inside every round,
@@ -31,13 +32,15 @@ Both classes therefore implement the same one-round-latency NBA semantics;
 they differ only in *how* a commit happens (block copy vs in-place cell
 update) and hence in cost structure. The class annotation is what allows the
 layout and emitter to pick the mechanism — consumers must never re-derive
-the decision from the state's type (e.g. `TypeKind::Array`).
+the decision from the state's type shape (e.g. whether the type carries a
+shape).
 
 ## Classification policy
 
 The decision uses the optimized (post stage-A) shape of each state:
 
-- **contiguity**: only `core.array` states are eligible for `mem`;
+- **contiguity**: only shaped (array) `core.logic` states are eligible for
+  `mem`;
 - **size**: an array whose linear byte size (`ceil(row-major bits / 8)`,
   semantic bits — the physical 4-state doubling is a backend concern) is at
   least `--mem-min-bytes` (default 64) becomes `mem`;
@@ -45,21 +48,23 @@ The decision uses the optimized (post stage-A) shape of each state:
   states — becomes `regLatch`.
 
 Update cost is the rationale, not a separate signal: a `mem`-class array is
-written through addressed mem ops whose per-round touched-cell count is
+written through addressed write ops (`writeArray`) whose per-round
+touched-cell count is
 typically far below the array size, so in-place commit avoids the
 `O(size)` publish copy; below the threshold the block copy is a single cheap
 `memcpy`, and keeping the state in regLatch keeps it on the uniform
-next/current path. Whole-array writes (`memFill`/`memAssign`) do not change
+next/current path. Whole-array writes (`fill`, or a whole-array `write`) do
+not change
 the class: applying them in place still avoids materializing a whole-array
 boundary value.
 
 Contrast example (default threshold):
 
 ```text
-q:        core.logic<64>              -> regLatch   (scalar, 8 B)
-smallRam: core.array<logic<32>, 4>    -> regLatch   (16 B, publish copy is cheap)
-bigRam:   core.array<logic<64>, 4096> -> mem        (32 KiB, sparse addressed
-                                                     writes commit in place)
+q:        core.logic<64>                      -> regLatch   (scalar, 8 B)
+smallRam: core.logic<128>, shape=[4]          -> regLatch   (16 B, publish copy is cheap)
+bigRam:   core.logic<262144>, shape=[4096]    -> mem        (32 KiB, sparse addressed
+                                                             writes commit in place)
 ```
 
 ### Incremental classification
@@ -85,12 +90,12 @@ fills unclassified states unless `--reclassify true` is given.
 
 - **B5 [`grhsim.split-phases`](grhsim-split-phases.md)** (M5d-5, wired): the
   first consumer. A write op's P_mem responsibility is decided by the *target
-  state's class* — mem ops on `mem`-class states go to P_mem; writes on
-  `regLatch` states (including mem ops on small arrays) stay on the
+  state's class* — writes on `mem`-class states go to P_mem; writes on
+  `regLatch` states (including writes on small arrays) stay on the
   next-buffer path (General phase).
 - **C3 `cpu.st.layout-named-stores`** (M5d-6): pure physical layout — it
   consumes the annotation and makes zero classification decisions. The old
-  implicit `TypeKind::Array` classification lived in the legacy M3/M4 backend
+  implicit array-type classification lived in the legacy M3/M4 backend
   passes, which were deleted in M5d-6.
 
 ## Options and diagnostics
@@ -112,13 +117,13 @@ semantic bytes per class over all states (`reg_latch_bytes`/`mem_bytes`).
 With any classification present, `verifyGrhSimModel` enforces:
 
 1. totality — every state carries a class;
-2. `mem` requires a `core.array` state;
-3. a `mem`-class state may not be targeted by `core.state.regWrite` or
-   `core.state.latchWrite` (its writes must be mem ops so P_mem can own the
+2. `mem` requires a shaped (array) `core.logic` state;
+3. a `mem`-class state may not be targeted by `core.state.latchWrite` (its
+   writes must be `write`/`writeArray`/`fill` ops so P_mem can own the
    commit).
 
 The phase consistency between the classification and the six-phase write
-attribution (mem ops on `mem` states carry P_mem, writes on `regLatch`
+attribution (writes on `mem` states carry P_mem, writes on `regLatch`
 states carry P_general) is enforced for every attributed op by the
 class-aware `verifyPhaseAttribution` (M5d-5), and the partition stage seals
 with `grhsim.verify --seal semantic` (B8).

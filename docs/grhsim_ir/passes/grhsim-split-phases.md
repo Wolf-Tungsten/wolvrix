@@ -25,9 +25,9 @@ keep their phase:
 | --- | --- |
 | `core.event.edgeDet` | `Event` (defensive; B2 already tags them) |
 | `core.output.write` | `Output` (defensive; B3 already tags them) |
-| `core.state.regWrite` | `General` |
+| `core.state.write` on a scalar target | `General` |
 | `core.state.latchWrite` | `General` (B4's timeslot write-backs stay `Output`) |
-| `core.state.memWrite/memFill/memAssign/memWriteSeq` | **class-aware**, see below |
+| `core.state.writeArray`/`fill`, and `write` on an array (shaped) target | **class-aware**, see below |
 | everything else (compute, reads, event-free `system.task`/`dpi.call`) | `General` |
 
 The P_mem write duty follows the **target state's store class** (A7
@@ -36,10 +36,13 @@ The P_mem write duty follows the **target state's store class** (A7
 - target classified `mem` → `Mem` (P_mem samples the write parameters and
   commits in place);
 - target classified `regLatch` → `General` (the write joins the supernode
-  fabric and commits through the next-buffer/publish path — this includes mem
-  ops on small arrays);
-- no classification present, or an unresolvable target ref → legacy fallback
-  `Mem` (pre-A7 flows and hand-built test models are unchanged).
+  fabric and commits through the next-buffer/publish path — this includes
+  writes on small arrays);
+- no classification present → legacy shape-based fallback (shaped target =
+  array → `Mem`, scalar `write` → `General`), so pre-A7 flows and hand-built
+  test models are unchanged; an unresolvable target ref mirrors the same
+  fallback (`General` for the scalar-capable `write`, `Mem` for the
+  array-only `writeArray`/`fill`).
 
 The pass requires B3 to have run when outputs exist: tagging an
 `output.write` `Output` while its operand is still General-produced violates
@@ -55,7 +58,7 @@ the attribution stays honest under later rewrites.
 
 The pass takes no arguments. The info line reports `attributed`,
 `phase_event`/`phase_general`/`phase_mem`/`phase_output`,
-`mem_writes_reglatch` (mem writes that took the General path via the class
+`mem_writes_reglatch` (array-target writes that took the General path via the class
 rule) and `already_attributed`. A second run is a no-op.
 
 ## Consumed by the final mapping (M5d-6)

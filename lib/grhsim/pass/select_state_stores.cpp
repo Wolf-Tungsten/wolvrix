@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -33,9 +32,10 @@ namespace wolvrix::lib::grhsim
             std::filesystem::path report;
         };
 
-        // Linear semantic bit size of a type: arrays flatten row-major
-        // (element stride = element size), non-logic scalars carry no bits.
-        // Returns false on an invalid type reference or a 64-bit overflow.
+        // Linear semantic bit size of a type: a Logic type's width is already
+        // the total across all shape dimensions (stage-06 arrays flatten
+        // row-major into the width); non-logic scalars carry no bits.
+        // Returns false on an invalid type reference.
         bool linearBitSize(const GrhSimModel &model, TypeId typeId, uint64_t &out)
         {
             if (!typeId.valid() || typeId.generation != 0 || typeId.index > model.types().size())
@@ -50,31 +50,21 @@ namespace wolvrix::lib::grhsim
             case TypeKind::String:
                 out = 0;
                 return true;
-            case TypeKind::Array:
-            {
-                uint64_t element = 0;
-                if (!linearBitSize(model, type.elementType, element)) return false;
-                if (type.count != 0 &&
-                    element > std::numeric_limits<uint64_t>::max() / type.count)
-                    return false;
-                out = type.count * element;
-                return true;
-            }
             }
             return false;
         }
 
-        // Array dimensions outermost-first, joined by 'x'; empty for scalars.
+        // Stage-06 shape dimensions outermost-first, joined by 'x'; empty for
+        // scalars (only logic types carry a shape).
         std::string shapeOf(const GrhSimModel &model, TypeId typeId)
         {
             std::string shape;
-            while (typeId.valid() && typeId.generation == 0 && typeId.index <= model.types().size())
+            if (!typeId.valid() || typeId.generation != 0 || typeId.index > model.types().size())
+                return shape;
+            for (const int64_t dim : model.types()[typeId.index - 1].shape)
             {
-                const Type &type = model.types()[typeId.index - 1];
-                if (type.kind != TypeKind::Array) break;
                 if (!shape.empty()) shape += 'x';
-                shape += std::to_string(type.count);
-                typeId = type.elementType;
+                shape += std::to_string(dim);
             }
             return shape;
         }
@@ -85,8 +75,12 @@ namespace wolvrix::lib::grhsim
             ok = linearBitSize(model, state.type, bits);
             if (!ok) return StateStoreClass::None;
             bytes = bits / 8 + (bits % 8 != 0 ? 1 : 0);
-            const TypeKind kind = model.types()[state.type.index - 1].kind;
-            if (kind == TypeKind::Array && bytes >= memMinBytes) return StateStoreClass::Mem;
+            // Stage-06: the mem class criterion is a SHAPED (array) logic state
+            // whose total byte size crosses the threshold; scalars stay
+            // RegLatch regardless of size.
+            const Type &type = model.types()[state.type.index - 1];
+            if (type.kind == TypeKind::Logic && !type.shape.empty() && bytes >= memMinBytes)
+                return StateStoreClass::Mem;
             return StateStoreClass::RegLatch;
         }
 
@@ -110,11 +104,10 @@ namespace wolvrix::lib::grhsim
                     if (refs.empty() || refs[0].kind != ObjectKind::State ||
                         refs[0].index > model.states().size())
                         continue;
-                    if (name == "core.state.regWrite" || name == "core.state.latchWrite" ||
-                        name == "core.state.memWrite" || name == "core.state.memFill" ||
-                        name == "core.state.memAssign" || name == "core.state.memWriteSeq")
+                    if (name == "core.state.write" || name == "core.state.writeArray" ||
+                        name == "core.state.fill" || name == "core.state.latchWrite")
                         ++writes[refs[0].index];
-                    else if (name == "core.state.read" || name == "core.state.memRead")
+                    else if (name == "core.state.read" || name == "core.state.readArray")
                         ++reads[refs[0].index];
                 }
 

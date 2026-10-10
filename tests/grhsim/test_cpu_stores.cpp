@@ -161,17 +161,17 @@ namespace
         return id;
     }
 
-    OpId addRegWrite(GrhSimModel &model, ValueId cond, ValueId next, ValueId mask,
-                     StateId target, std::vector<int64_t> acts)
+    OpId addWrite(GrhSimModel &model, ValueId cond, ValueId next, ValueId mask,
+                  StateId target, std::vector<int64_t> acts)
     {
         const std::array operands{cond, next, mask};
         const std::array refs{ObjectRef::state(target)};
         OpId id;
-        if (acts.empty()) id = model.addOperation("core.state.regWrite", operands, {}, refs);
+        if (acts.empty()) id = model.addOperation("core.state.write", operands, {}, refs);
         else
         {
             const std::array params{Parameter{model.intern("event_acts"), std::move(acts)}};
-            id = model.addOperation("core.state.regWrite", operands, {}, refs, params);
+            id = model.addOperation("core.state.write", operands, {}, refs, params);
         }
         model.setOperationPhase(id, SimPhase::General);
         return id;
@@ -313,10 +313,11 @@ namespace
 
         MainFixture() : model("m4_main")
         {
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto bit4 = model.logicType(4, false, LogicDomain::TwoState);
-            const auto memType = model.arrayType(bit, 16);
+            const std::array<int64_t, 1> memShape{16};
+            const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
             const auto clk0 = model.addInput("clk0", bit);
             const auto clk1 = model.addInput("clk1", bit);
             const auto rst = model.addInput("rst", bit);
@@ -362,37 +363,38 @@ namespace
             // supernode (M3 rule 2) and its result is a boundary value.
             shnv = addNot(model, dshv, "shn");
             const auto c0 = addAnd(model, rstDv, shnv, "c0");
-            w0 = addRegWrite(model, c0, shnv, one0, q0, {0, 2});
+            w0 = addWrite(model, c0, shnv, one0, q0, {0, 2});
             x1v = addNot(model, d1v, "x1");
             const auto x1g = addAnd(model, x1v, shnv, "x1g");
-            w1 = addRegWrite(model, one1, x1g, one1, q1, {1});
-            // Mem readers: one static address (4'h3), one dynamic (x1).
+            w1 = addWrite(model, one1, x1g, one1, q1, {1});
+            // Array readers: one static address (4'h3), one dynamic (x1).
             const auto mrv0 = model.addValue(bit, "mrv0");
             {
                 const std::array refs{ObjectRef::state(m1)};
-                mr0 = model.addOperation("core.state.memRead", std::array{row3},
+                mr0 = model.addOperation("core.state.readArray", std::array{row3},
                                          std::array{mrv0}, refs);
             }
-            w3 = addRegWrite(model, one3, mrv0, one3, q3, {0});
+            w3 = addWrite(model, one3, mrv0, one3, q3, {0});
             const auto mrv1 = model.addValue(bit, "mrv1");
             {
                 const std::array refs{ObjectRef::state(m1)};
-                mr1 = model.addOperation("core.state.memRead", std::array{x1v},
+                mr1 = model.addOperation("core.state.readArray", std::array{x1v},
                                          std::array{mrv1}, refs);
             }
-            w4 = addRegWrite(model, one4, mrv1, one4, q4, {1});
+            w4 = addWrite(model, one4, mrv1, one4, q4, {1});
             // State reader: publish fanout for q0.
             q0rv = addStateRead(model, q0, "q0r");
             const auto y = addNot(model, q0rv, "y");
-            w5 = addRegWrite(model, one5, y, one5, q5, {0});
-            // Two writes into m1: per-mem static priority follows op-id order.
+            w5 = addWrite(model, one5, y, one5, q5, {0});
+            // Two writes into m1: the per-state priority is the declaration
+            // rank (stage-06: op-id order == declaration order).
             {
                 const std::array refs{ObjectRef::state(m1)};
                 const std::array params{
                     Parameter{model.intern("event_acts"), std::vector<int64_t>{0}}};
-                mw0 = model.addOperation("core.state.memWrite",
+                mw0 = model.addOperation("core.state.writeArray",
                                          std::array{mw0e, row3, mdv, mw0m}, {}, refs, params);
-                mw1 = model.addOperation("core.state.memWrite",
+                mw1 = model.addOperation("core.state.writeArray",
                                          std::array{mw1e, x1v, mw1d, mw1m}, {}, refs);
             }
             // Timeslot task in P_output (the M2b migrated shape).
@@ -565,7 +567,7 @@ namespace
     void namingRulesTest()
     {
         GrhSimModel model("m4_names");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto bit2 = model.logicType(2, false, LogicDomain::TwoState);
         const auto bit8 = model.logicType(8, false, LogicDomain::TwoState);
@@ -604,12 +606,12 @@ namespace
         const auto qD = addState(model, "qD", bit, "1'b0");
         const auto qA2 = addState(model, "qA2", bit2, "2'b00");
         const auto qB2 = addState(model, "qB2", bit2, "2'b00");
-        addRegWrite(model, one, nv, one, qA, {0});
-        addRegWrite(model, one, nv, one, qB, {1});
-        addRegWrite(model, one, rv, one, qC, {1});
-        addRegWrite(model, one, wirv, one, qD, {0});
-        addRegWrite(model, one, sv, two, qA2, {0});
-        addRegWrite(model, one, sv, two, qB2, {1});
+        addWrite(model, one, nv, one, qA, {0});
+        addWrite(model, one, nv, one, qB, {1});
+        addWrite(model, one, rv, one, qC, {1});
+        addWrite(model, one, wirv, one, qD, {0});
+        addWrite(model, one, sv, two, qA2, {0});
+        addWrite(model, one, sv, two, qB2, {1});
         require(verifies(model), "naming: fixture rejected");
 
         runMappingPipeline(model);
@@ -668,7 +670,7 @@ namespace
     void latchEscapeTest()
     {
         GrhSimModel model("m4_latch");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto clk = model.addInput("clk", bit);
         const auto d0 = model.addInput("d0", bit);
@@ -681,7 +683,7 @@ namespace
         const auto oneL = addConstant(model, bit, "1'b1");
         const auto q0 = addState(model, "q0", bit, "1'b0");
         const auto ql = addState(model, "ql", bit, "1'b0");
-        addRegWrite(model, one0, d0v, one0, q0, {0});
+        addWrite(model, one0, d0v, one0, q0, {0});
         const auto ln = addNot(model, dlv, "ln");
         OpId wl;
         {
@@ -718,10 +720,11 @@ namespace
     void eventActivationCoverageTest()
     {
         GrhSimModel model("m4_event_activation");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(bit, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
         const auto clk0 = model.addInput("clk0", bit);
         const auto clk1 = model.addInput("clk1", bit);
         const auto d1 = model.addInput("d1", bit);
@@ -735,8 +738,8 @@ namespace
         const auto dlv = addReadOp(model, dl, "dl", SimPhase::None, false);
         const auto mdv = addReadOp(model, md, "md", SimPhase::None, false);
         const auto one = addConstant(model, bit, "1'b1");
-        const auto one2 = addConstant(model, bit, "1'b1");
         const auto oneL = addConstant(model, bit, "1'b1");
+        const auto maskByte = addConstant(model, byte, "8'hff");
         const auto row3 = addConstant(model, model.logicType(4, false, LogicDomain::TwoState),
                                       "4'h3");
         const auto q1 = addState(model, "q1", bit, "1'b0");
@@ -744,7 +747,7 @@ namespace
         const auto ql = addState(model, "ql", bit, "1'b0");
         const auto m1 = addState(model, "m1", memType, "0");
         // SinkEvent {1}: a posedge-clk1 register write.
-        const auto w1 = addRegWrite(model, d1v, d1v, d1v, q1, {1});
+        const auto w1 = addWrite(model, d1v, d1v, d1v, q1, {1});
         // Non-sink carrier of act 1: a gated DPI call with a return value
         // (lowered shape: event-free operands/refs plus event_acts).
         const std::array dblArgs{DpiArgument{model.intern("x"), DpiDirection::Input, byte}};
@@ -760,7 +763,7 @@ namespace
                                      refs, params);
         }
         // SinkEvent {1} consumer of the DPI result (keeps z live).
-        const auto w2 = addRegWrite(model, one2, z, one2, q2, {1});
+        const auto w2 = addWrite(model, one, z, maskByte, q2, {1});
         // SinkEscape: an event-free latch write.
         const auto ln = addNot(model, dlv, "ln");
         OpId wl;
@@ -774,7 +777,7 @@ namespace
             const std::array refs{ObjectRef::state(m1)};
             const std::array params{
                 Parameter{model.intern("event_acts"), std::vector<int64_t>{0}}};
-            model.addOperation("core.state.memWrite", std::array{mdv, row3, mdv, mdv},
+            model.addOperation("core.state.writeArray", std::array{mdv, row3, mdv, mdv},
                                {}, refs, params);
         }
         require(verifies(model), "coverage: fixture rejected");
@@ -806,9 +809,10 @@ namespace
         roundTrip(model);
     }
 
-    // cpu.st.build-mem-write-plan: per-mem op-id priority, exact static-row
-    // readers, conservative dynamic readers, and the event-free mark.
-    void memWritePlanTest()
+    // cpu.st.build-mem-write-plan: per-state declaration-rank priority, exact
+    // static-row readers, conservative dynamic readers, and the event-free
+    // mark.
+    void writePlanTest()
     {
         MainFixture fixture;
         auto &model = fixture.model;
@@ -1002,7 +1006,7 @@ namespace
         // Missing prerequisites fail cleanly without touching the mapping.
         std::string error;
         GrhSimModel fresh("m4_fresh");
-        fresh.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        fresh.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         for (auto name : {"cpu.st.layout-named-stores", "cpu.st.build-event-activation-map",
                           "cpu.st.build-mem-write-plan", "cpu.st.build-phase-schedule"})
         {
@@ -1045,7 +1049,7 @@ namespace
     void emptyModelTest()
     {
         GrhSimModel model("m4_empty");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
         runSchedulePipeline(model);
@@ -1098,7 +1102,7 @@ int main()
         eventActivationMapTest();
         latchEscapeTest();
         eventActivationCoverageTest();
-        memWritePlanTest();
+        writePlanTest();
         phaseScheduleTest();
         verifierRejectsTest();
         emptyModelTest();

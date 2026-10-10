@@ -59,7 +59,7 @@ namespace
         return id;
     }
 
-    grhsim::OpId addRegWrite(grhsim::GrhSimModel &model, grhsim::ValueId cond,
+    grhsim::OpId addWrite(grhsim::GrhSimModel &model, grhsim::ValueId cond,
                              grhsim::ValueId next, grhsim::ValueId mask, grhsim::StateId target,
                              grhsim::ValueId event, std::string edge)
     {
@@ -67,7 +67,7 @@ namespace
         const std::array refs{grhsim::ObjectRef::state(target)};
         const std::array params{grhsim::Parameter{model.intern("event_edges"),
                                                   std::vector<std::string>{std::move(edge)}}};
-        return model.addOperation("core.state.regWrite", operands, {}, refs, params);
+        return model.addOperation("core.state.write", operands, {}, refs, params);
     }
 
     const grhsim::Parameter *findParam(const grhsim::GrhSimModel &model,
@@ -259,7 +259,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("dut_081");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q = addState(model, "q", bit, "1'h0");
         const auto clk = addInputRead(model, "clk");
@@ -268,7 +268,7 @@ namespace
         model.addOperation("core.state.read", {}, std::array{qv},
                            std::array{ObjectRef::state(q)});
         const auto one = addConstant(model, bit, "1'b1");
-        addRegWrite(model, one, d, one, q, clk, "posedge");
+        addWrite(model, one, d, one, q, clk, "posedge");
         const auto out = model.addOutput("o", bit);
         model.addOperation("core.output.write", std::array{qv}, {},
                            std::array{ObjectRef::output(out)});
@@ -342,8 +342,8 @@ namespace
             !getStringParam(model, *det, "prevInit", "1'h0"))
             return fail("dut_081: edgeDet parameters wrong");
 
-        const auto writes = opsOfType(model, "core.state.regWrite");
-        if (writes.size() != 1) return fail("dut_081: regWrite lost");
+        const auto writes = opsOfType(model, "core.state.write");
+        if (writes.size() != 1) return fail("dut_081: write lost");
         const auto *write = writes.front();
         const auto writeOperands = model.operands(*write);
         const auto writeRefs = model.objectRefs(*write);
@@ -354,14 +354,14 @@ namespace
         const auto dValue = model.results(*dRead)[0];
         if (writeOperands.size() != 3 || writeOperands[0] != oneValue ||
             writeOperands[1] != dValue || writeOperands[2] != oneValue)
-            return fail("dut_081: regWrite operands not rewired to the event-free form");
+            return fail("dut_081: write operands not rewired to the event-free form");
         const auto *liveQ = findState(model, "q");
         if (writeRefs.size() != 1 || !liveQ || writeRefs[0].index != liveQ->id.index)
-            return fail("dut_081: regWrite refs wrong");
+            return fail("dut_081: write refs wrong");
         if (findParam(model, model.parameters(*write), "event_edges"))
             return fail("dut_081: event_edges survived");
         if (!getActsParam(model, *write, {0})) return fail("dut_081: event_acts wrong");
-        if (write->phase != SimPhase::General) return fail("dut_081: regWrite not General");
+        if (write->phase != SimPhase::General) return fail("dut_081: write not General");
 
         const auto outputs = opsOfType(model, "core.output.write");
         if (outputs.size() != 1 || outputs.front()->phase != SimPhase::None)
@@ -418,7 +418,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("dual_use_rst");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q1 = addState(model, "q1", bit, "1'h0");
         const auto q2 = addState(model, "q2", bit, "1'h0");
@@ -428,8 +428,8 @@ namespace
         const auto zero = addConstant(model, bit, "1'b0");
         const auto muxed = model.addValue(bit, "rst_mux");
         model.addOperation("core.compute.mux", std::array{rst, d, zero}, std::array{muxed});
-        addRegWrite(model, one, d, one, q1, rst, "posedge");
-        addRegWrite(model, one, muxed, one, q2, rst, "negedge");
+        addWrite(model, one, d, one, q1, rst, "posedge");
+        addWrite(model, one, muxed, one, q2, rst, "negedge");
         if (!verifies(model)) return fail("dual_use: pre-pass model rejected");
 
         diag::Diagnostics pass1Diagnostics;
@@ -483,12 +483,12 @@ namespace
                 sawNegedge = true;
         }
         if (!sawPosedge || !sawNegedge) return fail("dual_use: cluster numbering wrong");
-        const auto writes = opsOfType(model, "core.state.regWrite");
-        if (writes.size() != 2) return fail("dual_use: regWrites lost");
+        const auto writes = opsOfType(model, "core.state.write");
+        if (writes.size() != 2) return fail("dual_use: writes lost");
         bool sawActs0 = false, sawActs1 = false;
         for (const auto *write : writes)
         {
-            if (write->phase != SimPhase::General) return fail("dual_use: regWrite phase wrong");
+            if (write->phase != SimPhase::General) return fail("dual_use: write phase wrong");
             if (getActsParam(model, *write, {0})) sawActs0 = true;
             if (getActsParam(model, *write, {1})) sawActs1 = true;
         }
@@ -503,13 +503,13 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("pure_event_clk");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q = addState(model, "q", bit, "1'h0");
         const auto clk = addInputRead(model, "clk");
         const auto d = addInputRead(model, "d");
         const auto one = addConstant(model, bit, "1'b1");
-        addRegWrite(model, one, d, one, q, clk, "posedge");
+        addWrite(model, one, d, one, q, clk, "posedge");
         if (!verifies(model)) return fail("pure_event: pre-pass model rejected");
 
         diag::Diagnostics diagnostics;
@@ -537,20 +537,20 @@ namespace
         return 0;
     }
 
-    // Spec case 5: two regWrites share the (clk, posedge) cluster.
+    // Spec case 5: two writes share the (clk, posedge) cluster.
     int runSharedClusterTest()
     {
         using namespace grhsim;
         GrhSimModel model("shared_cluster");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q1 = addState(model, "q1", bit, "1'h0");
         const auto q2 = addState(model, "q2", bit, "1'h0");
         const auto clk = addInputRead(model, "clk");
         const auto d = addInputRead(model, "d");
         const auto one = addConstant(model, bit, "1'b1");
-        addRegWrite(model, one, d, one, q1, clk, "posedge");
-        addRegWrite(model, one, d, one, q2, clk, "posedge");
+        addWrite(model, one, d, one, q1, clk, "posedge");
+        addWrite(model, one, d, one, q2, clk, "posedge");
 
         diag::Diagnostics diagnostics;
         if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
@@ -561,9 +561,9 @@ namespace
             return fail("shared: lower diagnostic counts wrong");
         if (opsOfType(model, "core.event.edgeDet").size() != 1)
             return fail("shared: expected a single shared edgeDet");
-        for (const auto *write : opsOfType(model, "core.state.regWrite"))
+        for (const auto *write : opsOfType(model, "core.state.write"))
             if (!getActsParam(model, *write, {0}))
-                return fail("shared: both regWrites must reference cluster 0");
+                return fail("shared: both writes must reference cluster 0");
         if (!verifies(model)) return fail("shared: lowered model rejected");
         return 0;
     }
@@ -576,7 +576,7 @@ namespace
         using namespace grhsim;
         {
             GrhSimModel model("prev_init_reg");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto word = model.logicType(8, false, LogicDomain::TwoState);
             const auto q = addState(model, "q", bit, "1'h0");
@@ -590,8 +590,8 @@ namespace
             const auto widev = model.addValue(word, "wide_reg_value");
             model.addOperation("core.state.read", {}, std::array{widev},
                                std::array{ObjectRef::state(wideReg)});
-            addRegWrite(model, one, d, one, q, clkv, "posedge");
-            addRegWrite(model, one, d, one, q, widev, "negedge");
+            addWrite(model, one, d, one, q, clkv, "posedge");
+            addWrite(model, one, d, one, q, widev, "negedge");
 
             diag::Diagnostics diagnostics;
             if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
@@ -616,7 +616,7 @@ namespace
             // Derived clock clk & en with en a zero-init register: the cone
             // evaluates to 1'h0 and every cone op is cloned into Event.
             GrhSimModel model("prev_init_derived");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto q = addState(model, "q", bit, "1'h0");
             const auto en = addState(model, "en", bit, "1'h0");
@@ -628,7 +628,7 @@ namespace
                                std::array{ObjectRef::state(en)});
             const auto derived = model.addValue(bit, "clk_derived");
             model.addOperation("core.compute.and", std::array{clk, env}, std::array{derived});
-            addRegWrite(model, one, d, one, q, derived, "posedge");
+            addWrite(model, one, d, one, q, derived, "posedge");
 
             diag::Diagnostics diagnostics;
             if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
@@ -651,7 +651,7 @@ namespace
         {
             // add is not statically evaluable: zero fallback plus diagnostic.
             GrhSimModel model("prev_init_fallback");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto q = addState(model, "q", bit, "1'h0");
             const auto a = addInputRead(model, "a");
@@ -660,7 +660,7 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const auto sum = model.addValue(bit, "sum");
             model.addOperation("core.compute.add", std::array{a, b}, std::array{sum});
-            addRegWrite(model, one, d, one, q, sum, "posedge");
+            addWrite(model, one, d, one, q, sum, "posedge");
 
             diag::Diagnostics diagnostics;
             if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
@@ -677,7 +677,7 @@ namespace
             // An explicit-width init literal that does not match the state
             // width falls back to a zero literal of the event width.
             GrhSimModel model("prev_init_width_mismatch");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto word = model.logicType(8, false, LogicDomain::TwoState);
             const auto q = addState(model, "q", bit, "1'h0");
@@ -687,7 +687,7 @@ namespace
             const auto oddv = model.addValue(word, "odd_value");
             model.addOperation("core.state.read", {}, std::array{oddv},
                                std::array{ObjectRef::state(odd)});
-            addRegWrite(model, one, d, one, q, oddv, "posedge");
+            addWrite(model, one, d, one, q, oddv, "posedge");
 
             diag::Diagnostics diagnostics;
             if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
@@ -703,36 +703,46 @@ namespace
         return 0;
     }
 
-    // Spec case 7: the four mem-write kinds are rewired but keep phase None.
+    // Spec case 7: the stage-06 write family (writeArray/fill/whole-array
+    // write, plus a two-write sequence) is rewired but keeps phase None.
     int runMemWriteEventTest()
     {
         using namespace grhsim;
         GrhSimModel model("mem_write_events");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
-        const auto memType = model.arrayType(bit, 16);
+        const std::array<int64_t, 1> memShape{16};
+        const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
         const auto mem = addState(model, "mem", memType, "0");
-        const auto memFill = addState(model, "mem_fill", memType, "0");
-        const auto memAssign = addState(model, "mem_assign", memType, "0");
-        const auto memSeq = addState(model, "mem_seq", memType, "0");
+        const auto fillState = addState(model, "mem_fill", memType, "0");
+        const auto wholeState = addState(model, "mem_assign", memType, "0");
+        const auto seqState = addState(model, "mem_seq", memType, "0");
         const auto clk = addInputRead(model, "clk");
         const auto one = addConstant(model, bit, "1'b1");
         const auto zero = addConstant(model, bit, "1'b0");
         const auto row = addConstant(model, memType, "16'h0000");
+        const auto mask16 = addConstant(model, model.logicType(16, false, LogicDomain::TwoState),
+                                        "16'hffff");
         const std::array edges{Parameter{model.intern("event_edges"),
                                          std::vector<std::string>{"posedge"}}};
-        model.addOperation("core.state.memWrite", std::array{one, zero, one, one, clk}, {},
+        model.addOperation("core.state.writeArray", std::array{one, zero, one, one, clk}, {},
                            std::array{ObjectRef::state(mem)},
                            edges);
-        model.addOperation("core.state.memFill", std::array{one, zero, clk}, {},
-                           std::array{ObjectRef::state(memFill)},
+        model.addOperation("core.state.fill", std::array{one, zero, clk}, {},
+                           std::array{ObjectRef::state(fillState)},
                            edges);
-        model.addOperation("core.state.memAssign", std::array{one, row, clk}, {},
-                           std::array{ObjectRef::state(memAssign)},
+        model.addOperation("core.state.write", std::array{one, row, mask16, clk}, {},
+                           std::array{ObjectRef::state(wholeState)},
                            edges);
-        model.addOperation("core.state.memWriteSeq",
-                           std::array{one, zero, one, one, zero, zero, clk}, {},
-                           std::array{ObjectRef::state(memSeq)},
+        // Two writes on one state apply in declaration order (the stage-06
+        // replacement for the old sequence-write op).
+        model.addOperation("core.state.writeArray",
+                           std::array{one, zero, one, one, clk}, {},
+                           std::array{ObjectRef::state(seqState)},
+                           edges);
+        model.addOperation("core.state.writeArray",
+                           std::array{one, zero, zero, one, clk}, {},
+                           std::array{ObjectRef::state(seqState)},
                            edges);
         if (!verifies(model)) return fail("mem_events: pre-pass model rejected");
 
@@ -740,23 +750,39 @@ namespace
         if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
             return fail("mem_events: lower pass failed");
         if (!hasInfo(diagnostics, "grhsim.lower-edge-detect",
-                     "clusters=1 edge_dets=1 rewritten_ops=4 removed_history_states=0"))
+                     "clusters=1 edge_dets=1 rewritten_ops=5 removed_history_states=0"))
             return fail("mem_events: lower diagnostic counts wrong");
-        const auto expect = [&](std::string_view type, std::size_t operands) {
+        const auto expect = [&](std::string_view type, std::size_t operands, std::size_t count) {
             const auto ops = opsOfType(model, type);
-            if (ops.size() != 1) return false;
-            const auto *op = ops.front();
-            return model.operands(*op).size() == operands &&
-                   model.objectRefs(*op).size() == 1 &&
-                   model.objectRefs(*op)[0].kind == ObjectKind::State &&
-                   !findParam(model, model.parameters(*op), "event_edges") &&
-                   getActsParam(model, *op, {0}) && op->phase == SimPhase::None;
+            if (ops.size() != count) return false;
+            for (const auto *op : ops)
+            {
+                if (model.operands(*op).size() != operands ||
+                    model.objectRefs(*op).size() != 1 ||
+                    model.objectRefs(*op)[0].kind != ObjectKind::State ||
+                    findParam(model, model.parameters(*op), "event_edges") ||
+                    !getActsParam(model, *op, {0}) || op->phase != SimPhase::None)
+                    return false;
+            }
+            return true;
         };
-        if (!expect("core.state.memWrite", 4)) return fail("mem_events: memWrite shape wrong");
-        if (!expect("core.state.memFill", 2)) return fail("mem_events: memFill shape wrong");
-        if (!expect("core.state.memAssign", 2)) return fail("mem_events: memAssign shape wrong");
-        if (!expect("core.state.memWriteSeq", 6))
-            return fail("mem_events: memWriteSeq shape wrong");
+        if (!expect("core.state.writeArray", 4, 3)) return fail("mem_events: writeArray shape wrong");
+        if (!expect("core.state.fill", 2, 1)) return fail("mem_events: fill shape wrong");
+        if (!expect("core.state.write", 3, 1)) return fail("mem_events: write shape wrong");
+        // The sequence write kept its two writes in declaration order on the
+        // same state (later writes win): [en, idx, data, mask] each.
+        std::vector<const SimOp *> seqWrites;
+        for (const auto *op : opsOfType(model, "core.state.writeArray"))
+            if (model.objectRefs(*op)[0].index == seqState.index) seqWrites.push_back(op);
+        if (seqWrites.size() != 2)
+            return fail("mem_events: sequence write did not become two writeArray ops");
+        const auto firstArgs = model.operands(*seqWrites[0]);
+        const auto secondArgs = model.operands(*seqWrites[1]);
+        if (constValueOf(model, firstArgs[1]) != std::optional<std::string>("1'b0") ||
+            constValueOf(model, firstArgs[2]) != std::optional<std::string>("1'b1") ||
+            constValueOf(model, secondArgs[1]) != std::optional<std::string>("1'b0") ||
+            constValueOf(model, secondArgs[2]) != std::optional<std::string>("1'b0"))
+            return fail("mem_events: sequence write order or payload changed");
         if (model.states().size() != 4) return fail("mem_events: unexpected state count");
         if (!verifies(model)) return fail("mem_events: lowered model rejected");
         return 0;
@@ -767,7 +793,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("dpi_call_event");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const std::array funcArgs{DpiArgument{model.intern("x"), DpiDirection::Input, bit}};
         const auto func = model.addExternFunction("check", "core.dpi", "check", funcArgs, {});
@@ -805,13 +831,13 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("event_strobe");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q = addState(model, "q", bit, "1'h0");
         const auto clk = addInputRead(model, "clk");
         const auto d = addInputRead(model, "d");
         const auto one = addConstant(model, bit, "1'b1");
-        addRegWrite(model, one, d, one, q, clk, "posedge");
+        addWrite(model, one, d, one, q, clk, "posedge");
         const auto qv = model.addValue(bit, "q_value");
         model.addOperation("core.state.read", {}, std::array{qv},
                            std::array{ObjectRef::state(q)});
@@ -865,7 +891,7 @@ namespace
         if (outputConstants != 1 || outputReads != 1)
             return fail("event_strobe: Output cone clone shape wrong");
         // The original q state.read had no other user and was swept; the
-        // constant stays (dual use by the regWrite).
+        // constant stays (dual use by the write).
         if (opsOfType(model, "core.state.read").size() != 1)
             return fail("event_strobe: original state.read was not swept");
         if (!verifies(model)) return fail("event_strobe: migrated model rejected");
@@ -881,7 +907,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("free_timeslot");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
         const auto q1 = addState(model, "q1", bit, "1'h0");
@@ -1068,7 +1094,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("idempotent");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto q1 = addState(model, "q1", bit, "1'h0");
         const auto q2 = addState(model, "q2", bit, "1'h0");
@@ -1079,8 +1105,8 @@ namespace
         const auto zero = addConstant(model, bit, "1'b0");
         const auto muxed = model.addValue(bit, "rst_mux");
         model.addOperation("core.compute.mux", std::array{rst, d, zero}, std::array{muxed});
-        addRegWrite(model, one, d, one, q1, clk, "posedge");
-        addRegWrite(model, one, muxed, one, q2, rst, "negedge");
+        addWrite(model, one, d, one, q1, clk, "posedge");
+        addWrite(model, one, muxed, one, q2, rst, "negedge");
         // Give every M2b pass real work: an output cone (pass 3), an
         // event-driven strobe (pass 4 flags) and a free monitor (pass 4
         // prev-state form).
@@ -1146,7 +1172,7 @@ namespace
         using namespace grhsim;
         const auto base = [](const char *name) {
             GrhSimModel model(name);
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             return model;
         };
         const auto edgeDet = [](GrhSimModel &model, ValueId event, int64_t act,
@@ -1171,11 +1197,11 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const std::array acts{Parameter{model.intern("event_acts"),
                                             std::vector<int64_t>{0}}};
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                                                        std::array{one, d, one}, {},
                                                        std::array{ObjectRef::state(q)}, acts),
                                     SimPhase::General);
-            addRegWrite(model, one, d, one, q, clk, "posedge");
+            addWrite(model, one, d, one, q, clk, "posedge");
             edgeDet(model, clk, 0);
             if (verifies(model)) return fail("guard: event_edges/event_acts mix accepted");
         }
@@ -1189,14 +1215,14 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const std::array acts{Parameter{model.intern("event_acts"),
                                             std::vector<int64_t>{1}}};
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                                                        std::array{one, d, one}, {},
                                                        std::array{ObjectRef::state(q)}, acts),
                                     SimPhase::General);
             edgeDet(model, clk, 0);
             if (verifies(model)) return fail("guard: out-of-range event_acts accepted");
         }
-        // A regWrite with event_acts must use the event-free 3-operand shape.
+        // A write with event_acts must use the event-free 3-operand shape.
         {
             auto model = base("guard_operand_residue");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
@@ -1206,7 +1232,7 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const std::array acts{Parameter{model.intern("event_acts"),
                                             std::vector<int64_t>{0}}};
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                                                        std::array{one, d, one, clk}, {},
                                                        std::array{ObjectRef::state(q)}, acts),
                                     SimPhase::General);
@@ -1224,7 +1250,7 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const std::array acts{Parameter{model.intern("event_acts"),
                                             std::vector<int64_t>{0}}};
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                                                        std::array{one, d, one}, {},
                                                        std::array{ObjectRef::state(q)}, acts),
                                     SimPhase::General);
@@ -1245,7 +1271,7 @@ namespace
             const auto one = addConstant(model, bit, "1'b1");
             const std::array acts{Parameter{model.intern("event_acts"),
                                             std::vector<int64_t>{0}}};
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                                                        std::array{one, d, clk}, {},
                                                        std::array{ObjectRef::state(q)}, acts),
                                     SimPhase::General);
@@ -1278,7 +1304,7 @@ namespace
                                                            model.intern("constValue"),
                                                            std::string("1'h0")}}),
                                     SimPhase::Output);
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                                                        std::array{one, outNext, one}, {},
                                                        std::array{ObjectRef::state(q)}),
                                     SimPhase::General);

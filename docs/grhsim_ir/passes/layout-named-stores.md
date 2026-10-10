@@ -11,7 +11,7 @@ and their byte totals) were removed in M5d-6.
 The pass makes **zero classification decisions**: each state's store follows
 the A7 [`grhsim.select-state-stores`](select-state-stores.md) `storeClass`
 annotation (`regLatch` / `mem`) and nothing else — the old implicit
-`TypeKind::Array` split is gone. A state still at `StateStoreClass::None`
+array-type split is gone. A state still at `StateStoreClass::None`
 is an error that points at `grhsim.select-state-stores`.
 
 The stores, in fixed `CpuNamedStoreKind` order:
@@ -20,18 +20,24 @@ The stores, in fixed `CpuNamedStoreKind` order:
    arrays alike. Physical type: a 2-state 1-bit unsigned logic maps to Bool,
    ≤64-bit logic to UInt/SInt 8/16/32/64 (width rounded up), wider logic to
    `Array(UInt64, ceil(w/64))`, four-state logic to `Array(base, 2)`; Real →
-   F64; String → String; arrays recurse. Emit declares two struct instances
+   F64; String → String; a shaped (array) logic state maps to **one flat
+   `Array(elementPhysical, ∏shape)`** — row-major linearization of the
+   element's physical type, byte-identical to the legacy 1-D array layout,
+   no nesting (wide elements >64bit × multi-dimensional shapes included).
+   Emit declares two struct instances
    (`regLatchStore`, `regLatchStoreNext`) from this one store: writes commit
    NBA-style into the next buffer (regLatch-class array writes included) and
    publish copies the whole store back with one `memcpy`.
-2. `mem` — one named array field per **mem-class** state (element type ×
-   count).
+2. `mem` — one named field per **mem-class** state: the same flat
+   `Array(elementPhysical, ∏shape)` layout.
 3. `boundary` — one field per input port (aux = port index), then the
    cross-supernode / General→Mem operand value set. Operand slots of the
-   **Mem-phase** writes are named `<mem>__w<idx>__<enable|addr|data|mask>`
-   (per-mem write index in op-id order; memWriteSeq triples use
-   `enable<j>`/`addr<j>`/`data<j>`; a value shared by several writes keeps
-   its first writer's slot). All other entries use the source signal name.
+   **Mem-phase** writes are named `<mem>__w<idx>__<role>` (per-mem write
+   index in op-id order; roles are `enable`/`data`/`mask` for `write`,
+   `enable`/`addr`/`data`/`mask` for a single-index `writeArray` — the index
+   roles become `idx<j>` per dimension on a multi-index write — and
+   `enable`/`data` for `fill`; a value shared by several writes keeps its
+   first writer's slot). All other entries use the source signal name.
    Event/Output cones are self-contained (they read stores) and never extend
    this set.
 4. `prevEvent` — one slot per (event,edge) cluster, named

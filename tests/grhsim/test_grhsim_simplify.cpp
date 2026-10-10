@@ -244,7 +244,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("const_fold");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto nibble = model.logicType(4, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
@@ -376,7 +376,7 @@ namespace
     {
         using namespace grhsim;
         GrhSimModel model("simplify_whole");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
         const auto word = model.logicType(32, false, LogicDomain::TwoState);
@@ -445,7 +445,7 @@ namespace
         model.addOperation("core.compute.add", std::array{k10, k04}, std::array{deadV});
         const auto deadQ = addStateWithInit(model, "deadQ", byte, "8'h00");
         declareState(model, "deadQ", deadQ, 8);
-        model.addOperation("core.state.regWrite", std::array{sel, k04, addConstant(model, byte, "8'hff")},
+        model.addOperation("core.state.write", std::array{sel, k04, addConstant(model, byte, "8'hff")},
                            {}, std::array{ObjectRef::state(deadQ)});
 
         // Equivalent declared states shareA/shareB merge (Merged provenance).
@@ -456,7 +456,7 @@ namespace
         const auto kFF = addConstant(model, byte, "8'hff");
         const auto k77 = addConstant(model, byte, "8'h77");
         for (const auto state : {shareA, shareB})
-            model.addOperation("core.state.regWrite", std::array{sel, k77, kFF}, {},
+            model.addOperation("core.state.write", std::array{sel, k77, kFF}, {},
                                std::array{ObjectRef::state(state)});
         const auto shareReadA = model.addValue(byte, "shareReadA");
         model.addOperation("core.state.read", {}, std::array{shareReadA},
@@ -579,7 +579,7 @@ namespace
         using namespace grhsim;
         const auto buildModel = [] {
             GrhSimModel model("simplify_phase");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto word = model.logicType(32, false, LogicDomain::TwoState);
@@ -630,7 +630,7 @@ namespace
             const auto sharedQ = addStateWithInit(model, "sharedQ", word, "32'h0");
             declareState(model, "sharedQ", sharedQ, 32);
             model.setOperationPhase(
-                model.addOperation("core.state.regWrite", std::array{kOne, inD, kFF32}, {},
+                model.addOperation("core.state.write", std::array{kOne, inD, kFF32}, {},
                                    std::array{ObjectRef::state(sharedQ)}),
                 SimPhase::General);
             const auto sliceParams = [&](GrhSimModel &m, int64_t end) {
@@ -669,7 +669,7 @@ namespace
             const auto localQ = addStateWithInit(model, "localQ", word, "32'h1");
             declareState(model, "localQ", localQ, 4 * 8);
             model.setOperationPhase(
-                model.addOperation("core.state.regWrite", std::array{kOne, inD2, kFF32}, {},
+                model.addOperation("core.state.write", std::array{kOne, inD2, kFF32}, {},
                                    std::array{ObjectRef::state(localQ)}),
                 SimPhase::General);
             const auto lRead = model.addValue(word, "lRead");
@@ -778,7 +778,7 @@ namespace
         // non-convergence but still succeeds.
         {
             GrhSimModel model("simplify_cap");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto k10 = addConstant(model, byte, "8'h10");
             const auto wire = model.addValue(byte, "wire");
@@ -865,7 +865,7 @@ namespace
             graph.setAttr(read, "regSymbol", std::string("q"));
             const auto qValue = graph.createValue(graph.internSymbol("q_value"), 8, false);
             graph.addResult(read, qValue);
-            const auto write = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+            const auto write = graph.createOperation(grh::OperationKind::kRegisterWriteMaskPort,
                                                      graph.internSymbol("q_write"));
             graph.setAttr(write, "regSymbol", std::string("q"));
             graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});

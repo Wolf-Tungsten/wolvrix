@@ -45,10 +45,10 @@ namespace wolvrix::lib::grhsim {
                 !model.objectRefs(op).empty() || !model.parameters(op).empty()) return false;
             const auto &resultType = model.types()[model.values()[results[0].index - 1].type.index - 1];
             if (resultType.kind != TypeKind::Logic || resultType.domain != LogicDomain::TwoState ||
-                resultType.width == 0 || resultType.width > 64) return false;
+                !resultType.shape.empty() || resultType.width == 0 || resultType.width > 64) return false;
             const auto &condType = model.types()[model.values()[operands[0].index - 1].type.index - 1];
             return condType.kind == TypeKind::Logic && condType.domain == LogicDomain::TwoState &&
-                condType.width == 1 && !condType.isSigned;
+                condType.shape.empty() && condType.width == 1 && !condType.isSigned;
         };
 
         std::vector<uint8_t> claimed(operations.size() + 1, 0), removeOps(operations.size() + 1, 0);

@@ -1169,7 +1169,10 @@ namespace wolvrix::lib::grhsim
                 writer.startArray(); writeId(writer, type.id); writeId(writer, type.typeRef);
                 writer.value(toString(type.kind)); writer.value(static_cast<uint64_t>(type.width));
                 writer.value(type.isSigned); writer.value(toString(type.domain));
-                writeId(writer, type.elementType); writer.value(type.count); writer.endArray();
+                writer.startArray();
+                for (const int64_t dim : type.shape) writer.value(dim);
+                writer.endArray();
+                writer.endArray();
             }
             writer.endArray();
 
@@ -1312,9 +1315,6 @@ namespace wolvrix::lib::grhsim
                         writeId(writer, record.symbol); writeId(writer, record.origin);
                         writer.value(record.width);
                         writer.startArray();
-                        for (const uint64_t dim : record.shape) writer.value(dim);
-                        writer.endArray();
-                        writer.startArray();
                         for (const DeclProvenanceSlice &slice : record.slices)
                         {
                             writer.startArray();
@@ -1385,13 +1385,19 @@ namespace wolvrix::lib::grhsim
                 expectComma(reader); const bool isSigned = reader.boolean();
                 expectComma(reader); const auto domain = parseLogicDomain(reader.string());
                 if (!domain) throw std::runtime_error("unknown logic domain");
-                expectComma(reader); const TypeId element = readId<TypeId>(reader, "element type", true);
-                expectComma(reader); const uint64_t count = reader.unsignedInteger(); reader.endArray();
+                expectComma(reader);
+                std::vector<int64_t> shape;
+                bool dimFirst = true;
+                reader.startArray();
+                while (reader.nextArray(dimFirst)) shape.push_back(reader.integer());
+                reader.endArray();
                 TypeId actual;
-                if (*kind == TypeKind::Logic) actual = model->logicType(width, isSigned, *domain);
+                if (*kind == TypeKind::Logic) actual = model->logicType(width, isSigned, *domain, shape);
                 else if (*kind == TypeKind::Real) actual = model->realType();
                 else if (*kind == TypeKind::String) actual = model->stringType();
-                else actual = model->arrayType(element, count);
+                else throw std::runtime_error("unknown GrhSIM type kind");
+                if (!shape.empty() && *kind != TypeKind::Logic)
+                    throw std::runtime_error("non-logic GrhSIM type carries a shape");
                 if (actual != expected || model->text(model->types()[actual.index - 1].typeRef) != model->text(typeRef))
                     throw std::runtime_error("type table is not canonical or has mismatched IDs");
             }
@@ -1574,8 +1580,10 @@ namespace wolvrix::lib::grhsim
             // Optional trailing keys (absent in old checkpoints): a
             // "declaredSymbols" string-id array, then a "generateGroups" array
             // of [scope, name, [symbol ids]] entries, then a "declProvenance"
-            // array of [symbol, origin, width, [shape], [[kind, target kind,
-            // target index, target offset, decl offset, width]]] records.
+            // array of [symbol, origin, width, [[kind, target kind,
+            // target index, target offset, decl offset, width]]] records
+            // (v3/stage-06: the declaration shape item is gone — the shape
+            // lives in the type system).
             if (reader.comma())
             {
                 if (reader.string() != "declaredSymbols")
@@ -1619,11 +1627,6 @@ namespace wolvrix::lib::grhsim
                             record.origin = readId<OriginId>(reader, "provenance origin", true);
                             expectComma(reader);
                             record.width = reader.unsignedInteger();
-                            expectComma(reader);
-                            bool dimFirst = true;
-                            reader.startArray();
-                            while (reader.nextArray(dimFirst))
-                                record.shape.push_back(reader.unsignedInteger());
                             expectComma(reader);
                             bool sliceFirst = true;
                             reader.startArray();

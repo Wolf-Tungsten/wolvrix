@@ -109,11 +109,11 @@ namespace
         if (model->operations().size() != 8)
             return fail("unexpected lowered operation count");
 
-        bool foundRegWrite = false;
+        bool foundWrite = false;
         for (const auto &op : model->operations())
         {
-            if (model->text(op.opType) != "core.state.regWrite") continue;
-            foundRegWrite = true;
+            if (model->text(op.opType) != "core.state.write") continue;
+            foundWrite = true;
             const auto refs = model->objectRefs(op);
             if (refs.size() != 1 || refs[0].kind != grhsim::ObjectKind::State)
                 return fail("register write target ref is wrong");
@@ -127,7 +127,7 @@ namespace
             if (operands.size() != 4)
                 return fail("register write lost its trailing event operand");
         }
-        if (!foundRegWrite) return fail("core.state.regWrite is missing");
+        if (!foundWrite) return fail("core.state.write is missing");
         for (const auto &state : model->states())
             if (model->text(state.name).starts_with("__event_"))
                 return fail("convert materialized an event-history state");
@@ -143,8 +143,8 @@ namespace
             return fail("grhsim.verify pass failed or reported mutation");
 
         std::filesystem::create_directories(artifactDir);
-        const auto firstPath = artifactDir / "grhsim_v2.json";
-        const auto secondPath = artifactDir / "grhsim_v2_roundtrip.json";
+        const auto firstPath = artifactDir / "grhsim_v3.json";
+        const auto secondPath = artifactDir / "grhsim_v3_roundtrip.json";
         diag::Diagnostics storeDiagnostics;
         if (!grhsim::storeGrhSimModel(*model, firstPath, grhsim::defaultDialectRegistry(),
                                       storeDiagnostics))
@@ -166,9 +166,9 @@ namespace
             return fail("store/load/store did not produce stable bytes");
 
         std::string invalidFormat = readFile(firstPath);
-        const auto formatPos = invalidFormat.find("wolvrix.grhsim.v2");
+        const auto formatPos = invalidFormat.find("wolvrix.grhsim.v3");
         if (formatPos == std::string::npos) return fail("stored format marker is missing");
-        invalidFormat.replace(formatPos, std::string("wolvrix.grhsim.v2").size(), "wolvrix.grhsim.v1");
+        invalidFormat.replace(formatPos, std::string("wolvrix.grhsim.v3").size(), "wolvrix.grhsim.v1");
         const auto invalidFormatPath = artifactDir / "grhsim_invalid_format.json";
         if (!writeFile(invalidFormatPath, invalidFormat)) return fail("failed to write bad format fixture");
         diag::Diagnostics invalidFormatDiagnostics;
@@ -316,7 +316,7 @@ namespace
     int runIdentityAssignTest()
     {
         using namespace grhsim;
-        GrhSimModel model("identity_assign"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        GrhSimModel model("identity_assign"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto u5 = model.logicType(5, false, LogicDomain::TwoState);
         const auto s5 = model.logicType(5, true, LogicDomain::TwoState);
         const auto u8 = model.logicType(8, false, LogicDomain::TwoState);
@@ -391,7 +391,7 @@ namespace
     int runBitwisePredicatesTest()
     {
         using namespace grhsim;
-        GrhSimModel model("predicates"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        GrhSimModel model("predicates"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto signedBit = model.logicType(1, true, LogicDomain::TwoState);
         const auto byte = model.logicType(8, false, LogicDomain::TwoState);
@@ -442,7 +442,7 @@ namespace
         for (const uint32_t width : {1, 5, 64})
         for (const bool isSigned : {false, true})
         {
-            GrhSimModel model("algebra"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("algebra"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto type = model.logicType(width, isSigned, LogicDomain::TwoState);
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto x = model.addValue(type), y = model.addValue(type);
@@ -527,7 +527,7 @@ namespace
                 !readGrhSimJson(serialized, defaultDialectRegistry(), diagnostics))
                 return fail("algebraic pass output does not round-trip");
         }
-        GrhSimModel guards("algebra_guards"); guards.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        GrhSimModel guards("algebra_guards"); guards.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto u5 = guards.logicType(5, false, LogicDomain::TwoState);
         const auto s5 = guards.logicType(5, true, LogicDomain::TwoState);
         const auto four = guards.logicType(5, false, LogicDomain::FourState);
@@ -581,7 +581,7 @@ namespace
     int runConcatSliceFoldTest()
     {
         using namespace grhsim;
-        GrhSimModel model("concat_slice_fold"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        GrhSimModel model("concat_slice_fold"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto u2 = model.logicType(2, false, LogicDomain::TwoState);
         const auto u4 = model.logicType(4, false, LogicDomain::TwoState);
         const auto u5 = model.logicType(5, false, LogicDomain::TwoState);
@@ -832,7 +832,7 @@ namespace
             return fail("declared-symbol store/load/store did not produce stable bytes");
 
         // (d) A metadata-free checkpoint serializes without the trailing keys,
-        // and a v1 format marker is rejected: v2 does not accept v1 checkpoints.
+        // and a v1 format marker is rejected: v3 does not accept v1 checkpoints.
         {
             auto legacy = makeDeclaredMetadataDesign();
             diag::Diagnostics legacyDiagnostics;
@@ -850,9 +850,9 @@ namespace
             if (serialized.str().find("\"declaredSymbols\"") != std::string::npos)
                 return fail("metadata-free model should serialize without the trailing keys");
             std::string v1Marked = serialized.str();
-            const auto markerPos = v1Marked.find("wolvrix.grhsim.v2");
-            if (markerPos == std::string::npos) return fail("stored v2 format marker is missing");
-            v1Marked.replace(markerPos, std::string("wolvrix.grhsim.v2").size(), "wolvrix.grhsim.v1");
+            const auto markerPos = v1Marked.find("wolvrix.grhsim.v3");
+            if (markerPos == std::string::npos) return fail("stored v3 format marker is missing");
+            v1Marked.replace(markerPos, std::string("wolvrix.grhsim.v3").size(), "wolvrix.grhsim.v1");
             std::stringstream v1Stream(v1Marked);
             diag::Diagnostics readDiagnostics;
             if (grhsim::readGrhSimJson(v1Stream, grhsim::defaultDialectRegistry(),
@@ -938,7 +938,9 @@ namespace
     bool provenanceSlicesEqual(const grhsim::DeclProvenance &lhs,
                                const grhsim::DeclProvenance &rhs)
     {
-        return lhs.width == rhs.width && lhs.shape == rhs.shape && lhs.slices == rhs.slices;
+        // Stage-06: DeclProvenance carries no shape (it lives in the type
+        // system); width is the declaration's total linear bit width.
+        return lhs.width == rhs.width && lhs.slices == rhs.slices;
     }
 
     int runDeclProvenanceTest(const std::filesystem::path &artifactDir)
@@ -960,7 +962,7 @@ namespace
         if (model->declProvenances().size() != 7)
             return fail("unexpected lowered provenance record count");
         const grhsim::DeclProvenance *enable = findProvenance(*model, "enable");
-        if (!enable || enable->width != 1 || !enable->shape.empty() || enable->slices.size() != 1 ||
+        if (!enable || enable->width != 1 || enable->slices.size() != 1 ||
             enable->slices[0].kind != grhsim::DeclProvenanceKind::Direct ||
             enable->slices[0].target != grhsim::DeclProvenanceTarget::Value ||
             enable->slices[0].width != 1 || !enable->origin.valid())
@@ -974,20 +976,29 @@ namespace
             data->slices[0].width != 8)
             return fail("declared wire provenance is wrong");
         const grhsim::DeclProvenance *q = findProvenance(*model, "q");
-        if (!q || q->width != 8 || !q->shape.empty() || q->slices.size() != 1 ||
+        if (!q || q->width != 8 || q->slices.size() != 1 ||
             q->slices[0].target != grhsim::DeclProvenanceTarget::State ||
             q->slices[0].width != 8)
             return fail("register provenance is wrong");
         if (model->text(model->states()[q->slices[0].targetIndex - 1].name) != "q")
             return fail("register provenance does not resolve to the register state");
+        // Stage-06: the record width is the declaration's total linear width
+        // (32 = 4 rows x 8 bits); the array shape lives on the state's type.
         const grhsim::DeclProvenance *mem = findProvenance(*model, "mem");
-        if (!mem || mem->width != 8 || mem->shape != std::vector<uint64_t>{4} ||
+        if (!mem || mem->width != 32 ||
             mem->slices.size() != 1 ||
             mem->slices[0].target != grhsim::DeclProvenanceTarget::State ||
             mem->slices[0].width != 32)
-            return fail("memory provenance lost its array shape");
+            return fail("memory provenance lost its total linear width");
+        {
+            const auto &memState = model->states()[mem->slices[0].targetIndex - 1];
+            const auto &memType = model->types()[memState.type.index - 1];
+            if (memType.kind != grhsim::TypeKind::Logic || memType.width != 32 ||
+                memType.shape != std::vector<int64_t>{4})
+                return fail("memory state type lost its array shape");
+        }
         const grhsim::DeclProvenance *dpi = findProvenance(*model, "dpi_inc");
-        if (!dpi || dpi->width != 0 || !dpi->shape.empty() || dpi->slices.size() != 1 ||
+        if (!dpi || dpi->width != 0 || dpi->slices.size() != 1 ||
             dpi->slices[0].target != grhsim::DeclProvenanceTarget::Function ||
             dpi->slices[0].width != 0)
             return fail("DPI import provenance is wrong");
@@ -1061,7 +1072,7 @@ namespace
         // states + one DPI function, all declared.
         {
             grhsim::GrhSimModel hand("prov_model");
-            hand.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            hand.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto logic8 = hand.logicType(8, false, grhsim::LogicDomain::TwoState);
             const auto s1 = hand.addState("s1", logic8);
             const auto s2 = hand.addState("s2", logic8);
@@ -1189,7 +1200,7 @@ namespace {
     int runBitwiseMuxGuardsTest() {
         using namespace grhsim;
         for (unsigned scenario = 0; scenario < 8; ++scenario) {
-            GrhSimModel model("bitwise_mux_guards"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("bitwise_mux_guards"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto type = model.logicType(scenario == 0 ? 8 : 1, scenario == 1,
                 scenario == 2 ? LogicDomain::FourState : LogicDomain::TwoState);
             const auto input = [&](TypeId inputType) {
@@ -1214,7 +1225,7 @@ namespace {
             if (!outcome.success || outcome.changed) return fail("bitwise mux ignored a type, shape or metadata guard");
         }
         for (unsigned defect = 0; defect < 7; ++defect) {
-            GrhSimModel model("invalid_bit_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("invalid_bit_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto type = model.logicType(defect == 4 ? 65 : 8, false,
                 defect == 3 ? LogicDomain::FourState : LogicDomain::TwoState);
             const auto input = [&](TypeId inputType) {
@@ -1265,7 +1276,7 @@ namespace {
         // Positive: a four-link priority chain folds into one prioritySelect and
         // the pass is idempotent.
         {
-            GrhSimModel model("mux_chain_fold"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("mux_chain_fold"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto input = [&](TypeId type) {
                 const auto port = model.addInput("i" + std::to_string(model.inputs().size()), type);
@@ -1312,7 +1323,7 @@ namespace {
         // chain (only a long enough suffix folds); wide conditions and mismatched
         // link result types block the fold.
         for (unsigned scenario = 0; scenario < 3; ++scenario) {
-            GrhSimModel model("mux_chain_guards"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("mux_chain_guards"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto word = model.logicType(16, false, LogicDomain::TwoState);
@@ -1373,7 +1384,7 @@ namespace {
         }
         // The verifier rejects malformed prioritySelect shapes.
         for (unsigned defect = 0; defect < 7; ++defect) {
-            GrhSimModel model("invalid_priority_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("invalid_priority_select"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto input = [&](TypeId type) {
@@ -1443,7 +1454,7 @@ namespace {
         };
         // Scalar chain: a 64-bit add observed through a 39-bit slice narrows.
         {
-            GrhSimModel model("used_bits_scalar"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_scalar"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto wide = model.logicType(64, false, LogicDomain::TwoState);
             const auto a = inputOf(model, wide), b = inputOf(model, wide);
             const auto sum = model.addValue(wide);
@@ -1461,7 +1472,7 @@ namespace {
         }
         // Wide downgrade: a 128-bit and observed through 64 bits becomes scalar.
         {
-            GrhSimModel model("used_bits_wide"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_wide"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto wide = model.logicType(128, false, LogicDomain::TwoState);
             const auto a = inputOf(model, wide), b = inputOf(model, wide);
             const auto masked = model.addValue(wide);
@@ -1478,7 +1489,7 @@ namespace {
         // Non-transparent op: lshr keeps its width; a transparent consumer that
         // narrows forces a boundary slice between them.
         {
-            GrhSimModel model("used_bits_lshr"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_lshr"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto word = model.logicType(64, false, LogicDomain::TwoState);
             const auto data = inputOf(model, word), amount = inputOf(model, model.logicType(6, false, LogicDomain::TwoState));
             const auto other = inputOf(model, word);
@@ -1503,19 +1514,17 @@ namespace {
             if (wideLshr != 1 || narrowAnds != 1 || boundarySlices != 1)
                 return fail("used-bits lshr boundary shape is wrong");
         }
-        // Register narrowing: state, write port data/mask and reads all shrink;
-        // the event history and init record survive.
+        // Register narrowing: state, write data/mask and reads all shrink; the
+        // init record survives. (Stage-06: write ops carry exactly one state
+        // ref — the old event-history second ref is gone.)
         {
-            GrhSimModel model("used_bits_state"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_state"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto word = model.logicType(64, false, LogicDomain::TwoState);
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto state = model.addState("q", word);
-            const auto history = model.addState("q_clock_history", bit);
             const std::array initParams{Parameter{model.intern("value"), std::string("64'h0")}};
             const std::array initSteps{InitStep{model.intern("core.init.const"), {0, 1}}};
             model.addInit(state, initSteps, initParams);
-            const std::array historyInitParams{Parameter{model.intern("value"), std::string("1'h0")}};
-            model.addInit(history, initSteps, historyInitParams);
             const auto clock = inputOf(model, bit), enable = inputOf(model, bit);
             const auto next = inputOf(model, word);
             const auto maskConst = model.addValue(word);
@@ -1523,8 +1532,8 @@ namespace {
             model.addOperation("core.compute.constant", {}, std::array{maskConst}, {}, maskParams);
             const std::vector<std::string> edges{"posedge"};
             const std::array writeParams{Parameter{model.intern("event_edges"), edges}};
-            model.addOperation("core.state.regWrite", std::array{enable, next, maskConst, clock}, {},
-                std::array{ObjectRef::state(state), ObjectRef::state(history)}, writeParams);
+            model.addOperation("core.state.write", std::array{enable, next, maskConst, clock}, {},
+                std::array{ObjectRef::state(state)}, writeParams);
             const auto read = model.addValue(word);
             model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(state)});
             outputOf(model, sliceOf(model, read, 0, 15), model.logicType(16, false, LogicDomain::TwoState));
@@ -1532,7 +1541,7 @@ namespace {
             const auto result = runPass(model);
             if (!result.success || !result.changed) return fail("used-bits missed a state narrowing");
             if (model.states().size() != statesBefore) return fail("used-bits changed the state count on narrowing");
-            bool narrowState = false, historyKept = false;
+            bool narrowState = false, writeKept = false;
             StateId narrowedState;
             for (const auto &entry : model.states())
                 if (model.text(entry.name) == "q") {
@@ -1540,15 +1549,15 @@ namespace {
                     narrowedState = entry.id;
                 }
             for (const auto &op : model.operations())
-                if (model.text(op.opType) == "core.state.regWrite") {
+                if (model.text(op.opType) == "core.state.write") {
                     const auto refs = model.objectRefs(op);
-                    historyKept = refs.size() == 2 && refs[0].kind == ObjectKind::State &&
-                                  refs[0].index == narrowedState.index;
+                    writeKept = refs.size() == 1 && refs[0].kind == ObjectKind::State &&
+                                refs[0].index == narrowedState.index;
                     const auto operands = model.operands(op);
                     if (widthOf(model, operands[1]) != 16 || widthOf(model, operands[2]) != 16)
-                        return fail("used-bits regWrite data/mask did not follow the narrowed state");
+                        return fail("used-bits write data/mask did not follow the narrowed state");
                 }
-            if (!narrowState || !historyKept) return fail("used-bits state narrowing broke state/history wiring");
+            if (!narrowState || !writeKept) return fail("used-bits state narrowing broke state/write wiring");
             unsigned initRecords = 0;
             for (const auto &record : model.initRecords())
                 initRecords += record.state == narrowedState;
@@ -1557,7 +1566,7 @@ namespace {
         // Dead cone: unused compute chains, unread states and their write ports
         // disappear; live logic is untouched.
         {
-            GrhSimModel model("used_bits_dead"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_dead"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto a = inputOf(model, byte), b = inputOf(model, byte);
@@ -1591,7 +1600,7 @@ namespace {
         // Concat straddle: a 24-bit concat observed through 12 bits keeps only
         // the low operands and truncates the straddler.
         {
-            GrhSimModel model("used_bits_concat"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_concat"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto a = inputOf(model, byte), b = inputOf(model, byte), c = inputOf(model, byte);
             const auto joined = model.addValue(model.logicType(24, false, LogicDomain::TwoState));
@@ -1613,7 +1622,7 @@ namespace {
         // full width, its original high operand must remain available.
         {
             GrhSimModel model("used_bits_truncated_concat");
-            model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto word = model.logicType(32, false, LogicDomain::TwoState);
             const auto three = model.logicType(3, false, LogicDomain::TwoState);
@@ -1639,7 +1648,7 @@ namespace {
         // Event cone retention: an edgeDet consumes its event value with no
         // data result; the producer cone must not be swept as dead.
         {
-            GrhSimModel model("used_bits_event_cone"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_event_cone"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto clkPort = model.addInput("clk", bit);
             const auto clk = model.addValue(bit);
@@ -1667,7 +1676,7 @@ namespace {
         // Rebuilt computes and boundary slices stay inside their Event and
         // Output cones; narrowed register writes keep General-phase adaptors.
         {
-            GrhSimModel model("used_bits_phase_cones"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_phase_cones"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto word = model.logicType(16, false, LogicDomain::TwoState);
             const auto byte = model.logicType(8, false, LogicDomain::TwoState);
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
@@ -1742,7 +1751,7 @@ namespace {
                 return fail("used-bits phase-cone rewrites were not exercised");
         }
         {
-            GrhSimModel model("used_bits_phase_state"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("used_bits_phase_state"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto word = model.logicType(16, true, LogicDomain::TwoState);
             const auto byte = model.logicType(8, true, LogicDomain::TwoState);
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
@@ -1758,7 +1767,7 @@ namespace {
                 return value;
             };
             const auto enable = addGeneralRead(bit), data = addGeneralRead(word), mask = addGeneralRead(word);
-            model.setOperationPhase(model.addOperation("core.state.regWrite", std::array{enable, data, mask},
+            model.setOperationPhase(model.addOperation("core.state.write", std::array{enable, data, mask},
                                                    {}, std::array{ObjectRef::state(state)}), SimPhase::General);
             const auto read = model.addValue(word);
             model.setOperationPhase(model.addOperation("core.state.read", {}, std::array{read},
@@ -1780,7 +1789,7 @@ namespace {
             for (const auto &op : model.operations()) {
                 const auto name = model.text(op.opType);
                 if (name == "core.state.read") readOutput |= op.phase == SimPhase::Output;
-                if (name == "core.state.regWrite") writeGeneral |= op.phase == SimPhase::General;
+                if (name == "core.state.write") writeGeneral |= op.phase == SimPhase::General;
                 if (name == "core.compute.sliceStatic" && op.phase == SimPhase::General &&
                     widthOf(model, model.results(op)[0]) == 8)
                     generalAdaptor = true;
@@ -1798,7 +1807,7 @@ namespace {
     {
         using namespace grhsim;
         GrhSimModel model("canonicalize_phase_barrier");
-        model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto port = model.addInput("a", bit);
         const auto a = model.addValue(bit);
@@ -1880,14 +1889,15 @@ namespace {
             diag::Diagnostics diagnostics;
             return verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics);
         };
-        // Positive: deduplicated (event, edge) clusters — two regWrites share
+        // Positive: deduplicated (event, edge) clusters — two writes share
         // (clk, posedge) while rst carries both edges — plus one op of every
         // phase-constrained kind; the model verifies and round-trips.
         {
-            GrhSimModel model("edge_det_phase"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_phase"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto word = model.logicType(8, false, LogicDomain::TwoState);
-            const auto memType = model.arrayType(bit, 16);
+            const std::array<int64_t, 1> memShape{16};
+            const auto memType = model.logicType(16, false, LogicDomain::TwoState, memShape);
             const auto clk = inputBit(model, "clk");
             const auto rst = inputBit(model, "rst");
             edgeDet(model, clk, "posedge", 0, 0);
@@ -1900,9 +1910,12 @@ namespace {
                 return value;
             };
             const auto one = constant(bit, "1'h1");
+            const auto zero = constant(bit, "1'h0");
             const auto next = constant(word, "8'h00");
             const auto mask = constant(word, "8'hff");
             const auto row = constant(memType, "16'h0000");
+            const auto mask16 = constant(model.logicType(16, false, LogicDomain::TwoState),
+                                         "16'hffff");
             const auto state = [&](const char *name, TypeId type) {
                 const auto id = model.addState(name, type);
                 const std::array initParams{Parameter{model.intern("value"), std::string("0")}};
@@ -1913,29 +1926,36 @@ namespace {
             const auto q = state("q", word);
             const auto lq = state("lq", word);
             const auto mem = state("mem", memType);
-            const auto memFill = state("mem_fill", memType);
-            const auto memAssign = state("mem_assign", memType);
-            const auto memSeq = state("mem_seq", memType);
+            const auto fillMem = state("mem_fill", memType);
+            const auto wholeMem = state("mem_assign", memType);
+            const auto seqMem = state("mem_seq", memType);
             const auto edges = [&] {
                 return std::array{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
             };
-            model.setOperationPhase(model.addOperation("core.state.regWrite",
+            model.setOperationPhase(model.addOperation("core.state.write",
                 std::array{one, next, mask, clk}, {}, std::array{ObjectRef::state(q)}, edges()),
                 SimPhase::General);
             model.setOperationPhase(model.addOperation("core.state.latchWrite",
                 std::array{one, next, mask}, {}, std::array{ObjectRef::state(lq)}), SimPhase::General);
-            model.setOperationPhase(model.addOperation("core.state.memWrite",
+            model.setOperationPhase(model.addOperation("core.state.writeArray",
                 std::array{one, one, one, one, clk}, {}, std::array{ObjectRef::state(mem)}, edges()),
                 SimPhase::Mem);
-            model.setOperationPhase(model.addOperation("core.state.memFill",
-                std::array{one, one, clk}, {}, std::array{ObjectRef::state(memFill)}, edges()),
+            model.setOperationPhase(model.addOperation("core.state.fill",
+                std::array{one, one, clk}, {}, std::array{ObjectRef::state(fillMem)}, edges()),
                 SimPhase::Mem);
-            model.setOperationPhase(model.addOperation("core.state.memAssign",
-                std::array{one, row, clk}, {}, std::array{ObjectRef::state(memAssign)}, edges()),
+            // Whole-array write (the stage-06 write absorbs the old assign
+            // form): data is the state's full type, mask its full bit width.
+            model.setOperationPhase(model.addOperation("core.state.write",
+                std::array{one, row, mask16, clk}, {}, std::array{ObjectRef::state(wholeMem)}, edges()),
                 SimPhase::Mem);
-            model.setOperationPhase(model.addOperation("core.state.memWriteSeq",
-                std::array{one, one, one, clk}, {}, std::array{ObjectRef::state(memSeq)}, edges()),
-                SimPhase::Mem);
+            // Two writes on one state apply in declaration order, later
+            // writes winning (the stage-06 sequence-write replacement).
+            model.setOperationPhase(model.addOperation("core.state.writeArray",
+                std::array{one, one, zero, one, clk}, {}, std::array{ObjectRef::state(seqMem)},
+                edges()), SimPhase::Mem);
+            model.setOperationPhase(model.addOperation("core.state.writeArray",
+                std::array{one, one, one, one, clk}, {}, std::array{ObjectRef::state(seqMem)},
+                edges()), SimPhase::Mem);
             const auto read = model.addValue(word);
             // The output cone is self-contained (M2b verifier): the read
             // feeding an Output-phase output.write must be Output itself.
@@ -1980,7 +2000,7 @@ namespace {
         }
         // Signature and clustering defects.
         {
-            GrhSimModel model("edge_det_two_operands"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_two_operands"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             const auto rst = inputBit(model, "rst");
             const std::array<Parameter, 4> params{Parameter{model.intern("edge"), std::string("posedge")},
@@ -1992,7 +2012,7 @@ namespace {
             if (verify(model)) return fail("two-operand edgeDet passed verification");
         }
         {
-            GrhSimModel model("edge_det_missing_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_missing_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             const std::array<Parameter, 3> params{Parameter{model.intern("act"), int64_t{0}},
                                                   Parameter{model.intern("prev"), int64_t{0}},
@@ -2002,13 +2022,13 @@ namespace {
             if (verify(model)) return fail("edgeDet without an edge parameter passed verification");
         }
         {
-            GrhSimModel model("edge_det_bad_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_bad_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             edgeDet(model, clk, "rising", 0, 0);
             if (verify(model)) return fail("edgeDet with an illegal edge value passed verification");
         }
         {
-            GrhSimModel model("edge_det_act_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_act_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             const auto rst = inputBit(model, "rst");
             edgeDet(model, clk, "posedge", 0, 0);
@@ -2016,7 +2036,7 @@ namespace {
             if (verify(model)) return fail("edgeDet with a duplicate act index passed verification");
         }
         {
-            GrhSimModel model("edge_det_prev_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_prev_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             const auto rst = inputBit(model, "rst");
             edgeDet(model, clk, "posedge", 0, 0);
@@ -2024,7 +2044,7 @@ namespace {
             if (verify(model)) return fail("edgeDet with a duplicate prev index passed verification");
         }
         {
-            GrhSimModel model("edge_det_cluster_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_cluster_duplicate"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             edgeDet(model, clk, "posedge", 0, 0);
             edgeDet(model, clk, "posedge", 1, 1);
@@ -2032,19 +2052,19 @@ namespace {
         }
         // Phase attribution defects.
         {
-            GrhSimModel model("edge_det_phase_none"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_phase_none"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             edgeDet(model, clk, "posedge", 0, 0, SimPhase::None);
             if (verify(model)) return fail("edgeDet without an event phase passed verification");
         }
         {
-            GrhSimModel model("edge_det_phase_general"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("edge_det_phase_general"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             edgeDet(model, clk, "posedge", 0, 0, SimPhase::General);
             if (verify(model)) return fail("edgeDet with a non-event phase passed verification");
         }
         {
-            GrhSimModel model("output_write_phase_general"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+            GrhSimModel model("output_write_phase_general"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto clk = inputBit(model, "clk");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
             const auto out = model.addOutput("o", bit);
@@ -2055,12 +2075,295 @@ namespace {
         return 0;
     }
 
+    // Stage-06 array access verifier rules and the shaped-state JSON round
+    // trip: illegal shapes, readArray/writeArray index geometry, write mask
+    // width, latchWrite on an array state, and a legal multi-dim fixture.
+    int runArrayAccessRulesTest(const std::filesystem::path &artifactDir) {
+        using namespace grhsim;
+        const auto verifyMessages = [](GrhSimModel &model) {
+            diag::Diagnostics diagnostics;
+            verifyGrhSimModel(model, defaultDialectRegistry(), diagnostics);
+            std::string joined;
+            for (const auto &message : diagnostics.messages()) joined += message.message + '\n';
+            return joined;
+        };
+        const auto addInitFill = [](GrhSimModel &model, StateId state, int64_t rows) {
+            const std::array params{Parameter{model.intern("value"), std::string("0")},
+                                    Parameter{model.intern("start"), int64_t{0}},
+                                    Parameter{model.intern("count"), rows}};
+            const std::array steps{InitStep{model.intern("core.init.fill"), {0, 3}}};
+            model.addInit(state, steps, params);
+        };
+        // Illegal shaped types: a zero dimension, and a dimension product that
+        // does not divide the total width.
+        {
+            GrhSimModel model("array_zero_dim"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const std::array<int64_t, 1> shape{0};
+            const auto state = model.addState("bad", model.logicType(8, false, LogicDomain::TwoState, shape));
+            addInitFill(model, state, 0);
+            if (verifyMessages(model).find("shape dimensions must be positive") == std::string::npos)
+                return fail("verifier accepted a zero-dimension shape");
+        }
+        {
+            GrhSimModel model("array_indivisible"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const std::array<int64_t, 1> shape{3};
+            const auto state = model.addState("bad", model.logicType(8, false, LogicDomain::TwoState, shape));
+            addInitFill(model, state, 3);
+            if (verifyMessages(model).find("shape dimension product must divide the total width") ==
+                std::string::npos)
+                return fail("verifier accepted an indivisible shape");
+        }
+        // A non-logic type may not carry a shape; the JSON loader enforces it.
+        {
+            GrhSimModel model("shape_on_real"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            model.addInput("x", model.realType());
+            std::stringstream serialized;
+            diag::Diagnostics writeDiagnostics;
+            if (!writeGrhSimJson(model, serialized, defaultDialectRegistry(), writeDiagnostics))
+                return fail("shape-on-real fixture store failed");
+            std::string text = serialized.str();
+            const std::string row = "\"real\",0,false,\"4-state\",[]";
+            const auto pos = text.find(row);
+            if (pos == std::string::npos) return fail("real type row not found in the JSON");
+            text.replace(pos + row.size() - 2, 2, "[4]");
+            std::stringstream corrupted(text);
+            diag::Diagnostics readDiagnostics;
+            if (readGrhSimJson(corrupted, defaultDialectRegistry(), readDiagnostics))
+                return fail("a shaped non-logic type was not rejected");
+        }
+
+        // Rank-2 fixture shared by the op-geometry cases: a 24-bit state with
+        // shape [2,3] (4-bit elements, row-major).
+        struct Rank2Fixture
+        {
+            GrhSimModel model{"array_rank2"};
+            TypeId bit, idx, element, sub, array, mask12, mask24;
+            StateId state;
+            ValueId en, i0, i1, i2, data4, data12, data24, mask4v, mask12v, mask24v;
+            Rank2Fixture()
+            {
+                model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+                bit = model.logicType(1, false, LogicDomain::TwoState);
+                idx = model.logicType(2, false, LogicDomain::TwoState);
+                element = model.logicType(4, false, LogicDomain::TwoState);
+                const std::array<int64_t, 1> subShape{3};
+                const std::array<int64_t, 2> arrayShape{2, 3};
+                sub = model.logicType(12, false, LogicDomain::TwoState, subShape);
+                array = model.logicType(24, false, LogicDomain::TwoState, arrayShape);
+                mask12 = model.logicType(12, false, LogicDomain::TwoState);
+                mask24 = model.logicType(24, false, LogicDomain::TwoState);
+                const auto constant = [this](TypeId type, std::string literal) {
+                    const auto value = model.addValue(type);
+                    const std::array params{Parameter{model.intern("constValue"), std::move(literal)}};
+                    model.addOperation("core.compute.constant", {}, std::array{value}, {}, params);
+                    return value;
+                };
+                en = constant(bit, "1'h1");
+                i0 = constant(idx, "2'd0");
+                i1 = constant(idx, "2'd1");
+                i2 = constant(idx, "2'd2");
+                data4 = constant(element, "4'h0");
+                data12 = constant(sub, "12'h0");
+                data24 = constant(array, "24'h0");
+                mask4v = constant(element, "4'hf");
+                mask12v = constant(mask12, "12'hfff");
+                mask24v = constant(mask24, "24'hffffff");
+                state = model.addState("arr", array);
+                const std::array initParams{Parameter{model.intern("value"), std::string("4'h0")},
+                                            Parameter{model.intern("start"), int64_t{0}},
+                                            Parameter{model.intern("count"), int64_t{6}}};
+                const std::array initSteps{InitStep{model.intern("core.init.fill"), {0, 3}}};
+                model.addInit(state, initSteps, initParams);
+            }
+        };
+        const auto rejectedWith = [&](std::string_view needle, const char *what,
+                                      void (*populate)(Rank2Fixture &)) {
+            Rank2Fixture fixture;
+            populate(fixture);
+            if (verifyMessages(fixture.model).find(needle) == std::string::npos)
+                return fail(what);
+            return 0;
+        };
+        // readArray with more indices than the state rank.
+        if (const int status = rejectedWith("index count is out of the state rank range",
+                                            "readArray with too many indices was accepted",
+            [](Rank2Fixture &f) {
+                const auto result = f.model.addValue(f.element);
+                f.model.addOperation("core.state.readArray", std::array{f.i0, f.i1, f.i2},
+                                     std::array{result}, std::array{ObjectRef::state(f.state)});
+            }))
+            return status;
+        // readArray indices must be scalar logic values.
+        if (const int status = rejectedWith("indices must be scalar logic values",
+                                            "readArray with a shaped index was accepted",
+            [](Rank2Fixture &f) {
+                const auto result = f.model.addValue(f.element);
+                f.model.addOperation("core.state.readArray", std::array{f.data12},
+                                     std::array{result}, std::array{ObjectRef::state(f.state)});
+            }))
+            return status;
+        // writeArray data must be the addressed element / sub-array type.
+        if (const int status = rejectedWith("data must be the addressed element",
+                                            "writeArray with a mismatched data type was accepted",
+            [](Rank2Fixture &f) {
+                f.model.addOperation("core.state.writeArray", std::array{f.en, f.i0, f.data4, f.mask12v},
+                                     {}, std::array{ObjectRef::state(f.state)});
+            }))
+            return status;
+        // writeArray needs at least one index.
+        if (const int status = rejectedWith("must target a shaped state with",
+                                            "writeArray without an index was accepted",
+            [](Rank2Fixture &f) {
+                f.model.addOperation("core.state.writeArray", std::array{f.en, f.data24, f.mask24v},
+                                     {}, std::array{ObjectRef::state(f.state)});
+            }))
+            return status;
+        // writeArray on a scalar state.
+        if (const int status = rejectedWith("must target a shaped state with",
+                                            "writeArray on a scalar state was accepted",
+            [](Rank2Fixture &f) {
+                const auto scalar = f.model.addState("q", f.element);
+                const std::array initParams{Parameter{f.model.intern("value"), std::string("4'h0")}};
+                const std::array initSteps{InitStep{f.model.intern("core.init.const"), {0, 1}}};
+                f.model.addInit(scalar, initSteps, initParams);
+                f.model.addOperation("core.state.writeArray", std::array{f.en, f.i0, f.data4, f.mask4v},
+                                     {}, std::array{ObjectRef::state(scalar)});
+            }))
+            return status;
+        // write's mask must be a full-width scalar.
+        if (const int status = rejectedWith("mask(full-width scalar)",
+                                            "write with a narrow mask was accepted",
+            [](Rank2Fixture &f) {
+                f.model.addOperation("core.state.write", std::array{f.en, f.data24, f.mask4v},
+                                     {}, std::array{ObjectRef::state(f.state)});
+            }))
+            return status;
+        // fill on a scalar state is rejected.
+        if (const int status = rejectedWith("on a shaped state",
+                                            "fill on a scalar state was accepted",
+            [](Rank2Fixture &f) {
+                const auto scalar = f.model.addState("q", f.element);
+                const std::array initParams{Parameter{f.model.intern("value"), std::string("4'h0")}};
+                const std::array initSteps{InitStep{f.model.intern("core.init.const"), {0, 1}}};
+                f.model.addInit(scalar, initSteps, initParams);
+                f.model.addOperation("core.state.fill", std::array{f.en, f.data4},
+                                     {}, std::array{ObjectRef::state(scalar)});
+            }))
+            return status;
+        // latchWrite only targets scalar states.
+        if (const int status = rejectedWith("on a scalar state",
+                                            "latchWrite on an array state was accepted",
+            [](Rank2Fixture &f) {
+                f.model.addOperation("core.state.latchWrite", std::array{f.en, f.data24, f.mask24v},
+                                     {}, std::array{ObjectRef::state(f.state)});
+            }))
+            return status;
+
+        // Legal multi-dim fixture: whole read, sub-array read (k=1), element
+        // read (k=2), sub-array and element writes, broadcast and packed fill,
+        // and a whole-array write — all unphased.
+        {
+            Rank2Fixture f;
+            const auto whole = f.model.addValue(f.array);
+            f.model.addOperation("core.state.read", {}, std::array{whole},
+                                 std::array{ObjectRef::state(f.state)});
+            const auto subRead = f.model.addValue(f.sub);
+            f.model.addOperation("core.state.readArray", std::array{f.i0}, std::array{subRead},
+                                 std::array{ObjectRef::state(f.state)});
+            const auto elemRead = f.model.addValue(f.element);
+            f.model.addOperation("core.state.readArray", std::array{f.i0, f.i1}, std::array{elemRead},
+                                 std::array{ObjectRef::state(f.state)});
+            f.model.addOperation("core.state.writeArray", std::array{f.en, f.i0, f.data12, f.mask12v},
+                                 {}, std::array{ObjectRef::state(f.state)});
+            f.model.addOperation("core.state.writeArray",
+                                 std::array{f.en, f.i0, f.i1, f.data4, f.mask4v}, {},
+                                 std::array{ObjectRef::state(f.state)});
+            f.model.addOperation("core.state.fill", std::array{f.en, f.data4}, {},
+                                 std::array{ObjectRef::state(f.state)});
+            f.model.addOperation("core.state.fill", std::array{f.en, f.data24}, {},
+                                 std::array{ObjectRef::state(f.state)});
+            f.model.addOperation("core.state.write", std::array{f.en, f.data24, f.mask24v}, {},
+                                 std::array{ObjectRef::state(f.state)});
+            diag::Diagnostics diagnostics;
+            if (!verifyGrhSimModel(f.model, defaultDialectRegistry(), diagnostics))
+            {
+                for (const auto &message : diagnostics.messages())
+                    std::cerr << "[grhsim-ir] array fixture: " << message.context << ": "
+                              << message.message << '\n';
+                return fail("legal multi-dim array fixture was rejected");
+            }
+            // The shaped state and the indexed ops survive a JSON round trip
+            // byte-stably and keep their geometry.
+            std::filesystem::create_directories(artifactDir);
+            const auto firstPath = artifactDir / "grhsim_array_access.json";
+            const auto secondPath = artifactDir / "grhsim_array_access_roundtrip.json";
+            diag::Diagnostics storeDiagnostics;
+            if (!storeGrhSimModel(f.model, firstPath, defaultDialectRegistry(), storeDiagnostics))
+                return fail("array fixture GrhSIM JSON store failed");
+            diag::Diagnostics loadDiagnostics;
+            auto loaded = loadGrhSimModel(firstPath, defaultDialectRegistry(), loadDiagnostics);
+            if (!loaded || loadDiagnostics.hasError()) return fail("array fixture JSON load failed");
+            const StateObject *loadedState = nullptr;
+            for (const auto &entry : loaded->states())
+                if (loaded->text(entry.name) == "arr") loadedState = &entry;
+            if (!loadedState) return fail("array fixture lost its state");
+            const auto &loadedType = loaded->types()[loadedState->type.index - 1];
+            if (loadedType.kind != TypeKind::Logic || loadedType.width != 24 ||
+                loadedType.shape != std::vector<int64_t>{2, 3})
+                return fail("array fixture type shape did not round-trip");
+            unsigned wholeReads = 0, subReads = 0, elemReads = 0, subWrites = 0, elemWrites = 0,
+                     fills = 0, writes = 0;
+            bool wholeReadTypeOk = false, subReadTypeOk = false, elemReadTypeOk = false;
+            for (const auto &op : loaded->operations())
+            {
+                const auto name = loaded->text(op.opType);
+                const auto operands = loaded->operands(op);
+                const auto results = loaded->results(op);
+                const auto resultType = [&]() -> const Type & {
+                    return loaded->types()[loaded->values()[results[0].index - 1].type.index - 1];
+                };
+                if (name == "core.state.read")
+                {
+                    ++wholeReads;
+                    wholeReadTypeOk = resultType().width == 24 &&
+                                      resultType().shape == std::vector<int64_t>{2, 3};
+                }
+                else if (name == "core.state.readArray" && operands.size() == 1)
+                {
+                    ++subReads;
+                    subReadTypeOk = resultType().width == 12 &&
+                                    resultType().shape == std::vector<int64_t>{3};
+                }
+                else if (name == "core.state.readArray" && operands.size() == 2)
+                {
+                    ++elemReads;
+                    elemReadTypeOk = resultType().width == 4 && resultType().shape.empty();
+                }
+                else if (name == "core.state.writeArray" && operands.size() == 4) ++subWrites;
+                else if (name == "core.state.writeArray" && operands.size() == 5) ++elemWrites;
+                else if (name == "core.state.fill") ++fills;
+                else if (name == "core.state.write") ++writes;
+            }
+            if (wholeReads != 1 || subReads != 1 || elemReads != 1 || subWrites != 1 ||
+                elemWrites != 1 || fills != 2 || writes != 1)
+                return fail("array fixture op layout changed across the round trip");
+            if (!wholeReadTypeOk || !subReadTypeOk || !elemReadTypeOk)
+                return fail("array fixture read result types changed across the round trip");
+            diag::Diagnostics secondStoreDiagnostics;
+            if (!storeGrhSimModel(*loaded, secondPath, defaultDialectRegistry(), secondStoreDiagnostics))
+                return fail("array fixture round-trip store failed");
+            if (readFile(firstPath) != readFile(secondPath))
+                return fail("array fixture store/load/store did not produce stable bytes");
+        }
+        return 0;
+    }
+
     // Run the M5d-6 six-phase CPU mapping pipeline end to end and check that the
     // produced namedStores/eventActivation/memWritePlan shells survive a JSON
     // store/load/store round trip byte-identically.
     int runSimRefactorMappingShellTest(const std::filesystem::path &artifactDir) {
         using namespace grhsim;
-        GrhSimModel model("sim_refactor_shells"); model.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+        GrhSimModel model("sim_refactor_shells"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
         const auto bit = model.logicType(1, false, LogicDomain::TwoState);
         const auto word = model.logicType(8, false, LogicDomain::TwoState);
         const auto clkPort = model.addInput("clk", bit);
@@ -2083,11 +2386,10 @@ namespace {
             return id;
         };
         const auto q = state("q", word);
-        const auto history = state("q_clk_history", bit);
         const std::array edges{Parameter{model.intern("event_edges"), std::vector<std::string>{"posedge"}}};
-        model.addOperation("core.state.regWrite",
+        model.addOperation("core.state.write",
             std::array{one, next, mask, clk}, {},
-            std::array{ObjectRef::state(q), ObjectRef::state(history)}, edges);
+            std::array{ObjectRef::state(q)}, edges);
         const auto read = model.addValue(word);
         model.addOperation("core.state.read", {}, std::array{read}, std::array{ObjectRef::state(q)});
         const auto out = model.addOutput("o", word);
@@ -2166,6 +2468,8 @@ int main()
         if (const int status = runDeclProvenanceTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
             return status;
         if (const int status = runEdgeDetPhaseTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0) return status;
+        if (const int status = runArrayAccessRulesTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
+            return status;
         if (const int status = runSimRefactorMappingShellTest(WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR); status != 0)
             return status;
         return runHierarchyRejectionTest();

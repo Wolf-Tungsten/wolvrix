@@ -23,7 +23,7 @@ unconditionally every round (SinkEscape), never on `dataActiveFlag`:
   out — a value consumed only by sink supernodes gets no row.
 - `commitStateFanout`: a reg/latch state maps to its General reader
   supernodes (P_publish activation); every reader is covered. General-phase
-  `memRead` ops whose target is a **regLatch-class** array join this table
+  `readArray` ops whose target is a **regLatch-class** array join this table
   exactly like scalar readers — their writers commit through the NBA
   regLatch next buffer inside General supernodes. Mem-class array readers
   stay on the P_mem write plan's reader tables.

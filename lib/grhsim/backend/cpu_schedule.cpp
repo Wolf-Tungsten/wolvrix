@@ -64,17 +64,22 @@ namespace wolvrix::lib::grhsim
             return entries;
         }
 
-        // cpu.st.build-mem-write-plan (C5): Mem-phase write ops in op-id
-        // order (per-mem priority = ascending op id, preserving source
-        // order); readers are the target mem's General-phase memReads with
-        // their owning supernode (staticRow engaged when the address is a
-        // constant), plus the General-phase whole-array state.reads of the
-        // target (no address operand: always dynamic readers, activated on
-        // any write); eventFree marks writes without event_acts.
+        // cpu.st.build-mem-write-plan (C5): Mem-phase write ops (the stage-06
+        // write/writeArray/fill family) in op-id order; per-mem priority =
+        // declaration-order rank among the target state's Mem-phase writes
+        // (stage-03 semantics: same-state writes apply in declaration order,
+        // later writes overwrite earlier ones). Readers are the target mem's
+        // General-phase readArray ops with their owning supernode (staticRow
+        // engaged only for a full-rank, all-constant index vector, folded
+        // row-major into the linear row number), plus the General-phase
+        // whole-array state.reads of the target (no index operands: always
+        // dynamic readers, activated on any write); eventFree marks writes
+        // without event_acts.
         // M5d-6: the write set is the Mem phase (mem-class states only —
         // General-phase regLatch-class writes commit through the NBA
         // regLatch next buffer inside their supernodes, not P_mem), and the
-        // reader table follows the A7 store classification, not TypeKind.
+        // reader table follows the A7 store classification, not the type
+        // shape.
         std::vector<CpuMemWritePlanEntry> buildSixPhaseMemWritePlan(const GrhSimModel &model,
                                                                     const CpuPartitionTree &tree)
         {
@@ -86,10 +91,10 @@ namespace wolvrix::lib::grhsim
                 for (const auto value : model.results(op)) producer[value.index] = op.id;
                 if (op.phase != SimPhase::General) continue;
                 const auto opName = model.text(op.opType);
-                // memReads carry an address (staticRow when constant);
-                // whole-array state.reads of the target are always dynamic
-                // readers (any write may change any row).
-                if (opName != "core.state.memRead" && opName != "core.state.read") continue;
+                // readArray carries indices (staticRow when full-rank and
+                // all-constant); whole-array state.reads of the target are
+                // always dynamic readers (any write may change any row).
+                if (opName != "core.state.readArray" && opName != "core.state.read") continue;
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
                 if (model.states()[refs.front().index - 1].storeClass != StateStoreClass::Mem) continue;
@@ -111,19 +116,49 @@ namespace wolvrix::lib::grhsim
                     CpuMemReader memReader;
                     memReader.owner = supernodeOf[readerId.index];
                     const auto &reader = model.operations()[readerId.index - 1];
-                    if (model.text(reader.opType) == "core.state.memRead")
+                    if (model.text(reader.opType) == "core.state.readArray")
                     {
-                        const auto addr = model.operands(reader).front();
-                        const auto source = producer[addr.index];
-                        if (source && model.text(model.operations()[source.index - 1].opType) ==
-                                          "core.compute.constant")
+                        // staticRow engages only on a full-rank, all-constant
+                        // index vector: fold the constant indices row-major
+                        // (row = sum c_j * product(shape[j+1:])) into the
+                        // linear row number using the state type's shape. A
+                        // partial index vector reads a sub-array spanning
+                        // rows, and any non-constant index is dynamic — both
+                        // stay dynamic readers.
+                        const auto &stateType =
+                            model.types()[model.states()[model.objectRefs(reader).front().index - 1]
+                                              .type.index - 1];
+                        const auto indices = model.operands(reader);
+                        const std::size_t rank = stateType.shape.size();
+                        std::optional<uint64_t> row;
+                        if (rank != 0 && indices.size() == rank)
                         {
-                            const Parameter *literal = findCpuPhaseParameter(
-                                model, model.parameters(model.operations()[source.index - 1]), "constValue");
-                            if (const auto *text = literal ? std::get_if<std::string>(&literal->value)
-                                                           : nullptr)
-                                memReader.staticRow = parseCpuConstLiteral(*text);
+                            row = 0;
+                            for (std::size_t j = 0; j < rank && row; ++j)
+                            {
+                                const auto source = producer[indices[j].index];
+                                std::optional<uint64_t> index;
+                                if (source &&
+                                    model.text(model.operations()[source.index - 1].opType) ==
+                                        "core.compute.constant")
+                                {
+                                    const Parameter *literal = findCpuPhaseParameter(
+                                        model, model.parameters(model.operations()[source.index - 1]),
+                                        "constValue");
+                                    if (const auto *text = literal ? std::get_if<std::string>(&literal->value)
+                                                                   : nullptr)
+                                        index = parseCpuConstLiteral(*text);
+                                }
+                                const std::optional<uint64_t> stride = shapeElementCount(
+                                    std::span<const int64_t>(stateType.shape).subspan(j + 1));
+                                if (!index || !stride ||
+                                    *index > (std::numeric_limits<uint64_t>::max() - *row) / *stride)
+                                    row = std::nullopt;
+                                else
+                                    *row += *index * *stride;
+                            }
                         }
+                        memReader.staticRow = row;
                     }
                     entry.readers.push_back(memReader);
                 }
@@ -150,9 +185,9 @@ namespace wolvrix::lib::grhsim
         // supernodeFanout: boundary value -> consumer supernodes (Mem-phase
         // write consumers excluded: P_mem runs every round). stateFanout:
         // reg/latch state -> General reader supernodes (regLatch-class array
-        // memReads included; mem-class states use the write plan). V2 (M2):
-        // every table's targets are filtered to non-sink supernodes — sink
-        // consumers are never data-activated (boundary 2).
+        // readArray ops included; mem-class states use the write plan). V2
+        // (M2): every table's targets are filtered to non-sink supernodes —
+        // sink consumers are never data-activated (boundary 2).
         SixPhaseFanouts buildSixPhaseFanouts(const GrhSimModel &model, const CpuPartitionTree &tree)
         {
             const auto order = generalSupernodeOrder(tree);
@@ -212,17 +247,17 @@ namespace wolvrix::lib::grhsim
             {
                 if (op.phase != SimPhase::General) continue;
                 const auto opName = model.text(op.opType);
-                // state.read covers scalar and whole-array readers. memRead
+                // state.read covers scalar and whole-array readers. readArray
                 // joins for regLatch-class arrays (M5d-6): their writers
                 // commit through the NBA regLatch next buffer inside General
                 // supernodes, so their readers activate through stateFanout
                 // exactly like scalar reg/latch readers. mem-class array
                 // readers stay on the P_mem write plan's reader tables.
-                if (opName != "core.state.read" && opName != "core.state.memRead") continue;
+                if (opName != "core.state.read" && opName != "core.state.readArray") continue;
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
                 const auto &state = model.states()[refs.front().index - 1];
-                if (opName == "core.state.memRead" && state.storeClass != StateStoreClass::RegLatch)
+                if (opName == "core.state.readArray" && state.storeClass != StateStoreClass::RegLatch)
                     continue;
                 const auto owner = supernodeOf[op.id.index];
                 if (!owner || !isNonSinkSupernode(tree, owner)) continue;

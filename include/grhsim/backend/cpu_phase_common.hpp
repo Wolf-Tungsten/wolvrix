@@ -51,10 +51,16 @@ namespace wolvrix::lib::grhsim
         target.erase(std::unique(target.begin(), target.end()), target.end());
     }
 
+    // The write op family that may be attributed to P_mem (stage-06 op
+    // names; write covers both scalar whole-writes and the retired element
+    // assign). Whether a write actually lands in the Mem phase follows the
+    // target state's store class (class-aware routing: scalar/regLatch-class
+    // writes go to General), so this helper only answers "can this op kind
+    // write a mem-class state".
     inline bool isCpuPhaseMemWriteOp(std::string_view type) noexcept
     {
-        return type == "core.state.memWrite" || type == "core.state.memFill" ||
-               type == "core.state.memAssign" || type == "core.state.memWriteSeq";
+        return type == "core.state.write" || type == "core.state.writeArray" ||
+               type == "core.state.fill";
     }
 
     // The supernode ordinal (M5d-6, resolution 2): the General branch's

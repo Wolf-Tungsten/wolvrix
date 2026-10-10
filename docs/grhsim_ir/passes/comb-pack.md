@@ -14,7 +14,7 @@ Candidates roots come from three sources, each individually switchable:
 | --- | --- | --- |
 | declarations | `--enable-declared-roots` (default `true`) | values targeted by a declProvenance slice |
 | outputs | `--enable-output-roots` (default `true`) | the operand of each `core.output.write` |
-| storage data | `--enable-storage-data-roots` (default `true`) | the data operand of `core.state.regWrite`/`latchWrite` (operand 1), `memWrite` (operand 2), `memFill`/`memAssign` (operand 1) and every `memWriteSeq` data triple |
+| storage data | `--enable-storage-data-roots` (default `true`) | the data operand of `core.state.write`/`latchWrite` (operand 1), `writeArray` (the data operand after the index operands, before mask/events) and `fill` (operand 1) |
 
 A root must be produced by a supported internal op; pure leaves never form a
 group alone. A root whose minimal packed width (`laneWidth × min-group-size`)
@@ -36,7 +36,8 @@ ops; everything else is an opaque leaf. Supported internal ops:
 Signatures compare the op name, the structural type key (width, signedness,
 logic domain) and sorted parameters at every node; leaves compare only the type
 key, so two lanes may read unrelated leaf values. Tree size is capped by
-`--max-tree-nodes` (default 64). Non-logic values (real/string/array) are not
+`--max-tree-nodes` (default 64). Non-logic (real/string) values and shaped
+(array) values are not
 leaves and invalidate the whole tree.
 
 Lanes are bucketed by signature. Within a bucket, candidates are ordered by

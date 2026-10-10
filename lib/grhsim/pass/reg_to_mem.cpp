@@ -105,7 +105,7 @@ namespace {
                 for (auto v : m.operands(op)) ++valueUses[v.index];
                 const auto objects = m.objectRefs(op);
                 for (auto ref : objects) if (ref.kind == ObjectKind::State) refs[ref.index].push_back(op.id);
-                if (kind(op) == "core.state.regWrite" && !objects.empty()) writers[objects[0].index].push_back(op.id);
+                if (kind(op) == "core.state.write" && !objects.empty()) writers[objects[0].index].push_back(op.id);
             }
             for (const auto &init : m.initRecords()) inits[init.state.index] = &init;
             std::unordered_map<uint32_t,std::set<uint64_t>> decodedRows;
@@ -144,7 +144,10 @@ namespace {
         }
         std::optional<slang::SVInt> literal(ValueId v) {
             v=unwrap(v); const auto *op=def(v);
-            if (!op || kind(*op)!="core.compute.constant" || type(v).kind!=TypeKind::Logic) return {};
+            // Scalar gate: shaped (array) values never participate in the
+            // family discovery, so the whole pass idles on shaped inputs.
+            if (!op || kind(*op)!="core.compute.constant" || type(v).kind!=TypeKind::Logic ||
+                !type(v).shape.empty()) return {};
             const auto ps=m.parameters(*op);
             const auto *s=param<std::string>(m,ps,"value");
             if (!s) s=param<std::string>(m,ps,"constValue");
@@ -268,7 +271,7 @@ namespace {
             if(op && m.operands(*op).size()==1) {
                 const auto a=unwrap(m.operands(*op)[0]);
                 const auto &t=type(a);
-                if(t.kind==TypeKind::Logic && !t.isSigned && t.width<=64) {
+                if(t.kind==TypeKind::Logic && t.shape.empty() && !t.isSigned && t.width<=64) {
                     if(kind(*op)=="core.compute.reduceAnd")
                         return std::pair{a,t.width==64?~uint64_t{0}:(uint64_t{1}<<t.width)-1};
                     if(kind(*op)=="core.compute.logicNot" || kind(*op)=="core.compute.reduceNor")
@@ -332,14 +335,16 @@ namespace {
                 return false;
             };
             const auto &t=m.types()[m.states()[s.index-1].type.index-1];
-            if(t.kind!=TypeKind::Logic || t.domain!=LogicDomain::TwoState) return reject("type");
+            // Shaped (array) states are stage-06 arrays, not reg-to-mem row
+            // candidates: with no discoverable family the pass idles on them.
+            if(t.kind!=TypeKind::Logic || !t.shape.empty() || t.domain!=LogicDomain::TwoState) return reject("type");
             const auto *init=inits[s.index]; if(!init || m.steps(*init).size()!=1) return reject("init");
             const auto &step=m.steps(*init)[0];
             if(m.text(step.kind)!="core.init.const" || !param<std::string>(m,m.parameters(step),"value")) return reject("init");
             for(auto id:refs[s.index]) {
                 const auto &op=m.operations()[id.index-1]; const auto objects=m.objectRefs(op);
                 if(objects.empty() || objects[0]!=ObjectRef::state(s) ||
-                    (kind(op)!="core.state.read" && kind(op)!="core.state.regWrite")) return reject("unknown-state-user");
+                    (kind(op)!="core.state.read" && kind(op)!="core.state.write")) return reject("unknown-state-user");
                 // A storage state must be referenced exactly once per op, in
                 // the primary (target) slot.
                 if(std::count(objects.begin(),objects.end(),ObjectRef::state(s))!=1) return reject("duplicate-ref");
@@ -443,7 +448,7 @@ namespace {
             RowWrite result; result.op=op.id; result.mask=unwrap(operands[2]); result.edges=*edges;
             for(std::size_t i=0;i<edges->size();++i)
                 result.events.push_back(unwrap(operands[3+i]));
-            // A regWrite carries a global update condition separately from the
+            // A write carries a global update condition separately from the
             // mux condition in some lowering forms.  Keep it as part of every
             // effective branch guard; otherwise a false updateCond would still
             // commit a recovered memory write.
@@ -485,7 +490,7 @@ namespace {
                 for(const auto &[condition,data]:branches) {
                     auto g=guard(condition,row); if(!g) {parseReason="ambiguous-address";return {};}
                     // If the mux branch only carries the address hit and the
-                    // regWrite update condition was separate, conjoin it here.
+                    // write update condition was separate, conjoin it here.
                     // Avoid duplicating it when the branch already implies it.
                     std::vector<ValueId> assumptions{condition}; flatten(condition,true,assumptions);
                     const bool impliesUpdate=always || std::find(updates.begin(),updates.end(),condition)!=updates.end() ||
@@ -564,7 +569,8 @@ namespace {
                     slice.offset=static_cast<uint64_t>(*start);slice.bitWindow=true;
                 } else continue;
                 const auto &index=type(slice.index);
-                if(index.kind!=TypeKind::Logic || index.isSigned || index.domain!=LogicDomain::TwoState || index.width>64) continue;
+                if(index.kind!=TypeKind::Logic || !index.shape.empty() || index.isSigned ||
+                    index.domain!=LogicDomain::TwoState || index.width>64) continue;
                 slices[packed.index].push_back(slice);
             }
             for(const auto &op:m.operations()) if(kind(op)=="core.compute.concat") {
@@ -590,8 +596,8 @@ namespace {
                     const auto &slice=m.operations()[candidate.op.index-1];
                     const auto output=m.results(slice)[0];
                     if(candidate.bitWindow) {
-                        if(type(output).kind!=TypeKind::Logic || type(output).width>64 ||
-                            type(output).domain!=LogicDomain::TwoState) continue;
+                        if(type(output).kind!=TypeKind::Logic || !type(output).shape.empty() ||
+                            type(output).width>64 || type(output).domain!=LogicDomain::TwoState) continue;
                     } else if(typeId(output)!=element) continue;
                     view.slices.push_back(candidate);
                 }
@@ -762,6 +768,15 @@ namespace {
             auto literal=std::to_string(m.types()[t.index-1].width)+"'d"+std::to_string(n);
             return compute("core.compute.constant",t,{},{{m.intern("value"),literal}});
         }
+        // All-ones mask of the given (scalar) element type, any width: a
+        // binary literal carries widths past 64 bits. compute() interns the
+        // request, so one constant serves every writeArray of the family.
+        ValueId allOnes(TypeId t) {
+            const auto width=m.types()[t.index-1].width;
+            std::string text=std::to_string(width)+"'b";
+            text.append(width,'1');
+            return compute("core.compute.constant",t,{},{{m.intern("value"),text}});
+        }
         ValueId conjunction(const std::vector<ValueId> &terms) {
             if(terms.empty()) return constant(bit,1);
             auto v=terms.front();
@@ -785,12 +800,22 @@ namespace {
             }
             return address;
         }
-        void rewriteGroup(Group &g, bool merge) {
+        bool rewriteGroup(Group &g, bool merge) {
             const auto element=m.states()[g.rows[0].index-1].type;
             const auto origin=m.states()[g.rows[0].index-1].origin;
             const auto name=g.tableName.empty() ? "__reg_to_mem_"+std::to_string(g.rows[0].index) : g.tableName;
-            auto table=m.addState(name,m.arrayType(element,g.rows.size()),origin);
-            const auto elementWidth=m.types()[element.index-1].width;
+            const auto &elementType=m.types()[element.index-1];
+            const auto elementWidth=elementType.width;
+            // Stage-06 array type: the table is one logic state of the total
+            // row width with shape [rows] (one dimension; multi-dim declared
+            // families only feed the name/report). The element sign/domain
+            // carry over so the indexed-access element type matches the
+            // replaced row reads/writes exactly.
+            const uint64_t totalWidth=uint64_t{elementWidth}*g.rows.size();
+            if(totalWidth>std::numeric_limits<uint32_t>::max()) {g.reason="width-overflow";return false;}
+            const std::array<int64_t,1> shape{static_cast<int64_t>(g.rows.size())};
+            auto table=m.addState(name,
+                m.logicType(static_cast<uint32_t>(totalWidth),elementType.isSigned,elementType.domain,shape),origin);
             std::vector<InitStep> steps;std::vector<Parameter> parameters;
             for(std::size_t row=0;row<g.rows.size();++row) {
                 const auto old=g.rows[row]; rowMap[old.index]={table,row}; rowBase[old.index]=row*elementWidth;
@@ -808,7 +833,7 @@ namespace {
             m.addInit(table,steps,parameters);
             inits.resize(m.states().size()+1);
             for(const auto &init:m.initRecords()) inits[init.state.index]=&init;
-            if(!merge) return;
+            if(!merge) return true;
             const auto &first=g.writes.front();
             std::vector<ValueId> sequence;
             ValueId previousAddress;
@@ -852,7 +877,7 @@ namespace {
                     if (options.enableRowConstantFill) {
                         // A fill branch whose data is a per-row constant (e.g.
                         // an identity-init reset writing the row number) cannot
-                        // share one memFill value.  Expand it to one
+                        // share one fill value.  Expand it to one
                         // static-address triple per row; planWrites proved the
                         // fill guard exclusive with every addressed branch, so
                         // placing these triples at the front (lowest priority)
@@ -893,19 +918,32 @@ namespace {
             }
             if (!staticFills.empty())
                 sequence.insert(sequence.begin(), staticFills.begin(), staticFills.end());
+            // writeArray layout: [enable, address, data, mask, events...] for
+            // this rank-1 table. Stage-06 retires memWriteSeq: each triple
+            // becomes one writeArray op, emitted in the triples' low-to-high
+            // priority order — op declaration order is the application order
+            // (later writes win), so the old sequential semantics carry over
+            // exactly. planWrites proved multi-triple groups have a full
+            // (all-ones) mask, possibly folded into the enable for 1-bit
+            // elements; the single-triple form keeps the original mask.
             if(sequence.size()==3) {
                 sequence.push_back(first.mask); sequence.insert(sequence.end(),first.events.begin(),first.events.end());
-                m.addOperation("core.state.memWrite",sequence,{},objects,ps);
+                m.addOperation("core.state.writeArray",sequence,{},objects,ps);
             } else if(!sequence.empty()) {
-                sequence.insert(sequence.end(),first.events.begin(),first.events.end());
-                m.addOperation("core.state.memWriteSeq",sequence,{},objects,ps);
+                const auto mask=allOnes(element);
+                for(std::size_t offset=0;offset+2<sequence.size();offset+=3) {
+                    std::vector<ValueId> write{sequence[offset],sequence[offset+1],sequence[offset+2],mask};
+                    write.insert(write.end(),first.events.begin(),first.events.end());
+                    m.addOperation("core.state.writeArray",write,{},objects,ps);
+                }
             }
             for(const auto &[key,fill]:fills) {
                 (void)key;std::vector<ValueId> a{fill.first,fill.second};a.insert(a.end(),first.events.begin(),first.events.end());
-                m.addOperation("core.state.memFill",a,{},objects,ps);
+                m.addOperation("core.state.fill",a,{},objects,ps);
             }
             for(const auto &w:g.writes)
                 removedOps[w.op.index]=1;
+            return true;
         }
         void rewriteAccesses(std::size_t originalOps) {
             std::unordered_map<uint32_t,ValueId> rowConstants;
@@ -922,10 +960,12 @@ namespace {
                 std::vector<ValueId> args(m.operands(op).begin(),m.operands(op).end());
                 std::vector<Parameter> ps(m.parameters(op).begin(),m.parameters(op).end());
                 if(kind(op)=="core.state.read") {
-                    m.replaceOperation(op.id,"core.state.memRead",std::array{address},results,refs,ps);
+                    m.replaceOperation(op.id,"core.state.readArray",std::array{address},results,refs,ps);
                 } else {
+                    // write [en,data,mask,events...] -> writeArray
+                    // [en,addr,data,mask,events...]: insert the row address.
                     args.insert(args.begin()+1,address);
-                    m.replaceOperation(op.id,"core.state.memWrite",args,results,refs,ps);
+                    m.replaceOperation(op.id,"core.state.writeArray",args,results,refs,ps);
                 }
             }
         }
@@ -934,7 +974,10 @@ namespace {
                 if(!view.selected) continue;
                 const auto [table,base]=rowMap[view.lanes[0].index];
                 if(!table) continue;
-                const auto count=m.types()[m.states()[table.index-1].type.index-1].count;
+                const auto &tableType=m.types()[m.states()[table.index-1].type.index-1];
+                const auto elements=shapeElementCount(tableType.shape);
+                if(!elements) continue; // malformed table shape; verifier reports it
+                const auto count=*elements;
                 bool compatible=true,periodic=true;
                 std::vector<uint32_t> lanes;
                 for(std::size_t i=0;i<view.lanes.size();++i) {
@@ -946,14 +989,18 @@ namespace {
                 if(!compatible) continue;
                 const auto runs=laneRuns(lanes,count);
                 if(runs.size()>8) continue;
-                const auto element=m.types()[m.states()[table.index-1].type.index-1].elementType;
-                const auto elementWidth=m.types()[element.index-1].width;
+                const auto elementWidth=typeElementWidth(tableType);
+                if(!elementWidth) continue; // malformed table shape; verifier reports it
+                // Scalar element type of the rank-1 table (sign/domain match
+                // the table, hence the original row states).
+                const auto element=m.logicType(*elementWidth,tableType.isSigned,tableType.domain);
+                const uint32_t elementBits=*elementWidth;
                 for(const auto &slice:view.slices) {
                     const auto id=slice.op;
                     const auto op=m.operations()[id.index-1];
                     const auto output=m.results(op)[0];
                     auto address=slice.index;
-                    // Widen before adding the base, and clamp before memRead.
+                    // Widen before adding the base, and clamp before readArray.
                     // The outer mux restores the original zero on an invalid lane.
                     const auto addressType=m.logicType(64,false,LogicDomain::TwoState);
                     if(typeId(address)!=addressType)
@@ -963,7 +1010,7 @@ namespace {
                     const auto zero=constant(partType,0);
                     std::vector<ValueId> parts;
                     const auto width=slice.bitWindow?type(output).width:1;
-                    const uint64_t viewSize=view.lanes.size()*uint64_t{slice.bitWindow?elementWidth:1};
+                    const uint64_t viewSize=view.lanes.size()*uint64_t{slice.bitWindow?elementBits:1};
                     for(uint32_t i=width;i>0;--i) {
                         const uint64_t offset=slice.offset+i-1;
                         if(offset>=viewSize) {parts.push_back(zero);continue;}
@@ -973,9 +1020,9 @@ namespace {
                         auto safe=compute("core.compute.mux",addressType,{inRange,address,zeroAddress});
                         auto laneOffset=offset;
                         ValueId bitOffset;
-                        if(slice.bitWindow && elementWidth>1) {
+                        if(slice.bitWindow && elementBits>1) {
                             if(offset) safe=compute("core.compute.add",addressType,{safe,constant(addressType,offset)});
-                            const auto stride=constant(addressType,elementWidth);
+                            const auto stride=constant(addressType,elementBits);
                             bitOffset=compute("core.compute.mod",addressType,{safe,stride});
                             safe=compute("core.compute.div",addressType,{safe,stride});
                             laneOffset=0;
@@ -1011,7 +1058,7 @@ namespace {
                         auto [read,inserted]=createdReads.emplace(readKey,ValueId{});
                         if(inserted) {
                             read->second=m.addValue(element);
-                            m.addOperation("core.state.memRead",std::array{safe},std::array{read->second},std::array{ObjectRef::state(table)});
+                            m.addOperation("core.state.readArray",std::array{safe},std::array{read->second},std::array{ObjectRef::state(table)});
                         }
                         auto selected=read->second;
                         if(bitOffset) selected=compute("core.compute.sliceDynamic",bit,{selected,bitOffset},
@@ -1033,7 +1080,7 @@ namespace {
             }
             const auto removable=[&](const SimOp &op) {
                 const auto k=kind(op);
-                if(!k.starts_with("core.compute.") && k!="core.state.read" && k!="core.state.memRead") return false;
+                if(!k.starts_with("core.compute.") && k!="core.state.read" && k!="core.state.readArray") return false;
                 for(auto v:m.results(op)) if(uses[v.index]) return false;
                 return true;
             };
@@ -1052,7 +1099,7 @@ namespace {
             for(auto result:m.results(op)) words=std::max(words,(uint64_t{type(result).width}+63)/64);
             if(kind(op)=="core.compute.constant" || kind(op)=="core.compute.assign") return 0;
             if(kind(op)=="core.compute.concat") return words+static_cast<int64_t>(m.operands(op).size());
-            if(kind(op)=="core.state.regWrite") return 2;
+            if(kind(op)=="core.state.write") return 2;
             return static_cast<int64_t>(words);
         }
         // Count only the old nodes whose last use is removed, stopping at inputs
@@ -1208,7 +1255,8 @@ namespace {
                     for(std::size_t d=1;d<dims.size();++d) g.shape+="x"+std::to_string(dims[d]);
                     ++shapedFamilies; maxDims=std::max(maxDims,dims.size());
                 }
-                rewriteGroup(g,g.mergeWrites);g.reason=g.mergeWrites?"merged":"indexed-read";++count;
+                if(!rewriteGroup(g,g.mergeWrites)) continue;
+                g.reason=g.mergeWrites?"merged":"indexed-read";++count;
             }
             if(count) {
                 // Declarations of merged rows re-target to their element slice

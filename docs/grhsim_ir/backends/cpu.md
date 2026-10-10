@@ -53,19 +53,20 @@ CpuNamedStore
 | `core.logic<w, s, 4-state>` | `cpu.array<V, 2>`，`V` 是对应的 2-state 表示 |
 | `core.real` | `cpu.f64` |
 | `core.string` | `cpu.str` |
-| `core.array<T, n>` | `cpu.array<U, n>`（`U` 是 `T` 对应的 cpu 类型） |
+| 带 shape 的 `core.logic<w, s, d>`（数组） | `cpu.array<U, ∏shape>`（`U` 是元素位宽 `elementWidth = w/∏shape` 对应的 cpu 类型；按 shape 行主序摊平为**平坦**物理数组，不嵌套，字节布局与旧一维 `core.array` 布局逐字节一致，见 §2.2） |
 
 当前 `cpu.str` 的物理槽是 `pointer_bytes` 大小的字符串句柄，不是在字节 arena 中内嵌
 `std::string`。C++ emitter 让句柄指向独立的类型化字符串对象：object、boundary 和 input
 shadow 的字符串由模型持有；partition-local 字符串由 supernode 调用栈持有，生命周期覆盖
 其全部 helper chunk。`init()` 清空持久字符串并重新绑定被 arena 清零覆盖的句柄，析构由
-C++ RAII 完成。字符串 state 的初始化/提交与字符串数组尚未实现，emit 明确拒绝，不能走
-字节 memcpy 或把句柄数组解释为 `std::array<std::string, N>`。
+C++ RAII 完成。字符串 state 的初始化/提交尚未实现（shape 只配 `core.logic`，字符串数组
+不再是可表达的类型），emit 明确拒绝，不能走
+字节 memcpy 或把句柄解释为 `std::string` 对象内嵌。
 
 单结果 `core.compute.constant` 的两态 logic<1..64> 操作数在使用点直接发射为
 按原类型截断/符号扩展的 C++ literal，不物化到 local/boundary arena，也不发出
 常量变化通知。例如 `%one = constant logic<1,false> 1`、`%mask = constant
-logic<8,false> 255` 作为 `regWrite` 的 enable 和 mask 时，消费者直接使用 true 和
+logic<8,false> 255` 作为 `write` 的 enable 和 mask 时，消费者直接使用 true 和
 255，编译器可消去恒定的 enable 分支与全位掩码运算。`logic<5,true>` 的 `5'h1d`
 仍为 -3，`logic<1,false>` 仍按最低位截断，X/Z 沿用 two-state 投影为零的规则。
 所有 compute unit、commit domain 和端口活动位在 `init()` 时已激活，首次求值
@@ -94,10 +95,11 @@ eventGuard)` 内，而非 guard 之前。动态字符串、DPI output/inout 的�
 所有 compute supernode 初始化时已激活，常量不再需要运行期变化通知；此优化不改变
 调用次数、void 调用存活性、event 检测、history 采样或 compute/commit 分类。
 
-当前 CPU emitter 对 two-state logic state 及其一维数组完整应用显式初始化步骤：
-scalar `const`/`random`、array `const`/`fill`/`readmem`。数组 const 的 `value` 使用长度恰为
-`count` 的 logic literal 字符串序列；fill/readmem 的 `start`、`count` 是非负元素索引和
-元素数，缺省为 0 和剩余长度，显式 count=0 不写入。步骤按序覆盖，未覆盖的行、非法范围、
+当前 CPU emitter 对 two-state logic state 及其数组（带 shape 的 logic state）完整应用显式
+初始化步骤：scalar `const`/`random`、array `const`/`fill`/`readmem`。数组 const 的
+`value` 是总位宽的单个 logic literal（不逐元素书写）；fill/readmem 的 `start`、`count`
+是非负线性行地址和行数（行主序摊平，见 core 方言第 2.1 节），缺省为 0 和剩余长度，
+显式 count=0 不写入。步骤按序覆盖，未覆盖的行、非法范围、
 缺失值和不支持的类型在发射文件前报错，不能以 arena 的清零替代语义初值。
 
 readmem 沿用 legacy 的发射期解析方式，共用注释/空白分词与十六进制 `@address` 解析器；
@@ -112,7 +114,7 @@ random 使用 legacy SplitMix64 算法，每个宽值按低字到高字写入目
 独立采样；不构造返回值宽数组。CPU backend 的无 seed RNG 初值为
 `0x6a09e667f3bcc909`，每次 `init()` 重置；显式整数 seed 以其 64-bit 位模式初始化该步骤
 的局部 RNG，不消耗共享流。此处规定的是 backend 的可复现随机策略，不声称随机序列与
-其他 SV 仿真器一致。real/string state、嵌套数组仍明确拒绝，不能视为已支持。
+其他 SV 仿真器一致。real/string state 仍明确拒绝，不能视为已支持。
 
 位向量放入整数或宽整数时低位对齐：向量的第 0 位对应整数的最低位，超出位宽的高位
 按符号性填充（无符号补 0，有符号补符号位）。4-state 数组的第 0 个元素保存 value，
@@ -160,6 +162,29 @@ stage 之后生成，产出 `LayoutNamedStores` stage，mapping 仍为 `complete
 
 JSON 的 CPU layout 为 `[pointer_bytes, [types...], [named_stores...]?]` 位置化数组；
 未知枚举、缺失 layout 和 stage/payload 不一致均被拒绝。
+
+### 2.2 数组状态的布局与发射形状（stage-06）
+
+带 shape 的 `core.logic` state 按 shape **行主序摊平为平坦物理数组**
+`cpu.array<U, ∏shape>`（`U` 是元素位宽 `elementWidth` 对应的 cpu 类型），物理布局不
+嵌套；字节布局与旧一维 `core.array` 布局逐字节一致，shape 只影响寻址表达式与语义校验
+（"物理存储保持线性"原则）。宽元素（elementWidth > 64 的 _BitInt 行）× 多维 shape 的
+组合同样支持：最内层元素为 `cpu.uint<elementWidth>`（limb 数组），线性偏移 =
+线性下标 × elementWidth 的公式不变。
+
+发射端的索引寻址一律**线性化**：`readArray`/`writeArray` 的多索引在 emit 时按
+`stride_j = ∏shape[j+1:]` 折叠为线性下标 `i0*d1*...*dn-1 + ... + in-1`，再索引平坦
+物理数组。备选方案是直接发射嵌套下标表达式 `store.f[i0][i1]`；现行实现选择线性化
+（控制发射形状、对编译器更友好）。`sliceArray` 同理按行主序多索引偏移发射。
+
+整体数组写（目标是数组状态的 `write`）的发射策略参照 gsim 的 `arrayCopy` 三档：常量
+折叠（RHS 为常量）/ 逐元素展开（RHS 元素结构已知时逐元素 store）/ 循环拷贝（一般情形，
+按行主序 for 循环拷贝）；元素写始终是单条索引 store，不拼位。
+
+FST 波形对数组一律**逐元素注册 var**，使用方括号规范名 `arr[i0][i1]...`（GTKWave 折叠
+为数组树）；总字节超过 `kWaveMaxBytes`（512）的数组整个不 dump（不做截断式部分
+dump），宽元素逐元素走 _BitInt u64-word 镜像路径——逐元素化同时解除了旧"元素宽 ∈
+{8,16,32,64}"的限制。mem 类 state 不进 FST。详见 §5 的 FST 波形小节。
 
 ## 3. `PartitionTree`
 
@@ -270,7 +295,8 @@ SchedulePlan
   computeSupernodeFanout: Map<ValueId, ActivationTargets>
   commitStateFanout: Map<StateId, ActivationTargets>
   eventActivation: [{act: UInt32, supernodeWords: UInt64[]}]?    # C4（V2-M2，只覆盖非 sink 超节点）
-  memWritePlan: [{writeOp, priority, eventFree, readers}]?       # C5
+  memWritePlan: [{writeOp, priority, eventFree, readers}]?       # C5（priority = 该写在目标 state 的
+                                                                 # Mem 相写中的声明顺序位次）
   timeslotTriggers: [{act: UInt32, flag: UInt32}]?               # C7
 
 ActivationTargets
@@ -301,7 +327,7 @@ ScheduledTask
 P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEvent 查 eventActStore
 签名，SinkEscape 每轮无条件；A1 守卫细分的 SinkEvent 在签名门之后再 AND 一次
 `enableGuard` value 的读取——形如 `if(actBitsGuard(sig) && read(enableGuard))`，
-该 value 即成员 regWrite 共有的 en 操作数，经 boundaryValueStore（或
+该 value 即成员 write 共有的 en 操作数，经 boundaryValueStore（或
 input/state 读取重发）现成可读，语义上与体内逐 op 的 en 判断等价）。V3-M1 起 dataActiveFlag/dataActiveFlagNext 为
 bit-per-supernode 的 u64 字数组：扫描先按字外层跳过（一个非零判断覆盖 64 个静默
 超节点），字内逐位读 live word 检测并清位点火——同轮 fanout 目标恒在扫描方向前方
@@ -371,7 +397,7 @@ stage 之后生成：一个 NUMA node 0、core 0，task ID 从 1 开始，序列
 - `computeSupernodeFanout` 只激活跨超节点消费者，不建立自激活边；Mem 相写消费者除外
   （P_mem 每轮运行）；sink 消费者一律过滤（V2-M2，sink 不经 dataActiveFlag 激活）。
 - `commitStateFanout` 覆盖所有被 General 相读取的状态（`state.read` 及目标为 regLatch
-  类数组的 `memRead`），而不仅是 overview 第 4.2 节的输出/边沿状态依赖闭包 E；mem 类
+  类数组的 `readArray`），而不仅是 overview 第 4.2 节的输出/边沿状态依赖闭包 E；mem 类
   数组的读者由 C5 写计划的读者表激活。
 - `timeslotTriggers` 是 Output 相 timeslot 任务的 timeslotFlag × event_acts 笛卡尔展开
   （task op-id 序、单任务内 act 升序）。
@@ -415,7 +441,9 @@ store、全部成员与块函数声明、spill 帧结构、dump 打印助手）�
 链接为单一静态库 `lib<prefix>.a`——下游 difftest/hdlbits/xs-bugcase 接线不变）。块函数的
 跨块局部值经类内嵌套的 spill 帧结构（`SnFrame<i>`/`EventFrame`/`OutputFrame`）传递：
 driver 在栈上值初始化帧并按序调用块函数（调用方提供缓冲、无大临时拷贝）。常量、
-`input.read`/`state.read`/`memRead` 结果在任意块内可重读，不进帧；Output 锥额外把每个
+`input.read`/`state.read` 结果在任意块内可重读，不进帧；`readArray` 结果与计算值一样
+进帧 spill（重读形式会重新求值索引操作数，其局部量可能已死——XS 整核模型上实证）。
+Output 锥额外把每个
 锥内生产的 latchWrite 操作数进帧，使暂存提交观察到提交前值。DPI import 声明不进公共头
 （测试台自定义同名 extern "C" 定义）；每个引用它们的单元在文件头自行声明。C++
 编译并行由 Makefile 的源文件清单给出；模拟器执行顺序（相位/轮次/块序）不变。
@@ -455,10 +483,12 @@ totalRound、computeBatch/commitBatch、touchedStateShadow/touchedWrite 计数�
 `grhsim.fst`）。
 
 信号集与旧 emitter 的 declared-symbols 模式同源：遍历 `declaredSymbols`，解析到接口
-端口、RegLatch 状态字段或已实体化的 boundary 字段者入选；mem 状态（存储内容不进
+端口、RegLatch 状态字段或已实体化的 boundary 字段者入选；mem 类状态（存储内容不进
 FST）、字符串/四态类型、无 live object 的符号（被优化掉的线网）、折叠为超节点局部
-的 value，以及超过 512 字节的数组字段（与 dumpState 的哈希口径一致）跳过。数组按
-元素位宽 × 元素数摊平为一个宽 var（元素存储须无空隙：位宽 8/16/32/64）。
+的 value，以及总字节数超过 512（`kWaveMaxBytes`，与 dumpState 的哈希口径一致）的数组
+字段跳过（不做截断式部分 dump）。数组一律逐元素注册 var，方括号规范名
+`arr[i0][i1]...`（GTKWave 折叠为数组树）；宽元素逐元素走 _BitInt u64-word 镜像路径，
+不再有"元素宽 ∈ {8,16,32,64}"的限制（stage-06，见 §2.2）。
 
 产物与接线：注册表在 `<prefix>_wave_<g>.cpp`（每 4096 信号一个 `wave_setup_<k>` 成员
 函数、8 块一文件）——刻意不进 C8 TU 计划（计划与 emit 选项无关），只追加进生成
@@ -538,10 +568,10 @@ disjoint-mask 写口在同轮的修改。
 内存元素使用 `cpu_at<Element>(cpu_stage_cell(...), 0)`；stage helper 返回指定 cell 的 shadow
 地址，同轮第一次触及该行才复制 visible cell 并登记 pending，后续写口复用该行。
 dirty key 为每个数组分配的独立基址加行号；pending 保存 cell 字节偏移和长度，不扫描/复制整数组。
-`memFill` 逐行使用同一路径，因此 fill 与 masked/sequence 写口混用仍保留先后覆盖顺序。
+`fill` 逐行使用同一路径，因此 fill 与 masked/索引写口混用仍保留声明顺序的覆盖关系。
 写入地址越界时不登记 pending，但仍采样 event history。
-`memWriteSeq` 的整个有序写入列表必须先命中显式 event，
-之后才逐三元组检查 enable/address/data；event history 的采样不依赖某个 enable 成立。
+同一 state 的多个写 op 各自先命中自己的显式 event，再按声明顺序逐个检查
+enable/索引/data 并应用（后写覆盖先写）；event history 的采样不依赖某个 enable 成立。
 
 ### CPU C++ 状态发布
 
@@ -550,7 +580,7 @@ event history 采样和一般 state 写入使用 shadow/pending，在 publish �
 同轮先写 7 后写 0：最终 shadow=0，publish 不激活读者。任何提前排除不变写入的优化
 都必须保留这种覆盖顺序，并实测其比较/分支/代码体积成本，不能只按队列数量判断收益。
 
-每个 memRead 在 compute 时缓存实际读取 cell 的绝对字节偏移，包括地址为 local value 的情况。
+每个 readArray 在 compute 时缓存实际读取 cell 的绝对字节偏移，包括地址为 local value 的情况。
 memory pending 发布时仅激活缓存偏移与变更 cell 相同的读端口所属 supernode；地址输入变化仍由
 原 compute/input fanout 激活读端口。缓存、dirty bits 和 pending 在 init 时一起清除。
 
@@ -568,9 +598,9 @@ emitter 可将 value 解析为 state 引用并省去读取复制。state 发布�
 ### CPU C++ 标量内存写入
 
 标量 memory cell（two-state logic 1–64 bit）先比较 masked next，再决定是否
-进入 shadow/pending。`memWrite` operands 依次是 enable、index、data、mask、
-event values；`memFill` 的 enable/data 更新每行，`memWriteSeq` 的各组
-enable/index/data 按原顺序做全量更新。`cpu_write_cell<T,Width>` 使用
+进入 shadow/pending。`writeArray` operands 依次是 enable、各维索引（1..rank 个）、
+data、mask、event values；`fill` 的 enable/data 更新每行；同一 state 的多个写 op
+按声明顺序依次应用。`cpu_write_cell<T,Width>` 使用
 `key=memory_base+row` 和 `offset=array_offset+row*sizeof(T)`，从 dirty cell 的
 shadow 或干净 cell 的 visible 取 current，按元素宽度及 signedness 规范化
 `(current & ~mask) | (data & mask)`。next 等于 current 时无需拷贝、入队或写回；
@@ -587,7 +617,7 @@ publication，由最终 visible/shadow 比较消去通知。干净 cell 的零 m
 ### CPU C++ 标量直接提交
 
 唯一写者的 1..64-bit、2-state 标量可使用 direct commit，但完整 object-ref pool
-中的引用必须全部归类为该唯一 regWrite/latchWrite 的目标或 compute 的 state.read。
+中的引用必须全部归类为该唯一 write/latchWrite 的目标或 compute 的 state.read。
 任何 history、其他 commit/DPI/system ref、未知引用、多写者、memory 或宽值均回退。
 compute 已读取旧状态且 commit 没有其他观察者，因此该写站点计算的 masked/normalized
 值就是本次 G 的最终值，物理字节提前写回不可被中途观察。`q1 <= d; q2 <= q1`
@@ -606,13 +636,13 @@ direct commit 不改变 phase/task/domain/event 策略，也不影响 DPI 真实
 
 `grhsim.canonicalize-compute` 在纯计算 CSE 后共享确定性等价的普通状态，再重复
 纯计算 CSE，直到没有新的状态合并。每轮继续的前提是至少删除一个状态；不同
-反馈 value 的循环不推测等价。只处理 two-state logic 的唯一 regWrite/latchWrite，
+反馈 value 的循环不推测等价。只处理 two-state logic 的唯一 write/latchWrite，
 完整对象引用必须仅为目标写口和 state.read；随机/文件/多步初始化及额外引用回退。
 状态类型、单条 `core.init.const` 的完整参数、写口种类、全部操作数及参数必须相同。
 每个事件 history 必须仅由本写口引用，且两边对应 history 的类型和确定性初值相同；
 共享或被读取的 history 回退。
 
-regWrite 的操作数为 enable、data、mask，随后为各 event value；object refs 为
+write 的操作数为 enable、data、mask，随后为各 event value；object refs 为
 目标状态，随后为各 event history，`event_edges` 指定对应边沿。latchWrite 使用
 前三个操作数。相同初值和逐轮相同输入保证状态与历史始终等价，所以保留组内一个
 状态/写口，把同一类型的 state.read 合并为一个 value，并删除副本及其私有 history。
@@ -622,9 +652,9 @@ regWrite 的操作数为 enable、data、mask，随后为各 event value；objec
 
 ### CPU C++ 提交端口变化武装
 
-满足以下条件的 direct-commit 写口（regWrite/latchWrite）按变化武装（change-armed）：
+满足以下条件的 direct-commit 写口（write/latchWrite）按变化武装（change-armed）：
 enable/data/mask 三个操作数都是 boundary 存储的 2-state 1..64-bit logic，不是
-state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`core.state.memRead`
+state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`core.state.readArray`
 （这些写站点都经过 computeGroup 的变化发布路径）。每个 task 内合格写口按 op 顺序
 编号，每 8 个组成一个 `cpu_pflags` 活动字节；`init()` 全部置 1，首轮必做完整求值。
 
@@ -761,7 +791,7 @@ bit1 留在全局等待后续扫描。域 arm、DPI guard/history 和 commit 发
 
 发射器在同一个边沿域 commit task 内按采样等价类共享私有事件历史，适用于
 `DomainGatedCommit` 和 `AlwaysScanCommit`。每个 history 单独检查：全模型的
-object ref 必须全部是本 task 中 `regWrite/memWrite/memFill/memWriteSeq` 的
+object ref 必须全部是本 task 中 `write/writeArray/fill` 的
 posedge/negedge 采样，且每次采样使用同一个、不经 state-read alias 的 boundary
 ValueId。history 与 event 类型相同，均为 unsigned two-state 1-bit；history 具有
 唯一常量初始化记录，publication 目标恰为本域 arm。同一 history 可以被本 task
@@ -830,7 +860,7 @@ history 的初值和完整 guard 仍独立；只有上述已证明等价的历�
 和重复 init，并保留 shared-history 的 AlwaysScanCommit 测试。
 
 `DomainGatedCommit` 还可在原 body 之前检测整个 task 是否无效果：仅限
-`regWrite/memWrite/memFill/memWriteSeq`，全部 event 为 posedge/negedge，全部 history
+`write/writeArray/fill`，全部 event 为 posedge/negedge，全部 history
 均为 unsigned two-state 1-bit、一字节存储且各自只有一个 object ref。至少 16 个 history、
 至多八个不同的当前事件 ValueId 才启用。共享、被观察、被普通写口写入的 history
 以及 general/AlwaysScanCommit、DPI/system task 均不使用该检测。

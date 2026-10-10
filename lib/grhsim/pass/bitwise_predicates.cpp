@@ -16,7 +16,7 @@ namespace wolvrix::lib::grhsim
         const auto bit = [&](ValueId value) {
             const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];
             return type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
-                   type.width == 1 && !type.isSigned;
+                   type.shape.empty() && type.width == 1 && !type.isSigned;
         };
         uint64_t ands = 0, ors = 0;
         for (const auto &op : model.operations())

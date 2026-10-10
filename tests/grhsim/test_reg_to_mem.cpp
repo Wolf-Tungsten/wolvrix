@@ -19,7 +19,7 @@ using namespace wolvrix::lib;
 using namespace grhsim;
 void require(bool b, const char *s) { if (!b) throw std::runtime_error(s); }
 void compactTest() {
-    GrhSimModel m("compact"); m.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+    GrhSimModel m("compact"); m.addDialect("core", "1", "wolvrix.grhsim.core.v2");
     auto bit = m.logicType(1, false, LogicDomain::TwoState);
     auto q = m.addState("q", bit);
     const std::array params{Parameter{m.intern("value"), std::string("1'b0")}};
@@ -45,7 +45,7 @@ void compactTest() {
 }
 
 void updateConditionTest() {
-    GrhSimModel m("update-condition"); m.addDialect("core", "1", "wolvrix.grhsim.core.v1");
+    GrhSimModel m("update-condition"); m.addDialect("core", "1", "wolvrix.grhsim.core.v2");
     const auto bit = m.logicType(1, false, LogicDomain::TwoState);
     const auto addrType = m.logicType(2, false, LogicDomain::TwoState);
     const auto uInput = m.addInput("update", bit);
@@ -85,7 +85,7 @@ void updateConditionTest() {
         m.addOperation("core.compute.mux", std::array{hit, data, old}, std::array{lowNext});
         const auto highNext = m.addValue(bit);
         m.addOperation("core.compute.mux", std::array{hit, data2, lowNext}, std::array{highNext});
-        m.addOperation("core.state.regWrite", std::array{update, highNext, mask, event}, {},
+        m.addOperation("core.state.write", std::array{update, highNext, mask, event}, {},
                        std::array<ObjectRef, 1>{ObjectRef::state(q)},
                        std::array{Parameter{m.intern("event_edges"), std::vector<std::string>{"posedge"}}});
     }
@@ -98,35 +98,89 @@ void updateConditionTest() {
     require(result.success && result.changed, "reg-to-mem did not rewrite update-guarded rows");
     require(!d.hasError(), "reg-to-mem emitted diagnostics for update-guarded rows");
     require(m.states().size() == 1, "reg-to-mem did not compact the scalar rows");
-    bool foundArray = false, foundWrite = false, foundSequence = false, guardConjoined = false;
-    for (const auto &state : m.states())
-        foundArray |= m.types()[state.type.index - 1].kind == TypeKind::Array;
+    bool foundArray = false, guardConjoined = false;
+    std::size_t writeArrays = 0;
+    for (const auto &state : m.states()) {
+        const auto &type = m.types()[state.type.index - 1];
+        foundArray |= type.kind == TypeKind::Logic && type.shape == std::vector<int64_t>{2};
+    }
     std::vector<OpId> producers(m.values().size() + 1);
     for (const auto &op : m.operations()) {
-        if (m.text(op.opType) == "core.state.memWrite" || m.text(op.opType) == "core.state.memWriteSeq") {
-            foundWrite = true;
+        // Stage-06: each recovered write triple is one writeArray op; same-state
+        // ops apply in declaration order (later writes win).
+        if (m.text(op.opType) == "core.state.writeArray") {
             const auto operands = m.operands(op);
-            if (!operands.empty() && m.text(op.opType) == "core.state.memWriteSeq") {
-                for (std::size_t i = 0; i + 2 < operands.size(); i += 3) {
-                    if (producers[operands[i].index]) {
-                        const auto &guard = m.operations()[producers[operands[i].index].index - 1];
-                        guardConjoined |= m.text(guard.opType) == "core.compute.logicAnd";
-                    }
-                }
+            require(operands.size() == 5,
+                    "reg-to-mem duplicated scalar rows instead of recovering one dynamic write source");
+            ++writeArrays;
+            if (producers[operands[0].index]) {
+                const auto &guard = m.operations()[producers[operands[0].index].index - 1];
+                guardConjoined |= m.text(guard.opType) == "core.compute.logicAnd";
             }
         }
-        foundSequence |= m.text(op.opType) == "core.state.memWriteSeq";
         for (auto value : m.results(op)) producers[value.index] = op.id;
     }
-    require(foundArray && foundWrite && foundSequence && guardConjoined,
-            (std::cerr << "array=" << foundArray << " write=" << foundWrite << " seq=" << foundSequence
+    require(foundArray && writeArrays == 2 && guardConjoined,
+            (std::cerr << "array=" << foundArray << " writeArrays=" << writeArrays
                         << " guard=" << guardConjoined << '\n',
              "reg-to-mem lost the update condition on the recovered write"));
-    for (const auto &op : m.operations())
-        if (m.text(op.opType) == "core.state.memWriteSeq")
-            require(m.operands(op).size() == 7,
-                    "reg-to-mem duplicated scalar rows instead of recovering one dynamic write source");
     require(verifyGrhSimModel(m, defaultDialectRegistry(), d), "rewritten update-guarded model invalid");
+}
+void shapedStateIdleTest() {
+    // Stage-06: family discovery only recognizes scalar family naming (the
+    // shape.empty() gate), so a model whose only array is an already-shaped
+    // state plus unrelated scalar registers is a no-op for reg-to-mem.
+    GrhSimModel m("reg-to-mem-shaped-idle"); m.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+    const auto bit = m.logicType(1, false, LogicDomain::TwoState);
+    const auto addrType = m.logicType(2, false, LogicDomain::TwoState);
+    const auto word = m.logicType(16, false, LogicDomain::TwoState);
+    const std::array<int64_t, 1> tableShape{4};
+    const auto table = m.addState("mem", m.logicType(64, false, LogicDomain::TwoState, tableShape));
+    const std::array fillParams{Parameter{m.intern("value"), std::string("16'h0")},
+                                Parameter{m.intern("start"), int64_t{0}},
+                                Parameter{m.intern("count"), int64_t{4}}};
+    const std::array fillSteps{InitStep{m.intern("core.init.fill"), {0, 3}}};
+    m.addInit(table, fillSteps, fillParams);
+    auto input = [&](const char *name, TypeId type) {
+        const auto id = m.addInput(name, type);
+        const auto value = m.addValue(type);
+        m.addOperation("core.input.read", {}, std::array{value}, std::array<ObjectRef, 1>{ObjectRef::input(id)});
+        return value;
+    };
+    const auto en = input("en", bit);
+    const auto addr = input("addr", addrType);
+    const auto data = input("data", word);
+    const auto bitData = input("bit_data", bit);
+    const auto elemMask = m.addValue(word);
+    m.addOperation("core.compute.constant", {}, std::array{elemMask}, {},
+                   std::array{Parameter{m.intern("value"), std::string("16'hffff")}});
+    m.addOperation("core.state.writeArray", std::array{en, addr, data, elemMask}, {},
+                   std::array<ObjectRef, 1>{ObjectRef::state(table)});
+    const auto read = m.addValue(word);
+    m.addOperation("core.state.readArray", std::array{addr}, std::array{read},
+                   std::array<ObjectRef, 1>{ObjectRef::state(table)});
+    // Scalar registers with plain (non-decoded) writes: no recoverable family.
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto q = m.addState("misc_" + std::to_string(i), bit);
+        const std::array initSteps{InitStep{m.intern("core.init.const"), {0, 1}}};
+        const std::array initParams{Parameter{m.intern("value"), std::string("1'b0")}};
+        m.addInit(q, initSteps, initParams);
+        const auto mask = m.addValue(bit);
+        m.addOperation("core.compute.constant", {}, std::array{mask}, {},
+                       std::array{Parameter{m.intern("value"), std::string("1'b1")}});
+        m.addOperation("core.state.write", std::array{en, bitData, mask}, {},
+                       std::array<ObjectRef, 1>{ObjectRef::state(q)});
+    }
+    const auto statesBefore = m.states().size(), opsBefore = m.operations().size();
+    diag::Diagnostics d;
+    RegToMemOptions options; options.enableCostSelection = false;
+    RegToMemPass pass(options);
+    const auto result = pass.run(m, d);
+    require(result.success && !result.changed, "reg-to-mem rewrote a shaped-state idle model");
+    require(!d.hasError(), "reg-to-mem emitted diagnostics for a shaped-state idle model");
+    require(m.states().size() == statesBefore && m.operations().size() == opsBefore,
+            "idle reg-to-mem changed the op/state counts");
+    require(verifyGrhSimModel(m, defaultDialectRegistry(), d), "shaped-state idle model invalid");
 }
 void inspect(const GrhSimModel &m, std::string_view pattern) {
     std::vector<OpId> defs(m.values().size()+1);
@@ -139,25 +193,19 @@ void inspect(const GrhSimModel &m, std::string_view pattern) {
     for(auto id:targets) {
         const auto &state=m.states()[id-1];
         const auto &type=m.types()[state.type.index-1];
-        if(type.kind!=TypeKind::Array) continue;
-        std::size_t reads=0,writes=0,fills=0,sequences=0,triples=0;
+        if(type.kind!=TypeKind::Logic || type.shape.empty()) continue;
+        const auto rows=shapeElementCount(type.shape).value_or(0);
+        std::size_t reads=0,writes=0,fills=0;
         for(const auto &op:m.operations()) {
             const auto refs=m.objectRefs(op);
             if(refs.empty() || refs[0]!=ObjectRef::state(state.id)) continue;
             const auto k=m.text(op.opType);
-            reads+=k=="core.state.memRead";
-            writes+=k=="core.state.memWrite";
-            fills+=k=="core.state.memFill";
-            if(k=="core.state.memWriteSeq") {
-                ++sequences;
-                std::size_t events=0;
-                for(const auto &p:m.parameters(op)) if(m.text(p.name)=="event_edges")
-                    events=std::get<std::vector<std::string>>(p.value).size();
-                triples+=(m.operands(op).size()-events)/3;
-            }
+            reads+=k=="core.state.readArray";
+            writes+=k=="core.state.writeArray";
+            fills+=k=="core.state.fill";
         }
-        std::cout<<"ARRAY rows="<<type.count<<" reads="<<reads<<" writes="<<writes
-            <<" fills="<<fills<<" sequences="<<sequences<<" triples="<<triples<<'\n';
+        std::cout<<"ARRAY rows="<<rows<<" reads="<<reads<<" writes="<<writes
+            <<" fills="<<fills<<'\n';
     }
     std::set<uint32_t> seen;
     std::function<void(ValueId,unsigned)> dump=[&](ValueId v,unsigned depth) {
@@ -184,7 +232,7 @@ void inspect(const GrhSimModel &m, std::string_view pattern) {
         dump({static_cast<uint32_t>(std::stoul(std::string(pattern.substr(1)))),0},0);
         return;
     }
-    for(const auto &op:m.operations()) if(m.text(op.opType)=="core.state.regWrite" &&
+    for(const auto &op:m.operations()) if(m.text(op.opType)=="core.state.write" &&
         targets.contains(m.objectRefs(op)[0].index)) {
         std::cout<<"WRITE "<<op.id.index<<'\n';
         auto current=m.operands(op)[1];
@@ -198,7 +246,7 @@ void inspect(const GrhSimModel &m, std::string_view pattern) {
     }
 }
 void summarize(const GrhSimModel &m) {
-    struct Counts { uint64_t fixed=0,dynamic=0,writes=0,sequences=0,triples=0,fills=0; };
+    struct Counts { uint64_t fixed=0,dynamic=0,writes=0,fills=0; };
     std::vector<Counts> counts(m.states().size()+1);
     std::vector<bool> constant(m.values().size()+1);
     for(const auto &op:m.operations()) if(m.text(op.opType)=="core.compute.constant")
@@ -207,26 +255,21 @@ void summarize(const GrhSimModel &m) {
         auto refs=m.objectRefs(op);auto args=m.operands(op);
         if(refs.empty() || refs[0].kind!=ObjectKind::State) continue;
         auto &c=counts[refs[0].index];const auto k=m.text(op.opType);
-        if(k=="core.state.memRead") {
+        if(k=="core.state.readArray") {
             if(constant[args[0].index]) ++c.fixed; else ++c.dynamic;
         }
-        if(k=="core.state.memWrite") ++c.writes;
-        if(k=="core.state.memFill") ++c.fills;
-        if(k=="core.state.memWriteSeq") {
-            ++c.sequences;
-            std::size_t events=0;
-            for(const auto &p:m.parameters(op)) if(m.text(p.name)=="event_edges")
-                events=std::get<std::vector<std::string>>(p.value).size();
-            c.triples+=(args.size()-events)/3;
-        }
+        if(k=="core.state.writeArray") ++c.writes;
+        if(k=="core.state.fill") ++c.fills;
     }
-    std::cout<<"state\trows\twidth\tfixed_reads\tdynamic_reads\twrites\tsequences\ttriples\tfills\n";
+    std::cout<<"state\trows\twidth\tfixed_reads\tdynamic_reads\twrites\tfills\n";
     for(const auto &state:m.states()) {
         const auto &t=m.types()[state.type.index-1];
-        if(t.kind!=TypeKind::Array || !m.text(state.name).starts_with("__reg_to_mem_")) continue;
+        if(t.kind!=TypeKind::Logic || t.shape.empty() ||
+            !m.text(state.name).starts_with("__reg_to_mem_")) continue;
         const auto &c=counts[state.id.index];
-        std::cout<<m.text(state.name)<<'\t'<<t.count<<'\t'<<m.types()[t.elementType.index-1].width
-            <<'\t'<<c.fixed<<'\t'<<c.dynamic<<'\t'<<c.writes<<'\t'<<c.sequences<<'\t'<<c.triples<<'\t'<<c.fills<<'\n';
+        std::cout<<m.text(state.name)<<'\t'<<shapeElementCount(t.shape).value_or(0)<<'\t'
+            <<typeElementWidth(t).value_or(0)
+            <<'\t'<<c.fixed<<'\t'<<c.dynamic<<'\t'<<c.writes<<'\t'<<c.fills<<'\n';
     }
 }
 }
@@ -253,6 +296,6 @@ int main(int argc,char **argv) {
             diag::Diagnostics d; auto m=loadGrhSimModel(argv[2],defaultDialectRegistry(),d);
             require(bool(m),"load failed"); inspect(*m,argv[3]); return 0;
         }
-        compactTest(); updateConditionTest(); regToMemSemanticsTests(); std::cout<<"reg-to-mem tests passed\n"; return 0;
+        compactTest(); updateConditionTest(); shapedStateIdleTest(); regToMemSemanticsTests(); std::cout<<"reg-to-mem tests passed\n"; return 0;
     } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

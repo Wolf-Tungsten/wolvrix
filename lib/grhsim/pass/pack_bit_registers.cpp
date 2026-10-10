@@ -62,7 +62,7 @@ namespace wolvrix::lib::grhsim
                 const auto bit = [&](TypeId id) {
                     const auto &type = model.types()[id.index - 1];
                     return type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
-                           type.width == 1 && !type.isSigned;
+                           type.shape.empty() && type.width == 1 && !type.isSigned;
                 };
                 for (const auto &record : model.initRecords())
                     if (bit(model.states()[record.state.index - 1].type)) initial[record.state.index] = initialBit(model, record);
@@ -79,7 +79,7 @@ namespace wolvrix::lib::grhsim
                             model.values()[model.results(op)[0].index - 1].type == model.states()[refs[0].index - 1].type)
                             ++reads[refs[0].index];
                     }
-                    else if (type == "core.state.regWrite" && !refs.empty() && refs[0].kind == ObjectKind::State)
+                    else if (type == "core.state.write" && !refs.empty() && refs[0].kind == ObjectKind::State)
                         ++writes[refs[0].index];
                 }
                 // A shared enable/mask, an identical event sequence (same event
@@ -91,7 +91,7 @@ namespace wolvrix::lib::grhsim
                 std::map<std::vector<uint32_t>, std::vector<OpId>> groups;
                 for (const auto &op : model.operations())
                 {
-                    if (model.text(op.opType) != "core.state.regWrite") continue;
+                    if (model.text(op.opType) != "core.state.write") continue;
                     const auto refs = model.objectRefs(op);
                     const auto operands = model.operands(op);
                     if (refs.empty() || refs[0].kind != ObjectKind::State) continue;
@@ -176,7 +176,7 @@ namespace wolvrix::lib::grhsim
                                                               std::array{mask}, {}, replicate);
                         model.setOperationPhase(repOp, first.phase);
                         operands[1] = data; operands[2] = mask;
-                        const auto writeOp = model.addOperation("core.state.regWrite", operands, {},
+                        const auto writeOp = model.addOperation("core.state.write", operands, {},
                                                                 std::array{ObjectRef::state(state)},
                                                                 params, name, first.origin);
                         model.setOperationPhase(writeOp, first.phase);

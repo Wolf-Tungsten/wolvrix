@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <optional>
@@ -329,6 +332,7 @@ namespace wolvrix::lib::transform
 
     PassResult DeadCodeElimPass::run()
     {
+        const auto timingStart = std::chrono::steady_clock::now();
         PassResult result;
         bool anyChanged = false;
         const std::size_t graphCount = design().graphs().size();
@@ -929,6 +933,13 @@ namespace wolvrix::lib::transform
         message.append(std::to_string(changedGraphs));
         message.append(result.changed ? ", changed=true" : ", changed=false");
         logDebug(std::move(message));
+        if (std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr)
+        {
+            std::fprintf(stderr, "[simplify-phase] pass=dead-code-elim %lldms\n",
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now() - timingStart)
+                                                    .count()));
+        }
         return result;
     }
 

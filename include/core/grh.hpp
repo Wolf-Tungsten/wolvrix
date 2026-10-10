@@ -851,6 +851,11 @@ private:
     void ensurePortsCache() const;
     GraphBuilder& ensureBuilder();
     void removeSymbolFromGenerateGroups(SymbolId sym) noexcept;
+    // stage-07 shape contract for aliasing APIs: a flat replacement of a
+    // shaped value gets the shape backfilled (shape is a structural view, same
+    // total width by construction); aliasing two different non-empty shapes is
+    // rejected loudly instead of corrupting consumer geometry downstream.
+    void guardShapeAlias(ValueId from, ValueId to, std::string_view api);
     const GraphView& view() const;
     Value valueFromView(ValueId id) const;
     Value valueFromBuilder(ValueId id) const;

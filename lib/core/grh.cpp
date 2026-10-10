@@ -4131,8 +4131,37 @@ namespace wolvrix::lib::grh
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
+    void Graph::guardShapeAlias(ValueId from, ValueId to, std::string_view api)
+    {
+        if (!from.valid() || !to.valid())
+        {
+            return;
+        }
+        const std::span<const int64_t> fromShape = valueShape(from);
+        if (fromShape.empty())
+        {
+            return;
+        }
+        const std::span<const int64_t> toShape = valueShape(to);
+        if (toShape.empty())
+        {
+            setValueShape(to, fromShape);
+            return;
+        }
+        if (!std::equal(fromShape.begin(), fromShape.end(), toShape.begin(), toShape.end()))
+        {
+            throw std::runtime_error(std::string(api) +
+                                     ": refusing to alias array values with different shapes");
+        }
+    }
+
     void Graph::replaceResult(OperationId op, std::size_t index, ValueId value)
     {
+        const auto results = opResults(op);
+        if (index < results.size())
+        {
+            guardShapeAlias(results[index], value, "replaceResult");
+        }
         GraphBuilder &builder = ensureBuilder();
         builder.replaceResult(op, index, value);
         // No cache invalidation needed - doesn't affect value/op/port lists
@@ -4140,6 +4169,7 @@ namespace wolvrix::lib::grh
 
     void Graph::replaceAllUses(ValueId from, ValueId to)
     {
+        guardShapeAlias(from, to, "replaceAllUses");
         GraphBuilder &builder = ensureBuilder();
         builder.replaceAllUses(from, to);
         // No cache invalidation needed - doesn't affect value/op/port lists

@@ -345,10 +345,37 @@ namespace wolvrix::lib::transform
                         }
                         if (!shapesEqual(result.shape(), decl->shape))
                         {
-                            error(*graph, op, "grh.verify: kRegisterReadPort result shape " +
-                                                  shapeText(result.shape()) +
-                                                  " does not match register shape " +
-                                                  shapeText(decl->shape));
+                            // stage-07: the whole-read result is a structural
+                            // view of the register's bits (packed-first
+                            // doctrine); it may be flat over a shaped register
+                            // or carry a tiling view (e.g. inherited from a
+                            // connected port's packed type) over a flat
+                            // register. Width equality is checked above; here
+                            // only require a non-empty result shape to tile
+                            // the register width exactly.
+                            bool tiledView = result.shape().empty();
+                            if (!tiledView && decl->width > 0)
+                            {
+                                int64_t product = 1;
+                                for (const int64_t dim : result.shape())
+                                {
+                                    if (dim <= 0)
+                                    {
+                                        product = -1;
+                                        break;
+                                    }
+                                    product *= dim;
+                                }
+                                tiledView = product > 0 && decl->width % product == 0;
+                            }
+                            if (!tiledView)
+                            {
+                                error(*graph, op, "grh.verify: kRegisterReadPort result shape " +
+                                                      shapeText(result.shape()) +
+                                                      " does not tile register width " +
+                                                      std::to_string(decl->width) +
+                                                      " (register shape " + shapeText(decl->shape) + ")");
+                            }
                         }
                         break;
                     }
@@ -396,8 +423,17 @@ namespace wolvrix::lib::transform
                     }
                     if (!shapesEqual(result.shape(), std::span<const int64_t>(decl->shape).subspan(indexCount)))
                     {
-                        error(*graph, op, "grh.verify: kRegisterReadArrayPort result shape " +
-                                              shapeText(result.shape()) + " does not match expected sub-array shape");
+                        // stage-07: a flat result is always a valid view of the
+                        // sub-array bits (width equality is checked above);
+                        // shape is a structural view and passes legitimately
+                        // produce flat forms (e.g. alias/CSE representatives).
+                        // A non-empty result shape must still equal the
+                        // expected sub-array geometry exactly.
+                        if (!result.shape().empty())
+                        {
+                            error(*graph, op, "grh.verify: kRegisterReadArrayPort result shape " +
+                                                  shapeText(result.shape()) + " does not match expected sub-array shape");
+                        }
                     }
                     break;
                 }

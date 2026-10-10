@@ -2,9 +2,16 @@
 
 #include "core/grh.hpp"
 
+#include "topo_guard.hpp"
+
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -146,27 +153,38 @@ namespace wolvrix::lib::transform
             }
         };
 
-        bool isOutputPortValue(const wolvrix::lib::grh::Value &value)
+        // Lean screening helpers (stage-07): all read through the Graph id/span
+        // accessors instead of materializing fat Value/Operation copies.
+        bool isOutputPortValue(const wolvrix::lib::grh::Graph &graph,
+                               wolvrix::lib::grh::ValueId valueId)
         {
-            return value.isOutput() && !value.isInput() && !value.isInout();
+            return graph.valueIsOutput(valueId) && !graph.valueIsInput(valueId) &&
+                   !graph.valueIsInout(valueId);
         }
 
-        bool hasOtherUsers(const wolvrix::lib::grh::Value &value)
+        // Graph has no public lean users accessor, so this materializes the
+        // Value; call sites reach it only for output-port values (rare).
+        bool hasOtherUsers(const wolvrix::lib::grh::Graph &graph,
+                           wolvrix::lib::grh::ValueId valueId)
         {
+            const wolvrix::lib::grh::Value value = graph.getValue(valueId);
             return !value.users().empty();
         }
 
-        bool isTemporarySymbol(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Value &value)
+        bool isTemporarySymbol(const wolvrix::lib::grh::Graph &graph,
+                               wolvrix::lib::grh::ValueId valueId)
         {
-            if (value.isInput() || value.isOutput() || value.isInout())
+            if (graph.valueIsInput(valueId) || graph.valueIsOutput(valueId) ||
+                graph.valueIsInout(valueId))
             {
                 return false;
             }
-            if (graph.isDeclaredSymbol(value.symbol()))
+            const wolvrix::lib::grh::SymbolId symbol = graph.valueSymbol(valueId);
+            if (graph.isDeclaredSymbol(symbol))
             {
                 return false;
             }
-            const std::string_view name = value.symbolText();
+            const std::string_view name = graph.symbolText(symbol);
             if (name.rfind("_val_", 0) == 0)
             {
                 return true;
@@ -202,31 +220,43 @@ namespace wolvrix::lib::transform
         }
 
         bool isCseCandidate(const wolvrix::lib::grh::Graph &graph,
-                            const wolvrix::lib::grh::Operation &op)
+                            wolvrix::lib::grh::OperationId opId)
         {
-            if (!isSideEffectFreeOp(op.kind()))
+            const wolvrix::lib::grh::OperationKind kind = graph.opKind(opId);
+            if (!isSideEffectFreeOp(kind))
             {
                 return false;
             }
-            if (op.results().size() != 1)
+            // stage-07: constants stay out of CSE — constant dedup is
+            // const-fold's ConstantPool job (it runs before RE in the simplify
+            // pipeline), and copying/hashing their constValue literals into
+            // OpSignature (aggregate reset literals reach ~140KB) dominated
+            // this pass. A standalone RE run simply loses constant dedup;
+            // that semantic-safe trade-off is accepted.
+            if (kind == wolvrix::lib::grh::OperationKind::kConstant)
             {
                 return false;
             }
-            const wolvrix::lib::grh::ValueId resultId = op.results()[0];
+            const std::span<const wolvrix::lib::grh::ValueId> results = graph.opResults(opId);
+            if (results.size() != 1)
+            {
+                return false;
+            }
+            const wolvrix::lib::grh::ValueId resultId = results[0];
             if (!resultId.valid())
             {
                 return false;
             }
-            const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
-            if (resultValue.isInput() || resultValue.isOutput() || resultValue.isInout())
+            if (graph.valueIsInput(resultId) || graph.valueIsOutput(resultId) ||
+                graph.valueIsInout(resultId))
             {
                 return false;
             }
-            if (!isTemporarySymbol(graph, resultValue))
+            if (!isTemporarySymbol(graph, resultId))
             {
                 return false;
             }
-            for (const auto operandId : op.operands())
+            for (const auto operandId : graph.opOperands(opId))
             {
                 if (!operandId.valid())
                 {
@@ -236,25 +266,42 @@ namespace wolvrix::lib::transform
             return true;
         }
 
-        OpSignature makeSignature(const wolvrix::lib::grh::Graph &graph,
-                                  const wolvrix::lib::grh::Operation &op)
+        std::optional<OpSignature> makeSignature(const wolvrix::lib::grh::Graph &graph,
+                                                 wolvrix::lib::grh::OperationId opId)
         {
             OpSignature sig;
-            sig.kind = op.kind();
-            sig.operands.assign(op.operands().begin(), op.operands().end());
-            sig.attrs.assign(op.attrs().begin(), op.attrs().end());
+            sig.kind = graph.opKind(opId);
+            const std::span<const wolvrix::lib::grh::ValueId> operands = graph.opOperands(opId);
+            sig.operands.assign(operands.begin(), operands.end());
+            const std::span<const wolvrix::lib::grh::AttrKV> attrs = graph.opAttrs(opId);
+            // Defensive (stage-07): refuse to copy/hash a large string
+            // attribute into the signature; the op simply skips CSE.
+            // kConstant, the known offender, is already excluded upstream.
+            for (const auto &kv : attrs)
+            {
+                if (const auto *text = std::get_if<std::string>(&kv.value);
+                    text != nullptr && text->size() > 1024)
+                {
+                    return std::nullopt;
+                }
+            }
+            sig.attrs.assign(attrs.begin(), attrs.end());
             std::stable_sort(sig.attrs.begin(), sig.attrs.end(),
                              [](const wolvrix::lib::grh::AttrKV &lhs, const wolvrix::lib::grh::AttrKV &rhs)
                              { return lhs.key < rhs.key; });
-            const wolvrix::lib::grh::ValueId resultId = op.results()[0];
-            const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
-            sig.width = resultValue.width();
-            sig.isSigned = resultValue.isSigned();
+            const wolvrix::lib::grh::ValueId resultId = graph.opResults(opId)[0];
+            sig.width = graph.valueWidth(resultId);
+            sig.isSigned = graph.valueSigned(resultId);
             return sig;
         }
 
-        bool isSingleUser(const wolvrix::lib::grh::Value &value, wolvrix::lib::grh::OperationId user)
+        // Graph has no public lean users accessor, so this materializes the
+        // Value; call sites reach it only for screened rewrite candidates.
+        bool isSingleUser(const wolvrix::lib::grh::Graph &graph,
+                          wolvrix::lib::grh::ValueId valueId,
+                          wolvrix::lib::grh::OperationId user)
         {
+            const wolvrix::lib::grh::Value value = graph.getValue(valueId);
             std::size_t count = 0;
             for (const auto &use : value.users())
             {
@@ -278,77 +325,39 @@ namespace wolvrix::lib::transform
             {
                 return false;
             }
-            const wolvrix::lib::grh::OperationId defOpId = graph.getValue(maybeNot).definingOp();
+            const wolvrix::lib::grh::OperationId defOpId = graph.valueDef(maybeNot);
             if (!defOpId.valid())
             {
                 return false;
             }
-            const wolvrix::lib::grh::Operation defOp = graph.getOperation(defOpId);
-            if (defOp.kind() != wolvrix::lib::grh::OperationKind::kLogicNot &&
-                defOp.kind() != wolvrix::lib::grh::OperationKind::kNot)
+            const wolvrix::lib::grh::OperationKind defKind = graph.opKind(defOpId);
+            if (defKind != wolvrix::lib::grh::OperationKind::kLogicNot &&
+                defKind != wolvrix::lib::grh::OperationKind::kNot)
             {
                 return false;
             }
-            const auto &ops = defOp.operands();
+            const std::span<const wolvrix::lib::grh::ValueId> ops = graph.opOperands(defOpId);
             return !ops.empty() && ops.front() == operand;
         }
 
-        std::optional<int64_t> getIntAttr(const wolvrix::lib::grh::Operation &op,
+        // Lean overload: reads the attribute span directly (no Operation
+        // materialization) for hot screening loops.
+        std::optional<int64_t> getIntAttr(const wolvrix::lib::grh::Graph &graph,
+                                          wolvrix::lib::grh::OperationId op,
                                           std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
+            for (const auto &kv : graph.opAttrs(op))
             {
-                return std::nullopt;
-            }
-            if (const auto *value = std::get_if<int64_t>(&*attr))
-            {
-                return *value;
+                if (kv.key == key)
+                {
+                    if (const auto *value = std::get_if<int64_t>(&kv.value))
+                    {
+                        return *value;
+                    }
+                    return std::nullopt;
+                }
             }
             return std::nullopt;
-        }
-
-        bool dependsTransitivelyOn(const wolvrix::lib::grh::Graph &graph,
-                                   wolvrix::lib::grh::ValueId valueId,
-                                   wolvrix::lib::grh::ValueId targetId)
-        {
-            if (!valueId.valid() || !targetId.valid())
-            {
-                return false;
-            }
-            std::vector<wolvrix::lib::grh::ValueId> stack{valueId};
-            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> visited;
-            while (!stack.empty())
-            {
-                const wolvrix::lib::grh::ValueId current = stack.back();
-                stack.pop_back();
-                if (!current.valid())
-                {
-                    continue;
-                }
-                if (current == targetId)
-                {
-                    return true;
-                }
-                if (!visited.insert(current).second)
-                {
-                    continue;
-                }
-                const wolvrix::lib::grh::OperationId defOpId = graph.getValue(current).definingOp();
-                if (!defOpId.valid())
-                {
-                    continue;
-                }
-                const wolvrix::lib::grh::Operation defOp = graph.getOperation(defOpId);
-                for (const auto operandId : defOp.operands())
-                {
-                    if (operandId.valid())
-                    {
-                        stack.push_back(operandId);
-                    }
-                }
-            }
-            return false;
         }
 
         std::string makeInlineConstName(const wolvrix::lib::grh::Graph &graph,
@@ -402,6 +411,9 @@ namespace wolvrix::lib::transform
                           wolvrix::lib::grh::ValueId to,
                           const std::function<void(std::string)> &onError)
         {
+            // Shape views survive aliasing: Graph::replaceAllUses backfills the
+            // shape onto flat replacements and rejects mismatched non-empty
+            // shapes (stage-07 core guarantee).
             try
             {
                 graph.replaceAllUses(from, to);
@@ -443,6 +455,7 @@ namespace wolvrix::lib::transform
 
     PassResult RedundantElimPass::run()
     {
+        const auto timingStart = std::chrono::steady_clock::now();
         PassResult result;
         bool anyChanged = false;
         const std::size_t graphCount = design().graphs().size();
@@ -465,15 +478,47 @@ namespace wolvrix::lib::transform
                 return false;
             };
 
+            // Stage-07 compile-time fix: one topological ranking per graph
+            // sweep turns the per-candidate cycle guard into an O(1) check
+            // (see lib/transform/topo_guard.hpp); the lean DFS remains as the
+            // fallback for unranked (residual comb cycle) values.
+            const topo_guard::TopoValueRanks topoRanks = topo_guard::computeTopoValueRanks(graph);
+            topo_guard::ConeDfsScratch dfsScratch;
+            std::size_t guardDfsTrue = 0;
+            std::size_t guardDfsFalse = 0;
+            auto dependsTransitivelyOn = [&](const wolvrix::lib::grh::Graph &graph_,
+                                             wolvrix::lib::grh::ValueId valueId,
+                                             wolvrix::lib::grh::ValueId targetId) {
+                if (topoRanks.definitelyNotDependent(valueId, targetId))
+                {
+                    return false;
+                }
+                const bool dependent =
+                    topo_guard::dependsTransitivelyOn(graph_, valueId, targetId, dfsScratch);
+                if (dependent)
+                {
+                    ++guardDfsTrue;
+                }
+                else
+                {
+                    ++guardDfsFalse;
+                }
+                return dependent;
+            };
+
             std::vector<wolvrix::lib::grh::OperationId> ops(graph.operations().begin(),
                                                   graph.operations().end());
             for (const auto opId : ops)
             {
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                const auto &operands = op.operands();
-                const auto &results = op.results();
+                // Lean screening (stage-07): kind/operand/result/attr reads go
+                // through the Graph id/span accessors; a fat Operation is
+                // materialized only on rewrite error paths that need one for
+                // diagnostics.
+                const wolvrix::lib::grh::OperationKind opKind = graph.opKind(opId);
+                const std::span<const wolvrix::lib::grh::ValueId> operands = graph.opOperands(opId);
+                const std::span<const wolvrix::lib::grh::ValueId> results = graph.opResults(opId);
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kAssign &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kAssign &&
                     operands.size() == 1 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId srcId = operands[0];
@@ -482,26 +527,33 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Value srcValue = graph.getValue(srcId);
-                    const wolvrix::lib::grh::Value dstValue = graph.getValue(dstId);
 
-                    if (isOutputPortValue(dstValue) && !hasOtherUsers(dstValue))
+                    if (isOutputPortValue(graph, dstId) && !hasOtherUsers(graph, dstId))
                     {
-                        const wolvrix::lib::grh::OperationId constOpId = srcValue.definingOp();
+                        const wolvrix::lib::grh::OperationId constOpId = graph.valueDef(srcId);
                         if (constOpId.valid())
                         {
-                            const wolvrix::lib::grh::Operation constOp = graph.getOperation(constOpId);
-                            if (constOp.kind() == wolvrix::lib::grh::OperationKind::kConstant &&
-                                constOp.results().size() == 1)
+                            if (graph.opKind(constOpId) == wolvrix::lib::grh::OperationKind::kConstant &&
+                                graph.opResults(constOpId).size() == 1)
                             {
-                                auto constLiteral = constOp.attr("constValue");
-                                if (!constLiteral)
+                                // Copy the literal text up front: eraseOp
+                                // mutates builder storage, so the borrowed
+                                // attribute span is not held across it.
+                                std::string literalText;
+                                bool literalFound = false;
+                                for (const auto &kv : graph.opAttrs(constOpId))
                                 {
-                                    continue;
+                                    if (kv.key == "constValue")
+                                    {
+                                        if (const auto *text = std::get_if<std::string>(&kv.value))
+                                        {
+                                            literalText = *text;
+                                            literalFound = true;
+                                        }
+                                        break;
+                                    }
                                 }
-                                const auto *literalText =
-                                    std::get_if<std::string>(&*constLiteral);
-                                if (!literalText)
+                                if (!literalFound)
                                 {
                                     continue;
                                 }
@@ -509,8 +561,8 @@ namespace wolvrix::lib::transform
                                 {
                                     continue;
                                 }
-                                if (isSingleUser(srcValue, opId) &&
-                                    !srcValue.isOutput())
+                                if (isSingleUser(graph, srcId, opId) &&
+                                    !graph.valueIsOutput(srcId))
                                 {
                                     try
                                     {
@@ -525,14 +577,15 @@ namespace wolvrix::lib::transform
                                 }
 
                                 const std::string opName =
-                                    makeInlineConstName(graph, "op", dstValue.symbolText(),
+                                    makeInlineConstName(graph, "op",
+                                                        graph.symbolText(graph.valueSymbol(dstId)),
                                                         inlineConstCounter);
                                 wolvrix::lib::grh::SymbolId opSym = graph.internSymbol(opName);
                                 wolvrix::lib::grh::OperationId newConst =
                                     graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
                                                           opSym);
                                 graph.addResult(newConst, dstId);
-                                graph.setAttr(newConst, "constValue", *literalText);
+                                graph.setAttr(newConst, "constValue", literalText);
                                 graph.setOpSrcLoc(newConst,
                                                   makeTransformSrcLoc("redundant-elim", "clone_const"));
                                 graphChanged = true;
@@ -542,7 +595,7 @@ namespace wolvrix::lib::transform
                     }
                 }
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kConcat &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kConcat &&
                     operands.size() == 1 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId operandId = operands[0];
@@ -551,19 +604,21 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Value operandValue = graph.getValue(operandId);
-                    const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
-                    if (!isTemporarySymbol(graph, resultValue))
+                    if (!isTemporarySymbol(graph, resultId))
                     {
                         continue;
                     }
-                    if (operandValue.width() != resultValue.width() ||
-                        operandValue.isSigned() != resultValue.isSigned())
+                    if (graph.valueWidth(operandId) != graph.valueWidth(resultId) ||
+                        graph.valueSigned(operandId) != graph.valueSigned(resultId))
+                    {
+                        continue;
+                    }
+                    if (!topo_guard::shapesAliasable(graph, resultId, operandId))
                     {
                         continue;
                     }
                     auto onError = [&](const std::string &msg)
-                    { this->error(graph, op, msg); };
+                    { this->error(graph, graph.getOperation(opId), msg); };
                     replaceUsers(graph, resultId, operandId, onError);
                     if (eraseOp(opId))
                     {
@@ -572,7 +627,7 @@ namespace wolvrix::lib::transform
                     continue;
                 }
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kConcat &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kConcat &&
                     operands.size() >= 2 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId resultId = results[0];
@@ -594,30 +649,29 @@ namespace wolvrix::lib::transform
                             failed = true;
                             break;
                         }
-                        const wolvrix::lib::grh::Value operandValue = graph.getValue(operandId);
-                        const wolvrix::lib::grh::OperationId operandDefId = operandValue.definingOp();
+                        const wolvrix::lib::grh::OperationId operandDefId = graph.valueDef(operandId);
                         if (!operandDefId.valid())
                         {
                             flattenedOperands.push_back(operandId);
-                            flattenedWidth += operandValue.width();
+                            flattenedWidth += graph.valueWidth(operandId);
                             continue;
                         }
 
-                        const wolvrix::lib::grh::Operation operandDef = graph.getOperation(operandDefId);
-                        if (operandDef.kind() != wolvrix::lib::grh::OperationKind::kConcat ||
-                            !isTemporarySymbol(graph, operandValue) ||
-                            !isSingleUser(operandValue, opId))
+                        if (graph.opKind(operandDefId) != wolvrix::lib::grh::OperationKind::kConcat ||
+                            !isTemporarySymbol(graph, operandId) ||
+                            !isSingleUser(graph, operandId, opId))
                         {
                             flattenedOperands.push_back(operandId);
-                            flattenedWidth += operandValue.width();
+                            flattenedWidth += graph.valueWidth(operandId);
                             continue;
                         }
 
-                        const auto &innerOperands = operandDef.operands();
+                        const std::span<const wolvrix::lib::grh::ValueId> innerOperands =
+                            graph.opOperands(operandDefId);
                         if (innerOperands.empty())
                         {
                             flattenedOperands.push_back(operandId);
-                            flattenedWidth += operandValue.width();
+                            flattenedWidth += graph.valueWidth(operandId);
                             continue;
                         }
 
@@ -631,7 +685,7 @@ namespace wolvrix::lib::transform
                                 canFlatten = false;
                                 break;
                             }
-                            const int64_t width = graph.getValue(innerOperandId).width();
+                            const int64_t width = graph.valueWidth(innerOperandId);
                             if (width <= 0)
                             {
                                 canFlatten = false;
@@ -639,10 +693,10 @@ namespace wolvrix::lib::transform
                             }
                             innerWidth += width;
                         }
-                        if (!canFlatten || innerWidth != operandValue.width())
+                        if (!canFlatten || innerWidth != graph.valueWidth(operandId))
                         {
                             flattenedOperands.push_back(operandId);
-                            flattenedWidth += operandValue.width();
+                            flattenedWidth += graph.valueWidth(operandId);
                             continue;
                         }
 
@@ -658,8 +712,7 @@ namespace wolvrix::lib::transform
                         continue;
                     }
 
-                    const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
-                    if (flattenedWidth != resultValue.width())
+                    if (flattenedWidth != graph.valueWidth(resultId))
                     {
                         continue;
                     }
@@ -668,7 +721,7 @@ namespace wolvrix::lib::transform
                     {
                         for (std::size_t i = 0; i < flattenedOperands.size(); ++i)
                         {
-                            if (graph.getOperation(opId).operands().size() > i)
+                            if (graph.opOperands(opId).size() > i)
                             {
                                 graph.replaceOperand(opId, i, flattenedOperands[i]);
                             }
@@ -677,21 +730,21 @@ namespace wolvrix::lib::transform
                                 graph.addOperand(opId, flattenedOperands[i]);
                             }
                         }
-                        while (graph.getOperation(opId).operands().size() > flattenedOperands.size())
+                        while (graph.opOperands(opId).size() > flattenedOperands.size())
                         {
-                            graph.eraseOperand(opId, graph.getOperation(opId).operands().size() - 1);
+                            graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
                         }
                         graphChanged = true;
                     }
                     catch (const std::exception &ex)
                     {
-                        this->error(graph, op,
+                        this->error(graph, graph.getOperation(opId),
                                     std::string("Failed to flatten nested concat: ") + ex.what());
                     }
                     continue;
                 }
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceStatic &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kSliceStatic &&
                     operands.size() == 1 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId baseId = operands[0];
@@ -700,26 +753,25 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const auto sliceStart = getIntAttr(op, "sliceStart");
-                    const auto sliceEnd = getIntAttr(op, "sliceEnd");
+                    const auto sliceStart = getIntAttr(graph, opId, "sliceStart");
+                    const auto sliceEnd = getIntAttr(graph, opId, "sliceEnd");
                     if (!sliceStart || !sliceEnd || *sliceStart < 0 || *sliceEnd < *sliceStart)
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Value baseValue = graph.getValue(baseId);
-                    const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
 
                     const bool isIdentitySlice =
                         *sliceStart == 0 &&
-                        *sliceEnd + 1 == baseValue.width() &&
-                        baseValue.width() == resultValue.width() &&
-                        baseValue.isSigned() == resultValue.isSigned();
+                        *sliceEnd + 1 == graph.valueWidth(baseId) &&
+                        graph.valueWidth(baseId) == graph.valueWidth(resultId) &&
+                        graph.valueSigned(baseId) == graph.valueSigned(resultId);
                     if (isIdentitySlice &&
                         !dependsTransitivelyOn(graph, baseId, resultId) &&
-                        (isTemporarySymbol(graph, resultValue) || isOutputPortValue(resultValue)))
+                        topo_guard::shapesAliasable(graph, resultId, baseId) &&
+                        (isTemporarySymbol(graph, resultId) || isOutputPortValue(graph, resultId)))
                     {
                         auto onError = [&](const std::string &msg)
-                        { this->error(graph, op, msg); };
+                        { this->error(graph, graph.getOperation(opId), msg); };
                         replaceUsers(graph, resultId, baseId, onError);
                         if (eraseOp(opId))
                         {
@@ -728,24 +780,25 @@ namespace wolvrix::lib::transform
                         continue;
                     }
 
-                    const wolvrix::lib::grh::OperationId baseDefId = baseValue.definingOp();
+                    const wolvrix::lib::grh::OperationId baseDefId = graph.valueDef(baseId);
                     if (!baseDefId.valid())
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Operation baseDef = graph.getOperation(baseDefId);
-                    if (baseDef.kind() == wolvrix::lib::grh::OperationKind::kSliceStatic &&
-                        baseDef.operands().size() == 1)
+                    const wolvrix::lib::grh::OperationKind baseDefKind = graph.opKind(baseDefId);
+                    if (baseDefKind == wolvrix::lib::grh::OperationKind::kSliceStatic &&
+                        graph.opOperands(baseDefId).size() == 1)
                     {
-                        const auto innerStart = getIntAttr(baseDef, "sliceStart");
-                        const auto innerEnd = getIntAttr(baseDef, "sliceEnd");
+                        const auto innerStart = getIntAttr(graph, baseDefId, "sliceStart");
+                        const auto innerEnd = getIntAttr(graph, baseDefId, "sliceEnd");
                         if (innerStart && innerEnd && *innerStart >= 0 && *innerEnd >= *innerStart)
                         {
                             const int64_t combinedStart = *innerStart + *sliceStart;
                             const int64_t combinedEnd = *innerStart + *sliceEnd;
                             if (combinedEnd <= *innerEnd)
                             {
-                                const wolvrix::lib::grh::ValueId innerBaseId = baseDef.operands()[0];
+                                const wolvrix::lib::grh::ValueId innerBaseId =
+                                    graph.opOperands(baseDefId)[0];
                                 if (innerBaseId.valid() &&
                                     !dependsTransitivelyOn(graph, innerBaseId, resultId))
                                 {
@@ -759,18 +812,19 @@ namespace wolvrix::lib::transform
                                     }
                                     catch (const std::exception &ex)
                                     {
-                                        this->error(graph, op,
+                                        this->error(graph, graph.getOperation(opId),
                                                     std::string("Failed to combine nested slice: ") + ex.what());
                                     }
                                 }
                             }
                         }
                     }
-                    if (baseDef.kind() != wolvrix::lib::grh::OperationKind::kConcat)
+                    if (baseDefKind != wolvrix::lib::grh::OperationKind::kConcat)
                     {
                         continue;
                     }
-                    const auto &concatOperands = baseDef.operands();
+                    const std::span<const wolvrix::lib::grh::ValueId> concatOperands =
+                        graph.opOperands(baseDefId);
                     if (concatOperands.empty())
                     {
                         continue;
@@ -787,7 +841,7 @@ namespace wolvrix::lib::transform
                             widthsOk = false;
                             break;
                         }
-                        const int64_t width = graph.getValue(operandId).width();
+                        const int64_t width = graph.valueWidth(operandId);
                         if (width <= 0)
                         {
                             widthsOk = false;
@@ -796,7 +850,7 @@ namespace wolvrix::lib::transform
                         operandWidths.push_back(width);
                         totalWidth += width;
                     }
-                    if (!widthsOk || totalWidth <= 0 || totalWidth != baseValue.width() || *sliceEnd >= totalWidth)
+                    if (!widthsOk || totalWidth <= 0 || totalWidth != graph.valueWidth(baseId) || *sliceEnd >= totalWidth)
                     {
                         continue;
                     }
@@ -819,20 +873,20 @@ namespace wolvrix::lib::transform
                         {
                             break;
                         }
-                        const wolvrix::lib::grh::Value selectedOperand = graph.getValue(selectedOperandId);
                         const int64_t newLow = *sliceStart - operandLow;
                         const int64_t newHigh = *sliceEnd - operandLow;
                         const bool selectsWholeOperand =
                             newLow == 0 &&
-                            newHigh + 1 == selectedOperand.width() &&
-                            selectedOperand.width() == resultValue.width() &&
-                            selectedOperand.isSigned() == resultValue.isSigned();
+                            newHigh + 1 == graph.valueWidth(selectedOperandId) &&
+                            graph.valueWidth(selectedOperandId) == graph.valueWidth(resultId) &&
+                            graph.valueSigned(selectedOperandId) == graph.valueSigned(resultId);
 
                         if (selectsWholeOperand &&
-                            (isTemporarySymbol(graph, resultValue) || isOutputPortValue(resultValue)))
+                            topo_guard::shapesAliasable(graph, resultId, selectedOperandId) &&
+                            (isTemporarySymbol(graph, resultId) || isOutputPortValue(graph, resultId)))
                         {
                             auto onError = [&](const std::string &msg)
-                            { this->error(graph, op, msg); };
+                            { this->error(graph, graph.getOperation(opId), msg); };
                             replaceUsers(graph, resultId, selectedOperandId, onError);
                             if (eraseOp(opId))
                             {
@@ -866,7 +920,7 @@ namespace wolvrix::lib::transform
                         }
                         catch (const std::exception &ex)
                         {
-                            this->error(graph, op,
+                            this->error(graph, graph.getOperation(opId),
                                         std::string("Failed to retarget slice through concat: ") + ex.what());
                         }
                         break;
@@ -874,7 +928,7 @@ namespace wolvrix::lib::transform
                     continue;
                 }
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kLogicOr &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kLogicOr &&
                     operands.size() >= 2 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId resultId = results[0];
@@ -882,8 +936,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Value resultValue = graph.getValue(resultId);
-                    if (resultValue.width() != 1)
+                    if (graph.valueWidth(resultId) != 1)
                     {
                         continue;
                     }
@@ -911,13 +964,13 @@ namespace wolvrix::lib::transform
                         }
                     }
                     if (alwaysTrue &&
-                        (isTemporarySymbol(graph, resultValue) || isOutputPortValue(resultValue)))
+                        (isTemporarySymbol(graph, resultId) || isOutputPortValue(graph, resultId)))
                     {
                         auto onError = [&](const std::string &msg)
-                        { this->error(graph, op, msg); };
+                        { this->error(graph, graph.getOperation(opId), msg); };
                         wolvrix::lib::grh::ValueId constOne =
-                            createInlineConst(graph, resultValue.symbolText(),
-                                              1, resultValue.isSigned(), "1'b1",
+                            createInlineConst(graph, graph.symbolText(graph.valueSymbol(resultId)),
+                                              1, graph.valueSigned(resultId), "1'b1",
                                               inlineConstCounter);
                         replaceUsers(graph, resultId, constOne, onError);
                         eraseOp(opId);
@@ -926,7 +979,7 @@ namespace wolvrix::lib::transform
                     }
                 }
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kAssign &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kAssign &&
                     operands.size() == 1 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId srcId = operands[0];
@@ -935,49 +988,48 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Value srcValue = graph.getValue(srcId);
-                    const wolvrix::lib::grh::Value dstValue = graph.getValue(dstId);
-                    if (isOutputPortValue(dstValue) && !hasOtherUsers(dstValue))
+                    if (isOutputPortValue(graph, dstId) && !hasOtherUsers(graph, dstId))
                     {
-                        if (srcValue.isInput() || srcValue.isOutput() || srcValue.isInout())
+                        if (graph.valueIsInput(srcId) || graph.valueIsOutput(srcId) ||
+                            graph.valueIsInout(srcId))
                         {
                             continue;
                         }
-                        if (!dstValue.definingOp().valid() ||
-                            dstValue.definingOp() != opId)
+                        const wolvrix::lib::grh::OperationId dstDefId = graph.valueDef(dstId);
+                        if (!dstDefId.valid() || dstDefId != opId)
                         {
                             continue;
                         }
-                        if (!isSingleUser(srcValue, opId))
+                        if (!isSingleUser(graph, srcId, opId))
                         {
                             continue;
                         }
-                        if (srcValue.width() != dstValue.width() ||
-                            srcValue.isSigned() != dstValue.isSigned())
+                        if (graph.valueWidth(srcId) != graph.valueWidth(dstId) ||
+                            graph.valueSigned(srcId) != graph.valueSigned(dstId))
                         {
                             continue;
                         }
-                        const wolvrix::lib::grh::OperationId defOpId =
-                            srcValue.definingOp();
+                        const wolvrix::lib::grh::OperationId defOpId = graph.valueDef(srcId);
                         if (!defOpId.valid() || defOpId == opId)
                         {
                             continue;
                         }
-                        const wolvrix::lib::grh::Operation defOp = graph.getOperation(defOpId);
-                        if (defOp.results().empty())
+                        const std::span<const wolvrix::lib::grh::ValueId> defResults =
+                            graph.opResults(defOpId);
+                        if (defResults.empty())
                         {
                             continue;
                         }
-                        std::size_t defIndex = defOp.results().size();
-                        for (std::size_t i = 0; i < defOp.results().size(); ++i)
+                        std::size_t defIndex = defResults.size();
+                        for (std::size_t i = 0; i < defResults.size(); ++i)
                         {
-                            if (defOp.results()[i] == srcId)
+                            if (defResults[i] == srcId)
                             {
                                 defIndex = i;
                                 break;
                             }
                         }
-                        if (defIndex >= defOp.results().size())
+                        if (defIndex >= defResults.size())
                         {
                             continue;
                         }
@@ -992,49 +1044,51 @@ namespace wolvrix::lib::transform
                         }
                         catch (const std::exception &ex)
                         {
-                            this->error(graph, defOp,
+                            this->error(graph, graph.getOperation(defOpId),
                                         std::string("Failed to inline output assign: ") +
                                             ex.what());
                         }
                         continue;
                     }
-                    if (dstValue.isInput() || dstValue.isOutput() || dstValue.isInout())
+                    if (graph.valueIsInput(dstId) || graph.valueIsOutput(dstId) ||
+                        graph.valueIsInout(dstId))
                     {
                         continue;
                     }
-                    if (!isTemporarySymbol(graph, srcValue))
+                    if (!isTemporarySymbol(graph, srcId))
                     {
                         continue;
                     }
-                    if (!isSingleUser(srcValue, opId))
+                    if (!isSingleUser(graph, srcId, opId))
                     {
                         continue;
                     }
-                    if (srcValue.width() != dstValue.width() ||
-                        srcValue.isSigned() != dstValue.isSigned())
+                    if (graph.valueWidth(srcId) != graph.valueWidth(dstId) ||
+                        graph.valueSigned(srcId) != graph.valueSigned(dstId))
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::OperationId defOpId = srcValue.definingOp();
+                    const wolvrix::lib::grh::OperationId defOpId = graph.valueDef(srcId);
                     if (!defOpId.valid() || defOpId == opId)
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Operation defOp = graph.getOperation(defOpId);
-                    if (defOp.results().empty())
+                    const std::span<const wolvrix::lib::grh::ValueId> defResults =
+                        graph.opResults(defOpId);
+                    if (defResults.empty())
                     {
                         continue;
                     }
-                    std::size_t defIndex = defOp.results().size();
-                    for (std::size_t i = 0; i < defOp.results().size(); ++i)
+                    std::size_t defIndex = defResults.size();
+                    for (std::size_t i = 0; i < defResults.size(); ++i)
                     {
-                        if (defOp.results()[i] == srcId)
+                        if (defResults[i] == srcId)
                         {
                             defIndex = i;
                             break;
                         }
                     }
-                    if (defIndex >= defOp.results().size())
+                    if (defIndex >= defResults.size())
                     {
                         continue;
                     }
@@ -1049,13 +1103,13 @@ namespace wolvrix::lib::transform
                     }
                     catch (const std::exception &ex)
                     {
-                        this->error(graph, defOp,
+                        this->error(graph, graph.getOperation(defOpId),
                                     std::string("Failed to inline assign: ") + ex.what());
                     }
                     continue;
                 }
 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kNot &&
+                if (opKind == wolvrix::lib::grh::OperationKind::kNot &&
                     operands.size() == 1 && results.size() == 1)
                 {
                     const wolvrix::lib::grh::ValueId operandId = operands[0];
@@ -1064,39 +1118,39 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Value operandValue = graph.getValue(operandId);
-                    if (!isTemporarySymbol(graph, operandValue))
+                    if (!isTemporarySymbol(graph, operandId))
                     {
                         continue;
                     }
-                    if (!isSingleUser(operandValue, opId))
+                    if (!isSingleUser(graph, operandId, opId))
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::OperationId defOpId = operandValue.definingOp();
+                    const wolvrix::lib::grh::OperationId defOpId = graph.valueDef(operandId);
                     if (!defOpId.valid())
                     {
                         continue;
                     }
-                    const wolvrix::lib::grh::Operation defOp = graph.getOperation(defOpId);
-                    if (defOp.kind() != wolvrix::lib::grh::OperationKind::kXor)
+                    if (graph.opKind(defOpId) != wolvrix::lib::grh::OperationKind::kXor)
                     {
                         continue;
                     }
-                    if (defOp.results().empty())
+                    const std::span<const wolvrix::lib::grh::ValueId> defResults =
+                        graph.opResults(defOpId);
+                    if (defResults.empty())
                     {
                         continue;
                     }
-                    std::size_t defIndex = defOp.results().size();
-                    for (std::size_t i = 0; i < defOp.results().size(); ++i)
+                    std::size_t defIndex = defResults.size();
+                    for (std::size_t i = 0; i < defResults.size(); ++i)
                     {
-                        if (defOp.results()[i] == operandId)
+                        if (defResults[i] == operandId)
                         {
                             defIndex = i;
                             break;
                         }
                     }
-                    if (defIndex >= defOp.results().size())
+                    if (defIndex >= defResults.size())
                     {
                         continue;
                     }
@@ -1112,7 +1166,7 @@ namespace wolvrix::lib::transform
                     }
                     catch (const std::exception &ex)
                     {
-                        this->error(graph, defOp,
+                        this->error(graph, graph.getOperation(defOpId),
                                     std::string("Failed to fold NOT/XOR: ") + ex.what());
                     }
                     continue;
@@ -1130,18 +1184,25 @@ namespace wolvrix::lib::transform
                                                       graph.operations().end());
             for (const auto opId : cseOps)
             {
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                if (!isCseCandidate(graph, op))
+                // Lean screening (stage-07): candidate checks read id/span
+                // accessors only; kConstant never enters CSE (see
+                // isCseCandidate), so no mega constValue literal is copied
+                // into a signature.
+                if (!isCseCandidate(graph, opId))
                 {
                     continue;
                 }
-                const wolvrix::lib::grh::ValueId resultId = op.results()[0];
-                if (graph.getValue(resultId).type() != wolvrix::lib::grh::ValueType::Logic)
+                const wolvrix::lib::grh::ValueId resultId = graph.opResults(opId)[0];
+                if (graph.valueType(resultId) != wolvrix::lib::grh::ValueType::Logic)
                 {
                     continue;
                 }
-                OpSignature sig = makeSignature(graph, op);
-                auto [it, inserted] = seen.emplace(std::move(sig), CseEntry{opId, resultId});
+                std::optional<OpSignature> sig = makeSignature(graph, opId);
+                if (!sig)
+                {
+                    continue;
+                }
+                auto [it, inserted] = seen.emplace(std::move(*sig), CseEntry{opId, resultId});
                 if (inserted)
                 {
                     continue;
@@ -1151,8 +1212,22 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
+                // stage-07: shape is part of the value's structural contract for
+                // kSliceArray/kRegister-port consumers. Merging two duplicates
+                // whose results carry different non-empty shapes would hand one
+                // consumer the wrong geometry; only merge when shapes agree
+                // (flat+shaped merges are fine: replaceUsers backfills the
+                // shape onto the flat representative).
+                const auto resultShape = graph.valueShape(resultId);
+                const auto canonicalShape = graph.valueShape(canonicalValue);
+                if (!resultShape.empty() && !canonicalShape.empty()
+                    && !std::equal(resultShape.begin(), resultShape.end(),
+                                   canonicalShape.begin(), canonicalShape.end()))
+                {
+                    continue;
+                }
                 auto onError = [&](const std::string &msg)
-                { this->error(graph, op, msg); };
+                { this->error(graph, graph.getOperation(opId), msg); };
                 replaceUsers(graph, resultId, canonicalValue, onError);
                 if (eraseOp(opId))
                 {
@@ -1166,23 +1241,24 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                wolvrix::lib::grh::Value value = graph.getValue(port.value);
-                if (value.symbolText() == port.name)
+                if (graph.symbolText(graph.valueSymbol(port.value)) == port.name)
                 {
                     continue;
                 }
-                wolvrix::lib::grh::OperationId def = value.definingOp();
+                const wolvrix::lib::grh::OperationId def = graph.valueDef(port.value);
                 if (!def.valid())
                 {
                     continue;
                 }
-                if (graph.getOperation(def).kind() != wolvrix::lib::grh::OperationKind::kConstant)
+                if (graph.opKind(def) != wolvrix::lib::grh::OperationKind::kConstant)
                 {
                     continue;
                 }
                 wolvrix::lib::grh::ValueId existing = graph.findValue(port.name);
                 if (existing.valid() && existing != port.value)
                 {
+                    // Cold path (per output port): keep the fat Value for the
+                    // users emptiness check — no lean users accessor exists.
                     wolvrix::lib::grh::Value existingValue = graph.getValue(existing);
                     if (existingValue.isInput() || existingValue.isOutput() ||
                         existingValue.isInout() || existingValue.definingOp().valid() ||
@@ -1215,6 +1291,22 @@ namespace wolvrix::lib::transform
             {
                 ++changedGraphs;
             }
+            if (std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr)
+            {
+                std::fprintf(stderr,
+                             "[re-guard] graph=%s values=%zu unranked=%zu fastSafe=%zu "
+                             "fallbackUnranked=%zu fallbackOrdered=%zu dfsTrue=%zu dfsFalse=%zu "
+                             "dfsNodes=%llu\n",
+                             std::string(graph.symbol()).c_str(),
+                             topoRanks.totalValues,
+                             topoRanks.unrankedValues,
+                             topoRanks.fastSafe,
+                             topoRanks.fallbackUnranked,
+                             topoRanks.fallbackOrdered,
+                             guardDfsTrue,
+                             guardDfsFalse,
+                             static_cast<unsigned long long>(dfsScratch.nodesExpanded));
+            }
         }
 
         result.changed = anyChanged;
@@ -1228,6 +1320,13 @@ namespace wolvrix::lib::transform
         message.append(", valuesRemoved=");
         message.append(std::to_string(valuesRemoved));
         logDebug(std::move(message));
+        if (std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr)
+        {
+            std::fprintf(stderr, "[simplify-phase] pass=redundant-elim %lldms\n",
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now() - timingStart)
+                                                    .count()));
+        }
         return result;
     }
 

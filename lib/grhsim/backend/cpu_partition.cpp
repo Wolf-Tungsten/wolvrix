@@ -141,7 +141,26 @@ namespace wolvrix::lib::grhsim
                         for (uint32_t i = useOffsets[value.index]; i < useOffsets[value.index + 1]; ++i)
                             if (compute[uses[i].index] && --indegree[uses[i].index] == 0) ready.push_back(uses[i]);
                 }
-                if (topo.size() != ops.size()) throw std::runtime_error("CPU compute graph contains a combinational cycle");
+                if (topo.size() != ops.size())
+                {
+                    // stage-07: report the residual cycle members before dying —
+                    // aggregate RTL can leave pseudo-cycles through dynamic array
+                    // reads that scalarized forms never had.
+                    std::string detail;
+                    std::size_t shown = 0;
+                    for (auto id : ops)
+                    {
+                        if (indegree[id.index] > 0 && shown < 12)
+                        {
+                            const auto &op = model.operations()[id.index - 1];
+                            detail += " ";
+                            detail += std::string(model.text(op.name));
+                            detail += "(" + std::string(model.text(op.opType)) + ")";
+                            ++shown;
+                        }
+                    }
+                    throw std::runtime_error("CPU compute graph contains a combinational cycle; members:" + detail);
+                }
             }
         };
 

@@ -1111,7 +1111,10 @@ end
 **operands**: 无
 
 **results**:
-- `res[0]`: 读出的寄存器值，宽度与 shape 同目标 kRegister（数组寄存器读出全数组 value）
+- `res[0]`: 读出的寄存器值，宽度与目标 kRegister 相同。shape 契约（stage-07 修订）：
+  整体读结果是寄存器位内容的结构视图——可以为空（扁平视图，哪怕寄存器带 shape），
+  也可以携带任意精确铺满总位宽的 tiling shape（哪怕寄存器是标量轨无 shape，
+  例如视图来自端口连接对侧的 packed 类型）。verifier 只校验位宽一致与 shape 铺满。
 
 **attrs**:
 - `regSymbol` (string): 指向目标 kRegister 的 symbol

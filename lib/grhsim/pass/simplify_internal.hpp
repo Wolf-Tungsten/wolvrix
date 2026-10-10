@@ -86,8 +86,8 @@ namespace wolvrix::lib::grhsim
                                            std::span<const uint32_t> replacementWidth);
 
     // merge*: the target entity is packed into another entity at a per-entity
-    // bit base (reg-to-mem row -> table element, comb-pack lane -> packed
-    // value, pack-bit-registers member -> packed word). Slices are re-targeted
+    // bit base (comb-pack lane -> packed value, pack-bit-registers member ->
+    // packed word). Slices are re-targeted
     // and their targetOffset shifts by `targetBase[oldIndex]`; a Direct slice
     // downgrades to `kind` (Merged for all current callers). Whole-object
     // markers (width == 0) are dropped: after a merge the declaration is

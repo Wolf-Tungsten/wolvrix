@@ -1,5 +1,19 @@
 # Recovering scalarized tables
 
+> **RETIRED — 2026-10-10 (stage-07 sub-stage 7c-3).** The `grhsim.reg-to-mem`
+> and `grhsim.reg-to-mem-analyze` passes, their tests, and the playground
+> Makefile targets/scripts around them are removed. After stage-04/06
+> preserve-aggregate carried arrays end-to-end from firtool RTL into GrhSIM
+> IR, the frontend no longer scalarizes register families, so this pass had
+> no input left; measured results also showed disabling it was never a
+> regression. See
+> `pdocs/grh-ir-array-support/stage-07-preserve-aggregate-e2e.md` (end-to-end
+> preserve-aggregate design) and
+> `pdocs/perf-optimization/20261007-040954-reg-to-mem-off-negative.md`
+> (negative-result measurement). The body below is kept verbatim as a
+> historical record of the recognition rules, cost model, and
+> naming/reporting contracts — it describes a pass that no longer exists.
+
 `grhsim.reg-to-mem` is a semantic pass run after GRH-to-GrhSIM lowering and before CPU
 split-phase and mapping. It creates array states (one shaped `core.logic` state per
 family) from compatible scalar states without depending on RTL module names.

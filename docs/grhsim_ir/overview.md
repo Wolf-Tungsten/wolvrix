@@ -278,10 +278,11 @@ DeclProvenanceSlice
   `grhsim.simplify` 的全部子 pass 已按此维护（就地改写零维护、折叠重定向为
   alias、等价状态合并为 merged、窄化截断为部分覆盖，细则见
   [simplify pass 文档](passes/simplify.md)）；全图优化段（M5d-3）的
-  `grhsim.reg-to-mem`、`grhsim.comb-pack`、`grhsim.pack-bit-registers` 通过共享的
-  `mergeProvenance{Value,State}Slices` helper 把被合并行/成员/lane 的 slice 重定向为
-  目标实体内的偏移位段（kind=merged，targetOffset 按 lane/行/bit 线性偏移），细则见各
-  pass 文档；
+  `grhsim.comb-pack`、`grhsim.pack-bit-registers` 通过共享的
+  `mergeProvenance{Value,State}Slices` helper 把被合并成员/lane 的 slice 重定向为
+  目标实体内的偏移位段（kind=merged，targetOffset 按 lane/bit 线性偏移），细则见各
+  pass 文档（`grhsim.reg-to-mem` 已于 2026-10-10 退役，见
+  [reg-to-mem 历史记录](passes/reg-to-mem.md)）；
 - `compact()` 把 slice 目标重映射到重编号后的实体，并丢弃目标已被删除的 slice
   （记录保留，slices 可能变空，表示"声明已知、当前未实现"）——这是 pass 未主动
   维护时的安全网，不是免维护许可；

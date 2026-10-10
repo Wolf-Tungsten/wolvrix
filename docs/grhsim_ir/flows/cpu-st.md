@@ -56,13 +56,16 @@ metadata（见 [Overview](../overview.md) 第 3.4 节；`keep_declared_symbols=F
 `keep_declared_symbols`，不得以关闭声明保留换取优化。
 
 XiangShan 入口在 lower 成功后先执行全图优化段（M5d-3 起的目标 A 段顺序）：
-`grhsim.canonicalize-compute`（归一化）、`grhsim.reg-to-mem`（恢复标量化表/数组）、
+`grhsim.canonicalize-compute`（归一化）、
 [`grhsim.comb-pack`](../passes/comb-pack.md)（全图同构组合 lane 打包）、
 [`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)（bit 寄存器打包，改用原始
 event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全图不动点化简，
 最后 [`grhsim.select-state-stores`](../passes/select-state-stores.md)（M5d-4，A7）
 完成语义存储分类——每个状态获得 `regLatch`/`mem` 归属与对应 NBA 提交契约（见
 [Overview](../overview.md) 第 3.5 节）；这些 pass 不修改 GRH。
+（`grhsim.reg-to-mem` 已于 2026-10-10 从该段退役：stage-04/06 preserve-aggregate
+端到端保留数组后前端不再产标量化寄存器族，pass 失去输入来源，见
+[reg-to-mem 历史记录](../passes/reg-to-mem.md)。）
 
 随后是分区段 B（M5d-5 起接线，仍为纯语义层，不建立任何 CPU mapping）：
 `grhsim.classify-event-inputs`（B1）、`grhsim.lower-edge-detect`（B2）、

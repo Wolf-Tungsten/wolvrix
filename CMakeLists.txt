@@ -125,7 +125,6 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/simplify_internal.cpp
     lib/grhsim/pass/const_fold.cpp
     lib/grhsim/pass/simplify.cpp
-    lib/grhsim/pass/reg_to_mem.cpp
     lib/grhsim/pass/comb_pack.cpp
     lib/grhsim/pass/canonicalize_compute.cpp
     lib/grhsim/pass/bitwise_predicates.cpp
@@ -434,11 +433,6 @@ target_compile_definitions(grhsim-split-phases-tests
 
 register_test_exe(grhsim-split-phases-tests)
 
-add_executable(grhsim-reg-to-mem-tests tests/grhsim/test_reg_to_mem.cpp tests/grhsim/test_reg_to_mem_semantics.cpp)
-target_link_libraries(grhsim-reg-to-mem-tests PRIVATE wolvrix-lib)
-target_compile_definitions(grhsim-reg-to-mem-tests PRIVATE
-    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim")
-register_test_exe(grhsim-reg-to-mem-tests)
 add_executable(grhsim-event-lowering-tests tests/grhsim/test_grhsim_event_lowering.cpp)
 target_link_libraries(grhsim-event-lowering-tests PRIVATE wolvrix-lib)
 target_compile_definitions(grhsim-event-lowering-tests PRIVATE

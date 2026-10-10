@@ -1,9 +1,10 @@
 // Directed tests for the M5d-3 whole-graph optimization stage (A2-A6):
-// grhsim.reg-to-mem declaration-provenance maintenance and declared-family
-// shape recovery, the new grhsim.comb-pack lane packing, the reworked
-// grhsim.pack-bit-registers (raw event_edges + read/write safety analysis, no
-// CPU schedule), and the wired whole-graph pipeline ending in
-// grhsim.simplify(scope=whole).
+// grhsim.comb-pack lane packing, the reworked grhsim.pack-bit-registers
+// (raw event_edges + read/write safety analysis, no CPU schedule), and the
+// wired whole-graph pipeline ending in grhsim.simplify(scope=whole).
+// stage-07 7c-3 (2026-10-10): grhsim.reg-to-mem is retired — preserve-aggregate
+// RTL keeps arrays declared end-to-end, so the pass has no input left; its
+// dedicated fixture and its pipeline step are removed from this suite.
 
 #include "grhsim/dialect/registry.hpp"
 #include "grhsim/io/json.hpp"
@@ -137,10 +138,9 @@ namespace
         return model.types()[model.values()[value.index - 1].type.index - 1].width;
     }
 
-    // Minimal two-state interpreter (same semantics as the reg-to-mem
-    // semantics suite): reads see the pre-step state, writes publish together
-    // after evaluation, event edges compare against the previous step's event
-    // value (zero-initialized prev slots).
+    // Minimal two-state interpreter: reads see the pre-step state, writes
+    // publish together after evaluation, event edges compare against the
+    // previous step's event value (zero-initialized prev slots).
     class Simulation
     {
     public:
@@ -808,110 +808,6 @@ namespace
         return 0;
     }
 
-    // ---- A3: reg-to-mem declared-provenance and shape fixture -------------
-    // Two decoded write families with declared rows: tbl_0..3 (1-D) and
-    // mat_0_0..mat_1_1 (2-D, row-major decode order).
-    grhsim::GrhSimModel makeRegToMemDeclaredModel()
-    {
-        ModelBuilder b;
-        const auto addrType = b.model.logicType(3, false, grhsim::LogicDomain::TwoState);
-        const auto clk = b.input("clk", b.bit);
-        const auto u = b.input("u", b.bit);
-        const auto en = b.input("en", b.bit);
-        const auto addr = b.input("addr", addrType);
-        const auto d = b.input("d", b.byte);
-        const auto addr2 = b.input("addr2", addrType);
-        const auto d2 = b.input("d2", b.byte);
-        const auto mask = b.constant(b.byte, 0xff);
-        const std::vector<std::string> edges{"posedge"};
-        auto family = [&](std::string_view prefix, bool twoDim, grhsim::ValueId familyAddr,
-                          grhsim::ValueId familyData, std::string_view outputPrefix) {
-            for (unsigned row = 0; row < 4; ++row)
-            {
-                const std::string name = twoDim
-                    ? std::string(prefix) + "_" + char('0' + row / 2) + "_" + char('0' + row % 2)
-                    : std::string(prefix) + "_" + char('0' + row);
-                const auto state = b.state(name, b.byte, row);
-                const auto old = b.read(state, b.byte);
-                const auto hit = b.compute("core.compute.eq", b.bit,
-                                           {familyAddr, b.constant(addrType, row)});
-                const auto low = b.compute("core.compute.logicAnd", b.bit, {en, hit});
-                const auto next = b.compute("core.compute.mux", b.byte, {low, familyData, old});
-                b.model.addOperation("core.state.write", std::array{u, next, mask, clk}, {},
-                                     std::array{grhsim::ObjectRef::state(state)},
-                                     std::array{grhsim::Parameter{b.model.intern("event_edges"), edges}});
-                b.output(std::string(outputPrefix) + "_" + char('0' + row), b.byte, old);
-            }
-        };
-        family("tbl", false, addr, d, "qt");
-        family("mat", true, addr2, d2, "qm");
-        return std::move(b.model);
-    }
-
-    int runRegToMemDeclaredTest(const std::filesystem::path &artifactDir)
-    {
-        auto original = makeRegToMemDeclaredModel();
-        Simulation reference(original);
-        auto model = makeRegToMemDeclaredModel();
-        const auto reportPath = artifactDir / "reg_to_mem_declared.tsv";
-        const std::string reportArg = reportPath.string();
-        const std::array<std::string_view, 4> args{"--enable-cost-selection", "false", "--report",
-                                                   reportArg};
-        const Messages messages = runPass(model, "grhsim.reg-to-mem", args);
-        if (!messagesContain(messages, "transformed=2") ||
-            !messagesContain(messages, "provenance_records=8") ||
-            !messagesContain(messages, "declared_families=2") ||
-            !messagesContain(messages, "max_array_dims=2"))
-            return fail("reg-to-mem provenance/shape counters wrong");
-        const grhsim::StateObject *tbl = nullptr, *mat = nullptr;
-        for (const auto &state : model.states())
-        {
-            const std::string_view name = model.text(state.name);
-            if (name.find("__reg_to_mem_tbl_@__") == 0) tbl = &state;
-            if (name.find("__reg_to_mem_mat_@_@__") == 0) mat = &state;
-        }
-        if (!tbl || !mat) return fail("declared-pattern table names missing");
-        for (unsigned i = 0; i < 4; ++i)
-        {
-            const auto *record = findProvenance(model, "tbl_" + std::to_string(i));
-            if (!record || record->slices.size() != 1)
-                return fail("merged row lost its provenance record");
-            const auto &slice = record->slices[0];
-            if (slice.kind != grhsim::DeclProvenanceKind::Merged ||
-                slice.target != grhsim::DeclProvenanceTarget::State ||
-                slice.targetIndex != tbl->id.index || slice.targetOffset != i * 8 || slice.width != 8)
-                return fail("tbl row provenance slice is wrong");
-        }
-        const std::array<std::string, 4> matNames{"mat_0_0", "mat_0_1", "mat_1_0", "mat_1_1"};
-        for (unsigned i = 0; i < 4; ++i)
-        {
-            const auto *record = findProvenance(model, matNames[i]);
-            if (!record || record->slices.size() != 1 ||
-                record->slices[0].targetIndex != mat->id.index || record->slices[0].targetOffset != i * 8)
-                return fail("mat row provenance slice is wrong (row-major order expected)");
-        }
-        const std::string report = readFile(reportPath);
-        if (report.find("\tmerged\ttbl_0\t") == std::string::npos ||
-            report.find("\t4\n") == std::string::npos)
-            return fail("reg-to-mem report lost the 1-D shape column");
-        if (report.find("\tmerged\tmat_0_0\t") == std::string::npos ||
-            report.find("\t2x2\n") == std::string::npos)
-            return fail("reg-to-mem report lost the 2-D shape column");
-        if (!verifies(model)) return fail("merged model rejected by the verifier");
-        Simulation rewritten(model);
-        std::mt19937_64 rng(5150);
-        for (unsigned step = 0; step < 512; ++step)
-        {
-            std::vector<uint64_t> inputs{uint64_t{step % 2}, rng() & 1, rng() & 1, rng() % 6, rng(),
-                                         rng() % 6, rng()};
-            reference.step(inputs);
-            rewritten.step(inputs);
-            if (reference.outputs() != rewritten.outputs())
-                return fail("reg-to-mem declared differential mismatch");
-        }
-        return roundTrip(model, artifactDir, "grhsim_reg_to_mem_declared");
-    }
-
     // ---- A2-A6: wired whole-graph pipeline --------------------------------
     // One model mixing all three shapes: a decoded table, four packable bit
     // flags and four isomorphic comb lanes.
@@ -971,13 +867,14 @@ namespace
         Simulation reference(original);
         auto model = makePipelineModel();
         runPass(model, "grhsim.canonicalize-compute");
-        const std::array<std::string_view, 2> costOff{"--enable-cost-selection", "false"};
-        const Messages regToMem = runPass(model, "grhsim.reg-to-mem", costOff);
-        if (!messagesContain(regToMem, "transformed=1"))
-            return fail("pipeline reg-to-mem did not merge the table");
+        // stage-07 7c-3: grhsim.reg-to-mem is retired, so the decoded tbl_*
+        // rows now stay scalar declared states through the whole pipeline.
+        // stage-07 7c-3: with reg-to-mem gone the four tbl decode muxes
+        // (mux(low_i, d, old_i)) stay scalar and are visible to comb-pack,
+        // forming a second 4-lane group next to the intended lane_* group.
         const Messages combPack = runPass(model, "grhsim.comb-pack");
-        if (!messagesContain(combPack, "comb_pack_groups=1") ||
-            !messagesContain(combPack, "comb_pack_lanes=4"))
+        if (!messagesContain(combPack, "comb_pack_groups=2") ||
+            !messagesContain(combPack, "comb_pack_lanes=8"))
             return fail("pipeline comb-pack did not pack the lanes");
         const Messages packBits = runPass(model, "grhsim.pack-bit-registers");
         if (!messagesContain(packBits, "packed_register_words=1"))
@@ -992,14 +889,18 @@ namespace
             if (!record || record->slices.empty())
                 return fail("pipeline lost the provenance of " + std::string(prefix));
         }
-        bool haveTable = false, havePacked = false;
+        // stage-07 7c-3: no __reg_to_mem_* table state exists anymore; the
+        // four decoded rows must survive as their scalar declared states.
+        bool haveRows = true, havePacked = false;
+        for (unsigned row = 0; row < 4; ++row)
+            haveRows = haveRows && findState(model, "tbl_" + std::to_string(row)) != nullptr;
         for (const auto &state : model.states())
         {
             const std::string_view name = model.text(state.name);
-            if (name.find("__reg_to_mem_tbl_@__") == 0) haveTable = true;
             if (name.find("packed_bits_") == 0) havePacked = true;
         }
-        if (!haveTable || !havePacked) return fail("pipeline result misses the table or packed word");
+        if (!haveRows || !havePacked)
+            return fail("pipeline result misses the scalar table rows or packed word");
         Simulation rewritten(model);
         std::mt19937_64 rng(777);
         for (unsigned step = 0; step < 512; ++step)
@@ -1026,7 +927,6 @@ int main()
         if (const int status = runCombPackBitwiseTest(artifactDir)) return status;
         if (const int status = runCombPackMuxTest(artifactDir)) return status;
         if (const int status = runCombPackRejectTest()) return status;
-        if (const int status = runRegToMemDeclaredTest(artifactDir)) return status;
         return runWholePipelineTest(artifactDir);
     }
     catch (const std::exception &ex)

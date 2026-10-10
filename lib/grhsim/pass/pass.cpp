@@ -1,5 +1,4 @@
 #include "grhsim/pass/pass.hpp"
-#include "grhsim/pass/reg_to_mem.hpp"
 #include "grhsim/pass/comb_pack.hpp"
 #include "grhsim/pass/const_fold.hpp"
 #include "grhsim/pass/simplify.hpp"
@@ -181,7 +180,6 @@ namespace wolvrix::lib::grhsim
         registerCpuPasses(registry);
         registerConstFoldPass(registry);
         registerSimplifyPass(registry);
-        registerRegToMemPass(registry);
         registerCombPackPass(registry);
         registerCanonicalizeComputePass(registry);
         registerBitwisePredicatesPass(registry);

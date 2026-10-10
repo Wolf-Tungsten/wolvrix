@@ -760,6 +760,56 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kConcat:
+                {
+                    // stage-07: a concat's result width must equal the sum of
+                    // its operand widths. (A mis-widthed concat sailed past
+                    // every pass and broke comb-loop-elim's range analysis on
+                    // the preserve-aggregate XiangShan design before anything
+                    // reported it.)
+                    const auto operands = op.operands();
+                    const auto results = op.results();
+                    if (results.size() != 1)
+                    {
+                        error(*graph, op, "grh.verify: kConcat expects exactly one result");
+                        break;
+                    }
+                    int64_t totalWidth = 0;
+                    bool widthOk = true;
+                    for (const ValueId operand : operands)
+                    {
+                        if (!operand.valid())
+                        {
+                            widthOk = false;
+                            break;
+                        }
+                        const int32_t width = graph->valueWidth(operand);
+                        if (width <= 0)
+                        {
+                            widthOk = false;
+                            break;
+                        }
+                        totalWidth += width;
+                    }
+                    if (widthOk && totalWidth > 0
+                        && graph->valueWidth(results.front()) != totalWidth)
+                    {
+                        std::string locText;
+                        if (auto loc = op.srcLoc(); loc && !loc->file.empty())
+                        {
+                            locText = " at " + std::string(loc->file) + ":" + std::to_string(loc->line);
+                        }
+                        if (auto loc = op.srcLoc(); loc && !loc->pass.empty())
+                        {
+                            locText += " pass=" + loc->pass;
+                        }
+                        error(*graph, op, "grh.verify: kConcat result width " +
+                                              std::to_string(graph->valueWidth(results.front())) +
+                                              " does not match operand width sum " +
+                                              std::to_string(totalWidth) + locText);
+                    }
+                    break;
+                }
                 default:
                     break;
                 }

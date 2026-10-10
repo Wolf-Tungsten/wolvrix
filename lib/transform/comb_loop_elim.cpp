@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -840,7 +842,8 @@ namespace wolvrix::lib::transform
                              const CombLoopElimOptions &options,
                              RangeSuccMap &succ,
                              std::vector<RangeNode> &nodes,
-                             bool &uncertain)
+                             bool &uncertain,
+                             wolvrix::lib::grh::OperationId *bailOp = nullptr)
         {
             RangeNodeSet nodeSet;
             std::unordered_set<ValueId, ValueIdHash> loopSet(loop.loopValues.begin(), loop.loopValues.end());
@@ -885,6 +888,10 @@ namespace wolvrix::lib::transform
                 if (!opId.valid())
                 {
                     continue;
+                }
+                if (bailOp)
+                {
+                    *bailOp = opId;
                 }
                 const Operation op = graph.getOperation(opId);
                 if (isBoundaryOp(op.kind()))
@@ -1264,17 +1271,37 @@ namespace wolvrix::lib::transform
                                const CombLoopElimOptions &options,
                                bool &analysisIncomplete)
         {
+            static const bool debugLoops = std::getenv("WOLVRIX_CLE_DEBUG") != nullptr;
             RangeSuccMap rangeSucc;
             std::vector<RangeNode> rangeNodes;
             bool uncertain = false;
-            if (!buildRangeGraph(loop, graph, options, rangeSucc, rangeNodes, uncertain))
+            wolvrix::lib::grh::OperationId bailOp{};
+            if (!buildRangeGraph(loop, graph, options, rangeSucc, rangeNodes, uncertain, &bailOp))
             {
                 analysisIncomplete = true;
+                if (debugLoops)
+                {
+                    std::string bailKind = "none";
+                    std::string bailSym = "none";
+                    if (bailOp.valid())
+                    {
+                        const Operation op = graph.getOperation(bailOp);
+                        bailKind = std::string(toString(op.kind()));
+                        bailSym = std::string(op.symbolText());
+                    }
+                    std::fprintf(stderr, "[cle-debug] loop ops=%zu: range graph build failed at %s kind=%s\n",
+                                 loop.loopOps.size(), bailSym.c_str(), bailKind.c_str());
+                }
                 return false;
             }
             if (uncertain)
             {
                 analysisIncomplete = true;
+                if (debugLoops)
+                {
+                    std::fprintf(stderr, "[cle-debug] loop ops=%zu: uncertain during range build\n",
+                                 loop.loopOps.size());
+                }
                 return false;
             }
             if (rangeNodes.empty())
@@ -1291,6 +1318,12 @@ namespace wolvrix::lib::transform
                 if (scc.nodes.size() == 1 && !hasSelfLoop(scc.nodes.front(), rangeSucc))
                 {
                     continue;
+                }
+                if (debugLoops)
+                {
+                    std::fprintf(stderr, "[cle-debug] loop ops=%zu: range-level SCC size=%zu dynRead=%d\n",
+                                 loop.loopOps.size(), scc.nodes.size(),
+                                 loop.hasDynamicArrayRead ? 1 : 0);
                 }
                 if (scc.nodes.size() == 1 && hasSelfLoop(scc.nodes.front(), rangeSucc))
                 {

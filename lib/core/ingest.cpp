@@ -8479,10 +8479,27 @@ private:
             std::reverse(elements.begin(), elements.end());
         }
         int64_t total = 0;
+        // stage-07: elements whose plan-stage width hint is missing (lazily
+        // lowered port reads/slices) must fall back to the element TYPE's flat
+        // width, not to 1 -- defaulting to 1 produced a malformed concat whose
+        // result width equaled the element count (seen on preserve-aggregate
+        // XiangShan struct/array ports, breaking comb-loop-elim's range
+        // analysis and any width-based check downstream).
+        const uint64_t elementFlatWidthRaw =
+            computeFixedWidth(*elementType, *plan.body, diagnostics);
+        const int64_t elementFlatWidth =
+            elementFlatWidthRaw > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())
+                ? std::numeric_limits<int32_t>::max()
+                : static_cast<int64_t>(elementFlatWidthRaw);
         for (ExprNodeId element : elements)
         {
             const ExprNode& node = lowering.values[element];
-            total += node.widthHint > 0 ? node.widthHint : 1;
+            int64_t width = node.widthHint > 0 ? node.widthHint : node.sliceWidth;
+            if (width <= 0)
+            {
+                width = elementFlatWidth > 0 ? elementFlatWidth : 1;
+            }
+            total += width;
         }
         ExprNode node;
         node.kind = ExprNodeKind::Operation;
@@ -8568,7 +8585,11 @@ private:
 
     // Concat per-index leaf values into one array value (row-major flat
     // layout; packed arrays keep positional order, unpacked reverse it).
+    // elementFlatWidth is the per-element (leaf) width taken from the type,
+    // used when a lazily-lowered element carries no plan-stage width hint
+    // (stage-07: defaulting that to 1 produced wrong-width concats).
     ExprNodeId concatArrayElements(std::vector<ExprNodeId> elements, bool isUnpacked,
+                                   int64_t elementFlatWidth,
                                    slang::SourceLocation location)
     {
         if (isUnpacked)
@@ -8579,7 +8600,12 @@ private:
         for (ExprNodeId element : elements)
         {
             const ExprNode& node = lowering.values[element];
-            total += node.widthHint > 0 ? node.widthHint : 1;
+            int64_t width = node.widthHint > 0 ? node.widthHint : node.sliceWidth;
+            if (width <= 0)
+            {
+                width = elementFlatWidth > 0 ? elementFlatWidth : 1;
+            }
+            total += width;
         }
         ExprNode node;
         node.kind = ExprNodeKind::Operation;
@@ -8644,6 +8670,18 @@ private:
         if (leafCount == 0)
         {
             return false;
+        }
+        // stage-07: per-leaf flat widths drive the per-leaf concats' width
+        // (plan-stage width hints are absent for lazily-lowered values).
+        std::vector<StructSplitLeaf> leafTypes;
+        std::vector<int64_t> leafWidths;
+        if (splitStructType(*elementType, "", *plan.body, diagnostics, leafTypes))
+        {
+            leafWidths.reserve(leafTypes.size());
+            for (const StructSplitLeaf& leaf : leafTypes)
+            {
+                leafWidths.push_back(aggregateLeafFlatWidth(leaf));
+            }
         }
 
         // Resolve the component expression for each positional index.
@@ -8736,7 +8774,9 @@ private:
         }
         for (std::size_t j = 0; j < leafCount; ++j)
         {
+            const int64_t leafWidth = j < leafWidths.size() ? leafWidths[j] : 0;
             out.push_back(concatArrayElements(std::move(perLeaf[j]), isUnpacked,
+                                              leafWidth,
                                               pattern.sourceRange.start()));
         }
         return true;
@@ -23216,11 +23256,26 @@ private:
             {
                 return leaves.front();
             }
+            // stage-07: leaf symbol nodes carry no plan-stage width hint, so
+            // defaulting them to 1 produced a concat whose result width equaled
+            // the leaf count. Fall back to each leaf's TYPE flat width (the
+            // leaves tile the struct type exactly).
+            std::vector<StructSplitLeaf> leafTypes;
+            const bool haveLeafTypes =
+                expr.type &&
+                splitStructType(*expr.type, "", *state_.plan_.body,
+                                state_.context_.diagnostics, leafTypes) &&
+                leafTypes.size() == leaves.size();
             int64_t total = 0;
-            for (ExprNodeId leaf : leaves)
+            for (std::size_t i = 0; i < leaves.size(); ++i)
             {
-                const ExprNode& node = state_.lowering_.values[leaf];
-                total += node.widthHint > 0 ? node.widthHint : 1;
+                const ExprNode& node = state_.lowering_.values[leaves[i]];
+                int64_t width = node.widthHint > 0 ? node.widthHint : node.sliceWidth;
+                if (width <= 0)
+                {
+                    width = haveLeafTypes ? structLeafFlatWidth(leafTypes[i], *state_.plan_.body) : 1;
+                }
+                total += width;
             }
             return makeOperationNode(wolvrix::lib::grh::OperationKind::kConcat,
                                      std::move(leaves),

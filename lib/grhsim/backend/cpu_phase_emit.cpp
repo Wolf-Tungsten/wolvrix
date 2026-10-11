@@ -1021,6 +1021,13 @@ namespace wolvrix::lib::grhsim
             // Per-function value locals: values with a live cpu_v<index> local in
             // the function currently being emitted.
             mutable std::vector<char> activeLocals_;
+            // stage-07 fanout 合写：激活旗标在函数内写入局部累积变量、函数尾
+            // 一次写回 ActiveFlags——store 密集函数里同一 flag 词的 |= 互相触发
+            // DAGCombiner worklist 重排队（实测 visitSTORE 94%、单 TU 80min+）；
+            // 累积后每函数每词仅一次 store。只含 supernode 体/助手函数；函数内
+            // 对这些数组只写不读（调度器在函数间读），延后写回语义等价。
+            mutable bool flagAccumActive_ = false;
+            mutable std::map<std::string, std::set<uint32_t>> flagAccumTouched_;
             // Output-phase latchWrite staging: enable/data/mask texts captured
             // while the cone locals are live; committed after every output op
             // ran. enable empty means unconditional (constant-1 enable).
@@ -1119,6 +1126,9 @@ namespace wolvrix::lib::grhsim
                                       std::string_view array, std::string_view cond) const;
             void activateFanoutCond(std::ostream &out, std::span<const uint32_t> ordinals,
                                     uint32_t current, std::string_view cond) const;
+            // fanout 合写（stage-07）：累积词的声明与函数尾写回。
+            void flagAccumDecls(std::ostream &out) const;
+            void flagAccumWriteBack(std::ostream &out) const;
             // Compare-store of a computed boundary value; on a real change the
             // supernodeFanout ordinals fire (same-round split by current).
             void publishBoundary(std::ostream &out, ValueId result, const std::string &expr,
@@ -2346,6 +2356,24 @@ namespace wolvrix::lib::grhsim
             // Wide conditions are clean _BitInt values: reduce-or is != 0.
             return target.width > 64 ? "((" + read(condition) + ")!=0)" : read(condition);
         }
+        // fanout 合写累积变量名（数组名 + 词号；数组名本身是合法标识符）。
+        static std::string flagAccumVar(std::string_view array, uint32_t word)
+        {
+            return "cpu_flagAcc_" + std::string(array) + "_" + std::to_string(word);
+        }
+        // 函数尾写回：每个被动过的词一条 `array[word] |= acc;`。
+        void SixPhaseEmitter::flagAccumWriteBack(std::ostream &out) const
+        {
+            for (const auto &[array, words] : flagAccumTouched_)
+                for (const uint32_t word : words)
+                    out << array << '[' << word << "]|=" << flagAccumVar(array, word) << ";\n";
+        }
+        void SixPhaseEmitter::flagAccumDecls(std::ostream &out) const
+        {
+            for (const auto &[array, words] : flagAccumTouched_)
+                for (const uint32_t word : words)
+                    out << "std::uint64_t " << flagAccumVar(array, word) << "=0;\n";
+        }
         void SixPhaseEmitter::activateOrdinals(std::ostream &out, std::span<const uint32_t> ordinals,
                                                std::string_view array) const
         {
@@ -2353,7 +2381,19 @@ namespace wolvrix::lib::grhsim
             // (ordinals need not be sorted).
             std::map<uint32_t, uint64_t> words;
             for (const auto ordinal : ordinals) words[ordinal / 64] |= 1ull << (ordinal % 64);
-            for (const auto &[word, mask] : words) out << array << '[' << word << "]|=" << u64Const(mask) << ";\n";
+            for (const auto &[word, mask] : words)
+            {
+                if (flagAccumActive_)
+                {
+                    // stage-07 fanout 合写：函数级局部累积，函数尾一次写回。
+                    flagAccumTouched_[std::string(array)].insert(word);
+                    out << flagAccumVar(array, word) << "|=" << u64Const(mask) << ";\n";
+                }
+                else
+                {
+                    out << array << '[' << word << "]|=" << u64Const(mask) << ";\n";
+                }
+            }
         }
         void SixPhaseEmitter::activateFanout(std::ostream &out, std::span<const uint32_t> ordinals,
                                              uint32_t current) const
@@ -2376,7 +2416,17 @@ namespace wolvrix::lib::grhsim
             std::map<uint32_t, uint64_t> words;
             for (const auto ordinal : ordinals) words[ordinal / 64] |= 1ull << (ordinal % 64);
             for (const auto &[word, mask] : words)
-                out << array << '[' << word << "]|=-(std::uint64_t)" << cond << '&' << u64Const(mask) << ";\n";
+            {
+                if (flagAccumActive_)
+                {
+                    flagAccumTouched_[std::string(array)].insert(word);
+                    out << flagAccumVar(array, word) << "|=-(std::uint64_t)" << cond << '&' << u64Const(mask) << ";\n";
+                }
+                else
+                {
+                    out << array << '[' << word << "]|=-(std::uint64_t)" << cond << '&' << u64Const(mask) << ";\n";
+                }
+            }
         }
         // Emit the output-gate dirty flag when this change point feeds the
         // output phase (the set membership is decided at emit time, so other
@@ -4075,9 +4125,17 @@ namespace wolvrix::lib::grhsim
         void SixPhaseEmitter::supernodeBody(std::ostream &out, uint32_t ordinal) const
         {
             std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
-            out << "void " << class_ << "::" << supernodeName(ordinal) << "(){\n";
+            // fanout 合写：函数体先进缓冲，旗标写累积到局部变量，尾端一次写回。
+            std::ostringstream body;
+            flagAccumActive_ = true;
+            flagAccumTouched_.clear();
             for (const auto opId : supernodeOps_[ordinal])
-                emitCompute(out, model_.operations()[opId.index - 1], ordinal);
+                emitCompute(body, model_.operations()[opId.index - 1], ordinal);
+            flagAccumActive_ = false;
+            out << "void " << class_ << "::" << supernodeName(ordinal) << "(){\n";
+            flagAccumDecls(out);
+            out << body.str();
+            flagAccumWriteBack(out);
             out << "}\n";
         }
         // V3-M2: the sn_<ordinal> driver (wrapper) alone — emitted by the
@@ -4104,17 +4162,25 @@ namespace wolvrix::lib::grhsim
             for (std::size_t i = begin; i < end; ++i)
             {
                 const auto range = attrs.helperChunks[i];
-                out << "void " << class_ << "::" << supernodeName(ordinal) << "__c" << i << '(';
-                if (!frame.empty()) out << "SnFrame" << ordinal << " &cpu_f";
-                out << "){\n";
+                // fanout 合写：同 supernodeBody —— 体先进缓冲，尾端一次写回。
+                std::ostringstream body;
+                flagAccumActive_ = true;
+                flagAccumTouched_.clear();
                 std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
                 activateCrossing(frame);
                 for (uint32_t i2 = 0; i2 < range.count; ++i2)
                 {
                     const auto opId = supernodeOps_[ordinal][range.offset + i2];
-                    emitCompute(out, model_.operations()[opId.index - 1], ordinal);
+                    emitCompute(body, model_.operations()[opId.index - 1], ordinal);
                 }
                 deactivateCrossing(frame);
+                flagAccumActive_ = false;
+                out << "void " << class_ << "::" << supernodeName(ordinal) << "__c" << i << '(';
+                if (!frame.empty()) out << "SnFrame" << ordinal << " &cpu_f";
+                out << "){\n";
+                flagAccumDecls(out);
+                out << body.str();
+                flagAccumWriteBack(out);
                 out << "}\n";
             }
         }

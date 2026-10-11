@@ -21708,7 +21708,7 @@ private:
                             }
                             if (context_.diagnostics)
                             {
-                                context_.diagnostics->error(
+                                context_.diagnostics->warn(
                                     port->location,
                                     "Failed to lower the driver expression for struct input port connection");
                             }
@@ -21721,7 +21721,7 @@ private:
                         {
                             if (context_.diagnostics)
                             {
-                                context_.diagnostics->error(
+                                context_.diagnostics->warn(
                                     port->location,
                                     "Failed to emit the driver expression for struct input port connection");
                             }
@@ -21745,7 +21745,7 @@ private:
                             {
                                 if (context_.diagnostics)
                                 {
-                                    context_.diagnostics->error(
+                                    context_.diagnostics->warn(
                                         port->location,
                                         "Failed to resize the driver to the struct input port width");
                                 }

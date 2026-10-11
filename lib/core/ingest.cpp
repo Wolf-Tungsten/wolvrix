@@ -21706,6 +21706,12 @@ private:
                                 }
                                 break;
                             }
+                            if (context_.diagnostics)
+                            {
+                                context_.diagnostics->error(
+                                    port->location,
+                                    "Failed to lower the driver expression for struct input port connection");
+                            }
                             ok = false;
                             break;
                         }
@@ -21713,6 +21719,12 @@ private:
                         wolvrix::lib::grh::ValueId flat = emitExpr(flatId);
                         if (!flat.valid())
                         {
+                            if (context_.diagnostics)
+                            {
+                                context_.diagnostics->error(
+                                    port->location,
+                                    "Failed to emit the driver expression for struct input port connection");
+                            }
                             ok = false;
                             break;
                         }
@@ -21731,6 +21743,12 @@ private:
                                 false, expr->sourceRange.start());
                             if (!flat.valid())
                             {
+                                if (context_.diagnostics)
+                                {
+                                    context_.diagnostics->error(
+                                        port->location,
+                                        "Failed to resize the driver to the struct input port width");
+                                }
                                 ok = false;
                                 break;
                             }
@@ -24037,7 +24055,16 @@ private:
             }
             // stage-04: struct-typed connection expressions flatten to the
             // packed layout (per-leaf connections are sliced out at the
-            // instance site).
+            // instance site). stage-07: an implicit ConversionExpression that
+            // *carries* a struct type (slang wraps a width-mismatched flat
+            // driver to the struct port's type) must unwrap first — the struct
+            // flattener cannot see through the conversion node and the
+            // instance used to be dropped silently (the width resize below
+            // then never ran).
+            if (const auto *conversion = expr.as_if<slang::ast::ConversionExpression>())
+            {
+                return lowerExpression(conversion->operand());
+            }
             if (expr.type && isStructTyped(*expr.type))
             {
                 return flattenStructExpr(expr);

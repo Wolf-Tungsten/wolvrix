@@ -11,6 +11,7 @@
 #include "transform/memory_init_check.hpp"
 #include "transform/memory_read_retime.hpp"
 #include "transform/multidriven_guard.hpp"
+#include "transform/mux_tree_fold.hpp"
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
 #include "transform/slice_index_const.hpp"
@@ -416,6 +417,7 @@ namespace wolvrix::lib::transform
             "memory-read-retime",
             "slice-index-const",
             "multidriven-guard",
+            "mux-tree-fold",
             "hier-flatten",
             "instance-inline",
             "xmr-resolve",
@@ -449,6 +451,15 @@ namespace wolvrix::lib::transform
                 return nullptr;
             }
             return std::make_unique<MultiDrivenGuardPass>();
+        }
+        if (normalized == "mux-tree-fold")
+        {
+            if (!args.empty())
+            {
+                error = "mux-tree-fold does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<MuxTreeFoldPass>();
         }
         if (normalized == "blackbox-guard")
         {

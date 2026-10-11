@@ -164,6 +164,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/xmr_resolve.cpp
     lib/transform/latch_transparent_read.cpp
     lib/transform/slice_index_const.cpp
+    lib/transform/mux_tree_fold.cpp
     lib/transform/strip_debug.cpp
     lib/transform/verify.cpp
     lib/transform/repcut.cpp
@@ -624,6 +625,17 @@ target_link_libraries(transform-dead-code-elim
 )
 
 register_test_exe(transform-dead-code-elim)
+
+add_executable(transform-mux-tree-fold
+    tests/transform/test_mux_tree_fold.cpp
+)
+
+target_link_libraries(transform-mux-tree-fold
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-mux-tree-fold)
 
 add_executable(transform-redundant-elim
     tests/transform/test_redundant_elim_pass.cpp

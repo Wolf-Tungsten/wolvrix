@@ -1480,6 +1480,34 @@ namespace wolvrix::lib::grhsim
                 // cleaned the top word.
                 const auto words = (type.width + 63u) / 64u;
                 const auto *raw = parsed.getRawPtr();
+                bool allZero = true;
+                for (uint32_t i = 0; i < words; ++i)
+                {
+                    if (raw[i] != 0)
+                    {
+                        allZero = false;
+                        break;
+                    }
+                }
+                if (allZero)
+                {
+                    return "(" + wideType(type.width) + ")0";
+                }
+                if (words > 16)
+                {
+                    // stage-07: statement form for wide constants — a
+                    // left-nested ((x<<64)|w) expression needs one paren pair
+                    // per word and overflows the clang parser stack on
+                    // multi-hundred-word init values (XS aggregate memories).
+                    std::string body = "([&](){ " + wideType(type.width) + " cpu_lit=(" +
+                                       wideType(type.width) + ")UINT64_C(" +
+                                       std::to_string(raw[words - 1]) + ");\n";
+                    for (uint32_t i = words - 1; i-- > 0;)
+                        body += "cpu_lit=((" + wideType(type.width) + ")(cpu_lit)<<64)|UINT64_C(" +
+                                std::to_string(raw[i]) + ");\n";
+                    body += "return cpu_lit&" + wideMask(type.width) + ";}())";
+                    return body;
+                }
                 std::string result = "((" + wideType(type.width) + ")UINT64_C(" + std::to_string(raw[words - 1]) + "))";
                 for (uint32_t i = words - 1; i-- > 0;)
                     result = "((" + result + "<<64)|UINT64_C(" + std::to_string(raw[i]) + "))";
@@ -1781,8 +1809,16 @@ namespace wolvrix::lib::grhsim
                     // the ternary keeps the shift itself defined.
                     const auto container = wideContainer(typeOf(0).width);
                     if (kind == "sliceArray") start = "(" + start + ")*" + std::to_string(width);
+                    // stage-07: decompose the shift into a byte-aligned move
+                    // plus a <64 remainder. A non-aligned shift of a wide
+                    // container defeats LLVM's load-width narrowing, so every
+                    // slice read materialized the whole container — the
+                    // measured DAGCombiner::visitSTORE/KnownBits quadratic on
+                    // wide boundary stores (tu271/tu272 spun for an hour).
+                    const std::string window =
+                        "((unsigned __int128)((" + raw(0) + ")>>((" + start + ")&~UINT64_C(63))))";
                     return "((" + start + ")>=" + std::to_string(container) + "?UINT64_C(0):" +
-                           truncRaw("(std::uint64_t)((" + raw(0) + ")>>(" + start + "))", width) + ")";
+                           truncRaw("(std::uint64_t)((" + window + ")>>((" + start + ")&UINT64_C(63)))", width) + ")";
                 }
                 if (kind == "sliceArray")
                     start = "((" + start + ")>=64/" + std::to_string(width) + "+1?64:(" + start + ")*" + std::to_string(width) + ")";
@@ -2168,11 +2204,14 @@ namespace wolvrix::lib::grhsim
                 if ((kind == "sliceStatic" || kind == "sliceDynamic") && type(operands[0]).width > 64)
                 {
                     // start clamps at the source container (padding reads as
-                    // zero), the ternary keeps the shift defined.
+                    // zero), the ternary keeps the shift defined. The shift is
+                    // word-decomposed (see the <=64-bit result path).
                     const auto srcContainer = wideContainer(type(operands[0]).width);
                     const auto start = kind == "sliceStatic" ? std::to_string(number("sliceStart")) : raw(1);
                     return "((" + start + ")>=" + std::to_string(srcContainer) + "?" + wideTrunc("0", width) + ":" +
-                           wideTrunc("(" + raw(0) + ")>>(" + start + ")", width) + ")";
+                           wideTrunc("((" + raw(0) + ")>>((" + start + ")&~UINT64_C(63)))>>((" + start +
+                                      ")&UINT64_C(63))",
+                                  width) + ")";
                 }
                 if (kind == "sliceArray" && type(operands[0]).width > 64)
                 {
@@ -2189,7 +2228,9 @@ namespace wolvrix::lib::grhsim
                     const auto start = "(" + linearIndexText(baseShape, operands.size() - 1, indices) + ")*" +
                                        std::to_string(width);
                     return "((" + start + ")>=" + std::to_string(srcContainer) + "?" + wideTrunc("0", width) + ":" +
-                           wideTrunc("(" + raw(0) + ")>>(" + start + ")", width) + ")";
+                           wideTrunc("((" + raw(0) + ")>>((" + start + ")&~UINT64_C(63)))>>((" + start +
+                                      ")&UINT64_C(63))",
+                                  width) + ")";
                 }
                 throw std::runtime_error("CPU six-phase emit unsupported wide operation: " + std::string(kind) + " width=" + std::to_string(width));
             }
@@ -3434,7 +3475,11 @@ namespace wolvrix::lib::grhsim
             if (proc && *proc == "final")
                 throw std::runtime_error("CPU final-process task execution is not implemented");
             for (auto operand : model_.operands(op).subspan(1))
-                if (!type(operand).shape.empty())
+                // stage-07: a shaped logic argument is read as its flat
+                // total-width integer (packed-first doctrine; SV prints a
+                // packed array as one flat value), only non-logic shaped
+                // arguments remain unsupported.
+                if (!type(operand).shape.empty() && type(operand).kind != TypeKind::Logic)
                     throw std::runtime_error("CPU system task array arguments are not implemented");
         }
         void SixPhaseEmitter::validateSystemFunction(const SimOp &op) const
@@ -4984,17 +5029,32 @@ if(terminal){
                 // built-in CXX default is g++, and ?= does not override a
                 // built-in default — replace only the default origin so an
                 // env or command-line CXX still wins.
-                out << "ifeq ($(origin CXX),default)\nCXX := $(shell command -v clang++ || echo c++)\nendif\nAR ?= ar\nCXXFLAGS ?= -std=c++20 -O3\n";
+                out << "ifeq ($(origin CXX),default)\nCXX := $(shell command -v clang++ || echo c++)\nendif\nAR ?= ar\n"
+                    // stage-07: -fno-strict-aliasing is REQUIRED for
+                    // compile-time sanity: millions of distinct struct-member
+                    // accesses send clang's type-based alias analysis
+                    // quadratic (measured on XS aggregate: single TUs spin in
+                    // TypeBasedAAResult::alias for 45min+; the flag cuts them
+                    // to seconds). The generated code never type-puns, so the
+                    // flag costs nothing semantically.
+                    << "CXXFLAGS ?= -std=c++20 -O3 -fno-strict-aliasing\n";
                 if (waveform_)
                     out << "CC ?= cc\nCFLAGS ?= -O2 -D_GNU_SOURCE\nLIBFST_SRC_DIR := " << libfstSourceDir() << '\n';
                 out << "SOURCES :=";
                 for (const auto &source : sources) out << ' ' << source;
                 out << "\nOBJECTS := $(SOURCES:.cpp=.o)\n";
                 if (waveform_) out << "FST_OBJECTS := fstapi.o fastlz.o lz4.o\n";
-                out << "LIB := lib" << prefix_ << ".a\nall: $(LIB)\n"
+                out << "LIB := lib" << prefix_ << ".a\n";
+                // stage-07: precompile the (huge) model header once — every TU
+                // used to reparse ~160MB of store struct declarations (measured
+                // ~2.3s/TU on XiangShan; PCH saves ~0.9s/TU after load).
+                out << "PCH := " << prefix_ << ".hpp.pch\n";
+                out << "all: $(LIB)\n"
                     << "$(LIB): $(OBJECTS)" << (waveform_ ? " $(FST_OBJECTS)" : "") << "\n\t$(AR) rcs $@ $^\n"
-                    << "%.o: %.cpp " << prefix_ << ".hpp " << prefix_ << "_runtime.hpp\n"
-                    << "\t$(CXX) $(CXXFLAGS)" << (waveform_ ? " -I$(LIBFST_SRC_DIR)" : "") << " -c $< -o $@\n";
+                    << "$(PCH): " << prefix_ << ".hpp " << prefix_ << "_runtime.hpp\n"
+                    << "\t$(CXX) $(CXXFLAGS)" << (waveform_ ? " -I$(LIBFST_SRC_DIR)" : "") << " -x c++-header $< -o $@\n"
+                    << "%.o: %.cpp $(PCH)\n"
+                    << "\t$(CXX) $(CXXFLAGS)" << (waveform_ ? " -I$(LIBFST_SRC_DIR)" : "") << " -include-pch $(PCH) -c $< -o $@\n";
                 if (waveform_)
                     for (const char *unit : {"fstapi", "fastlz", "lz4"})
                         out << unit << ".o: $(LIBFST_SRC_DIR)/" << unit << ".c\n"

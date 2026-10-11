@@ -33,7 +33,27 @@ namespace wolvrix::lib::transform
         using wolvrix::lib::grh::ValueId;
         using wolvrix::lib::grh::ValueIdHash;
 
-        using SuccMap = std::unordered_map<ValueId, std::vector<ValueId>, ValueIdHash>;
+        // CSR successor graph over live values, keyed by ValueId.index slots
+        // (1-based within one graph; identical per-value edge order to the
+        // append order used when building it).
+        struct DenseSucc
+        {
+            std::vector<uint64_t> offsets;
+            std::vector<ValueId> targets;
+
+            std::size_t maxSlot() const noexcept
+            {
+                return offsets.size() >= 2 ? offsets.size() - 2 : 0;
+            }
+
+            std::span<const ValueId> edges(ValueId v) const noexcept
+            {
+                const uint64_t begin = offsets[v.index];
+                const uint64_t end = offsets[v.index + 1];
+                return std::span<const ValueId>(targets.data() + begin,
+                                                static_cast<std::size_t>(end - begin));
+            }
+        };
 
         struct LoopInfo
         {
@@ -52,13 +72,13 @@ namespace wolvrix::lib::transform
 
         struct TarjanState
         {
-            const SuccMap &succ;
-            std::unordered_map<ValueId, int, ValueIdHash> index;
-            std::unordered_map<ValueId, int, ValueIdHash> lowlink;
+            const DenseSucc &succ;
+            std::vector<int32_t> index;
+            std::vector<int32_t> lowlink;
             std::vector<ValueId> stack;
-            std::unordered_set<ValueId, ValueIdHash> onStack;
+            std::vector<char> onStack;
             std::vector<Scc> sccs;
-            int nextIndex = 0;
+            int nextIndex = 1;
         };
 
         struct BitRange
@@ -125,39 +145,61 @@ namespace wolvrix::lib::transform
             }
         }
 
+        // stage-07: ops without a bit-level copy map are rewritten
+        // monolithically when splitting a false loop — the result stays one
+        // whole fragment (no cut points) and operands are reassembled as full
+        // views. kRegisterReadArrayPort joins here (not via boundary skip): a
+        // state read cannot be fragmented, but its index operand is ordinary
+        // combinational input that must keep its (reassembled) cone.
+        bool isMonolithicLoopOp(OperationKind kind)
+        {
+            switch (kind)
+            {
+            case OperationKind::kSub:
+            case OperationKind::kMul:
+            case OperationKind::kDiv:
+            case OperationKind::kMod:
+            case OperationKind::kShl:
+            case OperationKind::kLShr:
+            case OperationKind::kAShr:
+            case OperationKind::kRegisterReadArrayPort:
+                return true;
+            default:
+                return false;
+            }
+        }
+
         void tarjanVisit(ValueId v, TarjanState &state)
         {
-            state.index.emplace(v, state.nextIndex);
-            state.lowlink.emplace(v, state.nextIndex);
+            const std::size_t slot = v.index;
+            state.index[slot] = state.nextIndex;
+            state.lowlink[slot] = state.nextIndex;
             ++state.nextIndex;
             state.stack.push_back(v);
-            state.onStack.insert(v);
+            state.onStack[slot] = 1;
 
-            auto it = state.succ.find(v);
-            if (it != state.succ.end())
+            for (ValueId w : state.succ.edges(v))
             {
-                for (ValueId w : it->second)
+                const std::size_t wSlot = w.index;
+                if (state.index[wSlot] == 0)
                 {
-                    if (state.index.find(w) == state.index.end())
-                    {
-                        tarjanVisit(w, state);
-                        state.lowlink[v] = std::min(state.lowlink[v], state.lowlink[w]);
-                    }
-                    else if (state.onStack.find(w) != state.onStack.end())
-                    {
-                        state.lowlink[v] = std::min(state.lowlink[v], state.index[w]);
-                    }
+                    tarjanVisit(w, state);
+                    state.lowlink[slot] = std::min(state.lowlink[slot], state.lowlink[wSlot]);
+                }
+                else if (state.onStack[wSlot])
+                {
+                    state.lowlink[slot] = std::min(state.lowlink[slot], state.index[wSlot]);
                 }
             }
 
-            if (state.lowlink[v] == state.index[v])
+            if (state.lowlink[slot] == state.index[slot])
             {
                 Scc scc;
                 while (!state.stack.empty())
                 {
                     ValueId w = state.stack.back();
                     state.stack.pop_back();
-                    state.onStack.erase(w);
+                    state.onStack[w.index] = 0;
                     scc.nodes.push_back(w);
                     if (w == v)
                     {
@@ -168,15 +210,17 @@ namespace wolvrix::lib::transform
             }
         }
 
-        std::vector<Scc> tarjanScc(std::span<const ValueId> nodes, const SuccMap &succ)
+        std::vector<Scc> tarjanScc(std::span<const ValueId> nodes, const DenseSucc &succ)
         {
             TarjanState state{succ};
-            state.index.reserve(nodes.size());
-            state.lowlink.reserve(nodes.size());
+            const std::size_t slotCount = succ.maxSlot() + 1;
+            state.index.assign(slotCount, 0);
+            state.lowlink.assign(slotCount, 0);
+            state.onStack.assign(slotCount, 0);
             state.stack.reserve(nodes.size());
             for (ValueId v : nodes)
             {
-                if (state.index.find(v) == state.index.end())
+                if (state.index[v.index] == 0)
                 {
                     tarjanVisit(v, state);
                 }
@@ -184,14 +228,9 @@ namespace wolvrix::lib::transform
             return state.sccs;
         }
 
-        bool hasSelfLoop(ValueId v, const SuccMap &succ)
+        bool hasSelfLoop(ValueId v, const DenseSucc &succ)
         {
-            auto it = succ.find(v);
-            if (it == succ.end())
-            {
-                return false;
-            }
-            const auto &edges = it->second;
+            const auto edges = succ.edges(v);
             return std::find(edges.begin(), edges.end(), v) != edges.end();
         }
 
@@ -275,6 +314,23 @@ namespace wolvrix::lib::transform
             if (const auto *value = std::get_if<int64_t>(&*attr))
             {
                 return *value;
+            }
+            return std::nullopt;
+        }
+
+        std::optional<int64_t> getIntAttr(const Graph &graph, OperationId opId, std::string_view key)
+        {
+            for (const auto &attr : graph.opAttrs(opId))
+            {
+                if (attr.key != key)
+                {
+                    continue;
+                }
+                if (const auto *value = std::get_if<int64_t>(&attr.value))
+                {
+                    return *value;
+                }
+                return std::nullopt;
             }
             return std::nullopt;
         }
@@ -386,36 +442,37 @@ namespace wolvrix::lib::transform
             {
                 return std::nullopt;
             }
-            const Value value = graph.getValue(valueId);
-            const OperationId defId = value.definingOp();
+            const OperationId defId = graph.valueDef(valueId);
             if (!defId.valid())
             {
                 return std::nullopt;
             }
-            const Operation defOp = graph.getOperation(defId);
-            switch (defOp.kind())
+            switch (graph.opKind(defId))
             {
             case OperationKind::kConstant:
             {
-                auto attr = defOp.attr("constValue");
-                if (!attr)
+                for (const auto &attr : graph.opAttrs(defId))
                 {
-                    return std::nullopt;
-                }
-                if (const auto *literal = std::get_if<std::string>(&*attr))
-                {
-                    auto parsed = parseConstIntLiteral(*literal);
-                    if (!parsed || *parsed < 0)
+                    if (attr.key != "constValue")
                     {
-                        return std::nullopt;
+                        continue;
                     }
-                    return static_cast<uint64_t>(*parsed);
+                    if (const auto *literal = std::get_if<std::string>(&attr.value))
+                    {
+                        auto parsed = parseConstIntLiteral(*literal);
+                        if (!parsed || *parsed < 0)
+                        {
+                            return std::nullopt;
+                        }
+                        return static_cast<uint64_t>(*parsed);
+                    }
+                    return std::nullopt;
                 }
                 return std::nullopt;
             }
             case OperationKind::kAssign:
             {
-                const auto &operands = defOp.operands();
+                const auto operands = graph.opOperands(defId);
                 if (operands.size() != 1 || !operands[0].valid())
                 {
                     return std::nullopt;
@@ -424,13 +481,13 @@ namespace wolvrix::lib::transform
             }
             case OperationKind::kSliceStatic:
             {
-                const auto &operands = defOp.operands();
+                const auto operands = graph.opOperands(defId);
                 if (operands.size() != 1 || !operands[0].valid())
                 {
                     return std::nullopt;
                 }
-                auto startOpt = getIntAttr(defOp, "sliceStart");
-                auto endOpt = getIntAttr(defOp, "sliceEnd");
+                auto startOpt = getIntAttr(graph, defId, "sliceStart");
+                auto endOpt = getIntAttr(graph, defId, "sliceEnd");
                 if (!startOpt || !endOpt)
                 {
                     return std::nullopt;
@@ -453,7 +510,7 @@ namespace wolvrix::lib::transform
             }
             case OperationKind::kConcat:
             {
-                const auto &operands = defOp.operands();
+                const auto operands = graph.opOperands(defId);
                 if (operands.empty())
                 {
                     return std::nullopt;
@@ -466,7 +523,7 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const int64_t width = graph.getValue(operand).width();
+                    const int64_t width = graph.valueWidth(operand);
                     if (width <= 0 || width > 63 || totalWidth + static_cast<int>(width) > 63)
                     {
                         return std::nullopt;
@@ -600,18 +657,43 @@ namespace wolvrix::lib::transform
             return geometry;
         }
 
-        bool dependsTransitivelyOn(const Graph &graph, ValueId valueId, ValueId targetId)
+        // Reusable scratch for dependsTransitivelyOn: generation-stamped dense
+        // visited marks keyed by ValueId.index (valid within one graph, which
+        // is all a single DFS ever sees), avoiding a fresh hash set per call.
+        struct TransitiveDepScratch
+        {
+            std::vector<uint32_t> visitedStamp;
+            std::vector<ValueId> stack;
+            uint32_t epoch = 0;
+        };
+
+        bool dependsTransitivelyOn(const Graph &graph, ValueId valueId, ValueId targetId,
+                                   TransitiveDepScratch &scratch)
         {
             if (!valueId.valid() || !targetId.valid())
             {
                 return false;
             }
-            std::vector<ValueId> stack{valueId};
-            std::unordered_set<ValueId, ValueIdHash> visited;
-            while (!stack.empty())
+            ++scratch.epoch;
+            if (scratch.epoch == 0)
             {
-                const ValueId current = stack.back();
-                stack.pop_back();
+                std::fill(scratch.visitedStamp.begin(), scratch.visitedStamp.end(), 0u);
+                scratch.epoch = 1;
+            }
+            const uint32_t epoch = scratch.epoch;
+            auto stampOf = [&](ValueId v) -> uint32_t & {
+                if (v.index >= scratch.visitedStamp.size())
+                {
+                    scratch.visitedStamp.resize(static_cast<std::size_t>(v.index) + 1, 0u);
+                }
+                return scratch.visitedStamp[v.index];
+            };
+            scratch.stack.clear();
+            scratch.stack.push_back(valueId);
+            while (!scratch.stack.empty())
+            {
+                const ValueId current = scratch.stack.back();
+                scratch.stack.pop_back();
                 if (!current.valid())
                 {
                     continue;
@@ -620,21 +702,22 @@ namespace wolvrix::lib::transform
                 {
                     return true;
                 }
-                if (!visited.insert(current).second)
+                uint32_t &stamp = stampOf(current);
+                if (stamp == epoch)
                 {
                     continue;
                 }
-                const OperationId defOpId = graph.getValue(current).definingOp();
+                stamp = epoch;
+                const OperationId defOpId = graph.valueDef(current);
                 if (!defOpId.valid())
                 {
                     continue;
                 }
-                const Operation defOp = graph.getOperation(defOpId);
-                for (ValueId operandId : defOp.operands())
+                for (ValueId operandId : graph.opOperands(defOpId))
                 {
                     if (operandId.valid())
                     {
-                        stack.push_back(operandId);
+                        scratch.stack.push_back(operandId);
                     }
                 }
             }
@@ -657,8 +740,7 @@ namespace wolvrix::lib::transform
             {
                 return false;
             }
-            const Value value = graph.getValue(valueId);
-            const int64_t width = value.width();
+            const int64_t width = graph.valueWidth(valueId);
             if (width <= 0)
             {
                 return false;
@@ -668,11 +750,11 @@ namespace wolvrix::lib::transform
             return true;
         }
 
-        bool opTouchesScc(const Operation &op, const std::unordered_set<ValueId, ValueIdHash> &sccSet)
+        bool opTouchesScc(const Graph &graph, OperationId opId, const std::unordered_set<ValueId, ValueIdHash> &sccSet)
         {
             bool hasOperand = false;
             bool hasResult = false;
-            for (ValueId operand : op.operands())
+            for (ValueId operand : graph.opOperands(opId))
             {
                 if (sccSet.find(operand) != sccSet.end())
                 {
@@ -680,7 +762,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
             }
-            for (ValueId result : op.results())
+            for (ValueId result : graph.opResults(opId))
             {
                 if (sccSet.find(result) != sccSet.end())
                 {
@@ -698,17 +780,13 @@ namespace wolvrix::lib::transform
 
             for (ValueId valueId : loopValues)
             {
-                const Value value = graph.getValue(valueId);
-                OperationId def = value.definingOp();
-                if (def.valid())
+                const OperationId def = graph.valueDef(valueId);
+                if (def.valid() && opTouchesScc(graph, def, sccSet))
                 {
-                    const Operation op = graph.getOperation(def);
-                    if (opTouchesScc(op, sccSet))
-                    {
-                        ops.insert(def);
-                    }
+                    ops.insert(def);
                 }
 
+                const Value value = graph.getValue(valueId);
                 for (const auto &user : value.users())
                 {
                     OperationId opId = user.operation;
@@ -716,8 +794,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation op = graph.getOperation(opId);
-                    if (opTouchesScc(op, sccSet))
+                    if (opTouchesScc(graph, opId, sccSet))
                     {
                         ops.insert(opId);
                     }
@@ -894,7 +971,14 @@ namespace wolvrix::lib::transform
                     *bailOp = opId;
                 }
                 const Operation op = graph.getOperation(opId);
-                if (isBoundaryOp(op.kind()))
+                // stage-07: a dynamic register-array read is a state-content
+                // boundary, but its index is an ordinary combinational input.
+                // Keep the index→result edge visible so false loops that merely
+                // share the index cone reach the range SCC instead of hiding
+                // behind the boundary classification (the state content itself
+                // never participates in the graph).
+                if (isBoundaryOp(op.kind()) &&
+                    op.kind() != OperationKind::kRegisterReadArrayPort)
                 {
                     continue;
                 }
@@ -907,6 +991,36 @@ namespace wolvrix::lib::transform
 
                 switch (op.kind())
                 {
+                case OperationKind::kRegisterReadArrayPort:
+                {
+                    if (operands.size() != 1 || results.size() != 1)
+                    {
+                        uncertain = true;
+                        return false;
+                    }
+                    const ValueId index = operands[0];
+                    const ValueId resultId = results[0];
+                    if (!index.valid() || !resultId.valid())
+                    {
+                        uncertain = true;
+                        return false;
+                    }
+                    if (loopSet.find(index) != loopSet.end() &&
+                        loopSet.find(resultId) != loopSet.end())
+                    {
+                        BitRange indexRange{};
+                        BitRange resultRange{};
+                        if (!getFullRange(graph, index, indexRange) ||
+                            !getFullRange(graph, resultId, resultRange))
+                        {
+                            uncertain = true;
+                            return false;
+                        }
+                        addRangeEdge(succ, nodeSet, RangeNode{index, indexRange},
+                                     RangeNode{resultId, resultRange});
+                    }
+                    break;
+                }
                 case OperationKind::kSliceStatic:
                 {
                     if (operands.size() != 1 || results.size() != 1)
@@ -980,7 +1094,7 @@ namespace wolvrix::lib::transform
                     }
                     auto widthOpt = getIntAttr(op, "sliceWidth");
                     auto indexOpt = getConstIntValue(graph, index);
-                    if (!widthOpt || !indexOpt)
+                    if (!widthOpt)
                     {
                         uncertain = true;
                         return false;
@@ -992,6 +1106,34 @@ namespace wolvrix::lib::transform
                     {
                         uncertain = true;
                         return false;
+                    }
+                    if (!indexOpt)
+                    {
+                        // Dynamic index: the selected window is unknown, so model
+                        // the read conservatively as depending on the whole base
+                        // (and on the index value itself) instead of giving up on
+                        // the range graph. This mirrors the kSliceArray dynamic
+                        // read handling below and lets the range SCC decide
+                        // whether the cycle is real.
+                        const bool baseInLoop = loopSet.find(base) != loopSet.end();
+                        const bool resultInLoop = loopSet.find(resultId) != loopSet.end();
+                        if (baseInLoop && resultInLoop)
+                        {
+                            addRangeEdge(succ, nodeSet, RangeNode{base, baseRange},
+                                         RangeNode{resultId, resultRange});
+                        }
+                        if (resultInLoop && loopSet.find(index) != loopSet.end())
+                        {
+                            BitRange indexRange{};
+                            if (!getFullRange(graph, index, indexRange))
+                            {
+                                uncertain = true;
+                                return false;
+                            }
+                            addRangeEdge(succ, nodeSet, RangeNode{index, indexRange},
+                                         RangeNode{resultId, resultRange});
+                        }
+                        break;
                     }
                     const int64_t sliceWidth = *widthOpt;
                     if (sliceWidth <= 0)
@@ -1510,7 +1652,7 @@ namespace wolvrix::lib::transform
 
         std::vector<LoopInfo> collectLoopInfos(const Graph &graph,
                                                const std::span<const ValueId> values,
-                                               const SuccMap &succ)
+                                               const DenseSucc &succ)
         {
             std::vector<LoopInfo> loops;
             std::vector<Scc> sccs = tarjanScc(values, succ);
@@ -1551,16 +1693,17 @@ namespace wolvrix::lib::transform
                              OperationId opId,
                              const std::unordered_set<ValueId, ValueIdHash> &loopSet,
                              std::size_t &retargeted,
-                             const std::function<void(const Operation &, std::string)> &onError)
+                             const std::function<void(const Operation &, std::string)> &onError,
+                             TransitiveDepScratch &depScratch)
         {
-            const Operation op = graph.getOperation(opId);
-            if (op.kind() != OperationKind::kSliceStatic &&
-                op.kind() != OperationKind::kSliceDynamic)
+            const OperationKind opKind = graph.opKind(opId);
+            if (opKind != OperationKind::kSliceStatic &&
+                opKind != OperationKind::kSliceDynamic)
             {
                 return false;
             }
-            const auto &operands = op.operands();
-            const auto &results = op.results();
+            const auto operands = graph.opOperands(opId);
+            const auto results = graph.opResults(opId);
             if (results.size() != 1)
             {
                 return false;
@@ -1570,15 +1713,15 @@ namespace wolvrix::lib::transform
             {
                 return false;
             }
-            if (op.kind() == OperationKind::kSliceStatic && operands.size() != 1)
+            if (opKind == OperationKind::kSliceStatic && operands.size() != 1)
             {
                 return false;
             }
-            if (op.kind() == OperationKind::kSliceDynamic && (operands.size() < 2 || !operands[1].valid()))
+            if (opKind == OperationKind::kSliceDynamic && (operands.size() < 2 || !operands[1].valid()))
             {
                 return false;
             }
-            ValueId base = operands[0];
+            const ValueId base = operands[0];
             if (!base.valid())
             {
                 return false;
@@ -1589,10 +1732,10 @@ namespace wolvrix::lib::transform
             }
             int64_t low = 0;
             int64_t high = -1;
-            if (op.kind() == OperationKind::kSliceStatic)
+            if (opKind == OperationKind::kSliceStatic)
             {
-                auto startOpt = getIntAttr(op, "sliceStart");
-                auto endOpt = getIntAttr(op, "sliceEnd");
+                auto startOpt = getIntAttr(graph, opId, "sliceStart");
+                auto endOpt = getIntAttr(graph, opId, "sliceEnd");
                 if (!startOpt || !endOpt)
                 {
                     return false;
@@ -1602,7 +1745,7 @@ namespace wolvrix::lib::transform
             }
             else
             {
-                auto widthOpt = getIntAttr(op, "sliceWidth");
+                auto widthOpt = getIntAttr(graph, opId, "sliceWidth");
                 auto indexOpt = getConstIntValue(graph, operands[1]);
                 if (!widthOpt || !indexOpt)
                 {
@@ -1616,22 +1759,21 @@ namespace wolvrix::lib::transform
                 return false;
             }
 
-            const Value baseValue = graph.getValue(base);
-            OperationId baseDefId = baseValue.definingOp();
+            const OperationId baseDefId = graph.valueDef(base);
             if (!baseDefId.valid())
             {
                 return false;
             }
-            const Operation baseDef = graph.getOperation(baseDefId);
+            const OperationKind baseDefKind = graph.opKind(baseDefId);
 
-            if (baseDef.kind() == OperationKind::kAssign)
+            if (baseDefKind == OperationKind::kAssign)
             {
-                const auto &baseOps = baseDef.operands();
+                const auto baseOps = graph.opOperands(baseDefId);
                 if (baseOps.size() != 1)
                 {
                     return false;
                 }
-                ValueId newBase = baseOps[0];
+                const ValueId newBase = baseOps[0];
                 if (!newBase.valid() || newBase == base)
                 {
                     return false;
@@ -1655,22 +1797,22 @@ namespace wolvrix::lib::transform
                 }
                 catch (const std::exception &ex)
                 {
-                    onError(baseDef, std::string("Failed to retarget slice through kAssign: ") + ex.what());
+                    onError(graph.getOperation(baseDefId), std::string("Failed to retarget slice through kAssign: ") + ex.what());
                     return false;
                 }
                 ++retargeted;
                 return true;
             }
 
-            if (baseDef.kind() == OperationKind::kSliceStatic)
+            if (baseDefKind == OperationKind::kSliceStatic)
             {
-                const auto &baseOps = baseDef.operands();
+                const auto baseOps = graph.opOperands(baseDefId);
                 if (baseOps.size() != 1)
                 {
                     return false;
                 }
-                auto baseStart = getIntAttr(baseDef, "sliceStart");
-                auto baseEnd = getIntAttr(baseDef, "sliceEnd");
+                auto baseStart = getIntAttr(graph, baseDefId, "sliceStart");
+                auto baseEnd = getIntAttr(graph, baseDefId, "sliceEnd");
                 if (!baseStart || !baseEnd)
                 {
                     return false;
@@ -1681,12 +1823,12 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
-                ValueId newBase = baseOps[0];
+                const ValueId newBase = baseOps[0];
                 if (!newBase.valid())
                 {
                     return false;
                 }
-                if (dependsTransitivelyOn(graph, newBase, resultId))
+                if (dependsTransitivelyOn(graph, newBase, resultId, depScratch))
                 {
                     return false;
                 }
@@ -1722,7 +1864,7 @@ namespace wolvrix::lib::transform
                 }
                 catch (const std::exception &ex)
                 {
-                    onError(baseDef, std::string("Failed to retarget slice through kSliceStatic: ") + ex.what());
+                    onError(graph.getOperation(baseDefId), std::string("Failed to retarget slice through kSliceStatic: ") + ex.what());
                     return false;
                 }
                 if (changed)
@@ -1732,9 +1874,9 @@ namespace wolvrix::lib::transform
                 return changed;
             }
 
-            if (baseDef.kind() == OperationKind::kConcat)
+            if (baseDefKind == OperationKind::kConcat)
             {
-                const auto &concatOps = baseDef.operands();
+                const auto concatOps = graph.opOperands(baseDefId);
                 if (concatOps.empty())
                 {
                     return false;
@@ -1748,7 +1890,7 @@ namespace wolvrix::lib::transform
                     {
                         return false;
                     }
-                    const int64_t width = graph.getValue(operandId).width();
+                    const int64_t width = graph.valueWidth(operandId);
                     if (width <= 0)
                     {
                         return false;
@@ -1788,12 +1930,12 @@ namespace wolvrix::lib::transform
                     }
                     const int64_t newLow = low - opLow;
                     const int64_t newHigh = high - opLow;
-                    ValueId newBase = concatOps[i];
+                    const ValueId newBase = concatOps[i];
                     if (!newBase.valid())
                     {
                         return false;
                     }
-                    if (dependsTransitivelyOn(graph, newBase, resultId))
+                    if (dependsTransitivelyOn(graph, newBase, resultId, depScratch))
                     {
                         return false;
                     }
@@ -1805,20 +1947,20 @@ namespace wolvrix::lib::transform
                             graph.replaceOperand(opId, 0, newBase);
                             changed = true;
                         }
-                        const int64_t operandWidth = graph.getValue(newBase).width();
+                        const int64_t operandWidth = graph.valueWidth(newBase);
                         if (newLow == 0 && newHigh + 1 == operandWidth)
                         {
                             graph.setOpKind(opId, OperationKind::kAssign);
-                            while (graph.getOperation(opId).operands().size() > 1)
+                            while (graph.opOperands(opId).size() > 1)
                             {
-                                graph.eraseOperand(opId, graph.getOperation(opId).operands().size() - 1);
+                                graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
                             }
                             graph.eraseAttr(opId, "sliceStart");
                             graph.eraseAttr(opId, "sliceEnd");
                             graph.eraseAttr(opId, "sliceWidth");
                             changed = true;
                         }
-                        else if (op.kind() == OperationKind::kSliceStatic)
+                        else if (opKind == OperationKind::kSliceStatic)
                         {
                             if (newLow != low)
                             {
@@ -1834,9 +1976,9 @@ namespace wolvrix::lib::transform
                         else
                         {
                             graph.setOpKind(opId, OperationKind::kSliceStatic);
-                            while (graph.getOperation(opId).operands().size() > 1)
+                            while (graph.opOperands(opId).size() > 1)
                             {
-                                graph.eraseOperand(opId, graph.getOperation(opId).operands().size() - 1);
+                                graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
                             }
                             graph.setAttr(opId, "sliceStart", newLow);
                             graph.setAttr(opId, "sliceEnd", newHigh);
@@ -1846,7 +1988,7 @@ namespace wolvrix::lib::transform
                     }
                     catch (const std::exception &ex)
                     {
-                        onError(baseDef, std::string("Failed to retarget slice through kConcat: ") + ex.what());
+                        onError(graph.getOperation(baseDefId), std::string("Failed to retarget slice through kConcat: ") + ex.what());
                         return false;
                     }
                     if (changed)
@@ -1866,6 +2008,7 @@ namespace wolvrix::lib::transform
                                         const std::function<void(const Operation &, std::string)> &onError)
         {
             std::unordered_set<ValueId, ValueIdHash> loopSet(loop.loopValues.begin(), loop.loopValues.end());
+            TransitiveDepScratch depScratch;
             bool changed = false;
             bool localChanged = true;
             while (localChanged)
@@ -1877,7 +2020,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    if (retargetSliceOp(graph, opId, loopSet, retargeted, onError))
+                    if (retargetSliceOp(graph, opId, loopSet, retargeted, onError, depScratch))
                     {
                         changed = true;
                         localChanged = true;
@@ -2313,7 +2456,9 @@ namespace wolvrix::lib::transform
 
             // stage-05: results of dynamic-index kSliceArray reads are defined
             // monolithically (the selected element is not statically known),
-            // so they must stay one whole fragment.
+            // so they must stay one whole fragment. stage-07: the same holds
+            // for monolithic loop ops (shifts, arithmetic, register-array
+            // reads) — their results take no cut points.
             std::unordered_set<ValueId, ValueIdHash> unsplittable;
             for (OperationId opId : loop.loopOps)
             {
@@ -2322,20 +2467,31 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 const Operation op = graph.getOperation(opId);
-                if (op.kind() != OperationKind::kSliceArray)
+                if (op.kind() == OperationKind::kSliceArray)
                 {
+                    const auto &results = op.results();
+                    if (results.size() != 1 || !results[0].valid() ||
+                        loopSet.find(results[0]) == loopSet.end())
+                    {
+                        continue;
+                    }
+                    auto geometry = getSliceArrayGeometry(graph, op);
+                    if (!geometry || !geometry->selectable)
+                    {
+                        unsplittable.insert(results[0]);
+                    }
                     continue;
                 }
-                const auto &results = op.results();
-                if (results.size() != 1 || !results[0].valid() ||
-                    loopSet.find(results[0]) == loopSet.end())
+                if (isMonolithicLoopOp(op.kind()))
                 {
-                    continue;
-                }
-                auto geometry = getSliceArrayGeometry(graph, op);
-                if (!geometry || !geometry->selectable)
-                {
-                    unsplittable.insert(results[0]);
+                    for (ValueId resultValue : op.results())
+                    {
+                        if (resultValue.valid() &&
+                            loopSet.find(resultValue) != loopSet.end())
+                        {
+                            unsplittable.insert(resultValue);
+                        }
+                    }
                 }
             }
 
@@ -3269,6 +3425,57 @@ namespace wolvrix::lib::transform
                                                           op.srcLoc()});
                     break;
                 }
+                case OperationKind::kSub:
+                case OperationKind::kMul:
+                case OperationKind::kDiv:
+                case OperationKind::kMod:
+                case OperationKind::kShl:
+                case OperationKind::kLShr:
+                case OperationKind::kAShr:
+                case OperationKind::kRegisterReadArrayPort:
+                {
+                    // Monolithic rewrite: the result is a single whole-value
+                    // fragment (unsplittable, see splitFalseLoop's cut
+                    // collection); operands reassemble as full views.
+                    if (resultSegments.size() != 1)
+                    {
+                        return false;
+                    }
+                    const auto &seg = resultSegments.front();
+                    if (seg.low != 0 ||
+                        seg.high + 1 != graph.getValue(resultId).width())
+                    {
+                        return false;
+                    }
+                    auto dstFrag = getFragment(resultId, seg);
+                    if (!dstFrag)
+                    {
+                        return false;
+                    }
+                    std::vector<ValueId> views;
+                    views.reserve(operands.size());
+                    for (ValueId operand : operands)
+                    {
+                        if (!operand.valid())
+                        {
+                            return false;
+                        }
+                        auto view = getFullView(operand);
+                        if (!view)
+                        {
+                            return false;
+                        }
+                        views.push_back(*view);
+                    }
+                    if (!definedFragments.insert(*dstFrag).second)
+                    {
+                        return false;
+                    }
+                    customOps.emplace(opId, CustomRewrite{op.kind(), std::move(views),
+                                                          resultId, resultSegments,
+                                                          op.srcLoc()});
+                    break;
+                }
                 default:
                     return false;
                 }
@@ -3408,10 +3615,12 @@ namespace wolvrix::lib::transform
             {
                 const OperationId opId = entry.first;
                 const auto &custom = entry.second;
-                if (isCompareOp(custom.kind) || custom.kind == OperationKind::kSliceArray)
+                if (isCompareOp(custom.kind) || custom.kind == OperationKind::kSliceArray ||
+                    isMonolithicLoopOp(custom.kind))
                 {
-                    // kSliceArray (dynamic index) and compares share the
-                    // "rewrite in place with reassembled operands" shape.
+                    // kSliceArray (dynamic index), compares, and monolithic
+                    // loop ops share the "rewrite in place with reassembled
+                    // operands" shape.
                     auto dstFrag = getFragment(custom.result, custom.resultSegments.front());
                     if (!dstFrag)
                     {
@@ -3710,19 +3919,40 @@ namespace wolvrix::lib::transform
                 continue;
             }
 
-            auto buildSucc = [&](std::size_t valueCount) {
-                SuccMap succ;
-                succ.reserve(valueCount);
+            auto buildSucc = [&]() {
+                std::size_t maxSlot = 0;
+                for (const ValueId value : graph.values())
+                {
+                    maxSlot = std::max<std::size_t>(maxSlot, value.index);
+                }
+                auto trackEndpoints = [&](std::span<const ValueId> operands, std::span<const ValueId> results) {
+                    for (const ValueId operand : operands)
+                    {
+                        maxSlot = std::max<std::size_t>(maxSlot, operand.index);
+                    }
+                    for (const ValueId result : results)
+                    {
+                        maxSlot = std::max<std::size_t>(maxSlot, result.index);
+                    }
+                };
                 for (const auto opId : graph.operations())
                 {
-                    const Operation op = graph.getOperation(opId);
-                    if (isBoundaryOp(op.kind()))
+                    trackEndpoints(graph.opOperands(opId), graph.opResults(opId));
+                }
+
+                DenseSucc succ;
+                succ.offsets.assign(maxSlot + 2, 0);
+                for (const auto opId : graph.operations())
+                {
+                    const OperationKind opKind = graph.opKind(opId);
+                    if (isBoundaryOp(opKind) &&
+                        opKind != OperationKind::kRegisterReadArrayPort)
                     {
                         continue;
                     }
 
-                    const auto operands = op.operands();
-                    const auto results = op.results();
+                    const auto operands = graph.opOperands(opId);
+                    const auto results = graph.opResults(opId);
                     if (operands.empty() || results.empty())
                     {
                         continue;
@@ -3730,11 +3960,37 @@ namespace wolvrix::lib::transform
 
                     for (ValueId operand : operands)
                     {
-                        auto &edges = succ[operand];
-                        edges.reserve(edges.size() + results.size());
+                        succ.offsets[operand.index + 1] += results.size();
+                    }
+                }
+                for (std::size_t i = 1; i < succ.offsets.size(); ++i)
+                {
+                    succ.offsets[i] += succ.offsets[i - 1];
+                }
+                succ.targets.resize(succ.offsets[maxSlot + 1]);
+                std::vector<uint64_t> cursor(succ.offsets.begin(), succ.offsets.end() - 1);
+                for (const auto opId : graph.operations())
+                {
+                    const OperationKind opKind = graph.opKind(opId);
+                    if (isBoundaryOp(opKind) &&
+                        opKind != OperationKind::kRegisterReadArrayPort)
+                    {
+                        continue;
+                    }
+
+                    const auto operands = graph.opOperands(opId);
+                    const auto results = graph.opResults(opId);
+                    if (operands.empty() || results.empty())
+                    {
+                        continue;
+                    }
+
+                    for (ValueId operand : operands)
+                    {
+                        uint64_t &cur = cursor[operand.index];
                         for (ValueId resultValue : results)
                         {
-                            edges.push_back(resultValue);
+                            succ.targets[cur++] = resultValue;
                         }
                     }
                 }
@@ -3889,7 +4145,7 @@ namespace wolvrix::lib::transform
 
             {
                 const auto valueSpan = graph.values();
-                SuccMap succ = buildSucc(valueSpan.size());
+                DenseSucc succ = buildSucc();
                 std::vector<LoopInfo> initialLoops = collectLoopInfos(graph, valueSpan, succ);
                 if (!initialLoops.empty())
                 {
@@ -3914,7 +4170,7 @@ namespace wolvrix::lib::transform
                 for (std::size_t iter = 0; iter < options_.maxFixIterations; ++iter)
                 {
                     const auto valueSpan = graph.values();
-                    SuccMap succ = buildSucc(valueSpan.size());
+                    DenseSucc succ = buildSucc();
                     std::vector<LoopInfo> loops = collectLoopInfos(graph, valueSpan, succ);
                     if (loops.empty())
                     {
@@ -3991,7 +4247,7 @@ namespace wolvrix::lib::transform
             }
 
             const auto finalValues = graph.values();
-            SuccMap finalSucc = buildSucc(finalValues.size());
+            DenseSucc finalSucc = buildSucc();
             std::vector<LoopInfo> finalLoops = collectLoopInfos(graph, finalValues, finalSucc);
             std::size_t falseLoops = 0;
             std::size_t trueLoops = 0;

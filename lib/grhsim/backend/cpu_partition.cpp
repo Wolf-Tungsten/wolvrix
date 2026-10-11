@@ -820,7 +820,55 @@ namespace wolvrix::lib::grhsim
                     if (--indegree[user.index] == 0) ready.insert(user.index);
             }
             if (result.size() != cone)
+            {
+                if (const char *dumpPath = std::getenv("WOLVRIX_CPU_PARTITION_CYCLE_DUMP");
+                    dumpPath && *dumpPath)
+                {
+                    std::ofstream dump(dumpPath, std::ios::trunc);
+                    dump << "phase " << toString(phase) << " cone " << cone
+                         << " stuck " << (cone - result.size()) << '\n';
+                    for (const auto &op : model.operations())
+                    {
+                        if (op.phase != phase || indegree[op.id.index] == 0) continue;
+                        dump << "op " << op.id.index << " type " << model.text(op.opType);
+                        if (model.strings().valid(op.name))
+                            dump << " name " << model.text(op.name);
+                        for (const auto &ref : model.objectRefs(op))
+                        {
+                            if (ref.kind == ObjectKind::State && ref.index >= 1 &&
+                                ref.index <= model.states().size())
+                            {
+                                const auto &state = model.states()[ref.index - 1];
+                                if (model.strings().valid(state.name))
+                                    dump << " state " << model.text(state.name);
+                            }
+                        }
+                        dump << " deps";
+                        for (auto value : model.operands(op))
+                        {
+                            const auto source = producer[value.index];
+                            if (!source.index || !inPhase[source.index] ||
+                                indegree[source.index] == 0)
+                                continue;
+                            dump << ' ' << source.index;
+                        }
+                        dump << " operands";
+                        for (auto value : model.operands(op))
+                        {
+                            const auto source = producer[value.index];
+                            dump << ' ' << value.index;
+                            if (value.index >= 1 && value.index <= model.values().size() &&
+                                model.strings().valid(model.values()[value.index - 1].name))
+                                dump << '<' << model.text(model.values()[value.index - 1].name) << '>';
+                            if (source.index)
+                                dump << "(from:" << model.text(model.operations()[source.index - 1].opType)
+                                     << ')';
+                        }
+                        dump << '\n';
+                    }
+                }
                 throw std::runtime_error("six-phase flat branch contains a dependency cycle");
+            }
             std::sort(detectors.begin(), detectors.end());
             for (auto id : detectors) result.push_back(OpId{id, 0});
             return result;

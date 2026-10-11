@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
+#include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -230,7 +233,13 @@ namespace wolvrix::lib::grhsim
                 std::vector<uint64_t> items;
                 items.reserve(ctx.schedule.memWritePlan->size());
                 for (const auto &entry : *ctx.schedule.memWritePlan)
-                    items.push_back(estimatedCpuOpLines(model, entry.writeOp) + 4 + entry.readers.size());
+                    // stage-07: do NOT charge entry.readers here — the default
+                    // on-write activation collects reader ordinals into a
+                    // burst set emitted once per enable-word run, so the real
+                    // per-entry cost is a handful of lines (measured ~32/entry
+                    // on XiangShan aggregate vs ~2950 estimated: 81% of the
+                    // whole TU plan was phantom mem lines).
+                    items.push_back(estimatedCpuOpLines(model, entry.writeOp) + 8);
                 packStream(chunks, CpuEmitChunkKind::Mem, items, chunkCap);
             }
 
@@ -281,6 +290,28 @@ namespace wolvrix::lib::grhsim
             plan.chunkMaxEstimatedLines = chunkCap;
             plan.unitMaxEstimatedLines = unitCap;
             const auto chunks = buildChunks(ctx, chunkCap, unitCap);
+            // stage-07 diagnostics: per-kind estimated-line totals steer the
+            // compile-time cost breakdown (WOLVRIX_EMIT_PLAN_DEBUG).
+            if (std::getenv("WOLVRIX_EMIT_PLAN_DEBUG"))
+            {
+                static const char *kindNames[] = {"core",   "init",   "event", "generalScan",
+                                                  "supernode", "mem",   "output", "dump",
+                                                  "supernodePart"};
+                std::map<int, std::pair<uint64_t, uint64_t>> byKind;
+                for (const auto &chunk : chunks)
+                {
+                    auto &entry = byKind[static_cast<int>(chunk.kind)];
+                    entry.first += chunk.estimatedLines;
+                    ++entry.second;
+                }
+                for (const auto &[kind, entry] : byKind)
+                {
+                    const char *name =
+                        kind >= 0 && static_cast<std::size_t>(kind) < 9 ? kindNames[kind] : "?";
+                    std::cerr << "[emit-plan] kind=" << name << " lines=" << entry.first
+                              << " chunks=" << entry.second << '\n';
+                }
+            }
             uint64_t unitLines = 0;
             for (const auto &chunk : chunks)
             {

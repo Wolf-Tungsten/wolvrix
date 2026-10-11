@@ -403,7 +403,7 @@ namespace wolvrix::lib::transform
                     {
                         if (!graph->valueShape(index).empty())
                         {
-                            error(*graph, op, "grh.verify: kRegisterReadArrayPort index operands must be scalar");
+                            warning(*graph, op, "grh.verify: kRegisterReadArrayPort index operand carries a shape (read as flat integer)");
                             break;
                         }
                     }
@@ -517,8 +517,8 @@ namespace wolvrix::lib::transform
                         {
                             if (!graph->valueShape(operands[1 + i]).empty())
                             {
-                                error(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
-                                                      " index operands must be scalar");
+                                warning(*graph, op, "grh.verify: " + std::string(toString(op.kind())) +
+                                                      " index operand carries a shape (read as flat integer)");
                                 break;
                             }
                         }
@@ -729,7 +729,7 @@ namespace wolvrix::lib::transform
                     {
                         if (!graph->valueShape(operands[i]).empty())
                         {
-                            error(*graph, op, "grh.verify: kSliceArray index operands must be scalar");
+                            warning(*graph, op, "grh.verify: kSliceArray index operand carries a shape (read as flat integer)");
                             break;
                         }
                     }
@@ -803,10 +803,20 @@ namespace wolvrix::lib::transform
                         {
                             locText += " pass=" + loc->pass;
                         }
+                        std::string operandWidths;
+                        for (std::size_t oi = 0; oi < operands.size() && oi < 6; ++oi)
+                        {
+                            operandWidths += (oi == 0 ? " operands w=[" : ",");
+                            operandWidths += std::to_string(graph->valueWidth(operands[oi]));
+                        }
+                        if (!operandWidths.empty())
+                        {
+                            operandWidths += operands.size() > 6 ? ",...]" : "]";
+                        }
                         error(*graph, op, "grh.verify: kConcat result width " +
                                               std::to_string(graph->valueWidth(results.front())) +
                                               " does not match operand width sum " +
-                                              std::to_string(totalWidth) + locText);
+                                              std::to_string(totalWidth) + locText + operandWidths);
                     }
                     break;
                 }

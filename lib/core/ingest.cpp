@@ -1208,6 +1208,7 @@ bool splitStructType(const slang::ast::Type& type, std::string_view rootName,
     return walker.isStruct && !walker.failed;
 }
 
+
 // stage-04: is the type struct-typed at the leaf level (arrays of structs
 // included)? Unions are treated as struct-typed here and rejected by the
 // splitter itself.
@@ -1236,6 +1237,233 @@ bool isStructTyped(const slang::ast::Type& type)
         }
     }
     return false;
+}
+
+// stage-07: SV packed-layout segments of struct-split leaves. The SoA split
+// keeps one value per field with outer dims migrated onto the leaf, but the
+// FLAT SV layout of an array-of-struct is element-major: a leaf with outer
+// packed dims occupies one bit run PER ELEMENT of the flat value, not a
+// contiguous block. Each segment records its LSB offset both in the whole
+// flat value and in the leaf's own flat value, so flat<->leaf translation in
+// either direction is an exact gather/scatter. Types without a packed layout
+// (unpacked dims, unions) report failure — callers fall back to the legacy
+// contiguous field-major view for those.
+struct SvLayoutSegment
+{
+    int64_t flatOffset = 0;  // LSB offset within the whole flat value
+    int64_t leafOffset = 0;  // LSB offset within the leaf's own flat value
+    int64_t width = 0;
+};
+
+bool collectSvLeafSegments(const slang::ast::Type& type, std::string_view rootName,
+                           const std::vector<StructSplitLeaf>& leaves,
+                           std::vector<std::vector<SvLayoutSegment>>& out)
+{
+    struct Walker
+    {
+        std::vector<std::vector<SvLayoutSegment>> segs;
+        std::vector<std::string> leafOrder;
+        std::unordered_map<std::string, std::size_t> leafIndex;
+        std::vector<int64_t> laneExtents;
+        std::vector<int64_t> laneIndices;
+        std::vector<std::size_t> boundaries;
+        bool failed = false;
+
+        int64_t widthOf(const slang::ast::Type& type)
+        {
+            const slang::ast::Type* current = &type;
+            while (current && !failed)
+            {
+                const slang::ast::Type& canonical = current->getCanonicalType();
+                switch (canonical.kind)
+                {
+                case slang::ast::SymbolKind::TypeAlias:
+                    current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+                    continue;
+                case slang::ast::SymbolKind::PackedArrayType: {
+                    const auto& packed = canonical.as<slang::ast::PackedArrayType>();
+                    const int64_t extent = static_cast<int64_t>(packed.range.fullWidth());
+                    const int64_t elem = widthOf(packed.elementType);
+                    if (extent <= 0 || elem <= 0 ||
+                        extent > std::numeric_limits<int64_t>::max() / elem)
+                    {
+                        failed = true;
+                        return 0;
+                    }
+                    return extent * elem;
+                }
+                case slang::ast::SymbolKind::PackedStructType:
+                case slang::ast::SymbolKind::UnpackedStructType: {
+                    int64_t total = 0;
+                    for (const auto& field : canonical.as<slang::ast::Scope>()
+                                                 .membersOfType<slang::ast::FieldSymbol>())
+                    {
+                        const int64_t fw = widthOf(field.getType());
+                        if (failed || fw <= 0 ||
+                            total > std::numeric_limits<int64_t>::max() - fw)
+                        {
+                            failed = true;
+                            return 0;
+                        }
+                        total += fw;
+                    }
+                    return total;
+                }
+                case slang::ast::SymbolKind::PackedUnionType:
+                case slang::ast::SymbolKind::UnpackedUnionType:
+                case slang::ast::SymbolKind::FixedSizeUnpackedArrayType:
+                case slang::ast::SymbolKind::DynamicArrayType:
+                case slang::ast::SymbolKind::AssociativeArrayType:
+                case slang::ast::SymbolKind::QueueType:
+                    failed = true;
+                    return 0;
+                default: {
+                    const uint64_t width = canonical.getBitstreamWidth();
+                    if (width == 0 ||
+                        width > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))
+                    {
+                        failed = true;
+                        return 0;
+                    }
+                    return static_cast<int64_t>(width);
+                }
+                }
+            }
+            failed = true;
+            return 0;
+        }
+
+        void recordLeaf(const std::string& path, int64_t base, int64_t width)
+        {
+            auto [it, inserted] = leafIndex.emplace(path, segs.size());
+            if (inserted)
+            {
+                leafOrder.push_back(path);
+                segs.emplace_back();
+            }
+            const std::size_t boundary = boundaries.empty() ? 0 : boundaries.back();
+            int64_t lane = 0;
+            for (std::size_t d = 0; d < boundary; ++d)
+                lane = lane * laneExtents[d] + laneIndices[d];
+            segs[it->second].push_back(SvLayoutSegment{base, lane * width, width});
+        }
+
+        void walk(const slang::ast::Type& type, const std::string& path, int64_t base)
+        {
+            const slang::ast::Type* current = &type;
+            while (current && !failed)
+            {
+                const slang::ast::Type& canonical = current->getCanonicalType();
+                switch (canonical.kind)
+                {
+                case slang::ast::SymbolKind::TypeAlias:
+                    current = &canonical.as<slang::ast::TypeAliasType>().targetType.getType();
+                    continue;
+                case slang::ast::SymbolKind::PackedArrayType: {
+                    const auto& packed = canonical.as<slang::ast::PackedArrayType>();
+                    const slang::ast::Type& element = packed.elementType;
+                    const int64_t elemWidth = widthOf(element);
+                    const int64_t extent = static_cast<int64_t>(packed.range.fullWidth());
+                    if (failed || elemWidth <= 0 || extent <= 0 || extent > (int64_t{1} << 20))
+                    {
+                        failed = true;
+                        return;
+                    }
+                    if (!isStructTyped(element))
+                    {
+                        // A struct-free packed array is one contiguous leaf
+                        // block (its own dims stay inside the leaf value).
+                        recordLeaf(path, base, elemWidth * extent);
+                        return;
+                    }
+                    laneExtents.push_back(extent);
+                    laneIndices.push_back(0);
+                    for (int64_t lane = 0; lane < extent && !failed; ++lane)
+                    {
+                        laneIndices.back() = lane;
+                        walk(element, path, base + lane * elemWidth);
+                    }
+                    laneExtents.pop_back();
+                    laneIndices.pop_back();
+                    return;
+                }
+                case slang::ast::SymbolKind::PackedStructType:
+                case slang::ast::SymbolKind::UnpackedStructType: {
+                    boundaries.push_back(laneExtents.size());
+                    int64_t cursor = base + widthOf(canonical);
+                    for (const auto& field : canonical.as<slang::ast::Scope>()
+                                                 .membersOfType<slang::ast::FieldSymbol>())
+                    {
+                        const int64_t fw = widthOf(field.getType());
+                        if (failed || fw <= 0 || cursor < base + fw)
+                        {
+                            failed = true;
+                            break;
+                        }
+                        cursor -= fw;
+                        std::string child = path;
+                        child.append("__DOT__");
+                        child.append(field.name);
+                        walk(field.getType(), child, cursor);
+                    }
+                    boundaries.pop_back();
+                    return;
+                }
+                case slang::ast::SymbolKind::PackedUnionType:
+                case slang::ast::SymbolKind::UnpackedUnionType:
+                case slang::ast::SymbolKind::FixedSizeUnpackedArrayType:
+                case slang::ast::SymbolKind::DynamicArrayType:
+                case slang::ast::SymbolKind::AssociativeArrayType:
+                case slang::ast::SymbolKind::QueueType:
+                    failed = true;
+                    return;
+                default:
+                    recordLeaf(path, base, widthOf(canonical));
+                    return;
+                }
+            }
+        }
+    };
+    Walker walker;
+    walker.walk(type, std::string(rootName), 0);
+    if (walker.failed || walker.leafOrder.size() != leaves.size())
+    {
+        return false;
+    }
+    for (std::size_t i = 0; i < leaves.size(); ++i)
+    {
+        if (walker.leafOrder[i] != leaves[i].fullName)
+        {
+            return false;
+        }
+    }
+    out = std::move(walker.segs);
+    return true;
+}
+
+// Do the segments describe the trivial layout (each leaf one contiguous run,
+// leaves tiling the flat value in declaration order from the MSB side)?
+// That layout is exactly what the legacy contiguous field-major offsets
+// compute, so callers can keep the single-slice fast path.
+bool svLeafSegmentsTrivial(const std::vector<std::vector<SvLayoutSegment>>& segments,
+                           int64_t totalWidth)
+{
+    int64_t expectHigh = totalWidth;
+    for (std::size_t i = 0; i < segments.size(); ++i)
+    {
+        if (segments[i].size() != 1)
+        {
+            return false;
+        }
+        const SvLayoutSegment& seg = segments[i][0];
+        const int64_t leafWidth = seg.width;
+        if (seg.leafOffset != 0 || seg.flatOffset + leafWidth != expectHigh)
+        {
+            return false;
+        }
+        expectHigh = seg.flatOffset;
+    }
+    return expectHigh == 0;
 }
 
 // Compute the TypeResolution for one split leaf: the leaf's own packed part
@@ -2966,6 +3194,38 @@ struct StmtLowererState {
         return false;
     }
 
+    // stage-07: gather one split leaf out of a flat SV-packed-layout value.
+    // A leaf with outer array dims occupies one bit run per element
+    // (element-major), so this is a concat of per-segment slices, MSB
+    // (highest leaf offset) first. Single-segment leaves stay a plain slice.
+    ExprNodeId sliceLeafFromFlatValue(ExprNodeId flat,
+                                      const std::vector<SvLayoutSegment>& segments,
+                                      int64_t leafWidth, slang::SourceLocation location)
+    {
+        if (segments.empty())
+        {
+            return kInvalidPlanIndex;
+        }
+        if (segments.size() == 1)
+        {
+            ExprNodeId offset =
+                addConstantLiteral(std::to_string(segments[0].flatOffset), location);
+            return makeSliceDynamic(flat, offset,
+                                    static_cast<int32_t>(std::max<int64_t>(1, leafWidth)),
+                                    location);
+        }
+        std::vector<ExprNodeId> parts;
+        parts.reserve(segments.size());
+        for (auto it = segments.rbegin(); it != segments.rend(); ++it)
+        {
+            ExprNodeId offset =
+                addConstantLiteral(std::to_string(it->flatOffset), location);
+            parts.push_back(makeSliceDynamic(flat, offset,
+                                             static_cast<int32_t>(it->width), location));
+        }
+        return makeOperation(wolvrix::lib::grh::OperationKind::kConcat, parts, location);
+    }
+
     // stage-04: lower a struct-typed RHS (pattern, aggregate expression, or
     // flat value) into per-leaf values of the given struct type.
     bool lowerStructRhsValues(const slang::ast::Type& lhsType,
@@ -2999,6 +3259,12 @@ struct StmtLowererState {
             return false;
         }
         std::vector<int64_t> offsets = aggregateLeafOffsets(leaves);
+        // stage-07: the flat RHS follows the SV packed layout (element-major
+        // over outer array dims); gather per-leaf segments exactly when the
+        // layout is non-trivial (array-of-struct), else keep the contiguous
+        // field-major fast path.
+        std::vector<std::vector<SvLayoutSegment>> leafSegments;
+        const bool haveSegments = collectSvLeafSegments(lhsType, "", leaves, leafSegments);
         int64_t total = 0;
         for (const StructSplitLeaf& leaf : leaves)
         {
@@ -3016,6 +3282,17 @@ struct StmtLowererState {
         for (std::size_t i = 0; i < leaves.size(); ++i)
         {
             const int64_t width = aggregateLeafFlatWidth(leaves[i]);
+            if (haveSegments)
+            {
+                ExprNodeId leafValue =
+                    sliceLeafFromFlatValue(flat, leafSegments[i], width, rhs.sourceRange.start());
+                if (leafValue == kInvalidPlanIndex)
+                {
+                    return false;
+                }
+                out.push_back(leafValue);
+                continue;
+            }
             ExprNodeId offset =
                 addConstantLiteral(std::to_string(offsets[i]), rhs.sourceRange.start());
             out.push_back(makeSliceDynamic(
@@ -8252,12 +8529,21 @@ private:
             return makeSliceDynamic(value, bitIndex, static_cast<int32_t>(subWidth), location);
         }
         const bool stateChain = isArrayStateChain(value);
+        // Result width of selecting the leaf's leading dim: the leaf's flat
+        // width divided by the consumed dim's extent (same formula as the
+        // connection-side variant elementSelectOnLeafConn). The widthHint must
+        // be exact here — resizeValueToWidth trusts it and would otherwise
+        // pad the lane value with bogus zeros.
+        const int64_t leafFlatWidth = std::max<int64_t>(1, aggregateLeafFlatWidth(leaf));
         if (!leaf.unpackedDims.empty())
         {
+            const int64_t extent = std::max<int64_t>(1, leaf.unpackedDims.front().extent);
+            const int32_t subWidth =
+                static_cast<int32_t>(std::max<int64_t>(1, leafFlatWidth / extent));
             if (stateChain)
             {
                 // pass4 normalizes raw unpacked indices on state reads.
-                return makeSliceDynamic(value, index, 1, location);
+                return makeSliceDynamic(value, index, subWidth, location);
             }
             const UnpackedDimInfo& dim = leaf.unpackedDims.front();
             ExprNodeId normalized = index;
@@ -8278,13 +8564,16 @@ private:
                 normalized = makeOperation(wolvrix::lib::grh::OperationKind::kSub,
                                            {offset, normalized}, location);
             }
-            return makeSliceArray(value, normalized, 1, location);
+            return makeSliceArray(value, normalized, subWidth, location);
         }
         if (!leaf.packedDimInfos.empty())
         {
+            const int64_t extent = std::max<int64_t>(1, leaf.packedDimInfos.front().extent);
+            const int32_t subWidth =
+                static_cast<int32_t>(std::max<int64_t>(1, leafFlatWidth / extent));
             ExprNodeId lane =
                 normalizePackedLaneIndexForDim(leaf.packedDimInfos.front(), index, location);
-            return makeSliceArray(value, lane, 1, location);
+            return makeSliceArray(value, lane, subWidth, location);
         }
         reportUnsupportedLocation(location,
                                   "Element select on scalar struct leaf in aggregate");
@@ -8327,6 +8616,57 @@ private:
             const ExprNode& node = lowering.values[value];
             total += node.widthHint > 0 ? node.widthHint : leafWidth;
             operands.push_back(value);
+        }
+        // stage-07: the flat SV packed layout is element-major over outer
+        // array dims — a leaf with outer dims scatters into one bit run per
+        // element. Gather runs in descending flat offset; the trivial layout
+        // (no interleaving) is exactly the legacy whole-leaf concat.
+        std::vector<std::vector<SvLayoutSegment>> leafSegments;
+        const bool haveSegments =
+            aggregate.type && aggregate.leafTypes.size() == operands.size() &&
+            collectSvLeafSegments(*aggregate.type, "", aggregate.leafTypes, leafSegments) &&
+            !svLeafSegmentsTrivial(leafSegments, total);
+        if (haveSegments)
+        {
+            struct ScatterPart
+            {
+                int64_t flatOffset;
+                std::size_t leaf;
+                int64_t leafOffset;
+                int64_t width;
+            };
+            std::vector<ScatterPart> scatter;
+            for (std::size_t i = 0; i < leafSegments.size(); ++i)
+            {
+                for (const SvLayoutSegment& seg : leafSegments[i])
+                {
+                    scatter.push_back(ScatterPart{seg.flatOffset, i, seg.leafOffset, seg.width});
+                }
+            }
+            std::sort(scatter.begin(), scatter.end(),
+                      [](const ScatterPart& a, const ScatterPart& b) {
+                          return a.flatOffset > b.flatOffset;
+                      });
+            std::vector<ExprNodeId> parts;
+            parts.reserve(scatter.size());
+            for (const ScatterPart& part : scatter)
+            {
+                ExprNodeId value = operands[part.leaf];
+                const int64_t leafWidth = aggregateLeafFlatWidth(aggregate.leafTypes[part.leaf]);
+                if (part.leafOffset != 0 || part.width != leafWidth)
+                {
+                    ExprNodeId offset =
+                        addConstantLiteral(std::to_string(part.leafOffset), location);
+                    value = makeSliceDynamic(value, offset,
+                                             static_cast<int32_t>(part.width), location);
+                    if (value == kInvalidPlanIndex)
+                    {
+                        return kInvalidPlanIndex;
+                    }
+                }
+                parts.push_back(value);
+            }
+            operands = std::move(parts);
         }
         ExprNode node;
         node.kind = ExprNodeKind::Operation;
@@ -8540,6 +8880,9 @@ private:
                 return false;
             }
             std::vector<int64_t> offsets = aggregateLeafOffsets(leaves);
+            std::vector<std::vector<SvLayoutSegment>> leafSegments;
+            const bool haveSegments =
+                collectSvLeafSegments(componentType, "", leaves, leafSegments);
             int64_t total = 0;
             for (const StructSplitLeaf& leaf : leaves)
             {
@@ -8557,6 +8900,17 @@ private:
             for (std::size_t i = 0; i < leaves.size(); ++i)
             {
                 const int64_t width = aggregateLeafFlatWidth(leaves[i]);
+                if (haveSegments)
+                {
+                    ExprNodeId leafValue = sliceLeafFromFlatValue(
+                        flat, leafSegments[i], width, expr.sourceRange.start());
+                    if (leafValue == kInvalidPlanIndex)
+                    {
+                        return false;
+                    }
+                    out.push_back(leafValue);
+                    continue;
+                }
                 ExprNodeId offset =
                     addConstantLiteral(std::to_string(offsets[i]), expr.sourceRange.start());
                 out.push_back(makeSliceDynamic(
@@ -9039,6 +9393,10 @@ private:
             // Flat integer literal for the whole struct: slice each leaf out
             // of the packed layout.
             std::vector<int64_t> offsets = aggregateLeafOffsets(out.leafTypes);
+            std::vector<std::vector<SvLayoutSegment>> leafSegments;
+            const bool haveSegments =
+                expr.type &&
+                collectSvLeafSegments(*expr.type, "", out.leafTypes, leafSegments);
             int64_t total = 0;
             for (const StructSplitLeaf& leaf : out.leafTypes)
             {
@@ -9055,6 +9413,17 @@ private:
             for (std::size_t i = 0; i < out.leafTypes.size(); ++i)
             {
                 const int64_t width = aggregateLeafFlatWidth(out.leafTypes[i]);
+                if (haveSegments)
+                {
+                    ExprNodeId leafValue = sliceLeafFromFlatValue(
+                        flat, leafSegments[i], width, expr.sourceRange.start());
+                    if (leafValue == kInvalidPlanIndex)
+                    {
+                        return false;
+                    }
+                    out.values.push_back(leafValue);
+                    continue;
+                }
                 ExprNodeId offset =
                     addConstantLiteral(std::to_string(offsets[i]), expr.sourceRange.start());
                 out.values.push_back(makeSliceDynamic(
@@ -9241,9 +9610,13 @@ private:
             {
                 if (info && !info->unpackedDims.empty())
                 {
+                    const int64_t extent =
+                        std::max<int32_t>(1, info->unpackedDims.front().extent);
+                    const int32_t rowWidth = static_cast<int32_t>(std::max<int64_t>(
+                        1, signalTotalWidth(*info) / extent));
                     if (isArrayStateChain(value))
                     {
-                        value = makeSliceDynamic(value, slice.index, 1, location);
+                        value = makeSliceDynamic(value, slice.index, rowWidth, location);
                     }
                     else
                     {
@@ -9268,7 +9641,7 @@ private:
                                 makeOperation(wolvrix::lib::grh::OperationKind::kSub,
                                               {offset, normalized}, location);
                         }
-                        value = makeSliceArray(value, normalized, 1, location);
+                        value = makeSliceArray(value, normalized, rowWidth, location);
                     }
                 }
                 else if (info && !info->packedDimInfos.empty())
@@ -9279,14 +9652,17 @@ private:
                         !info->packedDimInfos.empty())
                     {
                         // stage-04: folded-scalar leaf — plain bit slice of
-                        // the addressed sub-array (element width × remaining
-                        // packed dims).
-                        int64_t subWidth = static_cast<int64_t>(
-                            std::max<int32_t>(1, info->elementWidth));
-                        for (std::size_t d = 1; d < info->packedDimInfos.size(); ++d)
-                        {
-                            subWidth *= std::max<int32_t>(1, info->packedDimInfos[d].extent);
-                        }
+                        // the addressed sub-array. stage-07: the lane width is
+                        // the leaf's flat width divided by the consumed dim's
+                        // extent — the previous form (elementWidth × remaining
+                        // dims) double-counted the innermost dim whenever it
+                        // matched the element width (e.g. 50→2500 on
+                        // single-element packed-struct-array leaves).
+                        const int64_t extent =
+                            std::max<int32_t>(1, info->packedDimInfos.front().extent);
+                        const int64_t flatWidth =
+                            std::max<int32_t>(1, info->width);
+                        const int64_t subWidth = std::max<int64_t>(1, flatWidth / extent);
                         ExprNodeId bitIndex = lane;
                         if (subWidth > 1)
                         {
@@ -9300,7 +9676,11 @@ private:
                     }
                     else
                     {
-                        value = makeSliceArray(value, lane, 1, location);
+                        const int64_t extent =
+                            std::max<int32_t>(1, info->packedDimInfos.front().extent);
+                        const int32_t subWidth = static_cast<int32_t>(std::max<int64_t>(
+                            1, signalTotalWidth(*info) / extent));
+                        value = makeSliceArray(value, lane, subWidth, location);
                     }
                 }
                 else
@@ -9311,7 +9691,12 @@ private:
                 if (info && !info->unpackedDims.empty())
                 {
                     SignalInfo shrunk = *info;
+                    const int64_t extent = std::max<int32_t>(1, shrunk.unpackedDims.front().extent);
                     shrunk.unpackedDims.erase(shrunk.unpackedDims.begin());
+                    if (!shrunk.shape.empty() && shrunk.shape.front() == extent)
+                    {
+                        shrunk.shape.erase(shrunk.shape.begin());
+                    }
                     static thread_local std::deque<SignalInfo> shrunkPool;
                     shrunkPool.push_back(std::move(shrunk));
                     info = &shrunkPool.back();
@@ -9319,7 +9704,12 @@ private:
                 else if (info && !info->packedDimInfos.empty())
                 {
                     SignalInfo shrunk = *info;
+                    const int64_t extent = std::max<int32_t>(1, shrunk.packedDimInfos.front().extent);
                     shrunk.packedDimInfos.erase(shrunk.packedDimInfos.begin());
+                    if (!shrunk.shape.empty() && shrunk.shape.front() == extent)
+                    {
+                        shrunk.shape.erase(shrunk.shape.begin());
+                    }
                     static thread_local std::deque<SignalInfo> shrunkPool;
                     shrunkPool.push_back(std::move(shrunk));
                     info = &shrunkPool.back();
@@ -14022,9 +14412,11 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
 
     auto resolveSliceSelection =
         [&](const WriteSlice& slice, const slang::ast::Type* baseType,
-            int64_t baseWidth, SliceSelection& out) -> bool {
+            int64_t baseWidth, SliceSelection& out, const SignalInfo* leafInfo = nullptr,
+            std::size_t leafDim = 0) -> bool {
         out = {};
         const int64_t packedOffset = getPackedIndexOffset(baseType);
+        bool elementSliceResolved = false;
         switch (slice.kind)
         {
         case WriteSliceKind::MemberSelect:
@@ -14044,9 +14436,25 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 return false;
             }
             auto indexConst = evalConstInt(plan, lowering, slice.index);
-            const auto packedElement = getPackedArrayElementSlice(baseType);
+            auto packedElement = getPackedArrayElementSlice(baseType);
+            if (!packedElement && leafInfo && leafDim < leafInfo->packedDimInfos.size())
+            {
+                // stage-07: SoA-split leaves carry their outer array dims as
+                // SignalInfo metadata, not in the leaf type. The select
+                // consumes the outermost remaining dim; the lane width is the
+                // leaf's flat width divided by that dim's extent (the dim
+                // list also contains the leaf's own width dim, so multiplying
+                // an element width by the remaining dims would double-count).
+                const UnpackedDimInfo& dim = leafInfo->packedDimInfos[leafDim];
+                const int64_t extent = std::max<int32_t>(1, dim.extent);
+                const int64_t laneWidth =
+                    std::max<int64_t>(1, (baseWidth > 0 ? baseWidth : 1) / extent);
+                packedElement = std::pair{std::min<int64_t>(dim.left, dim.right),
+                                          laneWidth};
+            }
             out.width = packedElement ? packedElement->second : 1;
             out.subWidth = out.width;
+            elementSliceResolved = packedElement.has_value();
             if (indexConst)
             {
                 out.isStatic = true;
@@ -14152,7 +14560,7 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
              slice.kind == WriteSliceKind::RangeSelect) &&
             packedOffset != 0 &&
             !(slice.kind == WriteSliceKind::BitSelect &&
-              getPackedArrayElementSlice(baseType).has_value()))
+              elementSliceResolved))
         {
             if (out.isStatic)
             {
@@ -14313,12 +14721,13 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
 
     std::function<ExprNodeId(ExprNodeId, const slang::ast::Type*, int64_t,
                              const std::vector<WriteSlice>&, std::size_t, ExprNodeId,
-                             slang::SourceLocation)>
+                             slang::SourceLocation, const SignalInfo*)>
         applySlices;
     applySlices = [&](ExprNodeId base, const slang::ast::Type* baseType,
                       int64_t baseWidth, const std::vector<WriteSlice>& slices,
                       std::size_t start, ExprNodeId value,
-                      slang::SourceLocation location) -> ExprNodeId {
+                      slang::SourceLocation location,
+                      const SignalInfo* leafInfo = nullptr) -> ExprNodeId {
         if (start >= slices.size())
         {
             return value;
@@ -14333,7 +14742,8 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             return kInvalidPlanIndex;
         }
         SliceSelection selection;
-        if (!resolveSliceSelection(slices[start], baseType, baseWidth, selection))
+        if (!resolveSliceSelection(slices[start], baseType, baseWidth, selection,
+                                   leafInfo, start))
         {
             return kInvalidPlanIndex;
         }
@@ -14345,7 +14755,7 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
         }
         ExprNodeId updatedSub =
             applySlices(subValue, selection.subType, selection.subWidth, slices,
-                        start + 1, value, location);
+                        start + 1, value, location, leafInfo);
         if (updatedSub == kInvalidPlanIndex)
         {
             return kInvalidPlanIndex;
@@ -15810,7 +16220,8 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             }
             SliceSelection selection;
             if (!resolveSliceSelection(write.slices.front(), baseType, baseWidth,
-                                       selection) ||
+                                       selection,
+                                       findSignalBySymbol(plan, write.target)) ||
                 !selection.isStatic || selection.width <= 0)
             {
                 return false;
@@ -16144,7 +16555,8 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 }
                 SliceSelection selection;
                 if (!resolveSliceSelection(write.slices.front(), baseType, baseWidth,
-                                           selection) ||
+                                           selection,
+                                           findSignalBySymbol(plan, write.target)) ||
                     !selection.isStatic || selection.width <= 0)
                 {
                     sliceOk = false;
@@ -16242,7 +16654,8 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 }
                 SliceSelection selection;
                 if (!resolveSliceSelection(write.slices.front(), baseType, baseWidth,
-                                           selection) ||
+                                           selection,
+                                           findSignalBySymbol(plan, write.target)) ||
                     !selection.isStatic || selection.width <= 0)
                 {
                     canConcat = false;
@@ -16372,7 +16785,8 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
             if (!write.slices.empty())
             {
                 writeValue = applySlices(nextValue, baseType, baseWidth,
-                                         write.slices, 0, write.value, write.location);
+                                         write.slices, 0, write.value, write.location,
+                                         findSignalBySymbol(plan, write.target));
                 if (writeValue == kInvalidPlanIndex)
                 {
                     continue;
@@ -20095,6 +20509,62 @@ private:
             {
                 continue;
             }
+            // stage-07: the write data must match the addressed (sub-)array
+            // width exactly (the port contract checked by grh.verify);
+            // resize it against the register declaration instead of trusting
+            // the source expression's width (aggregate paths produced
+            // zero-extended or otherwise mismatched data values).
+            if (entry.memory.index < memoryOpBySymbol_.size())
+            {
+                const wolvrix::lib::grh::OperationId memOpId = memoryOpBySymbol_[entry.memory.index];
+                if (memOpId.valid())
+                {
+                    const wolvrix::lib::grh::Operation memOp = graph_.getOperation(memOpId);
+                    int64_t declWidth = 0;
+                    if (auto widthAttr = memOp.attr("width"))
+                    {
+                        if (const auto* w = std::get_if<int64_t>(&*widthAttr))
+                        {
+                            declWidth = *w;
+                        }
+                    }
+                    std::vector<int64_t> declShape;
+                    if (auto shapeAttr = memOp.attr("shape"))
+                    {
+                        if (const auto* dims = std::get_if<std::vector<int64_t>>(&*shapeAttr))
+                        {
+                            declShape = *dims;
+                        }
+                    }
+                    int64_t keptProduct = 1;
+                    bool shapeOk = declWidth > 0;
+                    for (std::size_t i = 0;
+                         shapeOk && i < entry.addressIndices.size() && i < declShape.size(); ++i)
+                    {
+                        if (declShape[i] <= 0)
+                        {
+                            shapeOk = false;
+                            break;
+                        }
+                        keptProduct *= declShape[i];
+                    }
+                    if (shapeOk && keptProduct > 0 && declWidth % keptProduct == 0)
+                    {
+                        const int64_t addressedWidth = declWidth / keptProduct;
+                        if (addressedWidth > 0 &&
+                            graph_.getValue(data).width() != addressedWidth)
+                        {
+                            const bool signExtend = graph_.getValue(data).isSigned();
+                            data = resizeValueToWidth(data, addressedWidth, signExtend,
+                                                      entry.location);
+                            if (!data.valid())
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             wolvrix::lib::grh::ValueId mask = wolvrix::lib::grh::ValueId::invalid();
             if (entry.mask != kInvalidPlanIndex)
             {
@@ -21266,15 +21736,58 @@ private:
                             }
                         }
                         const std::vector<int64_t> offsets = structLeafOffsets(leaves, *port);
+                        // stage-07: the flat driver follows the SV packed
+                        // layout (element-major over outer array dims), so a
+                        // leaf with outer dims maps to one bit run per
+                        // element. Gather the segments exactly instead of
+                        // assuming the contiguous field-major view.
+                        std::vector<std::vector<SvLayoutSegment>> leafSegments;
+                        const bool haveSegments =
+                            collectSvLeafSegments(port->getType(), port->name, leaves,
+                                                  leafSegments) &&
+                            !svLeafSegmentsTrivial(leafSegments, total);
                         for (std::size_t i = 0; i < leaves.size(); ++i)
                         {
                             const int64_t width = structLeafFlatWidth(leaves[i], *port);
                             const int64_t low = offsets[i];
                             const int64_t high = low + width - 1;
-                            wolvrix::lib::grh::ValueId slice =
-                                low == 0 && high == graph_.getValue(flat).width() - 1
-                                    ? flat
-                                    : makeSliceStatic(flat, low, high, expr->sourceRange.start());
+                            wolvrix::lib::grh::ValueId slice = wolvrix::lib::grh::ValueId::invalid();
+                            if (!haveSegments)
+                            {
+                                slice =
+                                    low == 0 && high == graph_.getValue(flat).width() - 1
+                                        ? flat
+                                        : makeSliceStatic(flat, low, high, expr->sourceRange.start());
+                            }
+                            else
+                            {
+                                // MSB-first over the leaf's segments.
+                                std::vector<wolvrix::lib::grh::ValueId> parts;
+                                parts.reserve(leafSegments[i].size());
+                                for (auto sit = leafSegments[i].rbegin();
+                                     sit != leafSegments[i].rend(); ++sit)
+                                {
+                                    wolvrix::lib::grh::ValueId part = makeSliceStatic(
+                                        flat, sit->flatOffset,
+                                        sit->flatOffset + sit->width - 1,
+                                        expr->sourceRange.start());
+                                    if (!part.valid())
+                                    {
+                                        break;
+                                    }
+                                    parts.push_back(part);
+                                }
+                                if (parts.size() == leafSegments[i].size())
+                                {
+                                    slice = parts.size() == 1
+                                                ? parts.front()
+                                                : makeConcat(std::move(parts),
+                                                             static_cast<int32_t>(std::min<int64_t>(
+                                                                 width > 0 ? width : 1,
+                                                                 std::numeric_limits<int32_t>::max())),
+                                                             expr->sourceRange.start());
+                                }
+                            }
                             if (!slice.valid())
                             {
                                 ok = false;
@@ -21330,6 +21843,21 @@ private:
                     {
                         ok = false;
                         break;
+                    }
+                    // stage-07: SV port connection extends/truncates the driver
+                    // to the port's declared width; do the same explicitly
+                    // (packed-array ports connected to narrower drivers, e.g.
+                    // IntRegFile's [3:0][5:0] io_readPorts_*_addr, otherwise
+                    // trip the kInstance width check).
+                    if (portWidth > 0 && graph_.getValue(value).width() != portWidth)
+                    {
+                        value = resizeValueToWidth(value, static_cast<int32_t>(portWidth),
+                                                   portSigned, expr->sourceRange.start());
+                        if (!value.valid())
+                        {
+                            ok = false;
+                            break;
+                        }
                     }
                     inputOperands.push_back(value);
                     break;
@@ -21680,6 +22208,34 @@ private:
         const wolvrix::lib::grh::ValueType baseType = graph_.getValue(base).type();
         wolvrix::lib::grh::ValueId result =
             graph_.createValue(sym, width, false, baseType);
+        graph_.addResult(op, result);
+        return result;
+    }
+
+    // MSB-first concat of graph values (parts.front() occupies the top bits).
+    wolvrix::lib::grh::ValueId makeConcat(std::vector<wolvrix::lib::grh::ValueId> parts,
+                                          int32_t width, slang::SourceLocation location)
+    {
+        if (parts.empty() || width <= 0)
+        {
+            return wolvrix::lib::grh::ValueId::invalid();
+        }
+        if (parts.size() == 1)
+        {
+            return parts.front();
+        }
+        wolvrix::lib::grh::OperationId op =
+            createOp(wolvrix::lib::grh::OperationKind::kConcat,
+                     wolvrix::lib::grh::SymbolId::invalid(),
+                     location);
+        for (const auto& part : parts)
+        {
+            graph_.addOperand(op, part);
+        }
+        wolvrix::lib::grh::SymbolId sym =
+            makeInternalValueSymbol();
+        wolvrix::lib::grh::ValueId result =
+            graph_.createValue(sym, width, false, graph_.getValue(parts.front()).type());
         graph_.addResult(op, result);
         return result;
     }
@@ -23277,6 +23833,57 @@ private:
                 }
                 total += width;
             }
+            // stage-07: scatter into the SV packed layout when outer array
+            // dims interleave the leaves (array-of-struct); the trivial
+            // layout equals the whole-leaf concat below.
+            std::vector<std::vector<SvLayoutSegment>> leafSegments;
+            if (haveLeafTypes &&
+                collectSvLeafSegments(*expr.type, "", leafTypes, leafSegments) &&
+                !svLeafSegmentsTrivial(leafSegments, total))
+            {
+                struct ScatterPart
+                {
+                    int64_t flatOffset;
+                    std::size_t leaf;
+                    int64_t leafOffset;
+                    int64_t width;
+                };
+                std::vector<ScatterPart> scatter;
+                for (std::size_t i = 0; i < leafSegments.size(); ++i)
+                {
+                    for (const SvLayoutSegment& seg : leafSegments[i])
+                    {
+                        scatter.push_back(ScatterPart{seg.flatOffset, i, seg.leafOffset, seg.width});
+                    }
+                }
+                std::sort(scatter.begin(), scatter.end(),
+                          [](const ScatterPart& a, const ScatterPart& b) {
+                              return a.flatOffset > b.flatOffset;
+                          });
+                std::vector<ExprNodeId> parts;
+                parts.reserve(scatter.size());
+                for (const ScatterPart& part : scatter)
+                {
+                    ExprNodeId value = leaves[part.leaf];
+                    const int64_t leafWidth =
+                        structLeafFlatWidth(leafTypes[part.leaf], *state_.plan_.body);
+                    if (part.leafOffset != 0 || part.width != leafWidth)
+                    {
+                        ExprNodeId offset =
+                            makeConstNode(std::to_string(part.leafOffset), expr.sourceRange.start());
+                        value = makeSliceDynamicNode(value, offset,
+                                                     static_cast<int32_t>(part.width),
+                                                     expr.sourceRange.start());
+                    }
+                    parts.push_back(value);
+                }
+                return makeOperationNode(wolvrix::lib::grh::OperationKind::kConcat,
+                                         std::move(parts),
+                                         static_cast<int32_t>(std::min<int64_t>(
+                                             total > 0 ? total : 1,
+                                             std::numeric_limits<int32_t>::max())),
+                                         expr.sourceRange.start());
+            }
             return makeOperationNode(wolvrix::lib::grh::OperationKind::kConcat,
                                      std::move(leaves),
                                      static_cast<int32_t>(std::min<int64_t>(
@@ -24456,7 +25063,21 @@ private:
         wolvrix::lib::grh::SymbolId sym =
             makeInternalValueSymbol();
         int32_t width = node.widthHint;
-        if (width <= 0)
+        if (node.op == wolvrix::lib::grh::OperationKind::kConcat)
+        {
+            // stage-07: a concat's result width is always the operand width
+            // sum -- the plan-stage widthHint is advisory and has repeatedly
+            // produced wrong values on aggregate paths (operand-count or
+            // first-operand-width artifacts). Never trust it here.
+            int64_t sum = 0;
+            for (const auto& operand : operands)
+            {
+                sum += graph_.getValue(operand).width();
+            }
+            width = static_cast<int32_t>(
+                std::min<int64_t>(sum, std::numeric_limits<int32_t>::max()));
+        }
+        else if (width <= 0)
         {
             switch (node.op)
             {
@@ -24481,16 +25102,6 @@ private:
                     width = graph_.getValue(operands[1]).width();
                 }
                 break;
-            case wolvrix::lib::grh::OperationKind::kConcat:
-            {
-                int32_t sum = 0;
-                for (const auto& operand : operands)
-                {
-                    sum += graph_.getValue(operand).width();
-                }
-                width = sum;
-                break;
-            }
             default:
                 if (!operands.empty())
                 {
@@ -24646,6 +25257,20 @@ private:
             // (kRegisterWritePort, no mask operand) from masked writes
             // (kRegisterWriteMaskPort); latch writes keep the built-in mask.
             const bool wholeWrite = maskLow == 0 && maskSpan == targetWidth;
+            // stage-07: the register write family contract requires nextValue
+            // at exactly the register width (grh.verify); resize against the
+            // target declaration rather than trusting the source expression
+            // (aggregate paths produced over-wide values, e.g. a ternary whose
+            // branches were widened by a wider sibling).
+            if (targetWidth > 0 && graph_.getValue(nextValue).width() != targetWidth)
+            {
+                const bool signExtend = graph_.getValue(nextValue).isSigned();
+                nextValue = resizeValueToWidth(nextValue, targetWidth, signExtend, entry.location);
+                if (!nextValue.valid())
+                {
+                    continue;
+                }
+            }
             wolvrix::lib::grh::ValueId maskValue;
             if (!wholeWrite || !isSequential)
             {

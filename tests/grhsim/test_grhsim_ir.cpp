@@ -2193,15 +2193,18 @@ namespace {
                                      std::array{result}, std::array{ObjectRef::state(f.state)});
             }))
             return status;
-        // readArray indices must be scalar logic values.
-        if (const int status = rejectedWith("indices must be scalar logic values",
-                                            "readArray with a shaped index was accepted",
-            [](Rank2Fixture &f) {
-                const auto result = f.model.addValue(f.element);
-                f.model.addOperation("core.state.readArray", std::array{f.data12},
-                                     std::array{result}, std::array{ObjectRef::state(f.state)});
-            }))
-            return status;
+        // stage-07: a shape view on an index value is benign — the index is
+        // read as a flat integer (packed-first doctrine, same as the GRH-side
+        // contract), so a shaped logic index must be accepted.
+        {
+            Rank2Fixture fixture;
+            const auto result = fixture.model.addValue(fixture.sub);
+            fixture.model.addOperation("core.state.readArray", std::array{fixture.data12},
+                                       std::array{result},
+                                       std::array{ObjectRef::state(fixture.state)});
+            if (!verifyMessages(fixture.model).empty())
+                return fail("readArray with a shaped logic index was rejected");
+        }
         // writeArray data must be the addressed element / sub-array type.
         if (const int status = rejectedWith("data must be the addressed element",
                                             "writeArray with a mismatched data type was accepted",

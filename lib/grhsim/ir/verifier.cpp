@@ -318,6 +318,12 @@ namespace wolvrix::lib::grhsim
         {
             return type && type->kind == TypeKind::Logic && type->shape.empty();
         }
+        // stage-07: a condition/mask/index operand is read as flat logic bits;
+        // a shape view on it is benign (packed-first doctrine).
+        bool logicAnyShape(const Type *type) noexcept
+        {
+            return type && type->kind == TypeKind::Logic;
+        }
         // State-boundary value contract (stage-06): a value read from or
         // written to a state must carry the same TOTAL bit width; the shape
         // of the value may differ from the state's (or be absent) — shape is
@@ -1153,12 +1159,18 @@ namespace wolvrix::lib::grhsim
                     else
                     {
                         for (const ValueId index : operands)
-                            if (!scalarLogic(valueType(model, index)))
+                        {
+                            // stage-07: an index is read as a flat integer; a
+                            // shape view on the index value is benign (packed-
+                            // first doctrine, same as the GRH-side contract).
+                            const Type *indexType = valueType(model, index);
+                            if (!indexType || indexType->kind != TypeKind::Logic)
                             {
-                                error("core.state.readArray indices must be scalar logic values",
+                                error("core.state.readArray indices must be logic values",
                                       context());
                                 break;
                             }
+                        }
                         if (!indexedAccessTypeMatches(valueType(model, results[0]), accessWidth))
                             error("core.state.readArray result type must be the addressed "
                                   "element / remaining-dims sub-array type",
@@ -1188,12 +1200,12 @@ namespace wolvrix::lib::grhsim
                     else if (opName == "core.state.write")
                     {
                         bool valid = operands.size() == 3 + events &&
-                                     scalarLogic(valueType(model, operands[0])) &&
+                                     logicAnyShape(valueType(model, operands[0])) &&
                                      stateValueGeometryOk(valueType(model, operands[1]),
                                                           *target);
                         const Type *mask = operands.size() >= 3 ? valueType(model, operands[2])
                                                                 : nullptr;
-                        valid = valid && scalarLogic(mask) && mask->width == target->width;
+                        valid = valid && logicAnyShape(mask) && mask->width == target->width;
                         if (!valid)
                         {
                             const Type *data = operands.size() >= 2 ? valueType(model, operands[1])
@@ -1234,16 +1246,22 @@ namespace wolvrix::lib::grhsim
                             }
                             else
                             {
-                                bool valid = scalarLogic(valueType(model, operands[0]));
+                                bool valid = logicAnyShape(valueType(model, operands[0]));
                                 for (std::size_t i = 1; i <= indexCount && valid; ++i)
-                                    valid = scalarLogic(valueType(model, operands[i]));
+                                {
+                                    // stage-07: an index is read as a flat
+                                    // integer; a shape view on it is benign
+                                    // (packed-first doctrine).
+                                    const Type *indexType = valueType(model, operands[i]);
+                                    valid = indexType && indexType->kind == TypeKind::Logic;
+                                }
                                 if (valid &&
                                     !indexedAccessTypeMatches(
                                         valueType(model, operands[1 + indexCount]),
                                         accessWidth))
                                     valid = false;
                                 const Type *mask = valueType(model, operands[2 + indexCount]);
-                                if (valid && (!scalarLogic(mask) || mask->width != accessWidth))
+                                if (valid && (!logicAnyShape(mask) || mask->width != accessWidth))
                                     valid = false;
                                 if (!valid)
                                     error("core.state.writeArray indices must be scalar logic, "
@@ -1280,10 +1298,10 @@ namespace wolvrix::lib::grhsim
                         const Type *mask = operands.size() >= 3 ? valueType(model, operands[2])
                                                                 : nullptr;
                         const bool valid = operands.size() == 3 && target->shape.empty() &&
-                                           scalarLogic(valueType(model, operands[0])) &&
+                                           logicAnyShape(valueType(model, operands[0])) &&
                                            stateValueGeometryOk(valueType(model, operands[1]),
                                                                 *target) &&
-                                           scalarLogic(mask) && mask->width == target->width;
+                                           logicAnyShape(mask) && mask->width == target->width;
                         if (!valid)
                             error("core.state.latchWrite must be [updateCond, nextValue(state "
                                   "type), mask(full-width scalar)] on a scalar state",
@@ -1311,13 +1329,17 @@ namespace wolvrix::lib::grhsim
                     else
                     {
                         for (std::size_t i = 1; i < operands.size(); ++i)
-                            if (!scalarLogic(valueType(model, operands[i])))
+                        {
+                            // stage-07: an index is read as a flat integer; a
+                            // shape view on it is benign.
+                            const Type *indexType = valueType(model, operands[i]);
+                            if (!indexType || indexType->kind != TypeKind::Logic)
                             {
-                                error("core.compute.sliceArray indices must be scalar logic "
-                                      "values",
+                                error("core.compute.sliceArray indices must be logic values",
                                       context());
                                 break;
                             }
+                        }
                         if (!indexedAccessTypeMatches(valueType(model, results[0]), accessWidth))
                             error("core.compute.sliceArray result type must be the addressed "
                                   "element / remaining-dims sub-array type",

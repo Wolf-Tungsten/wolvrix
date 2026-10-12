@@ -1591,12 +1591,19 @@ structMemberLeafRange(const slang::ast::Type& structType, std::string_view membe
 }
 
 // stage-04: element (innermost) width of one split leaf: the leaf's own
-// type width after outer-dim migration (1 for bare scalar leaves).
+// packed width after outer-dim migration. splitStructType stores leaf.type
+// as the innermost scalar (arrays are peeled into ownPackedDimInfos), so the
+// own packed dims must be multiplied back in — a plain
+// computeFixedWidth(leaf.type) would collapse a `logic [5:0]` leaf to 1.
 int64_t structLeafElementWidth(const StructSplitLeaf& leaf,
                                const slang::ast::Symbol& origin,
                                ConvertDiagnostics* diagnostics)
 {
     uint64_t width = computeFixedWidth(*leaf.type, origin, diagnostics);
+    for (const UnpackedDimInfo& dim : leaf.ownPackedDimInfos)
+    {
+        width *= dim.extent > 0 ? static_cast<uint64_t>(dim.extent) : 1;
+    }
     return static_cast<int64_t>(width > 0 ? width : 1);
 }
 
@@ -13001,6 +13008,24 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
         return id;
     };
 
+    // stage-07.1: a typed input port's backing symbol arrives as a
+    // VariableSymbol member (slang builds a VariableSymbol for typed non-var
+    // port headers). Collect its split leaves with Net kind: the value is
+    // driven by the port connection and read through the port value, so the
+    // array-state paths (register read/write ports, memory-op creation) must
+    // not claim it — otherwise a phantom never-written register splits off
+    // from the port value (XiangShan Ifu io_fromFtq_req_bits.fetch[*] reads).
+    std::unordered_set<const slang::ast::Symbol*> inputPortInternals;
+    for (const slang::ast::Symbol* portSymbol : body.getPortList())
+    {
+        const auto* port = portSymbol ? portSymbol->as_if<slang::ast::PortSymbol>() : nullptr;
+        if (port && port->direction == slang::ast::ArgumentDirection::In &&
+            port->internalSymbol)
+        {
+            inputPortInternals.insert(port->internalSymbol);
+        }
+    }
+
     // stage-04: field-wise split a struct-typed declaration into leaf
     // signals; returns true when the type contains a struct (handled).
     auto splitStructDecl = [&](const slang::ast::ValueSymbol& symbol, SignalKind kind,
@@ -13121,13 +13146,16 @@ void collectSignals(const slang::ast::InstanceBodySymbol& body, ModulePlan& plan
             }
             return;
         }
-        if (splitStructDecl(variable, SignalKind::Variable, scope))
+        const SignalKind variableKind = inputPortInternals.count(&variable)
+                                            ? SignalKind::Net
+                                            : SignalKind::Variable;
+        if (splitStructDecl(variable, variableKind, scope))
         {
             return;
         }
         SignalInfo info;
         info.symbol = internSignal(variable, scope);
-        info.kind = SignalKind::Variable;
+        info.kind = variableKind;
         TypeResolution typeInfo = analyzeSignalType(variable.getType(), variable, diagnostics);
         // stage-04: a pure packed array variable becomes array state under the
         // same threshold as the retired packed-element reinterpretation

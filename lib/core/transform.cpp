@@ -2488,6 +2488,28 @@ namespace wolvrix::lib::transform
                 {
                     options.strictInit = false;
                 }
+                else if (arg == "-memory-symbol" || arg.starts_with("-memory-symbol="))
+                {
+                    if (arg == "-memory-symbol")
+                    {
+                        if (i + 1 >= args.size())
+                        {
+                            error = "-memory-symbol expects a value";
+                            return nullptr;
+                        }
+                        options.memorySymbols.emplace_back(args[++i]);
+                    }
+                    else
+                    {
+                        const std::string_view value = arg.substr(std::string_view("-memory-symbol=").size());
+                        if (value.empty())
+                        {
+                            error = "-memory-symbol expects a non-empty value";
+                            return nullptr;
+                        }
+                        options.memorySymbols.emplace_back(value);
+                    }
+                }
                 else
                 {
                     error = "unknown mem-to-reg option";

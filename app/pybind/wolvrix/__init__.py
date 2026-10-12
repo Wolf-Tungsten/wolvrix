@@ -573,6 +573,12 @@ def _compile_mem_to_reg_kwargs(named: dict[str, Any]) -> list[str]:
         out.append("-strict-init")
     elif strict_init is False:
         out.append("-no-strict-init")
+    memory_symbols = _pop_named(local, "memory_symbols", None)
+    if memory_symbols is not None:
+        if isinstance(memory_symbols, str):
+            memory_symbols = [memory_symbols]
+        for symbol in memory_symbols:
+            out.extend(["-memory-symbol", str(symbol)])
     _ensure_no_extra_named("mem-to-reg", local)
     return out
 

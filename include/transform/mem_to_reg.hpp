@@ -4,6 +4,8 @@
 #include "core/transform.hpp"
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace wolvrix::lib::transform
 {
@@ -12,6 +14,8 @@ namespace wolvrix::lib::transform
     {
         int64_t rowLimit = 32;
         bool strictInit = false;
+        // Empty means all eligible memories; otherwise only exact symbols are lowered.
+        std::vector<std::string> memorySymbols;
     };
 
     class MemToRegPass : public Pass

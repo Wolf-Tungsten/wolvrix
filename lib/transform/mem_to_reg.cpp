@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -398,6 +399,7 @@ namespace wolvrix::lib::transform
             int64_t skippedNonConstMask = 0;
             int64_t skippedInit = 0;
             int64_t skippedMalformed = 0;
+            int64_t skippedUnselected = 0;
             int64_t registerCreated = 0;
             int64_t readPortRewritten = 0;
             int64_t writePortRewritten = 0;
@@ -419,6 +421,9 @@ namespace wolvrix::lib::transform
     {
         PassResult result;
         ConversionStats totalStats;
+        const std::unordered_set<std::string> selectedSymbols(
+            options_.memorySymbols.begin(), options_.memorySymbols.end());
+        const bool selectAll = selectedSymbols.empty();
 
         for (const auto &entry : design().graphs())
         {
@@ -443,6 +448,15 @@ namespace wolvrix::lib::transform
                 const auto memOp = graph.getOperation(memId);
                 ++totalStats.memoryTotal;
 
+                // Filter before collecting any port references. This keeps a targeted
+                // experiment from paying the whole-graph reference scan for unrelated RAMs.
+                const std::string memSymbol = std::string(memOp.symbolText());
+                if (!selectAll && selectedSymbols.find(memSymbol) == selectedSymbols.end())
+                {
+                    ++totalStats.skippedUnselected;
+                    continue;
+                }
+
                 const auto widthOpt = getAttr<int64_t>(memOp, "width");
                 const auto rowOpt = getAttr<int64_t>(memOp, "row");
                 const bool isSigned = getAttr<bool>(memOp, "isSigned").value_or(false);
@@ -460,7 +474,6 @@ namespace wolvrix::lib::transform
                     continue;
                 }
 
-                const std::string memSymbol = std::string(memOp.symbolText());
                 MemoryRefs refs = collectMemoryRefs(graph, memSymbol);
 
                 bool eligible = true;
@@ -717,6 +730,7 @@ namespace wolvrix::lib::transform
                 " skipped_nonconst_mask=" + std::to_string(totalStats.skippedNonConstMask) +
                 " skipped_init=" + std::to_string(totalStats.skippedInit) +
                 " skipped_malformed=" + std::to_string(totalStats.skippedMalformed) +
+                " skipped_unselected=" + std::to_string(totalStats.skippedUnselected) +
                 " regs_created=" + std::to_string(totalStats.registerCreated) +
                 " read_rewritten=" + std::to_string(totalStats.readPortRewritten) +
                 " write_rewritten=" + std::to_string(totalStats.writePortRewritten));

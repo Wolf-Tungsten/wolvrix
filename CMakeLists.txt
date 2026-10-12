@@ -687,6 +687,18 @@ target_link_libraries(transform-reg-to-mem
 
 register_test_exe(transform-reg-to-mem)
 
+# transform: mem-to-reg selection
+add_executable(transform-mem-to-reg-selection
+    tests/transform/test_mem_to_reg_selection.cpp
+)
+
+target_link_libraries(transform-mem-to-reg-selection
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-mem-to-reg-selection)
+
 # transform: strip-debug
 add_executable(transform-strip-debug
     tests/transform/test_strip_debug_pass.cpp

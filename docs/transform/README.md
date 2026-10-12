@@ -41,6 +41,7 @@ with wolvrix.Session() as sess:
 | [`xmr-resolve`](xmr-resolve.md) | resolve cross-module references | hierarchical cleanup |
 | [`memory-init-check`](memory-init-check.md) | validate memory initialization consistency | memory checking |
 | [`memory-write-coalesce`](memory-write-coalesce.md) | combine independent writes with equivalent enables and disjoint constant masks | reduce repeated memory write staging and commit work |
+| [`mem-to-reg`](mem-to-reg.md) | lower selected small memories to row registers | expose register boundaries before partitioning |
 | [`repcut`](repcut.md) | partition one graph with RepCut | large-graph partitioning |
 | [`simplify`](simplify.md) | run standard IR simplifications | general cleanup and optimization |
 | [`stats`](stats.md) | collect design statistics | analysis and debugging |

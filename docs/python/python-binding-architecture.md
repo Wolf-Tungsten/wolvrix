@@ -234,7 +234,15 @@ There is no separate pipeline API. A pipeline is simply multiple `run_pass(...)`
 sess.store_json(*, design: str, output: str, mode="pretty-compact", top=None) -> list[dict]
 sess.emit_sv(*, design: str, output: str, top=None, split_modules=False) -> list[dict]
 sess.emit_verilator_repcut_package(*, design: str, output: str, top=None) -> list[dict]
+sess.emit_grhsim_repcut_package(*, design: str, output: str, top=None) -> list[dict]
 ```
+
+`emit_grhsim_repcut_package` consumes the same RepCut-partitioned design as the
+Verilator emitter, but creates one GrhSIM model and adapter per partition. The
+generated package contains a `grhsim_<top>.hpp` facade and
+`libgrhsim_<top>.a`, so the existing XiangShan GrhSIM build can consume it.
+Backend selection is package-wide; the API rejects backend or waveform/per-model
+performance options because a single run cannot mix generated model ABIs.
 
 Large outputs still go to disk by default. The session is not meant to be a multi-gigabyte artifact cache.
 

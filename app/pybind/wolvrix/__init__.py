@@ -300,7 +300,10 @@ class Session:
         input_fullpass_specialization: bool | None = None,
         posedge_fullpass_specialization: bool | None = None,
         full_active_word_consume: bool | None = None,
+        full_active_word_profile: bool | None = None,
         direct_single_writer_state_reads: bool | None = None,
+        proved_zero_value_elision: bool | None = None,
+        producer_dirty_words: bool | None = None,
         pure_event_compute_word_bypass: bool | None = None,
         pure_event_compute_word_profile: bool | None = None,
         pure_event_word_pack_policy: str | None = None,
@@ -319,7 +322,9 @@ class Session:
                 sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
                 sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
                 input_fullpass_specialization is not None or posedge_fullpass_specialization is not None or
-                full_active_word_consume is not None or direct_single_writer_state_reads is not None or
+                full_active_word_consume is not None or full_active_word_profile is not None or direct_single_writer_state_reads is not None or
+                proved_zero_value_elision is not None or
+                producer_dirty_words is not None or
                 pure_event_compute_word_bypass is not None or
                 pure_event_compute_word_profile is not None or pure_event_word_pack_policy is not None or
                 pure_event_word_pack_max_moved_supernode_ppm is not None or
@@ -351,8 +356,14 @@ class Session:
             named_args["posedge_fullpass_specialization"] = posedge_fullpass_specialization
         if full_active_word_consume is not None:
             named_args["full_active_word_consume"] = full_active_word_consume
+        if full_active_word_profile is not None:
+            named_args["full_active_word_profile"] = full_active_word_profile
         if direct_single_writer_state_reads is not None:
             named_args["direct_single_writer_state_reads"] = direct_single_writer_state_reads
+        if proved_zero_value_elision is not None:
+            named_args["proved_zero_value_elision"] = proved_zero_value_elision
+        if producer_dirty_words is not None:
+            named_args["producer_dirty_words"] = producer_dirty_words
         if pure_event_compute_word_bypass is not None:
             named_args["pure_event_compute_word_bypass"] = pure_event_compute_word_bypass
         if pure_event_compute_word_profile is not None:
@@ -409,6 +420,37 @@ class Session:
         )
         return self._complete_action(
             "emit_verilator_repcut_package",
+            diagnostics,
+            success=bool(success),
+            design=design,
+            output=output,
+        )
+
+    def emit_grhsim_repcut_package(
+        self,
+        *,
+        design: str,
+        output: str,
+        top: list[str] | None = None,
+        proved_zero_value_elision: bool | None = None,
+        **named_args,
+    ) -> list[dict]:
+        """Emit a homogeneous GrhSIM package from a RepCut-partitioned design."""
+        self._ensure_open()
+        if proved_zero_value_elision is not None:
+            if not isinstance(proved_zero_value_elision, bool):
+                raise ValueError("emit_grhsim_repcut_package proved_zero_value_elision must be a bool")
+        _ensure_no_extra_named("emit_grhsim_repcut_package", named_args)
+        success, diagnostics = _native.session_emit_grhsim_repcut_package(
+            self._capsule,
+            design=design,
+            output=output,
+            top=top or [],
+            **({"proved_zero_value_elision": proved_zero_value_elision}
+               if proved_zero_value_elision is not None else {}),
+        )
+        return self._complete_action(
+            "emit_grhsim_repcut_package",
             diagnostics,
             success=bool(success),
             design=design,
@@ -859,10 +901,22 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
     if full_active_word_consume is not None:
         if not isinstance(full_active_word_consume, bool):
             raise ValueError("emit_grhsim_cpp full_active_word_consume must be a bool")
+    full_active_word_profile = local.pop("full_active_word_profile", None)
+    if full_active_word_profile is not None:
+        if not isinstance(full_active_word_profile, bool):
+            raise ValueError("emit_grhsim_cpp full_active_word_profile must be a bool")
     direct_single_writer_state_reads = local.pop("direct_single_writer_state_reads", None)
     if direct_single_writer_state_reads is not None:
         if not isinstance(direct_single_writer_state_reads, bool):
             raise ValueError("emit_grhsim_cpp direct_single_writer_state_reads must be a bool")
+    proved_zero_value_elision = local.pop("proved_zero_value_elision", None)
+    if proved_zero_value_elision is not None:
+        if not isinstance(proved_zero_value_elision, bool):
+            raise ValueError("emit_grhsim_cpp proved_zero_value_elision must be a bool")
+    producer_dirty_words = local.pop("producer_dirty_words", None)
+    if producer_dirty_words is not None:
+        if not isinstance(producer_dirty_words, bool):
+            raise ValueError("emit_grhsim_cpp producer_dirty_words must be a bool")
     pure_event_compute_word_bypass = local.pop("pure_event_compute_word_bypass", None)
     if pure_event_compute_word_bypass is not None:
         if not isinstance(pure_event_compute_word_bypass, bool):

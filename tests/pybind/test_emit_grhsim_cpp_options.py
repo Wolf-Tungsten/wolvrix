@@ -20,6 +20,28 @@ class DummySession:
 
 
 class EmitGrhsimCppOptionTest(unittest.TestCase):
+    def test_producer_dirty_words_option(self) -> None:
+        parameter = inspect.signature(wolvrix.Session.emit_grhsim_cpp).parameters["producer_dirty_words"]
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
+        for value in (True, False):
+            _compile_emit_grhsim_cpp_kwargs({"producer_dirty_words": value})
+        for value in (1, "true", []):
+            with self.assertRaises(ValueError):
+                _compile_emit_grhsim_cpp_kwargs({"producer_dirty_words": value})
+
+    def test_proved_zero_value_elision_option(self) -> None:
+        parameter = inspect.signature(wolvrix.Session.emit_grhsim_cpp).parameters[
+            "proved_zero_value_elision"
+        ]
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
+        for value in (True, False):
+            _compile_emit_grhsim_cpp_kwargs({"proved_zero_value_elision": value})
+        for value in (1, "true", []):
+            with self.assertRaises(ValueError):
+                _compile_emit_grhsim_cpp_kwargs({"proved_zero_value_elision": value})
+
     def test_python_commit_exact_event_policy_is_keyword_only(self) -> None:
         parameter = inspect.signature(
             wolvrix.Session.emit_grhsim_cpp
@@ -42,6 +64,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 design="design.main",
                 output="unused",
                 direct_single_writer_state_reads=None,
+                proved_zero_value_elision=None,
                 pure_event_compute_word_bypass=None,
                 active_mask_gap_pack_policy=None,
                 deferred_activation_forward_policy=None,
@@ -51,6 +74,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 commit_exact_event_policy=None,
             )
             self.assertNotIn("direct_single_writer_state_reads", calls[-1][1])
+            self.assertNotIn("proved_zero_value_elision", calls[-1][1])
             self.assertNotIn("pure_event_compute_word_bypass", calls[-1][1])
             self.assertNotIn("active_mask_gap_pack_policy", calls[-1][1])
             self.assertNotIn("deferred_activation_forward_policy", calls[-1][1])
@@ -64,6 +88,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 design="design.main",
                 output="unused",
                 direct_single_writer_state_reads=False,
+                proved_zero_value_elision=False,
                 pure_event_compute_word_bypass=False,
                 active_mask_gap_pack_policy="targeted-direct",
                 deferred_activation_forward_policy="probe",
@@ -73,6 +98,7 @@ class EmitGrhsimCppOptionTest(unittest.TestCase):
                 commit_exact_event_policy="targeted-cold-layout",
             )
             self.assertIs(calls[-1][1]["direct_single_writer_state_reads"], False)
+            self.assertIs(calls[-1][1]["proved_zero_value_elision"], False)
             self.assertIs(calls[-1][1]["pure_event_compute_word_bypass"], False)
             self.assertEqual(calls[-1][1]["active_mask_gap_pack_policy"], "targeted-direct")
             self.assertEqual(calls[-1][1]["deferred_activation_forward_policy"], "probe")

@@ -1,4 +1,5 @@
 #include "emit/verilator_repcut_package.hpp"
+#include "emit/grhsim_repcut_package.hpp"
 #include "core/grh.hpp"
 
 #include <algorithm>
@@ -782,6 +783,7 @@ int main()
         !contains(wrapperSource, "wolvi_repcut_pin_current_thread(phase_cpu_ids_.at(phase_host_lane_))") ||
         !contains(wrapperSource, "wolvi_repcut_set_current_thread_affinity(original_host_cpu_ids_)") ||
         !contains(wrapperSource, "worker.workFast.store(true, std::memory_order_release);") ||
+        !contains(wrapperSource, "// The next workFast release publishes the error reset.\n        worker.error = nullptr;\n      } else {\n        std::lock_guard<std::mutex> lock(worker.mutex);") ||
         !contains(wrapperSource, "worker.workFast.load(std::memory_order_acquire)") ||
         !contains(wrapperSource, "worker.completedFast.store(true, std::memory_order_release);") ||
         !contains(wrapperSource, "worker.completedFast.load(std::memory_order_acquire)") ||
@@ -811,6 +813,12 @@ int main()
         return fail("missing common wrapper source");
     }
     const std::string &commonSource = commonSourceIt->second;
+    if (contains(commonSource, "wolvi_repcut_enable_code_hugepages") ||
+        contains(commonSource, "WOLVI_GRHSIM_CODE_HUGEPAGE") ||
+        contains(commonSource, "mremap(copy"))
+    {
+        return fail("Verilator package must not include the GrhSIM code-page remapping path");
+    }
     if (!contains(wrapperHeader, "using WolviClock = std::chrono::steady_clock;") ||
         !contains(wrapperSource, "void WolviRepCutVerilatorSim::report_step_timing_() const {") ||
         !contains(wrapperSource, "[WOLVI][step-timing] steps=%llu total=%.3f ms avg=%.3f us\\n") ||
@@ -1117,6 +1125,34 @@ int main()
                       "effect operations that cannot be ordered atomically"))
         {
             return fail("side-effecting system function consuming a DPI result should fail fast");
+        }
+    }
+
+    {
+        const std::filesystem::path grhsimRoot = artifactRoot / "grhsim_package";
+        EmitDiagnostics grhsimDiagnostics;
+        EmitGrhSimRepCutPackage grhsimEmitter(&grhsimDiagnostics);
+        EmitOptions grhsimOptions;
+        grhsimOptions.outputDir = grhsimRoot.string();
+        grhsimOptions.topOverrides = {"SimTop"};
+        const EmitResult grhsimResult = grhsimEmitter.emit(buildDesign(), grhsimOptions);
+        if (!grhsimResult.success || grhsimDiagnostics.hasError())
+        {
+            return fail("GrhSIM RepCut package emit failed: " + diagnosticsSummary(grhsimDiagnostics));
+        }
+        for (const auto &path : {grhsimRoot / "grhsim_SimTop.hpp",
+                                 grhsimRoot / "wolvi_repcut_grhsim_sim.h",
+                                 grhsimRoot / "Makefile"})
+        {
+            if (!std::filesystem::exists(path))
+                return fail("GrhSIM package artifact is missing: " + path.string());
+        }
+        const std::string grhsimFacade = readFile(grhsimRoot / "grhsim_SimTop.hpp");
+        if (!contains(grhsimFacade, "class GrhSIM_SimTop") ||
+            !contains(grhsimFacade, "void eval()") ||
+            !contains(grhsimFacade, "void init()"))
+        {
+            return fail("GrhSIM facade is missing the native model lifecycle API");
         }
     }
 

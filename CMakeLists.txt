@@ -111,6 +111,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/emit.cpp
     lib/core/toposort.cpp
     lib/emit/grhsim_cpp.cpp
+    lib/emit/grhsim_repcut_unit.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
     lib/core/store.cpp
@@ -453,6 +454,87 @@ target_compile_definitions(emit-grhsim-cpp
 )
 
 register_test_exe(emit-grhsim-cpp)
+add_executable(emit-grhsim-cpp-input-bit-activation
+    tests/emit/test_emit_grhsim_input_bit_activation.cpp
+)
+target_link_libraries(emit-grhsim-cpp-input-bit-activation PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-cpp-input-bit-activation
+    PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+)
+register_test_exe(emit-grhsim-cpp-input-bit-activation)
+add_test(NAME emit-grhsim-cpp-bool-producer-reduce COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-bool-producer-reduce
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_BOOL_PRODUCER_REDUCE=1")
+add_test(NAME emit-grhsim-cpp-direct-bool-state-view COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-direct-bool-state-view
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_DIRECT_BOOL_STATE_VIEWS=1")
+add_test(NAME emit-grhsim-cpp-bool-zero-group-guard COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-bool-zero-group-guard
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_BOOL_ZERO_GROUP_GUARD=1")
+add_test(NAME emit-grhsim-cpp-scalar-concat-reduction COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-scalar-concat-reduction
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SCALAR_CONCAT_REDUCTION=1")
+add_test(NAME emit-grhsim-cpp-local-shift-demanded-bit COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-local-shift-demanded-bit
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_LOCAL_SHIFT_DEMANDED_BIT=1")
+add_test(NAME emit-grhsim-cpp-wordwise-bool-pack COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-wordwise-bool-pack
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_WORDWISE_BOOL_PACK=1")
+add_test(NAME emit-grhsim-cpp-scalar-leaf-mux COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-scalar-leaf-mux
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SCALAR_LEAF_MUX=1")
+add_test(NAME emit-grhsim-cpp-materialized-deferred-activation COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-materialized-deferred-activation
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_MATERIALIZED_DEFERRED_ACTIVATION=1")
+add_test(NAME emit-grhsim-cpp-wide-activation COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-wide-activation
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_WIDE_ACTIVATION=1")
+add_test(NAME emit-grhsim-cpp-wide-assign-xor COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-wide-assign-xor
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_WIDE_ASSIGN_XOR=1")
+add_test(NAME emit-grhsim-cpp-shared-deferred-activation COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-shared-deferred-activation
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_SHARED_DEFERRED_ACTIVATION=1")
+add_test(NAME emit-grhsim-cpp-direct-deferred-activation COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-direct-deferred-activation
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_DIRECT_DEFERRED_ACTIVATION=1")
+add_test(NAME emit-grhsim-cpp-packed-deferred-activation COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-packed-deferred-activation
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_PACKED_DEFERRED_ACTIVATION=1")
+add_test(NAME emit-grhsim-cpp-wordwise-concat COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-wordwise-concat
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_WORDWISE_CONCAT=1")
+add_test(NAME emit-grhsim-cpp-commit-same-readers COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-commit-same-readers
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_COMMIT_SAME_READERS=1")
+add_test(NAME emit-grhsim-cpp-commit-scalar-eager COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-commit-scalar-eager
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_COMMIT_SCALAR_EAGER=1")
+add_test(NAME emit-grhsim-cpp-priority-mux-chains COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-priority-mux-chains
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_PRIORITY_MUX_CHAINS=1")
+add_test(NAME emit-grhsim-cpp-priority-mux-commit-demand COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-priority-mux-commit-demand
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_PRIORITY_MUX_COMMIT_DEMAND=1")
+add_test(NAME emit-grhsim-cpp-local-compute-use-order COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-local-compute-use-order
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_LOCAL_COMPUTE_USE_ORDER=1")
+add_test(NAME emit-grhsim-cpp-wide-state-read-refs COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-wide-state-read-refs
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_WIDE_STATE_READ_REFS=1")
+add_test(NAME emit-grhsim-cpp-packed-array-late-index COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-packed-array-late-index
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_PACKED_ARRAY_LATE_INDEX=1")
+add_test(NAME emit-grhsim-cpp-batch-trigger-bitmap COMMAND emit-grhsim-cpp)
+set_tests_properties(emit-grhsim-cpp-batch-trigger-bitmap
+    PROPERTIES ENVIRONMENT "WOLVRIX_TEST_BATCH_TRIGGER_BITMAP=1")
+add_executable(grhsim-compiler-compat tests/emit/test_grhsim_compiler_compat.cpp)
+target_compile_definitions(grhsim-compiler-compat PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}"
+    WOLF_CLANG_REDUCTION_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/emit/data/grhsim_clang_sse2_reduction.cpp"
+)
+register_test_exe(grhsim-compiler-compat)
 add_test(NAME emit-grhsim-cpp-direct-hot-input-event
          COMMAND emit-grhsim-cpp)
 set_tests_properties(
@@ -515,6 +597,16 @@ target_compile_definitions(emit-verilator-repcut-package
 )
 
 register_test_exe(emit-verilator-repcut-package)
+
+add_executable(emit-grhsim-repcut-package
+    tests/emit/test_emit_grhsim_repcut_package.cpp
+)
+target_link_libraries(emit-grhsim-repcut-package PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-repcut-package PRIVATE
+    WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+    WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}"
+)
+register_test_exe(emit-grhsim-repcut-package)
 
 # transform tests
 add_executable(transform-pass-manager

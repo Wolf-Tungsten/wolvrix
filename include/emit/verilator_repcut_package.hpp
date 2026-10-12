@@ -11,6 +11,11 @@ namespace wolvrix::lib::emit
     public:
         using Emit::Emit;
 
+    protected:
+        EmitResult emitPackage(const wolvrix::lib::grh::Design &design,
+                               std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
+                               const EmitOptions &options, bool grhSim);
+
     private:
         EmitResult emitImpl(const wolvrix::lib::grh::Design &design,
                             std::span<const wolvrix::lib::grh::Graph *const> topGraphs,

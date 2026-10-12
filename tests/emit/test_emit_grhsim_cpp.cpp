@@ -1179,7 +1179,10 @@ namespace
                                   std::optional<std::size_t> pureEventWordPackMaxChangedWordPpm = std::nullopt,
                                   bool removeActivityScheduleDag = false,
                                   std::optional<std::string_view> pureEventWordPackMaxMovedSupernodePpmRaw = std::nullopt,
-                                  std::optional<std::string_view> pureEventWordPackMaxChangedWordPpmRaw = std::nullopt)
+                                  std::optional<std::string_view> pureEventWordPackMaxChangedWordPpmRaw = std::nullopt,
+                                  bool fullActiveWordProfile = false,
+                                  bool computeBatchDispatchGuard = false,
+                                  std::optional<std::size_t> schedWordHelperMaxEstimatedLines = std::nullopt)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1226,6 +1229,24 @@ namespace
         if (fullActiveWordConsume)
         {
             options.attributes["full_active_word_consume"] = "1";
+        }
+        if (fullActiveWordProfile)
+        {
+            options.attributes["full_active_word_profile"] = "1";
+        }
+        if (computeBatchDispatchGuard)
+        {
+            options.attributes["compute_batch_dispatch_guard"] = "1";
+            // This fixture inspects the activity-word guard specifically.
+            options.attributes["batch_trigger_bitmap"] = "0";
+            options.attributes["batch_trigger_bitmap_validate"] = "0";
+            options.attributes["batch_trigger_supernode_union"] = "0";
+            options.attributes["batch_trigger_supernode_accumulate"] = "0";
+        }
+        if (schedWordHelperMaxEstimatedLines.has_value())
+        {
+            options.attributes["sched_word_helper_max_estimated_lines"] =
+                std::to_string(*schedWordHelperMaxEstimatedLines);
         }
         if (pureEventComputeWordBypass)
         {
@@ -2390,6 +2411,185 @@ namespace
         graph.bindOutputPort("logic_and_y", logicAndY);
         graph.bindOutputPort("wide_and_y", wideAndY);
         graph.bindOutputPort("state_and_y", stateAndY);
+        return design;
+    }
+
+    Design buildStagedScalarConcatDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr std::size_t kBits = 32u;
+        std::array<ValueId, kBits> inputs{};
+        for (std::size_t i = 0; i < kBits; ++i)
+        {
+            const std::string name = "concat_in_" + std::to_string(i);
+            inputs[i] = makeLogicValue(graph, name, 1);
+            graph.bindInputPort(name, inputs[i]);
+        }
+        ValueId zero = addConstant(graph, "concat_zero_op", "concat_zero", 1, "1'b0");
+
+        std::array<ValueId, kBits> muxes{};
+        for (std::size_t i = 0; i < kBits; ++i)
+        {
+            const std::string name = "concat_mux_" + std::to_string(i);
+            muxes[i] = makeLogicValue(graph, name, 1);
+            OperationId mux = graph.createOperation(OperationKind::kMux, graph.internSymbol(name + "_op"));
+            graph.addOperand(mux, inputs[i]);
+            graph.addOperand(mux, inputs[(i + 1u) % kBits]);
+            graph.addOperand(mux, zero);
+            graph.addResult(mux, muxes[i]);
+        }
+
+        ValueId packed = makeLogicValue(graph, "staged_concat_y", static_cast<int32_t>(kBits));
+        OperationId concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("staged_concat_op"));
+        for (ValueId value : muxes)
+        {
+            graph.addOperand(concat, value);
+        }
+        graph.addResult(concat, packed);
+        graph.bindOutputPort("staged_concat_y", packed);
+        return design;
+    }
+
+    Design buildScalarConcatReductionDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr std::size_t kLongFields = 32u;
+        std::array<ValueId, kLongFields> longInputs{};
+        for (std::size_t i = 0; i < kLongFields; ++i)
+        {
+            const std::string name = "reduction_long_in_" + std::to_string(i);
+            longInputs[i] = makeLogicValue(graph, name, 1);
+            graph.bindInputPort(name, longInputs[i]);
+        }
+        ValueId longConcat = makeLogicValue(graph, "reduction_long_concat", 32);
+        OperationId longConcatOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("reduction_long_concat_op"));
+        for (ValueId input : longInputs)
+        {
+            graph.addOperand(longConcatOp, input);
+        }
+        graph.addResult(longConcatOp, longConcat);
+
+        const auto addReduction = [&](OperationKind kind,
+                                      std::string_view opName,
+                                      std::string_view outputName) {
+            ValueId result = makeLogicValue(graph, outputName, 1);
+            OperationId operation = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(operation, longConcat);
+            graph.addResult(operation, result);
+            graph.bindOutputPort(outputName, result);
+        };
+        // Two consumers from the same family exercise the all-users check and
+        // verify both polarities of the shared reduction snapshot.
+        addReduction(OperationKind::kReduceAnd, "reduction_long_and_op", "reduction_long_and");
+        addReduction(OperationKind::kReduceNand, "reduction_long_nand_op", "reduction_long_nand");
+
+        // A separate concat carries the OR/NOR family.  Keeping the families
+        // separate is intentional: a mixed-use concat must fail closed rather
+        // than silently choose one polarity.
+        ValueId longOrConcat = makeLogicValue(graph, "reduction_long_or_concat", 32);
+        OperationId longOrConcatOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("reduction_long_or_concat_op"));
+        for (ValueId input : longInputs)
+        {
+            graph.addOperand(longOrConcatOp, input);
+        }
+        graph.addResult(longOrConcatOp, longOrConcat);
+        const auto addOrReduction = [&](OperationKind kind,
+                                        std::string_view opName,
+                                        std::string_view outputName) {
+            ValueId result = makeLogicValue(graph, outputName, 1);
+            OperationId operation = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(operation, longOrConcat);
+            graph.addResult(operation, result);
+            graph.bindOutputPort(outputName, result);
+        };
+        addOrReduction(OperationKind::kReduceOr, "reduction_long_or_op", "reduction_long_or");
+        addOrReduction(OperationKind::kReduceNor, "reduction_long_nor_op", "reduction_long_nor");
+
+        constexpr std::size_t kShortFields = 8u;
+        std::array<ValueId, kShortFields> shortInputs{};
+        for (std::size_t i = 0; i < kShortFields; ++i)
+        {
+            const std::string name = "reduction_short_in_" + std::to_string(i);
+            shortInputs[i] = makeLogicValue(graph, name, 1);
+            graph.bindInputPort(name, shortInputs[i]);
+        }
+        ValueId shortConcat = makeLogicValue(graph, "reduction_short_concat", 8);
+        OperationId shortConcatOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("reduction_short_concat_op"));
+        for (ValueId input : shortInputs)
+        {
+            graph.addOperand(shortConcatOp, input);
+        }
+        graph.addResult(shortConcatOp, shortConcat);
+        ValueId shortOr = makeLogicValue(graph, "reduction_short_or", 1);
+        OperationId shortOrOp =
+            graph.createOperation(OperationKind::kReduceOr, graph.internSymbol("reduction_short_or_op"));
+        graph.addOperand(shortOrOp, shortConcat);
+        graph.addResult(shortOrOp, shortOr);
+        graph.bindOutputPort("reduction_short_or", shortOr);
+        return design;
+    }
+
+    Design buildBoolEagerLogicDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId a = makeLogicValue(graph, "a", 1);
+        ValueId b = makeLogicValue(graph, "b", 1);
+        ValueId wide = makeLogicValue(graph, "wide", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("wide", wide);
+
+        const auto addCopy = [&](std::string_view opName,
+                                 std::string_view resultName,
+                                 ValueId source) {
+            ValueId result = makeLogicValue(graph, resultName, 1);
+            OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(opName));
+            graph.addOperand(op, source);
+            graph.addResult(op, result);
+            return result;
+        };
+        ValueId aSlot = addCopy("eager_a_copy_op", "eager_a_copy", a);
+        ValueId bSlot = addCopy("eager_b_copy_op", "eager_b_copy", b);
+
+        const auto addLogic = [&](OperationKind kind,
+                                  std::string_view opName,
+                                  std::string_view resultName,
+                                  ValueId lhs,
+                                  ValueId rhs) {
+            ValueId result = makeLogicValue(graph, resultName, 1);
+            OperationId op = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, rhs);
+            graph.addResult(op, result);
+            graph.bindOutputPort(resultName, result);
+        };
+        addLogic(OperationKind::kLogicAnd, "eager_and_op", "and_y", aSlot, bSlot);
+        addLogic(OperationKind::kLogicOr, "eager_or_op", "or_y", aSlot, bSlot);
+        addLogic(OperationKind::kLogicAnd, "direct_and_op", "direct_and_y", a, b);
+        addLogic(OperationKind::kLogicOr, "direct_or_op", "direct_or_y", a, b);
+        addLogic(OperationKind::kLogicAnd, "mixed_and_op", "mixed_and_y", wide, bSlot);
+        addLogic(OperationKind::kLogicOr, "mixed_or_op", "mixed_or_y", wide, bSlot);
+        // Public copies remain materialized; repeated reads then receive local
+        // storage aliases instead of the scalar temporaries tested above.
+        ValueId aAlias = addCopy("alias_a_copy_op", "alias_a_copy", a);
+        ValueId bAlias = addCopy("alias_b_copy_op", "alias_b_copy", b);
+        graph.bindOutputPort("alias_a", aAlias);
+        graph.bindOutputPort("alias_b", bAlias);
+        addLogic(OperationKind::kLogicAnd, "alias_and_op", "alias_and_y", aAlias, bAlias);
+        addLogic(OperationKind::kLogicOr, "alias_or_op", "alias_or_y", aAlias, bAlias);
+        addLogic(OperationKind::kLogicAnd, "alias_mixed_op", "alias_mixed_y", wide, bAlias);
         return design;
     }
 
@@ -6559,6 +6759,3179 @@ namespace
         return 0;
     }
 
+    int runWordwiseWideConcatFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_WORDWISE_WIDE_CONCAT";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        const std::vector<std::vector<int32_t>> shapes = {
+            {1, 7, 16, 72}, {64, 64, 64, 64}, {65, 7, 130, 1},
+            {31, 33, 63, 65, 129}, {1, 1, 1, 130}, {257, 129, 7, 64, 3},
+            std::vector<int32_t>(128, 1), {32, 32, 31, 1}, {1, 1, 1, 61},
+        };
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_wordwise_concat";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "perf", "bitmap", "split"})
+        {
+            Design design;
+            Graph &graph = design.createGraph("top");
+            design.markAsTop(graph.symbol());
+            for (std::size_t c = 0; c < shapes.size(); ++c)
+            {
+                const auto &shape = shapes[c];
+                const std::string prefix = "case" + std::to_string(c);
+                const int32_t width = std::accumulate(shape.begin(), shape.end(), int32_t{0});
+                const ValueId result = makeLogicValue(graph, prefix + "_out", width);
+                const OperationId concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol(prefix + "_concat"));
+                for (std::size_t i = 0; i < shape.size(); ++i)
+                {
+                    const std::string name = prefix + "_in" + std::to_string(i);
+                    const ValueId value = makeLogicValue(graph, name, shape[i], i % 2 != 0);
+                    graph.bindInputPort(name, value);
+                    graph.addOperand(concat, value);
+                }
+                graph.addResult(concat, result);
+                graph.bindOutputPort(prefix + "_out", result);
+                const ValueId sliced = makeLogicValue(graph, prefix + "_slice", 7);
+                const OperationId slice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol(prefix + "_slice_op"));
+                graph.addOperand(slice, result);
+                graph.addResult(slice, sliced);
+                graph.setAttr(slice, "sliceStart", int64_t{5});
+                graph.setAttr(slice, "sliceEnd", int64_t{11});
+                graph.bindOutputPort(prefix + "_slice", sliced);
+            }
+            SessionStore session;
+            ActivityScheduleOptions schedule;
+            schedule.path = "top";
+            schedule.maxOpInComputeSupernode = 1;
+            if (!runActivitySchedule(design, session, schedule)) return fail("wordwise concat schedule failed");
+            const auto dir = baseDir / mode;
+            std::filesystem::create_directories(dir);
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &session;
+            options.sessionPathPrefix = "top";
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            if (mode != "default" && mode != "environment") options.attributes["wordwise_wide_concat"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            if (mode == "bitmap") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            const auto result = emitter.emit(design, options);
+            ::unsetenv(key);
+            if (!result.success || diag.hasError()) return fail("wordwise concat emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || mode == "precedence") && files != defaultFiles)
+                return fail("disabled wordwise concat changed generated code");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            if (countSubstring(code, "// Wordwise wide concat:") != (enabled ? shapes.size() - 1u : 0u))
+                return fail("wordwise concat coverage mismatch: " + mode);
+            const auto harness = dir / "wordwise_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=19;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();for(unsigned step=0;step<300;++step){\n";
+                for (std::size_t c = 0; c < shapes.size(); ++c)
+                {
+                    const auto &shape = shapes[c];
+                    const auto width = std::accumulate(shape.begin(), shape.end(), int32_t{0});
+                    out << "std::array<std::uint64_t," << (width + 63) / 64 << "> expected" << c << "{};\n";
+                    int32_t offset = width;
+                    for (std::size_t i = 0; i < shape.size(); ++i)
+                    {
+                        const auto name = "sim.case" + std::to_string(c) + "_in" + std::to_string(i);
+                        const auto operandWidth = shape[i];
+                        offset -= operandWidth;
+                        if (operandWidth > 64)
+                            out << "for(auto &word:" << name << ")word=step%9==0?0:step%9==1?UINT64_MAX:random();\n";
+                        else
+                            out << name << "=step%9==0?0:step%9==1?UINT64_MAX:random();\n";
+                        // Independent bit reference; deliberately dirty high input bits.
+                        out << "for(unsigned bit=0;bit<" << operandWidth << ";++bit){const bool v=(";
+                        if (operandWidth > 64) out << name << "[bit/64]>>(bit%64)";
+                        else out << "std::uint64_t(" << name << ")>>bit";
+                        out << ")&1;expected" << c << "[(bit+" << offset << ")/64]|=std::uint64_t(v)<<((bit+" << offset << ")%64);}\n";
+                    }
+                }
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (std::size_t c = 0; c < shapes.size(); ++c)
+                {
+                    out << "if(sim.case" << c << "_out!=expected" << c;
+                    if (c + 1u == shapes.size()) out << "[0]";
+                    out << ")return 1;if(sim.case" << c << "_slice!=((expected" << c << "[0]>>5)&127))return 2;\n";
+                }
+                out << "}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto exe = dir / "wordwise_harness";
+            command += " " + harness.string() + " -o " + exe.string();
+            if (std::system(command.c_str()) || std::system(exe.c_str()))
+                return fail("wordwise concat harness failed: " + mode);
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runLocalShiftDemandedBitFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_LOCAL_SHIFT_DEMANDED_BIT";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_shift_demanded_bit";
+        std::map<std::string, std::string> defaults;
+        for (const std::string mode : {"default", "off", "precedence", "on", "environment", "split", "bitmap", "perf"})
+        {
+            Design design;
+            Graph &graph = design.createGraph("top");
+            design.markAsTop(graph.symbol());
+            const auto input = [&](const std::string &name, int32_t width) {
+                const auto value = makeLogicValue(graph, name, width);
+                graph.bindInputPort(name, value);
+                return value;
+            };
+            const auto index = input("index", 64), wideIndex = input("wide_index", 128);
+            ActivityScheduleSupernodeToOps nodes(2);
+            struct Case { std::string name; int32_t width; int32_t bit; int kind; bool wide; };
+            std::vector<Case> cases;
+            for (const int32_t width : {65, 67, 128, 224, 256, 257})
+                for (const int32_t bit : {0, 63, 64, width - 1})
+                    cases.push_back({"case" + std::to_string(cases.size()), width, bit, 0, cases.size() % 2 != 0});
+            // Negative complete-use cases: a second bit, full wide output,
+            // supernode boundary, arithmetic shift, narrow result, wide slice,
+            // event use, and dynamic bit selection.
+            for (int kind = 1; kind <= 8; ++kind)
+                cases.push_back({"negative" + std::to_string(kind), kind == 5 ? 64 : 128, 0, kind, false});
+            ActivityScheduleValueFanout fanout;
+            ValueId eventBit = ValueId::invalid();
+            for (const auto &item : cases)
+            {
+                const auto source = input(item.name + "_in", item.width);
+                const auto shifted = makeLogicValue(graph, item.name + "_shifted", item.width);
+                const auto shift = graph.createOperation(item.kind == 4 ? OperationKind::kAShr : OperationKind::kLShr,
+                                                          graph.internSymbol(item.name + "_shift"));
+                graph.addOperand(shift, source);
+                graph.addOperand(shift, item.wide ? wideIndex : index);
+                graph.addResult(shift, shifted);
+                nodes[0].push_back(shift);
+                if (item.kind == 2) graph.bindOutputPort(item.name + "_whole", shifted);
+                for (unsigned copy = 0; copy < 2; ++copy)
+                {
+                    const auto name = item.name + "_out" + std::to_string(copy);
+                    const auto bit = item.bit + (item.kind == 1 && copy == 1 ? 1 : 0);
+                    const auto value = makeLogicValue(graph, name, item.kind == 6 && copy == 1 ? 2 : 1);
+                    const auto slice = graph.createOperation(item.kind == 8 ? OperationKind::kSliceDynamic : OperationKind::kSliceStatic,
+                                                              graph.internSymbol(name + "_slice"));
+                    graph.addOperand(slice, shifted);
+                    if (item.kind == 8) graph.addOperand(slice, index);
+                    graph.addResult(slice, value);
+                    graph.setAttr(slice, "sliceStart", int64_t{bit});
+                    graph.setAttr(slice, "sliceEnd", int64_t{bit + graph.valueWidth(value) - 1});
+                    graph.bindOutputPort(name, value);
+                    if (item.kind == 7 && copy == 0) eventBit = value;
+                    nodes[item.kind == 3 ? 1 : 0].push_back(slice);
+                }
+                if (item.kind == 3)
+                {
+                    fanout.resize(graph.values().size());
+                    fanout[shifted.index - 1u] = {1u};
+                }
+            }
+            // A state read exercises snapshot semantics across eval/commit.
+            const auto clk = input("clk", 1), data = input("data", 128);
+            const auto one = addConstant(graph, "one", "one_v", 1, "1'b1");
+            const auto mask = addConstant(graph, "mask", "mask_v", 128, "128'hffffffffffffffffffffffffffffffff");
+            nodes[0].push_back(graph.valueDef(one));
+            nodes[0].push_back(graph.valueDef(mask));
+            const auto reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("q"));
+            graph.setAttr(reg, "width", int64_t{128});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("128'h0"));
+            const auto readValue = makeLogicValue(graph, "q_read", 128);
+            const auto read = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("read_q"));
+            graph.setAttr(read, "regSymbol", std::string("q"));
+            graph.addResult(read, readValue);
+            nodes[0].push_back(read);
+            const auto shifted = makeLogicValue(graph, "state_shifted", 128);
+            const auto shift = graph.createOperation(OperationKind::kLShr, graph.internSymbol("state_shift"));
+            graph.addOperand(shift, readValue); graph.addOperand(shift, index); graph.addResult(shift, shifted);
+            nodes[0].push_back(shift);
+            const auto stateBit = makeLogicValue(graph, "state_bit", 1);
+            const auto slice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("state_slice"));
+            graph.addOperand(slice, shifted); graph.addResult(slice, stateBit);
+            graph.setAttr(slice, "sliceStart", int64_t{0}); graph.setAttr(slice, "sliceEnd", int64_t{0});
+            graph.bindOutputPort("state_bit", stateBit);
+            nodes[0].push_back(slice);
+            const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("write_q"));
+            for (auto v : {one, data, mask, clk}) graph.addOperand(write, v);
+            graph.setAttr(write, "regSymbol", std::string("q"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            nodes.push_back({write});
+            const auto eventReg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("event_q"));
+            graph.setAttr(eventReg, "width", int64_t{1});
+            graph.setAttr(eventReg, "isSigned", false);
+            graph.setAttr(eventReg, "initValue", std::string("1'b0"));
+            const auto eventWrite = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("write_event_q"));
+            for (auto v : {one, one, one, eventBit}) graph.addOperand(eventWrite, v);
+            graph.setAttr(eventWrite, "regSymbol", std::string("event_q"));
+            graph.setAttr(eventWrite, "eventEdge", std::vector<std::string>{"posedge"});
+            nodes[2].push_back(eventWrite);
+            fanout.resize(graph.values().size());
+            std::map<uint32_t, uint32_t> nodeByOp;
+            for (uint32_t node = 0; node < nodes.size(); ++node)
+                for (const auto id : nodes[node]) nodeByOp[id.index] = node;
+            // External inputs and cross-node values activate their consumers.
+            for (uint32_t node = 0; node < nodes.size(); ++node)
+                for (const auto id : nodes[node])
+                {
+                    const Operation consumer = graph.getOperation(id);
+                    for (const auto v : consumer.operands())
+                        if (!graph.valueDef(v).valid() || nodeByOp.at(graph.valueDef(v).index) != node)
+                        {
+                            auto &targets = fanout[v.index - 1u];
+                            if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                        }
+                }
+            SessionStore session;
+            setActivityScheduleFixtureSlot(session, "supernode_to_ops", std::move(nodes));
+            setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
+            setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u});
+            setActivityScheduleFixtureSlot(session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{{"q", {0u}}});
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            const auto dir = base / mode;
+            std::filesystem::create_directories(dir);
+            EmitOptions options;
+            options.outputDir = dir.string(); options.session = &session; options.sessionPathPrefix = "top";
+            if (mode != "default" && mode != "environment") options.attributes["local_shift_demanded_bit"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "bitmap") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(design, options);
+            ::unsetenv(key);
+            if (!result.success || diagnostics.hasError()) return fail("shift demanded-bit emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaults = files;
+            if ((mode == "off" || mode == "precedence") && files != defaults) return fail("disabled shift demanded-bit changed output");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const auto runtime = readFile(dir / "grhsim_top_runtime.hpp");
+            if ((runtime.find("bool grhsim_lshr_bit(") != std::string::npos) != enabled) return fail("shift helper option mismatch");
+            for (const auto &item : cases)
+            {
+                const auto call = "grhsim_lshr_bit<" + std::to_string(item.width) + "u, " +
+                    std::to_string(item.bit) + "u>(" + item.name + "_in, ";
+                if ((code.find(call) != std::string::npos) != (enabled && item.kind == 0))
+                    return fail("shift complete-use coverage mismatch: " + mode + "/" + item.name);
+            }
+            std::size_t calls = 0, position = 0;
+            while ((position = code.find("grhsim_lshr_bit<", position)) != std::string::npos) { ++calls; ++position; }
+            if (calls != (enabled ? 25u : 0u)) return fail("shift/state snapshot coverage count mismatch: " + mode);
+            if (mode == "off" || mode == "precedence" || mode == "environment") continue;
+            const auto harness = dir / "harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include \"grhsim_top_runtime.hpp\"\n#include <array>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=73;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n";
+                if (enabled)
+                {
+                    // Compare the new helper with the old one and an independent
+                    // bit oracle, including dirty padding and signed/wide shifts.
+                    for (const int width : {65, 67, 128, 224, 256, 257})
+                        for (const int bit : {0, 63, 64, width - 1, width})
+                            out << "{std::array<std::uint64_t," << (width + 63) / 64 << "> a{};for(auto &v:a)v=random();"
+                                << "for(std::uint64_t n=0;n<" << width + 65 << ";++n){auto old=grhsim_lshr_words(a,n," << width << ");"
+                                << "bool got=grhsim_lshr_bit<" << width << "," << bit << ">(a,n);"
+                                << "bool golden=" << bit << "<" << width << "&&n<" << width << "&&(n+" << bit << ")/64<a.size()&&((a[(n+" << bit << ")/64]>>((n+" << bit << ")%64))&1);"
+                                << "if(got!=grhsim_get_bit_words(old," << bit << ")||got!=golden)return 11;"
+                                << "std::array<std::uint64_t,2> s{n,0};if(grhsim_lshr_bit<" << width << "," << bit << ">(a,s)!=got)return 12;"
+                                << "s[1]=1;if(grhsim_lshr_bit<" << width << "," << bit << ">(a,s))return 13;}"
+                                << "if(grhsim_lshr_bit<" << width << "," << bit << ">(a,std::int64_t(-1)))return 14;}\n";
+                }
+                out << "for(unsigned init=0;init<2;++init){sim.init();sim.clk=0;sim.eval();std::array<std::uint64_t,2> q{};"
+                       "for(unsigned step=0;step<340;++step){sim.index=step==339?UINT64_MAX:step;sim.wide_index={sim.index,step%19==0?1u:0u};"
+                       "sim.data={random(),random()};\n";
+                for (const auto &item : cases)
+                {
+                    if (item.width > 64) out << "for(auto &v:sim." << item.name << "_in)v=random();";
+                    else out << "sim." << item.name << "_in=random();";
+                    if (item.width % 64) out << "sim." << item.name << "_in.back()&=(UINT64_C(1)<<" << item.width % 64 << ")-1;";
+                    out << "\n";
+                }
+                out << "for(unsigned edge=0;edge<2;++edge){sim.clk=edge;if(edge)q=sim.data;for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (const auto &item : cases)
+                {
+                    const auto source = "sim." + item.name + "_in";
+                    const auto arr = item.width > 64 ? source : "std::array<std::uint64_t,1>{" + source + "}";
+                    out << "{auto ref=" << (item.kind == 4 ? "grhsim_ashr_words" : "grhsim_lshr_words")
+                        << "(" << arr << ",sim." << (item.wide ? "wide_index" : "index") << "," << item.width << ");";
+                    for (unsigned copy = 0; copy < 2; ++copy)
+                    {
+                        const auto bit = item.bit + (item.kind == 1 && copy == 1 ? 1 : 0);
+                        out << "if(sim." << item.name << "_out" << copy << "!=(std::uint64_t(grhsim_get_bit_words(ref,"
+                            << (item.kind == 8 ? "grhsim_index_words(sim.index,128)" : std::to_string(bit)) << "))";
+                        if (item.kind == 6 && copy == 1) out << "|(std::uint64_t(grhsim_get_bit_words(ref," << bit + 1 << "))<<1)";
+                        out << "))return 20;";
+                    }
+                    if (item.kind == 2) out << "if(sim." << item.name << "_whole!=ref)return 21;";
+                    out << "}\n";
+                }
+                out << "if(sim.state_bit!=(sim.index<128&&((q[sim.index/64]>>(sim.index%64))&1)))return 22;}}}}return 0;}\n";
+            }
+            std::string sources;
+            for (const auto &[name, content] : files) if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            for (const std::string compiler : mode == "on" ? std::vector<std::string>{"clang++", "g++"} : std::vector<std::string>{"clang++"})
+            {
+                const auto exe = dir / (compiler == "g++" ? "harness_gcc" : "harness_clang");
+                const std::string sanitizer = mode == "on" ? " -fsanitize=address,undefined -fno-sanitize-recover=all" : "";
+                const auto command = compiler + " -std=c++20 -O2" + sanitizer + " -I" + dir.string() + sources + " " + harness.string() + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str())) return fail("shift demanded-bit harness failed: " + mode + "/" + compiler);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runWordwiseBoolPackFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_WORDWISE_WIDE_CONCAT_BOOL_PACK";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_bool_pack";
+        std::map<std::string, std::string> defaults;
+        for (const std::string mode : {"default", "off", "precedence", "on", "environment", "snapshot", "direct", "split", "bitmap", "perf", "no_wordwise"})
+        {
+            Design design;
+            Graph &graph = design.createGraph("top");
+            design.markAsTop(graph.symbol());
+            const auto input = [&](const std::string &name, int32_t width) {
+                const auto value = makeLogicValue(graph, name, width);
+                graph.bindInputPort(name, value);
+                return value;
+            };
+            const auto clk = input("clk", 1), en = input("en", 1), data = input("data", 128);
+            const auto one = addConstant(graph, "one", "one_v", 1, "1'b1");
+            const auto padding = addConstant(graph, "padding", "padding_v", 129, "129'h0");
+            for (unsigned i = 0; i < 128; ++i)
+            {
+                const auto name = "reg" + std::to_string(i);
+                const auto state = graph.createOperation(OperationKind::kRegister, graph.internSymbol(name));
+                graph.setAttr(state, "width", int64_t{1});
+                graph.setAttr(state, "isSigned", false);
+                graph.setAttr(state, "initValue", std::string("1'b0"));
+                const auto bit = makeLogicValue(graph, name + "_data", 1);
+                const auto slice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol(name + "_slice"));
+                graph.addOperand(slice, data);
+                graph.addResult(slice, bit);
+                graph.setAttr(slice, "sliceStart", int64_t{i});
+                graph.setAttr(slice, "sliceEnd", int64_t{i});
+                const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol(name + "_write"));
+                for (const auto value : {en, bit, one, clk}) graph.addOperand(write, value);
+                graph.setAttr(write, "regSymbol", name);
+                graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            }
+            for (unsigned i = 0; i < 128; ++i)
+            {
+                const auto state = graph.createOperation(OperationKind::kLatch, graph.internSymbol("latch" + std::to_string(i)));
+                graph.setAttr(state, "width", int64_t{1});
+                graph.setAttr(state, "isSigned", false);
+                graph.setAttr(state, "initValue", std::string(i % 2 ? "1'b1" : "1'b0"));
+            }
+            struct Case { std::string name; std::vector<unsigned> slots; bool negative = false; };
+            std::vector<Case> cases;
+            for (const unsigned count : {7, 8, 9, 63, 64, 65, 127, 128, 129})
+            {
+                Case item{"n" + std::to_string(count), {}};
+                for (unsigned i = 0; i < count; ++i) item.slots.push_back(i % 128);
+                cases.push_back(std::move(item));
+            }
+            for (const std::string name : {"reverse", "irregular", "repeat", "alias", "latch", "expression", "input"})
+            {
+                Case item{name, {}, name == "expression" || name == "input"};
+                for (unsigned i = 0; i < 128; ++i)
+                    item.slots.push_back(name == "reverse" ? 127 - i : name == "irregular" ? (17 * i) % 128 : name == "repeat" ? 3 : i);
+                cases.push_back(std::move(item));
+            }
+            for (const auto &item : cases)
+            {
+                std::vector<ValueId> operands{padding};
+                for (unsigned i = 0; i < item.slots.size(); ++i)
+                {
+                    const auto name = item.name + "_b" + std::to_string(i);
+                    auto value = makeLogicValue(graph, name, 1);
+                    if (item.name == "input") graph.bindInputPort(name, value);
+                    else
+                    {
+                        const bool latch = item.name == "latch";
+                        const auto read = graph.createOperation(latch ? OperationKind::kLatchReadPort : OperationKind::kRegisterReadPort,
+                                                                graph.internSymbol(name + "_read"));
+                        graph.addResult(read, value);
+                        graph.setAttr(read, latch ? "latchSymbol" : "regSymbol",
+                                      std::string(latch ? "latch" : "reg") + std::to_string(item.slots[i]));
+                        if (item.name == "expression" || item.name == "alias")
+                        {
+                            const auto result = makeLogicValue(graph, name + "_expr", 1);
+                            const auto op = graph.createOperation(item.name == "alias" ? OperationKind::kAssign : OperationKind::kNot,
+                                                                  graph.internSymbol(name + "_op"));
+                            graph.addOperand(op, value);
+                            graph.addResult(op, result);
+                            value = result;
+                        }
+                    }
+                    operands.push_back(value);
+                }
+                const auto result = makeLogicValue(graph, item.name + "_out", 129 + item.slots.size());
+                const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol(item.name + "_concat"));
+                for (const auto value : operands) graph.addOperand(concat, value);
+                graph.addResult(concat, result);
+                graph.bindOutputPort(item.name + "_out", result);
+            }
+            SessionStore session;
+            ActivityScheduleOptions schedule;
+            schedule.path = "top";
+            if (mode == "snapshot" || mode == "direct")
+            {
+                // Pin a real producer/consumer boundary; the normal scheduler
+                // may duplicate read roots instead of materializing them.
+                ActivityScheduleSupernodeToOps nodes(3);
+                ActivityScheduleStateReadSupernodes reads;
+                std::vector<uint32_t> nodeByOp(graph.operations().back().index + 1u, UINT32_MAX);
+                for (const auto id : graph.operations())
+                {
+                    const auto op = graph.getOperation(id);
+                    const auto kind = op.kind();
+                    if (kind == OperationKind::kRegister || kind == OperationKind::kLatch) continue;
+                    const bool read = kind == OperationKind::kRegisterReadPort || kind == OperationKind::kLatchReadPort;
+                    const uint32_t node = kind == OperationKind::kRegisterWritePort ? 2u :
+                        read || kind == OperationKind::kConstant || kind == OperationKind::kSliceStatic ? 0u : 1u;
+                    nodes[node].push_back(id);
+                    nodeByOp[id.index] = node;
+                    if (read)
+                    {
+                        const auto attr = op.attr(kind == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol");
+                        reads[std::get<std::string>(*attr)] = {0u};
+                    }
+                }
+                ActivityScheduleValueFanout fanout(graph.values().size());
+                for (uint32_t node = 0; node < nodes.size(); ++node)
+                {
+                    for (const auto id : nodes[node])
+                    {
+                        const auto op = graph.getOperation(id);
+                        for (const auto value : op.operands())
+                        {
+                            const auto def = graph.valueDef(value);
+                            if (def.valid() && nodeByOp[def.index] == node) continue;
+                            auto &targets = fanout[value.index - 1u];
+                            if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                        }
+                    }
+                }
+                setActivityScheduleFixtureSlot(session, "supernode_to_ops", std::move(nodes));
+                setActivityScheduleFixtureSlot(session, "value_fanout", std::move(fanout));
+                setActivityScheduleFixtureSlot(session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u});
+                setActivityScheduleFixtureSlot(session, "state_read_supernodes", std::move(reads));
+            }
+            else if (!runActivitySchedule(design, session, schedule)) return fail("bool pack scheduling failed");
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence" && mode != "no_wordwise";
+            const auto dir = base / mode;
+            std::filesystem::create_directories(dir);
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &session;
+            options.sessionPathPrefix = "top";
+            options.attributes["direct_single_writer_state_reads"] = mode == "direct" ? "1" : "0";
+            options.attributes["wordwise_wide_concat"] = mode == "no_wordwise" ? "0" : "1";
+            if (mode != "default" && mode != "environment")
+                options.attributes["wordwise_wide_concat_bool_pack"] = mode == "off" || mode == "precedence" ? "0" : "1";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "bitmap") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(design, options);
+            ::unsetenv(key);
+            if (!result.success || diagnostics.hasError()) return fail("bool pack emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaults = files;
+            if ((mode == "off" || mode == "precedence") && files != defaults)
+                return fail("disabled bool pack changed generated output");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const auto runtime = readFile(dir / "grhsim_top_runtime.hpp");
+            if ((runtime.find("grhsim_compact_bool_pack") != std::string::npos) != enabled ||
+                (code.find("grhsim_compact_bool_pack<offsets>") != std::string::npos) != (enabled && mode != "snapshot"))
+                return fail("bool pack coverage mismatch: " + mode);
+            if (code.find("grhsim_compact_bool_pack<offsets>(value_bool_slots_.data())") != std::string::npos)
+                return fail("bool pack must preserve the materialized value-slot path");
+            if (mode == "direct" && code.find("direct single-writer state read:") == std::string::npos)
+                return fail("bool pack fixture did not exercise direct state reads");
+            // Materialized expressions retain their original value-slot path;
+            // neither these snapshots nor inputs are packable state fields.
+            for (const auto &item : cases)
+            {
+                if (item.name != "input" && !(item.negative && mode != "snapshot") && item.name != "n7") continue;
+                const auto begin = code.find("// op " + item.name + "_concat [kConcat]");
+                if (begin == std::string::npos) return fail("missing bool pack concat marker");
+                const auto end = code.find("// op ", begin + 6);
+                if (code.substr(begin, end - begin).find("grhsim_compact_bool_pack<offsets>") != std::string::npos)
+                    return fail("unsafe bool pack coverage: " + mode + "/" + item.name);
+            }
+            if (mode == "off" || mode == "precedence" || mode == "environment") continue;
+            const auto harness = dir / "harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include \"grhsim_top_runtime.hpp\"\n#include <array>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=71;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n";
+                if (enabled)
+                {
+                    // Exhaust all byte patterns, both directions, repeated and
+                    // non-contiguous offsets (scalar fallback) and bit 63.
+                    for (const unsigned count : {7, 8, 9, 63, 64})
+                    {
+                        for (const unsigned order : {0, 1, 2, 3})
+                        {
+                            out << "{static constexpr std::uint32_t offsets[]={";
+                            for (unsigned i = 0; i < count; ++i)
+                                out << (i ? "," : "") << (order == 0 ? i : order == 1 ? count - 1 - i : order == 2 ? i * 2 : 3) << "*sizeof(bool)";
+                            out << "};std::array<bool,128> bits{};for(unsigned n=0;n<256;++n){for(unsigned i=0;i<bits.size();++i)bits[i]=(n>>(i%8))&1;"
+                                   "std::uint64_t ref=0;for(unsigned i=0;i<std::size(offsets);++i)ref|=std::uint64_t(bits[offsets[i]/sizeof(bool)])<<i;"
+                                   "if(grhsim_compact_bool_pack<offsets>(bits.data())!=ref)return 10;}}\n";
+                        }
+                    }
+                }
+                out << "for(unsigned init=0;init<2;++init){sim.init();sim.clk=0;sim.en=0;sim.eval();std::array<std::uint64_t,2> q{};"
+                       "for(unsigned step=0;step<256;++step){sim.en=step%3!=0;for(auto &v:sim.data)v=step%9==0?0:step%9==1?UINT64_MAX:random();"
+                       "for(unsigned edge=0;edge<2;++edge){sim.clk=edge;if(edge&&sim.en)q=sim.data;\n";
+                for (unsigned i = 0; i < 128; ++i) out << "sim.input_b" << i << "=(step>>" << i % 8 << ")&1;\n";
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (const auto &item : cases)
+                {
+                    const auto width = 129 + item.slots.size();
+                    out << "{std::array<std::uint64_t," << (width + 63) / 64 << "> expected{};\n";
+                    for (unsigned i = 0; i < item.slots.size(); ++i)
+                    {
+                        const auto slot = item.slots[i];
+                        const auto pos = item.slots.size() - i - 1;
+                        std::string value = "((q[" + std::to_string(slot / 64) + "]>>" + std::to_string(slot % 64) + ")&1)";
+                        if (item.name == "input") value = "sim.input_b" + std::to_string(i);
+                        else if (item.name == "latch") value = std::to_string(slot % 2);
+                        else if (item.name == "expression") value = "(!" + value + ")";
+                        out << "expected[" << pos / 64 << "]|=std::uint64_t(" << value << ")<<" << pos % 64 << ";\n";
+                    }
+                    out << "if(sim." << item.name << "_out!=expected)return 20;}\n";
+                }
+                out << "}}}}return 0;}\n";
+            }
+            std::string sources;
+            for (const auto &[name, content] : files) if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            for (const std::string compiler : mode == "on" ? std::vector<std::string>{"clang++", "g++"} : std::vector<std::string>{"clang++"})
+            {
+                const auto exe = dir / (compiler == "g++" ? "harness_gcc" : "harness_clang");
+                const std::string sanitizer = mode == "on" || mode == "snapshot" ? " -fsanitize=address,undefined -fno-sanitize-recover=all" : "";
+                const auto command = compiler + " -std=c++20 -O2" + sanitizer + " -I" + dir.string() + sources + " " + harness.string() + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str())) return fail("bool pack harness failed: " + mode + "/" + compiler);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runWideActivationFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_WIDE_ASSIGN_EAGER_MAX_ACTIVATION_WRITES";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        const std::vector<int32_t> widths{65, 128, 192, 257, 512, 1024, 4096, 1024};
+        std::vector<std::vector<uint32_t>> targets{
+            {1u}, {160u}, {17u, 176u}, {184u, 200u, 216u},
+            {224u, 240u, 256u, 272u}, {}, {615u}, {304u, 312u}};
+        for (uint32_t i = 0; i < 32u; ++i) targets[5].push_back(320u + i * 8u);
+        ActivityScheduleSupernodeToOps nodes(616u);
+        std::vector<ValueId> sources;
+        for (std::size_t c = 0; c < widths.size(); ++c)
+        {
+            const auto suffix = std::to_string(c);
+            const ValueId lhs = makeLogicValue(graph, "lhs_" + suffix, widths[c]);
+            const ValueId rhs = makeLogicValue(graph, "rhs_" + suffix, widths[c]);
+            const ValueId value = makeLogicValue(graph, "source_" + suffix, widths[c]);
+            graph.bindInputPort("lhs_" + suffix, lhs);
+            graph.bindInputPort("rhs_" + suffix, rhs);
+            const OperationId op = graph.createOperation(OperationKind::kOr, graph.internSymbol("or_" + suffix));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, rhs);
+            graph.addResult(op, value);
+            nodes[c * 8u].push_back(op);
+            sources.push_back(value);
+            for (uint32_t target : targets[c])
+            {
+                const auto name = "out_" + std::to_string(target);
+                const ValueId output = makeLogicValue(graph, name, widths[c]);
+                graph.bindOutputPort(name, output);
+                const OperationId sink = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_copy"));
+                graph.addOperand(sink, value);
+                graph.addResult(sink, output);
+                nodes[target].push_back(sink);
+            }
+        }
+        const ValueId padding = makeLogicValue(graph, "padding", 8);
+        graph.bindInputPort("padding", padding);
+        for (std::size_t node = 0; node < nodes.size(); ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "pad_" + std::to_string(node);
+            const ValueId output = makeLogicValue(graph, name, 8);
+            graph.bindOutputPort(name, output);
+            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_copy"));
+            graph.addOperand(op, padding);
+            graph.addResult(op, output);
+            nodes[node].push_back(op);
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (std::size_t c = 0; c < widths.size(); ++c) fanout[sources[c].index - 1u] = targets[c];
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_wide_activation";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "two", "three", "environment", "precedence",
+                                       "perf", "profile", "bitmap", "union", "split"})
+        {
+            EmitOptions options;
+            const auto dir = baseDir / mode;
+            options.outputDir = dir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["sched_batch_max_ops"] = "32";
+            options.attributes["sched_batch_max_estimated_lines"] = "512";
+            options.attributes["sched_batches_per_cpp"] = "16";
+            const unsigned budget = mode == "default" || mode == "off" || mode == "precedence" ? 0u
+                : mode == "two" ? 2u : mode == "three" ? 3u : 1u;
+            if (mode != "default" && mode != "environment")
+                options.attributes["wide_assign_eager_max_activation_writes"] = std::to_string(budget);
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            if (mode == "profile") options.attributes["batch_trigger_profile"] = "1";
+            if (mode == "bitmap" || mode == "union") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "union") options.attributes["batch_trigger_supernode_union"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(fixture.design, options);
+            ::unsetenv(key);
+            if (!result.success || diagnostics.hasError()) return fail("wide activation emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (!budget && files != defaultFiles) return fail("disabled wide activation changed output");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const std::size_t expected = budget == 0u ? 0u : budget + 3u;
+            if (countSubstring(code, "// Eager wide activation:") != expected)
+                return fail("wide activation budget coverage mismatch: " + mode);
+            if (budget && (code.find("activeWordFlags |= static_cast<std::uint8_t>") == std::string::npos ||
+                           code.find("grhsim_or_active_u16") == std::string::npos ||
+                           code.find("kActivationMasks[]") == std::string::npos))
+                return fail("wide activation local/global/table coverage missing: " + mode);
+            const auto harness = dir / "wide_activation_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=113;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();for(unsigned step=0;step<2048;++step){sim.padding=step;\n";
+                for (std::size_t c = 0; c < widths.size(); ++c)
+                {
+                    const auto suffix = std::to_string(c);
+                    out << "if(step%8==0||step%8==" << c << "){for(auto &w:sim.lhs_" << suffix
+                        << ")w=step%7==0?UINT64_MAX:step%7==1?0:random();for(auto &w:sim.rhs_" << suffix
+                        << ")w=step%5==0?UINT64_MAX:step%5==1?0:random();}\n"
+                        << "auto expected_" << suffix << "=sim.lhs_" << suffix << ";for(unsigned w=0;w<expected_"
+                        << suffix << ".size();++w)expected_" << suffix << "[w]|=sim.rhs_" << suffix << "[w];\n";
+                    if (widths[c] % 64)
+                        out << "expected_" << suffix << ".back()&=(UINT64_C(1)<<" << widths[c] % 64 << ")-1;\n";
+                }
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (std::size_t c = 0; c < widths.size(); ++c)
+                    for (uint32_t target : targets[c])
+                        out << "if(sim.out_" << target << "!=expected_" << c << ")return 1;\n";
+                out << "}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto executable = dir / "wide_activation_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) || std::system(executable.c_str()))
+                return fail("wide activation harness failed: " + mode);
+        }
+        for (const std::string invalid : {"4", "-1", "garbage", "18446744073709551616"})
+        {
+            EmitOptions options;
+            options.outputDir = (baseDir / "invalid").string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["wide_assign_eager_max_activation_writes"] = invalid;
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            if (emitter.emit(fixture.design, options).success || !diagnostics.hasError())
+                return fail("wide activation invalid budget accepted: " + invalid);
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runWideAssignXorFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_WIDE_ASSIGN_XOR";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+        const ValueId input = makeLogicValue(graph, "input", 128);
+        const ValueId output = makeLogicValue(graph, "output", 128);
+        graph.bindInputPort("in", input);
+        graph.bindOutputPort("out", output);
+        const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol("copy"));
+        graph.addOperand(op, input);
+        graph.addResult(op, output);
+        SessionStore session;
+        ActivityScheduleOptions schedule;
+        schedule.path = "top";
+        if (!runActivitySchedule(design, session, schedule)) return fail("wide assign schedule failed");
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_wide_assign_xor";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence"})
+        {
+            EmitOptions options;
+            const auto dir = baseDir / mode;
+            options.outputDir = dir.string();
+            options.session = &session;
+            options.sessionPathPrefix = "top";
+            const bool enabled = mode == "on" || mode == "environment";
+            if (mode != "default" && mode != "environment") options.attributes["wide_assign_xor"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(design, options);
+            ::unsetenv(key);
+            if (!result.success || diagnostics.hasError()) return fail("wide assign emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (!enabled && files != defaultFiles) return fail("disabled wide assign changed output");
+            for (const auto &[name, content] : files)
+            {
+                if (name.ends_with("_runtime.hpp"))
+                {
+                    if ((content.find("difference |= dst[i] ^ next;") != std::string::npos) != enabled)
+                        return fail("wide assign rule coverage mismatch");
+                }
+                else if (content != defaultFiles.at(name)) return fail("wide assign changed non-runtime code");
+            }
+            const auto harness = dir / "wide_assign_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << R"CPP(#include "grhsim_top.hpp"
+#include <array>
+#include <cstdint>
+template <std::size_t N> bool check() {
+    std::array<std::uint64_t,N> dst{},src{};
+    std::uint64_t rng=71;
+    auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};
+    for(unsigned round=0;round<4096;++round) {
+        if constexpr(N) {
+            if(round%4==0) for(auto &word:src) word=random();
+            else if(round%4==1) src[(round/4)%N]^=UINT64_C(1)<<((round/4)%64);
+            else if(round%4==2) src[(round/4)%N]^=UINT64_C(1)<<63;
+        }
+        bool expected=false;
+        for(std::size_t i=0;i<N;++i) if(dst[i]!=src[i]) expected=true;
+        const auto originalSrc=src;
+        if(grhsim_assign_words_full<N>(dst,src)!=expected || dst!=src || src!=originalSrc) return false;
+        if(grhsim_assign_words_full<N>(dst,src) || grhsim_assign_words_full<N>(dst,dst)) return false;
+    }
+    return true;
+}
+int main(){
+    if(!(check<0>()&&check<1>()&&check<2>()&&check<3>()&&check<4>()&&check<8>()&&check<16>()&&check<17>()&&check<33>())) return 1;
+    GrhSIM_top sim; sim.init();
+    for(unsigned i=0;i<1024;++i){sim.in={std::uint64_t(i),UINT64_C(1)<<(i%64)};sim.eval();if(sim.out!=sim.in)return 2;sim.eval();if(sim.out!=sim.in)return 3;}
+    return 0;
+}
+)CPP";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto executable = dir / "wide_assign_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) || std::system(executable.c_str())) return fail("wide assign harness failed: " + mode);
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runMaterializedDeferredActivationFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_DEFERRED_ACTIVATION_MATERIALIZE_MIN_SOURCES";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(184u);
+        struct Source { ValueId value; int32_t width; };
+        struct Output { uint32_t node; std::vector<std::size_t> inputs; };
+        std::vector<Source> sources;
+        std::vector<std::vector<uint32_t>> targets;
+        std::vector<Output> outputs;
+        for (std::size_t c = 0; c < 8u; ++c)
+        {
+            const int32_t width = c == 0u ? 1 : c == 1u || c == 4u ? 8 : c == 2u ? 32 : c == 7u ? 65 : 64;
+            const std::size_t count = c == 4u ? 31u : 32u;
+            const std::size_t first = sources.size();
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                const auto suffix = std::to_string(sources.size());
+                const ValueId input = makeLogicValue(graph, "in_" + suffix, width);
+                const ValueId value = makeLogicValue(graph, "source_" + suffix, width);
+                graph.bindInputPort("in_" + suffix, input);
+                const auto op = graph.createOperation(OperationKind::kAssign, graph.internSymbol("copy_" + suffix));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                nodes[c * 8u].push_back(op);
+                sources.push_back({value, width});
+                targets.emplace_back();
+            }
+            const auto sink = [&](uint32_t node, std::size_t begin, std::size_t length) {
+                ValueId sum = sources[begin].value;
+                std::vector<std::size_t> inputs;
+                for (std::size_t index = begin; index < begin + length; ++index)
+                {
+                    inputs.push_back(index);
+                    targets[index].push_back(node);
+                    if (index == begin) continue;
+                    const auto name = "fold_" + std::to_string(node) + "_" + std::to_string(index);
+                    const ValueId next = makeLogicValue(graph, name, width);
+                    const auto op = graph.createOperation(OperationKind::kXor, graph.internSymbol(name + "_op"));
+                    graph.addOperand(op, sum);
+                    graph.addOperand(op, sources[index].value);
+                    graph.addResult(op, next);
+                    nodes[node].push_back(op);
+                    sum = next;
+                }
+                const auto name = "out_" + std::to_string(node);
+                const ValueId result = makeLogicValue(graph, name, width);
+                const auto op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_copy"));
+                graph.addOperand(op, sum);
+                graph.addResult(op, result);
+                nodes[node].push_back(op);
+                graph.bindOutputPort(name, result);
+                outputs.push_back({node, std::move(inputs)});
+            };
+            if (c == 0u)
+            {
+                sink(1u, first, count);
+                sink(2u, first, count);
+                sink(5u, first, 16u);
+                sink(6u, first, 16u);
+                sink(7u, first, 1u); // Direct propagation beside overlapping groups.
+            }
+            else if (c == 5u)
+            {
+                sink(128u, first, count); // A long single-bit mask is not selected.
+            }
+            else if (c == 6u)
+            {
+                sink(144u, first, count);
+                sink(152u, first, count); // Two targets, but in different flag words.
+            }
+            else
+            {
+                const uint32_t node = c == 7u ? 160u : 64u + static_cast<uint32_t>(c) * 8u;
+                sink(node, first, count);
+                sink(node + 1u, first, count);
+            }
+        }
+        const ValueId padding = makeLogicValue(graph, "padding", 8);
+        graph.bindInputPort("padding", padding);
+        for (std::size_t node = 0; node < nodes.size(); ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "pad_" + std::to_string(node);
+            const ValueId value = makeLogicValue(graph, name, 8);
+            graph.bindOutputPort(name, value);
+            const auto op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_copy"));
+            graph.addOperand(op, padding);
+            graph.addResult(op, value);
+            nodes[node].push_back(op);
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (std::size_t index = 0; index < sources.size(); ++index)
+            fanout[sources[index].value.index - 1u] = targets[index];
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_materialized_deferred_activation";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "threshold16", "threshold33",
+                                       "perf", "profile", "bitmap", "union", "split", "fullpass", "packed", "direct"})
+        {
+            const auto dir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["sched_batch_max_ops"] = "32";
+            options.attributes["sched_batch_max_estimated_lines"] = "96";
+            options.attributes["sched_batches_per_cpp"] = "8";
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence" && mode != "threshold33";
+            if (mode != "default" && mode != "environment")
+                options.attributes["deferred_activation_materialize_min_sources"] =
+                    mode == "threshold16" ? "16" : mode == "threshold33" ? "33" : enabled ? "32" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "32", 1);
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            if (mode == "profile") options.attributes["batch_trigger_profile"] = "1";
+            if (mode == "bitmap" || mode == "union") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "union") options.attributes["batch_trigger_supernode_union"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "packed") options.attributes["packed_deferred_activation"] = "1";
+            if (mode == "direct") options.attributes["direct_deferred_activation"] = "1";
+            if (mode == "fullpass") options.attributes["input_fullpass_specialization"] = "1";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            const auto result = emitter.emit(fixture.design, options);
+            ::unsetenv(key);
+            if (!result.success || diag.hasError()) return fail("materialized deferred emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (!enabled && files != defaultFiles) return fail("disabled materialized deferred changed source: " + mode);
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const std::size_t expected = !enabled ? 0u : mode == "threshold16" ? 6u : 4u;
+            if (countSubstring(code, "// Materialized deferred predicate:") != expected)
+                return fail("materialized deferred threshold/selection coverage mismatch: " + mode);
+            if (enabled && (code.find("grhsim_any_changed_40_0_materialized") != std::string::npos ||
+                            code.find("grhsim_any_changed_48_0_materialized") != std::string::npos ||
+                            code.find("grhsim_any_changed_56_0_materialized") != std::string::npos))
+                return fail("materialized deferred single-bit/wide fallback mismatch");
+            const auto harness = dir / "materialized_deferred_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=91;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();std::array<std::uint64_t," << sources.size() << "> input{};"
+                       "for(unsigned step=0;step<512;++step){sim.padding=step;"
+                       "for(unsigned i=0;i<input.size();++i)if(step%4==0||step%input.size()==i)input[i]=random();\n";
+                for (std::size_t index = 0; index < sources.size(); ++index)
+                {
+                    const int32_t width = sources[index].width;
+                    if (width < 64) out << "input[" << index << "]&=UINT64_C(" << ((uint64_t{1} << width) - 1u) << ");\n";
+                    out << "sim.in_" << index << (width > 64 ? "[0]" : "") << "=input[" << index << "];\n";
+                    if (width > 64) out << "sim.in_" << index << "[1]=input[" << index << "]>>63;\n";
+                }
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (const auto &output : outputs)
+                {
+                    const bool wide = sources[output.inputs[0]].width > 64;
+                    std::string expr;
+                    for (auto index : output.inputs)
+                        expr += (expr.empty() ? "" : "^") + std::string("input[") + std::to_string(index) + "]";
+                    out << "if(sim.out_" << output.node << (wide ? "[0]" : "") << "!=(" << expr << "))return 1;\n";
+                    if (wide) out << "if(sim.out_" << output.node << "[1]!=((" << expr << ")>>63))return 2;\n";
+                }
+                out << "}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto executable = dir / "materialized_deferred_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) || std::system(executable.c_str()))
+                return fail("materialized deferred harness failed: " + mode);
+        }
+        for (const std::string invalid : {"-1", "invalid", "1.5"})
+        {
+            EmitOptions options;
+            options.outputDir = (baseDir / "invalid").string();
+            options.attributes["deferred_activation_materialize_min_sources"] = invalid;
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (emitter.emit(fixture.design, options).success || !diag.hasError())
+                return fail("materialized deferred accepted invalid threshold");
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runSharedDeferredActivationFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_SHARED_DEFERRED_ACTIVATION";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(256u);
+        const ValueId enable = makeLogicValue(graph, "enable", 1);
+        const ValueId zero = makeLogicValue(graph, "zero", 8);
+        graph.bindInputPort("enable", enable);
+        graph.bindInputPort("zero", zero);
+        std::vector<ValueId> sources;
+        std::vector<std::vector<uint32_t>> targets;
+        std::vector<std::pair<ValueId, std::vector<uint32_t>>> constantTargets;
+        struct Output { uint32_t node; std::vector<std::size_t> inputs; };
+        std::vector<Output> outputs;
+        // Positive cases save four/nine ORs. Controls save only three ORs or
+        // have only two sources, so neither meets the structural threshold.
+        const std::array<std::size_t, 4> commonCounts{6u, 3u, 5u, 2u};
+        const std::array<std::size_t, 4> groupCounts{2u, 6u, 2u, 4u};
+        for (std::size_t c = 0; c < commonCounts.size(); ++c)
+        {
+            const uint32_t sourceNode = static_cast<uint32_t>(64u * c);
+            const std::size_t first = sources.size();
+            std::vector<std::size_t> constantIndices;
+            if (c == 3u)
+            {
+                // These materialized constants appear in the dependency
+                // groups, but init owns their stores: no runtime change OR.
+                // Counting them would incorrectly pass the sharing threshold.
+                for (unsigned i = 0; i < 2u; ++i)
+                {
+                    const auto name = "fixed_zero_" + std::to_string(i);
+                    const auto value = addConstant(graph, name + "_op", name, 8, "8'h00");
+                    nodes[sourceNode].push_back(graph.valueDef(value));
+                    constantIndices.push_back(constantTargets.size());
+                    constantTargets.emplace_back(value, std::vector<uint32_t>{});
+                }
+            }
+            for (std::size_t i = 0; i < commonCounts[c] + groupCounts[c]; ++i)
+            {
+                const auto suffix = std::to_string(sources.size());
+                const ValueId input = makeLogicValue(graph, "in_" + suffix, 8);
+                const ValueId value = makeLogicValue(graph, "source_" + suffix, 8);
+                graph.bindInputPort("in_" + suffix, input);
+                const auto op = graph.createOperation(OperationKind::kMux, graph.internSymbol("mux_" + suffix));
+                graph.addOperand(op, enable);
+                graph.addOperand(op, input);
+                graph.addOperand(op, zero);
+                graph.addResult(op, value);
+                nodes[sourceNode].push_back(op);
+                sources.push_back(value);
+                targets.emplace_back();
+            }
+            for (std::size_t group = 0; group < groupCounts[c]; ++group)
+            {
+                std::vector<std::size_t> inputs;
+                for (std::size_t i = 0; i < commonCounts[c]; ++i) inputs.push_back(first + i);
+                inputs.push_back(first + commonCounts[c] + group);
+                for (uint32_t copy = 0; copy < 2u; ++copy)
+                {
+                    const uint32_t node = sourceNode + 1u + static_cast<uint32_t>(8u * group) + copy;
+                    ValueId value = sources[inputs.front()];
+                    for (std::size_t i = 1; i < inputs.size(); ++i)
+                    {
+                        const auto name = "reduce_" + std::to_string(node) + "_" + std::to_string(i);
+                        const ValueId result = makeLogicValue(graph, name, 8);
+                        const auto op = graph.createOperation(OperationKind::kXor, graph.internSymbol(name + "_op"));
+                        graph.addOperand(op, value);
+                        graph.addOperand(op, sources[inputs[i]]);
+                        graph.addResult(op, result);
+                        nodes[node].push_back(op);
+                        value = result;
+                    }
+                    for (std::size_t index : constantIndices)
+                    {
+                        const auto name = "fixed_reduce_" + std::to_string(node) + "_" + std::to_string(index);
+                        const auto result = makeLogicValue(graph, name, 8);
+                        const auto op = graph.createOperation(OperationKind::kXor, graph.internSymbol(name + "_op"));
+                        graph.addOperand(op, value);
+                        graph.addOperand(op, constantTargets[index].first);
+                        graph.addResult(op, result);
+                        nodes[node].push_back(op);
+                        value = result;
+                        constantTargets[index].second.push_back(node);
+                    }
+                    graph.bindOutputPort("out_" + std::to_string(node), value);
+                    for (std::size_t i : inputs) targets[i].push_back(node);
+                    outputs.push_back(Output{node, inputs});
+                }
+            }
+        }
+        const ValueId direct = makeLogicValue(graph, "direct", 8);
+        const auto directOp = graph.createOperation(OperationKind::kAssign, graph.internSymbol("direct_op"));
+        graph.addOperand(directOp, sources[0]);
+        graph.addResult(directOp, direct);
+        graph.bindOutputPort("direct", direct);
+        nodes[30u].push_back(directOp);
+        targets[0].push_back(30u);
+        const ValueId padding = makeLogicValue(graph, "padding", 8);
+        graph.bindInputPort("padding", padding);
+        for (std::size_t node = 0; node < nodes.size(); ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "pad_" + std::to_string(node);
+            const ValueId value = makeLogicValue(graph, name, 8);
+            graph.bindOutputPort(name, value);
+            const auto op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, padding);
+            graph.addResult(op, value);
+            nodes[node].push_back(op);
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (std::size_t i = 0; i < sources.size(); ++i) fanout[sources[i].index - 1u] = targets[i];
+        for (const auto &[value, readers] : constantTargets) fanout[value.index - 1u] = readers;
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_shared_deferred_activation";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "perf", "profile",
+                                       "bitmap", "union", "split", "fullpass", "packed", "direct", "materialized"})
+        {
+            const auto dir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["sched_batch_max_ops"] = "32";
+            options.attributes["sched_batch_max_estimated_lines"] = "96";
+            options.attributes["sched_batches_per_cpp"] = "8";
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            if (mode != "default" && mode != "environment")
+                options.attributes["shared_deferred_activation"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            if (mode == "profile") options.attributes["batch_trigger_profile"] = "1";
+            if (mode == "bitmap" || mode == "union") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "union") options.attributes["batch_trigger_supernode_union"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "fullpass") options.attributes["input_fullpass_specialization"] = "1";
+            if (mode == "packed") options.attributes["packed_deferred_activation"] = "1";
+            if (mode == "direct") options.attributes["direct_deferred_activation"] = "1";
+            if (mode == "materialized") options.attributes["deferred_activation_materialize_min_sources"] = "3";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            const auto result = emitter.emit(fixture.design, options);
+            ::unsetenv(key);
+            if (!result.success || diag.hasError()) return fail("shared deferred emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (!enabled && files != defaultFiles) return fail("disabled shared deferred changed source: " + mode);
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            // Packed/direct lowering handles the second positive supernode;
+            // the first retains ordinary Boolean groups and shares its ORs.
+            const std::size_t expected = !enabled ? 0u : mode == "packed" || mode == "direct" ? 1u : 2u;
+            if (countSubstring(code, "bool grhsim_shared_change_") != expected ||
+                code.find("grhsim_shared_change_128_") != std::string::npos ||
+                code.find("grhsim_shared_change_192_") != std::string::npos)
+                return fail("shared deferred threshold/compatibility coverage mismatch: " + mode);
+            const auto harness = dir / "shared_deferred_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=61;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();sim.zero=0;std::array<std::uint8_t," << sources.size() << "> input{};"
+                       "for(unsigned step=0;step<1024;++step){sim.padding=step;sim.enable=(step%7)!=0;"
+                       "for(unsigned i=0;i<input.size();++i)if(step%4==0||step%input.size()==i)input[i]=random();\n";
+                for (std::size_t i = 0; i < sources.size(); ++i) out << "sim.in_" << i << "=input[" << i << "];\n";
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (const auto &output : outputs)
+                {
+                    out << "if(sim.out_" << output.node << "!=(sim.enable?(0";
+                    for (std::size_t i : output.inputs) out << "^input[" << i << "]";
+                    out << "):0))return 1;\n";
+                }
+                out << "if(sim.direct!=(sim.enable?input[0]:0))return 2;}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            if (mode == "on") command += " -fsanitize=address,undefined -fno-sanitize-recover=all";
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto executable = dir / "shared_deferred_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) || std::system(executable.c_str()))
+                return fail("shared deferred harness failed: " + mode);
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runPackedDeferredActivationFocusedTests(bool directMode = false)
+    {
+        const char *key = directMode ? "WOLVRIX_GRHSIM_DIRECT_DEFERRED_ACTIVATION"
+                                     : "WOLVRIX_GRHSIM_PACKED_DEFERRED_ACTIVATION";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(directMode ? 320u : 232u);
+        std::vector<ValueId> sources;
+        std::vector<std::vector<uint32_t>> targets(directMode ? 32u : 24u);
+        struct Output { uint32_t node; std::size_t lhs; std::size_t rhs; bool mirrored = false; };
+        std::vector<Output> outputs;
+        for (std::size_t c = 0; c < (directMode ? 4u : 3u); ++c)
+        {
+            const uint32_t sourceNode = c == 0u ? 0u : c == 1u ? 32u : c == 2u ? 192u : 232u;
+            for (std::size_t index = 0; index < 8u; ++index)
+            {
+                const auto suffix = std::to_string(c * 8u + index);
+                const ValueId input = makeLogicValue(graph, "in_" + suffix, 8);
+                const ValueId value = makeLogicValue(graph, "source_" + suffix, 8);
+                graph.bindInputPort("in_" + suffix, input);
+                const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol("copy_" + suffix));
+                graph.addOperand(op, input);
+                graph.addResult(op, value);
+                nodes[sourceNode].push_back(op);
+                sources.push_back(value);
+            }
+            const auto sink = [&](uint32_t node, std::size_t lhs, std::size_t rhs) {
+                lhs += c * 8u;
+                rhs += c * 8u;
+                const auto suffix = std::to_string(node);
+                const ValueId value = makeLogicValue(graph, "out_" + suffix, 8);
+                graph.bindOutputPort("out_" + suffix, value);
+                const OperationId op = graph.createOperation(OperationKind::kXor, graph.internSymbol("xor_" + suffix));
+                const bool mirrored = directMode && c == 3u;
+                const auto input = [&](std::size_t index) {
+                    if (!mirrored) return sources[index];
+                    const auto name = "mirror_" + suffix + "_" + std::to_string(index);
+                    const ValueId result = makeLogicValue(graph, name, 8);
+                    const OperationId combine = graph.createOperation(OperationKind::kXor, graph.internSymbol(name + "_xor"));
+                    graph.addOperand(combine, sources[index]);
+                    graph.addOperand(combine, sources[index + 4u]);
+                    graph.addResult(combine, result);
+                    nodes[node].push_back(combine);
+                    targets[index + 4u].push_back(node);
+                    return result;
+                };
+                graph.addOperand(op, input(lhs));
+                graph.addOperand(op, input(rhs));
+                graph.addResult(op, value);
+                nodes[node].push_back(op);
+                targets[lhs].push_back(node);
+                targets[rhs].push_back(node);
+                outputs.push_back(Output{node, lhs, rhs, mirrored});
+            };
+            if (c == 3u)
+            {
+                // Include holes, bit 63, and an access ending exactly at the
+                // flag-array boundary; all six predicates remain distinct.
+                const std::array<uint32_t, 6> destination{256u, 257u, 263u, 264u, 279u, 319u};
+                std::size_t group = 0;
+                for (std::size_t lhs = 0; lhs < 4u; ++lhs)
+                    for (std::size_t rhs = lhs + 1u; rhs < 4u; ++rhs)
+                        sink(destination[group++], lhs, rhs);
+            }
+            else if (c == 2u)
+            {
+                // Four non-overlapping groups: do not pack this control.
+                for (uint32_t pair = 0; pair < 4u; ++pair) sink(200u + pair * 8u, pair * 2u, pair * 2u + 1u);
+            }
+            else
+            {
+                uint32_t group = 0;
+                const uint32_t groupCount = c == 0u ? 16u : 8u;
+                if (directMode && c == 0u)
+                {
+                    sink(++group, 0u, 1u);
+                    sink(++group, 0u, 2u);
+                    sink(++group, 1u, 2u);
+                }
+                for (std::size_t lhs = 0; lhs < 8u && group < groupCount; ++lhs)
+                    for (std::size_t rhs = lhs + 1u; rhs < 8u && group < groupCount; ++rhs)
+                    {
+                        if (directMode && c == 0u && rhs <= 2u) continue;
+                        if (c == 0u) sink(group + 1u, lhs, rhs);
+                        else for (uint32_t copy = 0; copy < 4u; ++copy) sink(64u + group + copy * 32u, lhs, rhs);
+                        ++group;
+                    }
+                // Leave one existing multi-lane group beside selected groups.
+                if (directMode && c == 0u) sink(240u, 2u, 5u);
+            }
+        }
+        // One direct target must still be propagated beside packed groups.
+        const ValueId direct = makeLogicValue(graph, "direct_out", 8);
+        graph.bindOutputPort("direct_out", direct);
+        const OperationId directOp = graph.createOperation(OperationKind::kAssign, graph.internSymbol("direct_copy"));
+        graph.addOperand(directOp, sources[0]);
+        graph.addResult(directOp, direct);
+        nodes[17u].push_back(directOp);
+        targets[0].push_back(17u);
+        const ValueId padding = makeLogicValue(graph, "padding", 8);
+        graph.bindInputPort("padding", padding);
+        for (std::size_t node = 0; node < nodes.size(); ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "pad_" + std::to_string(node);
+            const ValueId value = makeLogicValue(graph, name, 8);
+            graph.bindOutputPort(name, value);
+            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_copy"));
+            graph.addOperand(op, padding);
+            graph.addResult(op, value);
+            nodes[node].push_back(op);
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (std::size_t index = 0; index < sources.size(); ++index) fanout[sources[index].index - 1u] = targets[index];
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+                            (directMode ? "grhsim_cpp_direct_deferred_activation" : "grhsim_cpp_packed_deferred_activation");
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "perf", "profile", "bitmap", "union", "split"})
+        {
+            const auto dir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["sched_batch_max_ops"] = "8";
+            options.attributes["sched_batch_max_estimated_lines"] = "96";
+            options.attributes["sched_batches_per_cpp"] = "8";
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            if (mode != "default" && mode != "environment")
+                options.attributes[directMode ? "direct_deferred_activation" : "packed_deferred_activation"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            if (mode == "profile") options.attributes["batch_trigger_profile"] = "1";
+            if (mode == "bitmap" || mode == "union") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "union") options.attributes["batch_trigger_supernode_union"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            const auto result = emitter.emit(fixture.design, options);
+            ::unsetenv(key);
+            if (!result.success || diag.hasError()) return fail("packed deferred emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || mode == "precedence") && files != defaultFiles)
+                return fail("disabled packed deferred changed generated files");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const std::string marker = directMode ? "// Direct deferred activation:" : "// Packed deferred activation:";
+            if (countSubstring(code, marker) != (enabled ? (directMode ? 3u : 2u) : 0u))
+                return fail("packed deferred coverage mismatch: " + mode);
+            if (code.find("grhsim_deferred_active_word_") == std::string::npos)
+                return fail("packed deferred fixture must exercise aggregate flush");
+            if (enabled && !directMode && (code.find("grhsim_changed_groups_192") != std::string::npos ||
+                            code.find("grhsim_changed_groups_0 & UINT32_C(32768)") == std::string::npos))
+                return fail("packed deferred weak-overlap control or high bit mismatch");
+            if (enabled && directMode &&
+                (code.find("grhsim_direct_active_192_") != std::string::npos ||
+                 code.find("grhsim_direct_active_32_") != std::string::npos ||
+                 code.find("std::uint64_t grhsim_direct_active_232_0") == std::string::npos ||
+                 code.find("bool grhsim_direct_changed_232_0_") == std::string::npos ||
+                 code.find("grhsim_or_active_u64(supernode_active_curr_.data(), 32u, grhsim_direct_active_232_0)") == std::string::npos ||
+                 code.find("activeWordFlags |= grhsim_direct_active_0_") == std::string::npos))
+                return fail("direct deferred local/global/bounds/fallback coverage mismatch");
+            const auto harness = dir / "packed_deferred_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=53;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();std::array<std::uint8_t," << sources.size() << "> input{};"
+                       "for(unsigned step=0;step<1024;++step){sim.padding=step;"
+                       "for(unsigned i=0;i<input.size();++i)if(step%4==0||step%input.size()==i)input[i]=random();\n";
+                for (std::size_t index = 0; index < sources.size(); ++index)
+                    out << "sim.in_" << index << "=input[" << index << "];\n";
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (const auto &output : outputs)
+                {
+                    out << "if(sim.out_" << output.node << "!=(input[" << output.lhs << "]^input[" << output.rhs << "]";
+                    if (output.mirrored) out << "^input[" << output.lhs + 4u << "]^input[" << output.rhs + 4u << "]";
+                    out << "))return 1;\n";
+                }
+                out << "if(sim.direct_out!=input[0])return 2;}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto executable = dir / "packed_deferred_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) || std::system(executable.c_str()))
+                return fail("packed deferred harness failed: " + mode);
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runWordwiseMemoryConcatFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_WORDWISE_WIDE_CONCAT";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+                             "grhsim_cpp_wordwise_memory_concat";
+        const std::vector<int32_t> widths{31, 65, 130};
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "perf", "bitmap", "split"})
+        {
+            Design design;
+            Graph &graph = design.createGraph("top");
+            design.markAsTop(graph.symbol());
+            const auto input = [&](const std::string &name, int32_t width) {
+                const ValueId value = makeLogicValue(graph, name, width);
+                graph.bindInputPort(name, value);
+                return value;
+            };
+            const ValueId clock = input("clk", 1);
+            const ValueId enable = input("wen", 1);
+            for (std::size_t c = 0; c < widths.size(); ++c)
+            {
+                const std::string prefix = "case" + std::to_string(c);
+                const int32_t width = widths[c];
+                const int64_t rows = c == 1u ? 4 : 3;
+                const ValueId address = input(prefix + "_addr", 2);
+                const ValueId data = input(prefix + "_data", width);
+                const ValueId mask = input(prefix + "_mask", width);
+                const ValueId head = input(prefix + "_head", 40);
+                const ValueId tail = input(prefix + "_tail", 17);
+                const OperationId memory = graph.createOperation(
+                    OperationKind::kMemory, graph.internSymbol(prefix + "_mem"));
+                graph.setAttr(memory, "width", int64_t{width});
+                graph.setAttr(memory, "row", rows);
+                graph.setAttr(memory, "isSigned", c == 2u);
+                graph.setAttr(memory, "initKind", std::vector<std::string>{});
+                graph.setAttr(memory, "initFile", std::vector<std::string>{});
+                graph.setAttr(memory, "initValue", std::vector<std::string>{});
+                graph.setAttr(memory, "initStart", std::vector<int64_t>{});
+                graph.setAttr(memory, "initLen", std::vector<int64_t>{});
+                const ValueId one = addConstant(graph, prefix + "_one_op", prefix + "_one", 2, "2'd1");
+                const ValueId otherAddress = makeLogicValue(graph, prefix + "_other_addr", 2);
+                const OperationId xorOp = graph.createOperation(
+                    OperationKind::kXor, graph.internSymbol(prefix + "_addr_xor"));
+                graph.addOperand(xorOp, address);
+                graph.addOperand(xorOp, one);
+                graph.addResult(xorOp, otherAddress);
+                std::vector<ValueId> reads;
+                for (unsigned port = 0; port < 2; ++port)
+                {
+                    const ValueId value = makeLogicValue(graph, prefix + "_read" + std::to_string(port), width);
+                    const OperationId read = graph.createOperation(
+                        OperationKind::kMemoryReadPort, graph.internSymbol(prefix + "_read_op" + std::to_string(port)));
+                    graph.addOperand(read, port == 0u ? address : otherAddress);
+                    graph.addResult(read, value);
+                    graph.setAttr(read, "memSymbol", prefix + "_mem");
+                    reads.push_back(value);
+                }
+                const ValueId output = makeLogicValue(graph, prefix + "_out", 57 + width * 2);
+                const OperationId concat = graph.createOperation(
+                    OperationKind::kConcat, graph.internSymbol(prefix + "_concat"));
+                for (const ValueId value : {head, reads[0], reads[1], tail}) graph.addOperand(concat, value);
+                graph.addResult(concat, output);
+                graph.bindOutputPort(prefix + "_out", output);
+                const OperationId write = graph.createOperation(
+                    OperationKind::kMemoryWritePort, graph.internSymbol(prefix + "_write"));
+                for (const ValueId value : {enable, address, data, mask, clock}) graph.addOperand(write, value);
+                graph.setAttr(write, "memSymbol", prefix + "_mem");
+                graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            }
+            SessionStore session;
+            ActivityScheduleOptions schedule;
+            schedule.path = "top";
+            schedule.maxOpInComputeSupernode = 64;
+            if (!runActivitySchedule(design, session, schedule)) return fail("memory concat schedule failed");
+            const auto dir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &session;
+            options.sessionPathPrefix = "top";
+            const bool enabled = mode != "default" && mode != "off";
+            // Explicit zero also isolates this fixture from the caller's environment.
+            options.attributes["wordwise_wide_concat"] = enabled ? "1" : "0";
+            if (mode == "default") options.attributes.erase("wordwise_wide_concat");
+            if (mode == "perf") options.attributes["perf"] = "eval";
+            if (mode == "bitmap") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (!emitter.emit(design, options).success || diag.hasError()) return fail("memory concat emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (mode == "off" && files != defaultFiles) return fail("disabled memory concat changed code");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            if (countSubstring(code, "// Wordwise wide concat:") != (enabled ? widths.size() : 0u))
+                return fail("memory concat coverage mismatch: " + mode);
+            // Require the scalar state loads inside the concat. Wide reads
+            // may use local snapshots, which are also covered by this test.
+            if (enabled)
+            {
+                std::istringstream lines(code);
+                std::string line;
+                std::size_t inlineReads = 0;
+                while (std::getline(lines, line))
+                    if (line.find("concat_wordwise_") != std::string::npos &&
+                        line.find("state_mem_") != std::string::npos) ++inlineReads;
+                if (inlineReads < 2u) return fail("memory concat fixture did not inline reads");
+            }
+            const auto harness = dir / "wordwise_memory_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=71;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();sim.clk=0;sim.wen=0;sim.eval();\n";
+                for (std::size_t c = 0; c < widths.size(); ++c)
+                    out << "std::array<std::array<std::uint64_t," << (widths[c] + 63) / 64 << ">,"
+                        << (c == 1u ? 4 : 3) << "> mem" << c << "{};\n";
+                // Out-of-range reads return zero; writes use valid rows only.
+                out << "for(unsigned step=0;step<300;++step){sim.clk=false;sim.wen=step%5!=0&&step%4!=3;\n";
+                for (std::size_t c = 0; c < widths.size(); ++c)
+                {
+                    const auto prefix = "sim.case" + std::to_string(c);
+                    out << prefix << "_addr=step%4;" << prefix << "_head=random();" << prefix << "_tail=random();\n";
+                    if (widths[c] > 64)
+                        out << "for(auto &word:" << prefix << "_data)word=random();for(auto &word:"
+                            << prefix << "_mask)word=step%7==0?0:step%7==1?UINT64_MAX:random();\n";
+                    else
+                        out << prefix << "_data=random();" << prefix << "_mask=step%7==0?0:step%7==1?UINT64_MAX:random();\n";
+                }
+                out << "for(unsigned phase=0;phase<2;++phase){sim.clk=phase;\n";
+                for (std::size_t c = 0; c < widths.size(); ++c)
+                {
+                    const int32_t width = widths[c];
+                    const auto prefix = "sim.case" + std::to_string(c);
+                    const auto id = std::to_string(c);
+                    const auto rows = std::to_string(c == 1u ? 4 : 3);
+                    out << "unsigned addr" << id << "=" << prefix << "_addr&3;"
+                        << "if(phase&&sim.wen&&addr" << id << "<" << rows << "){for(unsigned bit=0;bit<" << width
+                        << ";++bit){const bool mask=(std::uint64_t(" << prefix << "_mask"
+                        << (width > 64 ? "[bit/64]" : "") << ")>>(bit%64))&1;"
+                        << "const bool data=(std::uint64_t(" << prefix << "_data"
+                        << (width > 64 ? "[bit/64]" : "") << ")>>(bit%64))&1;"
+                        << "if(mask)mem" << id << "[addr" << id << "][bit/64]=(mem" << id << "[addr" << id
+                        << "][bit/64]&~(UINT64_C(1)<<(bit%64)))|(std::uint64_t(data)<<(bit%64));}}\n";
+                    out << "std::array<std::uint64_t," << (57 + width * 2 + 63) / 64 << "> expected" << id << "{};"
+                        << "for(unsigned bit=0;bit<" << 57 + width * 2 << ";++bit){bool value;"
+                        << "if(bit<17)value=(std::uint64_t(" << prefix << "_tail)>>bit)&1;"
+                        << "else if(bit<" << 17 + width * 2 << "){unsigned local=(bit-17)%" << width
+                        << ";unsigned row=addr" << id << "^(bit<" << 17 + width << "?1:0);"
+                        << "value=row<" << rows << "&&((mem" << id << "[row][local/64]>>(local%64))&1);}"
+                        << "else value=(std::uint64_t(" << prefix << "_head)>>(bit-" << 17 + width * 2 << "))&1;"
+                        << "expected" << id << "[bit/64]|=std::uint64_t(value)<<(bit%64);}\n";
+                }
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (std::size_t c = 0; c < widths.size(); ++c)
+                    out << "if(sim.case" << c << "_out!=expected" << c << ")return " << c + 1 << ";\n";
+                out << "}}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + dir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (dir / name).string();
+            const auto executable = dir / "wordwise_memory_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) || std::system(executable.c_str()))
+                return fail("wordwise memory concat harness failed: " + mode);
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runCommitScalarSameReaderFocusedTests()
+    {
+        constexpr const char *environmentKey = "WOLVRIX_GRHSIM_COMMIT_SCALAR_SAME_READER_GROUPS";
+        const char *environmentValue = std::getenv(environmentKey);
+        const std::optional<std::string> savedEnvironment = environmentValue
+            ? std::optional<std::string>(environmentValue) : std::nullopt;
+        ::unsetenv(environmentKey);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        constexpr uint32_t commitNode = 64u;
+        ActivityScheduleSupernodeToOps nodes(commitNode + 1u);
+        ActivityScheduleStateReadSupernodes reads;
+        const auto input = [&](const std::string &name, int32_t width) {
+            const ValueId value = makeLogicValue(graph, name, width);
+            graph.bindInputPort(name, value);
+            return value;
+        };
+        const ValueId clk = input("clk", 1);
+        const ValueId enable = input("enable", 1);
+        const ValueId enable2 = input("enable2", 1);
+        const ValueId data2 = input("data2", 8);
+        const ValueId mask2 = input("mask2", 8);
+        struct Case
+        {
+            std::string name;
+            int32_t width;
+            std::vector<uint32_t> readers;
+            bool masked = false;
+            bool multiple = false;
+            bool otherGuard = false;
+        };
+        std::vector<Case> cases;
+        const std::array<int32_t, 10> widths = {1, 7, 8, 16, 32, 64, 1, 8, 16, 64};
+        for (std::size_t index = 0; index < widths.size(); ++index)
+            cases.push_back({"group_" + std::to_string(index), widths[index], {8u, 24u}});
+        cases.push_back({"different_a", 8, {8u}});
+        cases.push_back({"different_b", 8, {24u}});
+        cases.push_back({"different_c", 8, {8u}});
+        cases.push_back({"masked_a", 8, {8u, 24u}, true});
+        cases.push_back({"masked_b", 8, {8u, 24u}, true});
+        cases.push_back({"multi_a", 8, {8u, 24u}, false, true});
+        cases.push_back({"multi_b", 8, {8u, 24u}, false, true});
+        cases.push_back({"high_a", 32, {1u, 9u, 25u, 41u, 57u}});
+        cases.push_back({"high_b", 32, {1u, 9u, 25u, 41u, 57u}});
+        cases.push_back({"dead_a", 8, {}});
+        cases.push_back({"dead_b", 8, {}});
+        cases.push_back({"wide_a", 130, {8u, 24u}});
+        cases.push_back({"wide_b", 130, {8u, 24u}});
+        cases.push_back({"guard_a", 8, {63u}});
+        cases.push_back({"guard_b", 8, {63u}, false, false, true});
+        for (std::size_t index = 0; index < cases.size(); ++index)
+        {
+            const Case &test = cases[index];
+            const ValueId data = input(test.name + "_data", test.width);
+            const ValueId zero = addConstant(graph, test.name + "_zero_op", test.name + "_zero", test.width,
+                                             std::to_string(test.width) + "'h0");
+            nodes[0].push_back(graph.valueDef(zero));
+            const ValueId stored = makeLogicValue(graph, test.name + "_stored", test.width);
+            const OperationId add = graph.createOperation(OperationKind::kAdd, graph.internSymbol(test.name + "_add"));
+            graph.addOperand(add, data);
+            graph.addOperand(add, zero);
+            graph.addResult(add, stored);
+            nodes[0].push_back(add);
+            const ValueId mask = test.masked ? input(test.name + "_mask", test.width)
+                : addConstant(graph, test.name + "_mask_op", test.name + "_mask", test.width,
+                              allOnesLiteral(test.width));
+            if (!test.masked) nodes[0].push_back(graph.valueDef(mask));
+            const OperationId reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol(test.name));
+            graph.setAttr(reg, "width", int64_t{test.width});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::to_string(test.width) + "'d" + std::to_string(index % 2u));
+            for (uint32_t node : test.readers)
+            {
+                const std::string name = test.name + "_out_" + std::to_string(node);
+                const ValueId value = makeLogicValue(graph, name + "_read", test.width);
+                const OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                               graph.internSymbol(name + "_read_op"));
+                graph.setAttr(read, "regSymbol", test.name);
+                graph.addResult(read, value);
+                nodes[node].push_back(read);
+                const ValueId output = makeLogicValue(graph, name, test.width);
+                const OperationId copy = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_copy"));
+                graph.addOperand(copy, value);
+                graph.addResult(copy, output);
+                graph.bindOutputPort(name, output);
+                nodes[node].push_back(copy);
+                reads[test.name].push_back(node);
+            }
+            const auto write = [&](const std::string &name, ValueId condition, ValueId next, ValueId writeMask) {
+                const OperationId op = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol(name));
+                graph.setAttr(op, "regSymbol", test.name);
+                graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+                graph.addOperand(op, condition);
+                graph.addOperand(op, next);
+                graph.addOperand(op, writeMask);
+                graph.addOperand(op, clk);
+                nodes[commitNode].push_back(op);
+            };
+            write("write_" + test.name, test.otherGuard ? enable2 : enable, stored, mask);
+            if (test.multiple) write("write_" + test.name + "_second", enable2, data2, mask2);
+        }
+        for (uint32_t node = 0; node < commitNode; ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "padding_" + std::to_string(node);
+            const auto value = addConstant(graph, name + "_op", name, 1, "1'b0");
+            nodes[node].push_back(graph.valueDef(value));
+        }
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", ActivityScheduleValueFanout(graph.values().size()));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", std::move(reads));
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_commit_same_readers";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "split", "perf",
+                                      "fullpass", "bitmap", "activity-off", "activity-on", "trigger-off",
+                                      "trigger-on", "unhinted", "with-eager"})
+        {
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence" &&
+                                 mode != "activity-off" && mode != "trigger-off";
+            const bool activity = mode.starts_with("activity-") || mode.starts_with("trigger-");
+            const bool trigger = mode.starts_with("trigger-");
+            const bool perf = mode == "perf" || activity;
+            const auto outDir = baseDir / mode;
+            std::filesystem::create_directories(outDir);
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            options.attributes["commit_scalar_eager_max_activation_writes"] = mode == "with-eager" ? "2" : "0";
+            if (mode != "default" && mode != "environment")
+                options.attributes["commit_scalar_same_reader_groups"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(environmentKey, "1", 1);
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (perf) options.attributes["perf"] = "eval";
+            if (activity) options.attributes["emit_runtime_profile"] = "1";
+            if (trigger) options.attributes["batch_trigger_profile"] = "1";
+            if (mode == "bitmap") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "unhinted") options.attributes["commit_state_change_unlikely"] = "0";
+            if (mode == "fullpass")
+            {
+                options.attributes["input_fullpass_specialization"] = "1";
+                options.attributes["posedge_fullpass_specialization"] = "1";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto emitted = emitter.emit(fixture.design, options);
+            ::unsetenv(environmentKey);
+            if (!emitted.success || diagnostics.hasError()) return fail("same-reader commit emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || mode == "precedence") && files != defaultFiles)
+                return fail("disabled same-reader commit changed generated code");
+            const auto sched = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            if (countSubstring(sched, "// Same-reader scalar commit group:") != (enabled ? 3u : 0u) ||
+                (enabled && (countSubstring(sched, "group: 8 writes.") != 1u ||
+                             countSubstring(sched, "group: 2 writes.") != 2u)))
+                return fail("same-reader commit grouping or eligibility mismatch: " + mode);
+            const auto harness = outDir / "same_reader_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n#include <cstdlib>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=123;"
+                       "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n";
+                if (activity)
+                    out << "sim.set_runtime_profile_enabled(true);setenv(\"WOLVRIX_GRHSIM_SUPERNODE_TSV\",\""
+                        << (outDir / "activity.tsv").string() << "\",1);\n";
+                if (trigger)
+                    out << "setenv(\"WOLVRIX_GRHSIM_BATCH_TRIGGER_TSV\",\""
+                        << (outDir / "trigger.tsv").string() << "\",1);\n";
+                out << "for(unsigned reset=0;reset<2;++reset){sim.init();std::uint64_t writes=0;\n";
+                for (std::size_t index = 0; index < cases.size(); ++index)
+                {
+                    const Case &test = cases[index];
+                    out << (test.width > 64 ? "std::array<std::uint64_t,3> " : "std::uint64_t ")
+                        << "expected_" << test.name << "{" << index % 2u << "};sim." << test.name
+                        << "_data=expected_" << test.name << ";\n";
+                }
+                out << "for(unsigned step=0;step<400;++step){sim.clk=false;"
+                       "sim.enable=step<50||step%5!=0;sim.enable2=step>=50&&step%7!=0;"
+                       "sim.data2=random();sim.mask2=step%4?random():0;\n";
+                for (std::size_t index = 0; index < cases.size(); ++index)
+                {
+                    const Case &test = cases[index];
+                    const std::string mask = test.width >= 64 ? "UINT64_MAX" :
+                        "UINT64_C(" + std::to_string((UINT64_C(1) << test.width) - 1u) + ")";
+                    if (test.width > 64)
+                        out << "if(step==" << index << "+1)sim." << test.name << "_data[0]^=1;"
+                            << "else if(step>=50&&step%4!=0)sim." << test.name << "_data={random(),random(),random()&3};\n";
+                    else
+                        out << "if(step==" << index << "+1)sim." << test.name << "_data^=1;"
+                            << "else if(step>=50&&step%4!=0&&random()%3==0)sim." << test.name << "_data=random()&" << mask << ";\n";
+                    if (test.masked)
+                        out << "sim." << test.name << "_mask=step<50?255:step%4?(random()&" << mask << "):0;\n";
+                }
+                const auto checkOutputs = [&](unsigned code) {
+                    for (const Case &test : cases)
+                        for (uint32_t node : test.readers)
+                            out << "if(sim." << test.name << "_out_" << node << "!=expected_" << test.name
+                                << ")return " << code << ";\n";
+                };
+                out << "sim.eval();\n";
+                checkOutputs(1u);
+                out << "sim.clk=true;sim.eval();\n";
+                for (const Case &test : cases)
+                {
+                    out << "if(sim." << (test.otherGuard ? "enable2" : "enable") << "){auto next=";
+                    if (test.masked)
+                        out << "(expected_" << test.name << "&~std::uint64_t(sim." << test.name
+                            << "_mask))|(std::uint64_t(sim." << test.name << "_data)&sim." << test.name << "_mask)";
+                    else
+                        out << "sim." << test.name << "_data";
+                    out << ";writes+=(expected_" << test.name << "!=next);expected_" << test.name << "=next;}\n";
+                    if (test.multiple)
+                        out << "if(sim.enable2){auto next=(expected_" << test.name << "&~std::uint64_t(sim.mask2))|"
+                               "(std::uint64_t(sim.data2)&sim.mask2);writes+=(expected_" << test.name
+                            << "!=next);expected_" << test.name << "=next;}\n";
+                }
+                checkOutputs(2u);
+                out << "sim.eval();\n";
+                checkOutputs(3u);
+                if (perf) out << "if(sim.perf_counters().touchedWriteCount!=writes)return 4;\n";
+                out << "}\n";
+                if (activity) out << "sim.dump_runtime_profile();\n";
+                out << "}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            const auto executable = outDir / "same_reader_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                return fail("same-reader commit functional harness failed: " + mode);
+            if (mode == "activity-on" || mode == "trigger-on")
+            {
+                const auto reference = baseDir / (trigger ? "trigger-off" : "activity-off");
+                if (readFile(outDir / "activity.tsv") != readFile(reference / "activity.tsv"))
+                    return fail("same-reader commit changed dynamic reader execution counts");
+                if (trigger && readFile(outDir / "trigger.tsv") != readFile(reference / "trigger.tsv"))
+                    return fail("same-reader commit changed batch trigger counters");
+            }
+        }
+        if (savedEnvironment) ::setenv(environmentKey, savedEnvironment->c_str(), 1);
+        return 0;
+    }
+
+    int runCommitScalarEagerFocusedTests()
+    {
+        constexpr const char *environmentKey = "WOLVRIX_GRHSIM_COMMIT_SCALAR_EAGER_MAX_ACTIVATION_WRITES";
+        const char *environmentValue = std::getenv(environmentKey);
+        const std::optional<std::string> savedEnvironment = environmentValue
+            ? std::optional<std::string>(environmentValue) : std::nullopt;
+        ::unsetenv(environmentKey);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        constexpr uint32_t commitNode = 64u;
+        ActivityScheduleSupernodeToOps nodes(commitNode + 1u);
+        ActivityScheduleStateReadSupernodes reads;
+        const auto input = [&](const std::string &name, int32_t width) {
+            const ValueId value = makeLogicValue(graph, name, width);
+            graph.bindInputPort(name, value);
+            return value;
+        };
+        const ValueId clk = input("clk", 1);
+        const ValueId enable = input("enable", 1);
+        const ValueId enable2 = input("enable2", 1);
+        const ValueId data2 = input("data2", 8);
+        const ValueId mask2 = input("mask2", 8);
+        struct Case
+        {
+            std::string name;
+            int32_t width;
+            std::vector<uint32_t> readers;
+            bool masked = false;
+        };
+        const std::vector<Case> cases = {
+            {"bit", 1, {0u}}, {"u7", 7, {1u}, true}, {"u8", 8, {2u}},
+            {"u16", 16, {3u}, true}, {"u32", 32, {4u}}, {"u64", 64, {5u}, true},
+            {"two", 8, {8u, 24u}}, {"three", 8, {16u, 32u, 48u}},
+            {"high", 8, {9u, 25u, 41u, 57u}}, {"dead", 8, {}},
+            {"multi", 8, {6u}, true}, {"wide", 130, {7u}}
+        };
+        for (const Case &test : cases)
+        {
+            const ValueId data = input(test.name + "_data", test.width);
+            const ValueId mask = test.masked
+                ? input(test.name + "_mask", test.width)
+                : addConstant(graph, test.name + "_mask_op", test.name + "_mask", test.width,
+                              allOnesLiteral(test.width));
+            if (!test.masked) nodes[0].push_back(graph.valueDef(mask));
+            const OperationId reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol(test.name));
+            graph.setAttr(reg, "width", int64_t{test.width});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::to_string(test.width) + "'h0");
+            for (uint32_t node : test.readers)
+            {
+                const std::string name = test.name + "_out_" + std::to_string(node);
+                const ValueId value = makeLogicValue(graph, name + "_read_value", test.width);
+                const OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                               graph.internSymbol(name + "_read"));
+                graph.setAttr(read, "regSymbol", test.name);
+                graph.addResult(read, value);
+                nodes[node].push_back(read);
+                const ValueId result = makeLogicValue(graph, name, test.width);
+                const OperationId copy = graph.createOperation(OperationKind::kAssign,
+                                                               graph.internSymbol(name + "_copy"));
+                graph.addOperand(copy, value);
+                graph.addResult(copy, result);
+                graph.bindOutputPort(name, result);
+                nodes[node].push_back(copy);
+                reads[test.name].push_back(node);
+            }
+            const auto write = [&](const std::string &name, ValueId condition, ValueId next, ValueId writeMask) {
+                const OperationId op = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                             graph.internSymbol(name));
+                graph.setAttr(op, "regSymbol", test.name);
+                graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+                graph.addOperand(op, condition);
+                graph.addOperand(op, next);
+                graph.addOperand(op, writeMask);
+                graph.addOperand(op, clk);
+                nodes[commitNode].push_back(op);
+            };
+            write("write_" + test.name, enable, data, mask);
+            if (test.name == "multi") write("write_multi_second", enable2, data2, mask2);
+        }
+        for (uint32_t node = 0; node < commitNode; ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "padding_" + std::to_string(node);
+            const auto value = addConstant(graph, name + "_op", name, 1, "1'b0");
+            nodes[node].push_back(graph.valueDef(value));
+        }
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", ActivityScheduleValueFanout(graph.values().size()));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", std::move(reads));
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_commit_scalar_eager";
+        std::map<std::string, std::string> defaultFiles;
+        const auto optionKey = "commit_scalar_eager_max_activation_writes";
+        for (const std::string mode : {"default", "off", "one", "two", "three", "split", "perf", "fullpass",
+                                       "bitmap", "environment", "precedence", "unhinted", "activity-off", "activity-two"})
+        {
+            const bool checkActivity = mode == "activity-off" || mode == "activity-two";
+            const unsigned budget = mode == "default" || mode == "off" || mode == "precedence" || mode == "activity-off"
+                ? 0u : mode == "one" ? 1u : mode == "three" ? 3u : 2u;
+            const auto outDir = baseDir / mode;
+            std::filesystem::create_directories(outDir);
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default" && mode != "environment") options.attributes[optionKey] = std::to_string(budget);
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "perf" || checkActivity) options.attributes["perf"] = "eval";
+            if (checkActivity) options.attributes["emit_runtime_profile"] = "1";
+            if (mode == "fullpass")
+            {
+                options.attributes["input_fullpass_specialization"] = "1";
+                options.attributes["posedge_fullpass_specialization"] = "1";
+            }
+            if (mode == "bitmap") options.attributes["batch_trigger_bitmap_validate"] = "1";
+            if (mode == "unhinted") options.attributes["commit_state_change_unlikely"] = "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(environmentKey, "2", 1);
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const EmitResult emitted = emitter.emit(fixture.design, options);
+            ::unsetenv(environmentKey);
+            if (!emitted.success || diagnostics.hasError()) return fail("scalar eager commit emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || mode == "precedence") && files != defaultFiles)
+                return fail("disabled scalar eager commit changed generated code");
+            const auto sched = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            for (const Case &test : cases)
+            {
+                const std::string marker = "// op write_" + test.name + " [kRegisterWritePort]";
+                const std::size_t begin = sched.find(marker);
+                if (begin == std::string::npos) return fail("scalar eager commit missing test write: " + test.name);
+                const std::size_t end = sched.find("// op ", begin + marker.size());
+                const auto snippet = std::string_view(sched).substr(begin, end == std::string::npos ? end : end - begin);
+                const bool eligible = budget > 0u && test.width <= 64 && test.readers.size() <= budget;
+                if ((snippet.find("// Eager scalar commit:") != std::string_view::npos) != eligible)
+                    return fail("scalar eager commit activation budget mismatch: " + mode + "/" + test.name);
+                if (eligible && snippet.find("if (unlikely(") != std::string_view::npos)
+                    return fail("scalar eager commit retained a change guard: " + test.name);
+            }
+            const auto harness = outDir / "commit_eager_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "#include <cstdlib>\n#include <fstream>\n#include <string>\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=123;"
+                       "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n";
+                if (checkActivity)
+                    out << "sim.set_runtime_profile_enabled(true);setenv(\"WOLVRIX_GRHSIM_SUPERNODE_TSV\",\""
+                        << (outDir / "activity.tsv").string() << "\",1);\n";
+                out <<
+                       "for(unsigned reset=0;reset<2;++reset){sim.init();std::uint64_t writes=0;\n";
+                if (checkActivity)
+                    out << "std::array<std::uint64_t,64> fires{};fires.fill(1);std::uint64_t rounds=0;\n";
+                for (const Case &test : cases)
+                    out << (test.width > 64 ? "std::array<std::uint64_t,3> " : "std::uint64_t ")
+                        << "expected_" << test.name << "{};\n";
+                out << "for(unsigned step=0;step<300;++step){sim.clk=false;sim.enable=step%5!=0;"
+                       "sim.enable2=step%7!=0;sim.data2=random();sim.mask2=step%4?random():0;\n";
+                if (checkActivity) out << "std::array<bool,64> dirty{};\n";
+                for (const Case &test : cases)
+                {
+                    if (test.width > 64)
+                        out << "if(step%3==0)sim." << test.name << "_data={random(),random(),random()&3};\n";
+                    else
+                    {
+                        const std::string mask = test.width == 64 ? "UINT64_MAX" :
+                            "UINT64_C(" + std::to_string((UINT64_C(1) << test.width) - 1u) + ")";
+                        out << "if(step%3==0)sim." << test.name << "_data=random()&" << mask << ";\n";
+                        if (test.masked)
+                            out << "sim." << test.name << "_mask=step%4?(random()&" << mask << "):0;\n";
+                    }
+                }
+                const auto checkOutputs = [&](unsigned code) {
+                    for (const Case &test : cases)
+                        for (uint32_t node : test.readers)
+                            out << "if(sim." << test.name << "_out_" << node << "!=expected_" << test.name
+                                << ")return " << code << ";\n";
+                };
+                out << "sim.eval();\n";
+                checkOutputs(1u);
+                out << "sim.clk=true;sim.eval();\n";
+                for (const Case &test : cases)
+                {
+                    out << "if(sim.enable){auto next=";
+                    if (test.masked)
+                        out << "(expected_" << test.name << "&~std::uint64_t(sim." << test.name
+                            << "_mask))|(std::uint64_t(sim." << test.name << "_data)&sim." << test.name << "_mask)";
+                    else
+                        out << "sim." << test.name << "_data";
+                    out << ";const bool changed=(expected_" << test.name << "!=next);writes+=changed;";
+                    if (checkActivity)
+                        for (uint32_t node : test.readers) out << "dirty[" << node << "]|=changed;";
+                    out << "expected_" << test.name << "=next;}\n";
+                    if (test.name == "multi")
+                    {
+                        out << "if(sim.enable2){auto next=(expected_multi&~std::uint64_t(sim.mask2))|"
+                               "(std::uint64_t(sim.data2)&sim.mask2);const bool changed=(expected_multi!=next);writes+=changed;";
+                        if (checkActivity) out << "dirty[6]|=changed;";
+                        out << "expected_multi=next;}\n";
+                    }
+                }
+                checkOutputs(2u);
+                out << "sim.eval();\n";
+                checkOutputs(3u);
+                if (mode == "perf" || checkActivity)
+                    out << "if(sim.perf_counters().touchedWriteCount!=writes)return 4;\n";
+                if (checkActivity)
+                    out << "bool any=false;for(unsigned node=0;node<64;++node){fires[node]+=dirty[node];any|=dirty[node];}"
+                           "rounds+=2+any;const auto perf=sim.perf_counters();"
+                           "if(perf.totalRoundCount!=rounds||perf.computeBatchExecCount!=rounds||"
+                           "perf.commitBatchExecCount!=rounds)return 5;\n";
+                out << "}\n";
+                if (checkActivity)
+                    out << "sim.dump_runtime_profile();std::ifstream profile(\"" << (outDir / "activity.tsv").string()
+                        << "\");std::string header;std::getline(profile,header);"
+                           "std::array<bool,65> seen{};unsigned node=0;std::string phase;std::uint64_t count=0;"
+                           "while(profile>>node>>phase>>count){if(node>=65||seen[node])return 6;seen[node]=true;"
+                           "if(phase==\"compute\"){if(node>=64||count!=fires[node])return 7;}"
+                           "else if(phase!=\"commit\"||node!=64||count!=300)return 8;}"
+                           "for(bool value:seen)if(!value)return 9;\n";
+                out << "}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            const auto executable = outDir / "commit_eager_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                return fail("scalar eager commit functional harness failed: " + mode);
+        }
+        for (const std::string value : {"-1", "4", "invalid", "18446744073709551616"})
+        {
+            for (bool environment : {false, true})
+            {
+                EmitOptions options;
+                options.outputDir = (baseDir / "invalid").string();
+                options.session = &fixture.session;
+                options.sessionPathPrefix = "top";
+                if (environment) ::setenv(environmentKey, value.c_str(), 1);
+                else options.attributes[optionKey] = value;
+                EmitDiagnostics diagnostics;
+                EmitGrhSimCpp emitter(&diagnostics);
+                const bool success = emitter.emit(fixture.design, options).success;
+                ::unsetenv(environmentKey);
+                if (success || !diagnostics.hasError()) return fail("scalar eager commit accepted invalid budget");
+            }
+        }
+        if (savedEnvironment) ::setenv(environmentKey, savedEnvironment->c_str(), 1);
+        return 0;
+    }
+
+    int runPriorityMuxChainFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        enum class DataKind { kInput, kConstant, kConstantAlias, kMixed };
+        struct Case
+        {
+            std::string name;
+            int32_t width;
+            unsigned length;
+            unsigned continuation;
+            DataKind dataKind = DataKind::kInput;
+            bool constantFallback = false;
+        };
+        const std::vector<Case> cases = {{"long_chain", 8, 520, 2}, {"true_chain", 7, 12, 1},
+                                         {"mixed_chain", 64, 17, 0}, {"bit_chain", 1, 9, 0},
+                                         {"shared_chain", 8, 16, 2}, {"effect_chain", 8, 12, 2},
+                                         {"short_chain", 8, 7, 2}, {"cross_chain", 8, 12, 2},
+                                         {"constant_chain", 9, 609, 2, DataKind::kConstant},
+                                         {"constant_true", 7, 132, 1, DataKind::kConstant},
+                                         {"constant_mixed", 64, 130, 0, DataKind::kConstant},
+                                         {"constant_bit", 1, 134, 0, DataKind::kConstant},
+                                         {"constant_alias", 8, 136, 2, DataKind::kConstantAlias},
+                                         {"constant_base", 7, 144, 2, DataKind::kConstant, true},
+                                         {"constant_63", 16, 63, 2, DataKind::kConstant},
+                                         {"constant_64", 32, 64, 1, DataKind::kConstant},
+                                         {"constant_65", 64, 65, 0, DataKind::kConstant},
+                                         {"constant_128", 8, 128, 2, DataKind::kConstant},
+                                         {"mixed_data", 8, 138, 2, DataKind::kMixed},
+                                         {"mixed_true", 16, 142, 1, DataKind::kMixed}};
+        const unsigned crossNode = static_cast<unsigned>(cases.size());
+        const unsigned downstreamNode = crossNode + 1u;
+        ActivityScheduleSupernodeToOps nodes(cases.size() + 2u);
+        constexpr unsigned conditionCount = 609u;
+        const auto constantData = [](const Case &test, unsigned index) {
+            return test.dataKind != DataKind::kInput &&
+                   (test.dataKind != DataKind::kMixed || index != test.length / 2u);
+        };
+        const auto constantBits = [](const Case &test, unsigned index) {
+            const std::uint64_t mask = test.width == 64 ? UINT64_MAX : (UINT64_C(1) << test.width) - 1u;
+            return (UINT64_C(0xa593c7e159b3d70f) ^ (UINT64_C(0x91f3) * index)) & mask;
+        };
+        std::vector<ValueId> conditions;
+        std::vector<ValueId> outputs;
+        std::vector<ValueId> chainResults;
+        std::vector<ValueId> crossing;
+        for (unsigned i = 0; i < conditionCount; ++i)
+        {
+            const std::string name = "cond_" + std::to_string(i);
+            const ValueId value = makeLogicValue(graph, name, i % 2u == 0u ? 1 : 64);
+            graph.bindInputPort(name, value);
+            conditions.push_back(value);
+        }
+        const auto output = [&](ValueId source, const std::string &name, unsigned node) {
+            const ValueId value = makeLogicValue(graph, name, graph.valueWidth(source));
+            graph.bindOutputPort(name, value);
+            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, source);
+            graph.addResult(op, value);
+            nodes[node].push_back(op);
+            return value;
+        };
+        for (unsigned index = 0; index < cases.size(); ++index)
+        {
+            const Case &test = cases[index];
+            unsigned node = index;
+            ValueId previous;
+            if (test.constantFallback)
+            {
+                previous = addConstant(graph, test.name + "_base_op", test.name + "_base", test.width,
+                                       std::to_string(test.width) + "'d" + std::to_string(constantBits(test, test.length)));
+                nodes[node].push_back(graph.valueDef(previous));
+            }
+            else
+            {
+                previous = makeLogicValue(graph, test.name + "_base", test.width);
+                graph.bindInputPort(test.name + "_base", previous);
+            }
+            for (unsigned i = 0; i < test.length; ++i)
+            {
+                if (test.name == "cross_chain" && i == 6u)
+                {
+                    crossing.push_back(previous);
+                    node = crossNode;
+                }
+                const std::string suffix = test.name + "_" + std::to_string(i);
+                ValueId data;
+                if (constantData(test, i))
+                {
+                    data = addConstant(graph, suffix + "_const", suffix + "_data", test.width,
+                                       std::to_string(test.width) + "'d" + std::to_string(constantBits(test, i)));
+                    nodes[node].push_back(graph.valueDef(data));
+                    if (test.dataKind == DataKind::kConstantAlias)
+                    {
+                        for (unsigned alias = 0; alias < 2u; ++alias)
+                        {
+                            const std::string name = suffix + "_alias_" + std::to_string(alias);
+                            const ValueId result = makeLogicValue(graph, name, test.width);
+                            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_op"));
+                            graph.addOperand(op, data);
+                            graph.addResult(op, result);
+                            nodes[node].push_back(op);
+                            data = result;
+                        }
+                    }
+                }
+                else
+                {
+                    data = makeLogicValue(graph, suffix + "_data", test.width);
+                    graph.bindInputPort(suffix + "_data", data);
+                }
+                const ValueId result = makeLogicValue(graph, suffix + "_value", test.width);
+                const OperationId op = graph.createOperation(OperationKind::kMux, graph.internSymbol(suffix + "_mux"));
+                const unsigned arm = test.continuation ? test.continuation : (i % 2u + 1u);
+                graph.addOperand(op, conditions[i]);
+                graph.addOperand(op, arm == 1u ? previous : data);
+                graph.addOperand(op, arm == 2u ? previous : data);
+                graph.addResult(op, result);
+                if (test.name == "effect_chain" && i == test.length - 1u)
+                    graph.setAttr(op, "hasSideEffects", true);
+                nodes[node].push_back(op);
+                if (test.name == "shared_chain" && i == 7u)
+                    output(result, "shared_copy", node);
+                previous = result;
+            }
+            chainResults.push_back(previous);
+            outputs.push_back(output(previous, test.name + "_out", node));
+        }
+        output(outputs.front(), "downstream", downstreamNode);
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        fanout[outputs.front().index - 1u] = {downstreamNode};
+        for (ValueId value : crossing) fanout[value.index - 1u] = {crossNode};
+        ActivityScheduleTopoOrder topoOrder(nodes.size());
+        std::iota(topoOrder.begin(), topoOrder.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(topoOrder));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_priority_mux_chains";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "split", "combined", "environment",
+                                       "default-threshold", "threshold-16", "threshold-520", "threshold-521", "precedence",
+                                       "bitmap", "bitmap-split", "bitmap-combined", "bitmap-environment",
+                                       "bitmap-threshold", "bitmap-master-off", "bitmap-precedence"})
+        {
+            const bool enabled = mode != "default" && mode != "off" && mode != "bitmap-master-off";
+            const bool bitmaps = mode.starts_with("bitmap") && mode != "bitmap-precedence";
+            const std::size_t expectedChains = !enabled || mode == "threshold-521" ? 0u :
+                mode == "threshold-520" ? 1u : mode == "default-threshold" ? 3u :
+                mode == "threshold-16" ? 4u : mode == "bitmap-threshold" ? 3u : 8u;
+            const std::size_t minLength = mode == "threshold-16" ? 16u : mode == "threshold-520" ? 520u :
+                mode == "threshold-521" ? 521u :
+                mode == "default-threshold" || mode == "bitmap-threshold" ? 128u : 8u;
+            const auto expectedBitmap = [&](const Case &test) {
+                return enabled && bitmaps && test.length >= minLength &&
+                       (test.dataKind == DataKind::kConstant || test.dataKind == DataKind::kConstantAlias);
+            };
+            const std::size_t expectedBitmaps = std::count_if(cases.begin(), cases.end(), expectedBitmap);
+            const auto outDir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "bitmap-environment")
+                options.attributes["priority_mux_constant_bitmaps"] = bitmaps ? "1" : "0";
+            if (mode != "default" && mode != "environment")
+                options.attributes["priority_mux_chains"] = enabled ? "1" : "0";
+            if (enabled && mode != "default-threshold" && mode != "environment")
+                options.attributes["priority_mux_min_chain_length"] = std::to_string(minLength);
+            if (mode == "split" || mode == "bitmap-split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "combined" || mode == "bitmap-combined")
+            {
+                options.attributes["local_compute_use_order"] = "1";
+                options.attributes["packed_array_late_index"] = "1";
+            }
+            if (mode == "environment")
+            {
+                ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CHAINS", "1", 1);
+                ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_MIN_CHAIN_LENGTH", "8", 1);
+            }
+            if (mode == "precedence")
+                ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_MIN_CHAIN_LENGTH", "invalid", 1);
+            if (mode == "bitmap-environment" || mode == "bitmap-precedence")
+                ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CONSTANT_BITMAPS", "1", 1);
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            const EmitResult emitted = emitter.emit(fixture.design, options);
+            if (mode == "environment") ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CHAINS");
+            if (mode == "environment" || mode == "precedence")
+                ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_MIN_CHAIN_LENGTH");
+            if (mode == "bitmap-environment" || mode == "bitmap-precedence")
+                ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CONSTANT_BITMAPS");
+            if (!emitted.success || diag.hasError()) return fail("priority mux emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || mode == "bitmap-master-off") && files != defaultFiles)
+                return fail("disabled priority mux changed generation");
+            if (mode == "threshold-521" && files != defaultFiles)
+                return fail("unmatched priority mux threshold changed generation");
+            const std::string sched = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            if (countSubstring(sched, "// Priority mux chain:") != expectedChains)
+                return fail("priority mux chain eligibility or shared-result boundary mismatch: " + mode);
+            if (countSubstring(sched, "// Constant priority mux bitmap:") != expectedBitmaps)
+                return fail("constant priority mux bitmap eligibility mismatch: " + mode);
+            for (unsigned index = 0; index < cases.size(); ++index)
+            {
+                const Case &test = cases[index];
+                if (test.dataKind == DataKind::kInput) continue;
+                const std::string name = " priority_mux_" + std::to_string(chainResults[index].index) + ";";
+                const bool expected = enabled && ((test.dataKind == DataKind::kMixed && test.length >= minLength) ||
+                                                  expectedBitmap(test));
+                if ((sched.find(name) != std::string::npos) != expected)
+                    return fail("priority mux constant-choice classification mismatch: " + mode + "/" + test.name);
+            }
+            if (expectedChains && sched.find("// Priority mux chain: 520 ordered choices.") == std::string::npos)
+                return fail("priority mux did not preserve the full long chain");
+            if (enabled && (countSubstring(sched, "} while (false);") != expectedChains + expectedBitmaps ||
+                            sched.find("[&]() ->") != std::string::npos))
+                return fail("priority mux choices must stay in the calling compute function");
+            const auto harness = outDir / "priority_mux_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim; std::uint64_t rng=123;\n"
+                       "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n"
+                       "for(unsigned reset=0;reset<2;++reset){sim.init();for(unsigned step=0;step<2200;++step){\n"
+                    << "std::array<std::uint64_t," << conditionCount << "> cond{};for(unsigned i=0;i<" << conditionCount << ";++i)\n"
+                    << "cond[i]=step==0?0:step==1?1:step<" << conditionCount + 2u
+                    << "?(i==step-2?UINT64_C(0x8000000000000000):0):step<" << 2u * conditionCount + 2u
+                    << "?(i==step-" << conditionCount + 2u << "?0:UINT64_C(0x8000000000000000)):step<"
+                    << 3u * conditionCount + 3u << "?((i%2==0)^(i+" << 2u * conditionCount + 3u
+                    << "==step)):random()%3;\n";
+                for (unsigned i = 0; i < conditions.size(); ++i)
+                    out << "sim.cond_" << i << "=cond[" << i << "];\n";
+                for (const Case &test : cases)
+                {
+                    const std::string mask = test.width == 64 ? "UINT64_MAX" :
+                        "UINT64_C(" + std::to_string((UINT64_C(1) << test.width) - 1u) + ")";
+                    if (test.constantFallback)
+                        out << "std::uint64_t expected_" << test.name << "=UINT64_C(" << constantBits(test, test.length) << ");\n";
+                    else
+                        out << "sim." << test.name << "_base=random()&" << mask << ";\n"
+                            << "std::uint64_t expected_" << test.name << "=sim." << test.name << "_base;\n";
+                    for (unsigned i = 0; i < test.length; ++i)
+                    {
+                        const unsigned arm = test.continuation ? test.continuation : (i % 2u + 1u);
+                        const std::string data = constantData(test, i)
+                            ? "UINT64_C(" + std::to_string(constantBits(test, i)) + ")"
+                            : "sim." + test.name + "_" + std::to_string(i) + "_data";
+                        if (!constantData(test, i)) out << data << "=random()&" << mask << ";\n";
+                        out << "if(" << (arm == 1u ? "!" : "") << "cond[" << i << "]) expected_" << test.name
+                            << "=" << data << ";\n";
+                        if (test.name == "shared_chain" && i == 7u)
+                            out << "std::uint64_t expected_shared_copy=expected_shared_chain;\n";
+                    }
+                }
+                out << "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n";
+                for (const Case &test : cases)
+                    out << "if(sim." << test.name << "_out!=expected_" << test.name << ")return 1;\n";
+                out << "if(sim.shared_copy!=expected_shared_copy)return 2;"
+                       "if(sim.downstream!=expected_long_chain)return 3;}}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O3 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            const auto executable = outDir / "priority_mux_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                return fail("priority mux functional harness failed: " + mode);
+        }
+        for (const std::string invalid : {"", "0", "1", "-1", "1x", "18446744073709551616"})
+        {
+            EmitOptions options;
+            options.outputDir = (baseDir / "invalid").string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["priority_mux_chains"] = "1";
+            options.attributes["priority_mux_min_chain_length"] = invalid;
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (emitter.emit(fixture.design, options).success || !diag.hasError())
+                return fail("priority mux accepted an invalid chain threshold: " + invalid);
+        }
+        return 0;
+    }
+
+    int runPriorityMuxCommitDemandFocusedTests()
+    {
+        const char *savedChains = std::getenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CHAINS");
+        const char *savedDemand = std::getenv("WOLVRIX_GRHSIM_PRIORITY_MUX_COMMIT_DEMAND");
+        const char *savedMin = std::getenv("WOLVRIX_GRHSIM_PRIORITY_MUX_MIN_CHAIN_LENGTH");
+        ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CHAINS");
+        ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_COMMIT_DEMAND");
+        ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_MIN_CHAIN_LENGTH");
+
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        constexpr unsigned chainLength = 12u;
+        constexpr unsigned commitNode = 1u;
+        constexpr unsigned readNode = 2u;
+        ActivityScheduleSupernodeToOps nodes(3u);
+        ActivityScheduleStateReadSupernodes reads;
+        const auto input = [&](const std::string &name, int32_t width) {
+            const ValueId value = makeLogicValue(graph, name, width);
+            graph.bindInputPort(name, value);
+            return value;
+        };
+        const ValueId clk = input("clk", 1);
+        const ValueId enable = input("enable", 1);
+        const ValueId mask = input("mask", 8);
+        const ValueId base = input("base", 8);
+        std::vector<ValueId> conditions;
+        std::vector<ValueId> data;
+        conditions.reserve(chainLength);
+        data.reserve(chainLength);
+        for (unsigned index = 0; index < chainLength; ++index)
+        {
+            conditions.push_back(input("cond_" + std::to_string(index), 1));
+            data.push_back(input("data_" + std::to_string(index), 8));
+        }
+
+        const OperationId reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("demand_reg"));
+        graph.setAttr(reg, "width", int64_t{8});
+        graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("8'h5a"));
+        ValueId previous = base;
+        std::vector<ValueId> chainValues;
+        chainValues.reserve(chainLength);
+        for (unsigned index = 0; index < chainLength; ++index)
+        {
+            const ValueId result = makeLogicValue(graph, "mux_value_" + std::to_string(index), 8);
+            const OperationId mux = graph.createOperation(
+                OperationKind::kMux, graph.internSymbol("demand_mux_" + std::to_string(index)));
+            graph.addOperand(mux, conditions[index]);
+            graph.addOperand(mux, data[index]);
+            graph.addOperand(mux, previous);
+            graph.addResult(mux, result);
+            nodes[0].push_back(mux);
+            chainValues.push_back(result);
+            previous = result;
+        }
+        const ValueId root = previous;
+        const OperationId write = graph.createOperation(
+            OperationKind::kRegisterWritePort, graph.internSymbol("demand_reg_write"));
+        graph.setAttr(write, "regSymbol", std::string("demand_reg"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.addOperand(write, enable);
+        graph.addOperand(write, root);
+        graph.addOperand(write, mask);
+        graph.addOperand(write, clk);
+        nodes[commitNode].push_back(write);
+
+        const ValueId readValue = makeLogicValue(graph, "demand_reg_read", 8);
+        const OperationId read = graph.createOperation(
+            OperationKind::kRegisterReadPort, graph.internSymbol("demand_reg_read_op"));
+        graph.setAttr(read, "regSymbol", std::string("demand_reg"));
+        graph.addResult(read, readValue);
+        nodes[readNode].push_back(read);
+        const ValueId output = makeLogicValue(graph, "demand_out", 8);
+        const OperationId copy = graph.createOperation(
+            OperationKind::kAssign, graph.internSymbol("demand_out_copy"));
+        graph.addOperand(copy, readValue);
+        graph.addResult(copy, output);
+        graph.bindOutputPort("demand_out", output);
+        nodes[readNode].push_back(copy);
+        reads["demand_reg"].push_back(readNode);
+
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        fanout[root.index - 1u] = {commitNode};
+        ActivityScheduleTopoOrder topoOrder{0u, commitNode, readNode};
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(topoOrder));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", std::move(reads));
+
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+                             "grhsim_cpp_priority_mux_commit_demand";
+        std::map<std::string, std::string> baselineFiles;
+        for (const std::string mode : {"default", "off", "on"})
+        {
+            const auto outDir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default")
+            {
+                options.attributes["priority_mux_chains"] = mode == "on" ? "1" : "0";
+                options.attributes["priority_mux_min_chain_length"] = std::to_string(8u);
+                options.attributes["priority_mux_commit_demand"] = mode == "on" ? "1" : "0";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const EmitResult emitted = emitter.emit(fixture.design, options);
+            if (!emitted.success || diagnostics.hasError())
+                return fail("priority mux commit-demand emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default")
+                baselineFiles = files;
+            if (mode == "off" && files != baselineFiles)
+                return fail("disabled priority mux commit-demand changed generated code");
+            const std::string schedule = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            if (mode != "on" && schedule.find("Demand-evaluate terminal priority mux") != std::string::npos)
+                return fail("disabled priority mux commit-demand emitted a demand chain");
+            if (mode == "on")
+            {
+                if (countSubstring(schedule, "Demand-evaluate terminal priority mux") != 1u ||
+                    countSubstring(schedule, "Priority mux chain: 12 ordered choices.") != 1u)
+                    return fail("enabled priority mux commit-demand did not move exactly one chain");
+                const auto harness = outDir / "priority_mux_commit_demand_harness.cpp";
+                {
+                    std::ofstream out(harness);
+                    out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\n"
+                           "int main(){GrhSIM_top sim;sim.init();sim.mask=UINT64_MAX;"
+                           "sim.base=0x5a;sim.enable=1;sim.clk=false;";
+                    for (unsigned index = 0; index < chainLength; ++index)
+                        out << "sim.cond_" << index << "=0;sim.data_" << index << "="
+                            << (17u + index) << ";";
+                    out << "sim.eval();if(sim.demand_out!=0x5a)return 1;"
+                           "sim.cond_3=1;sim.clk=true;sim.eval();if(sim.demand_out!=20)return 2;"
+                           "sim.clk=false;sim.cond_3=0;sim.cond_9=1;sim.data_9=0xe7;sim.eval();"
+                           "if(sim.demand_out!=20)return 3;sim.clk=true;sim.eval();"
+                           "if(sim.demand_out!=0xe7)return 4;return 0;}\n";
+                }
+                std::string command = "clang++ -std=c++20 -O2 -I" + outDir.string();
+                for (const auto &[name, content] : files)
+                    if (name.ends_with(".cpp"))
+                        command += " " + (outDir / name).string();
+                const auto executable = outDir / "priority_mux_commit_demand_harness";
+                command += " " + harness.string() + " -o " + executable.string();
+                if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                    return fail("priority mux commit-demand functional harness failed");
+            }
+        }
+        if (savedChains) ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CHAINS", savedChains, 1);
+        if (savedDemand) ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_COMMIT_DEMAND", savedDemand, 1);
+        if (savedMin) ::setenv("WOLVRIX_GRHSIM_PRIORITY_MUX_MIN_CHAIN_LENGTH", savedMin, 1);
+        return 0;
+    }
+
+    int runLocalComputeUseOrderFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(3u);
+        const ValueId data = makeLogicValue(graph, "data", 128);
+        const ValueId shift = makeLogicValue(graph, "shift", 8);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("shift", shift);
+        std::vector<ValueId> shifted;
+        std::vector<ValueId> outputs;
+        std::vector<OperationId> outputOps;
+        const auto assign = [&](ValueId value, const std::string &name, uint32_t node, bool effect = false) {
+            const ValueId result = makeLogicValue(graph, name, 128);
+            graph.bindOutputPort(name, result);
+            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, value);
+            graph.addResult(op, result);
+            if (effect) graph.setAttr(op, "hasSideEffects", true);
+            nodes[node].push_back(op);
+            outputOps.push_back(op);
+            return result;
+        };
+        for (uint32_t node : {0u, 1u})
+        {
+            for (unsigned i = 0; i < 8u; ++i)
+            {
+                const std::string suffix = std::to_string(node * 8u + i);
+                const ValueId local = makeLogicValue(graph, "local_" + suffix, 128);
+                const OperationId op = graph.createOperation(OperationKind::kLShr, graph.internSymbol("shift_" + suffix));
+                graph.addOperand(op, i == 0u ? data : shifted.back());
+                graph.addOperand(op, shift);
+                graph.addResult(op, local);
+                nodes[node].push_back(op);
+                shifted.push_back(local);
+            }
+            for (unsigned i = 0; i < 8u; ++i)
+            {
+                const auto index = node * 8u + i;
+                const std::string suffix = std::to_string(index);
+                outputs.push_back(assign(shifted[index], "out_" + suffix, node, node == 1u && i == 0u));
+                assign(shifted[index], "copy_" + suffix, node);
+            }
+        }
+        assign(outputs.front(), "downstream", 2u);
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        fanout[outputs.front().index - 1u] = {2u};
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u});
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_local_compute_use_order";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "split", "guarded", "absolute-reject", "relative-reject"})
+        {
+            const bool enabled = mode == "on" || mode == "split" || mode == "guarded";
+            const bool rejected = mode == "absolute-reject" || mode == "relative-reject";
+            const auto outDir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default") options.attributes["local_compute_use_order"] = (enabled || rejected) ? "1" : "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "guarded" || rejected)
+            {
+                options.attributes["local_compute_use_order_min_saved_bit_ops"] =
+                    mode == "absolute-reject" ? "1048576" : "4096";
+                options.attributes["local_compute_use_order_min_reduction_percent"] =
+                    mode == "relative-reject" ? "90" : "25";
+            }
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (!emitter.emit(fixture.design, options).success || diag.hasError())
+                return fail("local compute use-order emission failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || rejected) && files != defaultFiles)
+                return fail("local compute use-order changed disabled or rejected generation");
+            const auto sched = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            for (unsigned index = 0; index < shifted.size(); ++index)
+            {
+                const std::string local = "const auto grhsim_v" + std::to_string(shifted[index].index) + "_0 =";
+                if (countSubstring(sched, local) != 1u)
+                    return fail("use-order must compute shared local exactly once: " + mode);
+            }
+            for (unsigned node = 0; node < 2u; ++node)
+            {
+                const std::string nextLocal = "const auto grhsim_v" + std::to_string(shifted[node * 8u + 1u].index) + "_0 =";
+                const std::string firstOutput = "// op out_" + std::to_string(node * 8u) + "_op [kAssign]";
+                const auto outputPos = sched.find(firstOutput);
+                const auto nextPos = sched.find(nextLocal);
+                if (outputPos == std::string::npos || nextPos == std::string::npos ||
+                    (outputPos < nextPos) != (enabled && node == 0u))
+                    return fail("use-order did not preserve effects or delay pure locals: " + mode);
+            }
+            std::size_t previous = 0;
+            for (OperationId op : outputOps)
+            {
+                const std::string marker = "// op " + std::string(graph.getOperation(op).symbolText()) + " [kAssign]";
+                const auto pos = sched.find(marker);
+                // Separate helper files need not be listed in execution order.
+                if (mode != "split" && (pos == std::string::npos || pos < previous))
+                    return fail("use-order changed persistent output order: " + mode);
+                previous = pos;
+            }
+            const auto harness = outDir / "use_order_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <array>\n#include <cstdint>\nint main() {\n"
+                       "GrhSIM_top sim; for(unsigned reset=0;reset<2;++reset){sim.init();\n"
+                       "for(unsigned step=0;step<512;++step){sim.shift=(step*37)%256;\n"
+                       "sim.data={UINT64_C(0xfedcba9876543210)*(step+1),~std::uint64_t(step*13)};sim.eval();\n"
+                       "unsigned __int128 bits=(static_cast<unsigned __int128>(sim.data[1])<<64)|sim.data[0];\n";
+                for (unsigned i = 0; i < 16u; ++i)
+                {
+                    if (i == 8u)
+                        out << "bits=(static_cast<unsigned __int128>(sim.data[1])<<64)|sim.data[0];\n";
+                    out << "bits=sim.shift<128 ? bits>>sim.shift : 0;\n"
+                           "{std::array<std::uint64_t,2> expected{std::uint64_t(bits),std::uint64_t(bits>>64)};\n"
+                        << "if(sim.out_" << i << "!=expected || sim.copy_" << i << "!=expected)return 1;}\n";
+                }
+                out << "if(sim.downstream!=sim.out_0)return 2; sim.eval();"
+                       "if(sim.downstream!=sim.out_0)return 3;}}return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O2 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            const auto executable = outDir / "use_order_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                return fail("local compute use-order functional harness failed: " + mode);
+        }
+        for (const auto &[key, value] : std::vector<std::pair<std::string, std::string>>{
+                 {"local_compute_use_order_min_saved_bit_ops", "-1"},
+                 {"local_compute_use_order_min_reduction_percent", "101"},
+                 {"local_compute_use_order_min_reduction_percent", "invalid"}})
+        {
+            EmitOptions options;
+            options.outputDir = (baseDir / "invalid").string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes[key] = value;
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (emitter.emit(fixture.design, options).success || !diag.hasError())
+                return fail("local compute use-order accepted invalid budget: " + key);
+        }
+        return 0;
+    }
+
+    int runWideStateReadRefsFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(7u);
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId enable = makeLogicValue(graph, "enable", 1);
+        const ValueId data = makeLogicValue(graph, "data", 130);
+        const ValueId data128 = makeLogicValue(graph, "data128", 128);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("enable", enable);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("data128", data128);
+        for (const auto &[name, width] : std::vector<std::pair<std::string, int>>{{"r130", 130}, {"r128", 128}})
+        {
+            const OperationId reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol(name));
+            graph.setAttr(reg, "width", static_cast<int64_t>(width));
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::to_string(width) + "'h0");
+            const ValueId mask = addConstant(graph, "mask_op_" + name, "mask_" + name,
+                                              width, allOnesLiteral(width));
+            nodes[0].push_back(graph.valueDef(mask));
+            const OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                              graph.internSymbol("write_" + name));
+            graph.addOperand(write, enable);
+            graph.addOperand(write, width == 130 ? data : data128);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", name);
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            nodes[5].push_back(write);
+        }
+        const auto read = [&](const std::string &name, const std::string &state, int width, uint32_t node) {
+            const ValueId value = makeLogicValue(graph, name, width);
+            const OperationId op = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                           graph.internSymbol(name + "_read"));
+            graph.setAttr(op, "regSymbol", state);
+            graph.addResult(op, value);
+            nodes[node].push_back(op);
+            return value;
+        };
+        const auto output = [&](const std::string &name, ValueId source, int width, uint32_t node,
+                                bool effectful = false) {
+            const ValueId value = makeLogicValue(graph, name, width);
+            graph.bindOutputPort(name, value);
+            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_assign"));
+            graph.addOperand(op, source);
+            graph.addResult(op, value);
+            if (effectful) graph.setAttr(op, "hasSideEffects", true);
+            nodes[node].push_back(op);
+        };
+        const ValueId local = read("local", "r130", 130, 0u);
+        const ValueId local128 = read("local128", "r128", 128, 0u);
+        output("a", local, 130, 0u);
+        output("b", local, 130, 0u); // Multiple uses must observe the same immutable state.
+        output("c", local128, 128, 0u);
+        const ValueId effect = read("effect", "r130", 130, 1u);
+        output("effect_out", effect, 130, 1u, true);
+        const ValueId persistent = read("persistent", "r130", 130, 2u);
+        graph.bindOutputPort("persistent_out", persistent);
+        const ValueId crossing = read("crossing", "r130", 130, 3u);
+        output("crossing_out", crossing, 130, 4u);
+        const ValueId dpiRead = read("dpi_read", "r130", 130, 6u);
+        const OperationId dpiImport = graph.createOperation(OperationKind::kDpicImport,
+                                                              graph.internSymbol("wide_ref_probe"));
+        graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{});
+        graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{});
+        graph.setAttr(dpiImport, "argsName", std::vector<std::string>{});
+        graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{});
+        graph.setAttr(dpiImport, "argsType", std::vector<std::string>{});
+        graph.setAttr(dpiImport, "hasReturn", false);
+        const OperationId dpiCall = graph.createOperation(OperationKind::kDpicCall,
+                                                            graph.internSymbol("wide_ref_probe_call"));
+        graph.addOperand(dpiCall, enable);
+        graph.addOperand(dpiCall, clk);
+        graph.setAttr(dpiCall, "targetImportSymbol", std::string("wide_ref_probe"));
+        graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{});
+        graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+        graph.setAttr(dpiCall, "hasReturn", false);
+        graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+        nodes[6].push_back(dpiCall);
+        output("dpi_out", dpiRead, 130, 6u);
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        fanout[crossing.index - 1u] = {4u};
+        ActivityScheduleStateReadSupernodes reads;
+        reads["r130"] = {0u, 1u, 2u, 3u, 6u};
+        reads["r128"] = {0u};
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u, 3u, 4u, 5u, 6u});
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", std::move(reads));
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_wide_state_read_refs";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "split"})
+        {
+            const bool enabled = mode == "on" || mode == "split";
+            const auto outDir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default") options.attributes["wide_state_read_refs"] = enabled ? "1" : "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (!emitter.emit(fixture.design, options).success || diag.hasError())
+            {
+                for (const auto &message : diag.messages()) std::cerr << message.message << '\n';
+                return fail("wide-state read-reference emission failed: " + mode);
+            }
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (mode == "off" && files != defaultFiles)
+                return fail("wide-state read-reference changed disabled generation");
+            const auto sched = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            for (ValueId value : {local, local128, effect, persistent, crossing, dpiRead})
+            {
+                const std::string name = "grhsim_v" + std::to_string(value.index) + "_" + std::to_string(value.generation);
+                const bool reference = sched.find("const auto &" + name + " =") != std::string::npos;
+                if (reference != (enabled && (value == local || value == local128)))
+                    return fail("wide-state read-reference eligibility mismatch: " + mode + " " + name);
+            }
+            const auto harness = outDir / "wide_refs_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << R"CPP(#include "grhsim_top.hpp"
+#include <array>
+#include <cstdint>
+static unsigned dpi_calls = 0;
+extern "C" void wide_ref_probe() { ++dpi_calls; }
+int main() {
+    GrhSIM_top sim;
+    for (unsigned reset = 0; reset < 2; ++reset) {
+        sim.init();
+        std::array<std::uint64_t, 3> expected{};
+        std::array<std::uint64_t, 2> expected128{};
+        for (unsigned step = 0; step < 256; ++step) {
+            sim.clk = false;
+            sim.enable = step % 5 != 0;
+            sim.data = {UINT64_C(0xfedcba9876543210) * (step + 1), ~std::uint64_t(step * 37), step % 4};
+            sim.data128 = {~sim.data[0], sim.data[1] ^ UINT64_C(0xabcd1234)};
+            sim.eval();
+            if (sim.a != expected || sim.b != expected || sim.c != expected128 ||
+                sim.effect_out != expected || sim.persistent_out != expected || sim.crossing_out != expected ||
+                sim.dpi_out != expected) return 1;
+            sim.clk = true;
+            sim.eval();
+            if (sim.enable) { expected = sim.data; expected128 = sim.data128; }
+            if (sim.a != expected || sim.b != expected || sim.c != expected128 ||
+                sim.effect_out != expected || sim.persistent_out != expected || sim.crossing_out != expected ||
+                sim.dpi_out != expected) return 2;
+            sim.eval();
+            if (sim.a != expected || sim.crossing_out != expected) return 3;
+        }
+    }
+    return dpi_calls == 0 ? 4 : 0;
+}
+)CPP";
+            }
+            std::string command = "clang++ -std=c++20 -O2 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            const auto executable = outDir / "wide_refs_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                return fail("wide-state read-reference functional harness failed: " + mode);
+        }
+        return 0;
+    }
+
+    int runPackedArrayLateIndexFocusedTests()
+    {
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(4u);
+        const auto assign = [&](ValueId from, ValueId to, uint32_t node, const std::string &name) {
+            const OperationId op = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name));
+            graph.addOperand(op, from);
+            graph.addResult(op, to);
+            nodes[node].push_back(op);
+            return op;
+        };
+        const ValueId index = makeLogicValue(graph, "index", 5);
+        graph.bindInputPort("index", index);
+        const ValueId storedIndex = makeLogicValue(graph, "stored_index", 5);
+        assign(index, storedIndex, 0u, "store_index");
+        const ValueId localIndex = makeLogicValue(graph, "local_index", 5);
+        graph.bindOutputPort("local_index", localIndex);
+        assign(index, localIndex, 1u, "make_local_index");
+        std::vector<ValueId> lanes;
+        for (std::size_t i = 0; i < 10u; ++i)
+        {
+            const std::string name = "lane_" + std::to_string(i);
+            lanes.push_back(makeLogicValue(graph, name, 8));
+            graph.bindInputPort(name, lanes.back());
+        }
+        const ValueId packed = makeLogicValue(graph, "packed", 80);
+        const OperationId concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("pack"));
+        for (std::size_t i = lanes.size(); i-- > 0u;) graph.addOperand(concat, lanes[i]);
+        graph.addResult(concat, packed);
+        graph.setAttr(concat, "svPackedArray.version", int64_t{1});
+        graph.setAttr(concat, "svPackedArray.elementWidth", int64_t{8});
+        graph.setAttr(concat, "svPackedArray.elementCount", int64_t{10});
+        graph.setAttr(concat, "svPackedArray.indexLow", int64_t{0});
+        graph.setAttr(concat, "svPackedArray.indexHigh", int64_t{9});
+        graph.setAttr(concat, "svPackedArray.laneOrder", std::string("lsb_index_low"));
+        graph.setAttr(concat, "svPackedArray.concat.operand0Index", int64_t{9});
+        graph.setAttr(concat, "svPackedArray.concat.operandStride", int64_t{-1});
+        nodes[0].push_back(concat);
+        std::vector<ValueId> slices;
+        std::vector<ValueId> outputs;
+        for (std::size_t i = 0; i < 4u; ++i)
+        {
+            const ValueId slice = makeLogicValue(graph, "slice_" + std::to_string(i), 8);
+            const OperationId op = graph.createOperation(OperationKind::kSliceArray,
+                                                          graph.internSymbol("select_" + std::to_string(i)));
+            graph.addOperand(op, packed);
+            graph.addOperand(op, i == 0u ? index : (i == 2u ? localIndex : storedIndex));
+            graph.addResult(op, slice);
+            graph.setAttr(op, "sliceWidth", int64_t{8});
+            nodes[i == 3u ? 2u : 1u].push_back(op);
+            slices.push_back(slice);
+        }
+        // Delay the consumers so early snapshots would all be live together.
+        for (std::size_t i = 0; i < slices.size(); ++i)
+        {
+            const ValueId output = makeLogicValue(graph, "out_" + std::to_string(i), 8);
+            graph.bindOutputPort("out_" + std::to_string(i), output);
+            const OperationId op = assign(slices[i], output, i == 3u ? 2u : 1u,
+                                           "consume_" + std::to_string(i));
+            // An explicitly effectful region must retain the snapshot.
+            if (i == 3u) graph.setAttr(op, "hasSideEffects", true);
+            outputs.push_back(output);
+        }
+        const ValueId downstream = makeLogicValue(graph, "downstream", 8);
+        graph.bindOutputPort("downstream", downstream);
+        assign(outputs[1], downstream, 3u, "downstream_assign");
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        fanout[storedIndex.index - 1u] = {1u, 2u};
+        fanout[packed.index - 1u] = {1u, 2u};
+        fanout[outputs[1].index - 1u] = {3u};
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", ActivityScheduleTopoOrder{0u, 1u, 2u, 3u});
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_packed_array_late_index";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "split"})
+        {
+            const bool enabled = mode == "on" || mode == "split";
+            const auto outDir = baseDir / mode;
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default") options.attributes["packed_array_late_index"] = enabled ? "1" : "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diag;
+            EmitGrhSimCpp emitter(&diag);
+            if (!emitter.emit(fixture.design, options).success || diag.hasError())
+                return fail("packed-array late-index emission failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if (mode == "off" && files != defaultFiles)
+                return fail("packed-array late-index changed disabled generation");
+            const auto sched = readFiles(collectSchedFiles(outDir, "grhsim_top_sched_"));
+            for (std::size_t i = 0; i < slices.size(); ++i)
+            {
+                const bool snapshot = sched.find("const std::size_t packed_array_idx_" +
+                                                  std::to_string(slices[i].index) + " =") != std::string::npos;
+                if (snapshot != (!enabled || i >= 2u))
+                    return fail("packed-array late-index eligibility mismatch: " + mode);
+            }
+            const auto harness = outDir / "late_index_harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\nint main() {\n"
+                       "GrhSIM_top sim; for (unsigned reset=0; reset<2; ++reset) { sim.init();\n"
+                       "for (unsigned step=0; step<512; ++step) { unsigned idx=(step*13)%32; sim.index=idx;\n";
+                for (std::size_t i = 0; i < lanes.size(); ++i)
+                    out << "sim.lane_" << i << "=static_cast<std::uint8_t>(step*37+" << i * 11u << ");\n";
+                out << "sim.eval(); const auto expected=idx<10 ? static_cast<std::uint8_t>(step*37+idx*11) : 0;\n";
+                for (std::size_t i = 0; i < outputs.size(); ++i)
+                    out << "if (sim.out_" << i << "!=expected) return " << i + 1u << ";\n";
+                out << "if(sim.downstream!=expected || sim.local_index!=idx) return 5;\n"
+                       "sim.eval(); if(sim.downstream!=expected) return 6;\n}} return 0;}\n";
+            }
+            std::string command = "clang++ -std=c++20 -O2 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            const auto executable = outDir / "late_index_harness";
+            command += " " + harness.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 || std::system(executable.c_str()) != 0)
+                return fail("packed-array late-index functional harness failed: " + mode);
+        }
+        return 0;
+    }
+
+    int runBatchTriggerBitmapFocusedTests()
+    {
+        // Eight independent pairs in one source supernode, each reaching four
+        // separated words, force the deferred aggregate lowering. Changing one
+        // pair at a time catches missing marks that first-eval activation hides.
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(64u);
+        std::vector<ValueId> sources;
+        for (std::size_t i = 0; i < 16u; ++i)
+        {
+            const std::string suffix = std::to_string(i);
+            const ValueId input = makeLogicValue(graph, "in_" + suffix, 8);
+            const ValueId value = makeLogicValue(graph, "source_" + suffix, 8);
+            graph.bindInputPort("in_" + suffix, input);
+            const OperationId op = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("source_op_" + suffix));
+            graph.addOperand(op, input);
+            graph.addResult(op, value);
+            nodes[0].push_back(op);
+            sources.push_back(value);
+        }
+        const ValueId padding = makeLogicValue(graph, "padding", 8);
+        graph.bindInputPort("padding", padding);
+        std::vector<std::vector<uint32_t>> targets(16u);
+        for (uint32_t node = 1u; node < 64u; ++node)
+        {
+            const std::string suffix = std::to_string(node);
+            const bool consumer = ((node / 8u) % 2u) != 0u;
+            const ValueId output = makeLogicValue(graph, "out_" + suffix, 8);
+            graph.bindOutputPort("out_" + suffix, output);
+            const OperationId op = graph.createOperation(
+                consumer ? OperationKind::kXor : OperationKind::kAssign,
+                graph.internSymbol("sink_" + suffix));
+            if (consumer)
+            {
+                const std::size_t pair = node % 8u;
+                for (std::size_t i : {2u * pair, 2u * pair + 1u})
+                {
+                    graph.addOperand(op, sources[i]);
+                    targets[i].push_back(node);
+                }
+            }
+            else
+            {
+                graph.addOperand(op, padding);
+            }
+            graph.addResult(op, output);
+            nodes[node].push_back(op);
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        for (std::size_t i = 0; i < sources.size(); ++i)
+        {
+            fanout[sources[i].index - 1u] = targets[i];
+        }
+        ActivityScheduleTopoOrder order(64u);
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes",
+                                      ActivityScheduleStateReadSupernodes{});
+
+        const std::filesystem::path baseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_batch_trigger_bitmap";
+        std::size_t bitmapMarkCount = 0;
+        for (const std::string mode : {"off", "bitmap", "validate", "split", "union",
+                                      "union_validate", "union_split", "accumulate",
+                                      "accumulate_validate", "accumulate_split"})
+        {
+            const bool unionMode = mode.starts_with("union");
+            const bool accumulateMode = mode.starts_with("accumulate");
+            const bool validate = mode == "validate" || mode.ends_with("_validate");
+            const auto outDir = baseDir / mode;
+            std::filesystem::create_directories(outDir);
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["sched_batch_max_ops"] = "8";
+            options.attributes["sched_batch_max_estimated_lines"] = "96";
+            options.attributes["sched_batches_per_cpp"] = "4";
+            options.attributes["emit_parallelism"] = "2";
+            options.attributes["batch_trigger_bitmap"] =
+                mode == "off" || unionMode || accumulateMode ? "0" : "1";
+            options.attributes["batch_trigger_bitmap_validate"] = validate ? "1" : "0";
+            options.attributes["batch_trigger_supernode_union"] = unionMode ? "1" : "0";
+            options.attributes["batch_trigger_supernode_accumulate"] = accumulateMode ? "1" : "0";
+            options.attributes["batch_trigger_profile"] = "0";
+            options.attributes["emit_runtime_profile"] = "0";
+            if (mode == "split" || mode.ends_with("_split"))
+            {
+                options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(fixture.design, options);
+            if (!result.success || diagnostics.hasError())
+            {
+                return fail("batch-trigger fixture emission failed: " + mode);
+            }
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            std::string scheduler;
+            for (const auto &[name, content] : files)
+            {
+                if (name.starts_with("grhsim_top_sched_")) scheduler += content;
+            }
+            if (scheduler.find("grhsim_deferred_active_word_") == std::string::npos)
+            {
+                return fail("batch-trigger fixture did not exercise deferred aggregate");
+            }
+            if (mode == "off" && files.at("grhsim_top.hpp").find("batch_trigger_bitmap_") != std::string::npos)
+            {
+                return fail("disabled batch bitmap changed the model layout");
+            }
+            const std::size_t markCount = countSubstring(scheduler, "batch_trigger_bitmap_[");
+            if (mode == "bitmap") bitmapMarkCount = markCount;
+            if ((unionMode || accumulateMode) && (markCount == 0 || markCount >= bitmapMarkCount))
+            {
+                return fail("supernode boundary did not merge repeated batch marks");
+            }
+            const auto harnessPath = outDir / "bitmap_harness.cpp";
+            {
+                std::ofstream harness(harnessPath);
+                harness << "#include \"grhsim_top.hpp\"\n#include <cstdint>\nint main() {\n"
+                        << "GrhSIM_top sim; sim.set_runtime_profile_enabled(true);\n"
+                        << "for (unsigned reset = 0; reset < 2; ++reset) {\n"
+                        << "sim.init();\nfor (unsigned step = 0; step < 256; ++step) {\n"
+                        << "sim.padding = static_cast<std::uint8_t>(step);\n";
+                for (std::size_t i = 0; i < 16u; ++i)
+                {
+                    harness << "if (step % 16u == " << i << "u) sim.in_" << i
+                            << " = static_cast<std::uint8_t>(step * 37u + " << i << "u);\n";
+                }
+                harness << "sim.eval();\n";
+                for (uint32_t node = 1u; node < 64u; ++node)
+                {
+                    harness << "if (sim.out_" << node << " != ";
+                    if (((node / 8u) % 2u) != 0u)
+                    {
+                        const std::size_t pair = node % 8u;
+                        harness << "static_cast<std::uint8_t>(sim.in_" << 2u * pair
+                                << " ^ sim.in_" << 2u * pair + 1u << ")";
+                    }
+                    else harness << "sim.padding";
+                    harness << ") return 1;\n";
+                }
+                harness << "sim.eval();\n}\nsim.dump_runtime_profile();\n}\nreturn 0; }\n";
+            }
+            const auto executable = outDir / "bitmap_harness";
+            const auto output = outDir / "bitmap_harness.out";
+            std::string command = "clang++ -std=c++20 -O2 -I" + outDir.string();
+            for (const auto &[name, content] : files)
+            {
+                if (name.ends_with(".cpp")) command += " " + (outDir / name).string();
+            }
+            command += " " + harnessPath.string() + " -o " + executable.string();
+            if (std::system(command.c_str()) != 0 ||
+                std::system((executable.string() + " > " + output.string()).c_str()) != 0)
+            {
+                return fail("batch-trigger changing-input/reset harness failed: " + mode);
+            }
+            if (validate &&
+                countSubstring(readFile(output), "fallback_total=0") != 2u)
+            {
+                return fail("batch-trigger validation detected a missing activation mark");
+            }
+        }
+        return 0;
+    }
+
     int runActiveMaskGapPackFocusedTests()
     {
         ActiveMaskGapPackFixture fixture = buildActiveMaskGapPackFixture();
@@ -7185,6 +10558,1014 @@ namespace
         return 0;
     }
 
+    int runScalarLeafMuxFocusedTests()
+    {
+        constexpr const char *environmentKey = "WOLVRIX_GRHSIM_SCALAR_LEAF_MUX_UNPREDICTABLE";
+        const char *environmentValue = std::getenv(environmentKey);
+        const std::optional<std::string> savedEnvironment = environmentValue
+            ? std::optional<std::string>(environmentValue) : std::nullopt;
+        ::unsetenv(environmentKey);
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+        const auto input = [&](const std::string &name, int32_t width, bool isSigned = false) {
+            const ValueId value = makeLogicValue(graph, name, width, isSigned);
+            graph.bindInputPort(name, value);
+            return value;
+        };
+        const auto operation = [&](OperationKind kind, const std::string &name, int32_t width,
+                                   const std::vector<ValueId> &operands, bool isSigned = false) {
+            const ValueId value = makeLogicValue(graph, name + "_value", width, isSigned);
+            const OperationId op = graph.createOperation(kind, graph.internSymbol(name));
+            for (ValueId operand : operands) graph.addOperand(op, operand);
+            graph.addResult(op, value);
+            return value;
+        };
+        const ValueId cond = input("cond", 1);
+        const ValueId cond2 = input("cond2", 1);
+        const ValueId wideCond = input("wide_cond", 8);
+        const ValueId byte = input("byte", 8);
+        const ValueId signedByte = input("signed_byte", 8, true);
+        const ValueId wide = input("wide", 130);
+        const ValueId zero8 = addConstant(graph, "zero8_op", "zero8", 8, "8'h0");
+        const ValueId one8 = addConstant(graph, "one8_op", "one8", 8, "8'h1");
+        const ValueId unknown8 = addConstant(graph, "unknown8_op", "unknown8", 8, "8'hxx");
+        const ValueId zero130 = addConstant(graph, "zero130_op", "zero130", 130, "130'h0");
+        struct Case { std::string name; bool eligible; std::string expected; };
+        std::vector<Case> cases;
+        const auto test = [&](const std::string &name, int32_t width, ValueId condition,
+                              ValueId onTrue, ValueId onFalse, bool eligible,
+                              const std::string &expected, OperationKind consumer = OperationKind::kOr) {
+            const ValueId value = operation(OperationKind::kMux, name + "_mux", width,
+                                             {condition, onTrue, onFalse});
+            graph.bindOutputPort(name, value);
+            // Keep the mux's output materialized so the assertion can inspect
+            // exactly this operation, independently of expression formatting.
+            if (consumer != OperationKind::kAssign)
+            {
+                const ValueId other = width > 64 ? wide : width == 1 ? cond2 : byte;
+                const ValueId combined = operation(consumer, name + "_combine", width, {value, other});
+                graph.bindOutputPort(name + "_or", combined);
+            }
+            cases.push_back({name, eligible, expected});
+        };
+        for (const int32_t width : {1, 7, 8, 16, 32, 63, 64})
+        {
+            const std::string suffix = std::to_string(width);
+            const ValueId data = input("data" + suffix, width);
+            const ValueId zero = addConstant(graph, "zero" + suffix + "_test", "zero" + suffix + "_v",
+                                             width, suffix + "'h0");
+            test("true" + suffix, width, cond, data, zero, true,
+                 "sim.cond ? sim.data" + suffix + " : 0");
+            test("false" + suffix, width, cond, zero, data, true,
+                 "sim.cond ? 0 : sim.data" + suffix);
+        }
+        const ValueId aliasCond = operation(OperationKind::kAssign, "alias_cond", 1, {cond});
+        const ValueId aliasByte = operation(OperationKind::kAssign, "alias_byte", 8, {byte});
+        graph.bindOutputPort("alias_cond", aliasCond);
+        graph.bindOutputPort("alias_byte", aliasByte);
+        test("alias", 8, aliasCond, aliasByte, zero8, true, "sim.cond ? sim.byte : 0");
+        test("alias_reverse", 8, aliasCond, zero8, aliasByte, true, "sim.cond ? 0 : sim.byte");
+        const ValueId temporary = operation(OperationKind::kAdd, "temporary", 8, {byte, one8});
+        test("temp", 8, cond, temporary, zero8, true, "sim.cond ? ((sim.byte + 1u) & 255u) : 0");
+        test("temp_reverse", 8, cond, zero8, temporary, true, "sim.cond ? 0 : ((sim.byte + 1u) & 255u)");
+        test("signed_extend", 16, cond, signedByte, zero8, true,
+             "sim.cond ? (static_cast<std::uint64_t>(static_cast<std::int8_t>(sim.signed_byte)) & 65535u) : 0");
+        test("truncate", 7, cond, byte, zero8, true, "sim.cond ? (sim.byte & 127u) : 0");
+        test("nonzero", 8, cond, byte, one8, false, "sim.cond ? sim.byte : 1");
+        test("nonbool", 8, wideCond, byte, zero8, false, "sim.wide_cond ? sim.byte : 0");
+        const ValueId inlineCond = operation(OperationKind::kLogicAnd, "inline_cond", 1, {cond, cond2});
+        test("computed_cond", 8, inlineCond, byte, zero8, false, "(sim.cond && sim.cond2) ? sim.byte : 0");
+        const ValueId inlineData = operation(OperationKind::kAdd, "inline_data", 8, {byte, one8});
+        test("computed_data", 8, cond, inlineData, zero8, false, "sim.cond ? ((sim.byte + 1u) & 255u) : 0");
+        test("standalone", 8, cond, byte, zero8, false, "sim.cond ? sim.byte : 0", OperationKind::kAssign);
+        test("logical_or", 8, cond, byte, zero8, false, "sim.cond ? sim.byte : 0", OperationKind::kLogicOr);
+        test("unknown", 8, cond, byte, unknown8, false, "sim.cond ? sim.byte : 0");
+        test("wide_result", 130, cond, wide, zero130, false, "");
+        const auto stateRead = [&](const std::string &name, int32_t width, const std::string &init,
+                                   bool latch = false) {
+            const OperationId state = graph.createOperation(latch ? OperationKind::kLatch : OperationKind::kRegister,
+                                                             graph.internSymbol(name));
+            graph.setAttr(state, "width", int64_t{width});
+            graph.setAttr(state, "isSigned", false);
+            graph.setAttr(state, "initValue", init);
+            const ValueId value = operation(latch ? OperationKind::kLatchReadPort : OperationKind::kRegisterReadPort,
+                                             name + "_read", width, {});
+            graph.setAttr(graph.valueDef(value), latch ? "latchSymbol" : "regSymbol", name);
+            return value;
+        };
+        test("state_leaf", 8, cond, stateRead("reg_a", 8, "8'ha5"), zero8, true,
+             "sim.cond ? 165 : 0");
+        ValueId stateAlias = stateRead("reg_b", 8, "8'h3c");
+        for (unsigned index = 0; index < 8; ++index)
+            stateAlias = operation(OperationKind::kAssign, "state_alias_" + std::to_string(index), 8, {stateAlias});
+        test("state_alias_leaf", 8, cond, zero8, stateAlias, true, "sim.cond ? 0 : 60");
+        test("latch_leaf", 8, cond, stateRead("latch_a", 8, "8'h5a", true), zero8, true,
+             "sim.cond ? 90 : 0");
+        test("state_condition", 8, stateRead("reg_condition", 1, "1'b1"), byte, zero8, true, "sim.byte");
+        const ValueId costly = operation(OperationKind::kAdd, "aliased_add", 8, {byte, one8});
+        const ValueId costlyAlias = operation(OperationKind::kAssign, "aliased_add_copy", 8, {costly});
+        test("aliased_computation", 8, cond, costlyAlias, zero8, false,
+             "sim.cond ? ((sim.byte + 1u) & 255u) : 0");
+        // Exercise heap-backed use lists (> InlineValueUsers' small capacity).
+        // The Value owning the returned users() span must outlive iteration.
+        for (unsigned index = 0; index < 12; ++index)
+        {
+            const std::string name = "fanout_" + std::to_string(index);
+            const ValueId value = operation(OperationKind::kOr, name, 8,
+                                             {graph.outputPortValue("true8"), byte});
+            graph.bindOutputPort(name, value);
+        }
+        SessionStore session;
+        if (!runActivitySchedule(design, session)) return fail("leaf mux scheduling failed");
+        const auto baseDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_leaf_mux";
+        std::map<std::string, std::string> defaultFiles;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "split"})
+        {
+            const bool enabled = mode == "on" || mode == "environment" || mode == "split";
+            const auto outDir = baseDir / mode;
+            std::filesystem::create_directories(outDir);
+            EmitOptions options;
+            options.outputDir = outDir.string();
+            options.session = &session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default" && mode != "environment")
+                options.attributes["scalar_leaf_mux_unpredictable"] = enabled ? "1" : "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "environment" || mode == "precedence") ::setenv(environmentKey, "1", 1);
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(design, options);
+            ::unsetenv(environmentKey);
+            if (!result.success || diagnostics.hasError()) return fail("leaf mux emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
+            if (mode == "default") defaultFiles = files;
+            if ((mode == "off" || mode == "precedence") && files != defaultFiles)
+                return fail("disabled leaf mux changed generated output");
+            const auto schedFiles = collectSchedFiles(outDir, "grhsim_top_sched_");
+            const auto sched = readFiles(schedFiles);
+            for (const auto &item : cases)
+            {
+                const std::string marker = "// op " + item.name + "_mux [kMux]";
+                const auto begin = sched.find(marker);
+                if (begin == std::string::npos) return fail("missing leaf mux: " + item.name);
+                const auto end = sched.find("// op ", begin + marker.size());
+                const auto snippet = std::string_view(sched).substr(begin, end == std::string::npos ? end : end - begin);
+                if ((snippet.find("grhsim_sel_u64(") != std::string_view::npos) != (enabled && item.eligible))
+                    return fail("leaf mux coverage mismatch: " + mode + "/" + item.name);
+            }
+            if (mode != "on" && mode != "default" && mode != "split") continue;
+            const auto harnessPath = outDir / "harness.cpp";
+            {
+                std::ofstream harness(harnessPath);
+                harness << "#include \"grhsim_top.hpp\"\n#include \"grhsim_top_runtime.hpp\"\n"
+                        << "#include <cstdint>\n#include <initializer_list>\nint main() {\n"
+                        << "GrhSIM_top sim; sim.init(); std::uint64_t seed = 0x9173a527b640ed21ULL;\n"
+                        << "for (unsigned i = 0; i < 4096; ++i) {\n"
+                        << "seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;\n"
+                        << "sim.cond = i & 1u; sim.cond2 = i & 2u; sim.byte = seed & 255u;\n"
+                        << "sim.wide_cond = (i % 3) ? 128 : 0; sim.signed_byte = seed & 255u;\n";
+                for (const int32_t width : {1, 7, 8, 16, 32, 63, 64})
+                {
+                    const auto mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1u;
+                    harness << "sim.data" << width << " = seed & UINT64_C(" << mask << ");\n";
+                }
+                harness << "sim.eval();\n";
+                for (const auto &item : cases)
+                {
+                    if (!item.expected.empty())
+                        harness << "if (sim." << item.name << " != (" << item.expected << ")) return 1;\n";
+                }
+                harness << "}\n";
+                if (enabled)
+                {
+                    harness << "for (std::uint64_t c : {UINT64_C(0), UINT64_C(1), UINT64_C(2), UINT64_MAX})\n"
+                            << "if (grhsim_sel_u64(c, seed, ~seed) != (c ? seed : ~seed)) return 2;\n";
+                }
+                harness << "return 0; }\n";
+            }
+            std::string sources;
+            for (const auto &file : collectSchedFiles(outDir, "grhsim_top_state")) sources += " " + file.string();
+            sources += " " + (outDir / "grhsim_top_eval.cpp").string();
+            for (const auto &file : schedFiles) sources += " " + file.string();
+            sources += " " + harnessPath.string();
+            for (const std::string compiler : {"clang++", "g++"})
+            {
+                // GCC also exercises the feature-detected fallback on compilers
+                // without __builtin_unpredictable; both run the same semantics.
+                const auto binary = outDir / (compiler == "clang++" ? "harness_clang" : "harness_gcc");
+                const auto command = compiler + " -std=c++20 -O2 -fsanitize=undefined -fno-sanitize-recover=all -I" +
+                                     outDir.string() + sources + " -o " + binary.string();
+                if (std::system(command.c_str()) != 0 || std::system(binary.c_str()) != 0)
+                    return fail("leaf mux harness failed: " + mode + "/" + compiler);
+            }
+        }
+        if (savedEnvironment) ::setenv(environmentKey, savedEnvironment->c_str(), 1);
+        return 0;
+    }
+
+    int runDirectBoolStateViewFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_DIRECT_BOOL_STATE_VIEWS";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_direct_bool_state_view";
+        std::string expectedOutput;
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(24u);
+        ActivityScheduleStateReadSupernodes reads;
+        auto input = [&](const std::string &name) {
+            auto v = makeLogicValue(graph, name, 1); graph.bindInputPort(name, v); return v;
+        };
+        const auto clk = input("clk"), data = input("data"), data2 = input("data2"),
+                   enable = input("enable"), second = input("second"), x = input("x");
+        const auto one = addConstant(graph, "one_op", "one", 1, "1'b1");
+        nodes[0].push_back(graph.valueDef(one));
+        const auto gate = makeLogicValue(graph, "gate", 1);
+        const auto gateOp = graph.createOperation(OperationKind::kXor, graph.internSymbol("gate_op"));
+        graph.addOperand(gateOp, x); graph.addOperand(gateOp, enable); graph.addResult(gateOp, gate);
+        nodes[0].push_back(gateOp);
+        const std::vector<std::string> names{"plain", "logic_not", "assign_path", "output",
+            "commit", "event", "multi", "snapshot", "effect", "no_readers", "partial_readers"};
+        auto reg = [&](const std::string &name, bool initial) {
+            auto id = graph.createOperation(OperationKind::kRegister, graph.internSymbol(name));
+            graph.setAttr(id, "width", int64_t{1}); graph.setAttr(id, "isSigned", false);
+            graph.setAttr(id, "initValue", std::string(initial ? "1'b1" : "1'b0"));
+        };
+        auto read = [&](const std::string &name, uint32_t node) {
+            const auto readName = name + "_read_" + std::to_string(node);
+            auto value = makeLogicValue(graph, readName, 1);
+            auto id = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol(readName + "_op"));
+            graph.setAttr(id, "regSymbol", name); graph.addResult(id, value);
+            nodes[node].push_back(id); reads[name].push_back(node); return value;
+        };
+        auto write = [&](const std::string &name, ValueId next, ValueId cond, ValueId clock, std::string suffix) {
+            auto id = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol(name + suffix));
+            graph.setAttr(id, "regSymbol", name);
+            graph.setAttr(id, "eventEdge", std::vector<std::string>{"posedge"});
+            for (auto v : {cond, next, one, clock}) graph.addOperand(id, v);
+            nodes[23].push_back(id);
+        };
+        std::ostringstream checks;
+        for (std::size_t i = 0; i < names.size(); ++i)
+        {
+            const auto &name = names[i]; const auto node = static_cast<uint32_t>(i + 1u);
+            reg(name + "_q", i % 2u);
+            ValueId raw = read(name + "_q", name == "snapshot" ? 0u : node);
+            if (name == "assign_path")
+            {
+                auto value = makeLogicValue(graph, "aliased_read", 1);
+                auto op = graph.createOperation(OperationKind::kAssign, graph.internSymbol("alias_op"));
+                graph.addOperand(op, raw); graph.addResult(op, value); nodes[node].push_back(op); raw = value;
+            }
+            const auto view = makeLogicValue(graph, name + "_view", 1);
+            const auto inv = graph.createOperation(name == "logic_not" ? OperationKind::kLogicNot : OperationKind::kNot,
+                                                   graph.internSymbol(name + "_invert"));
+            graph.addOperand(inv, raw); graph.addResult(inv, view); nodes[node].push_back(inv);
+            if (name == "effect") graph.setAttr(inv, "hasSideEffects", true);
+            if (name == "output") graph.bindOutputPort("protected_view", view);
+            write(name + "_q", data, enable, clk, "_write");
+            if (name == "multi") write(name + "_q", data2, second, clk, "_write2");
+            if (name == "commit" || name == "event")
+            {
+                reg(name + "_saved", false);
+                write(name + "_saved", name == "commit" ? view : data, enable,
+                      name == "event" ? view : clk, "_write");
+                const auto saved = read(name + "_saved", 20u);
+                graph.bindOutputPort(name + "_saved_out", saved);
+            }
+            for (const auto target : {node, 14u, 15u})
+            {
+                const auto port = name + "_out" + std::to_string(target);
+                const auto value = makeLogicValue(graph, port, 1);
+                const auto kind = target == 14u ? OperationKind::kLogicAnd :
+                                  target == 15u ? OperationKind::kLogicOr : OperationKind::kAnd;
+                const auto op = graph.createOperation(kind, graph.internSymbol(port + "_logic"));
+                graph.addOperand(op, view); graph.addOperand(op, gate); graph.addResult(op, value);
+                nodes[target].push_back(op); graph.bindOutputPort(port, value);
+                checks << "if (sim." << port << " != (!q[" << i << "] "
+                       << (target == 15u ? "||" : "&&") << " (sim.x!=sim.enable))) return " << i + 10u << ";\n";
+            }
+            // Independent live readers justify the pre-existing activation heads.
+            // The partial case intentionally omits the concat consumer's head.
+            for (const auto target : {14u, 15u, 16u})
+            {
+                if (name == "no_readers" || (name == "partial_readers" && target == 16u)) continue;
+                const auto extra = read(name + "_q", target);
+                const auto port = name + "_existing" + std::to_string(target);
+                graph.bindOutputPort(port, extra);
+                checks << "if(sim." << port << "!=q[" << i << "])return 60;\n";
+            }
+            const auto packed = makeLogicValue(graph, name + "_packed", 128);
+            const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol(name + "_concat"));
+            for (unsigned bit = 0; bit < 128u; ++bit) graph.addOperand(concat, view);
+            graph.addResult(concat, packed); nodes[16].push_back(concat); graph.bindOutputPort(name + "_packed", packed);
+            checks << "for(unsigned word=0;word<2;++word)if(sim." << name
+                   << "_packed[word]!=(q[" << i << "]?UINT64_C(0):~UINT64_C(0)))return 50;\n";
+        }
+        for (std::size_t node = 0; node < nodes.size(); ++node)
+            if (nodes[node].empty())
+            {
+                const auto name = "pad" + std::to_string(node);
+                auto v = addConstant(graph, name + "_op", name, 1, "1'b0"); nodes[node].push_back(graph.valueDef(v));
+            }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        std::map<uint32_t, uint32_t> nodeByOp;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node]) nodeByOp[id.index] = node;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node])
+            {
+                const Operation op = graph.getOperation(id);
+                for (auto value : op.operands())
+                if (!graph.valueDef(value).valid() || nodeByOp.at(graph.valueDef(value).index) != node)
+                {
+                    auto &targets = fanout[value.index - 1u];
+                    if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                }
+            }
+        ActivityScheduleTopoOrder order(nodes.size()); std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", std::move(reads));
+        std::map<std::string, std::string> defaults;
+        const auto commitBodies = [](const std::string &code) {
+            std::map<std::string, std::string> result;
+            const std::string prefix = "void GrhSIM_top::eval_commit_batch_";
+            std::size_t pos = 0;
+            while ((pos = code.find(prefix, pos)) != std::string::npos)
+            {
+                const auto start = pos;
+                const auto brace = code.find('{', pos);
+                if (brace == std::string::npos) return std::map<std::string, std::string>{};
+                int depth = 1; pos = brace + 1u;
+                while (pos < code.size() && depth)
+                {
+                    if (code[pos] == '{') ++depth;
+                    if (code[pos] == '}') --depth;
+                    ++pos;
+                }
+                result.emplace(code.substr(start, brace - start), code.substr(start, pos - start));
+            }
+            return result;
+        };
+        std::map<std::string, std::string> defaultCommits;
+        for (const std::string mode : {"default", "off", "on", "env", "precedence", "packed", "profile", "fullpass"})
+        {
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            const auto dir = base / mode;
+            std::filesystem::remove_all(dir);
+            std::filesystem::create_directories(dir);
+            EmitOptions options; options.outputDir = dir.string(); options.session = &fixture.session;
+            options.sessionPathPrefix = "top";
+            options.attributes["direct_single_writer_state_reads"] = "0";
+            options.attributes["bool_eager_logic"] = "1";
+            if (mode != "default" && mode != "env") options.attributes["direct_bool_state_views"] = enabled ? "1" : "0";
+            if (mode == "env" || mode == "precedence") ::setenv("WOLVRIX_GRHSIM_DIRECT_BOOL_STATE_VIEWS", "1", 1);
+            if (mode == "packed")
+            {
+                options.attributes["packed_deferred_activation"] = "1";
+                options.attributes["wordwise_wide_concat"] = "1";
+                options.attributes["wordwise_wide_concat_bool_pack"] = "1";
+                options.attributes["bool_zero_group_guard"] = "1";
+            }
+            if (mode == "profile")
+            {
+                options.attributes["emit_runtime_profile"] = "1";
+                options.attributes["batch_trigger_bitmap_validate"] = "1";
+            }
+            if (mode == "fullpass")
+            {
+                options.attributes["input_fullpass_specialization"] = "1";
+                options.attributes["posedge_fullpass_specialization"] = "1";
+            }
+            EmitDiagnostics diag; EmitGrhSimCpp emitter(&diag); const auto result = emitter.emit(fixture.design, options);
+            ::unsetenv("WOLVRIX_GRHSIM_DIRECT_BOOL_STATE_VIEWS");
+            if (!result.success || diag.hasError()) return fail("view emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaults = files;
+            if ((mode == "off" || mode == "precedence") && files != defaults) return fail("disabled output changed");
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            const auto commits = commitBodies(code);
+            if (commits.empty()) return fail("fixture must exercise commit code");
+            if (mode == "default") defaultCommits = commits;
+            if ((mode == "off" || mode == "on" || mode == "env" || mode == "precedence") && commits != defaultCommits)
+                return fail("existing-reader optimization must preserve commit code");
+            for (std::size_t i = 0; i < names.size(); ++i)
+            {
+                const auto marker = "// op " + names[i] + "_invert [";
+                const auto pos = code.find(marker); if (pos == std::string::npos) return fail("missing fixture op");
+                const auto end = code.find("// op ", pos + marker.size());
+                const auto snippet = code.substr(pos, end == std::string::npos ? end : end - pos);
+                if ((snippet.find("direct bool state view:") != std::string::npos) != (enabled && i < 3u))
+                    return fail("view coverage mismatch: " + mode + "/" + names[i]);
+                for (unsigned target : {14u, 15u})
+                {
+                    const auto logic = code.find("// op " + names[i] + "_out" + std::to_string(target) + "_logic [");
+                    if (logic == std::string::npos) return fail("missing logical view consumer");
+                    const auto next = code.find("// op ", logic + 6u);
+                    const auto text = code.substr(logic, next - logic);
+                    if (text.find(target == 14u ? " & " : " | ") == std::string::npos ||
+                        text.find(target == 14u ? " && " : " || ") != std::string::npos)
+                        return fail("eager bool lowering lost: " + mode + "/" + names[i]);
+                }
+                if (mode == "packed")
+                {
+                    const auto begin = code.find("// op " + names[i] + "_concat [");
+                    const auto end = code.find("// op ", begin + 6u);
+                    if (begin == std::string::npos || code.substr(begin, end - begin).find("grhsim_compact_bool_pack<") != std::string::npos)
+                        return fail("inverted state must not become a raw state pack");
+                }
+            }
+            std::ofstream harness(dir / "harness.cpp");
+            harness << "#include \"grhsim_top.hpp\"\n#include <cstdint>\n#include <iostream>\nint main(){\n"
+                << "std::uint64_t rng=381, hash=0; auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n"
+                << "GrhSIM_top sim;for(unsigned repeat=0;repeat<4;++repeat){sim.init();"
+                << (mode == "profile" ? "sim.set_runtime_profile_enabled(true);" : "")
+                << "bool prev=false,saved=false;"
+                << "bool q[]={false,true,false,true,false,true,false,true,false,true,false};\n"
+                << "for(unsigned step=0;step<16000;++step){auto r=random();sim.clk=step%5!=0;sim.enable=(r>>1)&1;"
+                << "sim.data=(r>>2)&1;sim.data2=(r>>3)&1;sim.second=(r>>4)&1;sim.x=(r>>5)&1;"
+                << "if(!prev&&sim.clk){if(sim.enable){saved=!q[4];for(auto &v:q)v=sim.data;}if(sim.second)q[6]=sim.data2;}"
+                << "prev=sim.clk;sim.eval();\n" << checks.str()
+                << "if(sim.protected_view!=!q[3]||sim.commit_saved_out!=saved)return 40;"
+                << "hash=(hash<<5)^(hash>>31)^sim.event_saved_out^sim.plain_out14;} }std::cout<<hash<<'\\n';}\n";
+            harness.close();
+            std::string sources;
+            for (const auto &[name, content] : files)
+                if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            sources += " " + (dir / "harness.cpp").string();
+            for (const std::string optimization : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (optimization == "-O0" ? "harness_o0" : "harness_o3");
+                const auto log = exe.string() + ".log";
+                const std::string sanitizer = mode == "on" || mode == "packed"
+                    ? " -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" : "";
+                const auto command = "clang++ -std=c++20 " + optimization + sanitizer +
+                    " -I" + dir.string() + sources + " -o " + exe.string();
+                const auto execute = exe.string() + " > " + log;
+                if (std::system(command.c_str()) || std::system(execute.c_str()))
+                    return fail("direct bool state view harness failed: " + mode + "/" + optimization);
+                const auto output = readFile(log);
+                if (output.empty()) return fail("direct bool state view harness produced no signature");
+                if (expectedOutput.empty()) expectedOutput = output;
+                if (output != expectedOutput) return fail("direct bool state view signature mismatch: " + mode);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runBoolProducerReduceFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_BOOL_PRODUCER_REDUCE";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(11u);
+        const auto unary = [&](OperationKind kind, const std::string &name, ValueId operand, uint32_t node) {
+            const auto value = makeLogicValue(graph, name, 1);
+            const auto op = graph.createOperation(kind, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, operand); graph.addResult(op, value); nodes[node].push_back(op);
+            return value;
+        };
+        const auto binary = [&](OperationKind kind, const std::string &name, ValueId left, ValueId right, uint32_t node) {
+            const auto value = makeLogicValue(graph, name, 1);
+            const auto op = graph.createOperation(kind, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, left); graph.addOperand(op, right); graph.addResult(op, value);
+            nodes[node].push_back(op); return value;
+        };
+        const auto expose = [&](const std::string &name, ValueId value, uint32_t node) {
+            const auto out = unary(OperationKind::kNot, name, value, node);
+            graph.bindOutputPort(name, out);
+        };
+        // An event-valued residual is read at the original OR position. It
+        // must not exclude a valid cone, nor be written/classified by the loop.
+        const auto eventInput = makeLogicValue(graph, "event_in", 1);
+        graph.bindInputPort("event_in", eventInput);
+        const auto eventValue = unary(OperationKind::kNot, "event_value", eventInput, 0u);
+        const auto one = addConstant(graph, "event_one_op", "event_one", 1, "1'b1");
+        nodes[0].push_back(graph.valueDef(one));
+        const auto reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("event_reg"));
+        graph.setAttr(reg, "width", int64_t{1}); graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("1'b0"));
+        const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("event_write"));
+        graph.setAttr(write, "regSymbol", std::string("event_reg"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        for (auto value : {one, one, one, eventValue}) graph.addOperand(write, value);
+        nodes[10].push_back(write);
+        const std::vector<std::string> cases{"plain", "dependent", "short", "escaped", "effect", "readers", "two_groups"};
+        std::ostringstream setup, expected, checks;
+        setup << "sim.event_in=step%5!=0;\n";
+        for (std::size_t c = 0; c < cases.size(); ++c)
+        {
+            const auto &name = cases[c];
+            const auto node = static_cast<uint32_t>(c + 1u);
+            const unsigned count = name == "short" ? 31u : name == "two_groups" ? 96u : 48u;
+            std::vector<ValueId> values;
+            ValueId interleaved{};
+            expected << "bool reduce_" << name << "=" << (name == "plain" ? "!sim.event_in" : "false") << ";\n";
+            for (unsigned i = 0; i < count; ++i)
+            {
+                const auto prefix = name + "_" + std::to_string(i);
+                std::array<ValueId, 2> sources;
+                for (unsigned side = 0; side < 2u; ++side)
+                {
+                    const auto port = prefix + "_in" + std::to_string(side);
+                    const auto input = makeLogicValue(graph, port, 1); graph.bindInputPort(port, input);
+                    sources[side] = unary(OperationKind::kNot, port + "_stored", input, 0u);
+                    setup << "sim." << port << "=step%7==0?true:step%7==1?false:bool(random()&1);\n";
+                }
+                const bool dependent = name == "dependent" && i != 0u;
+                const auto value = binary(i % 2 ? OperationKind::kAnd : OperationKind::kLogicAnd,
+                    prefix + "_and", dependent ? values.back() : sources[0], sources[1], node);
+                if (name == "effect" && i == 17u) graph.setAttr(graph.valueDef(value), "hasSideEffects", true);
+                values.push_back(value);
+                if (name == "plain")
+                    interleaved = binary(OperationKind::kLogicOr, name + "_interleaved_or" + std::to_string(i),
+                        i == 0u ? eventValue : interleaved, value, node);
+                expected << "const bool next_" << prefix << "=("
+                         << (dependent ? "next_" + name + "_" + std::to_string(i - 1u) : "!sim." + prefix + "_in0")
+                         << " && !sim." << prefix << "_in1);reduce_" << name << "|=next_" << prefix << ";\n";
+                for (uint32_t reader : {8u, 9u})
+                {
+                    if (name == "readers" && reader != 8u + i % 2u) continue;
+                    if (name == "two_groups" && reader != 8u + i / 48u) continue;
+                    const auto port = prefix + "_out" + std::to_string(reader);
+                    expose(port, value, reader);
+                    checks << "if(sim." << port << "!=!next_" << prefix << ")return 10;\n";
+                }
+            }
+            auto reduced = name == "plain" ? interleaved : values[0];
+            for (unsigned i = 1; name != "plain" && i < count; ++i)
+            {
+                reduced = binary(OperationKind::kLogicOr, name + "_or" + std::to_string(i), reduced, values[i], node);
+                if (name == "escaped" && i == 24u)
+                {
+                    expose("escaped_prefix", reduced, 8u);
+                    checks << "if(sim.escaped_prefix != !(";
+                    for (unsigned j = 0; j <= i; ++j) checks << (j ? "||" : "") << "next_escaped_" << j;
+                    checks << "))return 12;\n";
+                }
+            }
+            expose(name + "_reduced", reduced, 8u);
+            checks << "if(sim." << name << "_reduced!=!reduce_" << name << ")return 11;\n";
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        std::map<uint32_t, uint32_t> nodeByOp;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node]) nodeByOp[id.index] = node;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node])
+            {
+                const Operation op = graph.getOperation(id);
+                for (auto value : op.operands())
+                    if (!graph.valueDef(value).valid() || nodeByOp.at(graph.valueDef(value).index) != node)
+                    {
+                        auto &targets = fanout[value.index - 1u];
+                        if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                    }
+            }
+        ActivityScheduleTopoOrder order(nodes.size()); std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", ActivityScheduleStateReadSupernodes{});
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_bool_producer_reduce";
+        std::map<std::string, std::string> defaults;
+        for (const std::string mode : {"default", "off", "on", "env", "precedence", "packed", "direct", "profile", "fullpass", "split"})
+        {
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            const auto dir = base / mode; std::filesystem::create_directories(dir);
+            EmitOptions options; options.outputDir = dir.string(); options.session = &fixture.session;
+            options.sessionPathPrefix = "top"; options.attributes["bool_eager_logic"] = "1";
+            options.attributes["bool_zero_group_guard"] = "1"; options.attributes["emit_parallelism"] = "2";
+            if (mode != "default" && mode != "env") options.attributes["bool_producer_reduce"] = enabled ? "1" : "0";
+            if (mode == "env" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "packed") options.attributes["packed_deferred_activation"] = "1";
+            if (mode == "direct") options.attributes["direct_deferred_activation"] = "1";
+            if (mode == "profile")
+            {
+                options.attributes["emit_runtime_profile"] = "1";
+                options.attributes["batch_trigger_bitmap_validate"] = "1";
+                options.attributes["perf"] = "eval";
+            }
+            if (mode == "fullpass") options.attributes["input_fullpass_specialization"] = "1";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            EmitDiagnostics diagnostics; EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(fixture.design, options); ::unsetenv(key);
+            if (!result.success || diagnostics.hasError()) return fail("bool producer reduce emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaults = files;
+            if ((mode == "off" || mode == "precedence") && files != defaults)
+                return fail("disabled bool producer reduce changed generated files: " + mode);
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            if (countSubstring(code, "const auto grhsim_compact_reduce_") != (enabled ? 4u : 0u))
+                return fail("bool producer reduce coverage mismatch: " + mode);
+            if (mode == "off" || mode == "precedence" || mode == "env") continue;
+            const auto harness = dir / "harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\nint main(){GrhSIM_top sim;"
+                       "std::uint64_t rng=137;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned init=0;init<2;++init){sim.init();"
+                    << (mode == "profile" ? "sim.set_runtime_profile_enabled(true);" : "")
+                    << "for(unsigned step=0;step<2048;++step){\n" << setup.str() << expected.str()
+                    << "for(unsigned repeat=0;repeat<3;++repeat){sim.eval();\n" << checks.str() << "}}}return 0;}\n";
+            }
+            std::string sources;
+            for (const auto &[name, content] : files) if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            sources += " " + harness.string();
+            for (const std::string optimization : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (optimization == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + optimization +
+                    " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() + sources + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str()))
+                    return fail("bool producer reduce runtime test failed: " + mode + "/" + optimization);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runBoolZeroGroupFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_BOOL_ZERO_GROUP_GUARD";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        ActiveMaskGapPackFixture fixture;
+        Graph &graph = fixture.design.createGraph("top");
+        fixture.design.markAsTop(graph.symbol());
+        ActivityScheduleSupernodeToOps nodes(20u);
+        ActivityScheduleStateReadSupernodes reads;
+        const auto input = [&](const std::string &name, int32_t width = 1) {
+            const auto value = makeLogicValue(graph, name, width);
+            graph.bindInputPort(name, value);
+            return value;
+        };
+        const auto clk = input("clk"), gateData = input("gate_data"), enable = input("enable");
+        const auto one = addConstant(graph, "one_op", "one", 1, "1'b1");
+        nodes[0].push_back(graph.valueDef(one));
+        const auto reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("gate_reg"));
+        graph.setAttr(reg, "width", int64_t{1});
+        graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("1'b1"));
+        const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("gate_write"));
+        graph.setAttr(write, "regSymbol", std::string("gate_reg"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        for (auto value : {enable, gateData, one, clk}) graph.addOperand(write, value);
+        nodes[19].push_back(write);
+        const auto gate = makeLogicValue(graph, "visible_gate", 1);
+        const auto read = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("gate_read"));
+        graph.setAttr(read, "regSymbol", std::string("gate_reg"));
+        graph.addResult(read, gate);
+        nodes[0].push_back(read);
+        reads["gate_reg"].push_back(0u);
+        const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("zero_group_effect"));
+        graph.setAttr(import, "argsDirection", std::vector<std::string>{});
+        graph.setAttr(import, "argsWidth", std::vector<int64_t>{});
+        graph.setAttr(import, "argsName", std::vector<std::string>{});
+        graph.setAttr(import, "argsSigned", std::vector<bool>{});
+        graph.setAttr(import, "argsType", std::vector<std::string>{});
+        graph.setAttr(import, "hasReturn", false);
+        struct Case { std::string name; unsigned count; int32_t width = 1; };
+        const std::vector<Case> cases{{"normal", 8}, {"swapped", 12}, {"short", 7},
+            {"input_gate", 8}, {"overlap", 8}, {"effect", 8}, {"annotated", 8}, {"wide", 8, 8},
+            {"inline_assign", 8}, {"snapshot_gate", 8}};
+        std::ostringstream setup, checks;
+        for (std::size_t c = 0; c < cases.size(); ++c)
+        {
+            const auto &test = cases[c];
+            const uint32_t node = static_cast<uint32_t>(c + 1u);
+            std::vector<ValueId> results;
+            std::vector<OperationId> gateOps, calcOps, storeOps;
+            for (unsigned i = 0; i < test.count; ++i)
+            {
+                const auto name = test.name + "_" + std::to_string(i);
+                const auto raw = input(name + "_in", test.width);
+                const auto source = makeLogicValue(graph, name + "_source", test.width);
+                const auto invert = graph.createOperation(OperationKind::kNot, graph.internSymbol(name + "_invert"));
+                graph.addOperand(invert, raw); graph.addResult(invert, source);
+                nodes[0].push_back(invert);
+                if (test.name == "effect" && i == 4u)
+                {
+                    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("effect_call"));
+                    graph.addOperand(call, one); graph.addOperand(call, clk);
+                    graph.setAttr(call, "targetImportSymbol", std::string("zero_group_effect"));
+                    graph.setAttr(call, "inArgName", std::vector<std::string>{});
+                    graph.setAttr(call, "outArgName", std::vector<std::string>{});
+                    graph.setAttr(call, "hasReturn", false);
+                    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+                    calcOps.push_back(call);
+                }
+                const auto result = makeLogicValue(graph, name + "_result", test.width);
+                const auto op = graph.createOperation(OperationKind::kAnd, graph.internSymbol(name + "_and"));
+                auto actualSource = test.name == "overlap" && i == 7u ? results.front() : source;
+                auto actualGate = test.name == "input_gate" ? enable : gate;
+                if (test.name != "input_gate" && test.name != "snapshot_gate")
+                {
+                    actualGate = makeLogicValue(graph, name + "_local_gate", 1);
+                    const auto localRead = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                                  graph.internSymbol(name + "_local_read"));
+                    graph.setAttr(localRead, "regSymbol", std::string("gate_reg"));
+                    graph.addResult(localRead, actualGate); gateOps.push_back(localRead);
+                }
+                if (test.name == "inline_assign")
+                {
+                    const auto alias = makeLogicValue(graph, name + "_source_alias", 1);
+                    const auto copy = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_source_copy"));
+                    graph.addOperand(copy, actualSource); graph.addResult(copy, alias);
+                    gateOps.push_back(copy); actualSource = alias;
+                }
+                graph.addOperand(op, test.name == "swapped" ? actualGate : actualSource);
+                graph.addOperand(op, test.name == "swapped" ? actualSource : actualGate);
+                if (test.name == "inline_assign")
+                {
+                    const auto local = makeLogicValue(graph, name + "_local_and", 1);
+                    graph.addResult(op, local);
+                    const auto copy = graph.createOperation(OperationKind::kAssign, graph.internSymbol(name + "_store"));
+                    graph.addOperand(copy, local); graph.addResult(copy, result);
+                    storeOps.push_back(copy);
+                }
+                else graph.addResult(op, result);
+                if (test.name == "annotated" && i == 4u) graph.setAttr(op, "hasSideEffects", true);
+                calcOps.push_back(op);
+                results.push_back(result);
+                // Materialized outputs feed different reader sets. Checking
+                // every reader detects missed/overwritten deferred flags.
+                for (uint32_t target : {16u, 17u + i % 2u})
+                {
+                    const auto port = name + "_out" + std::to_string(target);
+                    const auto output = makeLogicValue(graph, port, test.width);
+                    const auto copy = graph.createOperation(OperationKind::kAssign, graph.internSymbol(port + "_copy"));
+                    graph.addOperand(copy, result); graph.addResult(copy, output);
+                    graph.bindOutputPort(port, output); nodes[target].push_back(copy);
+                    const auto inputName = test.name == "overlap" && i == 7u ? test.name + "_0_in" : name + "_in";
+                    const auto expected = test.width == 1 ? "!sim." + inputName : "(~unsigned(sim." + inputName + "))";
+                    checks << "if (unsigned(sim." << port << ") != (unsigned(" << expected << ") & unsigned("
+                           << (test.name == "input_gate" ? "sim.enable" : "q") << "))) return 10;\n";
+                }
+                setup << "sim." << name << "_in = static_cast<decltype(sim." << name << "_in)>("
+                      << (test.width == 1 ? "((step%8==0?0:step%8==1?1:random()) & 1)" : "random()") << ");\n";
+            }
+            for (const auto &ops : {gateOps, calcOps, storeOps})
+                nodes[node].insert(nodes[node].end(), ops.begin(), ops.end());
+            if (!gateOps.empty()) reads["gate_reg"].push_back(node);
+        }
+        for (std::size_t node = 0; node < nodes.size(); ++node)
+        {
+            if (!nodes[node].empty()) continue;
+            const auto name = "padding" + std::to_string(node);
+            const auto value = addConstant(graph, name + "_op", name, 1, "1'b0");
+            nodes[node].push_back(graph.valueDef(value));
+        }
+        ActivityScheduleValueFanout fanout(graph.values().size());
+        std::map<uint32_t, uint32_t> nodeByOp;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node]) nodeByOp[id.index] = node;
+        for (uint32_t node = 0; node < nodes.size(); ++node)
+            for (auto id : nodes[node])
+            {
+                const Operation consumer = graph.getOperation(id);
+                for (auto value : consumer.operands())
+                    if (!graph.valueDef(value).valid() || nodeByOp.at(graph.valueDef(value).index) != node)
+                    {
+                        auto &targets = fanout[value.index - 1u];
+                        if (std::find(targets.begin(), targets.end(), node) == targets.end()) targets.push_back(node);
+                    }
+            }
+        ActivityScheduleTopoOrder order(nodes.size());
+        std::iota(order.begin(), order.end(), 0u);
+        setActivityScheduleFixtureSlot(fixture.session, "supernode_to_ops", std::move(nodes));
+        setActivityScheduleFixtureSlot(fixture.session, "value_fanout", std::move(fanout));
+        setActivityScheduleFixtureSlot(fixture.session, "topo_order", std::move(order));
+        setActivityScheduleFixtureSlot(fixture.session, "state_read_supernodes", std::move(reads));
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_bool_zero_group";
+        std::map<std::string, std::string> defaults;
+        for (const std::string mode : {"default", "off", "on", "environment", "precedence", "lazy-bool",
+                                      "indirect-state", "split", "profile", "packed", "direct", "fullpass"})
+        {
+            const bool enabled = mode != "default" && mode != "off" && mode != "precedence";
+            const auto dir = base / mode;
+            std::filesystem::create_directories(dir);
+            EmitOptions options;
+            options.outputDir = dir.string(); options.session = &fixture.session; options.sessionPathPrefix = "top";
+            options.attributes["bool_eager_logic"] = mode == "lazy-bool" ? "0" : "1";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default" && mode != "environment") options.attributes["bool_zero_group_guard"] = enabled ? "1" : "0";
+            if (mode == "environment" || mode == "precedence") ::setenv(key, "1", 1);
+            if (mode == "indirect-state") options.attributes["direct_single_writer_state_reads"] = "0";
+            if (mode == "split") options.attributes["sched_word_helper_max_estimated_lines"] = "1";
+            if (mode == "profile")
+            {
+                options.attributes["emit_runtime_profile"] = "1";
+                options.attributes["batch_trigger_bitmap_validate"] = "1";
+                options.attributes["perf"] = "eval";
+            }
+            if (mode == "packed") options.attributes["packed_deferred_activation"] = "1";
+            if (mode == "direct") options.attributes["direct_deferred_activation"] = "1";
+            if (mode == "fullpass")
+            {
+                options.attributes["input_fullpass_specialization"] = "1";
+                options.attributes["posedge_fullpass_specialization"] = "1";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const auto result = emitter.emit(fixture.design, options);
+            ::unsetenv(key);
+            if (!result.success || diagnostics.hasError()) return fail("bool-zero-group emit failed: " + mode);
+            const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
+            if (mode == "default") defaults = files;
+            if ((mode == "off" || mode == "precedence") && files != defaults)
+                return fail("disabled bool-zero-group changed output: " + mode);
+            const auto code = readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+            if (countSubstring(code, "// Current-zero bool group:") != (enabled ? 3u : 0u))
+                return fail("bool-zero-group structural coverage mismatch: " + mode);
+            if (mode == "off" || mode == "precedence" || mode == "environment") continue;
+            const auto harness = dir / "harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\n"
+                       "static unsigned calls=0;extern \"C\" void zero_group_effect(){++calls;}\n"
+                       "int main(){GrhSIM_top sim;std::uint64_t rng=381;auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};\n"
+                       "for(unsigned init=0;init<2;++init){sim.init();"
+                    << (mode == "profile" ? "sim.set_runtime_profile_enabled(true);" : "")
+                    << "sim.clk=0;sim.enable=0;sim.eval();"
+                       "bool q=true;unsigned expectedCalls=calls;"
+                       "for(unsigned step=0;step<2048;++step){sim.enable=step%5!=0;sim.gate_data=(step%8)<3;\n"
+                    << setup.str() << "for(unsigned edge=0;edge<2;++edge){sim.clk=edge;"
+                       "if(edge){++expectedCalls;if(sim.enable)q=sim.gate_data;}"
+                       "for(unsigned repeat=0;repeat<2;++repeat){sim.eval();\n"
+                    << checks.str() << "if(calls!=expectedCalls)return 20;}}}}return 0;}\n";
+            }
+            std::string sources;
+            for (const auto &[name, content] : files) if (name.ends_with(".cpp")) sources += " " + (dir / name).string();
+            sources += " " + harness.string();
+            for (const std::string optimization : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (optimization == "-O0" ? "harness_o0" : "harness_o3");
+                const auto command = "clang++ -std=c++20 " + optimization +
+                    " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() + sources + " -o " + exe.string();
+                if (std::system(command.c_str()) || std::system(exe.c_str()))
+                    return fail("bool-zero-group harness failed: " + mode + "/" + optimization);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
+    int runScalarConcatReductionFocusedTests()
+    {
+        constexpr const char *key = "WOLVRIX_GRHSIM_SCALAR_CONCAT_REDUCTION";
+        const char *previous = std::getenv(key);
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        ::unsetenv(key);
+        // Mixed families, numeric outputs and parity must keep the complete
+        // concat. Multi-user locals also exercise the owning Value/use span.
+        const std::vector<std::vector<int32_t>> shapes = {
+            {1, 1}, {3, 5}, {7, 9, 16}, {1, 31, 32}, {63, 1},
+            std::vector<int32_t>(8, 1), std::vector<int32_t>(16, 1),
+            std::vector<int32_t>(32, 1), std::vector<int32_t>(64, 1),
+        };
+        const auto base = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+                          "grhsim_cpp_scalar_concat_reduction_focused";
+        std::string defaultSource;
+        for (const std::string mode : {"default", "off", "on", "min2", "min64"})
+        {
+            Design design;
+            Graph &graph = design.createGraph("top");
+            design.markAsTop(graph.symbol());
+            std::ostringstream setup, checks;
+            std::size_t caseNumber = 0;
+            for (const auto &widths : shapes)
+            {
+                for (int family = 0; family < 5; ++family, ++caseNumber)
+                {
+                    const std::string prefix = "case" + std::to_string(caseNumber);
+                    int32_t totalWidth = 0;
+                    std::vector<ValueId> inputs;
+                    setup << "std::uint64_t packed" << caseNumber << " = 0;\n";
+                    for (std::size_t i = 0; i < widths.size(); ++i)
+                    {
+                        const auto width = widths[i];
+                        totalWidth += width;
+                        const std::string name = prefix + "_in" + std::to_string(i);
+                        // Signed and deliberately noncanonical integer padding
+                        // must still be truncated to the field's actual width.
+                        const ValueId input = makeLogicValue(graph, name, width, i % 2u == 1u);
+                        graph.bindInputPort(name, input);
+                        inputs.push_back(input);
+                        const auto mask = (UINT64_C(1) << width) - 1u;
+                        setup << "sim." << name << " = "
+                              << (width == 1 ? "static_cast<bool>" : "static_cast<decltype(sim." + name + ")>")
+                              << "((t == 0 ? 0 : t == 1 ? UINT64_MAX : random())"
+                              << (width == 1 ? " & UINT64_C(1)" : "") << ");\n"
+                              << "packed" << caseNumber << " = (packed" << caseNumber << " << " << width
+                              << "u) | (static_cast<std::uint64_t>(sim." << name << ") & UINT64_C(" << mask << "));\n";
+                    }
+                    const ValueId concat = makeLogicValue(graph, prefix + "_concat", totalWidth);
+                    const OperationId concatOp = graph.createOperation(OperationKind::kConcat,
+                        graph.internSymbol(prefix + "_concat_op"));
+                    for (ValueId input : inputs) graph.addOperand(concatOp, input);
+                    graph.addResult(concatOp, concat);
+                    const auto mask = totalWidth == 64 ? UINT64_MAX : (UINT64_C(1) << totalWidth) - 1u;
+                    const auto reduce = [&](OperationKind kind, const std::string &suffix,
+                                            const std::string &expected) {
+                        const std::string name = prefix + "_" + suffix;
+                        const ValueId output = makeLogicValue(graph, name, 1);
+                        const OperationId op = graph.createOperation(kind, graph.internSymbol(name + "_op"));
+                        graph.addOperand(op, concat);
+                        graph.addResult(op, output);
+                        graph.bindOutputPort(name, output);
+                        checks << "if (sim." << name << " != (" << expected << ")) return " << caseNumber + 1 << ";\n";
+                    };
+                    const std::string packed = "packed" + std::to_string(caseNumber);
+                    const std::string all = packed + " == UINT64_C(" + std::to_string(mask) + ")";
+                    const std::string any = packed + " != 0";
+                    if (family == 0 || family == 2 || family == 3)
+                    {
+                        reduce(OperationKind::kReduceAnd, "and", all);
+                        reduce(OperationKind::kReduceNand, "nand", "!(" + all + ")");
+                    }
+                    if (family == 1 || family == 2)
+                    {
+                        reduce(OperationKind::kReduceOr, "or", any);
+                        reduce(OperationKind::kReduceNor, "nor", "!(" + any + ")");
+                    }
+                    if (family == 3)
+                    {
+                        graph.bindOutputPort(prefix + "_packed", concat);
+                        checks << "if (sim." << prefix << "_packed != " << packed << ") return 100;\n";
+                    }
+                    if (family == 4)
+                    {
+                        reduce(OperationKind::kReduceXor, "xor", "(__builtin_popcountll(" + packed + ") & 1) != 0");
+                        reduce(OperationKind::kReduceXnor, "xnor", "(__builtin_popcountll(" + packed + ") & 1) == 0");
+                    }
+                }
+            }
+            SessionStore session;
+            if (!runActivitySchedule(design, session)) return fail("concat-reduction focused schedule failed");
+            const auto dir = base / mode;
+            std::filesystem::create_directories(dir);
+            EmitOptions options;
+            options.outputDir = dir.string();
+            options.session = &session;
+            options.sessionPathPrefix = "top";
+            options.attributes["emit_parallelism"] = "2";
+            if (mode != "default") options.attributes["scalar_concat_reduction"] = mode == "off" ? "0" : "1";
+            if (mode == "min2" || mode == "min64")
+                options.attributes["scalar_concat_reduction_min_fields"] = mode.substr(3);
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            if (!emitter.emit(design, options).success || diagnostics.hasError())
+                return fail("concat-reduction focused emit failed: " + mode);
+            const auto sched = collectSchedFiles(dir, "grhsim_top_sched_");
+            const auto states = collectSchedFiles(dir, "grhsim_top_state");
+            const std::string source = readFiles(sched);
+            if (mode == "default") defaultSource = source;
+            if (mode == "off" && source != defaultSource)
+                return fail("concat-reduction default/off drift");
+            if (mode == "on" && source == defaultSource)
+                return fail("concat-reduction focused rule did not trigger");
+            const auto harness = dir / "harness.cpp";
+            {
+                std::ofstream out(harness);
+                out << "#include \"grhsim_top.hpp\"\n#include <cstdint>\n"
+                       "int main(){GrhSIM_top sim;sim.init();std::uint64_t rng=713;"
+                       "auto random=[&](){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;return rng;};"
+                       "for(unsigned t=0;t<12000;++t){\n"
+                    << setup.str() << "sim.eval();\n" << checks.str() << "}return 0;}\n";
+            }
+            std::string inputs;
+            for (const auto &file : states) inputs += " " + file.string();
+            inputs += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &file : sched) inputs += " " + file.string();
+            inputs += " " + harness.string();
+            for (const std::string optimization : {"-O0", "-O3"})
+            {
+                const auto exe = dir / (optimization == "-O0" ? "harness_o0" : "harness_o3");
+                const std::string command = "clang++ -std=c++20 " + optimization +
+                    " -fsanitize=address,undefined -fno-sanitize-recover=all -I" + dir.string() +
+                    inputs + " -o " + exe.string();
+                if (std::system(command.c_str()) != 0 || std::system(exe.c_str()) != 0)
+                    return fail("concat-reduction focused harness failed: " + mode + "/" + optimization);
+            }
+        }
+        if (saved) ::setenv(key, saved->c_str(), 1);
+        return 0;
+    }
+
 } // namespace
 
 #ifndef WOLF_SV_EMIT_ARTIFACT_DIR
@@ -7193,6 +11574,95 @@ namespace
 
 int main()
 {
+    if (std::getenv("WOLVRIX_TEST_BOOL_PRODUCER_REDUCE") != nullptr)
+    {
+        return runBoolProducerReduceFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_DIRECT_BOOL_STATE_VIEWS") != nullptr)
+    {
+        return runDirectBoolStateViewFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_BOOL_ZERO_GROUP_GUARD") != nullptr)
+    {
+        return runBoolZeroGroupFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_SCALAR_CONCAT_REDUCTION") != nullptr)
+    {
+        return runScalarConcatReductionFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_LOCAL_SHIFT_DEMANDED_BIT") != nullptr)
+    {
+        return runLocalShiftDemandedBitFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_WORDWISE_BOOL_PACK") != nullptr)
+    {
+        return runWordwiseBoolPackFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_SCALAR_LEAF_MUX") != nullptr)
+    {
+        return runScalarLeafMuxFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_MATERIALIZED_DEFERRED_ACTIVATION") != nullptr)
+    {
+        return runMaterializedDeferredActivationFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_WIDE_ACTIVATION") != nullptr)
+    {
+        return runWideActivationFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_WIDE_ASSIGN_XOR") != nullptr)
+    {
+        return runWideAssignXorFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_DIRECT_DEFERRED_ACTIVATION") != nullptr)
+    {
+        return runPackedDeferredActivationFocusedTests(true);
+    }
+    if (std::getenv("WOLVRIX_TEST_SHARED_DEFERRED_ACTIVATION") != nullptr)
+    {
+        return runSharedDeferredActivationFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_PACKED_DEFERRED_ACTIVATION") != nullptr)
+    {
+        return runPackedDeferredActivationFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_WORDWISE_CONCAT") != nullptr)
+    {
+        const int result = runWordwiseWideConcatFocusedTests();
+        return result == 0 ? runWordwiseMemoryConcatFocusedTests() : result;
+    }
+    if (std::getenv("WOLVRIX_TEST_COMMIT_SAME_READERS") != nullptr)
+    {
+        return runCommitScalarSameReaderFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_COMMIT_SCALAR_EAGER") != nullptr)
+    {
+        return runCommitScalarEagerFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_PRIORITY_MUX_CHAINS") != nullptr)
+    {
+        return runPriorityMuxChainFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_PRIORITY_MUX_COMMIT_DEMAND") != nullptr)
+    {
+        return runPriorityMuxCommitDemandFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_LOCAL_COMPUTE_USE_ORDER") != nullptr)
+    {
+        return runLocalComputeUseOrderFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_WIDE_STATE_READ_REFS") != nullptr)
+    {
+        return runWideStateReadRefsFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_PACKED_ARRAY_LATE_INDEX") != nullptr)
+    {
+        return runPackedArrayLateIndexFocusedTests();
+    }
+    if (std::getenv("WOLVRIX_TEST_BATCH_TRIGGER_BITMAP") != nullptr)
+    {
+        return runBatchTriggerBitmapFocusedTests();
+    }
     if (std::getenv("WOLVRIX_TEST_DIRECT_HOT_INPUT_EVENT") != nullptr)
     {
         return runDirectHotInputEventFocusedTests();
@@ -7250,6 +11720,9 @@ int main()
         options.attributes["sched_batch_max_ops"] = "8";
         options.attributes["sched_batch_max_estimated_lines"] = "96";
         options.attributes["emit_parallelism"] = "2";
+        // This fixture checks the legacy change-guard spelling explicitly.
+        options.attributes["commit_scalar_eager_max_activation_writes"] = "0";
+        options.attributes["commit_scalar_same_reader_groups"] = "0";
 
         EmitResult result = emitter.emit(design, options);
         if (!result.success)
@@ -9089,9 +13562,11 @@ int main()
         if (wideConcatFastSched.find("wide_concat_fast_mid") == std::string::npos ||
             wideConcatFastSched.find("value_words_2_slots_[") ==
                 std::string::npos ||
-            wideConcatFastSched.find("= std::array<std::uint64_t, 2>{};") == std::string::npos ||
+            (wideConcatFastSched.find("= std::array<std::uint64_t, 2>{};") == std::string::npos &&
+             wideConcatFastSched.find("// Wordwise wide concat:") == std::string::npos) ||
             wideConcatFastSched.find("value_words_2_slots_[") == std::string::npos ||
-            wideConcatFastSched.find(")[") == std::string::npos)
+            (wideConcatFastSched.find(")[") == std::string::npos &&
+             wideConcatFastSched.find("// Wordwise wide concat:") == std::string::npos))
         {
             return fail("wide-concat-fast should emit direct concat buffer statements");
         }
@@ -9255,6 +13730,17 @@ int main()
                                       false,
                                       false,
                                       true,
+                                      std::nullopt,
+                                      std::nullopt,
+                                      8u,
+                                      96u,
+                                      std::nullopt,
+                                      std::nullopt,
+                                      std::nullopt,
+                                      false,
+                                      std::nullopt,
+                                      std::nullopt,
+                                      true,
                                       true))
         {
             return fail("full-active-word-consume activity-schedule pass failed");
@@ -9270,6 +13756,17 @@ int main()
         if (fullWordConsumeStateFiles.empty() || fullWordConsumeSchedFiles.empty())
         {
             return fail("full-active-word-consume generated files missing");
+        }
+        const std::string fullWordConsumeEval = readFile(fullWordConsumeDir / "grhsim_top_eval.cpp");
+        const std::size_t computeBatchCallCount =
+            countSubstring(fullWordConsumeEval, "this->eval_compute_batch_");
+        const std::size_t guardedComputeBatchCallCount = countSubstring(
+            fullWordConsumeEval,
+            ")) != UINT8_C(0)) {\n        this->eval_compute_batch_");
+        if (computeBatchCallCount < 2u || guardedComputeBatchCallCount != computeBatchCallCount ||
+            countSubstring(fullWordConsumeEval, "if ((supernode_active_curr_[") < computeBatchCallCount)
+        {
+            return fail("compute batch dispatch guard should precede every batch call");
         }
         const std::string fullWordConsumeSched = readFiles(fullWordConsumeSchedFiles);
         const std::string dispatchMarker =
@@ -9368,6 +13865,127 @@ int main()
         if (std::system(fullWordConsumeHarnessExe.string().c_str()) != 0)
         {
             return fail("full-active-word-consume harness failed to run");
+        }
+
+        const std::filesystem::path wordHelperRoot =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_word_helper_chunks";
+        const std::array<std::string, 3> wordHelperNames = {"default", "zero", "enabled"};
+        std::filesystem::remove_all(wordHelperRoot);
+        std::array<std::map<std::string, std::string>, 3> wordHelperSources;
+        for (std::size_t variant = 0; variant < wordHelperNames.size(); ++variant)
+        {
+            const std::filesystem::path variantDir = wordHelperRoot / wordHelperNames[variant];
+            std::filesystem::create_directories(variantDir);
+            Design design = buildFullActiveWordConsumeDesign();
+            EmitDiagnostics diagnostics;
+            EmitResult result;
+            ActivityScheduleOptions schedule;
+            schedule.maxOpInComputeSupernode = 1;
+            schedule.enableCoarsen = false;
+            schedule.splitOversizeComputeNodes = true;
+            schedule.splitOversizeComputeNodeMaxOps = 1;
+            const std::optional<std::size_t> helperBudget =
+                variant == 0 ? std::nullopt : std::optional<std::size_t>(variant == 1 ? 0u : 1u);
+            if (!emitWithActivitySchedule(design,
+                                          variantDir,
+                                          diagnostics,
+                                          result,
+                                          schedule,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          true,
+                                          std::nullopt,
+                                          std::nullopt,
+                                          8u,
+                                          96u,
+                                          std::nullopt,
+                                          std::nullopt,
+                                          std::nullopt,
+                                          false,
+                                          std::nullopt,
+                                          std::nullopt,
+                                          false,
+                                          false,
+                                          helperBudget) ||
+                !result.success || diagnostics.hasError())
+            {
+                return fail("word-helper-chunks emit failed for " + wordHelperNames[variant]);
+            }
+            wordHelperSources[variant] = collectGeneratedSourceFiles(variantDir, "grhsim_top");
+            if (wordHelperSources[variant].empty())
+            {
+                return fail("word-helper-chunks generated files missing for " + wordHelperNames[variant]);
+            }
+        }
+        if (wordHelperSources[0] != wordHelperSources[1])
+        {
+            return fail("word-helper-chunks default and explicit zero output should match");
+        }
+        if (wordHelperSources[0] == wordHelperSources[2])
+        {
+            return fail("word-helper-chunks low threshold should change generated output");
+        }
+        const std::string wordHelperEnabledText = [&]() {
+            std::string text;
+            for (const auto &[name, content] : wordHelperSources[2])
+            {
+                text += name;
+                text += '\n';
+                text += content;
+            }
+            return text;
+        }();
+        if (wordHelperEnabledText.find("_word_0_chunk_") == std::string::npos ||
+            wordHelperEnabledText.find("deferredActiveWordFlags") == std::string::npos ||
+            wordHelperEnabledText.find("baseWordFlags") == std::string::npos)
+        {
+            return fail("word-helper-chunks should emit split helpers with same-word deferred activation");
+        }
+        const std::filesystem::path wordHelperEnabledDir = wordHelperRoot / "enabled";
+        const std::filesystem::path wordHelperHarnessPath = wordHelperEnabledDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(wordHelperHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create word-helper-chunks harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.chain_in = static_cast<std::uint8_t>(1);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.chain_out != static_cast<std::uint8_t>(10)) return 1;\n";
+            harness << "    sim.chain_in = static_cast<std::uint8_t>(7);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.chain_out != static_cast<std::uint8_t>(16)) return 2;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const auto wordHelperStateFiles = collectSchedFiles(wordHelperEnabledDir, "grhsim_top_state");
+        const auto wordHelperSchedFiles = collectSchedFiles(wordHelperEnabledDir, "grhsim_top_sched_");
+        const std::filesystem::path wordHelperHarnessExe = wordHelperEnabledDir / "grhsim_top_harness";
+        std::string wordHelperCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + wordHelperEnabledDir.string();
+        for (const auto &path : wordHelperStateFiles)
+        {
+            wordHelperCompileCmd += " " + path.string();
+        }
+        wordHelperCompileCmd += " " + (wordHelperEnabledDir / "grhsim_top_eval.cpp").string();
+        for (const auto &path : wordHelperSchedFiles)
+        {
+            wordHelperCompileCmd += " " + path.string();
+        }
+        wordHelperCompileCmd += " " + wordHelperHarnessPath.string() + " -o " + wordHelperHarnessExe.string();
+        if (std::system(wordHelperCompileCmd.c_str()) != 0 ||
+            std::system(wordHelperHarnessExe.string().c_str()) != 0)
+        {
+            return fail("word-helper-chunks cross-chunk activation harness failed");
         }
 
         const std::filesystem::path overlappingActivationDir =
@@ -9594,13 +14212,19 @@ int main()
         {
             return fail("commit-cond-batch perf counters should expose event settle density");
         }
-        if (countSubstring(commitBatchSched, "Commit writes update visible state directly") != 4 ||
+        const std::size_t sameReaderGroupCount =
+            countSubstring(commitBatchSched, "// Same-reader scalar commit group:");
+        if (sameReaderGroupCount > 1u ||
+            countSubstring(commitBatchSched, "// Same-reader scalar commit group: 2 writes.") !=
+                sameReaderGroupCount ||
+            countSubstring(commitBatchSched, "Commit writes update visible state directly") !=
+                4u - 2u * sameReaderGroupCount ||
             commitBatchSched.find("batch_reg0_write") == std::string::npos ||
             commitBatchSched.find("batch_reg1_write") == std::string::npos ||
             commitBatchSched.find("batch_reg2_write") == std::string::npos ||
             commitBatchSched.find("batch_reg3_write") == std::string::npos)
         {
-            return fail("commit-cond-batch should keep direct per-write commit bodies under the shared event guard");
+            return fail("commit-cond-batch should keep all writes with only the shared-reader pair eligible for grouping");
         }
         const std::size_t reg0WritePos = commitBatchSched.find("batch_reg0_write");
         const std::size_t reg1WritePos = commitBatchSched.find("batch_reg1_write");
@@ -9673,7 +14297,8 @@ int main()
             harness << "        return 2;\n";
             harness << "    }\n";
             harness << "    const auto counters = sim.perf_counters();\n";
-            harness << "    if (counters.eventFastPathCount != UINT64_C(2) ||\n";
+            harness << "    if (counters.touchedWriteCount != UINT64_C(4) ||\n";
+            harness << "        counters.eventFastPathCount != UINT64_C(2) ||\n";
             harness << "        counters.eventStateChangedCount != UINT64_C(2) ||\n";
             harness << "        counters.eventSparseSettleCount + counters.eventDenseSettleCount !=\n";
             harness << "            counters.eventStateChangedCount ||\n";
@@ -10053,6 +14678,423 @@ int main()
         if (std::system(oneBitHarnessExe.string().c_str()) != 0)
         {
             return fail("one-bit-bitwise harness failed to run");
+        }
+
+        const std::filesystem::path boolEagerBaseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_bool_eager_logic";
+        const char *boolEagerEnvironment = std::getenv("WOLVRIX_GRHSIM_BOOL_EAGER_LOGIC");
+        const std::optional<std::string> savedBoolEagerEnvironment =
+            boolEagerEnvironment ? std::optional<std::string>(boolEagerEnvironment) : std::nullopt;
+        // Default-output checks must not inherit the enclosing experiment's option.
+        if (::unsetenv("WOLVRIX_GRHSIM_BOOL_EAGER_LOGIC") != 0)
+        {
+            return fail("failed to isolate bool-eager-logic environment");
+        }
+        const std::array<std::string, 3> boolEagerNames = {"default", "zero", "enabled"};
+        std::filesystem::remove_all(boolEagerBaseDir);
+        Design boolEagerDesign = buildBoolEagerLogicDesign();
+        SessionStore boolEagerSession;
+        if (!runActivitySchedule(boolEagerDesign, boolEagerSession))
+        {
+            return fail("bool-eager-logic activity-schedule pass failed");
+        }
+        std::array<std::filesystem::path, 3> boolEagerDirs;
+        std::array<std::string, 3> boolEagerSources;
+        std::array<std::string, 3> boolEagerSchedSources;
+        for (std::size_t variant = 0; variant < boolEagerNames.size(); ++variant)
+        {
+            boolEagerDirs[variant] = boolEagerBaseDir / boolEagerNames[variant];
+            std::filesystem::create_directories(boolEagerDirs[variant]);
+            EmitOptions options;
+            options.outputDir = boolEagerDirs[variant].string();
+            options.session = &boolEagerSession;
+            options.sessionPathPrefix = std::string("top");
+            options.attributes["emit_parallelism"] = "2";
+            if (variant != 0)
+            {
+                options.attributes["bool_eager_logic"] = variant == 2 ? "1" : "0";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const EmitResult result = emitter.emit(boolEagerDesign, options);
+            if (!result.success || diagnostics.hasError())
+            {
+                return fail("bool-eager-logic emit failed for " + boolEagerNames[variant]);
+            }
+            const auto stateFiles = collectSchedFiles(boolEagerDirs[variant], "grhsim_top_state");
+            const auto schedFiles = collectSchedFiles(boolEagerDirs[variant], "grhsim_top_sched_");
+            if (stateFiles.empty() || schedFiles.empty())
+            {
+                return fail("bool-eager-logic generated files missing");
+            }
+            boolEagerSchedSources[variant] = readFiles(schedFiles);
+            boolEagerSources[variant] = readFile(boolEagerDirs[variant] / "grhsim_top.hpp") +
+                                        readFile(boolEagerDirs[variant] / "grhsim_top_runtime.hpp") +
+                                        readFiles(stateFiles) +
+                                        readFile(boolEagerDirs[variant] / "grhsim_top_eval.cpp") +
+                                        boolEagerSchedSources[variant];
+        }
+        if (boolEagerSources[0] != boolEagerSources[1])
+        {
+            return fail("bool-eager-logic default and explicit zero output should match");
+        }
+        const auto boolEagerSnippet = [&](std::size_t variant, std::string_view comment)
+        {
+            const std::string &sched = boolEagerSchedSources[variant];
+            const std::size_t begin = sched.find(comment);
+            if (begin == std::string::npos)
+            {
+                return std::string_view{};
+            }
+            const std::size_t end = sched.find("// op ", begin + comment.size());
+            return std::string_view(sched).substr(begin, end == std::string::npos ? end : end - begin);
+        };
+        const std::string_view defaultAnd = boolEagerSnippet(0, "// op eager_and_op [kLogicAnd]");
+        const std::string_view defaultOr = boolEagerSnippet(0, "// op eager_or_op [kLogicOr]");
+        const std::string_view enabledAnd = boolEagerSnippet(2, "// op eager_and_op [kLogicAnd]");
+        const std::string_view enabledOr = boolEagerSnippet(2, "// op eager_or_op [kLogicOr]");
+        const std::string_view enabledDirectAnd = boolEagerSnippet(2, "// op direct_and_op [kLogicAnd]");
+        const std::string_view enabledDirectOr = boolEagerSnippet(2, "// op direct_or_op [kLogicOr]");
+        const std::string_view enabledMixedAnd = boolEagerSnippet(2, "// op mixed_and_op [kLogicAnd]");
+        const std::string_view enabledMixedOr = boolEagerSnippet(2, "// op mixed_or_op [kLogicOr]");
+        if (defaultAnd.find(" && ") == std::string_view::npos ||
+            defaultOr.find(" || ") == std::string_view::npos)
+        {
+            return fail("bool-eager-logic default should preserve short-circuit expressions");
+        }
+        if (enabledAnd.find("static_cast<bool>(") == std::string_view::npos ||
+            enabledAnd.find(" & static_cast<bool>(") == std::string_view::npos ||
+            enabledOr.find("static_cast<bool>(") == std::string_view::npos ||
+            enabledOr.find(" | static_cast<bool>(") == std::string_view::npos)
+        {
+            return fail("bool-eager-logic enabled should use eager one-bit expressions");
+        }
+        if (enabledDirectAnd.find("(a) && (b)") == std::string_view::npos ||
+            enabledDirectOr.find("(a) || (b)") == std::string_view::npos)
+        {
+            return fail("bool-eager-logic should preserve direct-port logical expressions");
+        }
+        if (enabledMixedAnd.find(" && ") == std::string_view::npos ||
+            enabledMixedOr.find(" || ") == std::string_view::npos)
+        {
+            return fail("bool-eager-logic should preserve mixed-width logical expressions");
+        }
+        const std::string_view enabledAliasAnd = boolEagerSnippet(2, "// op alias_and_op [kLogicAnd]");
+        const std::string_view enabledAliasOr = boolEagerSnippet(2, "// op alias_or_op [kLogicOr]");
+        if (boolEagerSchedSources[2].find("auto &grhsim_value_") == std::string::npos ||
+            enabledAliasAnd.find("static_cast<bool>(grhsim_value_") == std::string_view::npos ||
+            enabledAliasAnd.find(" & static_cast<bool>(grhsim_value_") == std::string_view::npos ||
+            enabledAliasOr.find(" | static_cast<bool>(grhsim_value_") == std::string_view::npos)
+        {
+            return fail("bool-eager-logic should accept declaration-proven bool storage aliases");
+        }
+        if (boolEagerSnippet(0, "// op alias_and_op [kLogicAnd]").find(" && ") == std::string_view::npos ||
+            boolEagerSnippet(0, "// op alias_or_op [kLogicOr]").find(" || ") == std::string_view::npos ||
+            boolEagerSnippet(2, "// op alias_mixed_op [kLogicAnd]").find(" && ") == std::string_view::npos)
+        {
+            return fail("bool-eager alias coverage must preserve disabled and mixed-width cases");
+        }
+        for (const std::size_t variant : {0u, 2u})
+        {
+            const std::filesystem::path &dir = boolEagerDirs[variant];
+            const std::filesystem::path harnessPath = dir / "grhsim_top_harness.cpp";
+            {
+                std::ofstream harness(harnessPath);
+                if (!harness.is_open())
+                {
+                    return fail("failed to create bool-eager-logic harness");
+                }
+                harness << "#include \"grhsim_top.hpp\"\n";
+                harness << "#include <cstdint>\n\n";
+                harness << "#include <initializer_list>\n\n";
+                harness << "int main()\n{\n";
+                harness << "    GrhSIM_top sim;\n";
+                harness << "    sim.init();\n";
+                harness << "    for (unsigned a = 0; a < 2; ++a) {\n";
+                harness << "        for (unsigned b = 0; b < 2; ++b) {\n";
+                harness << "            for (unsigned wide : {0u, 1u, 2u, 128u, 255u}) {\n";
+                harness << "                sim.a = a != 0;\n";
+                harness << "                sim.b = b != 0;\n";
+                harness << "                sim.wide = static_cast<std::uint8_t>(wide);\n";
+                harness << "                sim.eval();\n";
+                harness << "                if (sim.and_y != (sim.a && sim.b)) return 1;\n";
+                harness << "                if (sim.or_y != (sim.a || sim.b)) return 2;\n";
+                harness << "                if (sim.direct_and_y != (sim.a && sim.b)) return 3;\n";
+                harness << "                if (sim.direct_or_y != (sim.a || sim.b)) return 4;\n";
+                harness << "                if (sim.mixed_and_y != (sim.wide && sim.b)) return 5;\n";
+                harness << "                if (sim.mixed_or_y != (sim.wide || sim.b)) return 6;\n";
+                harness << "                if (sim.alias_a != sim.a || sim.alias_b != sim.b) return 7;\n";
+                harness << "                if (sim.alias_and_y != (sim.a && sim.b)) return 8;\n";
+                harness << "                if (sim.alias_or_y != (sim.a || sim.b)) return 9;\n";
+                harness << "                if (sim.alias_mixed_y != (sim.wide && sim.b)) return 10;\n";
+                harness << "            }\n";
+                harness << "        }\n";
+                harness << "    }\n";
+                harness << "    return 0;\n";
+                harness << "}\n";
+            }
+            const auto stateFiles = collectSchedFiles(dir, "grhsim_top_state");
+            const auto schedFiles = collectSchedFiles(dir, "grhsim_top_sched_");
+            const std::filesystem::path harnessExe = dir / "grhsim_top_harness";
+            std::string compileCmd = "clang++ " + std::string(kHarnessCompileFlags) + " -I" + dir.string();
+            for (const auto &path : stateFiles)
+            {
+                compileCmd += " " + path.string();
+            }
+            compileCmd += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &path : schedFiles)
+            {
+                compileCmd += " " + path.string();
+            }
+            compileCmd += " " + harnessPath.string() + " -o " + harnessExe.string();
+            if (std::system(compileCmd.c_str()) != 0 || std::system(harnessExe.string().c_str()) != 0)
+            {
+                return fail("bool-eager-logic truth-table harness failed for " + boolEagerNames[variant]);
+            }
+        }
+
+        if (savedBoolEagerEnvironment &&
+            ::setenv("WOLVRIX_GRHSIM_BOOL_EAGER_LOGIC", savedBoolEagerEnvironment->c_str(), 1) != 0)
+        {
+            return fail("failed to restore bool-eager-logic environment");
+        }
+
+        const std::filesystem::path stagedConcatBaseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_staged_scalar_concat";
+        const std::array<std::string, 3> stagedConcatNames = {"default", "zero", "enabled"};
+        std::filesystem::remove_all(stagedConcatBaseDir);
+        Design stagedConcatDesign = buildStagedScalarConcatDesign();
+        SessionStore stagedConcatSession;
+        if (!runActivitySchedule(stagedConcatDesign, stagedConcatSession))
+        {
+            return fail("staged-scalar-concat activity-schedule pass failed");
+        }
+        std::array<std::filesystem::path, 3> stagedConcatDirs;
+        std::array<std::string, 3> stagedConcatSchedSources;
+        std::array<std::string, 3> stagedConcatSources;
+        for (std::size_t variant = 0; variant < stagedConcatNames.size(); ++variant)
+        {
+            stagedConcatDirs[variant] = stagedConcatBaseDir / stagedConcatNames[variant];
+            std::filesystem::create_directories(stagedConcatDirs[variant]);
+            EmitOptions options;
+            options.outputDir = stagedConcatDirs[variant].string();
+            options.session = &stagedConcatSession;
+            options.sessionPathPrefix = std::string("top");
+            options.attributes["emit_parallelism"] = "2";
+            if (variant != 0)
+            {
+                options.attributes["staged_scalar_concat"] = variant == 2 ? "1" : "0";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const EmitResult result = emitter.emit(stagedConcatDesign, options);
+            if (!result.success || diagnostics.hasError())
+            {
+                return fail("staged-scalar-concat emit failed for " + stagedConcatNames[variant]);
+            }
+            const auto stateFiles = collectSchedFiles(stagedConcatDirs[variant], "grhsim_top_state");
+            const auto schedFiles = collectSchedFiles(stagedConcatDirs[variant], "grhsim_top_sched_");
+            if (stateFiles.empty() || schedFiles.empty())
+            {
+                return fail("staged-scalar-concat generated files missing");
+            }
+            stagedConcatSchedSources[variant] = readFiles(schedFiles);
+            stagedConcatSources[variant] = readFile(stagedConcatDirs[variant] / "grhsim_top.hpp") +
+                                           readFile(stagedConcatDirs[variant] / "grhsim_top_runtime.hpp") +
+                                           readFiles(stateFiles) +
+                                           readFile(stagedConcatDirs[variant] / "grhsim_top_eval.cpp") +
+                                           stagedConcatSchedSources[variant];
+        }
+        if (stagedConcatSources[0] != stagedConcatSources[1])
+        {
+            return fail("staged-scalar-concat default and explicit zero output should match");
+        }
+        if (stagedConcatSchedSources[0].find("Staged scalar concat") != std::string::npos ||
+            stagedConcatSchedSources[0].find("concat_acc_") != std::string::npos)
+        {
+            return fail("staged-scalar-concat default output should stay disabled");
+        }
+        if (stagedConcatSchedSources[2].find("Staged scalar concat") == std::string::npos ||
+            stagedConcatSchedSources[2].find("concat_acc_") == std::string::npos ||
+            stagedConcatSchedSources[2].find(" |= ") == std::string::npos ||
+            stagedConcatSchedSources[2].find("grhsim_mux_u64(") == std::string::npos)
+        {
+            return fail("staged-scalar-concat enabled output should stage concat while preserving mux leaves");
+        }
+        const std::filesystem::path stagedConcatHarnessPath = stagedConcatDirs[2] / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(stagedConcatHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create staged-scalar-concat harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    for (std::uint32_t mask = 0; mask < 1024u; ++mask) {\n";
+            for (std::size_t i = 0; i < 32u; ++i)
+            {
+                harness << "        sim.concat_in_" << i << " = ((mask >> " << i << "u) & 1u) != 0;\n";
+            }
+            harness << "        sim.eval();\n";
+            harness << "        std::uint32_t expected = 0;\n";
+            harness << "        for (unsigned i = 0; i < 32u; ++i) {\n";
+            harness << "            if (((mask >> i) & 1u) != 0 && ((mask >> ((i + 1u) & 31u)) & 1u) != 0) expected |= UINT32_C(1) << (31u - i);\n";
+            harness << "        }\n";
+            harness << "        if (sim.staged_concat_y != expected) return 1;\n";
+            harness << "    }\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const auto stagedConcatStateFiles = collectSchedFiles(stagedConcatDirs[2], "grhsim_top_state");
+        const auto stagedConcatSchedFiles = collectSchedFiles(stagedConcatDirs[2], "grhsim_top_sched_");
+        const std::filesystem::path stagedConcatHarnessExe = stagedConcatDirs[2] / "grhsim_top_harness";
+        std::string stagedConcatCompileCmd = "clang++ " + std::string(kHarnessCompileFlags) +
+                                             " -I" + stagedConcatDirs[2].string();
+        for (const auto &path : stagedConcatStateFiles)
+        {
+            stagedConcatCompileCmd += " " + path.string();
+        }
+        stagedConcatCompileCmd += " " + (stagedConcatDirs[2] / "grhsim_top_eval.cpp").string();
+        for (const auto &path : stagedConcatSchedFiles)
+        {
+            stagedConcatCompileCmd += " " + path.string();
+        }
+        stagedConcatCompileCmd += " " + stagedConcatHarnessPath.string() + " -o " + stagedConcatHarnessExe.string();
+        if (std::system(stagedConcatCompileCmd.c_str()) != 0 ||
+            std::system(stagedConcatHarnessExe.string().c_str()) != 0)
+        {
+            return fail("staged-scalar-concat functional harness failed");
+        }
+
+        const std::filesystem::path concatReductionBaseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_concat_reduction";
+        const std::array<std::string, 3> concatReductionNames = {"default", "zero", "enabled"};
+        std::filesystem::remove_all(concatReductionBaseDir);
+        Design concatReductionDesign = buildScalarConcatReductionDesign();
+        SessionStore concatReductionSession;
+        if (!runActivitySchedule(concatReductionDesign, concatReductionSession))
+        {
+            return fail("scalar-concat-reduction activity-schedule pass failed");
+        }
+        std::array<std::filesystem::path, 3> concatReductionDirs;
+        std::array<std::string, 3> concatReductionSchedSources;
+        std::array<std::string, 3> concatReductionSources;
+        for (std::size_t variant = 0; variant < concatReductionNames.size(); ++variant)
+        {
+            concatReductionDirs[variant] = concatReductionBaseDir / concatReductionNames[variant];
+            std::filesystem::create_directories(concatReductionDirs[variant]);
+            EmitOptions options;
+            options.outputDir = concatReductionDirs[variant].string();
+            options.session = &concatReductionSession;
+            options.sessionPathPrefix = std::string("top");
+            options.attributes["emit_parallelism"] = "2";
+            if (variant != 0)
+            {
+                options.attributes["scalar_concat_reduction"] = variant == 2 ? "1" : "0";
+            }
+            EmitDiagnostics diagnostics;
+            EmitGrhSimCpp emitter(&diagnostics);
+            const EmitResult result = emitter.emit(concatReductionDesign, options);
+            if (!result.success || diagnostics.hasError())
+            {
+                return fail("scalar-concat-reduction emit failed for " + concatReductionNames[variant]);
+            }
+            const auto stateFiles = collectSchedFiles(concatReductionDirs[variant], "grhsim_top_state");
+            const auto schedFiles = collectSchedFiles(concatReductionDirs[variant], "grhsim_top_sched_");
+            if (stateFiles.empty() || schedFiles.empty())
+            {
+                return fail("scalar-concat-reduction generated files missing");
+            }
+            concatReductionSchedSources[variant] = readFiles(schedFiles);
+            concatReductionSources[variant] = readFile(concatReductionDirs[variant] / "grhsim_top.hpp") +
+                                               readFile(concatReductionDirs[variant] / "grhsim_top_runtime.hpp") +
+                                               readFiles(stateFiles) +
+                                               readFile(concatReductionDirs[variant] / "grhsim_top_eval.cpp") +
+                                               concatReductionSchedSources[variant];
+        }
+        if (concatReductionSources[0] != concatReductionSources[1])
+        {
+            return fail("scalar-concat-reduction default and explicit zero output should match");
+        }
+        if (concatReductionSources[0] == concatReductionSources[2])
+        {
+            return fail("scalar-concat-reduction enabled output should differ from default");
+        }
+        // The enabled output must contain the integer aggregate path.  The
+        // exact expression is intentionally structural rather than tied to a
+        // module or signal name.
+        if (concatReductionSchedSources[2].find("static_cast<std::uint64_t>") == std::string::npos ||
+            concatReductionSchedSources[2].find(" ^ UINT64_C(1)") == std::string::npos)
+        {
+            return fail("scalar-concat-reduction enabled output missing integer aggregate expression");
+        }
+        const std::filesystem::path concatReductionHarnessPath =
+            concatReductionDirs[2] / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(concatReductionHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create scalar-concat-reduction harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <array>\n#include <cstdint>\n\n";
+            harness << "int main()\n{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    const std::array<std::uint32_t, 12> cases = {\n";
+            harness << "        0u, UINT32_MAX, 1u, 0x80000000u, 0x55555555u, 0xAAAAAAAAu,\n";
+            harness << "        0x0000FFFFu, 0xFFFF0000u, 0x00FF00FFu, 0xF0F0F0F0u,\n";
+            harness << "        0x13579BDFu, 0x2468ACE0u};\n";
+            harness << "    for (std::uint32_t mask : cases) {\n";
+            for (std::size_t i = 0; i < 32u; ++i)
+            {
+                harness << "        sim.reduction_long_in_" << i
+                        << " = ((mask >> " << i << "u) & 1u) != 0;\n";
+            }
+            for (std::size_t i = 0; i < 8u; ++i)
+            {
+                harness << "        sim.reduction_short_in_" << i
+                        << " = (((mask >> " << i << "u) ^ (mask >> " << (i + 8u)
+                        << "u) ^ (mask >> " << (i + 16u) << "u) ^ (mask >> " << (i + 24u)
+                        << "u)) & 1u) != 0;\n";
+            }
+            harness << "        sim.eval();\n";
+            harness << "        const bool all = mask == UINT32_MAX;\n";
+            harness << "        const bool any = mask != 0u;\n";
+            harness << "        if (sim.reduction_long_and != all ||\n";
+            harness << "            sim.reduction_long_nand == all ||\n";
+            harness << "            sim.reduction_long_or != any ||\n";
+            harness << "            sim.reduction_long_nor == any) return 1;\n";
+            harness << "        const std::uint32_t shortMask = ((mask ^ (mask >> 8u) ^ (mask >> 16u) ^ (mask >> 24u)) & 0xFFu);\n";
+            harness << "        if (sim.reduction_short_or != (shortMask != 0u)) return 2;\n";
+            harness << "    }\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const auto concatReductionStateFiles = collectSchedFiles(concatReductionDirs[2], "grhsim_top_state");
+        const auto concatReductionSchedFiles = collectSchedFiles(concatReductionDirs[2], "grhsim_top_sched_");
+        const std::filesystem::path concatReductionHarnessExe =
+            concatReductionDirs[2] / "grhsim_top_harness";
+        std::string concatReductionCompileCmd = "clang++ " + std::string(kHarnessCompileFlags) +
+                                                " -I" + concatReductionDirs[2].string();
+        for (const auto &path : concatReductionStateFiles)
+        {
+            concatReductionCompileCmd += " " + path.string();
+        }
+        concatReductionCompileCmd += " " + (concatReductionDirs[2] / "grhsim_top_eval.cpp").string();
+        for (const auto &path : concatReductionSchedFiles)
+        {
+            concatReductionCompileCmd += " " + path.string();
+        }
+        concatReductionCompileCmd += " " + concatReductionHarnessPath.string() +
+                                     " -o " + concatReductionHarnessExe.string();
+        if (std::system(concatReductionCompileCmd.c_str()) != 0 ||
+            std::system(concatReductionHarnessExe.string().c_str()) != 0)
+        {
+            return fail("scalar-concat-reduction functional harness failed");
         }
 
         const std::filesystem::path gatedDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_gated_clock";
@@ -10982,7 +16024,8 @@ int main()
                                               std::size_t schedBatchMaxEstimatedLines = 96u,
                                               std::optional<std::string_view> packPolicy = std::nullopt,
                                               std::optional<std::size_t> packMaxMovedSupernodePpm = std::nullopt,
-                                              std::optional<std::size_t> packMaxChangedWordPpm = std::nullopt)
+                                              std::optional<std::size_t> packMaxChangedWordPpm = std::nullopt,
+                                              bool fullWordProfile = false)
             -> std::optional<std::filesystem::path>
         {
             const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
@@ -11007,7 +16050,11 @@ int main()
                                           schedBatchMaxEstimatedLines,
                                           packPolicy,
                                           packMaxMovedSupernodePpm,
-                                          packMaxChangedWordPpm) ||
+                                          packMaxChangedWordPpm,
+                                          false,
+                                          std::nullopt,
+                                          std::nullopt,
+                                          fullWordProfile) ||
                 !fixtureResult.success || fixtureDiag.hasError())
             {
                 return std::nullopt;
@@ -11071,6 +16118,19 @@ int main()
                                                                       true,
                                                                       false,
                                                                       true,
+                                                                      true);
+        const auto pureEventFullWordProfileDir = emitPureEventFixture("full_word_profile",
+                                                                      PureEventWordFixtureMode::kHomogeneous,
+                                                                      false,
+                                                                      false,
+                                                                      false,
+                                                                      std::nullopt,
+                                                                      16u,
+                                                                      8u,
+                                                                      96u,
+                                                                      std::nullopt,
+                                                                      std::nullopt,
+                                                                      std::nullopt,
                                                                       true);
         const auto pureEventSparseOneDir = emitPureEventFixture("sparse_one",
                                                                 PureEventWordFixtureMode::kHomogeneous,
@@ -11262,6 +16322,7 @@ int main()
         if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
             !pureEventProfileDisabledDir || !pureEventProfileOnlyDir || !pureEventProfileBypassDir ||
             !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir ||
+            !pureEventFullWordProfileDir ||
             !pureEventSparseOneDir || !pureEventSparseTwoDir || !pureEventDenseThreeDir ||
             !pureEventPackDefaultDir || !pureEventPackOffDir || !pureEventPackProbeDir ||
             !pureEventPackTargetedDir || !pureEventPackTargetedRepeatDir ||
@@ -11768,6 +16829,15 @@ int main()
 
         const std::string pureEventFullWordConsumeSched =
             readFiles(collectSchedFiles(*pureEventFullWordConsumeDir, "grhsim_top_sched_"));
+        const std::string pureEventFullWordProfileSource =
+            readPureEventGenerated(*pureEventFullWordProfileDir);
+        const std::string pureEventFullWordProfileSched =
+            readFiles(collectSchedFiles(*pureEventFullWordProfileDir, "grhsim_top_sched_"));
+        if (pureEventFullWordProfileSource.find("kFullActiveWordProfileEligibleCount") == std::string::npos ||
+            pureEventFullWordProfileSched.find("full_active_word_profile_all_on_by_batch_") == std::string::npos)
+        {
+            return fail("full-active-word profile should emit counters for complete words");
+        }
         if (readPureEventGenerated(*pureEventFullWordConsumeDir)
                 .find("kPureEventComputeWordEligibleCount = 0u") == std::string::npos)
         {

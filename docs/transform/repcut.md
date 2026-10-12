@@ -247,10 +247,64 @@ RepCut 分区数为 `K`：
 
 显式设置 `HOST_SPIN_US=0`、`WORKER_SPIN_US=0` 可保留 Host 参与但恢复全 CV 等待；设置
 `HOST_SPIN_US=50`、`WORKER_SPIN_US=0` 可恢复 Host 先自旋 50 us、worker 使用 CV 的实验配置。
+
+在 Host 和 worker 都永久轮询时，阶段派发清理 worker 异常槽不再获取逐 worker
+互斥锁：首次派发已有线程启动握手，后续派发已 acquire 上一阶段的 `completedFast`，
+随后 `workFast` 的 release/acquire 发布本阶段任务和异常槽复位。异常仍由完成握手
+传回 Host，并保留停止、join 与重新初始化路径。CV 或混合等待策略保留原有锁路径。
+当 worker 自旋而 Host 可能回退到 CV 时，派发还会在 mutex 下复位 `completed`，
+避免上一阶段残留的完成标志使 Host 提前越过屏障。
+此调度实现由 Verilator 和 GrhSIM 共用，不改变模型内部计算、跨分区复制或阶段屏障语义。
 运行时会输出一行 `[runtime-config]` JSON，记录实际 Host lane、CPU 映射、等待策略及配置来源。
 
 all-spin 假设进程 affinity 中至少有 N 个专用 CPU，并会持续占满这些 CPU；它以 walltime 为优化
 目标，不以 task-clock 或功耗为目标。析构时 Host affinity 会恢复为构造仿真器前的完整掩码。
+
+## GrhSIM RepCut 后端
+
+同一 RepCut 分区设计也可调用
+`Session.emit_grhsim_repcut_package(design=..., output=..., top=...)` 生成全 GrhSIM
+仿真包。每个分区分别执行 activity schedule、生成独立 GrhSIM 模型；adapter 将
+各模型 runtime header 隔离在独立编译单元，不在热路径加入虚函数或运行时后端判断。
+端口直接引用各模型自身存储，宽端口采用 `std::array<uint64_t, ceil(width/64)>`。
+
+两个后端共用上述 load / early eval / early update / normal eval / final update
+阶段调度器、CPU 绑定、Host 参与及 all-spin/CV 策略；后端在生成时确定，不混用。
+GrhSIM 包不依赖 Verilator，默认 `make` 构建 `libgrhsim_<top>.a`；
+`grhsim_<top>.hpp` facade 提供公共端口和 `init()/eval()`，可以接入现有 GrhSIM 客户端。
+`init()` 重置模型状态和计时统计；第一个 `eval()` 建立输入边沿基线，初始高电平不视为
+上升沿。常规同步设计应先执行时钟低电平的 eval，再翻转时钟。
+
+生成的 GrhSIM Makefile 对 Clang 21 的 x86/SSE2 向量 shuffle 错误代码生成加入兼容处理：
+目标未启用 SSSE3 时自动追加 `-fno-slp-vectorize`，保留 `-O3` 和循环向量化。
+GCC、其他 Clang 版本、非 x86 目标及显式启用 SSSE3 的构建不追加该选项。
+检测使用调用方的 `CXX/CPPFLAGS/CXXFLAGS`，Verilator 的生成/编译路径不变。
+这是规避已复现的编译器错误，不是 RTL 或分区的特例优化。
+
+当前边界：
+
+- 输入必须是 RepCut 重建后的单层 wrapper 和可由 GrhSIM 发射的叶子分区；原设计不被修改。
+- 固定宽度 logic 端口受支持；inout 不支持。顶层端口名在 C++ 中保留 sanitizer 后的名字，
+  关键字和名称冲突会报错。分区内部端口使用私有规范化名字，因此不受该命名约束。
+- 保留原有跨分区效果依赖检查；不支持 early→early 或 normal→early 的额外依赖链。
+- 不支持分区 waveform 和 GrhSIM 模型内部 perf/profile；框架级分区/阶段计时及
+  `WOLVI_REPCUT_TIMING_JSONL` 仍可使用。请求 `set_runtime_profile_enabled(true)` 明确报错。
+- DPI 延续 GrhSIM 的原生 ABI。当前香山输入的标量 bit/整数/string 导入可接入；不能将
+  任意 Verilator 的 packed-wide/open-array DPI stub 直接作为 GrhSIM stub。外部 DPI
+  实现自身须满足已有的并发调用约束。
+- 当前每个模型的文件句柄表独立，因此 package 明确拒绝
+  `$fopen/$ferror/$fdisplay/$fwrite/$fflush/$fclose`，直到支持共享文件上下文；
+  例外是 `$fdisplay/$fwrite` 使用直接 32 位常量标准流描述符
+  `1` / `0x80000001`（stdout）或 `0x80000002`（stderr），它们不依赖私有句柄表。
+  `$display/$write` 不受此限制，但不同分区输出的先后顺序不保证。
+
+Playground 的 `XS_REPCUT_BACKEND` 默认为 `verilator`；
+`make build_xs_repcut_sim XS_REPCUT_BACKEND=grhsim` 与
+`make run_xs_repcut_sim XS_REPCUT_BACKEND=grhsim XS_EMU_THREADS=32` 选择 GrhSIM。
+也可直接使用 `build_xs_repcut_grhsim` / `run_xs_repcut_grhsim`；产物位于独立的
+`build/xs/repcut-grhsim/{package,work,partitioned-emu}`，不覆盖原 Verilator 产物。
+GrhSIM 管线暂默认使用 `legacy` cost model 和 `none` reg-to-mem 收益筛选，避免把
+Verilator 专用成本估计当作 GrhSIM 成本；现有 Verilator 默认值保持不变。
 
 ## 前置条件
 

@@ -1,6 +1,7 @@
 #include "native/module/methods.hpp"
 
 #include "emit/grhsim_cpp.hpp"
+#include "emit/grhsim_repcut_package.hpp"
 #include "emit/system_verilog.hpp"
 #include "emit/verilator_repcut_package.hpp"
 #include "native/diagnostics/to_python.hpp"
@@ -90,9 +91,12 @@ namespace wolvrix::app::pybind
         const char *designKey = nullptr;
         const char *output = nullptr;
         PyObject *topListObj = Py_None;
-        static const char *kwlist[] = {"session", "design", "output", "top", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|O", const_cast<char **>(kwlist),
-                                         &sessionObj, &designKey, &output, &topListObj))
+        PyObject *provedZeroValueElisionObj = Py_None;
+        static const char *kwlist[] = {
+            "session", "design", "output", "top", "proved_zero_value_elision", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OO", const_cast<char **>(kwlist),
+                                         &sessionObj, &designKey, &output, &topListObj,
+                                         &provedZeroValueElisionObj))
         {
             return nullptr;
         }
@@ -128,6 +132,63 @@ namespace wolvrix::app::pybind
         }
         options.outputDir = outPath.string();
         options.topOverrides = std::move(topNames);
+        if (provedZeroValueElisionObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(provedZeroValueElisionObj);
+            if (enabled < 0) return nullptr;
+            options.attributes["proved_zero_value_elision"] = enabled != 0 ? "1" : "0";
+        }
+
+        const auto result = emitter.emit(*design, options);
+        return makeActionResult(result.success && !diagnostics.hasError(),
+                                diagnostics.messages(),
+                                sessionDesignSourceManager(*session, designKey));
+    }
+
+    PyObject *py_session_emit_grhsim_repcut_package(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
+    {
+        PyObject *sessionObj = nullptr;
+        const char *designKey = nullptr;
+        const char *output = nullptr;
+        PyObject *topListObj = Py_None;
+        static const char *kwlist[] = {"session", "design", "output", "top", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|O", const_cast<char **>(kwlist),
+                                         &sessionObj, &designKey, &output, &topListObj))
+        {
+            return nullptr;
+        }
+        SessionHandle *session = getSessionHandle(sessionObj);
+        if (!session)
+        {
+            return nullptr;
+        }
+        auto *design = sessionDesign(*session, designKey);
+        if (!design)
+        {
+            PyErr_Format(PyExc_KeyError, "design key not found: %s", designKey);
+            return nullptr;
+        }
+
+        std::vector<std::string> topNames;
+        std::string error;
+        if (!parseStringList(topListObj, topNames, error))
+        {
+            PyErr_SetString(PyExc_ValueError, error.c_str());
+            return nullptr;
+        }
+
+        wolvrix::lib::emit::EmitDiagnostics diagnostics;
+        wolvrix::lib::emit::EmitGrhSimRepCutPackage emitter(&diagnostics);
+        wolvrix::lib::emit::EmitOptions options;
+        const std::filesystem::path outPath(output);
+        if (outPath.empty())
+        {
+            PyErr_SetString(PyExc_ValueError,
+                            "emit_grhsim_repcut_package(...) expects an output directory");
+            return nullptr;
+        }
+        options.outputDir = outPath.string();
+        options.topOverrides = std::move(topNames);
 
         const auto result = emitter.emit(*design, options);
         return makeActionResult(result.success && !diagnostics.hasError(),
@@ -152,6 +213,7 @@ namespace wolvrix::app::pybind
         PyObject *inputFullpassSpecializationObj = Py_None;
         PyObject *posedgeFullpassSpecializationObj = Py_None;
         PyObject *fullActiveWordConsumeObj = Py_None;
+        PyObject *fullActiveWordProfileObj = Py_None;
         PyObject *directSingleWriterStateReadsObj = Py_None;
         PyObject *pureEventComputeWordBypassObj = Py_None;
         PyObject *pureEventComputeWordProfileObj = Py_None;
@@ -164,6 +226,8 @@ namespace wolvrix::app::pybind
         const char *sameBatchActivationCohortPolicy = nullptr;
         const char *sameBatchActivationCohortProfilePath = nullptr;
         const char *commitExactEventPolicy = nullptr;
+        PyObject *producerDirtyWordsObj = Py_None;
+        PyObject *provedZeroValueElisionObj = Py_None;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -191,10 +255,13 @@ namespace wolvrix::app::pybind
                                        "same_batch_activation_cohort_policy",
                                        "same_batch_activation_cohort_profile_path",
                                        "commit_exact_event_policy",
+                                       "producer_dirty_words",
+                                       "full_active_word_profile",
+                                       "proved_zero_value_elision",
                                        nullptr};
         if (!PyArg_ParseTupleAndKeywords(args,
                                          kwargs,
-                                         "Oss|OOOOOOOssOOOOOsOOOzzzzzz",
+                                         "Oss|OOOOOOOssOOOOOsOOOzzzzzzOOO",
                                          const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
@@ -222,7 +289,10 @@ namespace wolvrix::app::pybind
                                          &deferredActivationForwardProfilePath,
                                          &sameBatchActivationCohortPolicy,
                                          &sameBatchActivationCohortProfilePath,
-                                         &commitExactEventPolicy))
+                                         &commitExactEventPolicy,
+                                         &producerDirtyWordsObj,
+                                         &fullActiveWordProfileObj,
+                                         &provedZeroValueElisionObj))
         {
             return nullptr;
         }
@@ -407,6 +477,15 @@ namespace wolvrix::app::pybind
             }
             options.attributes["full_active_word_consume"] = enabled != 0 ? "1" : "0";
         }
+        if (fullActiveWordProfileObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(fullActiveWordProfileObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["full_active_word_profile"] = enabled != 0 ? "1" : "0";
+        }
         if (directSingleWriterStateReadsObj != Py_None)
         {
             const int enabled = PyObject_IsTrue(directSingleWriterStateReadsObj);
@@ -415,6 +494,15 @@ namespace wolvrix::app::pybind
                 return nullptr;
             }
             options.attributes["direct_single_writer_state_reads"] = enabled != 0 ? "1" : "0";
+        }
+        if (producerDirtyWordsObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(producerDirtyWordsObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["producer_dirty_words"] = enabled != 0 ? "1" : "0";
         }
         if (pureEventComputeWordBypassObj != Py_None)
         {
@@ -487,6 +575,15 @@ namespace wolvrix::app::pybind
         if (commitExactEventPolicy != nullptr)
         {
             options.attributes["commit_exact_event_policy"] = commitExactEventPolicy;
+        }
+        if (provedZeroValueElisionObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(provedZeroValueElisionObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["proved_zero_value_elision"] = enabled != 0 ? "1" : "0";
         }
 
         const auto result = emitter.emit(*design, options);

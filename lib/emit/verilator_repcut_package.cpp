@@ -1,9 +1,12 @@
 #include "emit/verilator_repcut_package.hpp"
+#include "grhsim_repcut_unit.hpp"
+#include "grhsim_compiler_compat.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -24,6 +27,22 @@ namespace wolvrix::lib::emit
 
     namespace
     {
+        bool environmentFlag(std::string_view name)
+        {
+            const char *value = std::getenv(std::string(name).c_str());
+            if (value == nullptr)
+            {
+                return false;
+            }
+            const std::string normalized = [&]() {
+                std::string text(value);
+                std::transform(text.begin(), text.end(), text.begin(),
+                               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                return text;
+            }();
+            return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+        }
+
         template <typename T>
         std::optional<T> getAttribute(const wolvrix::lib::grh::Operation &op, std::string_view key)
         {
@@ -165,6 +184,10 @@ namespace wolvrix::lib::emit
             std::string sourceSv;
             std::vector<ManifestPort> ports;
             Phase phase = Phase::Normal;
+            // Backend-specific generated model/adapter type. Empty for the
+            // Verilator path; populated deterministically for GrhSIM.
+            std::string backendModelName;
+            std::vector<std::string> trackedInputPorts;
         };
 
         struct UnitShimInfo
@@ -349,6 +372,25 @@ namespace wolvrix::lib::emit
                 candidate = original + "_" + std::to_string(++suffix);
             }
             return candidate;
+        }
+
+        bool isCppKeyword(std::string_view name)
+        {
+            static const std::unordered_set<std::string_view> keywords = {
+                "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor",
+                "bool", "break", "case", "catch", "char", "char8_t", "char16_t", "char32_t",
+                "class", "compl", "concept", "const", "consteval", "constexpr", "constinit",
+                "const_cast", "continue", "co_await", "co_return", "co_yield", "decltype",
+                "default", "delete", "do", "double", "dynamic_cast", "else", "enum", "explicit",
+                "export", "extern", "false", "float", "for", "friend", "goto", "if", "inline",
+                "int", "long", "mutable", "namespace", "new", "noexcept", "not", "not_eq",
+                "nullptr", "operator", "or", "or_eq", "private", "protected", "public",
+                "register", "reinterpret_cast", "requires", "return", "short", "signed",
+                "sizeof", "static", "static_assert", "static_cast", "struct", "switch",
+                "template", "this", "thread_local", "throw", "true", "try", "typedef",
+                "typeid", "typename", "union", "unsigned", "using", "virtual", "void",
+                "volatile", "wchar_t", "while", "xor", "xor_eq"};
+            return keywords.contains(name);
         }
 
         std::string verilatorPublicMemberName(std::string_view svIdentifier)
@@ -647,8 +689,18 @@ namespace wolvrix::lib::emit
             return shim;
         }
 
-        CppSignalDesc cppSignalDesc(int64_t width)
+        CppSignalDesc cppSignalDesc(int64_t width, bool grhSim = false)
         {
+            if (grhSim)
+            {
+                if (width <= 1) return {"bool", false, 0};
+                if (width <= 8) return {"std::uint8_t", false, 0};
+                if (width <= 16) return {"std::uint16_t", false, 0};
+                if (width <= 32) return {"std::uint32_t", false, 0};
+                if (width <= 64) return {"std::uint64_t", false, 0};
+                const auto words = static_cast<std::size_t>((width + 63) / 64);
+                return {"std::array<std::uint64_t, " + std::to_string(words) + ">", true, words};
+            }
             if (width <= 8)
             {
                 return {"CData", false, 0};
@@ -691,9 +743,9 @@ namespace wolvrix::lib::emit
             return out;
         }
 
-        std::string cppConstLiteral(std::string_view literal, int64_t width)
+        std::string cppConstLiteral(std::string_view literal, int64_t width, bool grhSim = false)
         {
-            const auto desc = cppSignalDesc(width);
+            const auto desc = cppSignalDesc(width, grhSim);
             const std::vector<uint32_t> words = parseConstWords(literal, width);
             std::ostringstream out;
             if (!desc.isWide)
@@ -711,13 +763,19 @@ namespace wolvrix::lib::emit
                 return out.str();
             }
             out << desc.typeName << "{";
-            for (std::size_t i = 0; i < words.size(); ++i)
+            for (std::size_t i = 0; i < words.size(); i += grhSim ? 2 : 1)
             {
                 if (i != 0)
                 {
                     out << ", ";
                 }
-                out << "static_cast<WData>(0x" << std::hex << words[i] << "U)";
+                if (grhSim)
+                {
+                    uint64_t word = words[i];
+                    if (i + 1 < words.size()) word |= uint64_t(words[i + 1]) << 32;
+                    out << "static_cast<std::uint64_t>(0x" << std::hex << word << "ULL)";
+                }
+                else out << "static_cast<WData>(0x" << std::hex << words[i] << "U)";
             }
             out << "}";
             return out.str();
@@ -901,8 +959,13 @@ namespace wolvrix::lib::emit
             return chunks;
         }
 
-        WrapperCode generatePartitionedWrapperCode(const PackageManifest &manifest)
+        WrapperCode generatePartitionedWrapperCode(const PackageManifest &manifest,
+                                                   bool grhSim,
+                                                   bool inputDirtyTracking)
         {
+            const std::string simClass = grhSim ? "WolviRepCutGrhSimSim" : "WolviRepCutVerilatorSim";
+            const std::string simStem = grhSim ? "wolvi_repcut_grhsim_sim" : "wolvi_repcut_verilator_sim";
+            const std::string simGuard = grhSim ? "WOLVI_REPCUT_GRHSIM_SIM_H" : "WOLVI_REPCUT_VERILATOR_SIM_H";
             struct UnitInfo
             {
                 std::string instanceName;
@@ -910,6 +973,7 @@ namespace wolvrix::lib::emit
                 std::string modelType;
                 std::unordered_map<std::string, CppSignalDesc> portDescByName;
                 std::unordered_map<std::string, std::string> portCppMemberByName;
+                std::unordered_map<std::string, std::size_t> inputIndexByName;
             };
             struct NamedSignal
             {
@@ -939,15 +1003,22 @@ namespace wolvrix::lib::emit
                                            UnitInfo{
                                                unit.instanceName,
                                                "unit_" + ident + "_",
-                                               "V" + unit.moduleName,
+                                               grhSim && !unit.backendModelName.empty()
+                                                   ? unit.backendModelName
+                                                   : (grhSim ? "G" : "V") + unit.moduleName,
+                                               {},
                                                {},
                                                {},
                                            });
                 auto &unitInfo = unitInfoByInstance.at(unit.instanceName);
                 for (const auto &port : unit.ports)
                 {
-                    unitInfo.portDescByName.emplace(port.name, cppSignalDesc(port.width));
+                    unitInfo.portDescByName.emplace(port.name, cppSignalDesc(port.width, grhSim));
                     unitInfo.portCppMemberByName.emplace(port.name, verilatorPublicMemberName(port.name));
+                }
+                for (std::size_t i = 0; i < unit.trackedInputPorts.size(); ++i)
+                {
+                    unitInfo.inputIndexByName.emplace(unit.trackedInputPorts[i], i);
                 }
             }
 
@@ -993,7 +1064,7 @@ namespace wolvrix::lib::emit
                 NamedSignal signal{
                     port.name,
                     "top_in_" + makeUniqueIdentifier(port.name, usedTopInputIdentifiers) + "_",
-                    cppSignalDesc(port.width),
+                    cppSignalDesc(port.width, grhSim),
                 };
                 topInputByPort.emplace(port.name, signal);
                 topInputs.push_back(std::move(signal));
@@ -1007,7 +1078,7 @@ namespace wolvrix::lib::emit
                 NamedSignal signal{
                     port.name,
                     "top_out_" + makeUniqueIdentifier(port.name, usedTopOutputIdentifiers) + "_",
-                    cppSignalDesc(port.width),
+                    cppSignalDesc(port.width, grhSim),
                 };
                 topOutputByPort.emplace(port.name, signal);
                 topOutputs.push_back(std::move(signal));
@@ -1025,7 +1096,7 @@ namespace wolvrix::lib::emit
                     NamedSignal signal{
                         edge.signal,
                         "const_" + makeUniqueIdentifier(edge.signal, usedConstIdentifiers) + "_",
-                        cppSignalDesc(edge.width),
+                        cppSignalDesc(edge.width, grhSim),
                     };
                     constSignalByName.emplace(edge.signal, signal);
                     constSignals.push_back(std::move(signal));
@@ -1040,13 +1111,26 @@ namespace wolvrix::lib::emit
                                  std::string_view srcExpr,
                                  bool srcIsWide,
                                  std::size_t srcWordCount,
-                                 int indentLevel)
+                                 int indentLevel,
+                                 bool copyChangedValues = false,
+                                 std::string_view changedHook = {})
             {
                 const std::string indent(static_cast<std::size_t>(indentLevel * 2), ' ');
                 if (dstIsWide && srcIsWide)
                 {
-                    out << indent << "copy_wide_words_(" << dstExpr << ", " << srcExpr
-                        << ", " << std::min(dstWordCount, srcWordCount) << ");\n";
+                    if (copyChangedValues && !changedHook.empty())
+                    {
+                        out << indent << "if (copy_tracked_wide_words_("
+                            << dstExpr << ", " << srcExpr
+                            << ", " << std::min(dstWordCount, srcWordCount) << ")) "
+                            << changedHook << ";\n";
+                    }
+                    else
+                    {
+                        out << indent << (copyChangedValues ? "copy_changed_wide_words_(" : "copy_wide_words_(")
+                            << dstExpr << ", " << srcExpr
+                            << ", " << std::min(dstWordCount, srcWordCount) << ");\n";
+                    }
                 }
                 else if (dstIsWide)
                 {
@@ -1055,6 +1139,10 @@ namespace wolvrix::lib::emit
                 else if (srcIsWide)
                 {
                     out << indent << "copy_to_verilated_(" << dstExpr << ", " << srcExpr << ");\n";
+                }
+                else if (copyChangedValues)
+                {
+                    out << indent << "copy_changed_scalar_(" << dstExpr << ", " << srcExpr << ");\n";
                 }
                 else
                 {
@@ -1197,6 +1285,16 @@ namespace wolvrix::lib::emit
                                 out << indent << "// updates from " << instanceName << "\n";
                                 wroteAny = true;
                             }
+                            std::string changedHook;
+                            if (inputDirtyTracking)
+                            {
+                                const auto inputIndexIt = sinkUnitInfo.inputIndexByName.find(sink.portName);
+                                if (inputIndexIt != sinkUnitInfo.inputIndexByName.end())
+                                {
+                                    changedHook = sinkUnitInfo.memberName + "->input_changes_[" +
+                                                  std::to_string(inputIndexIt->second * 64u) + "u] = 1";
+                                }
+                            }
                             emitAssign(out,
                                        sinkUnitInfo.memberName + "->" + sinkUnitInfo.portCppMemberByName.at(sink.portName),
                                        sinkUnitInfo.portDescByName.at(sink.portName).isWide,
@@ -1204,7 +1302,9 @@ namespace wolvrix::lib::emit
                                        srcExpr,
                                        unitInfo.portDescByName.at(edge.driver.portName).isWide,
                                        unitInfo.portDescByName.at(edge.driver.portName).wordCount,
-                                       indentLevel);
+                                       indentLevel,
+                                       grhSim,
+                                       changedHook);
                         }
                     }
                     else if (edge.kind == "unit_to_top")
@@ -1276,7 +1376,7 @@ namespace wolvrix::lib::emit
                         const std::string methodName =
                             makeUniqueIdentifier("run_load_" + instanceName, usedMethodIdentifiers) + "_";
                         std::ostringstream method;
-                        method << "void WolviRepCutVerilatorSim::" << methodName << "(std::size_t workerIndex) {\n";
+                        method << "void " + simClass + "::" << methodName << "(std::size_t workerIndex) {\n";
                         method << "  (void)workerIndex;\n";
                         method << "  PartTimingStats* partTimingStats = &part_timing_stats_["
                                << timingIndexIt->second << "];\n";
@@ -1300,7 +1400,7 @@ namespace wolvrix::lib::emit
                     const std::string methodName =
                         makeUniqueIdentifier("run_eval_" + instanceName, usedMethodIdentifiers) + "_";
                     std::ostringstream method;
-                    method << "void WolviRepCutVerilatorSim::" << methodName << "(std::size_t workerIndex) {\n";
+                    method << "void " + simClass + "::" << methodName << "(std::size_t workerIndex) {\n";
                     method << "  PartTimingStats* partTimingStats = &part_timing_stats_["
                            << timingIndexIt->second << "];\n";
                     method << "  if (phase_parallel_) {\n";
@@ -1310,7 +1410,8 @@ namespace wolvrix::lib::emit
                     method << "  }\n";
                     method << "  const auto evalBegin = WolviClock::now();\n";
                     method << "  // eval " << instanceName << "\n";
-                    method << "  " << unitInfo.memberName << "->eval();\n";
+                    method << "  " << unitInfo.memberName << "->"
+                           << (!unitInfo.inputIndexByName.empty() ? "eval_tracked()" : "eval()") << ";\n";
                     method << "  const auto evalEnd = WolviClock::now();\n";
                     method << "  partTimingStats->eval_ns += elapsed_ns_(evalBegin, evalEnd);\n";
                     method << "  partTimingStats->total_ns += elapsed_ns_(evalBegin, evalEnd);\n";
@@ -1369,7 +1470,7 @@ namespace wolvrix::lib::emit
                                                  usedMethodIdentifiers) +
                             "_";
                         std::ostringstream method;
-                        method << "void WolviRepCutVerilatorSim::" << methodName << "(std::size_t workerIndex) {\n";
+                        method << "void " + simClass + "::" << methodName << "(std::size_t workerIndex) {\n";
                         method << "  PartTimingStats* partTimingStats = &part_timing_stats_["
                                << timingIndexIt->second << "];\n";
                         method << "  if (phase_parallel_) {\n";
@@ -1410,9 +1511,9 @@ namespace wolvrix::lib::emit
             auto updateChunks = chunkEntriesByEstimatedSize(
                 updateMethods, [](const PhaseMethodDef &method) { return method.definition.size(); }, kUpdateChunkTargetBytes);
 
-            auto emitSourcePreamble = [](std::ostream &out, const std::vector<std::string> &modelTypes)
+            auto emitSourcePreamble = [&](std::ostream &out, const std::vector<std::string> &modelTypes)
             {
-                out << "#include \"wolvi_repcut_verilator_sim.h\"\n\n";
+                out << "#include \"" + simStem + ".h\"\n\n";
                 for (const auto &modelType : modelTypes)
                 {
                     out << "#include \"" << modelType << ".h\"\n";
@@ -1424,14 +1525,16 @@ namespace wolvrix::lib::emit
             };
 
             std::ostringstream header;
-            header << "#ifndef WOLVI_REPCUT_VERILATOR_SIM_H\n";
-            header << "#define WOLVI_REPCUT_VERILATOR_SIM_H\n\n";
+            header << "#ifndef " + simGuard + "\n";
+            header << "#define " + simGuard + "\n\n";
             header << "#include <array>\n";
             header << "#include <atomic>\n";
+            if (grhSim) header << "#include <cassert>\n";
             header << "#include <chrono>\n";
             header << "#include <condition_variable>\n";
             header << "#include <cstddef>\n";
             header << "#include <cstdint>\n";
+            if (grhSim) header << "#include <cstring>\n";
             header << "#include <exception>\n";
             header << "#include <memory>\n";
             header << "#include <mutex>\n";
@@ -1439,7 +1542,8 @@ namespace wolvrix::lib::emit
             header << "#include <string>\n";
             header << "#include <thread>\n";
             header << "#include <vector>\n";
-            header << "#include <verilated.h>\n\n";
+            if (!grhSim) header << "#include <verilated.h>\n\n";
+            else header << "\n";
             for (const auto &modelType : modelTypesInOrder)
             {
                 header << "class " << modelType << ";\n";
@@ -1448,10 +1552,16 @@ namespace wolvrix::lib::emit
             {
                 header << "\n";
             }
-            header << "class WolviRepCutVerilatorSim {\n";
+            header << "class " + simClass + " {\n";
             header << "public:\n";
-            header << "  WolviRepCutVerilatorSim();\n";
-            header << "  ~WolviRepCutVerilatorSim();\n";
+            header << "  " + simClass + "();\n";
+            header << "  ~" + simClass + "();\n";
+            if (grhSim)
+            {
+                header << "  void init();\n";
+                header << "  void set_runtime_profile_enabled(bool enabled);\n";
+                header << "  void dump_runtime_profile() const;\n";
+            }
             header << "  void step();\n";
             if (!topInputs.empty())
             {
@@ -1489,7 +1599,7 @@ namespace wolvrix::lib::emit
                 }
             }
             header << "\nprivate:\n";
-            header << "  using StepFn = void (WolviRepCutVerilatorSim::*)(std::size_t);\n";
+            header << "  using StepFn = void (" + simClass + "::*)(std::size_t);\n";
             header << "  using WolviClock = std::chrono::steady_clock;\n\n";
             header << "  template <typename WideDst, typename WideSrc>\n";
             header << "  static void copy_wide_words_(WideDst& dst, const WideSrc& src, std::size_t words) {\n";
@@ -1497,14 +1607,73 @@ namespace wolvrix::lib::emit
             header << "      dst[i] = src[i];\n";
             header << "    }\n";
             header << "  }\n\n";
+            if (grhSim)
+            {
+                // Plain scalar/array port storage has no write side effects. Avoid
+                // taking write ownership of unchanged inter-partition data;
+                // comparing the current destination also handles init/reinit.
+                header << "  template <typename T>\n";
+                header << "  static void copy_changed_scalar_(T& dst, const T& src) {\n";
+                header << "    const T value = src;\n";
+                header << "    if (dst != value) dst = value;\n";
+                header << "  }\n\n";
+                for (unsigned variant = 0; variant < (inputDirtyTracking ? 2u : 1u); ++variant)
+                {
+                    const bool tracked = variant != 0;
+                    header << "  template <std::size_t D, std::size_t S>\n";
+                    header << "  static " << (tracked ? "bool copy_tracked" : "void copy_changed")
+                           << "_wide_words_(std::array<std::uint64_t, D>& dst,\n";
+                    header << "                                       const std::array<std::uint64_t, S>& src, std::size_t words) {\n";
+                    header << "    assert(words <= D && words <= S);\n";
+                    if (tracked)
+                    {
+                        header << "    bool changed = false;\n";
+                    }
+                    header << "    std::size_t offset = 0;\n";
+                    header << "#ifdef __clang__\n";
+                    header << "#pragma clang loop unroll(disable)\n";
+                    header << "#endif\n";
+                    header << "    for (; offset + 8 <= words; offset += 8) {\n";
+                    // Keep this chunk's source values for both comparison and
+                    // conditional stores, avoiding repeated loads/library calls.
+                    header << "      const std::array<std::uint64_t, 8> values{\n";
+                    header << "        src[offset], src[offset+1], src[offset+2], src[offset+3],\n";
+                    header << "        src[offset+4], src[offset+5], src[offset+6], src[offset+7]};\n";
+                    header << "      std::uint64_t difference = 0;\n";
+                    header << "      for (std::size_t i = 0; i < 8; ++i)\n";
+                    header << "        difference |= dst[offset+i] ^ values[i];\n";
+                    header << "      if (difference != 0)" << (tracked ? " {\n" : "\n");
+                    if (tracked)
+                    {
+                        header << "        changed = true;\n";
+                    }
+                    header << "        std::memcpy(dst.data() + offset, values.data(), 64);\n";
+                    if (tracked) header << "      }\n";
+                    header << "    }\n";
+                    header << "    if (offset < words && std::memcmp(dst.data() + offset, src.data() + offset,\n";
+                    header << "                                      (words - offset) * 8) != 0)"
+                           << (tracked ? " {\n" : "\n");
+                    if (tracked)
+                    {
+                        header << "      changed = true;\n";
+                    }
+                    header << "      std::memcpy(dst.data() + offset, src.data() + offset, (words - offset) * 8);\n";
+                    if (tracked)
+                    {
+                        header << "    }\n";
+                        header << "    return changed;\n";
+                    }
+                    header << "  }\n\n";
+                }
+            }
             header << "  template <typename WideDst, std::size_t N>\n";
-            header << "  static void copy_to_verilated_(WideDst& dst, const std::array<WData, N>& src) {\n";
+            header << "  static void copy_to_verilated_(WideDst& dst, const std::array<" << (grhSim ? "std::uint64_t" : "WData") << ", N>& src) {\n";
             header << "    for (std::size_t i = 0; i < N; ++i) {\n";
             header << "      dst[i] = src[i];\n";
             header << "    }\n";
             header << "  }\n\n";
             header << "  template <std::size_t N, typename WideSrc>\n";
-            header << "  static void copy_from_verilated_(std::array<WData, N>& dst, const WideSrc& src) {\n";
+            header << "  static void copy_from_verilated_(std::array<" << (grhSim ? "std::uint64_t" : "WData") << ", N>& dst, const WideSrc& src) {\n";
             header << "    for (std::size_t i = 0; i < N; ++i) {\n";
             header << "      dst[i] = src[i];\n";
             header << "    }\n";
@@ -1614,25 +1783,175 @@ namespace wolvrix::lib::emit
                 header << "  " << signal.desc.typeName << " " << signal.memberName << "{};\n";
             }
             header << "};\n\n";
-            header << "#endif // WOLVI_REPCUT_VERILATOR_SIM_H\n";
+            header << "#endif // " + simGuard + "\n";
 
             std::vector<WrapperCode::SourceFile> sources;
 
             std::ostringstream commonSource;
+            if (grhSim)
+            {
+                // mremap(2) and dl_iterate_phdr(3) are GNU/Linux interfaces.
+                // Define the feature-test macro before the generated header is
+                // included so the declarations are visible to this TU.
+                commonSource << "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE 1\n#endif\n";
+            }
             emitSourcePreamble(commonSource, modelTypesInOrder);
             commonSource << "#include <algorithm>\n";
             commonSource << "#include <cassert>\n";
             commonSource << "#include <cerrno>\n";
             commonSource << "#include <cstdio>\n";
             commonSource << "#include <cstdlib>\n";
+            if (grhSim)
+            {
+                commonSource << "#include <cstring>\n";
+            }
             commonSource << "#include <limits>\n";
             commonSource << "#include <sstream>\n";
             commonSource << "#include <utility>\n";
             commonSource << "#if defined(__linux__)\n";
+            if (grhSim)
+            {
+                commonSource << "#include <link.h>\n";
+                commonSource << "#include <sys/mman.h>\n";
+                commonSource << "#include <unistd.h>\n";
+            }
             commonSource << "#include <pthread.h>\n";
             commonSource << "#include <sched.h>\n";
             commonSource << "#endif\n\n";
             commonSource << "namespace {\n";
+            if (grhSim)
+            {
+                // Keep this mechanism backend-local: the Verilator wrapper is
+                // deliberately generated without any text remapping code.
+                // The remap happens once, before the phase worker pool is
+                // created.  It preserves both virtual addresses and bytes,
+                // while replacing complete 2 MiB-aligned RX ranges of the
+                // main executable with anonymous THP-backed pages.
+                commonSource << "#if defined(__linux__)\n";
+                commonSource << "constexpr std::uintptr_t wolvi_repcut_code_huge_page = 2u * 1024u * 1024u;\n";
+                commonSource << "#ifndef MADV_COLLAPSE\n";
+                commonSource << "constexpr int wolvi_repcut_madv_collapse = 25;\n";
+                commonSource << "#else\n";
+                commonSource << "constexpr int wolvi_repcut_madv_collapse = MADV_COLLAPSE;\n";
+                commonSource << "#endif\n";
+                commonSource << "struct WolviRepCutCodePageResult {\n";
+                commonSource << "  bool mainExecutableSeen{false};\n";
+                commonSource << "  bool mapped{false};\n";
+                commonSource << "  std::uintptr_t begin{};\n";
+                commonSource << "  std::size_t bytes{};\n";
+                commonSource << "  int error{};\n";
+                commonSource << "};\n\n";
+                commonSource << "inline bool wolvi_repcut_code_hugepages_disabled() {\n";
+                commonSource << "  const char* value = std::getenv(\"WOLVI_GRHSIM_CODE_HUGEPAGE\");\n";
+                commonSource << "  if (value == nullptr || *value == '\\0') return false;\n";
+                commonSource << "  return std::strcmp(value, \"0\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"off\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"false\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"disable\") == 0 ||\n";
+                commonSource << "         std::strcmp(value, \"native\") == 0;\n";
+                commonSource << "}\n\n";
+                commonSource << "inline void wolvi_repcut_unmap_code_copy(void* copy, std::size_t bytes) {\n";
+                commonSource << "  if (copy != MAP_FAILED && copy != nullptr) {\n";
+                commonSource << "    (void)munmap(copy, bytes);\n";
+                commonSource << "  }\n";
+                commonSource << "}\n\n";
+                commonSource << "inline bool wolvi_repcut_map_code_range(\n";
+                commonSource << "    std::uintptr_t begin, std::uintptr_t end, int* error) {\n";
+                commonSource << "  const std::size_t bytes = static_cast<std::size_t>(end - begin);\n";
+                commonSource << "  void* reserve = mmap(nullptr, bytes + wolvi_repcut_code_huge_page,\n";
+                commonSource << "                      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n";
+                commonSource << "  if (reserve == MAP_FAILED) { if (error) *error = errno; return false; }\n";
+                commonSource << "  const auto raw = reinterpret_cast<std::uintptr_t>(reserve);\n";
+                commonSource << "  const auto aligned = (raw + wolvi_repcut_code_huge_page - 1) &\n";
+                commonSource << "                      ~(wolvi_repcut_code_huge_page - 1);\n";
+                commonSource << "  if (aligned > raw && munmap(reserve, aligned - raw) != 0) {\n";
+                commonSource << "    if (error) *error = errno;\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  const auto tail = raw + bytes + wolvi_repcut_code_huge_page - (aligned + bytes);\n";
+                commonSource << "  if (tail != 0 && munmap(reinterpret_cast<void*>(aligned + bytes), tail) != 0) {\n";
+                commonSource << "    if (error) *error = errno;\n";
+                commonSource << "    (void)munmap(reinterpret_cast<void*>(aligned), bytes);\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  void* copy = reinterpret_cast<void*>(aligned);\n";
+                commonSource << "  if (madvise(copy, bytes, MADV_HUGEPAGE) != 0) {\n";
+                commonSource << "    if (error) *error = errno;\n";
+                commonSource << "    wolvi_repcut_unmap_code_copy(copy, bytes);\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  std::memcpy(copy, reinterpret_cast<const void*>(begin), bytes);\n";
+                commonSource << "  if (std::memcmp(copy, reinterpret_cast<const void*>(begin), bytes) != 0) {\n";
+                commonSource << "    if (error) *error = EIO;\n";
+                commonSource << "    wolvi_repcut_unmap_code_copy(copy, bytes);\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  if (madvise(copy, bytes, wolvi_repcut_madv_collapse) != 0) {\n";
+                commonSource << "    if (error) *error = errno;\n";
+                commonSource << "    wolvi_repcut_unmap_code_copy(copy, bytes);\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  if (mprotect(copy, bytes, PROT_READ | PROT_EXEC) != 0) {\n";
+                commonSource << "    if (error) *error = errno;\n";
+                commonSource << "    wolvi_repcut_unmap_code_copy(copy, bytes);\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  void* remapped = mremap(copy, bytes, bytes, MREMAP_MAYMOVE | MREMAP_FIXED,\n";
+                commonSource << "                         reinterpret_cast<void*>(begin));\n";
+                commonSource << "  if (remapped == MAP_FAILED || remapped != reinterpret_cast<void*>(begin)) {\n";
+                commonSource << "    if (error) *error = errno;\n";
+                commonSource << "    wolvi_repcut_unmap_code_copy(copy, bytes);\n";
+                commonSource << "    return false;\n";
+                commonSource << "  }\n";
+                commonSource << "  return true;\n";
+                commonSource << "}\n\n";
+                commonSource << "inline int wolvi_repcut_codepage_visit(\n";
+                commonSource << "    dl_phdr_info* info, std::size_t, void* opaque) {\n";
+                commonSource << "  if (info->dlpi_name != nullptr && *info->dlpi_name != '\\0') return 0;\n";
+                commonSource << "  auto& result = *static_cast<WolviRepCutCodePageResult*>(opaque);\n";
+                commonSource << "  for (std::size_t index = 0; index < info->dlpi_phnum; ++index) {\n";
+                commonSource << "    const auto& ph = info->dlpi_phdr[index];\n";
+                commonSource << "    if (ph.p_type != PT_LOAD || (ph.p_flags & (PF_R | PF_X)) != (PF_R | PF_X) ||\n";
+                commonSource << "        (ph.p_flags & PF_W) != 0) continue;\n";
+                commonSource << "    const auto lo = static_cast<std::uintptr_t>(info->dlpi_addr + ph.p_vaddr);\n";
+                commonSource << "    const auto hi = lo + static_cast<std::uintptr_t>(ph.p_memsz);\n";
+                commonSource << "    const auto begin = (lo + wolvi_repcut_code_huge_page - 1) &\n";
+                commonSource << "                      ~(wolvi_repcut_code_huge_page - 1);\n";
+                commonSource << "    const auto end = hi & ~(wolvi_repcut_code_huge_page - 1);\n";
+                commonSource << "    if (begin >= end) continue;\n";
+                commonSource << "    result.mainExecutableSeen = true;\n";
+                commonSource << "    result.begin = begin;\n";
+                commonSource << "    result.bytes = static_cast<std::size_t>(end - begin);\n";
+                commonSource << "    result.mapped = wolvi_repcut_map_code_range(begin, end, &result.error);\n";
+                commonSource << "    return 1;\n";
+                commonSource << "  }\n";
+                commonSource << "  return 0;\n";
+                commonSource << "}\n\n";
+                commonSource << "inline void wolvi_repcut_enable_code_hugepages() {\n";
+                commonSource << "  static std::once_flag once;\n";
+                commonSource << "  std::call_once(once, []() {\n";
+                commonSource << "    if (wolvi_repcut_code_hugepages_disabled()) {\n";
+                commonSource << "      std::fprintf(stderr, \"[WOLVI][codepage] disabled by WOLVI_GRHSIM_CODE_HUGEPAGE\\n\");\n";
+                commonSource << "      return;\n";
+                commonSource << "    }\n";
+                commonSource << "    WolviRepCutCodePageResult result;\n";
+                commonSource << "    (void)dl_iterate_phdr(wolvi_repcut_codepage_visit, &result);\n";
+                commonSource << "    if (result.mapped) {\n";
+                commonSource << "      std::fprintf(stderr, \"[WOLVI][codepage] enabled=thp bytes=%zu begin=%zx\\n\",\n";
+                commonSource << "                   result.bytes, static_cast<std::size_t>(result.begin));\n";
+                commonSource << "    } else if (result.mainExecutableSeen) {\n";
+                commonSource << "      const int error = result.error != 0 ? result.error : EINVAL;\n";
+                commonSource << "      std::fprintf(stderr, \"[WOLVI][codepage] fallback=native reason=%s\\n\", std::strerror(error));\n";
+                commonSource << "    } else {\n";
+                commonSource << "      std::fprintf(stderr, \"[WOLVI][codepage] fallback=native reason=no-complete-2MiB-RX-range\\n\");\n";
+                commonSource << "    }\n";
+                commonSource << "    std::fflush(stderr);\n";
+                commonSource << "  });\n";
+                commonSource << "}\n";
+                commonSource << "#else\n";
+                commonSource << "inline void wolvi_repcut_enable_code_hugepages() {}\n";
+                commonSource << "#endif\n\n";
+            }
             commonSource << "inline std::vector<int> wolvi_repcut_available_cpus() {\n";
             commonSource << "#if defined(__linux__)\n";
             commonSource << "  cpu_set_t mask;\n";
@@ -1839,15 +2158,15 @@ namespace wolvrix::lib::emit
                 const auto edgeIt = std::find_if(manifest.connections.begin(), manifest.connections.end(),
                                                  [&](const ManifestEdge &edge) { return edge.signal == signal.originalName; });
                 const int64_t width = edgeIt != manifest.connections.end() ? edgeIt->width : 1;
-                commonSource << "const " << signal.desc.typeName << " WolviRepCutVerilatorSim::" << signal.memberName
-                             << " = " << cppConstLiteral(constLiteralBySignal.at(signal.originalName), width) << ";\n";
+                commonSource << "const " << signal.desc.typeName << " " + simClass + "::" << signal.memberName
+                             << " = " << cppConstLiteral(constLiteralBySignal.at(signal.originalName), width, grhSim) << ";\n";
             }
             if (!constSignals.empty())
             {
                 commonSource << "\n";
             }
 
-            commonSource << "WolviRepCutVerilatorSim::WolviRepCutVerilatorSim()\n";
+            commonSource << "" + simClass + "::" + simClass + "()\n";
             if (!manifest.units.empty())
             {
                 commonSource << "  : ";
@@ -1863,6 +2182,10 @@ namespace wolvrix::lib::emit
                 }
             }
             commonSource << " {\n";
+            if (grhSim)
+            {
+                commonSource << "  wolvi_repcut_enable_code_hugepages();\n";
+            }
             for (const auto &instanceName : evalOrder)
             {
                 emitConstLoadsForUnit(commonSource, instanceName, 1);
@@ -1870,17 +2193,42 @@ namespace wolvrix::lib::emit
             commonSource << "  register_step_fns_();\n";
             commonSource << "  initialize_phase_workers_();\n";
             commonSource << "}\n\n";
-            commonSource << "WolviRepCutVerilatorSim::~WolviRepCutVerilatorSim() {\n";
+            if (grhSim)
+            {
+                commonSource << "void " + simClass + "::init() {\n";
+                for (const auto &unit : manifest.units)
+                    commonSource << "  " << unitInfoByInstance.at(unit.instanceName).memberName << "->init();\n";
+                for (const auto &instanceName : evalOrder)
+                    emitConstLoadsForUnit(commonSource, instanceName, 1);
+                for (const auto &signal : topInputs)
+                    commonSource << "  " << signal.memberName << " = {};\n";
+                for (const auto &signal : topOutputs)
+                    commonSource << "  " << signal.memberName << " = {};\n";
+                commonSource << "  step_count_ = 0;\n  step_timing_ = {};\n  part_timing_stats_ = {};\n";
+                commonSource << "  for (auto& stats : part_timing_worker_stats_) stats = {};\n";
+                commonSource << "}\n\n";
+                commonSource << "void " + simClass + "::set_runtime_profile_enabled(bool enabled) {\n";
+                for (const auto &unit : manifest.units)
+                    commonSource << "  " << unitInfoByInstance.at(unit.instanceName).memberName
+                                 << "->set_runtime_profile_enabled(enabled);\n";
+                commonSource << "}\n\n";
+                commonSource << "void " + simClass + "::dump_runtime_profile() const {\n";
+                for (const auto &unit : manifest.units)
+                    commonSource << "  " << unitInfoByInstance.at(unit.instanceName).memberName
+                                 << "->dump_runtime_profile();\n";
+                commonSource << "}\n\n";
+            }
+            commonSource << "" + simClass + "::~" + simClass + "() {\n";
             commonSource << "  report_step_timing_();\n";
             commonSource << "  report_part_timing_();\n";
             commonSource << "  dump_timing_jsonl_();\n";
             commonSource << "  shutdown_phase_workers_();\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::register_step_fns_() {\n";
+            commonSource << "void " + simClass + "::register_step_fns_() {\n";
             commonSource << "  load_step_fns_.reserve(" << loadMethods.size() << ");\n";
             for (const auto &method : loadMethods)
             {
-                commonSource << "  load_step_fns_.push_back(&WolviRepCutVerilatorSim::" << method.methodName
+                commonSource << "  load_step_fns_.push_back(&" + simClass + "::" << method.methodName
                              << ");\n";
             }
             const std::size_t earlyEvalMethodCount = static_cast<std::size_t>(std::count_if(
@@ -1900,7 +2248,7 @@ namespace wolvrix::lib::emit
                 commonSource << "  "
                              << (method.phase == ManifestUnit::Phase::Early ? "early_eval_step_fns_"
                                                                            : "normal_eval_step_fns_")
-                             << ".push_back(&WolviRepCutVerilatorSim::" << method.methodName
+                             << ".push_back(&" + simClass + "::" << method.methodName
                              << ");\n";
             }
             commonSource << "  early_update_step_fns_.reserve(" << earlyUpdateMethodCount << ");\n";
@@ -1910,11 +2258,11 @@ namespace wolvrix::lib::emit
                 commonSource << "  "
                              << (method.phase == ManifestUnit::Phase::Early ? "early_update_step_fns_"
                                                                            : "normal_update_step_fns_")
-                             << ".push_back(&WolviRepCutVerilatorSim::" << method.methodName
+                             << ".push_back(&" + simClass + "::" << method.methodName
                              << ");\n";
             }
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::initialize_phase_workers_() {\n";
+            commonSource << "void " + simClass + "::initialize_phase_workers_() {\n";
             commonSource << "  const std::size_t requestedWorkers = wolvi_repcut_requested_workers();\n";
             commonSource << "  const std::size_t maxParallelFns = std::max({early_eval_step_fns_.size(), early_update_step_fns_.size(), normal_eval_step_fns_.size(), normal_update_step_fns_.size()});\n";
             commonSource << "  if (requestedWorkers > " << manifest.units.size() << ") {\n";
@@ -1998,7 +2346,7 @@ namespace wolvrix::lib::emit
             commonSource << "    throw;\n";
             commonSource << "  }\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::shutdown_phase_workers_() {\n";
+            commonSource << "void " + simClass + "::shutdown_phase_workers_() {\n";
             commonSource << "  if (phase_workers_) {\n";
             commonSource << "    for (std::size_t workerIndex = 0; workerIndex < phase_worker_count_; ++workerIndex) {\n";
             commonSource << "      auto &worker = phase_workers_[workerIndex];\n";
@@ -2041,7 +2389,7 @@ namespace wolvrix::lib::emit
             commonSource << "  phase_host_spin_overridden_ = false;\n";
             commonSource << "  phase_worker_spin_overridden_ = false;\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::phase_worker_loop_(std::size_t workerIndex) {\n";
+            commonSource << "void " + simClass + "::phase_worker_loop_(std::size_t workerIndex) {\n";
             commonSource << "  auto &worker = phase_workers_[workerIndex];\n";
             commonSource << "  while (true) {\n";
             commonSource << "    if (phase_worker_spin_infinite_) {\n";
@@ -2095,12 +2443,12 @@ namespace wolvrix::lib::emit
             commonSource << "    worker.cv.notify_one();\n";
             commonSource << "  }\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::run_host_phase_(const std::vector<StepFn>& phaseFns) {\n";
+            commonSource << "void " + simClass + "::run_host_phase_(const std::vector<StepFn>& phaseFns) {\n";
             commonSource << "  for (const auto stepFn : phaseFns) {\n";
             commonSource << "    (this->*stepFn)(0);\n";
             commonSource << "  }\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::run_phase_batch_(const std::vector<StepFn>& phaseFns,\n";
+            commonSource << "void " + simClass + "::run_phase_batch_(const std::vector<StepFn>& phaseFns,\n";
             commonSource << "                                            std::size_t workerIndex,\n";
             commonSource << "                                            std::size_t workerCount) {\n";
             commonSource << "  if (workerCount == 0 || phaseFns.empty()) {\n";
@@ -2112,7 +2460,7 @@ namespace wolvrix::lib::emit
             commonSource << "    (this->*phaseFns[index])(workerIndex);\n";
             commonSource << "  }\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::run_phase_workers_(const std::vector<StepFn>& phaseFns) {\n";
+            commonSource << "void " + simClass + "::run_phase_workers_(const std::vector<StepFn>& phaseFns) {\n";
             commonSource << "  if (phaseFns.empty()) {\n";
             commonSource << "    return;\n";
             commonSource << "  }\n";
@@ -2127,9 +2475,17 @@ namespace wolvrix::lib::emit
             commonSource << "        continue;\n";
             commonSource << "      }\n";
             commonSource << "      auto &worker = phase_workers_[workerIndex];\n";
-            commonSource << "      {\n";
+            commonSource << "      if (phase_host_spin_infinite_ && phase_worker_spin_infinite_) {\n";
+            commonSource << "        // Startup or the previous completion already synchronized this worker.\n";
+            commonSource << "        // The next workFast release publishes the error reset.\n";
+            commonSource << "        worker.error = nullptr;\n";
+            commonSource << "      } else {\n";
             commonSource << "        std::lock_guard<std::mutex> lock(worker.mutex);\n";
             commonSource << "        worker.error = nullptr;\n";
+            commonSource << "        // A spinning worker may still signal a Host waiting on the CV.\n";
+            commonSource << "        if (phase_worker_spin_infinite_) {\n";
+            commonSource << "          worker.completed = false;\n";
+            commonSource << "        }\n";
             commonSource << "      }\n";
             commonSource << "      worker.completedFast.store(false, std::memory_order_relaxed);\n";
             commonSource << "      if (phase_worker_spin_infinite_) {\n";
@@ -2192,7 +2548,7 @@ namespace wolvrix::lib::emit
             commonSource << "    throw;\n";
             commonSource << "  }\n";
             commonSource << "}\n\n";
-            commonSource << "WolviRepCutVerilatorSim::PartTimingStats WolviRepCutVerilatorSim::collect_part_timing_stats_(std::size_t partIndex) const {\n";
+            commonSource << "" + simClass + "::PartTimingStats " + simClass + "::collect_part_timing_stats_(std::size_t partIndex) const {\n";
             commonSource << "  PartTimingStats total = part_timing_stats_[partIndex];\n";
             commonSource << "  for (const auto& workerStats : part_timing_worker_stats_) {\n";
             commonSource << "    total.input_apply_ns += workerStats[partIndex].input_apply_ns;\n";
@@ -2202,7 +2558,7 @@ namespace wolvrix::lib::emit
             commonSource << "  }\n";
             commonSource << "  return total;\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::report_step_timing_() const {\n";
+            commonSource << "void " + simClass + "::report_step_timing_() const {\n";
             commonSource << "  if (step_timing_.steps == 0) {\n";
             commonSource << "    return;\n";
             commonSource << "  }\n";
@@ -2229,7 +2585,7 @@ namespace wolvrix::lib::emit
             commonSource << "  printPhase(\"part_eval\", step_timing_.part_eval_ns);\n";
             commonSource << "  printPhase(\"global_update\", step_timing_.global_update_ns);\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::report_part_timing_() const {\n";
+            commonSource << "void " + simClass + "::report_part_timing_() const {\n";
             commonSource << "  if (step_count_ == 0) {\n";
             commonSource << "    return;\n";
             commonSource << "  }\n";
@@ -2265,7 +2621,7 @@ namespace wolvrix::lib::emit
             commonSource << "                 updatePushAvgUs);\n";
             commonSource << "  }\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::dump_timing_jsonl_() const {\n";
+            commonSource << "void " + simClass + "::dump_timing_jsonl_() const {\n";
             commonSource << "  const char* path = std::getenv(\"WOLVI_REPCUT_TIMING_JSONL\");\n";
             commonSource << "  if (path == nullptr || *path == '\\0') {\n";
             commonSource << "    return;\n";
@@ -2341,12 +2697,23 @@ namespace wolvrix::lib::emit
             commonSource << "  }\n";
             commonSource << "  std::fclose(file);\n";
             commonSource << "}\n\n";
-            commonSource << "void WolviRepCutVerilatorSim::step() {\n";
+            commonSource << "void " + simClass + "::step() {\n";
             commonSource << "  ++step_count_;\n";
             commonSource << "  ++step_timing_.steps;\n";
             commonSource << "  const auto stepBegin = WolviClock::now();\n";
             commonSource << "  const auto inputLoadBegin = stepBegin;\n";
-            commonSource << "  run_host_phase_(load_step_fns_);\n";
+            if (grhSim)
+            {
+                // Each GrhSIM load method writes only one partition's top-input
+                // fields. Dispatch this independent fanout through the same
+                // all-spin worker pool used by the eval/update phases.
+                commonSource << "  run_phase_workers_(load_step_fns_);\n";
+            }
+            else
+            {
+                // Keep the Verilator wrapper's established Host-only load path.
+                commonSource << "  run_host_phase_(load_step_fns_);\n";
+            }
             commonSource << "  const auto inputLoadEnd = WolviClock::now();\n";
             commonSource << "  step_timing_.input_load_ns += elapsed_ns_(inputLoadBegin, inputLoadEnd);\n";
             commonSource << "  const auto earlyEvalBegin = inputLoadEnd;\n";
@@ -2368,7 +2735,7 @@ namespace wolvrix::lib::emit
             commonSource << "  step_timing_.total_ns += elapsed_ns_(stepBegin, finalUpdateEnd);\n";
             commonSource << "}\n";
             sources.push_back(WrapperCode::SourceFile{
-                "wolvi_repcut_verilator_sim_common.cpp",
+                "" + simStem + "_common.cpp",
                 commonSource.str(),
             });
 
@@ -2394,7 +2761,7 @@ namespace wolvrix::lib::emit
                     chunkSource << loadMethods[methodIndex].definition << "\n";
                 }
                 sources.push_back(WrapperCode::SourceFile{
-                    "wolvi_repcut_verilator_sim_load_" + std::to_string(chunkIndex) + ".cpp",
+                    "" + simStem + "_load_" + std::to_string(chunkIndex) + ".cpp",
                     chunkSource.str(),
                 });
             }
@@ -2421,7 +2788,7 @@ namespace wolvrix::lib::emit
                     chunkSource << evalMethods[methodIndex].definition << "\n";
                 }
                 sources.push_back(WrapperCode::SourceFile{
-                    "wolvi_repcut_verilator_sim_eval_" + std::to_string(chunkIndex) + ".cpp",
+                    "" + simStem + "_eval_" + std::to_string(chunkIndex) + ".cpp",
                     chunkSource.str(),
                 });
             }
@@ -2448,7 +2815,7 @@ namespace wolvrix::lib::emit
                     chunkSource << updateMethods[methodIndex].definition << "\n";
                 }
                 sources.push_back(WrapperCode::SourceFile{
-                    "wolvi_repcut_verilator_sim_update_" + std::to_string(chunkIndex) + ".cpp",
+                    "" + simStem + "_update_" + std::to_string(chunkIndex) + ".cpp",
                     chunkSource.str(),
                 });
             }
@@ -2589,16 +2956,82 @@ namespace wolvrix::lib::emit
             return BuildGlueCode{smokeMain.str(), unitsMk.str(), makefile.str()};
         }
 
+        // A facade with the native GrhSIM public-port API lets existing clients
+        // consume the package without including any partition's runtime header.
+        std::string generateGrhSimFacade(const PackageManifest &manifest)
+        {
+            std::ostringstream out;
+            out << "#pragma once\n#include \"wolvi_repcut_grhsim_sim.h\"\n\n";
+            out << "#if defined(WOLVRIX_GRHSIM_PERF) && WOLVRIX_GRHSIM_PERF\n";
+            out << "#error GrhSIM RepCut does not support per-model perf counters\n#endif\n";
+            out << "#ifndef WOLVRIX_GRHSIM_PERF\n#define WOLVRIX_GRHSIM_PERF 0\n#endif\n\n";
+            out << "class GrhSIM_" << manifest.topModule << " final {\n";
+            out << "  WolviRepCutGrhSimSim model_;\npublic:\n";
+            for (const auto &port : manifest.topInputs)
+                out << "  " << cppSignalDesc(port.width, true).typeName << " "
+                    << sanitizeIdentifier(port.name) << "{};\n";
+            for (const auto &port : manifest.topOutputs)
+                out << "  " << cppSignalDesc(port.width, true).typeName << " "
+                    << sanitizeIdentifier(port.name) << "{};\n";
+            out << "  void init() {\n    model_.init();\n";
+            for (const auto &port : manifest.topInputs)
+                out << "    " << sanitizeIdentifier(port.name) << " = {};\n";
+            for (const auto &port : manifest.topOutputs)
+                out << "    " << sanitizeIdentifier(port.name) << " = {};\n";
+            out << "  }\n";
+            out << "  void eval() {\n";
+            for (const auto &port : manifest.topInputs)
+                out << "    model_.set_" << sanitizeIdentifier(port.name) << "("
+                    << sanitizeIdentifier(port.name) << ");\n";
+            out << "    model_.step();\n";
+            for (const auto &port : manifest.topOutputs)
+                out << "    " << sanitizeIdentifier(port.name) << " = model_.get_"
+                    << sanitizeIdentifier(port.name) << "();\n";
+            out << "  }\n";
+            out << "  void set_runtime_profile_enabled(bool enabled) { model_.set_runtime_profile_enabled(enabled); }\n";
+            out << "  void dump_runtime_profile() const { model_.dump_runtime_profile(); }\n";
+            out << "};\n";
+            return out.str();
+        }
+
+        std::string generateGrhSimMakefile(const PackageManifest &manifest,
+                                           const std::vector<std::string> &sources)
+        {
+            std::ostringstream out;
+            out << "CXX ?= c++\nAR ?= ar\nARFLAGS = rcs\n";
+            out << "CXXFLAGS ?= -std=c++20 -O3\nCPPFLAGS ?=\n";
+            emitGrhSimCompilerCompatibilityMakefile(out);
+            out << "LIB := libgrhsim_" << manifest.topModule << ".a\nSRCS :=";
+            for (const auto &source : sources) out << " " << source;
+            out << "\nOBJS := $(SRCS:.cpp=.o)\nDEPS := $(OBJS:.o=.d)\n";
+            out << ".DEFAULT_GOAL := all\n.DELETE_ON_ERROR:\n\nall: $(LIB)\n\n";
+            out << "$(LIB): $(OBJS) Makefile\n";
+            out << "\t$(RM) $@\n\t$(AR) $(ARFLAGS) $@ $(OBJS)\n\n";
+            out << "%.o: %.cpp Makefile\n";
+            out << "\t$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GRHSIM_COMPILER_FLAGS) -I. -pthread -MMD -MP -c $< -o $@\n\n";
+            out << "clean:\n\t$(RM) $(OBJS) $(DEPS) $(LIB)\n\n";
+            out << "-include $(DEPS)\n.PHONY: all clean\n";
+            return out.str();
+        }
+
     } // namespace
 
     EmitResult EmitVerilatorRepCutPackage::emitImpl(const wolvrix::lib::grh::Design &design,
                                                     std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
                                                     const EmitOptions &options)
     {
+        return emitPackage(design, topGraphs, options, false);
+    }
+
+    EmitResult EmitVerilatorRepCutPackage::emitPackage(const wolvrix::lib::grh::Design &design,
+                                                      std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
+                                                      const EmitOptions &options, bool grhSim)
+    {
         EmitResult result;
         if (topGraphs.size() != 1 || topGraphs.front() == nullptr)
         {
-            reportError("emitVerilatorRepCutPackage expects exactly one top graph");
+            reportError(grhSim ? "emitGrhSimRepCutPackage expects exactly one top graph"
+                               : "emitVerilatorRepCutPackage expects exactly one top graph");
             result.success = false;
             return result;
         }
@@ -2606,6 +3039,109 @@ namespace wolvrix::lib::emit
         const wolvrix::lib::grh::Graph &topGraph = *topGraphs.front();
         const std::filesystem::path packageDir = resolveOutputDir(options);
         const std::filesystem::path svDir = packageDir / "sv";
+
+        if (grhSim)
+        {
+            if (!topGraph.inoutPorts().empty())
+            {
+                reportError("GrhSIM RepCut does not support top-level inout ports", topGraph.symbol());
+                result.success = false;
+                return result;
+            }
+            for (const auto &[attribute, value] : options.attributes)
+            {
+                if ((attribute != "proved_zero_value_elision" && attribute != "input_dirty_tracking") ||
+                    (value != "0" && value != "1"))
+                {
+                    reportError("GrhSIM RepCut accepts only proved_zero_value_elision and input_dirty_tracking "
+                                "emitter attributes with values 0 or 1; "
+                                "waveform and per-model perf are disabled");
+                    result.success = false;
+                    return result;
+                }
+            }
+            std::unordered_set<std::string> facadeNames = {
+                "model_", "init", "eval", "set_runtime_profile_enabled", "dump_runtime_profile",
+                "WOLVRIX_GRHSIM_PERF", "WOLVI_REPCUT_GRHSIM_SIM_H", "WolviRepCutGrhSimSim",
+                "GrhSIM_" + sanitizeIdentifier(topGraph.symbol())};
+            const auto validPort = [&](const auto &port) {
+                const std::string name = sanitizeIdentifier(port.name);
+                if (isCppKeyword(name) || !facadeNames.insert(name).second)
+                {
+                    reportError("GrhSIM RepCut top port has a reserved or colliding C++ name", port.name);
+                    return false;
+                }
+                if (topGraph.valueType(port.value) != wolvrix::lib::grh::ValueType::Logic ||
+                    topGraph.valueWidth(port.value) <= 0)
+                {
+                    reportError("GrhSIM RepCut top ports must be fixed-width logic values", port.name);
+                    return false;
+                }
+                return true;
+            };
+            for (const auto &port : topGraph.inputPorts())
+                if (!validPort(port)) { result.success = false; return result; }
+            for (const auto &port : topGraph.outputPorts())
+                if (!validPort(port)) { result.success = false; return result; }
+
+            // GrhSIM currently owns its file-handle table inside each model.
+            // Passing the numeric handle across a partition boundary would
+            // silently resolve it in a different table. Fixed standard output
+            // descriptors need no table; reject operations that do until a
+            // shared package runtime exists;
+            // do this before emitting any unit or wrapper artifacts.
+            static const std::unordered_set<std::string_view> fileHandleOperations = {
+                "fopen", "ferror", "fdisplay", "fwrite", "fflush", "fclose"};
+            for (const auto *reachableGraph : reachableGraphsFromTops(design, topGraphs))
+            {
+                for (const auto opId : reachableGraph->operations())
+                {
+                    const auto kind = reachableGraph->opKind(opId);
+                    if (kind != wolvrix::lib::grh::OperationKind::kSystemFunction &&
+                        kind != wolvrix::lib::grh::OperationKind::kSystemTask)
+                    {
+                        continue;
+                    }
+                    const auto name = getAttribute<std::string>(reachableGraph->getOperation(opId), "name");
+                    if (name && fileHandleOperations.contains(*name))
+                    {
+                        // Operand 0 is callCond; operand 1 is the descriptor.
+                        // Only direct, known standard streams need no table.
+                        const auto operands = reachableGraph->opOperands(opId);
+                        if ((*name == "fwrite" || *name == "fdisplay") && operands.size() >= 2 &&
+                            reachableGraph->valueType(operands[1]) == wolvrix::lib::grh::ValueType::Logic &&
+                            reachableGraph->valueWidth(operands[1]) == 32)
+                        {
+                            const auto def = reachableGraph->valueDef(operands[1]);
+                            if (def.valid() && reachableGraph->opKind(def) == wolvrix::lib::grh::OperationKind::kConstant)
+                            {
+                                const auto literal = getAttribute<std::string>(
+                                    reachableGraph->getOperation(def), "constValue");
+                                if (literal)
+                                {
+                                    try
+                                    {
+                                        const auto descriptor = slang::SVInt::fromString(*literal).resize(32);
+                                        if (!descriptor.hasUnknown())
+                                        {
+                                            const auto raw = descriptor.getRawPtr()[0];
+                                            if (raw == UINT64_C(1) || raw == UINT64_C(0x80000001) ||
+                                                raw == UINT64_C(0x80000002)) continue;
+                                        }
+                                    }
+                                    catch (const std::exception &) {}
+                                }
+                            }
+                        }
+                        reportError("GrhSIM RepCut does not support $" + *name +
+                                        ": file handles are model-local and no shared package file-handle context exists",
+                                    reachableGraph->symbol() + "." + opSymbolRequired(*reachableGraph, opId));
+                        result.success = false;
+                        return result;
+                    }
+                }
+            }
+        }
 
         EmitSystemVerilog svEmitter(diagnostics());
         EmitOptions svOptions = options;
@@ -2615,7 +3151,7 @@ namespace wolvrix::lib::emit
         svOptions.topOverrides.clear();
         svOptions.topOverrides.push_back(topGraph.symbol());
 
-        const EmitResult svResult = svEmitter.emit(design, svOptions);
+        const EmitResult svResult = grhSim ? EmitResult{} : svEmitter.emit(design, svOptions);
         if (!svResult.success)
         {
             result.success = false;
@@ -2625,7 +3161,7 @@ namespace wolvrix::lib::emit
 
         const std::vector<const wolvrix::lib::grh::Graph *> emittedGraphs =
             reachableGraphsFromTops(design, topGraphs);
-        if (emittedGraphs.size() != svResult.artifacts.size())
+        if (!grhSim && emittedGraphs.size() != svResult.artifacts.size())
         {
             reportError("SV split emit artifacts do not match reachable graph count", topGraph.symbol());
             result.success = false;
@@ -2641,7 +3177,8 @@ namespace wolvrix::lib::emit
             {
                 continue;
             }
-            const std::string moduleName = std::filesystem::path(svResult.artifacts[i]).stem().string();
+            const std::string moduleName = grhSim ? sanitizeIdentifier(graph->symbol())
+                : std::filesystem::path(svResult.artifacts[i]).stem().string();
             emittedModuleNameByGraph.emplace(graph->symbol(), moduleName);
         }
 
@@ -2798,7 +3335,25 @@ namespace wolvrix::lib::emit
             UnitShimInfo shim;
             try
             {
-                shim = buildUnitShim(*unitGraph, emittedModuleName, emittedSvPath, wrapperModuleName);
+                if (grhSim)
+                {
+                    shim.wrapperModuleName = wrapperModuleName;
+                    for (const auto &port : unitGraph->inputPorts())
+                    {
+                        const auto member = "in_" + std::to_string(shim.inputPortByGraphName.size());
+                        shim.inputPortByGraphName.emplace(port.name, member);
+                        shim.wrapperPorts.push_back({member, "input", unitGraph->valueWidth(port.value),
+                                                     unitGraph->valueSigned(port.value)});
+                    }
+                    for (const auto &port : unitGraph->outputPorts())
+                    {
+                        const auto member = "out_" + std::to_string(shim.outputPortByGraphName.size());
+                        shim.outputPortByGraphName.emplace(port.name, member);
+                        shim.wrapperPorts.push_back({member, "output", unitGraph->valueWidth(port.value),
+                                                     unitGraph->valueSigned(port.value)});
+                    }
+                }
+                else shim = buildUnitShim(*unitGraph, emittedModuleName, emittedSvPath, wrapperModuleName);
             }
             catch (const std::exception &ex)
             {
@@ -2807,6 +3362,8 @@ namespace wolvrix::lib::emit
                 return result;
             }
 
+            if (!grhSim)
+            {
             const std::filesystem::path shimSvPath = packageDir / shim.wrapperSourceSv;
             auto shimSvStream = openOutputFile(shimSvPath);
             if (!shimSvStream)
@@ -2816,6 +3373,7 @@ namespace wolvrix::lib::emit
             }
             *shimSvStream << shim.wrapperSvText;
             result.artifacts.push_back(shimSvPath.string());
+            }
             unitShimByInstance.emplace(instanceName, shim);
             const auto &storedShim = unitShimByInstance.at(instanceName);
 
@@ -3050,6 +3608,88 @@ namespace wolvrix::lib::emit
             edge.publishPhase = ManifestEdge::PublishPhase::EarlyEffect;
         }
 
+        std::optional<wolvrix::lib::grh::Design> grhDesign;
+        if (grhSim) grhDesign.emplace(design.clone());
+        const auto inputDirtyTrackingAttribute = options.attributes.find("input_dirty_tracking");
+        const bool inputDirtyTracking = grhSim &&
+            (inputDirtyTrackingAttribute != options.attributes.end()
+             ? (inputDirtyTrackingAttribute->second == "1" ||
+               inputDirtyTrackingAttribute->second == "true" ||
+               inputDirtyTrackingAttribute->second == "yes" ||
+               inputDirtyTrackingAttribute->second == "on")
+             : environmentFlag("WOLVRIX_GRHSIM_INPUT_DIRTY_TRACKING"));
+        if (inputDirtyTracking)
+        {
+            for (auto &unit : manifest.units)
+            {
+                const auto &graph = *design.findGraph(unit.moduleGraphName);
+                const auto &shim = unitShimByInstance.at(unit.instanceName);
+                std::unordered_map<wolvrix::lib::grh::ValueId, std::size_t,
+                                   wolvrix::lib::grh::ValueIdHash> aliases;
+                for (const auto &port : graph.inputPorts()) ++aliases[port.value];
+                for (const auto &port : graph.inputPorts())
+                {
+                    const auto width = graph.valueWidth(port.value);
+                    if ((width + 63) / 64 < 128 || aliases.at(port.value) != 1) continue;
+                    const auto &member = shim.inputPortByGraphName.at(port.name);
+                    std::size_t writers = 0;
+                    bool internalFullWidth = false;
+                    for (const auto &edge : manifest.connections)
+                    {
+                        for (const auto &sink : edge.sinks)
+                        {
+                            if (sink.kind != SinkDesc::Kind::Unit || sink.instanceName != unit.instanceName ||
+                                sink.portName != member) continue;
+                            ++writers;
+                            internalFullWidth = edge.kind == "unit_to_unit" && edge.width == width;
+                        }
+                    }
+                    if (writers == 1 && internalFullWidth) unit.trackedInputPorts.push_back(member);
+                }
+            }
+        }
+        if (grhSim)
+        {
+            // Adapter classes, private model classes, and the public facade
+            // share the global C++ namespace even though their definitions
+            // intentionally live in separate translation units. Reserve all
+            // of them together rather than only uniquifying adapter names.
+            std::unordered_set<std::string> usedClassNames = {
+                "WolviRepCutGrhSimSim", "GrhSIM_" + manifest.topModule};
+            std::unordered_set<std::string> usedOutputNames = {
+                "wolvi_repcut_grhsim_sim.h", "grhsim_" + manifest.topModule + ".hpp"};
+            for (auto &unit : manifest.units)
+            {
+                const std::string base = sanitizeIdentifier("G" + unit.instanceName);
+                for (std::size_t suffix = 0;; ++suffix)
+                {
+                    const std::string adapterName = suffix == 0 ? base : base + "_" + std::to_string(suffix);
+                    const std::string modelName = adapterName + "_model";
+                    const std::string modelClass = "GrhSIM_" + modelName;
+                    // These are all headers emitted by EmitGrhSimCpp and
+                    // flattened by emitGrhSimRepCutUnit, plus the adapter's
+                    // own files. In particular, a top ending in _runtime
+                    // must not overwrite a private model runtime header.
+                    const std::array<std::string, 4> outputNames = {
+                        adapterName + ".h", adapterName + ".cpp",
+                        "grhsim_" + modelName + ".hpp",
+                        "grhsim_" + modelName + "_runtime.hpp"};
+                    if (design.findGraph(modelName) != nullptr ||
+                        usedClassNames.contains(adapterName) || usedClassNames.contains(modelClass) ||
+                        std::any_of(outputNames.begin(), outputNames.end(), [&](const auto &name) {
+                            return usedOutputNames.contains(name);
+                        }))
+                    {
+                        continue;
+                    }
+                    unit.backendModelName = adapterName;
+                    usedClassNames.insert(adapterName);
+                    usedClassNames.insert(modelClass);
+                    usedOutputNames.insert(outputNames.begin(), outputNames.end());
+                    break;
+                }
+            }
+        }
         for (const auto &unit : manifest.units)
         {
             const auto *unitGraph = design.findGraph(unit.moduleGraphName);
@@ -3060,6 +3700,35 @@ namespace wolvrix::lib::emit
                 return result;
             }
 
+            if (grhSim)
+            {
+                std::vector<detail::GrhSimRepCutPort> ports;
+                const auto &shim = unitShimByInstance.at(unit.instanceName);
+                for (const auto &port : unitGraph->inputPorts())
+                    ports.push_back({port.name, shim.inputPortByGraphName.at(port.name),
+                                     unitGraph->valueWidth(port.value), true});
+                for (const auto &port : unitGraph->outputPorts())
+                    ports.push_back({port.name, shim.outputPortByGraphName.at(port.name),
+                                     unitGraph->valueWidth(port.value), false});
+                EmitOptions modelOptions = options;
+                modelOptions.attributes["input_dirty_tracking"] = unit.trackedInputPorts.empty() ? "0" : "1";
+                modelOptions.attributes.erase("tracked_input_ports");
+                if (!unit.trackedInputPorts.empty())
+                {
+                    std::string names;
+                    for (const auto &member : unit.trackedInputPorts)
+                    {
+                        if (!names.empty()) names += ',';
+                        names += member;
+                    }
+                    modelOptions.attributes["tracked_input_ports"] = names;
+                }
+                auto unitResult = detail::emitGrhSimRepCutUnit(*grhDesign, unit.moduleGraphName,
+                    unit.backendModelName, ports, packageDir, modelOptions, diagnostics());
+                if (!unitResult.success) { result.success = false; return result; }
+                result.artifacts.insert(result.artifacts.end(), unitResult.artifacts.begin(), unitResult.artifacts.end());
+                continue;
+            }
             const std::array<const wolvrix::lib::grh::Graph *, 1> unitTopGraphs = {unitGraph};
             const auto reachableForUnit = reachableGraphsFromTops(design, unitTopGraphs);
             const std::filesystem::path fileListPath = packageDir / "verilate" / (unit.instanceName + ".f");
@@ -3087,13 +3756,14 @@ namespace wolvrix::lib::emit
             result.artifacts.push_back(fileListPath.string());
         }
 
-        const WrapperCode wrapperCode = generatePartitionedWrapperCode(manifest);
+        const std::string wrapperStem = grhSim ? "wolvi_repcut_grhsim_sim" : "wolvi_repcut_verilator_sim";
+        const WrapperCode wrapperCode = generatePartitionedWrapperCode(manifest, grhSim, inputDirtyTracking);
         std::error_code cleanupEc;
         std::filesystem::remove(packageDir / "partitioned_wrapper.h", cleanupEc);
         cleanupEc.clear();
         std::filesystem::remove(packageDir / "partitioned_wrapper.cpp", cleanupEc);
         cleanupEc.clear();
-        std::filesystem::remove(packageDir / "wolvi_repcut_verilator_sim.cpp", cleanupEc);
+        std::filesystem::remove(packageDir / (wrapperStem + ".cpp"), cleanupEc);
         cleanupEc.clear();
         if (std::filesystem::exists(packageDir, cleanupEc))
         {
@@ -3108,7 +3778,7 @@ namespace wolvrix::lib::emit
                     continue;
                 }
                 const std::string filename = entry.path().filename().string();
-                if (filename.rfind("wolvi_repcut_verilator_sim_", 0) != 0 ||
+                if (filename.rfind(wrapperStem + "_", 0) != 0 ||
                     entry.path().extension() != ".cpp")
                 {
                     continue;
@@ -3117,7 +3787,7 @@ namespace wolvrix::lib::emit
                 cleanupEc.clear();
             }
         }
-        const std::filesystem::path wrapperHeaderPath = packageDir / "wolvi_repcut_verilator_sim.h";
+        const std::filesystem::path wrapperHeaderPath = packageDir / (wrapperStem + ".h");
         auto wrapperHeaderStream = openOutputFile(wrapperHeaderPath);
         if (!wrapperHeaderStream)
         {
@@ -3141,6 +3811,32 @@ namespace wolvrix::lib::emit
             *wrapperSourceStream << sourceFile.contents;
             result.artifacts.push_back(wrapperSourcePath.string());
             wrapperSourceNames.push_back(sourceFile.filename);
+        }
+
+        if (grhSim)
+        {
+            // Keep the explicit source list: never compile stale units left by a
+            // previous partition count, and never merge model runtime headers.
+            std::vector<std::string> sourceNames;
+            std::unordered_set<std::string> seenSourceNames;
+            for (const auto &artifact : result.artifacts)
+            {
+                const std::filesystem::path path(artifact);
+                if (path.extension() != ".cpp") continue;
+                const auto sourceName = path.filename().generic_string();
+                if (seenSourceNames.insert(sourceName).second)
+                    sourceNames.push_back(sourceName);
+            }
+            const auto facadePath = packageDir / ("grhsim_" + manifest.topModule + ".hpp");
+            auto facade = openOutputFile(facadePath);
+            const auto makefilePath = packageDir / "Makefile";
+            auto makefile = openOutputFile(makefilePath);
+            if (!facade || !makefile) { result.success = false; return result; }
+            *facade << generateGrhSimFacade(manifest);
+            *makefile << generateGrhSimMakefile(manifest, sourceNames);
+            result.artifacts.push_back(facadePath.string());
+            result.artifacts.push_back(makefilePath.string());
+            return result;
         }
 
         const BuildGlueCode buildGlue = generateBuildGlueCode(manifest, wrapperSourceNames);

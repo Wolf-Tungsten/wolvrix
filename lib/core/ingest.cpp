@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <functional>
 #include <future>
@@ -3226,6 +3227,312 @@ struct StmtLowererState {
         return makeOperation(wolvrix::lib::grh::OperationKind::kConcat, parts, location);
     }
 
+    // stage-07.1: guard against materializing oversized aggregate values in
+    // the expression layer. Struct values must stay field-wise (SoA); a
+    // residual flatten above this width means a missing field-wise lowering.
+    int32_t aggregateFlattenWarnWidthLimit() const
+    {
+        static const int32_t limit = [] {
+            constexpr int32_t fallback = 4096;
+            const char* env = std::getenv("WOLVRIX_AGGREGATE_FLATTEN_WARN_WIDTH");
+            if (!env || !*env)
+            {
+                return fallback;
+            }
+            try
+            {
+                const int value = std::stoi(env);
+                return value > 0 ? value : fallback;
+            }
+            catch (...)
+            {
+                return fallback;
+            }
+        }();
+        return limit;
+    }
+
+    void warnAggregateFlattenWidth(int64_t width, slang::SourceLocation location,
+                                   std::string_view context) const
+    {
+        const int32_t limit = aggregateFlattenWarnWidthLimit();
+        if (!diagnostics || width <= limit)
+        {
+            return;
+        }
+        std::string message(context);
+        message.append(" materializes a ");
+        message.append(std::to_string(width));
+        message.append("-bit aggregate value (guard width ");
+        message.append(std::to_string(limit));
+        message.append("); missing field-wise lowering (stage-07.1)");
+        diagnostics->warn(location, std::move(message));
+    }
+
+    // stage-07.1: lower a flat-typed struct RHS whose top level is a
+    // replicate/concat of struct values directly into per-leaf values, so the
+    // whole-array flat value (elements x struct width) never materializes.
+    // Per leaf the operands' split leaves are replicated/concatenated and
+    // resized to the leaf flat width (MSB-side zero-extend/truncate, same
+    // semantics as the flat fallback below).
+    bool lowerStructRhsFieldWise(const std::vector<StructSplitLeaf>& leaves,
+                                 const slang::ast::Expression& rhs,
+                                 std::vector<ExprNodeId>& out)
+    {
+        static const bool debug = [] {
+            const char* env = std::getenv("WOLVRIX_FIELDWISE_DEBUG");
+            return env && *env && *env != '0';
+        }();
+        auto bail = [&](std::string_view why) {
+            if (debug)
+            {
+                std::string message("field-wise RHS bail: ");
+                message.append(why);
+                diagnostics->warn(rhs.sourceRange.start(), std::move(message));
+            }
+            return false;
+        };
+        const slang::ast::Expression* expr = peelImplicit(rhs);
+        if (!expr)
+        {
+            return bail("null expr");
+        }
+        // Per-leaf element widths must match between every operand and the
+        // LHS leaf walk; otherwise the per-leaf layout would diverge from the
+        // packed layout and the flat fallback must handle it.
+        auto elementWidthsMatch = [&](const std::vector<const AggregateExpr*>& parts) {
+            for (std::size_t i = 0; i < leaves.size(); ++i)
+            {
+                const int64_t lhsWidth =
+                    structLeafElementWidth(leaves[i], *plan.body, diagnostics);
+                for (const AggregateExpr* part : parts)
+                {
+                    if (i >= part->leafTypes.size() ||
+                        structLeafElementWidth(part->leafTypes[i], *plan.body, diagnostics) !=
+                            lhsWidth)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        auto widthHintOf = [&](ExprNodeId value) -> int64_t {
+            if (value < lowering.values.size())
+            {
+                return lowering.values[value].widthHint;
+            }
+            return 0;
+        };
+        auto finishLeaf = [&](ExprNodeId value, std::size_t leafIndex) -> ExprNodeId {
+            const int64_t target =
+                std::max<int64_t>(1, aggregateLeafFlatWidth(leaves[leafIndex]));
+            const int32_t clamped = static_cast<int32_t>(
+                std::min<int64_t>(target, std::numeric_limits<int32_t>::max()));
+            return resizeValueToWidth(value, clamped, false, expr->sourceRange.start());
+        };
+        // Lower one concat operand (or the replicated unit) into per-leaf
+        // values. Accepts a struct-typed expression, a single-element concat
+        // wrapper (slang canonicalizes `{e}` to a 1-operand concat), or a
+        // replicate `{K{u}}` whose unit is struct-typed.
+        auto lowerOnePart = [&](const slang::ast::Expression* partExpr,
+                                AggregateExpr& part) -> bool {
+            const slang::ast::Expression* e = partExpr ? peelImplicit(*partExpr) : nullptr;
+            auto unwrapSingle = [&](const slang::ast::Expression*& cur) {
+                while (cur)
+                {
+                    const auto* single = cur->as_if<slang::ast::ConcatenationExpression>();
+                    if (!single || single->operands().size() != 1)
+                    {
+                        break;
+                    }
+                    const slang::ast::Expression* inner = single->operands().front();
+                    cur = inner ? peelImplicit(*inner) : nullptr;
+                }
+            };
+            unwrapSingle(e);
+            if (!e || !e->type)
+            {
+                return bail("part has no type");
+            }
+            if (isStructTyped(*e->type))
+            {
+                auto aggregate = lowerAggregateValues(*e);
+                if (!aggregate || aggregate->values.size() != leaves.size())
+                {
+                    return bail("part aggregate mismatch");
+                }
+                part = std::move(*aggregate);
+                return true;
+            }
+            if (const auto* repl = e->as_if<slang::ast::ReplicationExpression>())
+            {
+                const slang::ConstantValue* countValue = repl->count().getConstant();
+                if (!countValue || !countValue->isInteger() || countValue->hasUnknown())
+                {
+                    return bail("replicate count not constant");
+                }
+                auto count = countValue->integer().as<int64_t>();
+                if (!count || *count <= 0)
+                {
+                    return bail("replicate count <= 0");
+                }
+                // slang wraps the replicated unit in a (possibly
+                // single-element) ConcatenationExpression typed as a flat
+                // bit vector; unwrap down to the struct unit.
+                const slang::ast::Expression* unit = peelImplicit(repl->concat());
+                unwrapSingle(unit);
+                if (!unit || !unit->type || !isStructTyped(*unit->type))
+                {
+                    return bail("replicate unit not struct-typed");
+                }
+                auto aggregate = lowerAggregateValues(*unit);
+                if (!aggregate || aggregate->values.size() != leaves.size())
+                {
+                    return bail("replicate unit aggregate mismatch");
+                }
+                ExprNodeId countId = lowerExpression(repl->count());
+                if (countId == kInvalidPlanIndex)
+                {
+                    return bail("replicate count lowering failed");
+                }
+                part.type = aggregate->type;
+                part.leafTypes = aggregate->leafTypes;
+                part.values.reserve(aggregate->values.size());
+                for (ExprNodeId leafValue : aggregate->values)
+                {
+                    ExprNode node;
+                    node.kind = ExprNodeKind::Operation;
+                    node.op = wolvrix::lib::grh::OperationKind::kReplicate;
+                    node.operands = {countId, leafValue};
+                    node.location = e->sourceRange.start();
+                    node.tempSymbol = makeTempSymbol();
+                    const int64_t sourceWidth = widthHintOf(leafValue);
+                    if (sourceWidth > 0 &&
+                        *count <= std::numeric_limits<int32_t>::max() / sourceWidth)
+                    {
+                        node.widthHint = static_cast<int32_t>(*count * sourceWidth);
+                    }
+                    part.values.push_back(addNode(nullptr, std::move(node)));
+                }
+                return true;
+            }
+            return bail("part not struct-typed");
+        };
+        // Lower each operand of a struct concat into its split-leaf values.
+        // Every operand must lower to a part with a leaf walk matching the
+        // target leaves in count and per-leaf element width.
+        auto lowerParts = [&](std::span<const slang::ast::Expression* const> operandExprs,
+                              std::vector<AggregateExpr>& parts) -> bool {
+            for (const slang::ast::Expression* operand : operandExprs)
+            {
+                if (!operand)
+                {
+                    return bail("concat null operand");
+                }
+                AggregateExpr part;
+                if (!lowerOnePart(operand, part))
+                {
+                    return false;
+                }
+                parts.push_back(std::move(part));
+            }
+            std::vector<const AggregateExpr*> partPtrs;
+            partPtrs.reserve(parts.size());
+            for (const AggregateExpr& part : parts)
+            {
+                partPtrs.push_back(&part);
+            }
+            if (partPtrs.empty() || !elementWidthsMatch(partPtrs))
+            {
+                return bail("concat element width mismatch");
+            }
+            return true;
+        };
+        // One kConcat per leaf across the operand parts (single-operand
+        // concats pass the leaf value through unchanged).
+        auto concatPerLeaf = [&](const std::vector<AggregateExpr>& parts,
+                                 std::vector<ExprNodeId>& leafValues) {
+            for (std::size_t i = 0; i < leaves.size(); ++i)
+            {
+                if (parts.size() == 1)
+                {
+                    leafValues.push_back(parts.front().values[i]);
+                    continue;
+                }
+                std::vector<ExprNodeId> operands;
+                operands.reserve(parts.size());
+                int64_t total = 0;
+                bool widthKnown = true;
+                for (const AggregateExpr& part : parts)
+                {
+                    operands.push_back(part.values[i]);
+                    const int64_t width = widthHintOf(part.values[i]);
+                    if (width <= 0)
+                    {
+                        widthKnown = false;
+                    }
+                    total += width;
+                }
+                const int32_t widthHint =
+                    widthKnown && total > 0
+                        ? static_cast<int32_t>(
+                              std::min<int64_t>(total, std::numeric_limits<int32_t>::max()))
+                        : 0;
+                leafValues.push_back(makeOperationWithWidth(
+                    wolvrix::lib::grh::OperationKind::kConcat, std::move(operands), widthHint,
+                    expr->sourceRange.start()));
+            }
+        };
+        if (expr->as_if<slang::ast::ReplicationExpression>())
+        {
+            // The whole RHS is one replicate part; lowerOnePart produces the
+            // per-leaf replicated values directly.
+            AggregateExpr part;
+            if (!lowerOnePart(expr, part))
+            {
+                return false;
+            }
+            if (!elementWidthsMatch({&part}))
+            {
+                return bail("replicate element width mismatch");
+            }
+            out.reserve(out.size() + leaves.size());
+            for (std::size_t i = 0; i < leaves.size(); ++i)
+            {
+                ExprNodeId value = finishLeaf(part.values[i], i);
+                if (value == kInvalidPlanIndex)
+                {
+                    return bail("replicate leaf resize failed");
+                }
+                out.push_back(value);
+            }
+            return true;
+        }
+        if (const auto* concat = expr->as_if<slang::ast::ConcatenationExpression>())
+        {
+            std::vector<AggregateExpr> parts;
+            if (!lowerParts(concat->operands(), parts))
+            {
+                return false;
+            }
+            std::vector<ExprNodeId> leafValues;
+            concatPerLeaf(parts, leafValues);
+            out.reserve(out.size() + leaves.size());
+            for (std::size_t i = 0; i < leaves.size(); ++i)
+            {
+                ExprNodeId value = finishLeaf(leafValues[i], i);
+                if (value == kInvalidPlanIndex)
+                {
+                    return bail("concat leaf resize failed");
+                }
+                out.push_back(value);
+            }
+            return true;
+        }
+        return bail("not a replicate/concat of struct values");
+    }
+
     // stage-04: lower a struct-typed RHS (pattern, aggregate expression, or
     // flat value) into per-leaf values of the given struct type.
     bool lowerStructRhsValues(const slang::ast::Type& lhsType,
@@ -3242,6 +3549,17 @@ struct StmtLowererState {
             out = std::move(aggregate->values);
             return true;
         }
+        std::vector<StructSplitLeaf> leaves;
+        if (!splitStructType(lhsType, "", *plan.body, diagnostics, leaves))
+        {
+            return false;
+        }
+        // stage-07.1: replicate/concat of struct values lower field-wise
+        // before any whole-array flat value is materialized.
+        if (lowerStructRhsFieldWise(leaves, rhs, out))
+        {
+            return true;
+        }
         // Flat-typed RHS (literal/cast/concat): slice each leaf out of the
         // packed layout.
         ExprNodeId flat = kInvalidPlanIndex;
@@ -3250,11 +3568,6 @@ struct StmtLowererState {
             flat = lowerExpression(rhs);
         }
         if (flat == kInvalidPlanIndex)
-        {
-            return false;
-        }
-        std::vector<StructSplitLeaf> leaves;
-        if (!splitStructType(lhsType, "", *plan.body, diagnostics, leaves))
         {
             return false;
         }
@@ -3270,6 +3583,8 @@ struct StmtLowererState {
         {
             total += aggregateLeafFlatWidth(leaf);
         }
+        warnAggregateFlattenWidth(total, rhs.sourceRange.start(),
+                                  "Struct assignment flat RHS");
         flat = resizeValueToWidth(
             flat,
             static_cast<int32_t>(std::min<int64_t>(
@@ -8621,6 +8936,7 @@ private:
         // array dims — a leaf with outer dims scatters into one bit run per
         // element. Gather runs in descending flat offset; the trivial layout
         // (no interleaving) is exactly the legacy whole-leaf concat.
+        warnAggregateFlattenWidth(total, location, "Struct expression flatten");
         std::vector<std::vector<SvLayoutSegment>> leafSegments;
         const bool haveSegments =
             aggregate.type && aggregate.leafTypes.size() == operands.size() &&

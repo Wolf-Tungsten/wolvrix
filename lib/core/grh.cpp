@@ -4145,7 +4145,25 @@ namespace wolvrix::lib::grh
         const std::span<const int64_t> toShape = valueShape(to);
         if (toShape.empty())
         {
-            setValueShape(to, fromShape);
+            // Backfill the alias shape only when the target width can carry
+            // it: a fragmenting rewrite (comb-loop-elim) legitimately
+            // replaces a whole-array result with one element-wide fragment,
+            // and forcing the array shape onto it would be inconsistent.
+            int64_t elementCount = 1;
+            for (const int64_t dim : fromShape)
+            {
+                if (dim <= 0 || elementCount > std::numeric_limits<int64_t>::max() / dim)
+                {
+                    elementCount = -1;
+                    break;
+                }
+                elementCount *= dim;
+            }
+            const int64_t toWidth = getValue(to).width();
+            if (elementCount > 0 && toWidth > 0 && toWidth % elementCount == 0)
+            {
+                setValueShape(to, fromShape);
+            }
             return;
         }
         if (!std::equal(fromShape.begin(), fromShape.end(), toShape.begin(), toShape.end()))

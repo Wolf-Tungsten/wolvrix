@@ -1050,6 +1050,20 @@ target_compile_definitions(ingest-struct-array-fieldwise
 )
 register_test_exe(ingest-struct-array-fieldwise)
 
+# ingest: input-port array element read must slice the port value (stage-07.1)
+add_executable(ingest-port-array-elem-read
+    tests/ingest/test_ingest_port_array_elem_read.cpp
+)
+target_link_libraries(ingest-port-array-elem-read
+    PRIVATE
+        wolvrix-lib
+)
+target_compile_definitions(ingest-port-array-elem-read
+    PRIVATE
+        WOLF_SV_INGEST_PORT_ARRAY_ELEM_READ_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/ingest_port_array_elem_read.sv"
+)
+register_test_exe(ingest-port-array-elem-read)
+
 # ingest: graph assembly dpi/display
 add_executable(ingest-graph-assembly-dpi-display
     tests/ingest/test_ingest_graph_assembly_dpi_display.cpp

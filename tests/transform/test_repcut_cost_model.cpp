@@ -67,6 +67,8 @@ int main()
         Fixture f;
         check(RepcutOptions{}.costModel == RepcutCostModel::kLegacy, "default must stay legacy");
         check(repcutCostModelName(RepcutCostModel::kVerilatorV1) == "verilator-v1", "versioned name");
+        check(repcutCostModelName(RepcutCostModel::kVerilatorLoweredV1) == "verilator-lowered-v1",
+              "lowered versioned name");
         for (const auto width : {32, 64, 65, 128, 256, 1024})
         {
             const auto words = width <= 64 ? 1u : (width + 31u) / 32u;
@@ -89,6 +91,9 @@ int main()
         }
         check(f.cost(K::kMemoryWritePort, {1, 8, 256, 256}, 0).weight == 513,
               "dynamic memory mask per-bit rule/data operand 2");
+        check(f.memoryMaskCost("256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                              RepcutCostModel::kVerilatorLoweredV1) == 9,
+              "contiguous lowered memory write uses one part-select");
         check(f.cost(K::kMemoryWritePort, {1, 64, 256, 256}, 0).weight == 513,
               "address width must not replace data width");
         const auto registerWrite = f.cost(K::kRegisterWritePort, {1, 256, 256, 1}, 0);
@@ -101,6 +106,8 @@ int main()
         check(f.memoryMaskCost("256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff") == 9,
               "whole-row memory write");
         check(f.memoryMaskCost("256'h5") == 3, "partial memory mask counts enabled bits");
+        check(f.memoryMaskCost("256'hff", RepcutCostModel::kVerilatorLoweredV1) == 9,
+              "lowered partial contiguous memory mask uses one run");
         for (const auto kind : {K::kMul, K::kDiv, K::kMod, K::kDpicCall, K::kMemoryReadPort})
         {
             const auto id = f.operation(kind, {256, 256}, 256);
@@ -117,7 +124,7 @@ int main()
         try { (void)f.cost(K::kAdd, {8, 8}, 8, invalid); }
         catch (const std::invalid_argument &) { rejected = true; }
         check(rejected, "unknown model must not silently fall back");
-        for (const auto token : {"legacy", "verilator-v1"})
+        for (const auto token : {"legacy", "verilator-v1", "verilator-lowered-v1"})
         {
             std::string error;
             const std::string option = std::string("-cost-model=") + token;

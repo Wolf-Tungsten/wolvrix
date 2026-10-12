@@ -69,7 +69,7 @@
 | `-mtkahypar-preset` | `deterministic-quality` | mt-kahypar 预设；`repcut` 会强制使用确定性 preset |
 | `-mtkahypar-threads` | `0` | 线程数，`0` 表示后端默认 |
 | `-weight-mode` | `baseline` | 求解器 vertex weight 模式；严格支持 `baseline` 或 `closure-aware` |
-| `-cost-model` | `legacy` | 操作计算成本模型；支持 `legacy` 和实验性 `verilator-v1` |
+| `-cost-model` | `legacy` | 操作计算成本模型；支持 `legacy`、实验性 `verilator-v1` 和非默认 `verilator-lowered-v1` |
 | `-keep-intermediate-files` | false | 是否保留中间文件 |
 
 `baseline` 保留原有 RepCut vertex weight 口径。`closure-aware` 包含三步：
@@ -106,6 +106,12 @@ ASC（不可拆分的原子逻辑锥）、共享 piece（逻辑片段）和分�
 `legacy` 保留历史位宽/扇出规则，仍是默认。`verilator-v1` 根据当前 Verilator 的 scalar/wide
 表示和 helper 实现给出相对工作量：它不是周期数或生成 C++ 字节数，尚未完成跨设计或 walltime 验证。
 模型不随 emitter 自动切换，也不使用香山分区耗时拟合。未覆盖的操作显式回退 legacy。
+
+`verilator-lowered-v1` 是更激进但仍然静态的实验模型：它额外识别当前 SV emitter
+已经实现的常量左移和连续 constant-mask memory/register write lowering，分别按固定
+shift/part-select 近似计价。它不需要运行 Verilator，也不是完整 C++/机器码成本模型；
+默认不启用，必须显式传入，验证无收益时可以直接移除而不影响 `legacy` 和
+`verilator-v1`。
 
 记 `L(W)=1`（`W<=64`），否则为 `ceil(W/32)`；`O` 为最大结果位宽，`I` 为最大操作数位宽。
 首版主要规则如下，系数是机制启发式，不是已标定硬件常数：
@@ -211,6 +217,14 @@ CLI 对应 `-cost-model=verilator-v1`。Python 省略 `cost_model` 或传 `None`
 不改变 `RegToMemOptions::profitabilityFilter` 在通用库/API 中的默认 `None`；可分别通过
 `XS_REPCUT_MEMORY_WRITE_COALESCE=0`、`XS_REPCUT_REG_TO_MEM=0` 或
 `XS_REPCUT_REG_TO_MEM_PROFITABILITY_FILTER=none` 关闭/回退。
+
+评估新模型时显式使用：
+
+```bash
+make build_xs_repcut_verilator \
+  XS_REPCUT_WEIGHT_MODE=closure-aware \
+  XS_REPCUT_COST_MODEL=verilator-lowered-v1
+```
 
 ## Verilator RepCut 运行时
 

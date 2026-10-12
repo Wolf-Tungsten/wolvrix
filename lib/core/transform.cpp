@@ -2713,7 +2713,12 @@ namespace wolvrix::lib::transform
                     options.costModel = RepcutCostModel::kVerilatorV1;
                     return true;
                 }
-                error = "invalid -cost-model value; expected legacy or verilator-v1";
+                if (value == "verilator-lowered-v1")
+                {
+                    options.costModel = RepcutCostModel::kVerilatorLoweredV1;
+                    return true;
+                }
+                error = "invalid -cost-model value; expected legacy, verilator-v1, or verilator-lowered-v1";
                 return false;
             };
             auto parseWeightMode = [&](std::string_view value) -> bool {

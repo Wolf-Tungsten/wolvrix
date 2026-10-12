@@ -289,6 +289,79 @@ namespace wolvrix::lib::transform
             return std::nullopt;
         }
 
+        std::optional<uint64_t> constantMaskRuns(
+            const grh::Graph &graph, const grh::Operation &op, std::size_t index, int32_t width)
+        {
+            if (index >= op.operands().size())
+                return std::nullopt;
+            const auto def = graph.valueDef(op.operands()[index]);
+            if (!def.valid() || graph.opKind(def) != OperationKind::kConstant)
+                return std::nullopt;
+            const auto attr = graph.getOperation(def).attr("constValue");
+            const auto *literal = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            if (!literal || width <= 0)
+                return std::nullopt;
+            if (*literal == "'0")
+                return 0;
+            try
+            {
+                auto bits = slang::SVInt::fromString(*literal).resize(width);
+                if (bits.hasUnknown())
+                    return std::nullopt;
+                uint64_t runs = 0;
+                bool inRun = false;
+                for (int32_t bit = 0; bit < width; ++bit)
+                {
+                    const bool one = bits[static_cast<std::size_t>(bit)].toChar() == '1';
+                    if (one && !inRun)
+                    {
+                        ++runs;
+                    }
+                    inRun = one;
+                }
+                return runs;
+            }
+            catch (const std::exception &)
+            {
+                return std::nullopt;
+            }
+        }
+
+        std::optional<uint64_t> constantUnsignedValue(
+            const grh::Graph &graph, const grh::Operation &op, std::size_t index)
+        {
+            if (index >= op.operands().size())
+                return std::nullopt;
+            const auto def = graph.valueDef(op.operands()[index]);
+            if (!def.valid() || graph.opKind(def) != OperationKind::kConstant)
+                return std::nullopt;
+            const auto attr = graph.getOperation(def).attr("constValue");
+            const auto *literal = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            if (!literal)
+                return std::nullopt;
+            try
+            {
+                const auto bits = slang::SVInt::fromString(*literal);
+                if (bits.hasUnknown())
+                    return std::nullopt;
+                uint64_t value = 0;
+                const auto width = bits.getBitWidth();
+                for (std::size_t bit = 0; bit < width; ++bit)
+                {
+                    if (bits[bit].toChar() != '1')
+                        continue;
+                    if (bit >= 64)
+                        return std::numeric_limits<uint64_t>::max();
+                    value |= uint64_t{1} << bit;
+                }
+                return value;
+            }
+            catch (const std::exception &)
+            {
+                return std::nullopt;
+            }
+        }
+
         std::optional<uint64_t> verilatorWeight(const grh::Graph &graph, const grh::Operation &op)
         {
             const auto resultWidth = getResultWidth(graph, op);
@@ -379,6 +452,53 @@ namespace wolvrix::lib::transform
             }
         }
 
+        std::optional<uint64_t> verilatorLoweredWeight(const grh::Graph &graph, const grh::Operation &op)
+        {
+            const auto resultWidth = getResultWidth(graph, op);
+            const auto operandWidth = getMaxOperandWidth(graph, op);
+            const uint64_t outWords = workWords(resultWidth);
+            const uint64_t inWords = workWords(operandWidth);
+            switch (op.kind())
+            {
+            case OperationKind::kShl:
+            case OperationKind::kLShr:
+            case OperationKind::kAShr:
+                // A constant shift is folded to a fixed shift/mask sequence by
+                // the generated-code compiler.  Keep one word of expression
+                // overhead instead of charging the dynamic-shift path twice.
+                return constantUnsignedValue(graph, op, 1) ? 1u + outWords : 2u * outWords;
+            case OperationKind::kRegisterWritePort:
+            case OperationKind::kLatchWritePort:
+            case OperationKind::kMemoryWritePort:
+            {
+                const bool memory = op.kind() == OperationKind::kMemoryWritePort;
+                const auto dataIndex = memory ? 2u : 1u;
+                const auto maskIndex = memory ? 3u : 2u;
+                const int32_t width = getOperandWidth(graph, op, dataIndex);
+                const uint64_t words = workWords(width);
+                const auto runs = constantMaskRuns(graph, op, maskIndex, width);
+                if (!runs)
+                {
+                    // Unknown/dynamic masks still use the conservative bit
+                    // staging estimate used by verilator-v1.
+                    return memory ? std::optional<uint64_t>(1u + 2u * static_cast<uint64_t>(width))
+                                   : std::nullopt;
+                }
+                if (*runs == 0)
+                    return 1u;
+                if (*runs == 1)
+                {
+                    // One contiguous run is emitted as one NBA/part-select;
+                    // the run width is approximated by the enclosing data word
+                    // count, which is available before C++ generation.
+                    return 1u + words;
+                }
+                return 1u + *runs + words;
+            }
+            default:
+                return verilatorWeight(graph, op);
+            }
+        }
     }
 
     std::string_view repcutCostModelName(RepcutCostModel model)
@@ -387,6 +507,7 @@ namespace wolvrix::lib::transform
         {
         case RepcutCostModel::kLegacy: return "legacy";
         case RepcutCostModel::kVerilatorV1: return "verilator-v1";
+        case RepcutCostModel::kVerilatorLoweredV1: return "verilator-lowered-v1";
         }
         return "unknown";
     }
@@ -397,7 +518,16 @@ namespace wolvrix::lib::transform
         if (model == RepcutCostModel::kLegacy)
             return {legacyWeight(graph, op), false};
         if (model != RepcutCostModel::kVerilatorV1)
-            throw std::invalid_argument("unknown repcut cost model");
+        {
+            if (model != RepcutCostModel::kVerilatorLoweredV1)
+                throw std::invalid_argument("unknown repcut cost model");
+            if (const auto weight = verilatorLoweredWeight(graph, op))
+            {
+                return {static_cast<uint32_t>(std::clamp<uint64_t>(
+                            *weight, 1u, std::numeric_limits<uint32_t>::max() - 1u)), false};
+            }
+            return {legacyWeight(graph, op), true};
+        }
         if (const auto weight = verilatorWeight(graph, op))
         {
             // UINT32_MAX is reserved by the caller as the uncomputed-cache sentinel.

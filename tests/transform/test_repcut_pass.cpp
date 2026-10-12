@@ -424,7 +424,8 @@ int main()
     {
         std::string legacyHgr;
         for (const auto costModel : {RepcutCostModel::kLegacy,
-                                    RepcutCostModel::kVerilatorV1})
+                                    RepcutCostModel::kVerilatorV1,
+                                    RepcutCostModel::kVerilatorLoweredV1})
         {
             wolvrix::lib::grh::Design costDesign;
             populateBasicRepcutDesign(costDesign, "top_wide", 256);

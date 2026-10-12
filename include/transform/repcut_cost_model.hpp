@@ -13,6 +13,9 @@ namespace wolvrix::lib::transform
     {
         kLegacy,
         kVerilatorV1,
+        // Static estimate after known SystemVerilog emitter lowering rules.
+        // Experimental and intentionally not the default.
+        kVerilatorLoweredV1,
     };
 
     struct RepcutOperationCost

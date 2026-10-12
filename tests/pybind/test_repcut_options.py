@@ -9,7 +9,7 @@ class RepcutOptionTest(unittest.TestCase):
     def test_cost_model_is_sparse_and_forwarded(self) -> None:
         self.assertEqual(_compile_repcut_kwargs({}), [])
         self.assertEqual(_compile_repcut_kwargs({"cost_model": None}), [])
-        for value in ("legacy", "verilator-v1"):
+        for value in ("legacy", "verilator-v1", "verilator-lowered-v1"):
             with self.subTest(value=value):
                 self.assertEqual(
                     _compile_repcut_kwargs({"cost_model": value}),
@@ -23,12 +23,12 @@ class RepcutOptionTest(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(
-                    ValueError, "cost_model must be one of: legacy, verilator-v1"
+            ValueError, "cost_model must be one of: legacy, verilator-v1, verilator-lowered-v1"
                 ):
                     _compile_repcut_kwargs({"cost_model": value})
 
     def test_cost_model_and_weight_mode_are_independent(self) -> None:
-        for cost_model in ("legacy", "verilator-v1"):
+        for cost_model in ("legacy", "verilator-v1", "verilator-lowered-v1"):
             for weight_mode in ("baseline", "closure-aware"):
                 with self.subTest(cost_model=cost_model, weight_mode=weight_mode):
                     self.assertEqual(

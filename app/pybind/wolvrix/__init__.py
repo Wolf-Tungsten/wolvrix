@@ -675,9 +675,10 @@ def _compile_repcut_kwargs(named: dict[str, Any]) -> list[str]:
         if not isinstance(cost_model, str) or cost_model not in {
             "legacy",
             "verilator-v1",
+            "verilator-lowered-v1",
         }:
             raise ValueError(
-                "cost_model must be one of: legacy, verilator-v1"
+                "cost_model must be one of: legacy, verilator-v1, verilator-lowered-v1"
             )
         out.extend(["-cost-model", cost_model])
     weight_mode = _pop_named(local, "weight_mode", None)

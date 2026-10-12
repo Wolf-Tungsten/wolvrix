@@ -1508,6 +1508,204 @@ namespace wolvrix::lib::transform
                 return ValueId::invalid();
             }
 
+            // Is the value an all-zero constant literal?
+            bool isZeroConst(ValueId value) const
+            {
+                const auto text = asConstText(value);
+                if (!text)
+                {
+                    return false;
+                }
+                std::string_view digits = *text;
+                const std::size_t tick = digits.find('\'');
+                if (tick != std::string_view::npos)
+                {
+                    digits.remove_prefix(tick + 1);
+                    if (!digits.empty() && digits.front() == 's')
+                    {
+                        digits.remove_prefix(1);
+                    }
+                    if (!digits.empty() &&
+                        (digits.front() == 'b' || digits.front() == 'o' ||
+                         digits.front() == 'd' || digits.front() == 'h'))
+                    {
+                        digits.remove_prefix(1);
+                    }
+                }
+                return !digits.empty() &&
+                       digits.find_first_not_of('0') == std::string_view::npos;
+            }
+
+            // stage-07.1: array-width pad-concat read produced by field-wise
+            // ingest: kSliceArray(kConcat(padRun..., wholeArrayRead), idx, w)
+            // where the LSB input is the whole-array read of a rank-1 register
+            // (lanes [0, N)) and every MSB input is a uniform pad run — a
+            // kReplicate of one element-wide value, or an all-zero constant.
+            // Folds to a clamped or muxed array read.
+            bool tryFoldArrayPadConcat(OperationId id, ValueId result, ValueId index,
+                                       OperationId baseDef, int64_t elemWidth)
+            {
+                std::vector<ValueId> inputs;
+                std::function<void(ValueId)> flatten = [&](ValueId value) {
+                    value = strip(value);
+                    const OperationId def = defOf(value);
+                    if (def.valid() && graph_.opKind(def) == OperationKind::kConcat)
+                    {
+                        // Bind a named copy: operands() spans the Operation's
+                        // own storage, so iterating a temporary would dangle.
+                        const Operation concatOp = graph_.getOperation(def);
+                        for (const ValueId child : concatOp.operands())
+                        {
+                            flatten(child);
+                        }
+                        return;
+                    }
+                    inputs.push_back(value);
+                };
+                const Operation baseOp = graph_.getOperation(baseDef);
+                for (const ValueId child : baseOp.operands())
+                {
+                    flatten(child);
+                }
+                if (inputs.size() < 2)
+                {
+                    return false;
+                }
+                // LSB input: whole-array read of the source register.
+                const ValueId lsb = inputs.back();
+                const OperationId lsbDef = defOf(lsb);
+                if (!lsbDef.valid() || graph_.opKind(lsbDef) != OperationKind::kRegisterReadPort)
+                {
+                    return false;
+                }
+                const Operation lsbOp = graph_.getOperation(lsbDef);
+                const auto regAttr = lsbOp.attr("regSymbol");
+                if (!regAttr)
+                {
+                    return false;
+                }
+                const auto *regSym = std::get_if<std::string>(&*regAttr);
+                if (!regSym)
+                {
+                    return false;
+                }
+                const RegisterInfo *info = findRegister(*regSym);
+                if (!info || info->elemWidth != elemWidth ||
+                    graph_.getValue(lsb).width() != info->elemCount * elemWidth)
+                {
+                    return false;
+                }
+                // MSB inputs: uniform pad runs; all runs must agree on the
+                // pad value (samePad at run granularity).
+                int64_t padElem = -1;
+                ValueId padValue = ValueId::invalid();
+                bool havePad = false;
+                for (std::size_t j = 0; j + 1 < inputs.size(); ++j)
+                {
+                    const ValueId run = inputs[j];
+                    const int64_t runWidth = graph_.getValue(run).width();
+                    if (runWidth <= 0 || runWidth % elemWidth != 0)
+                    {
+                        return false;
+                    }
+                    const OperationId runDef = defOf(run);
+                    if (runDef.valid() && graph_.opKind(runDef) == OperationKind::kReplicate)
+                    {
+                        const Operation repOp = graph_.getOperation(runDef);
+                        if (repOp.operands().size() != 1)
+                        {
+                            return false;
+                        }
+                        const auto repAttr = repOp.attr("rep");
+                        if (!repAttr)
+                        {
+                            return false;
+                        }
+                        const auto *repCount = std::get_if<int64_t>(&*repAttr);
+                        if (!repCount || *repCount <= 0 || *repCount * elemWidth != runWidth)
+                        {
+                            return false;
+                        }
+                        const ValueId elem = strip(repOp.operands()[0]);
+                        if (graph_.getValue(elem).width() != elemWidth)
+                        {
+                            return false;
+                        }
+                        if (!havePad)
+                        {
+                            padValue = elem;
+                            havePad = true;
+                            if (const auto elemRead = asElemRead(elem, elemWidth);
+                                elemRead && elemRead->regSym == *regSym)
+                            {
+                                padElem = elemRead->index;
+                            }
+                        }
+                        else if (!sameValue(elem, padValue, 2))
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (isZeroConst(run))
+                    {
+                        if (!havePad)
+                        {
+                            padValue = makeConst(0, elemWidth);
+                            havePad = true;
+                        }
+                        else if (!isZeroConst(padValue))
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                    return false;
+                }
+                if (!havePad)
+                {
+                    return false;
+                }
+                const int64_t pw = graph_.getValue(index).width();
+                if (pw <= 0 || pw > 62)
+                {
+                    return false;
+                }
+                ValueId folded;
+                if (padElem >= 0)
+                {
+                    // element pad: index clamp  arr[idx < N ? idx : padElem]
+                    const ValueId clamped = makeIndexClamp(index, info->elemCount, padElem, pw);
+                    folded = makeArrayRead(*regSym, clamped, elemWidth);
+                }
+                else
+                {
+                    // const/generic pad: idx < N ? arr[idx] : pad
+                    const ValueId directRead = makeArrayRead(*regSym, index, elemWidth);
+                    const ValueId limitConst =
+                        makeConst(static_cast<uint64_t>(info->elemCount), pw);
+                    const ValueId ltResult =
+                        graph_.createValue(graph_.makeInternalValSym(), 1, false);
+                    const OperationId lt = graph_.createOperation(OperationKind::kLt,
+                                                                  graph_.makeInternalOpSym());
+                    graph_.addOperand(lt, index);
+                    graph_.addOperand(lt, limitConst);
+                    graph_.addResult(lt, ltResult);
+                    folded = graph_.createValue(graph_.makeInternalValSym(),
+                                                static_cast<int32_t>(elemWidth), false);
+                    const OperationId mux = graph_.createOperation(OperationKind::kMux,
+                                                                   graph_.makeInternalOpSym());
+                    graph_.addOperand(mux, ltResult);
+                    graph_.addOperand(mux, directRead);
+                    graph_.addOperand(mux, padValue);
+                    graph_.addResult(mux, folded);
+                }
+                graph_.replaceAllUses(result, folded);
+                sweepSeeds_.push_back(id);
+                sweepSeeds_.push_back(baseDef);
+                return true;
+            }
+
             void foldPadReads()
             {
                 std::vector<OperationId> candidates;
@@ -1610,6 +1808,13 @@ namespace wolvrix::lib::transform
                     }
                     if (!ok || !info)
                     {
+                        // stage-07.1: element-width mapping failed — the
+                        // concat may be the array-width pad form produced by
+                        // field-wise ingest (pad runs + whole-array read).
+                        if (tryFoldArrayPadConcat(id, result, index, baseDef, elemWidth))
+                        {
+                            ++padReadsFolded_;
+                        }
                         continue;
                     }
                     const int64_t elemCount = info->elemCount;

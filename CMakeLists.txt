@@ -1036,6 +1036,20 @@ target_compile_definitions(ingest-graph-assembly-aggregate-port-slice
 )
 register_test_exe(ingest-graph-assembly-aggregate-port-slice)
 
+# ingest: struct array field-wise expression lowering (stage-07.1)
+add_executable(ingest-struct-array-fieldwise
+    tests/ingest/test_ingest_struct_array_fieldwise.cpp
+)
+target_link_libraries(ingest-struct-array-fieldwise
+    PRIVATE
+        wolvrix-lib
+)
+target_compile_definitions(ingest-struct-array-fieldwise
+    PRIVATE
+        WOLF_SV_INGEST_STRUCT_ARRAY_FIELDWISE_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/ingest_struct_array_fieldwise.sv"
+)
+register_test_exe(ingest-struct-array-fieldwise)
+
 # ingest: graph assembly dpi/display
 add_executable(ingest-graph-assembly-dpi-display
     tests/ingest/test_ingest_graph_assembly_dpi_display.cpp

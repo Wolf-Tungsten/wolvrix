@@ -1698,7 +1698,8 @@ namespace wolvrix::lib::transform
         {
             const OperationKind opKind = graph.opKind(opId);
             if (opKind != OperationKind::kSliceStatic &&
-                opKind != OperationKind::kSliceDynamic)
+                opKind != OperationKind::kSliceDynamic &&
+                opKind != OperationKind::kSliceArray)
             {
                 return false;
             }
@@ -1721,12 +1722,32 @@ namespace wolvrix::lib::transform
             {
                 return false;
             }
+            std::optional<SliceArrayGeometry> arrayGeometry;
+            if (opKind == OperationKind::kSliceArray)
+            {
+                arrayGeometry = getSliceArrayGeometry(graph, graph.getOperation(opId));
+                // A dynamic or otherwise non-selectable array read cannot be
+                // retargeted through a structural alias: doing so would
+                // preserve the alias but could change which array element is
+                // selected.
+                if (!arrayGeometry || !arrayGeometry->selectable)
+                {
+                    return false;
+                }
+            }
             const ValueId base = operands[0];
             if (!base.valid())
             {
                 return false;
             }
-            if (loopSet.find(base) == loopSet.end())
+            // The first retarget may move an array read through an alias whose
+            // replacement base is outside the SCC. Keep walking that same
+            // entrance while its result remains in the loop so an
+            // assign->concat chain can be reduced all the way to the selected
+            // concat operand.
+            if (loopSet.find(base) == loopSet.end() &&
+                (opKind != OperationKind::kSliceArray ||
+                 loopSet.find(resultId) == loopSet.end()))
             {
                 return false;
             }
@@ -1743,7 +1764,7 @@ namespace wolvrix::lib::transform
                 low = *startOpt;
                 high = *endOpt;
             }
-            else
+            else if (opKind == OperationKind::kSliceDynamic)
             {
                 auto widthOpt = getIntAttr(graph, opId, "sliceWidth");
                 auto indexOpt = getConstIntValue(graph, operands[1]);
@@ -1753,6 +1774,11 @@ namespace wolvrix::lib::transform
                 }
                 low = *indexOpt;
                 high = low + *widthOpt - 1;
+            }
+            else
+            {
+                low = arrayGeometry->offset;
+                high = low + arrayGeometry->subVolume - 1;
             }
             if (low < 0 || high < low)
             {
@@ -1765,6 +1791,32 @@ namespace wolvrix::lib::transform
                 return false;
             }
             const OperationKind baseDefKind = graph.opKind(baseDefId);
+
+            auto foldArrayReadInFalseLoop = [&]() {
+                if (opKind != OperationKind::kSliceArray ||
+                    loopSet.find(base) == loopSet.end() ||
+                    loopSet.find(resultId) == loopSet.end())
+                {
+                    return false;
+                }
+                try
+                {
+                    while (graph.opOperands(opId).size() > 1)
+                    {
+                        graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
+                    }
+                    graph.setOpKind(opId, OperationKind::kSliceStatic);
+                    graph.setAttr(opId, "sliceStart", low);
+                    graph.setAttr(opId, "sliceEnd", high);
+                }
+                catch (const std::exception &ex)
+                {
+                    onError(graph.getOperation(opId), std::string("Failed to fold false-loop array read: ") + ex.what());
+                    return false;
+                }
+                ++retargeted;
+                return true;
+            };
 
             if (baseDefKind == OperationKind::kAssign)
             {
@@ -1791,6 +1843,18 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
+                if (opKind == OperationKind::kSliceArray)
+                {
+                    const auto baseShape = graph.valueShape(base);
+                    const auto newBaseShape = graph.valueShape(newBase);
+                    if (baseShape.size() != newBaseShape.size() ||
+                        !std::equal(baseShape.begin(), baseShape.end(), newBaseShape.begin()))
+                    {
+                        // The alias changes the array view, so keep the base
+                        // and select its exact bit range before retargeting.
+                        return foldArrayReadInFalseLoop();
+                    }
+                }
                 try
                 {
                     graph.replaceOperand(opId, 0, newBase);
@@ -1804,7 +1868,8 @@ namespace wolvrix::lib::transform
                 return true;
             }
 
-            if (baseDefKind == OperationKind::kSliceStatic)
+            if (baseDefKind == OperationKind::kSliceStatic &&
+                opKind != OperationKind::kSliceArray)
             {
                 const auto baseOps = graph.opOperands(baseDefId);
                 if (baseOps.size() != 1)
@@ -1935,7 +2000,12 @@ namespace wolvrix::lib::transform
                     {
                         return false;
                     }
-                    if (dependsTransitivelyOn(graph, newBase, resultId, depScratch))
+                    // A constant array read already depends on this concat
+                    // operand. Selecting it directly preserves the same
+                    // dependency even when a different bit range feeds back.
+                    if (newBase == resultId ||
+                        (opKind != OperationKind::kSliceArray &&
+                         dependsTransitivelyOn(graph, newBase, resultId, depScratch)))
                     {
                         return false;
                     }
@@ -1999,7 +2069,7 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            return false;
+            return foldArrayReadInFalseLoop();
         }
 
         bool retargetLoopSliceEntrances(Graph &graph,

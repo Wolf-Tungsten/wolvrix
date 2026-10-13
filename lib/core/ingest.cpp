@@ -3406,15 +3406,24 @@ struct StmtLowererState {
                 part.type = aggregate->type;
                 part.leafTypes = aggregate->leafTypes;
                 part.values.reserve(aggregate->values.size());
-                for (ExprNodeId leafValue : aggregate->values)
+                for (std::size_t leafIndex = 0; leafIndex < aggregate->values.size();
+                     ++leafIndex)
                 {
+                    const ExprNodeId leafValue = aggregate->values[leafIndex];
                     ExprNode node;
                     node.kind = ExprNodeKind::Operation;
                     node.op = wolvrix::lib::grh::OperationKind::kReplicate;
                     node.operands = {countId, leafValue};
                     node.location = e->sourceRange.start();
                     node.tempSymbol = makeTempSymbol();
-                    const int64_t sourceWidth = widthHintOf(leafValue);
+                    // Bare symbol leaf values carry no widthHint; fall back to
+                    // the leaf's flat width so a degenerate {1{struct}} does
+                    // not collapse to a 1-bit replicate at assembly.
+                    int64_t sourceWidth = widthHintOf(leafValue);
+                    if (sourceWidth <= 0 && leafIndex < aggregate->leafTypes.size())
+                    {
+                        sourceWidth = aggregateLeafFlatWidth(aggregate->leafTypes[leafIndex]);
+                    }
                     if (sourceWidth > 0 &&
                         *count <= std::numeric_limits<int32_t>::max() / sourceWidth)
                     {
@@ -8841,13 +8850,7 @@ private:
             {
                 subWidth *= std::max<int32_t>(1, leaf.packedDimInfos[d].extent);
             }
-            ExprNodeId bitIndex = lane;
-            if (subWidth > 1)
-            {
-                ExprNodeId scale = addConstantLiteral(std::to_string(subWidth), location);
-                bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
-                                         {lane, scale}, location);
-            }
+            ExprNodeId bitIndex = scalePackedElementLaneIndex(lane, subWidth, location);
             return makeSliceDynamic(value, bitIndex, static_cast<int32_t>(subWidth), location);
         }
         const bool stateChain = isArrayStateChain(value);
@@ -9858,14 +9861,8 @@ private:
                 {
                     subWidth = 1;
                 }
-                ExprNodeId bitIndex = laneBase;
-                if (subWidth > 1)
-                {
-                    ExprNodeId scale =
-                        addConstantLiteral(std::to_string(subWidth), range->sourceRange.start());
-                    bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
-                                             {laneBase, scale}, range->sourceRange.start());
-                }
+                ExprNodeId bitIndex = scalePackedElementLaneIndex(
+                    laneBase, subWidth, range->sourceRange.start());
                 const int64_t sliceWidth = subWidth * count;
                 out.values.push_back(makeSliceDynamic(
                     base->values[i], bitIndex,
@@ -9986,14 +9983,8 @@ private:
                         const int64_t flatWidth =
                             std::max<int32_t>(1, info->width);
                         const int64_t subWidth = std::max<int64_t>(1, flatWidth / extent);
-                        ExprNodeId bitIndex = lane;
-                        if (subWidth > 1)
-                        {
-                            ExprNodeId scale =
-                                addConstantLiteral(std::to_string(subWidth), location);
-                            bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
-                                                     {lane, scale}, location);
-                        }
+                        ExprNodeId bitIndex =
+                            scalePackedElementLaneIndex(lane, subWidth, location);
                         value = makeSliceDynamic(value, bitIndex,
                                                  static_cast<int32_t>(subWidth), location);
                     }
@@ -24319,7 +24310,11 @@ private:
                 return kInvalidPlanIndex;
             }
             ExprNodeId value = makeSymbolNode(leaf, expr.sourceRange.start());
-            const SignalInfo* info = findSignalBySymbol(state_.plan_, leaf);
+            std::optional<SignalInfo> selectedInfo;
+            if (const SignalInfo* info = findSignalBySymbol(state_.plan_, leaf))
+            {
+                selectedInfo = *info;
+            }
             // Apply selects oldest-first (outermost array dim first).
             for (auto rit = selects.rbegin(); rit != selects.rend(); ++rit)
             {
@@ -24328,11 +24323,17 @@ private:
                 {
                     return kInvalidPlanIndex;
                 }
+                SignalInfo* info = selectedInfo ? &*selectedInfo : nullptr;
                 if (info && !info->unpackedDims.empty())
                 {
+                    const int64_t extent =
+                        std::max<int32_t>(1, info->unpackedDims.front().extent);
+                    const int32_t subWidth = static_cast<int32_t>(
+                        std::max<int64_t>(1, signalTotalWidth(*info) / extent));
                     if (isArrayStateChainConn(value))
                     {
-                        value = makeSliceDynamicNode(value, index, 1, expr.sourceRange.start());
+                        value = makeSliceDynamicNode(value, index, subWidth,
+                                                     expr.sourceRange.start());
                     }
                     else
                     {
@@ -24359,25 +24360,39 @@ private:
                                  normalized},
                                 32, expr.sourceRange.start());
                         }
-                        value = makeSliceArrayNode(value, normalized, 1, expr.sourceRange.start());
+                        value = makeSliceArrayNode(value, normalized, subWidth,
+                                                   expr.sourceRange.start());
                     }
-                    SignalInfo shrunk = *info;
-                    shrunk.unpackedDims.erase(shrunk.unpackedDims.begin());
-                    static thread_local std::deque<SignalInfo> shrunkPool;
-                    shrunkPool.push_back(std::move(shrunk));
-                    info = &shrunkPool.back();
+                    info->unpackedDims.erase(info->unpackedDims.begin());
+                    if (!info->shape.empty() && info->shape.front() == extent)
+                    {
+                        info->shape.erase(info->shape.begin());
+                    }
+                    if (info->shape.empty())
+                    {
+                        info->width = subWidth;
+                    }
                 }
                 else if (info && !info->packedDimInfos.empty())
                 {
+                    const int64_t extent =
+                        std::max<int32_t>(1, info->packedDimInfos.front().extent);
+                    const int32_t subWidth = static_cast<int32_t>(
+                        std::max<int64_t>(1, signalTotalWidth(*info) / extent));
                     ExprNodeId lane =
                         normalizePackedLaneConn(info->packedDimInfos.front(), index,
                                                 expr.sourceRange.start());
-                    value = makeSliceArrayNode(value, lane, 1, expr.sourceRange.start());
-                    SignalInfo shrunk = *info;
-                    shrunk.packedDimInfos.erase(shrunk.packedDimInfos.begin());
-                    static thread_local std::deque<SignalInfo> shrunkPool;
-                    shrunkPool.push_back(std::move(shrunk));
-                    info = &shrunkPool.back();
+                    value = makeSliceArrayNode(value, lane, subWidth,
+                                               expr.sourceRange.start());
+                    info->packedDimInfos.erase(info->packedDimInfos.begin());
+                    if (!info->shape.empty() && info->shape.front() == extent)
+                    {
+                        info->shape.erase(info->shape.begin());
+                    }
+                    if (info->shape.empty())
+                    {
+                        info->width = subWidth;
+                    }
                 }
                 else
                 {
@@ -25215,7 +25230,19 @@ private:
             graph_.setAttr(op, "rep", static_cast<int64_t>(*count));
             wolvrix::lib::grh::SymbolId sym =
                 makeInternalValueSymbol();
-            const int32_t width = normalizeWidth(node.widthHint);
+            const int64_t operandWidth = graph_.valueWidth(operands[1]);
+            const int64_t maxWidth = std::numeric_limits<int32_t>::max();
+            if (operandWidth <= 0 || *count > maxWidth / operandWidth)
+            {
+                if (context_.diagnostics)
+                {
+                    context_.diagnostics->warn(
+                        node.location,
+                        "Replication result width is invalid or exceeds the GRH limit");
+                }
+                return wolvrix::lib::grh::ValueId::invalid();
+            }
+            const int32_t width = static_cast<int32_t>(*count * operandWidth);
             wolvrix::lib::grh::ValueId result =
                 graph_.createValue(sym, width, false, node.valueType);
             graph_.addResult(op, result);
@@ -25335,57 +25362,14 @@ private:
                 valueByExpr_[id] = wolvrix::lib::grh::ValueId::invalid();
                 return wolvrix::lib::grh::ValueId::invalid();
             }
-            // Flat width of the selected element/sub-array, and per-dim lane
-            // strides (dim-major: lane = sum(i_j * stride_j)).
+            // Flat width of the selected element/sub-array.
             int64_t subWidth = baseWidth;
-            std::vector<int64_t> strides(indexCount, 1);
             for (std::size_t i = 0; i < indexCount; ++i)
             {
                 const int64_t dim = baseShape[i] > 0 ? baseShape[i] : 1;
                 if (subWidth > 0 && dim > 0 && subWidth % dim == 0)
                 {
                     subWidth /= dim;
-                }
-            }
-            // lane strides run over the indexed dims only (i+1..k-1); the
-            // remaining dims are covered by subWidth.
-            for (std::size_t i = indexCount; i-- > 0;)
-            {
-                int64_t stride = 1;
-                for (std::size_t j = i + 1; j < indexCount; ++j)
-                {
-                    stride *= baseShape[j] > 0 ? baseShape[j] : 1;
-                }
-                strides[i] = stride;
-            }
-            // All-constant indices fold to one static bit slice.
-            int64_t lane = 0;
-            bool allConst = true;
-            for (std::size_t i = 0; i < indexCount && allConst; ++i)
-            {
-                std::optional<int64_t> staticIndex =
-                    evalConstInt(plan_, lowering_, node.operands[1 + i]);
-                if (!staticIndex || *staticIndex < 0)
-                {
-                    allConst = false;
-                    break;
-                }
-                lane += *staticIndex * strides[i];
-            }
-            if (allConst)
-            {
-                const int64_t start = lane * subWidth;
-                const int64_t end = start + subWidth - 1;
-                if (subWidth > 0 && (baseWidth <= 0 || (end >= start && end < baseWidth)))
-                {
-                    wolvrix::lib::grh::ValueId result =
-                        createStaticSliceValue(operands[0], start, end,
-                                               false, node.valueType, node.location);
-                    if (result.valid())
-                    {
-                        valueByExpr_[id] = result;
-                        return result;
-                    }
                 }
             }
 

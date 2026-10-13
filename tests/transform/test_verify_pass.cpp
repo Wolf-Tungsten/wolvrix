@@ -459,5 +459,43 @@ int main()
         }
     }
 
+    // Case 14: replicate width is determined by the operand and rep attr.
+    for (const int32_t resultWidth : {9, 1})
+    {
+        Design design;
+        Graph &graph = design.createGraph("replicate_width");
+        ValueId input = graph.createValue(graph.internSymbol("input"), 9, false);
+        ValueId output = graph.createValue(graph.internSymbol("output"), resultWidth, false);
+        OperationId replicate = graph.createOperation(OperationKind::kReplicate,
+                                                      graph.internSymbol("replicate"));
+        graph.addOperand(replicate, input);
+        graph.addResult(replicate, output);
+        graph.setAttr(replicate, "rep", int64_t(1));
+        if (runVerify(design) != (resultWidth == 9))
+        {
+            return fail("kReplicate width verification did not detect a collapsed result");
+        }
+    }
+    {
+        Design design;
+        Graph &graph = design.createGraph("replicate_count");
+        ValueId input = graph.createValue(graph.internSymbol("input"), 9, false);
+        ValueId output = graph.createValue(graph.internSymbol("output"), 27, false);
+        OperationId replicate = graph.createOperation(OperationKind::kReplicate,
+                                                      graph.internSymbol("replicate"));
+        graph.addOperand(replicate, input);
+        graph.addResult(replicate, output);
+        graph.setAttr(replicate, "rep", int64_t(3));
+        if (!runVerify(design))
+        {
+            return fail("valid multi-copy kReplicate failed verification");
+        }
+        graph.setAttr(replicate, "rep", int64_t(0));
+        if (runVerify(design))
+        {
+            return fail("kReplicate with zero rep passed verification");
+        }
+    }
+
     return 0;
 }

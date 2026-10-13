@@ -593,6 +593,17 @@ target_link_libraries(transform-pass-manager
 
 register_test_exe(transform-pass-manager)
 
+add_executable(transform-slice-index-const
+    tests/transform/test_slice_index_const_pass.cpp
+)
+
+target_link_libraries(transform-slice-index-const
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-slice-index-const)
+
 add_executable(transform-verify
     tests/transform/test_verify_pass.cpp
 )
@@ -1063,6 +1074,20 @@ target_compile_definitions(ingest-port-array-elem-read
         WOLF_SV_INGEST_PORT_ARRAY_ELEM_READ_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/ingest_port_array_elem_read.sv"
 )
 register_test_exe(ingest-port-array-elem-read)
+
+# ingest: struct-array field reads in packed instance input connections
+add_executable(ingest-instance-struct-array-field-read
+    tests/ingest/test_ingest_instance_struct_array_field_read.cpp
+)
+target_link_libraries(ingest-instance-struct-array-field-read
+    PRIVATE
+        wolvrix-lib
+)
+target_compile_definitions(ingest-instance-struct-array-field-read
+    PRIVATE
+        WOLF_SV_INGEST_INSTANCE_STRUCT_ARRAY_FIELD_READ_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/ingest_instance_struct_array_field_read.sv"
+)
+register_test_exe(ingest-instance-struct-array-field-read)
 
 # ingest: graph assembly dpi/display
 add_executable(ingest-graph-assembly-dpi-display

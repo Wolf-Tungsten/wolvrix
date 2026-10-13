@@ -70,7 +70,7 @@
 | 数组状态元素写 | kRegisterWriteArrayPort / WriteArrayMaskPort 多索引；行内位/段写合成 mask |
 | 数组状态整体读 | kRegisterReadPort（数组 value 单定义） |
 | 数组状态整体写 | kRegisterWritePort / FillPort |
-| net/组合数组元素读 | kSliceArray 多索引（常量索引折叠为 kSliceStatic） |
+| net/组合数组元素读 | kSliceArray 多索引（常量索引保留数组访问） |
 | 成员访问（读/写） | 成员链解析到拆分叶子信号 + 剩余索引（无专用位段路径） |
 | 折回叶子元素选择 | 位切片（element width × 剩余维宽） |
 

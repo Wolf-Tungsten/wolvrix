@@ -13,7 +13,10 @@ module ingest_port_array_elem_read (
     input  logic [1:0]    sel,
     input  logic [48:0]   other,
     input  port_fetch_t [1:0] req_bits,
-    output logic [48:0]   o
+    input  logic [3:0][7:0] bytes,
+    output logic [48:0]   o,
+    output logic [7:0]    const_byte
 );
     assign o = req_bits[sel].startVAddr.addr + other;
+    assign const_byte = bytes[2];
 endmodule

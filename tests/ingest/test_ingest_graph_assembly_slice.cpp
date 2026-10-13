@@ -24,18 +24,6 @@ struct CompilationBundle {
     std::unique_ptr<slang::ast::Compilation> compilation;
 };
 
-std::optional<int64_t> intAttr(const wolvrix::lib::grh::Operation& op,
-                               std::string_view key) {
-    auto attr = op.attr(key);
-    if (!attr) {
-        return std::nullopt;
-    }
-    if (const auto* value = std::get_if<int64_t>(&*attr)) {
-        return *value;
-    }
-    return std::nullopt;
-}
-
 std::optional<std::string> stringAttr(const wolvrix::lib::grh::Operation& op,
                                       std::string_view key) {
     auto attr = op.attr(key);
@@ -110,7 +98,7 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
     bool hasConcat = false;
     bool hasSlice = false;
     bool hasConst = false;
-    bool hasPackedLane9Slice = false;
+    int packedLaneArrayReads = 0;
     bool hasPackedDynamicLaneSliceArray = false;
     bool hasSmallDynamicLaneSliceArray = false;
     bool hasUptoDynamicLaneSliceArray = false;
@@ -140,16 +128,6 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
             break;
         case wolvrix::lib::grh::OperationKind::kSliceStatic:
             hasSlice = true;
-            if (op.operands().size() == 1) {
-                const wolvrix::lib::grh::Value operand = graph->getValue(op.operands()[0]);
-                const auto sliceStart = intAttr(op, "sliceStart");
-                const auto sliceEnd = intAttr(op, "sliceEnd");
-                if (operand.symbolText() == "packed_data" &&
-                    sliceStart && sliceEnd &&
-                    *sliceStart == 72 && *sliceEnd == 79) {
-                    hasPackedLane9Slice = true;
-                }
-            }
             break;
         case wolvrix::lib::grh::OperationKind::kSliceArray:
             if (op.operands().size() == 2) {
@@ -161,6 +139,7 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
                 }
                 const int64_t elementWidth = operand.width() / baseShape.front();
                 if (operand.symbolText() == "packed_data" && elementWidth == 8) {
+                    ++packedLaneArrayReads;
                     hasPackedDynamicLaneSliceArray = true;
                 }
                 if (operand.symbolText() == "small_lanes" && elementWidth == 3) {
@@ -227,8 +206,8 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
     if (!hasConst) {
         return fail("Missing kConstant op in graph");
     }
-    if (!hasPackedLane9Slice) {
-        return fail("Missing packed_data[9] kSliceStatic [72:79]");
+    if (packedLaneArrayReads != 2) {
+        return fail("Expected both packed_data[9] and packed_data[dyn_idx] as kSliceArray");
     }
     if (!hasPackedDynamicLaneSliceArray) {
         return fail("Missing packed_data[dyn_idx] kSliceArray with element width 8 from shape");

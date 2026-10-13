@@ -399,21 +399,6 @@ int main()
     {
         return fail("expected native mt-kahypar partition output file");
     }
-    const std::filesystem::path featurePath = outDir / "top_repcut_k2.partition_features.jsonl";
-    if (!std::filesystem::exists(featurePath))
-    {
-        return fail("expected repcut partition static feature export");
-    }
-    const std::string featureText = readFile(featurePath);
-    if (featureText.find("\"record_type\":\"partition_static_feature_summary\"") == std::string::npos ||
-        featureText.find("\"record_type\":\"partition_static_features\"") == std::string::npos ||
-        featureText.find("\"part_name\":\"part_0\"") == std::string::npos ||
-        featureText.find("\"op_kind_counts\":{") == std::string::npos ||
-        featureText.find("\"width_bucket_counts\":{") == std::string::npos)
-    {
-        return fail("unexpected repcut partition static feature export content");
-    }
-
     if (!result.success || diags.hasError())
     {
         bool hasExpectedDiagnostic = false;
@@ -431,6 +416,16 @@ int main()
             return fail("repcut failed without explicit phase-e cross-partition diagnostic");
         }
         return 0;
+    }
+
+    const std::string *stats = findRepcutStatsDiagnostic(diags);
+    if (stats == nullptr ||
+        stats->find("\"partition_static_features\":[") == std::string::npos ||
+        stats->find("\"part_name\":\"part_0\"") == std::string::npos ||
+        stats->find("\"op_kind_counts\":{") == std::string::npos ||
+        stats->find("\"width_bucket_counts\":{") == std::string::npos)
+    {
+        return fail("missing repcut partition static features in stats diagnostic");
     }
 
     if (!result.changed)

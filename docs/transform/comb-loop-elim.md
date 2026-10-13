@@ -90,10 +90,11 @@ The pass now repairs false loops in two stages:
 1. retarget loop-entry slices
 2. if that is insufficient, split loop values into bit-range fragments and rewrite the affected ops
 
-The first stage is intentionally narrow. It only handles slice-like entrances that can be rewritten without creating a new dependency:
+The first stage handles slice-like entrances in an already identified false loop:
 
 - `kSliceStatic`
 - `kSliceDynamic` with a constant index
+- `kSliceArray` with in-bounds constant indices
 - retarget through `kAssign`
 - retarget through `kConcat`
 
@@ -102,7 +103,18 @@ When the selected slice fully covers a concat operand, the pass can rewrite:
 - to `kAssign` if the whole operand is selected
 - to `kSliceStatic` if only part of the operand is selected
 
-The pass rejects this rewrite if the chosen new base already depends on the slice result transitively. That guard is important for avoiding pseudo-loop rewrites that would turn a false loop into a real one.
+For static and dynamic bit slices, retargeting rejects a concat operand that
+already depends on the result. A constant array read may select such an operand:
+the dependency was already present through the concat, so selecting the same
+element directly does not add one. A direct self-assignment is still rejected.
+
+For example, if `a` has shape `[2]` and contains two 6-bit elements,
+`a = concat(hi, lo)`, then `kSliceArray(a, 1)` selects bits `[11:6]` and can
+become `kAssign(hi)`. If an intervening `kAssign` connects `a` to a flat
+12-bit value without the same shape, the array read keeps `a` as its base and
+becomes `kSliceStatic(a, 6, 11)` inside this false-loop repair. This local
+fallback does not change dynamic array reads or normalize constant array
+reads elsewhere in the graph.
 
 ## Carry-Chain Example
 

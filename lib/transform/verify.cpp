@@ -820,6 +820,28 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kReplicate:
+                {
+                    const auto operands = op.operands();
+                    const auto results = op.results();
+                    const std::optional<int64_t> rep = attrAs<int64_t>(op, "rep");
+                    if (operands.size() != 1 || results.size() != 1 || !rep || *rep <= 0 ||
+                        !operands.front().valid() || !results.front().valid())
+                    {
+                        error(*graph, op, "grh.verify: kReplicate requires one operand, one result, and a positive int rep attr");
+                        break;
+                    }
+                    const int32_t operandWidth = graph->valueWidth(operands.front());
+                    if (operandWidth <= 0 || *rep > std::numeric_limits<int32_t>::max() / operandWidth ||
+                        graph->valueWidth(results.front()) != *rep * operandWidth)
+                    {
+                        error(*graph, op, "grh.verify: kReplicate result width " +
+                                              std::to_string(graph->valueWidth(results.front())) +
+                                              " does not match rep " + std::to_string(*rep) +
+                                              " x operand width " + std::to_string(operandWidth));
+                    }
+                    break;
+                }
                 default:
                     break;
                 }

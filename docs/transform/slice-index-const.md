@@ -2,11 +2,12 @@
 
 ## 功能概述
 
-`slice-index-const` pass 将常量索引的动态切片（`kSliceDynamic`）转换为静态切片（`kSliceStatic`），以便后续优化。
+`slice-index-const` pass 将位偏移为常量的动态位切片（`kSliceDynamic`）转换为静态位切片（`kSliceStatic`），以便后续优化。
+数组访问 `kSliceArray` 保留原操作，即使所有下标都是常量；其 shape 信息供后续数组寻址使用。
 
 ## 详细说明
 
-动态切片操作在编译时索引已知的情况下，可以转换为等效的静态切片操作。这种转换允许后续 passes 进行更多的常量传播和优化。
+动态位切片操作在编译时位偏移已知的情况下，可以转换为等效的静态位切片操作。这种转换允许后续 passes 进行更多的常量传播和优化。
 
 ### 转换条件
 

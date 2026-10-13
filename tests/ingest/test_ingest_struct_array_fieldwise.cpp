@@ -93,6 +93,8 @@ int testFieldWiseStructArray(const std::filesystem::path& sourcePath) {
     }
 
     bool sawPerLeafReplicate = false;
+    bool sawBankSlice = false;
+    bool sawWaySlice = false;
     for (const wolvrix::lib::grh::ValueId valueId : graph->values()) {
         const wolvrix::lib::grh::Value value = graph->getValue(valueId);
         const int64_t width = value.width();
@@ -107,6 +109,27 @@ int testFieldWiseStructArray(const std::filesystem::path& sourcePath) {
     }
     for (const wolvrix::lib::grh::OperationId opId : graph->operations()) {
         const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if ((op.kind() == wolvrix::lib::grh::OperationKind::kSliceDynamic ||
+             op.kind() == wolvrix::lib::grh::OperationKind::kSliceArray) &&
+            op.operands().size() == 2 && op.results().size() == 1) {
+            const int64_t baseWidth = graph->getValue(op.operands().front()).width();
+            const int64_t resultWidth = graph->getValue(op.results().front()).width();
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceDynamic &&
+                baseWidth == 2048 && resultWidth == 256) {
+                sawBankSlice = true;
+                if (graph->getValue(op.operands()[1]).width() < 11) {
+                    return fail("Bank index bit offset truncates before 7 * 256");
+                }
+            }
+            if (baseWidth == 256 && resultWidth == 64) {
+                sawWaySlice = true;
+                const int64_t minIndexWidth =
+                    op.kind() == wolvrix::lib::grh::OperationKind::kSliceDynamic ? 8 : 2;
+                if (graph->getValue(op.operands()[1]).width() < minIndexWidth) {
+                    return fail("Way index cannot address all four entries");
+                }
+            }
+        }
         if (op.kind() != wolvrix::lib::grh::OperationKind::kReplicate) {
             continue;
         }
@@ -115,10 +138,31 @@ int testFieldWiseStructArray(const std::filesystem::path& sourcePath) {
                 sawPerLeafReplicate = true;
             }
         }
+        // Invariant (stage-07 bug4): result width == rep x operand width. A
+        // bare symbol leaf carries no plan-stage widthHint; the replicate
+        // must still take the true operand width, never collapse to 1.
+        const auto repAttr = op.attr("rep");
+        if (!repAttr || op.operands().size() != 1 || op.results().size() != 1) {
+            continue;
+        }
+        const auto* rep = std::get_if<int64_t>(&*repAttr);
+        if (!rep || *rep <= 0) {
+            continue;
+        }
+        const int64_t operandWidth = graph->getValue(op.operands().front()).width();
+        const int64_t resultWidth = graph->getValue(op.results().front()).width();
+        if (resultWidth != *rep * operandWidth) {
+            return fail("kReplicate width mismatch: result=" + std::to_string(resultWidth) +
+                        " rep=" + std::to_string(*rep) +
+                        " operand=" + std::to_string(operandWidth));
+        }
     }
     if (!sawPerLeafReplicate) {
         return fail("Missing per-leaf replicate of width " +
                     std::to_string(kPerLeafRepWidth) + " (160 x 64)");
+    }
+    if (!sawBankSlice || !sawWaySlice) {
+        return fail("Missing bank/way reads of the split struct leaf");
     }
     return 0;
 }

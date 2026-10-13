@@ -82,6 +82,7 @@ int testPortArrayElemRead(const std::filesystem::path& sourcePath) {
     }
 
     bool sawArrayRead = false;
+    bool sawConstantArrayRead = false;
     for (const wolvrix::lib::grh::OperationId opId : graph->operations()) {
         const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
         if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
@@ -90,10 +91,18 @@ int testPortArrayElemRead(const std::filesystem::path& sourcePath) {
         }
         if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceArray) {
             sawArrayRead = true;
+            if (op.operands().size() == 2 && op.results().size() == 1 &&
+                graph->getValue(op.operands()[0]).width() == 32 &&
+                graph->getValue(op.results()[0]).width() == 8) {
+                sawConstantArrayRead = true;
+            }
         }
     }
     if (!sawArrayRead) {
         return fail("Expected the port element read to lower to kSliceArray");
+    }
+    if (!sawConstantArrayRead) {
+        return fail("Expected the constant packed-array read to remain kSliceArray");
     }
     return 0;
 }

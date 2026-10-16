@@ -16,7 +16,8 @@ mapping 字段、默认参数和 emitter 约束以 [CPU 后端](../backends/cpu.
 
 ## 1. 范围与产物
 
-当前路线已实现事件/主体/内存写/输出四相位（P_event/P_general/P_mem/P_output）、
+当前路线已实现事件/主体/大状态写/输出四个 op 相位
+（P_event/P_general/P_large_sink/P_output），运行时另有 P_input/P_publish，
 活动度传播、数据布局、调度和 C++ emit。运行时使用一个 NUMA node、一个 CPU core；
 调用方改变输入后调用 `eval()`，不要求存在名为 `clock` 的端口，也不把一次 `eval()`
 等同于一个硬件时钟周期。
@@ -61,7 +62,7 @@ XiangShan 入口在 lower 成功后先执行全图优化段（M5d-3 起的目标
 [`grhsim.pack-bit-registers`](../passes/pack-bit-registers.md)（bit 寄存器打包，改用原始
 event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全图不动点化简，
 最后 [`grhsim.select-state-stores`](../passes/select-state-stores.md)（M5d-4，A7）
-完成语义存储分类——每个状态获得 `regLatch`/`mem` 归属与对应 NBA 提交契约（见
+完成语义存储分类——每个状态获得 `smallSink`/`largeSink` 归属与对应 NBA 提交契约（见
 [Overview](../overview.md) 第 3.5 节）；这些 pass 不修改 GRH。
 （`grhsim.reg-to-mem` 已于 2026-10-10 从该段退役：stage-04/06 preserve-aggregate
 端到端保留数组后前端不再产标量化寄存器族，pass 失去输入来源，见
@@ -71,11 +72,11 @@ event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全
 `grhsim.classify-event-inputs`（B1）、`grhsim.lower-edge-detect`（B2）、
 `grhsim.extract-output-cones`（B3）、`grhsim.migrate-timeslot-tasks`（B4）完成事件/输出/
 time-slot 结构降级；[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5）按
-A7 分类完成类感知相位归属（`mem` 类状态的写归 P_mem，`regLatch` 类状态——含小数组——
+A7 分类完成类感知相位归属（`largeSink` 类状态的写归 P_large_sink，`smallSink` 类状态
 的写归 P_general），`grhsim.simplify(scope=phase)`（B6）逐分区独立化简
 （保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），最后
 `grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
-P_mem 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clone-shared-compute`）撤除：
+P_large_sink 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clone-shared-compute`）撤除：
 边界感知克隆移入 mapping 段（C2.5，见下），**B8 之后除注册的 C 段微调 pass 外不再有
 任何语义改写**——旧管线的"后置化简 + 第二轮 mapping"往返段已拆除，CPU mapping
 （下表 C1–C8 八个 `cpu.st.*` pass 加 C2.5）在封板模型上只运行一次，单向推进。
@@ -160,12 +161,12 @@ stage，单向不回退。
 
 | 阶段 | Pass | 主要产物 |
 | --- | --- | --- |
-| C1 | [`cpu.st.build-general-nodes`](../passes/build-general-nodes.md) | 从零初始化 mapping：root + Event/General/Mem/Output 四平铺分枝，General 分枝的 node（锥吸收） |
+| C1 | [`cpu.st.build-general-nodes`](../passes/build-general-nodes.md) | 从零初始化 mapping：root + Event/General/LargeSink/Output 四平铺分枝，General 分枝的 node（锥吸收） |
 | C2 | [`cpu.st.merge-general-supernodes`](../passes/merge-general-supernodes.md) | General 超节点；超节点序号 = General 分枝子节点顺序，就此固定 |
-| C3 | [`cpu.st.layout-named-stores`](../passes/layout-named-stores.md) | 物理类型表与七个具名 store（零分类决策，只消费 A7 `storeClass`） |
-| C4 | [`cpu.st.build-event-activation-map`](../passes/build-event-activation-map.md) | 每个 event act 的 P_event 激活映射：含该 act 事件 op 的**非 sink** 超节点位图（bit i = C2 序号 i；V2-M2 起 sink 超节点不再配位图） |
-| C5 | [`cpu.st.build-mem-write-plan`](../passes/build-mem-write-plan.md) | Mem 相写的 per-mem 优先级与 mem 类状态的 General 相读者表 |
-| C6 | [`cpu.st.pack-general-functions`](../passes/pack-general-functions.md) | 超节点 helperChunks；General 分枝尾随 EmitFunction 叶子（只记 `supernodeRange` 区间）；Event/Mem/Output 各塌缩为唯一 EmitFunction |
+| C3 | [`cpu.st.layout-named-stores`](../passes/layout-named-stores.md) | 物理类型表与 12 个具名 store（零分类决策，只消费 A7 `storeClass`） |
+| C4 | [`cpu.st.build-event-activation-map`](../passes/build-event-activation-map.md) | 每个 event act 的 P_event 激活映射：含该 act 事件 op 的 nonSink 超节点位图（bit i = C2 序号 i；smallSink 超节点不配位图） |
+| C5 | [`cpu.st.build-mem-write-plan`](../passes/build-mem-write-plan.md) | LargeSink 相写的 per-state 优先级、事件簇与 largeSink 状态的 General 相读者表 |
+| C6 | [`cpu.st.pack-general-functions`](../passes/pack-general-functions.md) | 超节点 helperChunks；General 分枝尾随 EmitFunction 叶子（只记 `supernodeRange` 区间）；Event/LargeSink/Output 各塌缩为唯一 EmitFunction |
 | C7 | [`cpu.st.build-phase-schedule`](../passes/build-phase-schedule.md) | 三张 fanout、timeslot 触发映射、单核 task 序列 |
 | C8 | [`cpu.st.plan-translation-units`](../passes/plan-translation-units.md) | emit TU 计划（块流 + 单元装箱，记录规模上限）；终态 `TranslationUnits` |
 | 发射 | `cpu.st.emit-cpp` | 每单元一个 .cpp + 共享头 + 多源 Makefile，要求输出目录为空 |
@@ -177,7 +178,7 @@ root
   phase Event    -> emit_function -> ops         ; 锥拓扑序，edgeDet 殿后
   phase General  -> supernode+ -> node+ -> ops   ; 超节点直挂 General 分枝，子节点顺序即序号
                  -> emit_function+               ; 尾随叶子，attrs.supernodeRange 记序号区间
-  phase Mem      -> emit_function -> ops         ; op-id 序
+  phase LargeSink -> emit_function -> ops        ; op-id 序
   phase Output   -> emit_function -> ops         ; 拓扑序
 ```
 
@@ -185,7 +186,7 @@ root
 supernode 决定活动度粒度；EmitFunction 决定代码组织，不能为了减少函数数而扩大调度粒度。
 归位决议 2：超节点序号在 C2 固定、与函数打包解耦——C6 不再重新挂载超节点，只在区间上
 记录函数边界。TU 归属由 C8 的 `translationUnits` 计划承载（M5d-7）：块流（Core/Init/
-Event/GeneralScan/Supernode/Mem/Output/Dump）按估计行数装箱为规模受控的单元，emit
+Event/GeneralScan/Supernode/LargeSink/Output/Dump）按估计行数装箱为规模受控的单元，emit
 逐单元输出一个源文件，生成的 Makefile 承载完整源文件清单（`make -j` 即并行编译）。
 
 `PhaseSchedule`（C7 后）与 `TranslationUnits`（C8 后）都是 `complete=true` 的终态；
@@ -205,21 +206,21 @@ event/output 锥，[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B
 存储分类完成总归属，B8 封板。C 段只消费 `SimOp::phase`，不重新归因；C1 发现 `none`
 op 即报错并指向 B5。
 
-写 op 集合为 `core.state.write`、`writeArray`、`fill`、`latchWrite`：标量目标的
-`write` 与全部 `latchWrite`，以及 `regLatch` 类状态（含小数组）上的写在 General 相，
-`mem` 类状态的写在 Mem 相。其他 op 归 General（含 `core.system.task` 和
+写 op 集合为 `core.state.write`、`writeMask`、`writeArray`、`writeArrayMask`、`fill`、`latchWrite`：目标状态为
+`smallSink` 时归 General 相，为 `largeSink` 时归 LargeSink 相；Output 相的
+timeslot `latchWrite` 是例外。其他 op 归 General（含 `core.system.task` 和
 `core.dpi.call`），事件锥与输出锥分别归 Event/Output。
 
 事件在 B2 已降级为聚类形态：每个 `(event, edge)` 去重聚类对应一个
 `core.event.edgeDet`（P_event，`prevEvent` 保存上一轮事件值），消费 op 以
 `event_acts`（聚类下标数组）引用判定结果；C4 按聚类生成 P_event 激活映射（只覆盖
-含事件 op 的非 sink 超节点）。写口守卫是命中聚类的析取，再与 enable 组合决定是否写
+含事件 op 的 nonSink 超节点）。写口守卫是命中聚类的析取，再与 enable 组合决定是否写
 数据；即使 enable 为假，prevEvent 仍逐轮采样。
 
 不得预设 XiangShan 只有一个事件聚类，也不得假设同一 state 只有一个写口；多个写口完整
-保留，合法性和覆盖规则遵守 core 方言。同一 state 的多个写 op 按 op 声明顺序应用、后写
-覆盖先写（stage-06 起 `memWriteSeq` 退役，有序覆盖由声明顺序表达）；该相对顺序是 IR
-语义，分区或函数打包不得重排同 state 的写 op。
+保留，合法性和覆盖规则遵守 core 方言。同一 state 的较晚声明写 op 优先级更高；
+smallSink 和 largeSink 都先按优先级升序执行，再按 `eventAct` 聚类，最后按 enable 位图
+批量跳过。低优先级写先执行，高优先级写后执行并覆盖重叠位；分区或函数打包不能破坏此顺序。
 
 DPI 保持 `callCond && event guard` 语义：有无返回值不决定其相位，没有结果的调用不能被
 删除，没有 event 时 guard 为真；未触发时结果保持。
@@ -239,50 +240,54 @@ C6 的函数打包只聚合 C2 序号的连续区间（`supernodeRange`），不
 ops/lines 除以目标数放大阈值，0 则不启用该调整。默认值为 64。改变此参数必须单独记录
 并重新验证编译，不能仅凭函数数接近 legacy 就认定 emit 结构或编译成本已一致。
 
-DataLayout 在 C3 生成：状态归 store 只消费 A7 的 `storeClass` 注解（`regLatch`/`mem`），
-未分类状态报错并指向 `grhsim.select-state-stores`。`regLatch` 类状态（含数组）进
-regLatch store（emit 声明 `regLatchStore`/`regLatchStoreNext` 双缓冲，publish 整块
-memcpy 提交），`mem` 类数组进 mem store。输入端口、跨超节点 value 和 General→Mem 写
-参数使用 boundary 持久存储。布局完整性不能代替 emitter 的类型支持检查。
+DataLayout 在 C3 生成：状态归 store 只消费 A7 的 `storeClass` 注解
+（`smallSink`/`largeSink`），未分类状态报错并指向 `grhsim.select-state-stores`。
+小状态（标量或数组）进入 `smallSinkStore`，emit 声明同布局的
+`smallSinkStoreNext` 双缓冲；大状态（标量或数组）进入 `largeSinkStore`。
+外部输入单独进入 `inputStore`，nonSink 间的值进入 `nonSinkBoundaryStore`；
+写使能和数据/地址/mask 则分别进入 small/large 两套 enable/payload boundary store。
+布局完整性不能代替 emitter 的类型支持检查：两态多维数组逐维嵌套 emit，
+四态 aggregate 与 DPI aggregate ABI 明确不支持。
 
 C7 的单核 task 序列为：P_event（`AlwaysScanCommit`）→ P_general 各 EmitFunction 叶子
 （`DataGated`，任务执行叶子的 `supernodeRange` 区间；V2-M2 前名为 `EventDataGated`）
-→ P_mem（`AlwaysScanCommit`）
+→ P_large_sink（`AlwaysScanCommit`）
 → P_output（`EvalEnd`，round 循环外）；每个 EmitFunction 叶子对应一个 task，
 `waitsFor` 为空。激活关系由三张 fanout 表表示（目标按 C2 序号排序去重；V2-M2 起目标
-一律收窄为**非 sink** 超节点——sink 超节点不经 dataActiveFlag 激活）：
+一律收窄为 nonSink 超节点；smallSink 超节点不经 `nonSinkActiveFlag` 激活）：
 
 | 激活表 | 触发源与用途 |
 | --- | --- |
 | `inputFanout` | General 相输入 read value 的任意变化，激活所属超节点；纯事件输入无条目（由 P_event 覆盖） |
-| `computeSupernodeFanout` | boundary value 真变化，激活跨超节点非 sink 消费者（Mem 相写消费者除外，P_mem 每轮运行；sink 消费者过滤后无条目） |
-| `commitStateFanout` | reg/latch 状态真变化，激活 General 读者超节点并决定继续迭代；General 相、目标为 regLatch 类数组的 `readArray` 读者同标量一样经本表激活 |
+| `computeSupernodeFanout` | `nonSinkBoundaryStore` 值真变化，激活跨超节点 nonSink 消费者；largeSink 写消费者和 smallSink 消费者不在此表 |
+| `commitStateFanout` | smallSink 状态真变化，激活 General nonSink 读者进入下一轮；标量与数组 `read`/`readArray` 共用本表 |
 
-activate 目标只指向 General 超节点；mem 类数组的读者不在此表，由 C5 写计划的读者表
+activate 目标只指向 General nonSink 超节点；largeSink 状态的读者不在此表，由 C5 写计划的读者表
 激活。posedge 聚类也必须观察下降沿，以便 prevEvent 回到 0；不能只在所需边沿方向上
 做事件判定。
 
 ## 5. 运行时 Flow
 
-初始化应用全部 `Init` 步骤（写 regLatchStore 当前值后由 initGlue 同步 next 缓冲），
-激活全部 General 超节点（dataActiveFlag 全 1）。每次 `eval()` 固定外部输入，然后执行：
+初始化应用全部 `Init` 步骤（写 `smallSinkStore` 当前值后同步 next 缓冲），
+激活全部 General nonSink 超节点（`nonSinkActiveFlag` 全 1）。每次 `eval()` 固定外部输入，然后执行：
 
 ```text
-加载并归一化输入
-对 inputFanout 所列输入做差分，置位对应超节点的 dataActiveFlag
+P_input：加载并归一化输入；对 inputFanout 所列输入做差分，更新 inputStore，
+  置位对应超节点的 nonSinkActiveFlag
 重复执行轮次：
   P_event：边沿判定写 eventActStore、采样 prevEvent；按 C4 激活映射把
-    命中 act 的非 sink 超节点置位 dataActiveFlag（V2-M2 起无 eventActiveFlag）
+    命中 act 的 nonSink 超节点置位 nonSinkActiveFlag（V2-M2 起无 eventActiveFlag）
   P_general：按 task、C2 序号顺序，按超节点类别点火并传播变化
-    （非 sink：dataActiveFlag 点火并清零；SinkEvent 簇：eventActStore 签名
-    组合门控；SinkEscape 簇：每轮无条件；sink 簇体内不再重复判断事件——
-    V2-M3，非 sink 体内事件 op 与 P_mem 写口保留逐 op guard；regLatch 类写
-    在超节点内 NBA 提交 regLatchStoreNext；readArray 读当前值）
-  P_mem：按 C5 计划逐写原地提交 mem 类数组（计划按写 op 声明顺序生成，
-    同地址后写覆盖先写）
-  P_publish：regLatchStoreNext 整块提交回 regLatchStore；状态真变化经
-    commitStateFanout 把读者激活进 dataActiveFlagNext，并决定是否继续迭代
-  若 E 未变化，退出轮次循环
+    （nonSink：nonSinkActiveFlag 点火并清零；SmallSinkEvent 簇：eventActStore
+    签名门控；SmallSinkEscape 簇：每轮进入扫描）。nonSink 产生的写参数进入
+    small/large 各自的 enable/payload boundary store；smallSink 写经
+    优先级（低到高）→ eventAct → enable 顺序进入 smallSinkStoreNext，真变化使
+    commitStateFanout 激活 nonSinkActiveFlagNext
+  P_large_sink：先按低到高优先级，再按 eventAct 聚类，最后按 largeSinkEnableBoundaryStore
+    批量跳过；命中后读取 payload 并原地提交 largeSinkStore，变化读者进入 next 位图
+  P_publish：smallSinkStoreNext 整块提交回 smallSinkStore；合并并清零
+    nonSinkActiveFlagNext，由其是否全零决定继续迭代
+  若无下一轮激活，退出轮次循环
 P_output：收敛后执行一次（EvalEnd，round 循环外），刷新对外输出
 超过收敛轮数上限则报告错误
 ```
@@ -290,33 +295,35 @@ P_output：收敛后执行一次（EvalEnd，round 循环外），刷新对外�
 当前 C++ emitter 的收敛保护上限为 100000 轮。
 
 prevEvent 是普通状态更新的一部分：每轮 P_event 的边沿判定读取上一轮 prevEvent，采样随
-本轮生效，**不是冻结到整个 eval 结束**。dataActiveFlagNext 与当前轮标志分开消费，轮末
+本轮生效，**不是冻结到整个 eval 结束**。`nonSinkActiveFlagNext` 与当前轮标志分开消费，轮末
 清理不能丢失 publish 刚产生的唤醒。
 
 例如派生时钟 `g = clk & en` 从 0 变为 1，P_event 判定 posedge 后写 eventActStore 对应
-act 位，引用该聚类的 SinkEvent 写簇在 P_general 经签名组合门控点火写状态；g 的下降沿
+act 位，引用该聚类的 SmallSinkEvent 写簇在 P_general 经签名组合门控点火写状态；g 的下降沿
 同样被判定（prevEvent 回到 0），不会把同一电平再次误判为上升沿，也为下次上升做好准备。
-产生门控使能的 latch 写落入 SinkEscape 簇、每轮无条件点火，使"EN 先稳定、Q 边沿后判定"
+产生门控使能的 latch 写落入 SmallSinkEscape 簇、每轮无条件点火，使"EN 先稳定、Q 边沿后判定"
 在同一 eval 的轮次循环内闭环（不再存在 eventActiveFlag 双重门的循环等待）。
 
 ## 6. Emit 约束与优化边界
 
 emit 可以改变 C++ 形态，但不能改变上述 G 转移、E 或调用语义。当前 emitter 的关键结构：
 
-- General 相 regLatch 类数组写（`write`/`writeArray`/`fill`）在所属超节点内
-  NBA 提交 regLatchStoreNext：merge 基为 next 行（同轮多写口读改写叠加）、对 cur 行做
-  真变化检测，经 commitStateFanout 把读者激活进 dataActiveFlagNext，与标量 reg/latch
-  路径一致；`readArray` 对 regLatch 类数组读 regLatchStore 当前值；init 写 cur 后由
-  initGlue 同步 next。
-- mem 类数组写在 P_mem 按 C5 计划原地提交：计划按写 op 的**声明顺序**生成（`priority`
-  字段 = 该写在目标 state 的 Mem 相写中的声明顺序位次，保留为检查/调试可读性），原地
-  提交天然后写覆盖先写；跨事件写端口不受同顺序域限制——P_mem 在 P_general 之后统一
-  提交，同轮多个事件聚类命中的写口按 plan 顺序应用。常量地址的读者按精确 staticRow
+- General 相 smallSink 写在所属超节点内进入 `smallSinkStoreNext`：
+  `smallSinkEnableBoundaryStore` 先批量检测使能，命中后才读取 payload；
+  对当前状态做真变化检测，经 `commitStateFanout` 把读者激活进
+  `nonSinkActiveFlagNext`。数组和标量都读 `smallSinkStore` 当前值；初始化当前值后同步 next。
+- largeSink 写在 `P_large_sink` 按 C5 计划原地提交：较晚声明的同状态写口有
+  更高优先级，外层按优先级升序、内部按 eventAct 聚类，再用
+  `largeSinkEnableBoundaryStore` 批量跳过；高优先级写自然覆盖低优先级写入的重叠位。
+  常量地址的读者按精确 staticRow
   激活（`readArray` 的全 rank 索引全部为常量时按行主序折叠为线性行号；任一非常量索引
   或 k<rank 的部分索引一律视为动态读者），动态地址保守地在任意写时激活。
-- 宽位 helper 沿用 legacy 的指针式、调用者提供 out-buffer 的原地计算 ABI，不增加整块
-  旧值快照。
-- dumpState 对 regLatch 类大数组（count>64）与 memStore 一样走 fnv1a 哈希。
+- 同状态有多个 event-free 写且有 General 读者时，以本轮最终变化决定读者激活，
+  避免每轮先改再覆盖回原值却无法收敛。smallSink 在 publish 前比较已有 current/next；
+  largeSink 只记录本轮实际改动行的首次旧值，全部写完后比较并清空记录。
+- 两态宽值使用 C23 `_BitInt` 原生运算；其他运行时 helper 沿用调用者提供的
+  输出缓冲策略。四态 aggregate emit 不支持。
+- dumpState 对大数组与 `largeSinkStore` 使用 fnv1a 哈希。
 - M5d-7 多 TU：emit 按 C8 计划把块函数分配到多个 .cpp；超过规模的函数再拆块成员
   （超节点 `sn_<i>__c<j>` 用 C6 helperChunks；相位/init/dump/扫描各有块函数），跨块
   局部值经类内嵌套 spill 帧（`SnFrame<i>`/`EventFrame`/`OutputFrame`）按引用传递

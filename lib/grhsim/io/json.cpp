@@ -564,7 +564,10 @@ namespace wolvrix::lib::grhsim
                         writeId(writer, field.value); writer.value(static_cast<uint64_t>(field.aux));
                         writer.endArray();
                     }
-                    writer.endArray(); writer.value(store.sizeBytes); writer.endArray();
+                    writer.endArray(); writer.value(store.sizeBytes);
+                    writer.startArray();
+                    for (const auto value : store.enableBitValues) writeId(writer, value);
+                    writer.endArray(); writer.endArray();
                 }
                 writer.endArray();
             }
@@ -801,7 +804,14 @@ namespace wolvrix::lib::grhsim
                         expectComma(reader); field.aux = reader.index("store field aux", true);
                         reader.endArray(); store.fields.push_back(field);
                     }
-                    expectComma(reader); store.sizeBytes = reader.unsignedInteger(); reader.endArray();
+                    expectComma(reader); store.sizeBytes = reader.unsignedInteger();
+                    if (reader.comma())
+                    {
+                        reader.startArray(); bool bitFirst = true;
+                        while (reader.nextArray(bitFirst))
+                            store.enableBitValues.push_back(readId<ValueId>(reader, "enable bitmap value"));
+                    }
+                    reader.endArray();
                     layout.namedStores->push_back(std::move(store));
                 }
             }
@@ -1004,7 +1014,7 @@ namespace wolvrix::lib::grhsim
                         else
                         {
                             partition.attrs.supernodeCategory =
-                                readCpuEnum(reader, CpuSupernodeCategory::SinkEvent);
+                                readCpuEnum(reader, CpuSupernodeCategory::SmallSinkEvent);
                             // A1: a guard-subdivided SinkEvent supernode
                             // trails its shared-enable value index after the
                             // category scalar.

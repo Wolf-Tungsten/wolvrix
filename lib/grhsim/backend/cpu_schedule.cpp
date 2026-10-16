@@ -19,7 +19,7 @@ namespace wolvrix::lib::grhsim
         // V2 (M2): fanout targets and the activation map cover NON-SINK
         // supernodes only (boundary 2) — sink supernodes fire on their
         // eventActStore signature (SinkEvent) or unconditionally every round
-        // (SinkEscape), never on dataActiveFlag.
+        // (SinkEscape), never on nonSinkActiveFlag.
         bool isNonSinkSupernode(const CpuPartitionTree &tree, PartitionId id)
         {
             const auto &attrs = tree.partitions[id.index - 1].attrs;
@@ -33,7 +33,7 @@ namespace wolvrix::lib::grhsim
         // the bitmap of non-sink General supernodes holding an op that
         // carries the act (bit i = supernode ordinal i), sourced from the
         // supernodes' eventActs annotations. P_event ORs the fired acts'
-        // words into dataActiveFlag. Acts with no non-sink carrier get no
+        // words into nonSinkActiveFlag. Acts with no non-sink carrier get no
         // entry; sink supernodes never appear (see above).
         std::vector<CpuEventActivation> buildSixPhaseEventActivation(const CpuPartitionTree &tree)
         {
@@ -65,10 +65,13 @@ namespace wolvrix::lib::grhsim
         }
 
         // cpu.st.build-mem-write-plan (C5): Mem-phase write ops (the stage-06
-        // write/writeArray/fill family) in op-id order; per-mem priority =
+        // write/writeArray/fill family); per-state priority =
         // declaration-order rank among the target state's Mem-phase writes
         // (stage-03 semantics: same-state writes apply in declaration order,
-        // later writes overwrite earlier ones). Readers are the target mem's
+        // later writes overwrite earlier ones). The plan schedules lower
+        // priority first and higher priority last, then clusters by event acts
+        // inside each priority.
+        // Readers are the target mem's
         // General-phase readArray ops with their owning supernode (staticRow
         // engaged only for a full-rank, all-constant index vector, folded
         // row-major into the linear row number), plus the General-phase
@@ -97,14 +100,14 @@ namespace wolvrix::lib::grhsim
                 if (opName != "core.state.readArray" && opName != "core.state.read") continue;
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
-                if (model.states()[refs.front().index - 1].storeClass != StateStoreClass::Mem) continue;
+                if (model.states()[refs.front().index - 1].storeClass != StateStoreClass::LargeSink) continue;
                 readersByState[refs.front().index].push_back(op.id);
             }
             std::vector<uint32_t> perMem(model.states().size() + 1, 0);
             std::vector<CpuMemWritePlanEntry> plan;
             for (const auto &op : model.operations())
             {
-                if (op.phase != SimPhase::Mem || !isCpuPhaseMemWriteOp(model.text(op.opType))) continue;
+                if (op.phase != SimPhase::LargeSink || !isCpuPhaseMemWriteOp(model.text(op.opType))) continue;
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
                 CpuMemWritePlanEntry entry;
@@ -134,7 +137,7 @@ namespace wolvrix::lib::grhsim
                         if (rank != 0 && indices.size() == rank)
                         {
                             row = 0;
-                            for (std::size_t j = 0; j < rank && row; ++j)
+                            for (std::size_t j = 0; j < rank && row.has_value(); ++j)
                             {
                                 const auto source = producer[indices[j].index];
                                 std::optional<uint64_t> index;
@@ -151,7 +154,7 @@ namespace wolvrix::lib::grhsim
                                 }
                                 const std::optional<uint64_t> stride = shapeElementCount(
                                     std::span<const int64_t>(stateType.shape).subspan(j + 1));
-                                if (!index || !stride ||
+                                if (!index || *index >= static_cast<uint64_t>(stateType.shape[j]) || !stride ||
                                     *index > (std::numeric_limits<uint64_t>::max() - *row) / *stride)
                                     row = std::nullopt;
                                 else
@@ -169,6 +172,14 @@ namespace wolvrix::lib::grhsim
                                     entry.readers.end());
                 plan.push_back(std::move(entry));
             }
+            std::vector<std::vector<int64_t>> acts(model.operations().size() + 1);
+            for (const auto &entry : plan)
+                acts[entry.writeOp.index] =
+                    readCpuPhaseEventActs(model, model.operations()[entry.writeOp.index - 1]);
+            std::stable_sort(plan.begin(), plan.end(), [&](const auto &left, const auto &right) {
+                if (left.priority != right.priority) return left.priority < right.priority;
+                return acts[left.writeOp.index] < acts[right.writeOp.index];
+            });
             return plan;
         }
 
@@ -257,7 +268,7 @@ namespace wolvrix::lib::grhsim
                 const auto refs = model.objectRefs(op);
                 if (refs.empty() || refs.front().kind != ObjectKind::State) continue;
                 const auto &state = model.states()[refs.front().index - 1];
-                if (opName == "core.state.readArray" && state.storeClass != StateStoreClass::RegLatch)
+                if (opName == "core.state.readArray" && state.storeClass != StateStoreClass::SmallSink)
                     continue;
                 const auto owner = supernodeOf[op.id.index];
                 if (!owner || !isNonSinkSupernode(tree, owner)) continue;
@@ -322,7 +333,7 @@ namespace wolvrix::lib::grhsim
                         if (tree.partitions[child.index - 1].attrs.kind == CpuPartitionKind::EmitFunction)
                             addTask(child, CpuExecution::DataGated);
                 }
-                else if (branch.attrs.phase == CpuPhase::Event || branch.attrs.phase == CpuPhase::Mem)
+                else if (branch.attrs.phase == CpuPhase::Event || branch.attrs.phase == CpuPhase::LargeSink)
                     addTask(branch.children.front(), CpuExecution::AlwaysScanCommit);
                 else if (branch.attrs.phase == CpuPhase::Output)
                     addTask(branch.children.front(), CpuExecution::EvalEnd);

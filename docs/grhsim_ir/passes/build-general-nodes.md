@@ -12,30 +12,31 @@ The pass errors out on any `SimPhase::None` op, pointing at
 [`grhsim.split-phases`](grhsim-split-phases.md) (B5). It then:
 
 1. Builds the partition-tree root with exactly four flat `Phase` children in
-   the fixed order `Event`, `General`, `Mem`, `Output`.
+   the fixed order `Event`, `General`, `LargeSink`, `Output`.
 2. Fills the flat branches. `Event` holds every Event-phase op in cone
    topological order (Kahn, smallest op id first) with all
    `core.event.edgeDet` detectors trailing, so the cone is evaluated before
-   edges are detected. `Mem` holds the `Mem`-phase write ops in op-id order
+   edges are detected. `LargeSink` holds the large-sink write ops in op-id order
    (the static priority seed; C5's mem write plan finalizes priorities).
    `Output` holds the Output-phase ops in topological order.
-3. Forms `Node` partitions under the General branch — over the **non-sink**
+3. Forms `Node` partitions under the General branch — over the **nonSink**
    General-phase ops only (V2-M1). The General-phase ops split by shape:
-   - **Sink ops** (no results: `core.state.write` / `latchWrite`, the
-     General-phase `core.state.writeArray` / `fill` (and `write` on arrays)
-     on regLatch-class arrays, and no-result
+   - **SmallSink ops** (no results: `core.state.write` / `writeMask` / `latchWrite`, the
+     General-phase `core.state.writeArray` / `writeArrayMask` / `fill` (and
+     `write`/`writeMask` on arrays)
+     on smallSink-class arrays, and no-result
      `core.system.task` / `core.dpi.call`) never enter node formation. Each
-     anchors a singleton `Node` appended in op-id order after the non-sink
-     nodes, and C2 clusters them into sink supernodes by event signature.
-   - **Non-sink ops** (value-producing, event-carrying ones included) go
+     anchors a singleton `Node` appended in op-id order after the nonSink
+     nodes, and C2 clusters them into smallSink supernodes by priority and event signature.
+   - **NonSink ops** (value-producing, event-carrying ones included) go
      through the reverse-topological cone absorption: `core.compute.*`,
      `core.input.read`, `core.state.read` and `core.state.readArray` absorb
      into their result's only user node; shared values (used by several
-     nodes) and ops whose users include ops outside the non-sink set (a sink
-     op, or a write op in the Mem branch) block absorption and anchor their
-     own node, becoming boundary value candidates. Sink operand cones stay in
-     this non-sink frame — their values become boundary values sampled by the
-     sink supernodes.
+     nodes) and ops whose users include ops outside the nonSink set (a smallSink
+     op, or a write op in the LargeSink branch) block absorption and anchor their
+     own node, becoming boundary value candidates. SmallSink operand cones stay in
+     this nonSink frame — their values become enable/payload boundary values sampled by the
+     smallSink supernodes.
    - The capacity knob is `--max-op-in-compute-node` (default 128).
    - `--semantic-nodes` (default 0, S1 exploration): every value targeted by
      a `DeclProvenance` Value slice (a source-level declared signal) anchors
@@ -52,8 +53,8 @@ For example, with `w = write(cond=%c, next=%n, mask=%one)` where `%c` and
 ```text
 op3 core.compute.and  -> %c     ; feeds only w (a sink)
 op4 core.compute.not  -> %n     ; feeds only w
-op5 core.compute.and  -> %mw_c  ; feeds a Mem-branch writeArray
-op6 core.state.write [%c, %n, %one] {@q} { event_acts: [0] }
+op5 core.compute.and  -> %mw_c  ; feeds a LargeSink-branch writeArray
+op6 core.state.writeMask [%c, %n, %one] {@q} { event_acts: [0] }
 ```
 
 becomes four nodes (every cone op's only user is outside the non-sink set,
@@ -62,7 +63,7 @@ so nothing absorbs; the write anchors a singleton sink node):
 ```text
 node { op3 }   ; cone op — user is a sink, absorption blocked
 node { op4 }   ; cone op — user is a sink, absorption blocked
-node { op5 }   ; cone op — user sits in the Mem branch, absorption blocked
+node { op5 }   ; cone op — user sits in the LargeSink branch, absorption blocked
 node { op6 }   ; singleton sink node
 ```
 

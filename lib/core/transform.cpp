@@ -12,6 +12,7 @@
 #include "transform/memory_read_retime.hpp"
 #include "transform/multidriven_guard.hpp"
 #include "transform/mux_tree_fold.hpp"
+#include "transform/register_write_normalize.hpp"
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
 #include "transform/slice_index_const.hpp"
@@ -418,6 +419,7 @@ namespace wolvrix::lib::transform
             "slice-index-const",
             "multidriven-guard",
             "mux-tree-fold",
+            "register-write-normalize",
             "hier-flatten",
             "instance-inline",
             "xmr-resolve",
@@ -454,12 +456,21 @@ namespace wolvrix::lib::transform
         }
         if (normalized == "mux-tree-fold")
         {
+            if (args.size() == 1 && args[0] == "-guarded-writes=2state")
+                return std::make_unique<MuxTreeFoldPass>(true);
             if (!args.empty())
             {
-                error = "mux-tree-fold does not accept arguments";
+                error = "mux-tree-fold accepts only -guarded-writes=2state";
                 return nullptr;
             }
             return std::make_unique<MuxTreeFoldPass>();
+        }
+        if (normalized == "register-write-normalize")
+        {
+            if (args.size() == 1 && args[0] == "-semantics=2state")
+                return std::make_unique<RegisterWriteNormalizePass>(true);
+            error = "register-write-normalize requires -semantics=2state";
+            return nullptr;
         }
         if (normalized == "blackbox-guard")
         {

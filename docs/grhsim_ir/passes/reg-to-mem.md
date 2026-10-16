@@ -23,9 +23,9 @@ For example, with `hit_k(i) = enable_k && address_k == i`:
 ```text
 q_i.next = hit_1(i) ? data_1 : hit_0(i) ? data_0 : q_i
 
-=> core.state.writeArray @table  (enable_0, address_0, data_0, maskAllOnes, clock)
+=> core.state.writeArrayMask @table  (enable_0, address_0, data_0, maskAllOnes, clock)
      event_edges = ["posedge"]
-   core.state.writeArray @table  (enable_1, address_1, data_1, maskAllOnes, clock)
+   core.state.writeArrayMask @table  (enable_1, address_1, data_1, maskAllOnes, clock)
      event_edges = ["posedge"]
    ; emitted in this declaration order: the later write wins an address collision
 ```
@@ -81,9 +81,9 @@ merged_0 = data_0
 merged_1 = data_1 | (enable_0 && address_0 == address_1 ? data_0 : 0)
 merged_2 = data_2 | (enable_0 && address_0 == address_2 ? data_0 : 0)
                  | (enable_1 && address_1 == address_2 ? data_1 : 0)
-writeArray(table, enable_0, address_0, merged_0, maskAllOnes, clock)
-writeArray(table, enable_1, address_1, merged_1, maskAllOnes, clock)
-writeArray(table, enable_2, address_2, merged_2, maskAllOnes, clock)
+writeArrayMask(table, enable_0, address_0, merged_0, maskAllOnes, clock)
+writeArrayMask(table, enable_1, address_1, merged_1, maskAllOnes, clock)
+writeArrayMask(table, enable_2, address_2, merged_2, maskAllOnes, clock)
 ; declaration order = priority
 ```
 

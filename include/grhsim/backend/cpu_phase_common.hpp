@@ -59,8 +59,83 @@ namespace wolvrix::lib::grhsim
     // write a mem-class state".
     inline bool isCpuPhaseMemWriteOp(std::string_view type) noexcept
     {
-        return type == "core.state.write" || type == "core.state.writeArray" ||
-               type == "core.state.fill";
+        return type == "core.state.write" || type == "core.state.writeMask" ||
+               type == "core.state.writeArray" || type == "core.state.writeArrayMask" ||
+               type == "core.state.fill" || type == "core.state.latchWrite";
+    }
+
+    struct CpuIndexedWriteLayout
+    {
+        bool valid = false;
+        bool masked = false;
+        uint32_t indexCount = 0;
+    };
+
+    // Resolve the post-edge-lowering operand geometry of an indexed state
+    // write. `writeArray` is the canonical unmasked form, but old v3 models
+    // used that name for a masked write; type geometry disambiguates the two
+    // forms when arity alone is insufficient.
+    inline CpuIndexedWriteLayout cpuIndexedWriteLayout(const GrhSimModel &model,
+                                                       const SimOp &op,
+                                                       const Type &target)
+    {
+        const std::string_view name = model.text(op.opType);
+        const auto operands = model.operands(op);
+        const bool forceMasked = name == "core.state.writeArrayMask";
+        const auto validValue = [&](ValueId value, uint32_t width) {
+            if (!value.valid() || value.index > model.values().size()) return false;
+            const TypeId typeId = model.values()[value.index - 1].type;
+            if (!typeId.valid() || typeId.index > model.types().size()) return false;
+            const Type &type = model.types()[typeId.index - 1];
+            // Packed-first: data and mask are consumed as flat bits. Their
+            // shape is an optional structural view and does not affect the
+            // state access layout.
+            return type.kind == TypeKind::Logic && type.width == width;
+        };
+        const auto logicAnyShape = [&](ValueId value) {
+            if (!value.valid() || value.index > model.values().size()) return false;
+            const TypeId typeId = model.values()[value.index - 1].type;
+            if (!typeId.valid() || typeId.index > model.types().size()) return false;
+            const Type &type = model.types()[typeId.index - 1];
+            return type.kind == TypeKind::Logic;
+        };
+        const auto elementWidth = typeElementWidth(target);
+        if (target.kind != TypeKind::Logic || target.shape.empty() || !elementWidth)
+            return {};
+        const auto tryLayout = [&](bool masked) {
+            CpuIndexedWriteLayout result{false, masked, 0};
+            const std::size_t base = 2 + (masked ? 1 : 0);
+            if (operands.size() < base + 1) return result;
+            const std::size_t count = operands.size() - base;
+            if (count == 0 || count > target.shape.size()) return result;
+            for (std::size_t i = 0; i < count; ++i)
+                if (!logicAnyShape(operands[1 + i])) return result;
+            uint64_t suffix = 1;
+            for (std::size_t i = count; i < target.shape.size(); ++i)
+            {
+                const uint64_t dim = static_cast<uint64_t>(target.shape[i]);
+                if (!dim || suffix > UINT64_MAX / dim) return result;
+                suffix *= dim;
+            }
+            const uint64_t dataWidth = uint64_t(*elementWidth) * suffix;
+            if (dataWidth > UINT32_MAX) return result;
+            if (!validValue(operands[1 + count], static_cast<uint32_t>(dataWidth)))
+                return result;
+            if (masked)
+            {
+                if (!logicAnyShape(operands[2 + count])) return result;
+                const TypeId maskTypeId = model.values()[operands[2 + count].index - 1].type;
+                const Type &maskType = model.types()[maskTypeId.index - 1];
+                if (maskType.width != dataWidth) return result;
+            }
+            result.valid = true;
+            result.indexCount = static_cast<uint32_t>(count);
+            return result;
+        };
+        if (forceMasked) return tryLayout(true);
+        const auto plain = tryLayout(false);
+        if (plain.valid) return plain;
+        return tryLayout(true);
     }
 
     // The supernode ordinal (M5d-6, resolution 2): the General branch's
@@ -116,38 +191,114 @@ namespace wolvrix::lib::grhsim
         return acts;
     }
 
-    // Boundary-store value set: General-produced values consumed across a
-    // supernode boundary or sampled by a Mem-phase write op. Event/Output
-    // cones are self-contained (they read stores), so they never extend the
-    // set. M5d-6: General-phase regLatch-class mem writes live inside
-    // General supernodes, so their operands follow the normal
-    // cross-supernode rule; only Mem-phase (mem-class) writes sample
-    // unconditionally.
-    inline std::vector<bool> sixPhaseBoundaryValues(const GrhSimModel &model, const CpuPartitionTree &tree,
-                                                    std::span<const PartitionId> supernodeOf)
+    enum class CpuBoundaryUse : uint8_t
+    {
+        NonSink,
+        SmallSinkEnable,
+        SmallSinkPayload,
+        LargeSinkEnable,
+        LargeSinkPayload
+    };
+
+    inline uint8_t cpuBoundaryUseBit(CpuBoundaryUse use) noexcept
+    { return uint8_t{1} << static_cast<uint8_t>(use); }
+
+    // A produced value can cross more than one boundary, so its uses are a
+    // mask rather than an exclusive classification.
+    inline std::vector<uint8_t> sixPhaseBoundaryUses(const GrhSimModel &model,
+                                                      const CpuPartitionTree &tree,
+                                                      std::span<const PartitionId> supernodeOf)
     {
         std::vector<OpId> producer(model.values().size() + 1);
         for (const auto &op : model.operations())
             for (const auto value : model.results(op)) producer[value.index] = op.id;
-        std::vector<bool> boundary(model.values().size() + 1, false);
+        std::vector<uint8_t> uses(model.values().size() + 1, 0);
         for (const auto &op : model.operations())
         {
-            const bool memConsumer = op.phase == SimPhase::Mem;
+            const bool largeSinkConsumer = op.phase == SimPhase::LargeSink;
             const auto consumer = supernodeOf[op.id.index];
-            for (const auto operand : model.operands(op))
+            const auto operands = model.operands(op);
+            for (std::size_t i = 0; i < operands.size(); ++i)
             {
+                const auto operand = operands[i];
                 const auto source = producer[operand.index];
                 if (!source) continue;
                 const auto sourceSupernode = supernodeOf[source.index];
-                if (memConsumer)
+                if (largeSinkConsumer)
                 {
-                    if (sourceSupernode) boundary[operand.index] = true;
+                    const auto use = i == 0 && isCpuPhaseMemWriteOp(model.text(op.opType))
+                        ? CpuBoundaryUse::LargeSinkEnable : CpuBoundaryUse::LargeSinkPayload;
+                    uses[operand.index] |= cpuBoundaryUseBit(use);
                 }
-                else if (consumer && sourceSupernode && consumer != sourceSupernode)
-                    boundary[operand.index] = true;
+                else if (consumer && consumer != sourceSupernode)
+                {
+                    const auto &attrs = tree.partitions[consumer.index - 1].attrs;
+                    CpuBoundaryUse use = CpuBoundaryUse::NonSink;
+                    if (attrs.supernodeCategory != CpuSupernodeCategory::NonSink)
+                    {
+                        const auto opType = model.text(op.opType);
+                        const bool write = isCpuPhaseMemWriteOp(opType) ||
+                                           opType == "core.state.latchWrite";
+                        use = write && i == 0 ? CpuBoundaryUse::SmallSinkEnable
+                                              : CpuBoundaryUse::SmallSinkPayload;
+                    }
+                    if (use != CpuBoundaryUse::NonSink || sourceSupernode)
+                        uses[operand.index] |= cpuBoundaryUseBit(use);
+                }
             }
         }
+        return uses;
+    }
+
+    inline std::vector<bool> sixPhaseBoundaryValues(const GrhSimModel &model, const CpuPartitionTree &tree,
+                                                    std::span<const PartitionId> supernodeOf)
+    {
+        const auto uses = sixPhaseBoundaryUses(model, tree, supernodeOf);
+        std::vector<bool> boundary(uses.size(), false);
+        for (std::size_t i = 0; i < uses.size(); ++i) boundary[i] = uses[i] != 0;
         return boundary;
+    }
+
+    inline std::vector<ValueId> cpuEnableBitmapValues(const GrhSimModel &model,
+                                                      const CpuNamedStore &enableStore,
+                                                      SimPhase phase)
+    {
+        std::vector<bool> inStore(model.values().size() + 1, false);
+        std::vector<bool> seen(model.values().size() + 1, false);
+        std::vector<OpId> producer(model.values().size() + 1);
+        for (const auto &field : enableStore.fields)
+            if (field.value) inStore[field.value.index] = true;
+        for (const auto &op : model.operations())
+            for (const auto value : model.results(op)) producer[value.index] = op.id;
+        std::vector<ValueId> values;
+        for (const auto &op : model.operations())
+        {
+            if (op.phase != phase) continue;
+            const auto name = model.text(op.opType);
+            if (!isCpuPhaseMemWriteOp(name) &&
+                !(phase == SimPhase::General && name == "core.state.latchWrite")) continue;
+            const auto operands = model.operands(op);
+            if (operands.empty()) continue;
+            const auto enable = operands.front();
+            if (seen[enable.index]) continue;
+            const auto &type = model.types()[model.values()[enable.index - 1].type.index - 1];
+            if (type.kind != TypeKind::Logic || type.domain != LogicDomain::TwoState ||
+                type.width != 1 || !type.shape.empty()) continue;
+            const auto source = producer[enable.index];
+            if (source && model.text(model.operations()[source.index - 1].opType) ==
+                              "core.compute.constant") continue;
+            if (!inStore[enable.index])
+            {
+                if (!source) continue;
+                const auto &sourceOp = model.operations()[source.index - 1];
+                if (model.text(sourceOp.opType) != "core.input.read") continue;
+                const auto refs = model.objectRefs(sourceOp);
+                if (refs.size() != 1 || refs[0].kind != ObjectKind::Input) continue;
+            }
+            seen[enable.index] = true;
+            values.push_back(enable);
+        }
+        return values;
     }
 
     // Emitted-line estimate for one op, shared by the C6 function packing and
@@ -238,7 +389,7 @@ namespace wolvrix::lib::grhsim
     // The init stream emitted by init() and its cpu_init_<k> chunks (M5d-7):
     // flattened init steps, then one constant-boundary preload per boundary
     // field whose producer is a constant, then one prevEvent init per edgeDet
-    // op, then the final regLatchStoreNext sync line.
+    // op, then the final smallSinkStoreNext sync line.
     struct CpuInitStreamTotals
     {
         uint64_t steps = 0;
@@ -247,7 +398,8 @@ namespace wolvrix::lib::grhsim
         uint64_t total() const { return steps + boundaryPreloads + prevEvents + 1; }
     };
 
-    inline CpuInitStreamTotals cpuInitStreamTotals(const GrhSimModel &model, const CpuNamedStore &boundaryStore)
+    inline CpuInitStreamTotals cpuInitStreamTotals(const GrhSimModel &model,
+                                                  std::span<const CpuNamedStore> stores)
     {
         CpuInitStreamTotals totals;
         std::vector<OpId> producer(model.values().size() + 1);
@@ -257,13 +409,14 @@ namespace wolvrix::lib::grhsim
             if (model.text(op.opType) == "core.event.edgeDet") ++totals.prevEvents;
         }
         for (const auto &record : model.initRecords()) totals.steps += model.steps(record).size();
-        for (const auto &field : boundaryStore.fields)
-        {
-            if (!field.value) continue;
-            const auto source = producer[field.value.index];
-            if (source && model.text(model.operations()[source.index - 1].opType) == "core.compute.constant")
-                ++totals.boundaryPreloads;
-        }
+        for (const auto &store : stores)
+            for (const auto &field : store.fields)
+            {
+                if (!field.value || store.kind == CpuNamedStoreKind::PrevEvent) continue;
+                const auto source = producer[field.value.index];
+                if (source && model.text(model.operations()[source.index - 1].opType) == "core.compute.constant")
+                    ++totals.boundaryPreloads;
+            }
         return totals;
     }
 

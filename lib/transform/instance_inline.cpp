@@ -357,6 +357,28 @@ namespace wolvrix::lib::transform
             parent.setValueShape(parentValue, childShape);
         }
 
+        wolvrix::lib::grh::ValueId mapInputPortShape(wolvrix::lib::grh::Graph &parent,
+                                                     const wolvrix::lib::grh::Graph &child,
+                                                     wolvrix::lib::grh::ValueId childValue,
+                                                     wolvrix::lib::grh::ValueId parentValue)
+        {
+            const std::span<const int64_t> shape = child.valueShape(childValue);
+            if (shape.empty() || !parent.valueShape(parentValue).empty() ||
+                parent.valueWidth(parentValue) != child.valueWidth(childValue))
+            {
+                return parentValue;
+            }
+            const wolvrix::lib::grh::ValueId view =
+                parent.createValue(parent.makeInternalValSym(), parent.valueWidth(parentValue),
+                                   parent.valueSigned(parentValue), parent.valueType(parentValue), shape);
+            const wolvrix::lib::grh::OperationId assign =
+                parent.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                       parent.makeInternalOpSym());
+            parent.addOperand(assign, parentValue);
+            parent.addResult(assign, view);
+            return view;
+        }
+
         bool buildPortMap(const wolvrix::lib::grh::Graph &child,
                           wolvrix::lib::grh::Graph &parent,
                           const wolvrix::lib::grh::Operation &instOp,
@@ -418,8 +440,8 @@ namespace wolvrix::lib::transform
                 {
                     childValue = child.inputPorts()[i].value;
                 }
-                portMap.emplace(childValue, instOp.operands()[i]);
-                propagatePortShape(parent, child, childValue, instOp.operands()[i]);
+                portMap.emplace(childValue, mapInputPortShape(parent, child, childValue,
+                                                               instOp.operands()[i]));
             }
 
             std::unordered_map<std::string_view, wolvrix::lib::grh::ValueId> childOutputsByName;
@@ -485,10 +507,10 @@ namespace wolvrix::lib::transform
                 const auto operandIndex = inputCount + i;
                 const auto outIndex = outputCount + i;
                 const auto oeIndex = outputCount + inoutCount + i;
-                portMap.emplace(port.in, instOp.operands()[operandIndex]);
+                portMap.emplace(port.in, mapInputPortShape(parent, child, port.in,
+                                                           instOp.operands()[operandIndex]));
                 portMap.emplace(port.out, instOp.results()[outIndex]);
                 portMap.emplace(port.oe, instOp.results()[oeIndex]);
-                propagatePortShape(parent, child, port.in, instOp.operands()[operandIndex]);
                 propagatePortShape(parent, child, port.out, instOp.results()[outIndex]);
                 propagatePortShape(parent, child, port.oe, instOp.results()[oeIndex]);
             }

@@ -2,6 +2,7 @@
 #include "transform/redundant_elim.hpp"
 #include "core/transform.hpp"
 
+#include <array>
 #include <iostream>
 #include <string>
 
@@ -219,6 +220,53 @@ int main()
         {
             return fail(std::string("declared symbols inconsistent after run: ") + issues.front());
         }
+    }
+
+    {
+        wolvrix::lib::grh::Design shapeDesign;
+        auto &shapeGraph = shapeDesign.createGraph("shape_cse");
+        const auto source = shapeGraph.createValue(shapeGraph.internSymbol("source"), 1, false);
+        shapeGraph.bindInputPort("source", source);
+        const auto flat = shapeGraph.createValue(shapeGraph.internSymbol("flat"), 1, false);
+        const auto flatNot = shapeGraph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                        shapeGraph.makeInternalOpSym());
+        shapeGraph.addOperand(flatNot, source);
+        shapeGraph.addResult(flatNot, flat);
+        const std::array<int64_t, 1> one{1};
+        const auto shaped = shapeGraph.createValue(shapeGraph.internSymbol("shaped"), 1, false,
+                                                    wolvrix::lib::grh::ValueType::Logic, one);
+        const auto shapedNot = shapeGraph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                          shapeGraph.makeInternalOpSym());
+        shapeGraph.addOperand(shapedNot, source);
+        shapeGraph.addResult(shapedNot, shaped);
+        const auto mem = shapeGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                    shapeGraph.internSymbol("mem"));
+        shapeGraph.setAttr(mem, "width", int64_t{2});
+        shapeGraph.setAttr(mem, "isSigned", false);
+        shapeGraph.setAttr(mem, "shape", std::vector<int64_t>{2});
+        const auto readValue = shapeGraph.createValue(shapeGraph.internSymbol("read"), 1, false);
+        const auto read = shapeGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort,
+                                                     shapeGraph.makeInternalOpSym());
+        shapeGraph.addOperand(read, flat);
+        shapeGraph.addResult(read, readValue);
+        shapeGraph.setAttr(read, "regSymbol", std::string("mem"));
+        shapeGraph.bindOutputPort("read", readValue);
+        const auto sliceValue = shapeGraph.createValue(shapeGraph.internSymbol("slice"), 1, false);
+        const auto slice = shapeGraph.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                                      shapeGraph.makeInternalOpSym());
+        shapeGraph.addOperand(slice, shaped);
+        shapeGraph.addOperand(slice, source);
+        shapeGraph.addResult(slice, sliceValue);
+        shapeGraph.bindOutputPort("slice", sliceValue);
+
+        PassManager shapeManager;
+        shapeManager.addPass(std::make_unique<RedundantElimPass>());
+        PassDiagnostics shapeDiagnostics;
+        const PassManagerResult shapeResult = shapeManager.run(shapeDesign, shapeDiagnostics);
+        if (!shapeResult.success || shapeDiagnostics.hasError() ||
+            !shapeGraph.valueShape(flat).empty() || shapeGraph.valueShape(shaped).size() != 1 ||
+            shapeGraph.opOperands(read)[0] != flat || shapeGraph.opOperands(slice)[0] != shaped)
+            return fail("CSE merged flat index and shaped array values");
     }
 
     return 0;

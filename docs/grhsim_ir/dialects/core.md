@@ -39,12 +39,12 @@ core.string
 类型就是它保存的内容的类型，数组状态就是 shape 非空的 `core.logic` 状态。只有
 `core.logic` 可以携带 shape；`core.real`/`core.string` 不数组化。
 
-**shape 是纯结构视图，不改变任何 op 的扁平位语义**：任何 op 对带 shape value 的语义等同
-于对其 `width` 位扁平位向量的语义；物理存储保持线性（元素按行主序摊平、连续存放），
-shape 只影响数组寻址与语义校验。元素 `(i0, i1, ..., in-1)` 的线性位偏移为
+**shape 是结构视图，不改变普通按位 op 的扁平位语义**：普通按位 op 对带 shape value 的
+语义等同于对其 `width` 位向量的语义；元素仍按行主序连续存放，但 CPU emit 的数组声明和
+字段类型必须保留每一维 shape，不能将多维数组永久声明为一维数组。元素
+`(i0, i1, ..., in-1)` 的线性位偏移为
 `(i0*d1*...*dn-1 + i1*d2*...*dn-1 + ... + in-1) * elementWidth`，canonical index 0 对应
-最低元素地址。shape 感知点只有 `core.compute.sliceArray` 与第 5 节的索引访问 op
-（readArray/writeArray/fill）；其余 op 对 shape 透明。
+最低元素地址。数组寻址及语义校验需要 shape；CPU emit 声明和索引也必须保留其多维结构。
 
 verifier 对 shape 的强制规则（与 GRH verify pass 同构）：各维必须大于 0；各维乘积不得
 溢出 uint64；`width % ∏shape == 0`（必须整除）。非 logic 类型不得携带 shape。
@@ -164,13 +164,16 @@ mux 转为此 op，保留原 producer 求值与依赖。GRH lowering 不直接�
 | --- | --- | --- | --- | --- |
 | `core.state.read` | 无 | 一个 `S` 对象 | 无 | 一个与目标状态同类型的值 |
 | `core.state.readArray` | `%i0, ..., %ik-1`（`1 <= k <= rank`） | 一个带 shape 的 `S` 对象 | 无 | `k == rank` → 元素类型的值；`k < rank` → 带剩余维 shape 的子数组值 |
-| `core.state.write` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象 | `event_edges` | 无 |
-| `core.state.writeArray` | `%updateCond, %i0..%ik-1, %data, %mask, %events...`（`1 <= k <= rank`） | 一个带 shape 的 `S` 对象 | `event_edges` | 无 |
+| `core.state.write` | `%updateCond, %nextValue, %events...` | 一个 `S` 对象 | `event_edges` | 无 |
+| `core.state.writeMask` | `%updateCond, %nextValue, %mask, %events...` | 一个 `S` 对象 | `event_edges` | 无 |
+| `core.state.writeArray` | `%updateCond, %i0..%ik-1, %data, %events...`（`1 <= k <= rank`） | 一个带 shape 的 `S` 对象 | `event_edges` | 无 |
+| `core.state.writeArrayMask` | `%updateCond, %i0..%ik-1, %data, %mask, %events...`（`1 <= k <= rank`） | 一个带 shape 的 `S` 对象 | `event_edges` | 无 |
 | `core.state.fill` | `%updateCond, %data, %events...` | 一个带 shape 的 `S` 对象 | `event_edges` | 无 |
 | `core.state.latchWrite` | `%updateCond, %nextValue, %mask` | 一个标量 `S` 对象 | 无 | 无 |
 
-命名约定为**访问形态命名 + `Array` 后缀标记索引变体**：`read`/`readArray` 和
-`write`/`writeArray` 两对分别是整体访问与索引访问，`fill` 是整体广播写，`latchWrite`
+命名约定为**访问形态命名 + `Array` 后缀标记索引变体 + `Mask` 后缀标记掩码变体**：
+`read`/`readArray` 和 `write`/`writeArray` 两对分别是整体访问与索引访问，
+`writeMask`/`writeArrayMask` 是对应的逐位掩码变体，`fill` 是整体广播写，`latchWrite`
 是唯一的例外——latch 是电平敏感的不同状态种类，值得独立名字。时钟/电平差异由 event
 操作数表达而非名字前缀：`write`/`writeArray`/`fill` 至少携带一个 event（`event_edges`
 逐一标注边沿），`latchWrite` 无 event、电平敏感。访问形态（整体/索引/掩码/填充）是 op
@@ -181,9 +184,9 @@ mux 转为此 op，保留原 producer 求值与依赖。GRH lowering 不直接�
 
 - `updateCond` 和每个 event 必须是一位 logic；索引操作数 `%i0..%ik-1` 必须是标量 logic
   （无 shape）。越界索引的行为是实现定义（仿真端按实现截断/钳位，不做跨实现约定）。
-- `mask` 是**位掩码**（`mask[i]=1` 时写入第 `i` 位，不提供元素粒度掩码）：
-  `write`/`latchWrite` 的 mask 宽等于目标状态的总位宽，`writeArray` 的 mask 宽等于
-  `%data` 的总位宽。mask 位为 1 的部分允许更新，其他部分保持原值。
+- `Mask` 变体的 `mask` 是**位掩码**（`mask[i]=1` 时写入第 `i` 位，不提供元素粒度掩码）：
+  `writeMask`/`latchWrite` 的 mask 宽等于目标状态的总位宽，`writeArrayMask` 的 mask
+  宽等于 `%data` 的总位宽。无 `Mask` 的写是整宽更新。
 
 `core.state.read` 返回目标状态的当前值，结果类型就是目标状态的类型——数组状态读出带全
 shape 的整体值。
@@ -194,23 +197,24 @@ shape 为 `[d0, ..., dn-1]`（rank = n），索引数 `k` 满足 `1 <= k <= n`�
 `elementWidth × ∏shape[k:]`，shape 为 `shape[k:]`）。
 
 `core.state.write` 在 `%updateCond` 为真且至少一个 event 命中对应边沿时，用 `%nextValue`
-被 mask 选中的部分更新目标状态；`%nextValue` 的类型必须等于目标状态的类型。它承接旧
-`regWrite`（标量写）与旧 `memAssign`（数组整体写 = mask 全 1、`%nextValue` 带全 shape
-的 `write`）。条件不成立时目标状态保持原值。
+整宽更新目标状态；`%nextValue` 的类型必须等于目标状态的类型。`core.state.writeMask`
+使用同样的条件，但只更新 mask 选中的位。二者分别承接旧 `regWrite`/`memAssign` 的无掩码
+形式和掩码形式。条件不成立时目标状态保持原值。
 
 `core.state.latchWrite` 的更新规则与 `write` 相同，但无 event、电平敏感，且目标必须是
 标量状态（shape 为空）。
 
-`core.state.writeArray` 在 `write` 的同样条件下更新 `%i0..%ik-1` 寻址到的元素或子数组；
-`%data` 的类型规则与 `readArray` 的结果几何对称（`k == rank` → 元素类型；`k < rank` →
-带剩余维 shape 的子数组类型）。
+`core.state.writeArray` 在 `write` 的同样条件下整宽更新 `%i0..%ik-1` 寻址到的元素或子数组；
+`core.state.writeArrayMask` 使用同样的寻址和条件，但只更新 mask 选中的位。两者的 `%data`
+类型规则都与 `readArray` 的结果几何对称（`k == rank` → 元素类型；`k < rank` → 带剩余维
+shape 的子数组类型）。
 
 `core.state.fill` 在 `%updateCond` 为真且 event 命中时，把 `%data` 写入目标状态的全部
 元素：`%data` 通常是元素宽度的标量（广播填充）；作为例外，`%data` 可以是目标状态总位宽
 的打包 logic 值（packed fill，来自整宽聚合写），此时按行主序逐行切片，线性行号为 `i`
 的元素取 `%data[i*elementWidth +: elementWidth]`。
 
-**同一状态的多个写 op（`write`/`writeArray`/`fill` 的任意组合）按 op 声明顺序应用：
+**同一状态的多个写 op（`write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill` 的任意组合）按 op 声明顺序应用：
 同轮同时激活时按声明顺序依次生效，后声明的写覆盖先声明的写**（与 GRH stage-03 §3.4 的
 同 regSymbol 写端口优先级规则同构；转换层 1:1 保序生成）。**同 state 写 op 的相对顺序
 是 IR 语义的一部分，pass 不得重排**（verifier 断言兜底）。跨事件的写口同样适用该规则，
@@ -227,7 +231,7 @@ shape 为 `[d0, ..., dn-1]`（rank = n），索引数 `k` 满足 `1 <= k <= n`�
 ## 6. Event 与边沿标注
 
 `event_edges` 与事件敏感 op 尾部的 event operands 一一对应，每项只能是 `posedge` 或
-`negedge`。事件敏感 op 包括状态写口（`write`/`writeArray`/`fill`）、system task 和
+`negedge`。事件敏感 op 包括状态写口（`write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill`）、system task 和
 DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份原始标注（M5 起不再
 附带每 event 的 `__event_*` 历史状态对象）；边沿判定全部由六阶段 lowering
 （`grhsim.lower-edge-detect`，见 [lower-edge-detect](../passes/lower-edge-detect.md)）
@@ -247,7 +251,7 @@ DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份�
 > 元素为聚类下标、保持原顺序）。
 > `core.system.task` 改写后不再持有 object refs，`core.dpi.call` 只保留首部 Function
 > 引用；`write`/`latchWrite`/`system.task`/`dpi.call` 的 phase 置为 `general`，
-> `writeArray`/`fill` 与目标是数组状态的 `write` 在语义归类前保持无 phase。verifier
+> `writeArray`/`writeArrayMask`/`fill` 与目标是数组状态的 `write`/`writeMask` 在语义归类前保持无 phase。verifier
 > 在模型出现 `event_acts` 后禁止任何 `event_edges` 残留。
 > M5d-5 起这些写由语义层 `grhsim.split-phases`（B5）归类：按目标状态的存储分类，
 > `mem` 类状态的写归 `mem` 相、`regLatch` 类状态的写归 `general` 相（见
@@ -265,10 +269,10 @@ DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份�
 
 | op | operands | object refs | parameters | results |
 | --- | --- | --- | --- | --- |
-| `core.event.edgeDet` | `%event`（一个 logic 值） | 无 | `edge`, `act`, `prev`, `prevInit` | 无 |
+| `core.event.edgeDet` | `%event`（一个无 shape 的 1 位 logic 值） | 无 | `edge`, `act`, `prev`, `prevInit` | 无 |
 
 - `%event` 是事件锥的末端值（P_event 阶段算出的该 event 信号当前值），必须是
-  `core.logic` 类型；edgeDet 不产生任何 data value，也没有 object refs。
+  无 shape 的 1 位 `core.logic`；edgeDet 不产生任何 data value，也没有 object refs。
 - `edge` 为 string 参数，取值 `posedge`/`negedge`/`both`，编码沿用 `event_edges` 并补
   `both` 双边沿。
 - `act` 为非负 int64：该聚类在 eventActStore 中的 bit 下标，全模型唯一。
@@ -436,10 +440,10 @@ core.dpi.call
 | `kRegister`（数组，shape 非空） | `StateObject`（`core.logic` 类型直接继承 GRH 的 width+shape）+ `Init` 条目 |
 | `kRegisterReadPort` | `core.state.read` |
 | `kRegisterReadArrayPort` | `core.state.readArray` |
-| `kRegisterWritePort` | `core.state.write`（转换器补全 1 mask 常量） |
-| `kRegisterWriteMaskPort` | `core.state.write` |
-| `kRegisterWriteArrayPort` | `core.state.writeArray`（转换器补全 1 mask 常量） |
-| `kRegisterWriteArrayMaskPort` | `core.state.writeArray` |
+| `kRegisterWritePort` | `core.state.write` |
+| `kRegisterWriteMaskPort` | `core.state.writeMask` |
+| `kRegisterWriteArrayPort` | `core.state.writeArray` |
+| `kRegisterWriteArrayMaskPort` | `core.state.writeArrayMask` |
 | `kRegisterFillPort` | `core.state.fill` |
 | `kLatch` | `StateObject`（类型同 GRH 声明）+ `Init` 条目 |
 | `kLatchReadPort` | `core.state.read` |
@@ -475,7 +479,7 @@ kRegisterWriteMaskPort @q
 对应的 core op：
 
 ```text
-core.state.write
+core.state.writeMask
   object_refs: [@S.q]
   operands: [%enable, %d, %mask, %clk]
   event_edges: [posedge]
@@ -491,16 +495,16 @@ Core 模型必须满足：
 
 - 类型合法：`core.logic` 的 `width` 大于零；`shape` 各维大于 0、乘积不溢出 uint64 且
   整除 `width`；非 logic 类型不得携带 shape；
-- `readArray`/`writeArray`/`fill` 的目标是带 shape 的（数组）状态，`latchWrite` 的目标是
+- `readArray`/`writeArray`/`writeArrayMask`/`fill` 的目标是带 shape 的（数组）状态，`latchWrite` 的目标是
   标量状态；
 - `read` 的 result 类型等于目标状态的类型（数组状态读出带全 shape 的整体值）；
-- `readArray`/`writeArray` 的索引数满足 `1 <= k <= rank`，索引操作数都是标量 logic；
-  `readArray` 的 result 与 `writeArray` 的 `%data` 类型为寻址到的元素（`k == rank`）或
+- `readArray`/`writeArray`/`writeArrayMask` 的索引数满足 `1 <= k <= rank`，索引操作数都是标量 logic；
+  `readArray` 的 result 与 `writeArray`/`writeArrayMask` 的 `%data` 类型为寻址到的元素（`k == rank`）或
   带剩余维 shape 的子数组（`k < rank`，宽 `elementWidth × ∏shape[k:]`、shape 为
   `shape[k:]`）；
-- `write` 的 `%nextValue` 类型等于目标状态类型；`write`/`latchWrite` 的 `%mask` 是宽等于
-  目标状态总位宽的标量 logic，`writeArray` 的 `%mask` 是宽等于 `%data` 总位宽的标量
-  logic；
+- `write`/`writeMask` 的 `%nextValue` 类型等于目标状态类型；`writeMask`/`latchWrite` 的
+  `%mask` 是宽等于目标状态总位宽的标量 logic，`writeArrayMask` 的 `%mask` 是宽等于
+  `%data` 总位宽的标量 logic；
 - `fill` 的 `%data` 为元素宽度的标量，或目标状态总位宽的打包值（packed fill，见第 5 节）；
 - 同一状态的多个写 op 的相对顺序即覆盖优先级（声明顺序语义，见第 5 节），转换与 pass
   不得重排；

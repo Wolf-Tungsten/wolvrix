@@ -11,10 +11,15 @@ inputs are already marked. (Pre-M5 GRH lowering also attached one `__event_*`
 history state per event slot as a trailing object ref; that is gone — refs
 carry no event slots.)
 
+An event value used by `core.event.edgeDet` must be an unshaped 1-bit
+`core.logic`. The pass rejects wider or shaped event values; aggregate edge
+semantics are not defined.
+
 The pass has nine steps, in order:
 
 1. Collect every op carrying an `event_edges` parameter (the event-sensitive
-   kinds: `core.state.write`, `core.state.writeArray`, `core.state.fill`,
+   kinds: `core.state.write`, `core.state.writeMask`, `core.state.writeArray`,
+   `core.state.writeArrayMask`, `core.state.fill`,
    `core.system.task`,
    `core.dpi.call`; `latchWrite` has no events). Anything else carrying the
    parameter, a non-string-array value, an edge outside
@@ -47,13 +52,13 @@ The pass has nine steps, in order:
    no event slots: `core.system.task` has no refs, `core.dpi.call` keeps the
    leading Function ref, state writes keep the target state), delete
    the `event_edges` parameter and append `event_acts` (int64 array of cluster
-   indices in the original event order). `write` on a scalar target,
-   `system.task` and
-   `dpi.call` get phase `general`; `writeArray`/`fill` and `write` on an array
-   (shaped) target stay phase-less (`None`)
-   until the semantic split ([`grhsim.split-phases`](grhsim-split-phases.md), B5,
-   M5d-5) attributes them class-aware — P_mem for `mem`-class targets, P_general
-   for `regLatch`-class targets.
+   indices in the original event order). All `write`/`writeMask`/`writeArray`/
+   `writeArrayMask`/`fill`
+   operations stay phase-less (`None`), regardless of scalar or array target;
+   `system.task` and `dpi.call` get phase `general`. The semantic split
+   ([`grhsim.split-phases`](grhsim-split-phases.md), B5, M5d-5) later assigns
+   writes by target class: `P_large_sink` for `largeSink`, `P_general` for
+   `smallSink`.
 7. Sweep any unreferenced `__event_*` history state left over from a pre-M5
    checkpoint together with its InitRecord, and sweep the dead original cone
    ops to a fixed point (`sweepDeadConeOps`): only `core.compute.*` and the
@@ -73,7 +78,7 @@ For example, the dut_081 fragment
 op1 core.input.read -> %clk                 (pure event input)
 op2 core.input.read -> %d
 op4 core.compute.constant -> %one (1'b1)
-op5 core.state.write operands=[%one, %d, %one, %clk]
+op5 core.state.writeMask operands=[%one, %d, %one, %clk]
     object_refs=[@q]  parameters={ event_edges: [posedge] }
 ```
 
@@ -83,7 +88,7 @@ becomes
 op1' core.input.read -> %clk.ev   phase=event   (clone, keeps event_only)
 op7  core.event.edgeDet operands=[%clk.ev]  phase=event
      parameters={ edge: posedge, act: 0, prev: 0, prevInit: 1'h0 }
-op5  core.state.write operands=[%one, %d, %one]  phase=general
+op5  core.state.writeMask operands=[%one, %d, %one]  phase=general
      object_refs=[@q]  parameters={ event_acts: [0] }
 ; op1 is swept.
 ```

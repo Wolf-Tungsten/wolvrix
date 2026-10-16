@@ -165,6 +165,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/latch_transparent_read.cpp
     lib/transform/slice_index_const.cpp
     lib/transform/mux_tree_fold.cpp
+    lib/transform/register_write_normalize.cpp
     lib/transform/strip_debug.cpp
     lib/transform/verify.cpp
     lib/transform/repcut.cpp

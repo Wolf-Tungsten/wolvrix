@@ -772,7 +772,7 @@ namespace wolvrix::lib::grhsim
         case SimPhase::None: return "none";
         case SimPhase::Event: return "event";
         case SimPhase::General: return "general";
-        case SimPhase::Mem: return "mem";
+        case SimPhase::LargeSink: return "large_sink";
         case SimPhase::Output: return "output";
         }
         return "unknown";
@@ -783,7 +783,7 @@ namespace wolvrix::lib::grhsim
         if (text == "none") return SimPhase::None;
         if (text == "event") return SimPhase::Event;
         if (text == "general") return SimPhase::General;
-        if (text == "mem") return SimPhase::Mem;
+        if (text == "large_sink") return SimPhase::LargeSink;
         if (text == "output") return SimPhase::Output;
         return std::nullopt;
     }
@@ -793,8 +793,8 @@ namespace wolvrix::lib::grhsim
         switch (storeClass)
         {
         case StateStoreClass::None: return "none";
-        case StateStoreClass::RegLatch: return "regLatch";
-        case StateStoreClass::Mem: return "mem";
+        case StateStoreClass::SmallSink: return "smallSink";
+        case StateStoreClass::LargeSink: return "largeSink";
         }
         return "unknown";
     }
@@ -802,8 +802,8 @@ namespace wolvrix::lib::grhsim
     std::optional<StateStoreClass> parseStateStoreClass(std::string_view text) noexcept
     {
         if (text == "none") return StateStoreClass::None;
-        if (text == "regLatch") return StateStoreClass::RegLatch;
-        if (text == "mem") return StateStoreClass::Mem;
+        if (text == "smallSink") return StateStoreClass::SmallSink;
+        if (text == "largeSink") return StateStoreClass::LargeSink;
         return std::nullopt;
     }
 
@@ -811,9 +811,14 @@ namespace wolvrix::lib::grhsim
     {
         switch (kind)
         {
-        case CpuNamedStoreKind::RegLatch: return "regLatch";
-        case CpuNamedStoreKind::Mem: return "mem";
-        case CpuNamedStoreKind::Boundary: return "boundary";
+        case CpuNamedStoreKind::SmallSink: return "smallSink";
+        case CpuNamedStoreKind::LargeSink: return "largeSink";
+        case CpuNamedStoreKind::Input: return "input";
+        case CpuNamedStoreKind::NonSinkBoundary: return "nonSinkBoundary";
+        case CpuNamedStoreKind::SmallSinkEnableBoundary: return "smallSinkEnableBoundary";
+        case CpuNamedStoreKind::SmallSinkPayloadBoundary: return "smallSinkPayloadBoundary";
+        case CpuNamedStoreKind::LargeSinkEnableBoundary: return "largeSinkEnableBoundary";
+        case CpuNamedStoreKind::LargeSinkPayloadBoundary: return "largeSinkPayloadBoundary";
         case CpuNamedStoreKind::PrevEvent: return "prevEvent";
         case CpuNamedStoreKind::EventAct: return "eventAct";
         case CpuNamedStoreKind::TimeslotTrigger: return "timeslotTrigger";
@@ -824,9 +829,14 @@ namespace wolvrix::lib::grhsim
 
     std::optional<CpuNamedStoreKind> parseCpuNamedStoreKind(std::string_view text) noexcept
     {
-        if (text == "regLatch") return CpuNamedStoreKind::RegLatch;
-        if (text == "mem") return CpuNamedStoreKind::Mem;
-        if (text == "boundary") return CpuNamedStoreKind::Boundary;
+        if (text == "smallSink") return CpuNamedStoreKind::SmallSink;
+        if (text == "largeSink") return CpuNamedStoreKind::LargeSink;
+        if (text == "input") return CpuNamedStoreKind::Input;
+        if (text == "nonSinkBoundary") return CpuNamedStoreKind::NonSinkBoundary;
+        if (text == "smallSinkEnableBoundary") return CpuNamedStoreKind::SmallSinkEnableBoundary;
+        if (text == "smallSinkPayloadBoundary") return CpuNamedStoreKind::SmallSinkPayloadBoundary;
+        if (text == "largeSinkEnableBoundary") return CpuNamedStoreKind::LargeSinkEnableBoundary;
+        if (text == "largeSinkPayloadBoundary") return CpuNamedStoreKind::LargeSinkPayloadBoundary;
         if (text == "prevEvent") return CpuNamedStoreKind::PrevEvent;
         if (text == "eventAct") return CpuNamedStoreKind::EventAct;
         if (text == "timeslotTrigger") return CpuNamedStoreKind::TimeslotTrigger;

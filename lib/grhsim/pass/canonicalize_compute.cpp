@@ -170,7 +170,8 @@ namespace wolvrix::lib::grhsim
                     for (auto ref : refs)
                         if (ref.kind == ObjectKind::State) local[ref.index] = 0;
                 if (name == "core.state.read") ++allowed[refs[0].index];
-                else if (name == "core.state.write" || name == "core.state.latchWrite")
+                else if (name == "core.state.write" || name == "core.state.writeMask" ||
+                         name == "core.state.latchWrite")
                 { ++allowed[refs[0].index]; ++writers[refs[0].index]; }
             }
             std::vector<StateId> canonical(references.size());
@@ -183,7 +184,8 @@ namespace wolvrix::lib::grhsim
             {
                 if (!scope.inScope(op.phase)) continue;
                 const auto name = model.text(op.opType);
-                if (name != "core.state.write" && name != "core.state.latchWrite") continue;
+                if (name != "core.state.write" && name != "core.state.writeMask" &&
+                    name != "core.state.latchWrite") continue;
                 const auto refs = model.objectRefs(op);
                 const StateId state{refs[0].index, 0};
                 const auto &type = model.types()[model.states()[state.index - 1].type.index - 1];

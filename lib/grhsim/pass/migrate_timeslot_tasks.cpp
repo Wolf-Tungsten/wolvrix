@@ -231,7 +231,7 @@ namespace wolvrix::lib::grhsim
                             // commit with the regLatch publish boundary; the
                             // Output-phase latchWrite timing is unchanged.
                             if (model.hasStateStoreClassification())
-                                model.setStateStoreClass(prev, StateStoreClass::RegLatch);
+                                model.setStateStoreClass(prev, StateStoreClass::SmallSink);
                             const std::array initParams{Parameter{
                                 model.intern("value"), hexLiteral(type.width, 0)}};
                             const std::array steps{

@@ -303,20 +303,20 @@ JSON checkpoint 中 `declaredSymbols`、`generateGroups`、`declProvenance` 依�
 在全图优化段末尾写入：
 
 ```text
-StateStoreClass = none | regLatch | mem
+StateStoreClass = none | smallSink | largeSink
 ```
 
 - `none`：模型尚未分类（仅 A7 之前合法；分类一旦出现必须覆盖全部状态）；
-- `regLatch`：小状态——写入合并进 next 缓冲（NBA 双缓冲 + 逐行变化检测），
+- `smallSink`：小状态，标量或数组——写入合并进 next 缓冲（NBA 双缓冲 + 变化检测），
   `P_publish` 以整块拷贝提交（NBA）；
-- `mem`：大状态——写参数在计算阶段采样，`P_mem` 按声明顺序原地提交，
+- `largeSink`：大状态，标量或数组——写参数在计算阶段采样，`P_large_sink` 原地提交，
   避免整块拷贝。两类都实现相同的"读旧值、写延迟一轮"NBA 语义，区别只在提交机制与
   成本结构；逐类的旧值读取、部分写、多写优先级与多轮更新契约见 pass 文档。
 
-**分类标准 = 状态的总字节数**（阈值参数 `--mem-min-bytes`，默认 64 字节量级）：带 shape
-的数组状态总字节数达到阈值归 `mem`，其余——任意位宽的标量、小数组、`real`/`string`
-状态——一律归 `regLatch`。分类与访问模式无关、与访问该状态的 op
-族解耦——stage-06 起 state 访问统一为 `read`/`readArray`/`write`/`writeArray`/`fill`
+**分类标准 = 状态的总字节数**（阈值参数 `--mem-min-bytes`，默认 64 字节）：任意
+`core.logic` 状态的总语义字节数达到阈值归 `largeSink`，不论是否带 shape；较小
+logic 状态及 `real`/`string` 状态归 `smallSink`。分类与访问模式无关、与访问该状态的 op
+族解耦——stage-06 起 state 访问统一为 `read`/`readArray`/`write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill`
 一族（mem* 一族已退役），同一族 op 服务两类状态，分类只决定提交机制。
 
 分类是**语义层注解**，不是物理布局：字节布局由后端映射（C3 `layout-named-stores`）
@@ -324,9 +324,9 @@ StateStoreClass = none | regLatch | mem
 归属。
 维护契约：分类是 `StateObject` 的字段，`compact()`/`clone()` 随状态自动携带；
 在已分类模型上创建或重建状态的 pass 必须在创建时增量分类（见 pass 文档的增量规则）。
-verifier 强制：分类要么全有要么全无（totality）、`mem` 仅限带 shape 的 logic（数组）
-状态、`mem` 类状态不得被 `latchWrite` 写（其写口必须是 `write`/`writeArray`/`fill`，
-由 P_mem 承接提交）。
+verifier 强制：分类要么全有要么全无（totality），`largeSink` 只用于 logic 状态，
+但不要求带 shape；标量大状态的 `write`/`latchWrite` 与数组大状态的写入都由
+`P_large_sink` 承接。
 
 JSON checkpoint 中分类是 `states` 行的可选第五元素（`[id, name, type, origin, class]`），
 仅在已分类时写出：未分类 checkpoint 与旧模式字节兼容，已分类 checkpoint 字节稳定往返。
@@ -336,34 +336,32 @@ JSON checkpoint 中分类是 `states` 行的可选第五元素（`[id, name, typ
 每个 `SimOp` 携带一个六阶段相位归属（`SimPhase`），由语义层 pass 写入：
 
 ```text
-SimPhase = none | event | general | mem | output
+SimPhase = none | event | general | large_sink | output
 ```
 
 三个**计算分区**是 `event`（P_event 事件锥）、`general`（P_general 主体）、`output`
-（P_output 输出锥与 time-slot 任务）；`mem` 归属表示该写 op 由 P_mem 承接提交。运行时的
+（P_output 输出锥与 time-slot 任务）；`large_sink` 归属表示该写 op 由 `P_large_sink` 承接提交。运行时的
 P_input/P_publish 没有 op（输入装载与 NBA 发布是运行时动作）。分区由第一轮分解建立：
 
 - `grhsim.lower-edge-detect`（B2）克隆事件锥并标记 `event`，把事件消费者的
-  `event_edges` 改写为 `event_acts` 并把标量写（`write`/`latchWrite`）等消费者归入
-  `general`；
+  `event_edges` 改写为 `event_acts`；被改写的状态写保持未归属，交给 B5 按目标状态分类；
 - `grhsim.extract-output-cones`（B3）与 `grhsim.migrate-timeslot-tasks`（B4）克隆输出锥、
   迁移 time-slot 任务并标记 `output`；
 - [`grhsim.split-phases`](passes/grhsim-split-phases.md)（B5，M5d-5）完成总归属——
-  剩余 `none` op 全部归类，其中写 op（`write`/`writeArray`/`fill`）按**目标状态的存储
-  分类**确定 P_mem 写入职责：
-  `mem` 类状态的写归 `mem` 相（采样后在 P_mem 原地提交），`regLatch` 类状态（含小数组）
-  的写归 `general` 相（并入超节点、走 next 缓冲 NBA 路径）。未分类模型保持旧的按类型
-  兜底归因（数组目标的写归 `mem` 相）。
+  剩余 `none` op 全部归类，其中写 op（`write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill`/`latchWrite`）
+  按**目标状态的存储分类**确定写入职责：`largeSink` 类状态的写归 `large_sink` 相
+  （采样后在 `P_large_sink` 原地提交），`smallSink` 类状态的写归 `general` 相
+  （并入超节点、走 next 缓冲 NBA 路径）。未分类模型仍按目标 shape 保留旧兜底归因。
 
 verifier 约束（含分区自封，任何中间形态都必须满足）：`edgeDet` 恒为 `event`；
 `output.write` 恒为 `output`；事件锥/输出锥自包含（`event`/`output` op 只读同相位值，
 `general` op 不读锥内值）；`__tslot_prev_*` 状态只能被 `output` 相 `latchWrite` 写；
-已分类模型上相位与分类一致（`mem` 类状态的写口必须归 `mem` 相，`regLatch` 类状态的
+已分类模型上相位与分类一致（`largeSink` 类状态的写口必须归 `large_sink` 相，`smallSink` 类状态的
 写口必须归 `general` 相）。
 
 分区阶段的封板校验是 `grhsim.verify --seal semantic`（B8）：在既有校验之上要求
 **相位归属全覆盖**（无 `none` op）、**无 `event_edges` 残留**（事件已降为 `event_acts`
-形态）、**P_mem 采样局部性**（`mem` 相写 op 的 operand 全部由 `general` 相 op 产生）。
+形态）、**P_large_sink 采样局部性**（`large_sink` 相写 op 的 operand 全部由 `general` 相 op 产生）。
 封板后语义层不再有任何改写；CPU mapping（C 段）只消费归属结果。
 
 JSON checkpoint 中相位随 op 行持久化，字节稳定往返。
@@ -381,8 +379,8 @@ pass（C2.5）外不回改语义；mapping
 | C2 | `cpu.st.merge-general-supernodes` | General 超节点；序号 = 分枝子节点顺序，就此固定 |
 | C2.5 | `cpu.st.clone-shared-boundaries` | 真实超节点边界上的廉价双射共享计算克隆（唯一注册的 C 段语义微调；就地维护分区树） |
 | C3 | `cpu.st.layout-named-stores` | named-store 布局（零分类决策，只消费 A7 `storeClass`） |
-| C4 | `cpu.st.build-event-activation-map` | event act → 含该 act 事件的**非 sink** 超节点位图（bit i = C2 序号 i；V2-M2 起 sink 超节点不再配位图） |
-| C5 | `cpu.st.build-mem-write-plan` | Mem 相写计划与 mem 类状态的读者表 |
+| C4 | `cpu.st.build-event-activation-map` | event act → 含该 act 事件的 nonSink 超节点位图（bit i = C2 序号 i；smallSink 超节点不配位图） |
+| C5 | `cpu.st.build-mem-write-plan` | `P_large_sink` 写计划与 largeSink 状态的读者表（pass 名称沿用旧称） |
 | C6 | `cpu.st.pack-general-functions` | EmitFunction 只记超节点序号区间（`supernodeRange`） |
 | C7 | `cpu.st.build-phase-schedule` | fanout/trigger/task；`PhaseSchedule`（complete） |
 | C8 | `cpu.st.plan-translation-units` | emit TU 计划（规模受控块流装箱）；终态 `TranslationUnits`（complete） |
@@ -393,10 +391,10 @@ pass（C2.5）外不回改语义；mapping
   重新挂载超节点，EmitFunction 是尾随叶子，只记录连续序号区间（铺满 [0,N)）。
 - **零分类决策**：C3 的状态归 store 只消费第 3.5 节的 `storeClass` 注解，未分类状态
   报错；后端不得凭状态的类型形状重新推导归属。
-- **写按相位调度**：General 相 regLatch 类写（含小数组上的 `write`/`writeArray`/`fill`）
-  在超节点内经 NBA
-  next 缓冲提交、读者经 `commitStateFanout` 激活；Mem 相 mem 类写由 P_mem 按 C5 声明顺序
-  原地提交。
+- **写按相位调度**：General 相 smallSink 类写在超节点内进入
+  `smallSinkStoreNext`、读者经 `commitStateFanout` 激活；largeSink 类写由
+  `P_large_sink` 原地提交。两条路径均先按写优先级升序执行，再按 `eventAct` 聚类，
+  最后按 enable 位图批量跳过；不同优先级不得合并，后声明的高优先级写覆盖先前写入。
 - **枚举兼容**：`CpuMappingStage` 数值保持稳定（旧 checkpoint 解码），但流水线顺序
   不再是数值顺序，stage 比较走 `cpuMappingStageRank`；stage 早于 `SplitPhases` 的旧
   checkpoint 被 verify 拒绝，`SplitPhases` 本身不再由任何 pass 产生。

@@ -20,7 +20,8 @@ namespace wolvrix::lib::grhsim
     // written only once the model is classified; v1 checkpoints are rejected.
     // v3 (stage-06): types carry width + shape (the core.array constructor,
     // elementType/count items and declProvenance.shape are retired) and the
-    // state access ops are read/readArray/write/writeArray/fill (the mem*
+    // state access ops are read/readArray/write/writeMask/writeArray/
+    // writeArrayMask/fill (the mem*
     // family is retired); v2 checkpoints are rejected.
     inline constexpr const char *kGrhSimJsonFormat = "wolvrix.grhsim.v3";
 

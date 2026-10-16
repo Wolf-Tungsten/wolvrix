@@ -104,10 +104,10 @@ namespace wolvrix::lib::grhsim
             case OperationKind::kRegisterReadPort:
             case OperationKind::kLatchReadPort: return "core.state.read";
             case OperationKind::kRegisterReadArrayPort: return "core.state.readArray";
-            case OperationKind::kRegisterWritePort:
-            case OperationKind::kRegisterWriteMaskPort: return "core.state.write";
-            case OperationKind::kRegisterWriteArrayPort:
-            case OperationKind::kRegisterWriteArrayMaskPort: return "core.state.writeArray";
+            case OperationKind::kRegisterWritePort: return "core.state.write";
+            case OperationKind::kRegisterWriteMaskPort: return "core.state.writeMask";
+            case OperationKind::kRegisterWriteArrayPort: return "core.state.writeArray";
+            case OperationKind::kRegisterWriteArrayMaskPort: return "core.state.writeArrayMask";
             case OperationKind::kRegisterFillPort: return "core.state.fill";
             case OperationKind::kLatchWritePort: return "core.state.latchWrite";
             case OperationKind::kSystemFunction: return "core.system.function";
@@ -409,28 +409,9 @@ namespace wolvrix::lib::grhsim
             return valueMap[value.index];
         };
 
-        // stage-03/stage-06: GRH whole writes (kRegisterWritePort) and
-        // unmasked array writes (kRegisterWriteArrayPort) drop the constant
-        // full mask, while grhsim write/writeArray keep
-        // [en, (idx...), data, mask, events...]. Synthesize (cached) all-ones
-        // constant values for those masks.
-        std::unordered_map<uint32_t, grhsim::ValueId> allOnesMaskByWidth;
-        auto allOnesMaskFor = [&](uint32_t width) -> grhsim::ValueId {
-            const uint32_t normalized = std::max<uint32_t>(1, width);
-            auto [it, inserted] = allOnesMaskByWidth.try_emplace(normalized);
-            if (!inserted)
-                return it->second;
-            const grhsim::ValueId value = model->addValue(
-                model->logicType(normalized, false, options.logicDomain), {}, {});
-            std::string literal = std::to_string(normalized) + "'b";
-            literal.append(normalized, '1');
-            const std::array results{value};
-            const std::array parameters{Parameter{model->intern("constValue"), std::move(literal)}};
-            model->addOperation("core.compute.constant", {}, results, {}, parameters, {}, {});
-            it->second = value;
-            return value;
-        };
-
+        // Keep unmasked and masked GRH write ports distinct in the extended
+        // core dialect. The backend may normalize an unmasked write to an
+        // all-ones merge internally, but the IR retains the source semantics.
         std::unordered_map<std::string, StateId> statesBySymbol;
         std::unordered_map<std::string, ValueType> storageReadKinds;
         for (grh::OperationId opId : graph->operations())
@@ -671,22 +652,6 @@ namespace wolvrix::lib::grhsim
             std::vector<grhsim::ValueId> operands;
             operands.reserve(op.operands().size() + 1);
             for (grh::ValueId value : op.operands()) operands.push_back(mappedValue(value, op.symbolText()));
-            if (op.kind() == OperationKind::kRegisterWritePort ||
-                op.kind() == OperationKind::kRegisterWriteArrayPort)
-            {
-                // Insert the synthesized full mask right before the events.
-                const std::optional<std::size_t> eventStart = grh::firstEventOperandIndex(op);
-                if (!eventStart || *eventStart < 2 || *eventStart > operands.size())
-                {
-                    diagnostics.error("write port layout does not locate event operands",
-                                      std::string(op.symbolText()));
-                    continue;
-                }
-                const uint32_t dataWidth = static_cast<uint32_t>(std::max<int32_t>(
-                    1, graph->valueWidth(op.operands()[*eventStart - 1])));
-                operands.insert(operands.begin() + static_cast<std::ptrdiff_t>(*eventStart),
-                                allOnesMaskFor(dataWidth));
-            }
             std::vector<grhsim::ValueId> results;
             results.reserve(op.results().size());
             for (grh::ValueId value : op.results()) results.push_back(mappedValue(value, op.symbolText()));

@@ -1212,17 +1212,13 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                // stage-07: shape is part of the value's structural contract for
-                // kSliceArray/kRegister-port consumers. Merging two duplicates
-                // whose results carry different non-empty shapes would hand one
-                // consumer the wrong geometry; only merge when shapes agree
-                // (flat+shaped merges are fine: replaceUsers backfills the
-                // shape onto the flat representative).
+                // A flat value may also be used as an array index. Merging it
+                // with a shaped result would backfill shape onto every user of
+                // the representative, changing those index operands' types.
                 const auto resultShape = graph.valueShape(resultId);
                 const auto canonicalShape = graph.valueShape(canonicalValue);
-                if (!resultShape.empty() && !canonicalShape.empty()
-                    && !std::equal(resultShape.begin(), resultShape.end(),
-                                   canonicalShape.begin(), canonicalShape.end()))
+                if (!std::equal(resultShape.begin(), resultShape.end(),
+                                canonicalShape.begin(), canonicalShape.end()))
                 {
                     continue;
                 }

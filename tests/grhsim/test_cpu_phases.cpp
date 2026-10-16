@@ -279,13 +279,13 @@ namespace
 
     // M5d-6 mapping entry: the A7 store classification feeds B5's class-aware
     // attribution and C3's layout; C1 initializes the one final mapping.
-    // allMem forces every array into the mem store class (mem-min-bytes=0) so
-    // mem-write branch tests keep their P_mem shape.
-    void attributeAndInit(GrhSimModel &model, bool allMem = false)
+    // largeArray places the fixture's 2-byte array in LargeSink while its
+    // 1-byte scalar states remain SmallSink.
+    void attributeAndInit(GrhSimModel &model, bool largeArray = false)
     {
-        if (allMem)
+        if (largeArray)
             runPass(model, "grhsim.select-state-stores",
-                    std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+                    std::array<std::string_view, 2>{"--mem-min-bytes", "2"});
         else
             runPass(model, "grhsim.select-state-stores");
         runPass(model, "grhsim.split-phases");
@@ -391,7 +391,7 @@ namespace
         require(dataPack && sinkPack && dataPack != sinkPack,
                 "f1: cone and writes did not split into non-sink and sink supernodes");
         requireCategory(*dataPack, CpuSupernodeCategory::NonSink, "f1");
-        requireCategory(*sinkPack, CpuSupernodeCategory::SinkEvent, "f1");
+        requireCategory(*sinkPack, CpuSupernodeCategory::SmallSinkEvent, "f1");
         require(flatOps(merged, dataPack->id).size() == 3,
                 "f1: non-sink supernode does not hold the whole cone");
         require(containsOp(merged, *sinkPack, w2) && flatOps(merged, sinkPack->id).size() == 2,
@@ -407,7 +407,7 @@ namespace
         const auto &packed = *model.cpuMapping();
         require(packed.stage == CpuMappingStage::GeneralFunctions, "f1: final stage wrong");
         require(branch(packed, CpuPhase::Event).children.size() == 1 &&
-                branch(packed, CpuPhase::Mem).children.size() == 1 &&
+                branch(packed, CpuPhase::LargeSink).children.size() == 1 &&
                 branch(packed, CpuPhase::Output).children.size() == 1, "f1: flat functions missing");
         require(flatOps(packed, branch(packed, CpuPhase::Event).children.front()).size() == 2,
                 "f1: event function ops wrong");
@@ -438,8 +438,8 @@ namespace
         const auto *s1 = supernodeOf(mapping, w1);
         const auto *s2 = supernodeOf(mapping, w2);
         require(s1 && s2 && s1 != s2, "f2: subset-signature writes merged");
-        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f2");
-        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f2");
+        requireCategory(*s1, CpuSupernodeCategory::SmallSinkEvent, "f2");
+        requireCategory(*s2, CpuSupernodeCategory::SmallSinkEvent, "f2");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
                 "f2: first supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>({0, 1}),
@@ -486,8 +486,8 @@ namespace
         require(conePack && s1 && s2 && conePack != s1 && conePack != s2 && s1 != s2,
                 "f3: cone or writes left their class");
         requireCategory(*conePack, CpuSupernodeCategory::NonSink, "f3");
-        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f3");
-        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f3");
+        requireCategory(*s1, CpuSupernodeCategory::SmallSinkEvent, "f3");
+        requireCategory(*s2, CpuSupernodeCategory::SmallSinkEvent, "f3");
         require(conePack->attrs.eventActs && conePack->attrs.eventActs->empty(),
                 "f3: cone supernode should carry an empty eventActs");
         require(containsOp(mapping, *conePack, inputRead.back()),
@@ -538,8 +538,8 @@ namespace
                 "f4: non-sink supernode must carry an empty eventActs");
         require(s1 && s2 && s1 != s2 && packA != s1 && packA != s2,
                 "f4: writes merged with each other or with the chain");
-        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f4");
-        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f4");
+        requireCategory(*s1, CpuSupernodeCategory::SmallSinkEvent, "f4");
+        requireCategory(*s2, CpuSupernodeCategory::SmallSinkEvent, "f4");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
                 "f4: first write supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>{1},
@@ -574,8 +574,8 @@ namespace
         const auto *s2 = supernodeOf(mapping, w2);
         require(s1 && s2 && s1 != s2, "f9: cross-domain writes merged through the state read");
         require(supernodes(mapping).size() == 3, "f9: expected exactly three supernodes");
-        requireCategory(*s1, CpuSupernodeCategory::SinkEvent, "f9");
-        requireCategory(*s2, CpuSupernodeCategory::SinkEvent, "f9");
+        requireCategory(*s1, CpuSupernodeCategory::SmallSinkEvent, "f9");
+        requireCategory(*s2, CpuSupernodeCategory::SmallSinkEvent, "f9");
         require(s1->attrs.eventActs && *s1->attrs.eventActs == std::vector<int64_t>{0},
                 "f9: first write supernode signature wrong");
         require(s2->attrs.eventActs && *s2->attrs.eventActs == std::vector<int64_t>{1},
@@ -657,9 +657,9 @@ namespace
         require(verifies(model), "f5: fixture rejected");
 
         // f5 pins the P_mem shape: B5 runs before any classification, so its
-        // unclassified-model fallback attributes every array write to the Mem
-        // phase; the classification forced to all-mem below keeps C3
-        // consistent with that attribution.
+        // unclassified-model fallback attributes every array write to the
+        // LargeSink phase; the 2-byte threshold below keeps the 2-byte arrays
+        // large and the 1-byte scalar states small.
         const auto split = runPass(model, "grhsim.split-phases");
         require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(5),
                 "f5: mem attribution count wrong");
@@ -667,31 +667,31 @@ namespace
         runPass(model, "cpu.st.build-general-nodes");
         const auto &mapping = *model.cpuMapping();
         const std::vector<OpId> memOrder{mw, mf, ma, mws0, mws1};
-        require(branch(mapping, CpuPhase::Mem).ops == memOrder, "f5: mem branch is not flat op-id order");
+        require(branch(mapping, CpuPhase::LargeSink).ops == memOrder, "f5: mem branch is not flat op-id order");
         for (auto opId : memOrder)
-            require(model.operations()[opId.index - 1].phase == SimPhase::Mem,
+            require(model.operations()[opId.index - 1].phase == SimPhase::LargeSink,
                     "f5: mem write phase wrong");
         roundTrip(model);
 
         runPass(model, "grhsim.select-state-stores",
-                std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+                std::array<std::string_view, 2>{"--mem-min-bytes", "2"});
         runPass(model, "cpu.st.merge-general-supernodes");
         advanceToFunctions(model);
         const auto &packed = *model.cpuMapping();
-        const auto &memBranch = branch(packed, CpuPhase::Mem);
+        const auto &memBranch = branch(packed, CpuPhase::LargeSink);
         require(memBranch.children.size() == 1 && memBranch.ops.empty(), "f5: mem branch shape wrong");
         require(flatOps(packed, memBranch.children.front()) == memOrder,
                 "f5: mem function does not hold exactly the five writes");
         const auto *regPack = supernodeOf(packed, wr);
         require(regPack && flatOps(packed, regPack->id) == std::vector<OpId>{wr},
                 "f5: scalar write sink cluster must hold the write alone");
-        requireCategory(*regPack, CpuSupernodeCategory::SinkEvent, "f5");
+        requireCategory(*regPack, CpuSupernodeCategory::SmallSinkEvent, "f5");
         require(regPack->attrs.eventActs && *regPack->attrs.eventActs == std::vector<int64_t>{0},
                 "f5: write supernode signature wrong");
         const auto *latchPack = supernodeOf(packed, wl);
         require(latchPack && flatOps(packed, latchPack->id) == std::vector<OpId>{wl},
                 "f5: latchWrite sink cluster must hold the write alone");
-        requireCategory(*latchPack, CpuSupernodeCategory::SinkEscape, "f5");
+        requireCategory(*latchPack, CpuSupernodeCategory::SmallSinkEscape, "f5");
         require(latchPack->attrs.eventActs && latchPack->attrs.eventActs->empty(),
                 "f5: escape sink supernode must carry an empty signature");
         // The write cones live in the non-sink frame.
@@ -748,7 +748,7 @@ namespace
         require(verifies(model), "f6: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores",
-                std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+                std::array<std::string_view, 2>{"--mem-min-bytes", "2"});
         const auto split = runPass(model, "grhsim.split-phases");
         require(infoValue(split, "grhsim.split-phases", "phase_mem=") == std::optional<uint64_t>(1),
                 "f6: semantic split mem attribution wrong");
@@ -758,7 +758,7 @@ namespace
         require(!model.mappings().front().complete, "f6: six-phase mapping must stay incomplete");
         const auto &root = mapping.partitionTree.partitions[mapping.partitionTree.root.index - 1];
         const std::array<CpuPhase, 4> order{CpuPhase::Event, CpuPhase::General,
-                                            CpuPhase::Mem, CpuPhase::Output};
+                                            CpuPhase::LargeSink, CpuPhase::Output};
         require(root.children.size() == order.size(), "f6: root branch count wrong");
         for (std::size_t i = 0; i < order.size(); ++i)
         {
@@ -772,7 +772,7 @@ namespace
         const std::vector<OpId> outputOrder{or_, ow};
         require(branch(mapping, CpuPhase::Output).ops == outputOrder,
                 "f6: output branch did not topologically sort the cone");
-        require(branch(mapping, CpuPhase::Mem).ops == std::vector<OpId>{mw}, "f6: mem branch wrong");
+        require(branch(mapping, CpuPhase::LargeSink).ops == std::vector<OpId>{mw}, "f6: mem branch wrong");
         require(mapping.stage == CpuMappingStage::GeneralNodes, "f6: node stage wrong");
         const auto &generalNodes = branch(mapping, CpuPhase::General);
         require(!generalNodes.children.empty() && generalNodes.ops.empty(), "f6: general nodes missing");
@@ -797,7 +797,7 @@ namespace
                 "f6: six-phase tree must not contain active words");
         require(countKind(packed, CpuPartitionKind::EventDomain) == 0,
                 "f6: six-phase tree must not contain event domains");
-        for (auto phase : {CpuPhase::Event, CpuPhase::Mem, CpuPhase::Output})
+        for (auto phase : {CpuPhase::Event, CpuPhase::LargeSink, CpuPhase::Output})
         {
             const auto &flat = branch(packed, phase);
             require(flat.children.size() == 1 && flat.ops.empty(), "f6: flat branch shape wrong");
@@ -807,7 +807,7 @@ namespace
         }
         require(flatOps(packed, branch(packed, CpuPhase::Event).children.front()) == eventOrder,
                 "f6: event function lost the cone order");
-        require(flatOps(packed, branch(packed, CpuPhase::Mem).children.front()) == std::vector<OpId>{mw},
+        require(flatOps(packed, branch(packed, CpuPhase::LargeSink).children.front()) == std::vector<OpId>{mw},
                 "f6: mem function wrong");
         require(flatOps(packed, branch(packed, CpuPhase::Output).children.front()) == outputOrder,
                 "f6: output function wrong");
@@ -921,7 +921,7 @@ namespace
         bad = mergedMapping;
         for (auto &partition : bad.partitionTree.partitions)
             if (partition.attrs.kind == CpuPartitionKind::Supernode && partition.attrs.supernodeCategory &&
-                *partition.attrs.supernodeCategory == CpuSupernodeCategory::SinkEvent)
+                *partition.attrs.supernodeCategory == CpuSupernodeCategory::SmallSinkEvent)
             { partition.attrs.supernodeCategory = CpuSupernodeCategory::NonSink; break; }
         reject(bad);
 
@@ -1007,7 +1007,7 @@ namespace
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::GeneralFunctions, "f8: final stage wrong");
         require(branch(mapping, CpuPhase::General).children.empty(), "f8: general branch not empty");
-        for (auto phase : {CpuPhase::Event, CpuPhase::Mem, CpuPhase::Output})
+        for (auto phase : {CpuPhase::Event, CpuPhase::LargeSink, CpuPhase::Output})
         {
             const auto &flat = branch(mapping, phase);
             require(flat.children.size() == 1 &&
@@ -1041,7 +1041,7 @@ namespace
         require(verifies(model), "f10: fixture rejected");
 
         runPass(model, "grhsim.select-state-stores");
-        require(model.states()[tab.index - 1].storeClass == StateStoreClass::RegLatch,
+        require(model.states()[tab.index - 1].storeClass == StateStoreClass::SmallSink,
                 "f10: small array was not classified regLatch");
         const auto split = runPass(model, "grhsim.split-phases");
         require(infoValue(split, "grhsim.split-phases", "mem_writes_reglatch=") == std::optional<uint64_t>(1),
@@ -1052,12 +1052,12 @@ namespace
                 "f10: regLatch mem write phase wrong");
         runPass(model, "cpu.st.build-general-nodes");
         const auto &mapping = *model.cpuMapping();
-        require(branch(mapping, CpuPhase::Mem).ops.empty(), "f10: mem branch is not empty");
+        require(branch(mapping, CpuPhase::LargeSink).ops.empty(), "f10: mem branch is not empty");
         runPass(model, "cpu.st.merge-general-supernodes");
         const auto &merged = *model.cpuMapping();
         const auto *pack = supernodeOf(merged, write);
         require(pack, "f10: regLatch mem write is not inside a general supernode");
-        requireCategory(*pack, CpuSupernodeCategory::SinkEvent, "f10");
+        requireCategory(*pack, CpuSupernodeCategory::SmallSinkEvent, "f10");
         require(flatOps(merged, pack->id) == std::vector<OpId>{write},
                 "f10: regLatch mem write sink cluster must hold the write alone");
         require(pack->attrs.eventActs && *pack->attrs.eventActs == std::vector<int64_t>{0},
@@ -1066,7 +1066,7 @@ namespace
         roundTrip(model);
         advanceToFunctions(model);
         const auto &packed = *model.cpuMapping();
-        const auto &memBranch = branch(packed, CpuPhase::Mem);
+        const auto &memBranch = branch(packed, CpuPhase::LargeSink);
         require(memBranch.children.size() == 1 &&
                 flatOps(packed, memBranch.children.front()).empty(), "f10: mem function is not empty");
         requirePackedGeneralBranch(packed, "f10");
@@ -1343,7 +1343,7 @@ namespace
         // The enable write is the whole escape cluster.
         const auto *escapePack = supernodeOf(mapping, enWrite);
         require(escapePack && escapePack != dataPack, "f12: enable write left the escape class");
-        requireCategory(*escapePack, CpuSupernodeCategory::SinkEscape, "f12");
+        requireCategory(*escapePack, CpuSupernodeCategory::SmallSinkEscape, "f12");
         require(flatOps(mapping, escapePack->id) == std::vector<OpId>{enWrite},
                 "f12: escape cluster must hold the enable write alone");
         require(escapePack->attrs.eventActs && escapePack->attrs.eventActs->empty(),
@@ -1352,7 +1352,7 @@ namespace
         const auto *macroPack = supernodeOf(mapping, w1);
         require(macroPack && macroPack != dataPack && macroPack != escapePack,
                 "f12: macro writes left the event sink class");
-        requireCategory(*macroPack, CpuSupernodeCategory::SinkEvent, "f12");
+        requireCategory(*macroPack, CpuSupernodeCategory::SmallSinkEvent, "f12");
         require(containsOp(mapping, *macroPack, w2) && flatOps(mapping, macroPack->id).size() == 2,
                 "f12: same-signature macro writes did not cluster");
         require(macroPack->attrs.eventActs && *macroPack->attrs.eventActs == std::vector<int64_t>{0},
@@ -1424,10 +1424,10 @@ namespace
             require(guardA && guardB && ordinary && escape, "f13: supernode lookup failed");
             require(guardA != guardB && guardA != ordinary && guardB != ordinary,
                     "f13: enable groups did not form distinct supernodes");
-            requireCategory(*guardA, CpuSupernodeCategory::SinkEvent, "f13");
-            requireCategory(*guardB, CpuSupernodeCategory::SinkEvent, "f13");
-            requireCategory(*ordinary, CpuSupernodeCategory::SinkEvent, "f13");
-            requireCategory(*escape, CpuSupernodeCategory::SinkEscape, "f13");
+            requireCategory(*guardA, CpuSupernodeCategory::SmallSinkEvent, "f13");
+            requireCategory(*guardB, CpuSupernodeCategory::SmallSinkEvent, "f13");
+            requireCategory(*ordinary, CpuSupernodeCategory::SmallSinkEvent, "f13");
+            requireCategory(*escape, CpuSupernodeCategory::SmallSinkEscape, "f13");
             require(guardA->attrs.enableGuard && *guardA->attrs.enableGuard == int64_t(fixture.enA.index),
                     "f13: first guard supernode enableGuard wrong");
             require(guardB->attrs.enableGuard && *guardB->attrs.enableGuard == int64_t(fixture.enB.index),
@@ -1478,7 +1478,7 @@ namespace
                     "f13(off): expected non-sink, event and escape supernodes");
             const auto *ordinary = supernodeOf(mapping, fixture.groupA.front());
             require(ordinary, "f13(off): event sink supernode missing");
-            requireCategory(*ordinary, CpuSupernodeCategory::SinkEvent, "f13(off)");
+            requireCategory(*ordinary, CpuSupernodeCategory::SmallSinkEvent, "f13(off)");
             require(!ordinary->attrs.enableGuard, "f13(off): ordinary supernode gained an enableGuard");
             require(containsOp(mapping, *ordinary, fixture.groupB.front()) &&
                     containsOp(mapping, *ordinary, fixture.groupC.front()) &&

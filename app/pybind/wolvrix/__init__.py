@@ -483,6 +483,13 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
         compiled.extend(_compile_comb_loop_elim_kwargs(named))
     elif canonical_name == "simplify":
         compiled.extend(_compile_simplify_kwargs(named))
+    elif canonical_name in ("register-write-normalize", "mux-tree-fold"):
+        local = dict(named)
+        key = "semantics" if canonical_name == "register-write-normalize" else "guarded_writes"
+        mode = _pop_named(local, key, None)
+        if mode is not None:
+            compiled.append(f"-{'semantics' if key == 'semantics' else 'guarded-writes'}={mode}")
+        _ensure_no_extra_named(canonical_name, local)
     elif canonical_name == "stats":
         compiled.extend(_compile_stats_kwargs(named))
     elif canonical_name == "repcut":

@@ -43,7 +43,7 @@ namespace wolvrix::lib::grhsim
             if (!validPartition(tree.root)) return error("partition root is invalid");
             const auto &root = tree.partitions[tree.root.index - 1];
             const std::array<CpuPhase, 4> phaseOrder{CpuPhase::Event, CpuPhase::General,
-                                                     CpuPhase::Mem, CpuPhase::Output};
+                                                     CpuPhase::LargeSink, CpuPhase::Output};
             if (root.parent || root.attrs.kind != CpuPartitionKind::Root || !root.ops.empty() ||
                 root.children.size() != phaseOrder.size())
                 return error("six-phase CPU root must contain exactly four phase branches");
@@ -103,7 +103,7 @@ namespace wolvrix::lib::grhsim
                 if (attrs.enableGuard &&
                     !(generalSupernode && atLeast(CpuMappingStage::GeneralSupernodes) &&
                       attrs.supernodeCategory &&
-                      *attrs.supernodeCategory == CpuSupernodeCategory::SinkEvent))
+                      *attrs.supernodeCategory == CpuSupernodeCategory::SmallSinkEvent))
                     return error("enable guards annotate only event sink supernodes");
                 if (attrs.enableGuard &&
                     (*attrs.enableGuard <= 0 ||
@@ -191,7 +191,7 @@ namespace wolvrix::lib::grhsim
                         if (!partition.children.empty())
                             return error("flat emit function must be a leaf");
                         if (phase == CpuPhase::Event) ++eventFunctions;
-                        else if (phase == CpuPhase::Mem) ++memFunctions;
+                        else if (phase == CpuPhase::LargeSink) ++memFunctions;
                         else if (phase == CpuPhase::Output) ++outputFunctions;
                     }
                     break;
@@ -222,12 +222,12 @@ namespace wolvrix::lib::grhsim
                     if (phase == CpuPhase::None) return error("op outside any phase branch");
                     const auto required = phase == CpuPhase::Event ? SimPhase::Event :
                                           phase == CpuPhase::General ? SimPhase::General :
-                                          phase == CpuPhase::Mem ? SimPhase::Mem : SimPhase::Output;
+                                          phase == CpuPhase::LargeSink ? SimPhase::LargeSink : SimPhase::Output;
                     if (op.phase != required) return error("op belongs to the wrong phase branch");
-                    if (phase == CpuPhase::Mem && !isCpuPhaseMemWriteOp(model.text(op.opType)))
+                    if (phase == CpuPhase::LargeSink && !isCpuPhaseMemWriteOp(model.text(op.opType)))
                         return error("mem branch holds only memory write ops");
                     (phase == CpuPhase::Event ? eventOps : phase == CpuPhase::General ? generalOps :
-                     phase == CpuPhase::Mem ? memOps : outputOps).push_back(opId);
+                     phase == CpuPhase::LargeSink ? memOps : outputOps).push_back(opId);
                 }
             }
             if (std::count(visited.begin() + 1, visited.end(), false)) return error("unreachable partitions");
@@ -340,9 +340,9 @@ namespace wolvrix::lib::grhsim
                             if (!sink && opSink) return error("non-sink supernode holds a sink op");
                             const auto opActs = readCpuPhaseEventActs(model, op);
                             unionCpuPhaseActs(acts, opActs);
-                            if (category == CpuSupernodeCategory::SinkEvent && opActs != *attrs.eventActs)
+                            if (category == CpuSupernodeCategory::SmallSinkEvent && opActs != *attrs.eventActs)
                                 return error("sink supernode mixes event signatures");
-                            if (category == CpuSupernodeCategory::SinkEscape && !opActs.empty())
+                            if (category == CpuSupernodeCategory::SmallSinkEscape && !opActs.empty())
                                 return error("escape sink supernode holds an event-carrying op");
                             // A1: every op in a guard supernode must be
                             // individually guarded by the shared enable —
@@ -360,7 +360,7 @@ namespace wolvrix::lib::grhsim
                         }
                     if (*attrs.eventActs != acts)
                         return error("general supernode event acts disagree with its ops");
-                    if (category == CpuSupernodeCategory::SinkEvent && attrs.eventActs->empty())
+                    if (category == CpuSupernodeCategory::SmallSinkEvent && attrs.eventActs->empty())
                         return error("event sink supernode requires a nonempty signature");
                 }
                 for (uint32_t ordinal = 0; ordinal < supernodeOrder.size(); ++ordinal)

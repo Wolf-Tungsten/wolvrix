@@ -1,8 +1,13 @@
 #include "core/grh.hpp"
-#include "transform/mux_tree_fold.hpp"
 #include "core/transform.hpp"
+#include "transform/mux_tree_fold.hpp"
+#include "transform/register_write_normalize.hpp"
+#include "transform/verify.hpp"
 
+#include <functional>
 #include <iostream>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -45,6 +50,7 @@ namespace
         const grh::OperationId op =
             graph.createOperation(grh::OperationKind::kRegister, graph.internSymbol(sym));
         graph.setAttr(op, "width", elems * elemWidth);
+        graph.setAttr(op, "isSigned", false);
         graph.setAttr(op, "shape", std::vector<int64_t>{elems});
         return op;
     }
@@ -386,6 +392,384 @@ namespace
         return 0;
     }
 
+    // Small independent two-state evaluator: every write samples the same
+    // pre-event state and declaration order resolves write collisions.
+    using Inputs = std::map<uint32_t, uint64_t>;
+    std::vector<uint64_t> evaluateWrites(grh::Graph &graph, const Inputs &inputs,
+                                        const std::vector<uint64_t> &old)
+    {
+        std::map<uint32_t, uint64_t> cache;
+        std::function<uint64_t(grh::ValueId)> eval = [&](grh::ValueId value) -> uint64_t {
+            if (auto it = inputs.find(value.index); it != inputs.end()) return it->second;
+            if (auto it = cache.find(value.index); it != cache.end()) return it->second;
+            const auto def = graph.valueDef(value);
+            if (!def.valid()) throw std::runtime_error("unbound evaluator input");
+            const auto op = graph.getOperation(def);
+            const auto args = op.operands();
+            uint64_t result = 0;
+            switch (op.kind())
+            {
+            case grh::OperationKind::kConstant:
+            {
+                const auto text = std::get<std::string>(*op.attr("constValue"));
+                const auto tick = text.find('\'');
+                const int base = tick == std::string::npos ? 10 : text[tick + 1] == 'h' ? 16 :
+                                 text[tick + 1] == 'b' ? 2 : 10;
+                result = std::stoull(text.substr(tick == std::string::npos ? 0 : tick + 2), nullptr, base);
+                break;
+            }
+            case grh::OperationKind::kAssign: result = eval(args[0]); break;
+            case grh::OperationKind::kMux: result = eval(args[0]) ? eval(args[1]) : eval(args[2]); break;
+            case grh::OperationKind::kAnd:
+            case grh::OperationKind::kLogicAnd: result = eval(args[0]) & eval(args[1]); break;
+            case grh::OperationKind::kOr:
+            case grh::OperationKind::kLogicOr: result = eval(args[0]) | eval(args[1]); break;
+            case grh::OperationKind::kNot: result = ~eval(args[0]); break;
+            case grh::OperationKind::kLogicNot: result = !eval(args[0]); break;
+            case grh::OperationKind::kReduceOr: result = eval(args[0]) != 0; break;
+            case grh::OperationKind::kConcat:
+                for (auto arg : args) result = (result << graph.valueWidth(arg)) | eval(arg);
+                break;
+            case grh::OperationKind::kEq: result = eval(args[0]) == eval(args[1]); break;
+            case grh::OperationKind::kNe: result = eval(args[0]) != eval(args[1]); break;
+            case grh::OperationKind::kRegisterReadArrayPort:
+            {
+                const auto row = eval(args[0]);
+                result = row < old.size() ? old[row] : 0;
+                break;
+            }
+            default: throw std::runtime_error("unsupported evaluator operation");
+            }
+            const auto width = graph.valueWidth(value);
+            if (width < 64) result &= (UINT64_C(1) << width) - 1;
+            cache[value.index] = result;
+            return result;
+        };
+        auto next = old;
+        for (auto id : graph.operations())
+        {
+            const auto op = graph.getOperation(id);
+            if (!grh::isRegisterWritePortKind(op.kind())) continue;
+            const auto args = op.operands();
+            if (!eval(args[0])) continue;
+            if (op.kind() == grh::OperationKind::kRegisterWriteArrayPort)
+            {
+                auto row = eval(args[1]);
+                if (row < next.size()) next[row] = eval(args[2]);
+            }
+            else if (op.kind() == grh::OperationKind::kRegisterWritePort)
+            {
+                const auto packed = eval(args[1]);
+                for (std::size_t row = 0; row < next.size(); ++row)
+                    next[row] = (packed >> (row * 8)) & 255;
+            }
+            else if (op.kind() == grh::OperationKind::kRegisterFillPort)
+                std::fill(next.begin(), next.end(), eval(args[1]));
+            else throw std::runtime_error("unsupported evaluator write");
+        }
+        return next;
+    }
+
+    int testGuardedWriteNormalization(bool withOr)
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("guarded");
+        makeRegisterArray(graph, "arr", 8, 4);
+        const auto clock = makeInput(graph, "clk", 1);
+        const auto reset = makeInput(graph, "rst", 1);
+        const auto notReset = makeOp1(graph, grh::OperationKind::kNot, "nr", 1, reset);
+        const auto one = makeConst(graph, "one", 1, "1'b1");
+        grh::ValueId ptr[4], valid[4], data[3];
+        for (int p = 0; p < 4; ++p)
+        {
+            ptr[p] = makeInput(graph, "p" + std::to_string(p), 3);
+            valid[p] = makeInput(graph, "v" + std::to_string(p), 1);
+            if (p < 3) data[p] = makeInput(graph, "d" + std::to_string(p), 8);
+        }
+        // Whole reset is deliberately mixed with the decoder group.
+        const auto resetOp = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+                                                    graph.internSymbol("reset_write"));
+        graph.addOperand(resetOp, reset);
+        graph.addOperand(resetOp, makeConst(graph, "zeros", 32, "32'h0"));
+        graph.addOperand(resetOp, clock);
+        graph.setAttr(resetOp, "regSymbol", std::string("arr"));
+        graph.setAttr(resetOp, "eventEdge", std::vector<std::string>{"posedge"});
+        for (int row = 0; row < 4; ++row)
+        {
+            const auto suffix = std::to_string(row);
+            const auto idx = makeConst(graph, "idx" + suffix, 3, "3'd" + suffix);
+            grh::ValueId hit[4];
+            for (int p = 0; p < 4; ++p)
+            {
+                const auto tag = std::to_string(p) + "_" + suffix;
+                const auto eq = row == 0
+                    ? makeOp1(graph, grh::OperationKind::kNot, "eq" + tag, 1,
+                        makeOp1(graph, grh::OperationKind::kReduceOr, "nonzero" + tag, 1, ptr[p]))
+                    : makeOp2(graph, grh::OperationKind::kEq, "eq" + tag, 1, ptr[p], idx);
+                hit[p] = makeOp2(graph, grh::OperationKind::kAnd, "hit" + tag, 1, valid[p], eq);
+            }
+            const auto top = withOr ? makeOp2(graph, grh::OperationKind::kOr, "or" + suffix, 1, hit[2], hit[3]) : hit[2];
+            const auto topEnable = makeOp2(graph, grh::OperationKind::kAnd, "top_en" + suffix, 1, notReset, top);
+            const auto topData = withOr ? makeConst(graph, "zero_data" + suffix, 8, "8'h0") : data[2];
+            if (row != 0)
+                makeArrayWrite(graph, "top_w" + suffix, "arr", topEnable, idx, topData, clock);
+            const auto noTop = makeOp1(graph, grh::OperationKind::kNot, "no_top" + suffix, 1, top);
+            const auto elseEnable = makeOp2(graph, grh::OperationKind::kAnd, "else_en" + suffix, 1, notReset, noTop);
+            const auto middleEnable = makeOp2(graph, grh::OperationKind::kAnd, "mid_en" + suffix, 1, elseEnable, hit[1]);
+            const auto noMiddle = makeOp1(graph, grh::OperationKind::kNot, "no_mid" + suffix, 1, hit[1]);
+            const auto tailEnable = makeOp2(graph, grh::OperationKind::kAnd, "tail_en" + suffix, 1, elseEnable, noMiddle);
+            const auto hold = makeReadElem(graph, "arr", "hold" + suffix, idx, 8);
+            if (withOr && row == 0) graph.bindOutputPort("old_out", hold);
+            const auto tail = makeMux(graph, "tail" + suffix, 8, hit[0], data[0], hold);
+            if (row < 2)
+            {
+                auto middle = makeMux(graph, "middle" + suffix, 8, hit[1], data[1], tail);
+                if (row == 0) middle = makeMux(graph, "top_mux" + suffix, 8, top, topData, middle);
+                makeArrayWrite(graph, "tail_w" + suffix, "arr", row == 0 ? notReset : elseEnable, idx, middle, clock);
+            }
+            else
+            {
+                makeArrayWrite(graph, "mid_w" + suffix, "arr", middleEnable, idx, data[1], clock);
+                makeArrayWrite(graph, "tail_w" + suffix, "arr", tailEnable, idx, tail, clock);
+            }
+        }
+        const auto output = makeReadElem(graph, "arr", "read_output", ptr[0], 8);
+        graph.bindOutputPort("out", output);
+        struct Case { Inputs inputs; std::vector<uint64_t> old, expected; };
+        std::vector<Case> cases;
+        uint64_t random = 7;
+        for (int trial = 0; trial < 4096; ++trial)
+        {
+            auto nextRandom = [&] { random = random * UINT64_C(6364136223846793005) + 1; return random >> 32; };
+            Case c;
+            c.inputs[clock.index] = 1;
+            c.inputs[reset.index] = trial % 17 == 0;
+            c.inputs[one.index] = 1;
+            for (int p = 0; p < 4; ++p)
+            {
+                c.inputs[ptr[p].index] = nextRandom() & 7;
+                c.inputs[valid[p].index] = nextRandom() & 1;
+                if (p < 3) c.inputs[data[p].index] = nextRandom() & 255;
+            }
+            for (int row = 0; row < 4; ++row) c.old.push_back(nextRandom() & 255);
+            c.expected = evaluateWrites(graph, c.inputs, c.old);
+            cases.push_back(std::move(c));
+        }
+        const auto originalWrites = countKind(graph, grh::OperationKind::kRegisterWriteArrayPort);
+        PassManager normalizer;
+        normalizer.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+        PassDiagnostics diags;
+        if (!normalizer.run(design, diags).success || diags.hasError()) return fail("guarded writes: normalization failed");
+        if (countKind(graph, grh::OperationKind::kRegisterWriteArrayPort) > originalWrites)
+            return fail("guarded writes: normalizer expanded write ports");
+        for (const auto &c : cases)
+            if (evaluateWrites(graph, c.inputs, c.old) != c.expected)
+                return fail("guarded writes: normalization changed state transition");
+        PassManager manager;
+        manager.addPass(std::make_unique<MuxTreeFoldPass>(true));
+        manager.addPass(std::make_unique<GrhVerifyPass>());
+        if (!manager.run(design, diags).success || diags.hasError())
+        {
+            for (const auto &diag : diags.messages())
+                std::cerr << diag.passName << ": " << diag.message << " [" << diag.context << "]\n";
+            return fail("guarded writes: pipeline failed");
+        }
+        const auto expectedPorts = withOr ? 4 : 3;
+        if (countKind(graph, grh::OperationKind::kRegisterWriteArrayPort) != expectedPorts)
+            return fail("guarded writes: expected " + std::to_string(expectedPorts) + " dynamic ports, got " +
+                        std::to_string(countKind(graph, grh::OperationKind::kRegisterWriteArrayPort)));
+        if (countKind(graph, grh::OperationKind::kRegisterReadArrayPort) != (withOr ? 2 : 1))
+            return fail("guarded writes: hold reads remain or functional read lost");
+        if (countKind(graph, grh::OperationKind::kRegisterWritePort) != 1)
+            return fail("guarded writes: whole reset lost");
+        for (const auto &c : cases)
+            if (evaluateWrites(graph, c.inputs, c.old) != c.expected)
+                return fail("guarded writes: before/after transition mismatch");
+        return 0;
+    }
+
+    int testIdentityOverridesEarlierWrite()
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("identity_priority");
+        makeRegisterArray(graph, "arr", 8, 4);
+        const auto clock = makeInput(graph, "clk", 1);
+        const auto condition = makeInput(graph, "condition", 1);
+        const auto data = makeInput(graph, "data", 8);
+        const auto index = makeConst(graph, "idx", 2, "2'd0");
+        const auto one = makeConst(graph, "one", 1, "1'b1");
+        makeArrayWrite(graph, "first", "arr", one, index, data, clock);
+        const auto hold = makeReadElem(graph, "arr", "old", index, 8);
+        const auto selected = makeMux(graph, "last_data", 8, condition,
+                                      makeConst(graph, "last_value", 8, "8'd99"), hold);
+        makeArrayWrite(graph, "last", "arr", one, index, selected, clock);
+        PassManager manager;
+        manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+        PassDiagnostics diags;
+        const auto res = manager.run(design, diags);
+        if (!res.success || res.changed) return fail("priority: identity overwrite must remain");
+        Inputs inputs{{clock.index, 1}, {condition.index, 0}, {data.index, 42}};
+        if (evaluateWrites(graph, inputs, {7, 8, 9, 10})[0] != 7)
+            return fail("priority: higher-priority self assignment exposed earlier data");
+        return 0;
+    }
+
+    int testTwoStateOptIn()
+    {
+        std::string error;
+        if (makePass("register-write-normalize", {}, error))
+            return fail("normalization must require explicit two-state semantics");
+        const std::string_view arg = "-semantics=2state";
+        if (!makePass("register-write-normalize", std::span(&arg, 1), error))
+            return fail("normalization two-state factory option failed");
+        grh::Design design;
+        auto &graph = design.createGraph("default_semantics");
+        makeRegisterArray(graph, "arr", 8, 4);
+        const auto index = makeConst(graph, "i", 2, "2'd0");
+        const auto enable = makeConst(graph, "en", 1, "1'b1");
+        const auto hold = makeReadElem(graph, "arr", "old", index, 8);
+        makeArrayWrite(graph, "identity", "arr", enable, index, hold, makeInput(graph, "clk", 1));
+        PassManager manager;
+        manager.addPass(std::make_unique<RegisterWriteNormalizePass>());
+        PassDiagnostics diags;
+        const auto result = manager.run(design, diags);
+        if (!result.success || result.changed || countKind(graph, grh::OperationKind::kRegisterWriteArrayPort) != 1)
+            return fail("normalization default must preserve four-state behavior");
+        return 0;
+    }
+
+    int testGuardedFoldRejections()
+    {
+        for (int scenario = 0; scenario < 4; ++scenario)
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("guarded_reject");
+            makeRegisterArray(graph, "arr", 8, 4);
+            const auto clock = makeInput(graph, "clk", 1);
+            const auto otherClock = makeInput(graph, "clk2", 1);
+            const auto pointer = makeInput(graph, "p", 2);
+            const auto pointer2 = makeInput(graph, "p2", 2);
+            const auto data = makeInput(graph, "d", 8);
+            const auto data2 = makeInput(graph, "d2", 8);
+            const int rows = scenario == 0 ? 3 : 4;
+            for (int row = 0; row < rows; ++row)
+            {
+                const auto suffix = std::to_string(row);
+                const auto index = makeConst(graph, "i" + suffix, 2, "2'd" + suffix);
+                const auto hit = makeOp2(graph, grh::OperationKind::kEq, "eq" + suffix, 1, pointer, index);
+                const auto hit2 = makeOp2(graph, grh::OperationKind::kEq, "eq2_" + suffix, 1, pointer2, index);
+                const auto rowData = scenario == 1 ? makeInput(graph, "row_data" + suffix, 8) : data;
+                if (scenario == 3 && row % 2 == 0)
+                    makeArrayWrite(graph, "w2_" + suffix, "arr", hit2, index, data2, clock);
+                makeArrayWrite(graph, "w" + suffix, "arr", hit, index, rowData,
+                               scenario == 2 && row == 0 ? otherClock : clock);
+                if (scenario == 3 && row % 2 != 0)
+                    makeArrayWrite(graph, "w2_" + suffix, "arr", hit2, index, data2, clock);
+            }
+            PassManager manager;
+            manager.addPass(std::make_unique<MuxTreeFoldPass>(true));
+            manager.addPass(std::make_unique<GrhVerifyPass>());
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("guarded reject: invalid resulting graph");
+            if (findWritePortWithDynamicIndex(graph, "arr").valid())
+                return fail("guarded reject: folded unsafe scenario " + std::to_string(scenario));
+        }
+        return 0;
+    }
+
+    int testWholeWriteBarrier()
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("guarded_barrier");
+        makeRegisterArray(graph, "arr", 8, 4);
+        const auto clock = makeInput(graph, "clk", 1);
+        const auto reset = makeInput(graph, "rst", 1);
+        grh::ValueId ptr[2], data[2];
+        for (int source = 0; source < 2; ++source)
+        {
+            ptr[source] = makeInput(graph, "p" + std::to_string(source), 3);
+            data[source] = makeInput(graph, "d" + std::to_string(source), 8);
+            if (source == 1)
+            {
+                const auto whole = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+                                                         graph.internSymbol("whole"));
+                graph.addOperand(whole, reset);
+                graph.addOperand(whole, makeConst(graph, "nonuniform", 32, "32'h11223344"));
+                graph.addOperand(whole, clock);
+                graph.setAttr(whole, "regSymbol", std::string("arr"));
+                graph.setAttr(whole, "eventEdge", std::vector<std::string>{"posedge"});
+            }
+            for (int row = 0; row < 4; ++row)
+            {
+                const auto suffix = std::to_string(source) + "_" + std::to_string(row);
+                const auto index = makeConst(graph, "i" + suffix, 3, "3'd" + std::to_string(row));
+                const auto hit = makeOp2(graph, grh::OperationKind::kEq, "hit" + suffix, 1, ptr[source], index);
+                makeArrayWrite(graph, "w" + suffix, "arr", hit, index, data[source], clock);
+            }
+        }
+        struct Case { Inputs inputs; std::vector<uint64_t> expected; };
+        const std::vector<uint64_t> old{1, 2, 3, 4};
+        std::vector<Case> cases;
+        for (unsigned a = 0; a < 8; ++a)
+            for (unsigned b = 0; b < 8; ++b)
+                for (unsigned rst = 0; rst < 2; ++rst)
+                {
+                    Inputs inputs{{clock.index, 1}, {reset.index, rst},
+                                  {ptr[0].index, a}, {ptr[1].index, b},
+                                  {data[0].index, 91}, {data[1].index, 173}};
+                    cases.push_back({inputs, evaluateWrites(graph, inputs, old)});
+                }
+        PassManager manager;
+        manager.addPass(std::make_unique<MuxTreeFoldPass>(true));
+        manager.addPass(std::make_unique<GrhVerifyPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError()) return fail("barrier: pipeline failed");
+        if (countKind(graph, grh::OperationKind::kRegisterWriteArrayPort) != 2 ||
+            countKind(graph, grh::OperationKind::kRegisterWritePort) != 1)
+            return fail("barrier: static segments were not independently folded");
+        for (const auto &c : cases)
+            if (evaluateWrites(graph, c.inputs, old) != c.expected)
+                return fail("barrier: whole-write priority changed");
+        return 0;
+    }
+
+    int testBoundedPointerDomain()
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("bounded_pointer");
+        makeRegisterArray(graph, "arr", 8, 4);
+        const auto clock = makeInput(graph, "clk", 1);
+        const auto bit = makeInput(graph, "bit", 1);
+        const auto data = makeInput(graph, "data", 8);
+        const auto pointer = makeOp2(graph, grh::OperationKind::kConcat, "pointer", 3,
+                                     makeConst(graph, "zero", 2, "2'b00"), bit);
+        for (int row = 0; row < 2; ++row)
+        {
+            const auto suffix = std::to_string(row);
+            const auto index = makeConst(graph, "i" + suffix, 3, "3'd" + suffix);
+            const auto hit = makeOp2(graph, grh::OperationKind::kEq, "hit" + suffix, 1, pointer, index);
+            makeArrayWrite(graph, "w" + suffix, "arr", hit, index, data, clock);
+        }
+        PassManager manager;
+        manager.addPass(std::make_unique<MuxTreeFoldPass>(true));
+        manager.addPass(std::make_unique<GrhVerifyPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError()) return fail("bounded pointer: pipeline failed");
+        if (countKind(graph, grh::OperationKind::kRegisterWriteArrayPort) != 1 ||
+            !findWritePortWithDynamicIndex(graph, "arr").valid())
+            return fail("bounded pointer: complete reachable domain was not folded");
+        for (uint64_t row = 0; row < 2; ++row)
+        {
+            Inputs inputs{{clock.index, 1}, {bit.index, row}, {data.index, 87}};
+            auto expected = std::vector<uint64_t>{1, 2, 3, 4};
+            expected[row] = 87;
+            if (evaluateWrites(graph, inputs, {1, 2, 3, 4}) != expected)
+                return fail("bounded pointer: wrong row updated");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -402,6 +786,13 @@ int main()
     {
         return rc;
     }
+    if (int rc = testGuardedWriteNormalization(false)) return rc;
+    if (int rc = testGuardedWriteNormalization(true)) return rc;
+    if (int rc = testIdentityOverridesEarlierWrite()) return rc;
+    if (int rc = testTwoStateOptIn()) return rc;
+    if (int rc = testGuardedFoldRejections()) return rc;
+    if (int rc = testWholeWriteBarrier()) return rc;
+    if (int rc = testBoundedPointerDomain()) return rc;
     std::cout << "[mux-tree-fold-tests] all tests passed\n";
     return 0;
 }

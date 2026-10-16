@@ -17,8 +17,8 @@ Two steps:
    ranges drive the emit-side chunk members (`sn_<i>__c<j>`) — one per chunk,
    with cross-chunk locals spilled through the supernode's `SnFrame<i>` frame
    struct; the C8 TU plan keeps a supernode's chunks in one translation unit.
-   The six-phase model gates whole supernodes through the ActiveFlags byte
-   arrays; the partition tree never contains `ActiveWord` (or `EventDomain`)
+   The six-phase model gates nonSink supernodes through `nonSinkActiveFlag`
+   u64 words; the partition tree never contains `ActiveWord` (or `EventDomain`)
    partitions.
 2. Emit functions: the General branch's supernodes are **not** remounted
    (resolution 2 — supernode ordinals are decoupled from function packing).
@@ -28,7 +28,7 @@ Two steps:
    C2 order. Batching uses the legacy thresholds `--batch-max-ops` (2048),
    `--batch-max-estimated-lines` (8192) and `--target-batch-count` (64; with
    a nonzero target the effective limits are `max(limit, total/target)` over
-   the General branch). The flat `Event`, `Mem` and `Output` branches each
+   the General branch). The flat `Event`, `LargeSink` and `Output` branches each
    collapse into exactly one `EmitFunction` leaf holding the branch's ops —
    one task per branch — even when the branch is empty.
 
@@ -39,7 +39,7 @@ root
 ├─ phase Event   └─ EmitFunction { flat event ops }      ; cone, then edgeDets
 ├─ phase General ├─ Supernode+ └─ Node+                  ; direct children, C2 order
 │                └─ EmitFunction+ { supernodeRange }     ; trailing leaves, tile [0,N)
-├─ phase Mem     └─ EmitFunction { mem writes }          ; op-id order
+├─ phase LargeSink └─ EmitFunction { large-sink writes } ; op-id order
 └─ phase Output  └─ EmitFunction { flat output ops }
 ```
 

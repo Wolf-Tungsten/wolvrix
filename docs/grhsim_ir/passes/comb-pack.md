@@ -14,7 +14,7 @@ Candidates roots come from three sources, each individually switchable:
 | --- | --- | --- |
 | declarations | `--enable-declared-roots` (default `true`) | values targeted by a declProvenance slice |
 | outputs | `--enable-output-roots` (default `true`) | the operand of each `core.output.write` |
-| storage data | `--enable-storage-data-roots` (default `true`) | the data operand of `core.state.write`/`latchWrite` (operand 1), `writeArray` (the data operand after the index operands, before mask/events) and `fill` (operand 1) |
+| storage data | `--enable-storage-data-roots` (default `true`) | the data operand of `core.state.write`/`writeMask`/`latchWrite` (operand 1), `writeArray`/`writeArrayMask` (the data operand after the index operands, before an optional mask/events tail) and `fill` (operand 1) |
 
 A root must be produced by a supported internal op; pure leaves never form a
 group alone. A root whose minimal packed width (`laneWidth × min-group-size`)

@@ -1,11 +1,9 @@
 # GrhSIM CPU 后端
 
-> **状态（M5d-6）**：CPU mapping 定为 C 段七 pass 的一次最终 mapping
-> （`cpu.st.build-general-nodes` → … → `cpu.st.build-phase-schedule`，见
-> [CPU 单线程活动度仿真 Flow](../flows/cpu-st.md)）；旧两阶段 mapping 管线、
-> `cpu.st.split-phases` 与旧 emit 均已删除。本文 §1–§4 已更新为当前结构（字段以
-> `include/grhsim/ir/model.hpp` 为准）；§5 中"CPU C++ …"各小节及 §2 中字符串句柄、
-> 常量内联等 emit 行为段落记录的是旧 emitter 的约定，保留为设计背景。
+> **状态（2026-10-13）**：本文保留了部分 M5d-6 的七 store、`P_mem` 和旧调度说明，
+> 这些段落不再代表当前六阶段实现。当前 store、phase 与 schedule 字段以
+> `include/grhsim/ir/model.hpp` 和对应 pass 文档为准；§2.2 的多维数组 emit 约束
+> 已按当前实现更新。§5 中旧 emitter 行为段落仍作为设计背景保留。
 
 本文定义 CPU 后端的映射结构 `CpuBackendMapping`。[GrhSIM IR Overview](../overview.md)
 定义通用模型和后端边界；本文中的三个分量仅属于 CPU 后端，不是其他后端必须采用的结构。
@@ -34,10 +32,13 @@ CpuBackendMapping
 DataLayout
   pointer_bytes: UInt32
   types: CpuType[]                  # 独立物理类型表，CpuTypeId 稠密
-  namedStores: CpuNamedStore[]?     # 七个具名 store，C3 起
+  namedStores: CpuNamedStore[]?     # 12 个具名 store，C3 起
 
 CpuNamedStore
-  kind: regLatch | mem | boundary | prevEvent | eventAct | timeslotTrigger | activeFlags
+  kind: smallSink | largeSink | input | nonSinkBoundary
+      | smallSinkEnableBoundary | smallSinkPayloadBoundary
+      | largeSinkEnableBoundary | largeSinkPayloadBoundary
+      | prevEvent | eventAct | timeslotTrigger | activeFlags
   fields: [{name, type, offset, state | value, aux}]
   sizeBytes: UInt64
 ```
@@ -53,7 +54,7 @@ CpuNamedStore
 | `core.logic<w, s, 4-state>` | `cpu.array<V, 2>`，`V` 是对应的 2-state 表示 |
 | `core.real` | `cpu.f64` |
 | `core.string` | `cpu.str` |
-| 带 shape 的 `core.logic<w, s, d>`（数组） | `cpu.array<U, ∏shape>`（`U` 是元素位宽 `elementWidth = w/∏shape` 对应的 cpu 类型；按 shape 行主序摊平为**平坦**物理数组，不嵌套，字节布局与旧一维 `core.array` 布局逐字节一致，见 §2.2） |
+| 带 shape 的两态 `core.logic<w, s, d>`（数组） | 每个 shape 维度各嵌套一层 `cpu.array`，最外维在最外层；`shape=[2,3]` 映射为 `cpu.array<cpu.array<U,3>,2>`，`U` 对应元素位宽 `w/∏shape`，见 §2.2。四态 aggregate 不支持 emit。 |
 
 当前 `cpu.str` 的物理槽是 `pointer_bytes` 大小的字符串句柄，不是在字节 arena 中内嵌
 `std::string`。C++ emitter 让句柄指向独立的类型化字符串对象：object、boundary 和 input
@@ -123,14 +124,14 @@ random 使用 legacy SplitMix64 算法，每个宽值按低字到高字写入目
 该对应是默认选择而非约束：只要 cpu 类型的取值集合覆盖语义类型的取值集合，`DataLayout`
 可以为同一语义类型选择不同的 cpu 类型。
 
-named stores 共同覆盖模型的持久数据：`regLatch`/`mem` 按 A7 `storeClass` 覆盖 `S` 的每个
-状态，`boundary` 覆盖每个输入端口与跨超节点/General→Mem 写参数 value，其余 store 覆盖
-事件聚类、timeslot 标志与活动标志数组。`F` 中的外部函数声明不是数据对象，不在覆盖
-范围；外部函数如何绑定到具体实现由 CPU 后端自行定义。超节点内部的临时 value 不占
-named store 字段，由 emit 在函数帧内分配。
+named stores 共同覆盖模型的持久数据：`smallSink`/`largeSink` 按 A7 `storeClass`
+覆盖 `S` 的每个状态，`input` 单独保存外部输入，`nonSinkBoundary` 保存 nonSink
+超节点间的 value。写参数按目标类别拆为 small/large 两套 enable/payload boundary
+store；其余 store 保存事件聚类、timeslot 标志与激活位图。`F` 中的外部函数声明
+不是数据对象，不在覆盖范围；超节点内部的临时 value 不占 named store 字段。
 
 一个 value 是否跨超节点，由 `G` 中的定义/使用关系和 `PartitionTree` 共同确定；C3 据此
-把跨超节点 value 收入 `boundary` store，不能改变 value 的生产者或使用者。
+把跨 nonSink 超节点 value 收入 `nonSinkBoundary` store，不能改变 value 的生产者或使用者。
 
 `DataLayout` 不定义初始化语义，也不保存初值。`Init` 始终是 `GrhSimModel` 的分量，初始化
 语义（步骤种类、覆盖规则）完全由 core 方言定义（见 core 方言第 2.1 节），CPU 后端只负责
@@ -153,11 +154,12 @@ stage 之后生成，产出 `LayoutNamedStores` stage，mapping 仍为 `complete
 
 `CpuDataLayout` 只含两个 payload：`types`（按 ID 稠密存储
 `kind/width/elementType/count/size/alignment`，结构相同的类型去重）与 `namedStores`
-（固定顺序的七个具名 store）。状态归 store 只消费 A7 `storeClass` 注解，未分类状态
-报错并指向 `grhsim.select-state-stores`；boundary store 覆盖输入端口、跨超节点 value
-与 Mem 相写参数槽位（`<mem>__w<idx>__<role>` 命名）。命名推演集中在 C3，emit 只消费；
+（固定顺序的 12 个具名 store）。状态归 store 只消费 A7 `storeClass` 注解，未分类状态
+报错并指向 `grhsim.select-state-stores`；input、nonSink、smallSink enable/payload、
+largeSink enable/payload 分别建 store，largeSink 写参数槽位沿用
+`<state>__w<idx>__<role>` 命名。命名推演集中在 C3，emit 只消费；
 所有大小计算检查 UInt64 溢出。verifier 对 named stores 做结构校验（类型表稠密、store
-定序、字段名全图唯一、偏移对齐不重叠、状态双射、boundary 按图重算、每聚类一条目），
+定序、字段名全图唯一、偏移对齐不重叠、状态双射、各类 boundary 按图重算、每聚类一条目），
 不再做旧 canonical 布局的重建比较。
 
 JSON 的 CPU layout 为 `[pointer_bytes, [types...], [named_stores...]?]` 位置化数组；
@@ -165,17 +167,18 @@ JSON 的 CPU layout 为 `[pointer_bytes, [types...], [named_stores...]?]` 位置
 
 ### 2.2 数组状态的布局与发射形状（stage-06）
 
-带 shape 的 `core.logic` state 按 shape **行主序摊平为平坦物理数组**
-`cpu.array<U, ∏shape>`（`U` 是元素位宽 `elementWidth` 对应的 cpu 类型），物理布局不
-嵌套；字节布局与旧一维 `core.array` 布局逐字节一致，shape 只影响寻址表达式与语义校验
-（"物理存储保持线性"原则）。宽元素（elementWidth > 64 的 _BitInt 行）× 多维 shape 的
-组合同样支持：最内层元素为 `cpu.uint<elementWidth>`（limb 数组），线性偏移 =
-线性下标 × elementWidth 的公式不变。
+带 shape 的两态 `core.logic` state 按 shape **逐维嵌套**：
+`shape=[d0,d1,...,dn]` 对应 `cpu.array<cpu.array<...<U,dn>...,d1>,d0>`，其中
+`U` 是元素位宽对应的物理类型。生成的 C++ 字段、端口和 shaped 局部值也保留同一组
+维度，例如 8 位元素的 `[2,3]` 声明为 `std::array<std::array<std::uint8_t,3>,2>`。
+行主序元素仍连续存放；内部打包或线性偏移计算不改变多维声明。宽于 64 位的两态
+元素使用单个 `cpu.uint<elementWidth>` / C23 `_BitInt` 对象。四态 aggregate 在
+GrhSIM emit 中明确拒绝。
 
-发射端的索引寻址一律**线性化**：`readArray`/`writeArray` 的多索引在 emit 时按
-`stride_j = ∏shape[j+1:]` 折叠为线性下标 `i0*d1*...*dn-1 + ... + in-1`，再索引平坦
-物理数组。备选方案是直接发射嵌套下标表达式 `store.f[i0][i1]`；现行实现选择线性化
-（控制发射形状、对编译器更友好）。`sliceArray` 同理按行主序多索引偏移发射。
+`readArray`/`writeArray`/`sliceArray` 的多索引遵守逐维 shape，完整索引定位元素，
+部分索引取得剩余维度的子数组；必要的线性行号按
+`stride_j = ∏shape[j+1:]` 折叠，仅用于行主序偏移或静态 reader 匹配，不能替代
+生成类型中的多维结构。
 
 整体数组写（目标是数组状态的 `write`）的发射策略参照 gsim 的 `arrayCopy` 三档：常量
 折叠（RHS 为常量）/ 逐元素展开（RHS 元素结构已知时逐元素 store）/ 循环拷贝（一般情形，
@@ -184,7 +187,7 @@ JSON 的 CPU layout 为 `[pointer_bytes, [types...], [named_stores...]?]` 位置
 FST 波形对数组一律**逐元素注册 var**，使用方括号规范名 `arr[i0][i1]...`（GTKWave 折叠
 为数组树）；总字节超过 `kWaveMaxBytes`（512）的数组整个不 dump（不做截断式部分
 dump），宽元素逐元素走 _BitInt u64-word 镜像路径——逐元素化同时解除了旧"元素宽 ∈
-{8,16,32,64}"的限制。mem 类 state 不进 FST。详见 §5 的 FST 波形小节。
+{8,16,32,64}"的限制。largeSink 类 state 不进 FST。详见 §5 的 FST 波形小节。
 
 ## 3. `PartitionTree`
 
@@ -201,18 +204,18 @@ Partition
 
 PartitionAttrs
   kind: root | phase | event_domain | supernode | node | active_word | emit_function
-  phase: none | compute | commit | event | general | mem | output
+  phase: none | compute | commit | event | general | large_sink | output
   helper_chunks: [{offset: UInt32, count: UInt32}]
   event_acts: Int64[]?                             # General 超节点命中的聚类并集（C2 起 engaged，无事件为空数组；sink 超节点上即事件签名）
   supernode_range: {offset: UInt32, count: UInt32}?  # General 分枝尾随 EmitFunction 叶子（C6 起）
-  supernode_category: non_sink | sink_escape | sink_event?  # General 超节点分类（C2 起 engaged，V2-M1）
-  enable_guard: Int64?                             # 共享 en 细分的 SinkEvent 超节点：成员共有写使能的 value index（C2 起，A1）
+  supernode_category: non_sink | small_sink_escape | small_sink_event?  # General 超节点分类
+  enable_guard: Int64?                             # 共享 en 细分的 SmallSinkEvent 超节点：成员共有写使能的 value index
 ```
 
 `event_domain`/`active_word` kind 与 `compute`/`commit` phase 的枚举值仅为 checkpoint
 兼容保留，不再产生；旧 `event_gate`/`active_id`/`active_word` 字段已在 M5d-6 删除。
 `supernode_category` 在 V2-M1 引入：`non_sink` 超节点只含有返回值 op（走合并框架），
-`sink_event`/`sink_escape` 超节点只含无返回值 op（按事件签名聚类；空签名为逃逸类，
+`small_sink_event`/`small_sink_escape` 超节点只含无返回值 op（按优先级及事件签名聚类；空签名为逃逸类，
 每个 round 无条件激活）。V2-M1 之前的 checkpoint 缺少该字段，载入后由校验器拒绝。
 
 `PartitionTree` 满足以下约束：
@@ -237,7 +240,7 @@ root
   phase Event    -> emit_function -> ops         ; 锥拓扑序，edgeDet 殿后
   phase General  -> supernode+ -> node+ -> ops   ; 超节点直挂 General 分枝，子节点顺序即序号
                  -> emit_function+               ; 尾随叶子，只记 supernode_range 区间
-  phase Mem      -> emit_function -> ops         ; op-id 序
+  phase LargeSink -> emit_function -> ops        ; op-id 序
   phase Output   -> emit_function -> ops         ; 拓扑序
 ```
 
@@ -272,7 +275,7 @@ attr_tail = [[helper_offset, helper_count], ...]   -- helperChunks
             [[event_act, ...]]?                    -- eventActs（C2 起）
             [[range_offset, range_count]]?         -- supernodeRange（C6 起）
             enable_guard?                          -- 标量 value index，仅 A1 守卫细分
-                                                     -- 的 SinkEvent 超节点（category 标量之后）
+                                                     -- 的 SmallSinkEvent 超节点（category 标量之后）
 layout    = [pointer_bytes, [type, ...], [named_store, ...]?]
 schedule  = [numa_nodes, input_fanout, supernode_fanout, state_fanout,
              event_activation?, mem_write_plan?, timeslot_triggers?]
@@ -286,7 +289,10 @@ attr_tail 与 schedule 尾部保持位置化追加：靠后的字段存在时，
 旧的非 CPU mapping 行仍为四项，空 mappings 的旧 checkpoint 可直接读取。
 load 和 clone 为 mapping 绑定新模型 identity；semantic mutation 清除整个 mapping。
 
-## 4. `SchedulePlan`
+## 4. `SchedulePlan`（M5d-6 历史说明）
+
+本节保留早期七 store / `P_mem` 版本的细节，当前六阶段调度和 fanout 以
+[CPU 单线程活动度仿真 Flow](../flows/cpu-st.md) 第 4–5 节为准。
 
 ```text
 SchedulePlan
@@ -294,9 +300,8 @@ SchedulePlan
   inputFanout: Map<ValueId, ActivationTargets>
   computeSupernodeFanout: Map<ValueId, ActivationTargets>
   commitStateFanout: Map<StateId, ActivationTargets>
-  eventActivation: [{act: UInt32, supernodeWords: UInt64[]}]?    # C4（V2-M2，只覆盖非 sink 超节点）
-  memWritePlan: [{writeOp, priority, eventFree, readers}]?       # C5（priority = 该写在目标 state 的
-                                                                 # Mem 相写中的声明顺序位次）
+  eventActivation: [{act: UInt32, supernodeWords: UInt64[]}]?    # C4（只覆盖 nonSink 超节点）
+  memWritePlan: [{writeOp, priority, eventFree, readers}]?       # C5（保留旧结构名；目标是 largeSink）
   timeslotTriggers: [{act: UInt32, flag: UInt32}]?               # C7
 
 ActivationTargets
@@ -349,6 +354,11 @@ enable 全部被影子化的极大连续 run 外包一层按字 OR 聚合跳过�
 顺序：未被影子化的端口——常数 enable、regLatch/mem 回读 enable——仅仅结束一个
 run，不参与聚合）。常量 enable（如恒 1）保持折叠、不进位图。
 
+六阶段 emitter 在所有 `cpu_init_*` 常量预装完成后，每 8 个位图 word 用一个
+`noinline` lambda 初始化，避免数万 enable 的表达式被合并进同一个巨大 `init()`。
+这只拆分冷初始化代码；位图读取的字段及顺序不变。香山 aggregate 模型中，未拆分的
+1538 个 word 使 clang `-O3` 的 MachineCombiner 耗时超过 15 分钟。
+
 P_mem 端口另按 event act 聚类：同一 chunk 内共享同一 `eventActStore` 守卫的极大
 连续端口段只在段首判断一次守卫（端口体只读 eventActStore、不写，合并精确）；段内再
 套 enable 位图 run 聚合。此外，boundary 发布在"无超节点 fanout 且无位图 hook"时
@@ -383,7 +393,7 @@ task 从所在的 `CpuCoreSchedule` 继承 CPU core 和 NUMA node 归属。`Data
 所有 task 序列与 `waits_for` 合成的顺序必须无环，并覆盖 `G` 中跨 task value 的生产者到
 使用者关系。该顺序还必须满足方言规定的对象访问约束。
 
-### 4.1 当前 `cpu.st.build-phase-schedule`（C7）实现
+### 4.1 M5d-6 `cpu.st.build-phase-schedule`（C7）实现记录
 
 旧 `cpu.st.build-schedule` 已在 M5d-6 删除。当前调度由 C7
 [`cpu.st.build-phase-schedule`](../passes/build-phase-schedule.md) 在 `GeneralFunctions`
@@ -546,6 +556,12 @@ FST）、字符串/四态类型、无 live object 的符号（被优化掉的线
 再掩回语义位宽。宽移位量按全精度与位宽比较——高字非零自然落入饱和分支，不会出现
 只读低 64 位的截断。
 
+六阶段 emitter 对超过 8 个操作数的宽 `concat` 生成平衡的拼接树，每层只拓宽到
+该层的实际位宽，并用命名局部变量限制 C++ 表达式嵌套深度。叶子先转成无符号位模式，
+防止 signed 64-bit 输入在拓宽时把符号位写进相邻字段。结果仍为原生 `_BitInt`；
+这样避免香山 3201 输入、16384 位拼接中，连续对整个结果移位引发的 SelectionDAG
+优化耗时。
+
 ### CPU C++ 宽状态写入
 
 两态、1–64 位的 staged 标量写入先读取有效值：dirty 时使用当前 shadow，否则使用
@@ -598,8 +614,8 @@ emitter 可将 value 解析为 state 引用并省去读取复制。state 发布�
 ### CPU C++ 标量内存写入
 
 标量 memory cell（two-state logic 1–64 bit）先比较 masked next，再决定是否
-进入 shadow/pending。`writeArray` operands 依次是 enable、各维索引（1..rank 个）、
-data、mask、event values；`fill` 的 enable/data 更新每行；同一 state 的多个写 op
+进入 shadow/pending。`writeArray` operands 依次是 enable、各维索引（1..rank 个）、data、
+event values；`writeArrayMask` 在 data 后再携带 mask；`fill` 的 enable/data 更新每行；同一 state 的多个写 op
 按声明顺序依次应用。`cpu_write_cell<T,Width>` 使用
 `key=memory_base+row` 和 `offset=array_offset+row*sizeof(T)`，从 dirty cell 的
 shadow 或干净 cell 的 visible 取 current，按元素宽度及 signedness 规范化
@@ -791,7 +807,7 @@ bit1 留在全局等待后续扫描。域 arm、DPI guard/history 和 commit 发
 
 发射器在同一个边沿域 commit task 内按采样等价类共享私有事件历史，适用于
 `DomainGatedCommit` 和 `AlwaysScanCommit`。每个 history 单独检查：全模型的
-object ref 必须全部是本 task 中 `write/writeArray/fill` 的
+object ref 必须全部是本 task 中 `write/writeMask/writeArray/writeArrayMask/fill` 的
 posedge/negedge 采样，且每次采样使用同一个、不经 state-read alias 的 boundary
 ValueId。history 与 event 类型相同，均为 unsigned two-state 1-bit；history 具有
 唯一常量初始化记录，publication 目标恰为本域 arm。同一 history 可以被本 task
@@ -860,7 +876,7 @@ history 的初值和完整 guard 仍独立；只有上述已证明等价的历�
 和重复 init，并保留 shared-history 的 AlwaysScanCommit 测试。
 
 `DomainGatedCommit` 还可在原 body 之前检测整个 task 是否无效果：仅限
-`write/writeArray/fill`，全部 event 为 posedge/negedge，全部 history
+`write/writeMask/writeArray/writeArrayMask/fill`，全部 event 为 posedge/negedge，全部 history
 均为 unsigned two-state 1-bit、一字节存储且各自只有一个 object ref。至少 16 个 history、
 至多八个不同的当前事件 ValueId 才启用。共享、被观察、被普通写口写入的 history
 以及 general/AlwaysScanCommit、DPI/system task 均不使用该检测。
@@ -900,8 +916,9 @@ boundary 中的旧返回值/output/inout 保持不变。所有 event history 均
 宽 input 为 `const std::array<uint64_t,N>&`，output/inout 指向调用者临时存储。inout 先按
 声明类型归一化并装载输入，调用后依次发布返回值、output 和 inout，真变化时激活 mapping
 中的 fanout。宽结果屏蔽 padding；窄 signed 结果保留逻辑位宽的符号扩展，包括 signed 1-bit。
-Real 端口和 DPI 值使用 double。此 ABI 不是通用 svdpi/open-array ABI；unpacked array 参数
-显式拒绝。重复 symbol 的不兼容声明、调用数量/类型不匹配在写出文件之前报告错误。
+Real 端口和 DPI 值使用 double。此 ABI 不是通用 svdpi/open-array ABI；任何带 shape
+的 DPI input/output/inout 参数和返回值均标记为不支持，aggregate ABI 未实现（P1），
+emit 必须显式拒绝。重复 symbol 的不兼容声明、调用数量/类型不匹配在写出文件之前报告错误。
 DPI C 声明只写入 compute task 源文件，不污染公共模型头文件。这沿用 legacy 的翻译单元
 边界，允许 harness 继续包含其原生接口声明；本机 scalar ABI 保持原始位模式，不承诺跨 ABI
 或通用 svdpi 兼容。

@@ -188,6 +188,15 @@ namespace
         return false;
     }
 
+    bool hasErrorContaining(const diag::Diagnostics &diagnostics, std::string_view needle)
+    {
+        for (const auto &message : diagnostics.messages())
+            if (message.kind == diag::DiagnosticKind::Error &&
+                message.message.find(needle) != std::string::npos)
+                return true;
+        return false;
+    }
+
     bool jsonRoundTripStable(const grhsim::GrhSimModel &model, const std::filesystem::path &dir,
                              const std::string &baseName)
     {
@@ -361,7 +370,7 @@ namespace
         if (findParam(model, model.parameters(*write), "event_edges"))
             return fail("dut_081: event_edges survived");
         if (!getActsParam(model, *write, {0})) return fail("dut_081: event_acts wrong");
-        if (write->phase != SimPhase::General) return fail("dut_081: write not General");
+        if (write->phase != SimPhase::None) return fail("dut_081: write phase resolved before store classification");
 
         const auto outputs = opsOfType(model, "core.output.write");
         if (outputs.size() != 1 || outputs.front()->phase != SimPhase::None)
@@ -488,7 +497,8 @@ namespace
         bool sawActs0 = false, sawActs1 = false;
         for (const auto *write : writes)
         {
-            if (write->phase != SimPhase::General) return fail("dual_use: write phase wrong");
+            if (write->phase != SimPhase::None)
+                return fail("dual_use: write phase resolved before store classification");
             if (getActsParam(model, *write, {0})) sawActs0 = true;
             if (getActsParam(model, *write, {1})) sawActs1 = true;
         }
@@ -568,9 +578,10 @@ namespace
         return 0;
     }
 
-    // Spec case 6: prevInit static evaluation — a register used as a clock
-    // inherits its init.const literal; a derived clock evaluates recursively;
-    // unevaluable cones and width-mismatched init literals fall back to zero.
+    // Spec case 6: prevInit static evaluation on 1-bit events. A register
+    // used as a clock inherits its init.const literal; a derived clock
+    // evaluates recursively; unevaluable cones and width-mismatched init
+    // literals fall back to zero.
     int runPrevInitEvalTest()
     {
         using namespace grhsim;
@@ -578,37 +589,36 @@ namespace
             GrhSimModel model("prev_init_reg");
             model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
-            const auto word = model.logicType(8, false, LogicDomain::TwoState);
             const auto q = addState(model, "q", bit, "1'h0");
             const auto clkReg = addState(model, "clk_reg", bit, "1'h1");
-            const auto wideReg = addState(model, "wide_reg", word, "8'h01");
+            const auto clkRegZero = addState(model, "clk_reg_zero", bit, "1'h0");
             const auto d = addInputRead(model, "d");
             const auto one = addConstant(model, bit, "1'b1");
             const auto clkv = model.addValue(bit, "clk_reg_value");
             model.addOperation("core.state.read", {}, std::array{clkv},
                                std::array{ObjectRef::state(clkReg)});
-            const auto widev = model.addValue(word, "wide_reg_value");
-            model.addOperation("core.state.read", {}, std::array{widev},
-                               std::array{ObjectRef::state(wideReg)});
+            const auto zerov = model.addValue(bit, "clk_reg_zero_value");
+            model.addOperation("core.state.read", {}, std::array{zerov},
+                               std::array{ObjectRef::state(clkRegZero)});
             addWrite(model, one, d, one, q, clkv, "posedge");
-            addWrite(model, one, d, one, q, widev, "negedge");
+            addWrite(model, one, d, one, q, zerov, "negedge");
 
             diag::Diagnostics diagnostics;
             if (!runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success)
                 return fail("prev_init: lower pass failed");
             if (!hasInfo(diagnostics, "grhsim.lower-edge-detect", "prev_init_fallbacks=0"))
                 return fail("prev_init: register inits must evaluate without fallback");
-            bool sawOne = false, sawWide = false;
+            bool sawOne = false, sawZero = false;
             for (const auto *det : opsOfType(model, "core.event.edgeDet"))
             {
                 if (getStringParam(model, *det, "prevInit", "1'h1") &&
                     getStringParam(model, *det, "edge", "posedge"))
                     sawOne = true;
-                if (getStringParam(model, *det, "prevInit", "8'h01") &&
+                if (getStringParam(model, *det, "prevInit", "1'h0") &&
                     getStringParam(model, *det, "edge", "negedge"))
-                    sawWide = true;
+                    sawZero = true;
             }
-            if (!sawOne || !sawWide)
+            if (!sawOne || !sawZero)
                 return fail("prev_init: register init literals were not propagated");
             if (!verifies(model)) return fail("prev_init: lowered model rejected");
         }
@@ -679,12 +689,11 @@ namespace
             GrhSimModel model("prev_init_width_mismatch");
             model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, LogicDomain::TwoState);
-            const auto word = model.logicType(8, false, LogicDomain::TwoState);
             const auto q = addState(model, "q", bit, "1'h0");
-            const auto odd = addState(model, "odd_reg", word, "1'h1");
+            const auto odd = addState(model, "odd_reg", bit, "8'h01");
             const auto d = addInputRead(model, "d");
             const auto one = addConstant(model, bit, "1'b1");
-            const auto oddv = model.addValue(word, "odd_value");
+            const auto oddv = model.addValue(bit, "odd_value");
             model.addOperation("core.state.read", {}, std::array{oddv},
                                std::array{ObjectRef::state(odd)});
             addWrite(model, one, d, one, q, oddv, "posedge");
@@ -696,9 +705,37 @@ namespace
                 return fail("prev_init_width: expected one fallback");
             const auto dets = opsOfType(model, "core.event.edgeDet");
             if (dets.size() != 1 ||
-                !getStringParam(model, *dets.front(), "prevInit", "8'h00"))
-                return fail("prev_init_width: fallback literal must be 8'h00");
+                !getStringParam(model, *dets.front(), "prevInit", "1'h0"))
+                return fail("prev_init_width: fallback literal must be 1'h0");
             if (!verifies(model)) return fail("prev_init_width: lowered model rejected");
+        }
+        return 0;
+    }
+
+    int runUnsupportedEventTypeTest()
+    {
+        using namespace grhsim;
+        for (const bool shaped : {false, true})
+        {
+            GrhSimModel model(shaped ? "shaped_event" : "wide_event");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+            const std::array<int64_t, 1> shape{1};
+            const auto eventType = shaped ? model.logicType(1, false, LogicDomain::TwoState, shape)
+                                          : model.logicType(8, false, LogicDomain::TwoState);
+            const auto q = addState(model, "q", bit, "1'h0");
+            const auto port = model.addInput("event", eventType);
+            const auto event = model.addValue(eventType, "event_value");
+            model.addOperation("core.input.read", {}, std::array{event},
+                               std::array{ObjectRef::input(port)});
+            const auto one = addConstant(model, bit, "1'b1");
+            addWrite(model, one, one, one, q, event, "posedge");
+
+            diag::Diagnostics diagnostics;
+            if (runPasses(model, {"grhsim.lower-edge-detect"}, diagnostics).success ||
+                !hasErrorContaining(diagnostics, "event operand must be unshaped 1-bit core.logic"))
+                return fail(shaped ? "shaped event was not rejected by lowering"
+                                   : "wide event was not rejected by lowering");
         }
         return 0;
     }
@@ -1382,6 +1419,7 @@ int main()
         if (const int status = runPureEventInputTest(); status != 0) return status;
         if (const int status = runSharedClusterTest(); status != 0) return status;
         if (const int status = runPrevInitEvalTest(); status != 0) return status;
+        if (const int status = runUnsupportedEventTypeTest(); status != 0) return status;
         if (const int status = runMemWriteEventTest(); status != 0) return status;
         if (const int status = runDpiCallEventTest(); status != 0) return status;
         if (const int status = runEventStrobeTaskTest(artifactDir); status != 0) return status;

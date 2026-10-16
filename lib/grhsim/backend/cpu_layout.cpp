@@ -87,7 +87,10 @@ namespace wolvrix::lib::grhsim
         class StoreNamer
         {
         public:
-            explicit StoreNamer(GrhSimModel &model) : model_(model) {}
+            explicit StoreNamer(GrhSimModel &model) : model_(model)
+            {
+                used_.insert("enabledWords");
+            }
 
             StringId claim(std::string base, uint32_t id)
             {
@@ -154,12 +157,8 @@ namespace wolvrix::lib::grhsim
         // single UInt(width) (emitted as a C23 unsigned _BitInt object —
         // unsigned storage, signedness re-derived at op points); four-state
         // values keep the UInt64 word array and double into a two-element
-        // array. Stage-06: a shaped logic type stores as ONE flat array of
-        // product(shape) rows of the element's physical type (row-major
-        // linearization — byte-identical to the legacy 1-D array layout;
-        // multi-dimensional indexing is linearized at the emit side, the
-        // layout does not nest). A four-state shaped type therefore lays out
-        // as array(elementPhysical4S, rows).
+        // array. A shaped logic type nests one physical Array per dimension,
+        // preserving its row-major geometry in the generated declaration.
         CpuTypeId namedStorePhysicalTypeImpl(TypeMapper &mapper, const Type &type)
         {
             switch (type.kind)
@@ -169,13 +168,15 @@ namespace wolvrix::lib::grhsim
                 if (!type.shape.empty())
                 {
                     const std::optional<uint32_t> elementWidth = typeElementWidth(type);
-                    const std::optional<uint64_t> rows = shapeElementCount(type.shape);
-                    if (!elementWidth || !rows)
+                    if (!elementWidth || !shapeElementCount(type.shape))
                         throw std::runtime_error("CPU layout requires a valid logic type shape");
                     Type element = type;
                     element.width = *elementWidth;
                     element.shape.clear();
-                    return mapper.array(namedStorePhysicalTypeImpl(mapper, element), *rows);
+                    CpuTypeId physical = namedStorePhysicalTypeImpl(mapper, element);
+                    for (std::size_t dimension = type.shape.size(); dimension-- > 0;)
+                        physical = mapper.array(physical, static_cast<uint64_t>(type.shape[dimension]));
+                    return physical;
                 }
                 CpuTypeId base;
                 if (type.width == 1 && !type.isSigned) base = mapper.scalar(CpuTypeKind::Bool);
@@ -256,21 +257,21 @@ namespace wolvrix::lib::grhsim
             TypeMapper mapper(layout);
             StoreNamer namer(model);
             const auto supernodeOf = generalSupernodeOf(model, tree);
-            const auto boundary = sixPhaseBoundaryValues(model, tree, supernodeOf);
+            const auto boundaryUses = sixPhaseBoundaryUses(model, tree, supernodeOf);
             const auto supernodeCount = static_cast<uint32_t>(generalSupernodeOrder(tree).size());
             std::vector<OpId> producer(model.values().size() + 1);
             for (const auto &op : model.operations())
                 for (const auto value : model.results(op)) producer[value.index] = op.id;
 
-            std::vector<CpuNamedStore> stores(7);
+            std::vector<CpuNamedStore> stores(12);
 
             // regLatch / mem: one named field per state, placed by the A7
             // semantic store classification (M5d-4/M5d-6: layout is a pure
             // consumer — no implicit type/shape split here anymore).
             auto &regLatch = stores[0];
-            regLatch.kind = CpuNamedStoreKind::RegLatch;
+            regLatch.kind = CpuNamedStoreKind::SmallSink;
             auto &mem = stores[1];
-            mem.kind = CpuNamedStoreKind::Mem;
+            mem.kind = CpuNamedStoreKind::LargeSink;
             NamedStoreBuilder regBuilder{layout, regLatch}, memBuilder{layout, mem};
             for (const auto &state : model.states())
             {
@@ -281,7 +282,7 @@ namespace wolvrix::lib::grhsim
                 if (state.storeClass == StateStoreClass::None)
                     throw std::runtime_error("cpu.st.layout-named-stores requires the state store "
                                              "classification (run grhsim.select-state-stores first)");
-                (state.storeClass == StateStoreClass::Mem ? memBuilder : regBuilder)
+                (state.storeClass == StateStoreClass::LargeSink ? memBuilder : regBuilder)
                     .add(name, physical, state.id, {}, 0);
             }
             regBuilder.finish();
@@ -289,20 +290,24 @@ namespace wolvrix::lib::grhsim
             stats.regLatchFields = regLatch.fields.size();
             stats.memFields = mem.fields.size();
 
-            // boundary: input ports, then the cross-supernode / General->Mem
-            // value set. Mem-phase (mem-class) write operand slots carry the
-            // dedicated <mem>__w<idx>__<role> names (first writer wins for a
-            // shared operand value); everything else uses the source signal
-            // name.
-            auto &boundaryStore = stores[2];
-            boundaryStore.kind = CpuNamedStoreKind::Boundary;
+            // Inputs and each cross-stage use own independent stores. A value
+            // used by several consumer classes gets one field in each store.
+            constexpr std::array<CpuNamedStoreKind, 5> boundaryKinds{
+                CpuNamedStoreKind::NonSinkBoundary,
+                CpuNamedStoreKind::SmallSinkEnableBoundary,
+                CpuNamedStoreKind::SmallSinkPayloadBoundary,
+                CpuNamedStoreKind::LargeSinkEnableBoundary,
+                CpuNamedStoreKind::LargeSinkPayloadBoundary};
+            auto &inputStore = stores[2];
+            inputStore.kind = CpuNamedStoreKind::Input;
+            NamedStoreBuilder inputBuilder{layout, inputStore};
             struct SlotName { StateId state; uint32_t write; std::string role; };
             std::vector<std::optional<SlotName>> slotNames(model.values().size() + 1);
             {
                 std::vector<uint32_t> perMem(model.states().size() + 1, 0);
                 for (const auto &op : model.operations())
                 {
-                    if (op.phase != SimPhase::Mem) continue;
+                    if (op.phase != SimPhase::LargeSink) continue;
                     const auto type = model.text(op.opType);
                     if (!isCpuPhaseMemWriteOp(type)) continue;
                     const auto refs = model.objectRefs(op);
@@ -317,21 +322,32 @@ namespace wolvrix::lib::grhsim
                             slotNames[value.index] = SlotName{state, writeIndex, std::move(role)};
                     };
                     // Post-lowering operand layouts (no trailing events):
-                    // write [en, data, mask]; writeArray [en, i0..ik-1, data,
-                    // mask]; fill [en, data].
-                    if (type == "core.state.write")
+                    // write [en, data], writeMask/latchWrite [en, data, mask],
+                    // writeArray [en, i0..ik-1, data], writeArrayMask [en,
+                    // i0..ik-1, data, mask], and fill [en, data]. Legacy
+                    // masked write/writeArray forms are recognized by arity.
+                    const bool maskedWhole =
+                        type == "core.state.writeMask" || type == "core.state.latchWrite" ||
+                        (type == "core.state.write" && operands.size() >= 3);
+                    if (type == "core.state.write" || type == "core.state.writeMask" ||
+                        type == "core.state.latchWrite")
                     {
-                        slot(0, "enable"); slot(1, "data"); slot(2, "mask");
+                        slot(0, "enable"); slot(1, "data");
+                        if (maskedWhole) slot(2, "mask");
                     }
-                    else if (type == "core.state.writeArray")
+                    else if (type == "core.state.writeArray" || type == "core.state.writeArrayMask")
                     {
                         slot(0, "enable");
-                        const auto indexCount = operands.size() >= 3 ?
-                                                    static_cast<uint32_t>(operands.size()) - 3 : 0;
+                        const auto &stateType = model.types()[model.states()[state.index - 1].type.index - 1];
+                        const auto layout = cpuIndexedWriteLayout(model, op, stateType);
+                        if (!layout.valid)
+                            throw std::runtime_error("invalid indexed state write layout");
+                        const bool masked = layout.masked;
+                        const uint32_t indexCount = layout.indexCount;
                         for (uint32_t j = 0; j < indexCount; ++j)
                             slot(1 + j, indexCount == 1 ? "addr" : "idx" + std::to_string(j));
                         slot(1 + indexCount, "data");
-                        slot(2 + indexCount, "mask");
+                        if (masked) slot(2 + indexCount, "mask");
                     }
                     else if (type == "core.state.fill")
                     {
@@ -341,32 +357,39 @@ namespace wolvrix::lib::grhsim
                         throw std::runtime_error("unexpected Mem-phase write op: " + std::string(type));
                 }
             }
-            NamedStoreBuilder boundaryBuilder{layout, boundaryStore};
             for (const auto &input : model.inputs())
             {
                 const auto physical = namedStorePhysicalType(mapper, model, input.type);
                 const auto name = namer.claim(model.text(input.name).empty() ?
                                               "input_" + std::to_string(input.id.index) :
                                               std::string(model.text(input.name)), input.id.index);
-                boundaryBuilder.add(name, physical, {}, {}, input.id.index - 1);
+                inputBuilder.add(name, physical, {}, {}, input.id.index - 1);
             }
-            for (const auto &value : model.values())
+            inputBuilder.finish();
+            stats.boundaryFields = inputStore.fields.size();
+            for (std::size_t use = 0; use < boundaryKinds.size(); ++use)
             {
-                if (!boundary[value.id.index]) continue;
-                std::string base;
-                uint32_t claimId = value.id.index;
-                if (slotNames[value.id.index])
+                auto &store = stores[3 + use];
+                store.kind = boundaryKinds[use];
+                NamedStoreBuilder builder{layout, store};
+                for (const auto &value : model.values())
                 {
-                    const auto &slot = *slotNames[value.id.index];
-                    base = StoreNamer::sanitize(model.text(model.states()[slot.state.index - 1].name)) +
-                           "__w" + std::to_string(slot.write) + "__" + slot.role;
+                    if (!(boundaryUses[value.id.index] & cpuBoundaryUseBit(static_cast<CpuBoundaryUse>(use))))
+                        continue;
+                    std::string base;
+                    if (use >= 3 && slotNames[value.id.index])
+                    {
+                        const auto &slot = *slotNames[value.id.index];
+                        base = StoreNamer::sanitize(model.text(model.states()[slot.state.index - 1].name)) +
+                               "__w" + std::to_string(slot.write) + "__" + slot.role;
+                    }
+                    else base = signalNameOf(model, value.id, producer);
+                    const auto physical = namedStorePhysicalType(mapper, model, value.type);
+                    builder.add(namer.claim(std::move(base), value.id.index), physical, {}, value.id, 0);
                 }
-                else base = signalNameOf(model, value.id, producer);
-                const auto physical = namedStorePhysicalType(mapper, model, value.type);
-                boundaryBuilder.add(namer.claim(std::move(base), claimId), physical, {}, value.id, 0);
+                builder.finish();
+                stats.boundaryFields += store.fields.size();
             }
-            boundaryBuilder.finish();
-            stats.boundaryFields = boundaryStore.fields.size();
 
             // prevEvent: one slot per (event,edge) cluster, named
             // <signal>__<edge>, typed after the event value, aux = cluster.
@@ -382,9 +405,9 @@ namespace wolvrix::lib::grhsim
                 const auto index = std::get_if<int64_t>(&act->value);
                 if (!detOfAct.count(*index)) detOfAct[*index] = op.id;
             }
-            auto &prevEvent = stores[3];
+            auto &prevEvent = stores[8];
             prevEvent.kind = CpuNamedStoreKind::PrevEvent;
-            auto &eventAct = stores[4];
+            auto &eventAct = stores[9];
             eventAct.kind = CpuNamedStoreKind::EventAct;
             NamedStoreBuilder prevBuilder{layout, prevEvent};
             const auto boolType = mapper.scalar(CpuTypeKind::Bool);
@@ -414,7 +437,7 @@ namespace wolvrix::lib::grhsim
 
             // timeslotTrigger: one byte per event-carrying timeslot task,
             // named after the task, aux = timeslotFlag index.
-            auto &timeslot = stores[5];
+            auto &timeslot = stores[10];
             timeslot.kind = CpuNamedStoreKind::TimeslotTrigger;
             uint32_t maxFlag = 0;
             for (const auto &op : model.operations())
@@ -436,24 +459,27 @@ namespace wolvrix::lib::grhsim
             timeslot.sizeBytes = timeslot.fields.empty() ? 0 : maxFlag + 1;
             stats.timeslotFlags = timeslot.fields.size();
 
-            // activeFlags: dataActiveFlag/dataActiveFlagNext u64 word arrays
+            // activeFlags: nonSinkActiveFlag/nonSinkActiveFlagNext u64 word arrays
             // with one BIT per General supernode (V3-M1: bit-packing replaces
             // the byte-per-supernode arrays; the P_general scan skips silent
             // words whole instead of testing every supernode byte. V2-M2
             // removed eventActiveFlag: non-sink supernodes fire on
-            // dataActiveFlag alone, sink supernodes gate on their
+            // nonSinkActiveFlag alone, sink supernodes gate on their
             // eventActStore signature or fire unconditionally). aux carries
             // the supernode count (the ordinal space of the M4 spec); bit
             // index == supernode ordinal by definition.
-            auto &active = stores[6];
+            auto &active = stores[11];
             active.kind = CpuNamedStoreKind::ActiveFlags;
             NamedStoreBuilder activeBuilder{layout, active};
             const auto wordCount = std::max<uint32_t>((supernodeCount + 63) / 64, 1);
             const auto wordArray = mapper.array(mapper.scalar(CpuTypeKind::UInt, 64), wordCount);
-            activeBuilder.add(namer.claim("dataActiveFlag", 0), wordArray, {}, {}, supernodeCount);
-            activeBuilder.add(namer.claim("dataActiveFlagNext", 1), wordArray, {}, {}, supernodeCount);
+            activeBuilder.add(namer.claim("nonSinkActiveFlag", 0), wordArray, {}, {}, supernodeCount);
+            activeBuilder.add(namer.claim("nonSinkActiveFlagNext", 1), wordArray, {}, {}, supernodeCount);
             activeBuilder.finish();
             stats.activeBytes = active.sizeBytes;
+
+            stores[4].enableBitValues = cpuEnableBitmapValues(model, stores[4], SimPhase::General);
+            stores[6].enableBitValues = cpuEnableBitmapValues(model, stores[6], SimPhase::LargeSink);
 
             stats.renamed = namer.renamed();
             return stores;
@@ -499,14 +525,15 @@ namespace wolvrix::lib::grhsim
                     if (!type.shape.empty())
                     {
                         const std::optional<uint32_t> elementWidth = typeElementWidth(type);
-                        const std::optional<uint64_t> rows = shapeElementCount(type.shape);
-                        if (!elementWidth || !rows) return {};
+                        if (!elementWidth || !shapeElementCount(type.shape)) return {};
                         Type element = type;
                         element.width = *elementWidth;
                         element.shape.clear();
-                        const CpuTypeId elementPhysical = physicalTypeOf(element);
-                        return elementPhysical ? findType(CpuTypeKind::Array, 0, elementPhysical, *rows)
-                                               : CpuTypeId{};
+                        CpuTypeId physical = physicalTypeOf(element);
+                        for (std::size_t dimension = type.shape.size(); dimension-- > 0 && physical;)
+                            physical = findType(CpuTypeKind::Array, 0, physical,
+                                                static_cast<uint64_t>(type.shape[dimension]));
+                        return physical;
                     }
                     CpuTypeId base;
                     if (type.width == 1 && !type.isSigned) base = findType(CpuTypeKind::Bool, 0, {}, 0);
@@ -538,15 +565,18 @@ namespace wolvrix::lib::grhsim
                 return physicalTypeOf(model.types()[semantic.index - 1]);
             };
             const auto &stores = *layout.namedStores;
-            constexpr std::array<CpuNamedStoreKind, 7> kinds{
-                CpuNamedStoreKind::RegLatch, CpuNamedStoreKind::Mem, CpuNamedStoreKind::Boundary,
-                CpuNamedStoreKind::PrevEvent, CpuNamedStoreKind::EventAct,
-                CpuNamedStoreKind::TimeslotTrigger, CpuNamedStoreKind::ActiveFlags};
+            constexpr std::array<CpuNamedStoreKind, 12> kinds{
+                CpuNamedStoreKind::SmallSink, CpuNamedStoreKind::LargeSink, CpuNamedStoreKind::Input,
+                CpuNamedStoreKind::NonSinkBoundary, CpuNamedStoreKind::SmallSinkEnableBoundary,
+                CpuNamedStoreKind::SmallSinkPayloadBoundary, CpuNamedStoreKind::LargeSinkEnableBoundary,
+                CpuNamedStoreKind::LargeSinkPayloadBoundary, CpuNamedStoreKind::PrevEvent,
+                CpuNamedStoreKind::EventAct, CpuNamedStoreKind::TimeslotTrigger,
+                CpuNamedStoreKind::ActiveFlags};
             if (stores.size() != kinds.size())
-                return error("named-store layout must hold all seven stores");
+                return error("named-store layout must hold all twelve stores");
             for (std::size_t i = 0; i < kinds.size(); ++i)
                 if (stores[i].kind != kinds[i])
-                    return error("named stores must be ordered regLatch, mem, boundary, prevEvent, eventAct, timeslotTrigger, activeFlags");
+                    return error("named stores have the wrong kind or order");
             {
                 std::unordered_set<std::string_view> names;
                 for (const auto &store : stores)
@@ -599,41 +629,54 @@ namespace wolvrix::lib::grhsim
                         return error("state store misses a state");
                 return true;
             };
-            if (!checkStateStore(stores[0], StateStoreClass::RegLatch) ||
-                !checkStateStore(stores[1], StateStoreClass::Mem)) return false;
-            // boundary: every input port (aux = port index) plus exactly the
-            // recomputed cross-supernode / General->Mem value set.
+            if (!checkStateStore(stores[0], StateStoreClass::SmallSink) ||
+                !checkStateStore(stores[1], StateStoreClass::LargeSink)) return false;
+            // Input ports and the five value-use boundary stores have disjoint
+            // ownership by store kind. A value may appear in several stores.
             {
                 const auto &store = stores[2];
                 if (!checkStructStore(store)) return false;
-                std::vector<bool> seenPorts(model.inputs().size(), false), seenValues(model.values().size() + 1, false);
+                std::vector<bool> seenPorts(model.inputs().size(), false);
                 for (const auto &field : store.fields)
                 {
-                    if (field.state) return error("boundary field must not reference a state");
-                    if (field.value)
-                    {
-                        if (field.value.index > model.values().size() || seenValues[field.value.index])
-                            return error("boundary value field is invalid or duplicated");
-                        seenValues[field.value.index] = true;
-                        if (field.type != physicalType(model.values()[field.value.index - 1].type))
-                            return error("boundary value field type disagrees with its value");
-                    }
-                    else
-                    {
-                        if (field.aux >= model.inputs().size() || seenPorts[field.aux])
-                            return error("boundary port field is invalid or duplicated");
-                        seenPorts[field.aux] = true;
-                        if (field.type != physicalType(model.inputs()[field.aux].type))
-                            return error("boundary port field type disagrees with its input");
-                    }
+                    if (field.state || field.value || field.aux >= model.inputs().size() ||
+                        seenPorts[field.aux])
+                        return error("input store port field is invalid or duplicated");
+                    seenPorts[field.aux] = true;
+                    if (field.type != physicalType(model.inputs()[field.aux].type))
+                        return error("input store port field type disagrees with its input");
                 }
                 for (std::size_t i = 0; i < seenPorts.size(); ++i)
-                    if (!seenPorts[i]) return error("boundary store misses an input port");
-                const auto expected = sixPhaseBoundaryValues(model, mapping.partitionTree,
-                                                             generalSupernodeOf(model, mapping.partitionTree));
-                for (std::size_t i = 1; i < expected.size(); ++i)
-                    if (expected[i] != seenValues[i])
-                        return error("boundary store coverage disagrees with the cross-supernode value set");
+                    if (!seenPorts[i]) return error("input store misses an input port");
+            }
+            const auto expectedUses = sixPhaseBoundaryUses(model, mapping.partitionTree,
+                                                           generalSupernodeOf(model, mapping.partitionTree));
+            for (std::size_t use = 0; use < 5; ++use)
+            {
+                const auto &store = stores[3 + use];
+                if (!checkStructStore(store)) return false;
+                std::vector<bool> seenValues(model.values().size() + 1, false);
+                for (const auto &field : store.fields)
+                {
+                    if (field.state || !field.value || field.value.index > model.values().size() ||
+                        seenValues[field.value.index])
+                        return error("boundary value field is invalid or duplicated");
+                    seenValues[field.value.index] = true;
+                    if (field.type != physicalType(model.values()[field.value.index - 1].type))
+                        return error("boundary value field type disagrees with its value");
+                }
+                for (std::size_t i = 1; i < expectedUses.size(); ++i)
+                    if (bool(expectedUses[i] & cpuBoundaryUseBit(static_cast<CpuBoundaryUse>(use))) !=
+                        seenValues[i])
+                        return error("boundary store coverage disagrees with the value-use classification");
+            }
+            for (std::size_t i = 0; i < stores.size(); ++i)
+            {
+                const auto phase = i == 4 ? SimPhase::General : SimPhase::LargeSink;
+                const auto expected = (i == 4 || i == 6)
+                    ? cpuEnableBitmapValues(model, stores[i], phase) : std::vector<ValueId>{};
+                if (stores[i].enableBitValues != expected)
+                    return error("enable bitmap values disagree with the boundary store layout");
             }
             // prevEvent / eventAct: one entry per (event,edge) cluster.
             uint32_t edgeDetCount = 0;
@@ -649,7 +692,7 @@ namespace wolvrix::lib::grhsim
             const auto boolType = findType(CpuTypeKind::Bool, 0, {}, 0);
             if (!boolType) return error("named-store layout lacks the Bool type");
             {
-                const auto &store = stores[3];
+                const auto &store = stores[8];
                 if (!checkStructStore(store)) return false;
                 if (store.fields.size() != acts.size())
                     return error("prev event store must hold one slot per event cluster");
@@ -667,7 +710,7 @@ namespace wolvrix::lib::grhsim
                 }
             }
             {
-                const auto &store = stores[4];
+                const auto &store = stores[9];
                 if (store.fields.size() != acts.size())
                     return error("event act store must hold one bit per event cluster");
                 std::set<uint32_t> seen;
@@ -686,7 +729,7 @@ namespace wolvrix::lib::grhsim
             }
             // timeslotTrigger: one byte per event-carrying timeslot task.
             {
-                const auto &store = stores[5];
+                const auto &store = stores[10];
                 std::set<uint32_t> expected;
                 for (const auto &op : model.operations())
                 {
@@ -719,10 +762,10 @@ namespace wolvrix::lib::grhsim
             // count (V3-M1: ceil(N/64) words each, aux keeps the supernode
             // count).
             {
-                const auto &store = stores[6];
+                const auto &store = stores[11];
                 const auto supernodeCount = static_cast<uint32_t>(
                     generalSupernodeOrder(mapping.partitionTree).size());
-                const std::array<std::string_view, 2> names{"dataActiveFlag", "dataActiveFlagNext"};
+                const std::array<std::string_view, 2> names{"nonSinkActiveFlag", "nonSinkActiveFlagNext"};
                 if (store.fields.size() != names.size())
                     return error("active flags store must hold exactly two fields");
                 const auto wordCount = std::max<uint32_t>((supernodeCount + 63) / 64, 1);
@@ -733,7 +776,7 @@ namespace wolvrix::lib::grhsim
                 {
                     const auto &field = store.fields[i];
                     if (model.text(field.name) != names[i])
-                        return error("active flags fields must be dataActiveFlag, dataActiveFlagNext");
+                        return error("active flags fields must be nonSinkActiveFlag, nonSinkActiveFlagNext");
                     if (field.aux != supernodeCount)
                         return error("active flags field aux must be the supernode count");
                     if (field.type != wordArray || field.offset != i * uint64_t(wordCount) * 8)

@@ -222,15 +222,12 @@ namespace wolvrix::lib::grhsim
 
         // M5d-4 state store classification contract (pass
         // grhsim.select-state-stores): the classification is the single
-        // decision point for regLatchStore/memStore attribution; consumers
+        // decision point for smallSinkStore/largeSinkStore attribution; consumers
         // (split-phases, layout, emit) must read the annotation instead of
         // re-deriving it from the state's type. Structural rules only:
-        // classification is total once present, the mem class requires a
-        // contiguous shaped (array) state, and a mem-class state's writes go
-        // through the class-aware phase rule so P_mem owns the in-place
-        // commit (stage-06: write absorbs the old whole-array memAssign, so
-        // the write family is class-neutral; latchWrite stays scalar-only and
-        // may never target a mem-class state). The per-class NBA contract
+        // classification is total once present, and a large-sink state's
+        // writes go through the class-aware phase rule so P_large_sink owns
+        // the in-place commit. The per-class NBA contract
         // itself (commit timing, old-value reads, partial writes,
         // declaration-order multi-write priority, multi-round accumulation)
         // is defined by the select-state-stores pass doc.
@@ -256,37 +253,13 @@ namespace wolvrix::lib::grhsim
                           context);
                     continue;
                 }
-                if (state.storeClass == StateStoreClass::Mem)
+                if (state.storeClass == StateStoreClass::LargeSink)
                 {
                     if (!validId(state.type, model.types().size())) continue;
                     const Type &type = model.types()[state.type.index - 1];
-                    if (type.kind != TypeKind::Logic || type.shape.empty())
-                        error("mem store class requires a shaped (array) state", context);
+                    if (type.kind != TypeKind::Logic)
+                        error("large-sink store class requires a logic state", context);
                 }
-            }
-            for (std::size_t i = 0; i < model.operations().size(); ++i)
-            {
-                const SimOp &op = model.operations()[i];
-                if (!model.strings().valid(op.opType)) continue;
-                const std::string_view name = model.text(op.opType);
-                if (name != "core.state.latchWrite") continue;
-                std::span<const ObjectRef> refs;
-                try
-                {
-                    refs = model.objectRefs(op);
-                }
-                catch (const std::exception &)
-                {
-                    continue; // malformed ranges are reported by the per-op check
-                }
-                if (refs.empty() || refs[0].kind != ObjectKind::State ||
-                    !validId(StateId{refs[0].index, 0}, model.states().size()))
-                    continue;
-                if (model.states()[refs[0].index - 1].storeClass == StateStoreClass::Mem)
-                    error("core.state.latchWrite targets a mem-class state; mem states may only "
-                          "be written by core.state.write/writeArray/fill ops so P_mem owns "
-                          "the commit",
-                          "operations[" + std::to_string(i) + "]");
             }
             return ok;
         }
@@ -318,8 +291,9 @@ namespace wolvrix::lib::grhsim
         {
             return type && type->kind == TypeKind::Logic && type->shape.empty();
         }
-        // stage-07: a condition/mask/index operand is read as flat logic bits;
-        // a shape view on it is benign (packed-first doctrine).
+        // Packed-first contract: shape is a structural view over a logic
+        // value.  State conditions, masks, and array indices consume the
+        // flattened bits, so a shaped logic value is valid here as well.
         bool logicAnyShape(const Type *type) noexcept
         {
             return type && type->kind == TypeKind::Logic;
@@ -354,9 +328,9 @@ namespace wolvrix::lib::grhsim
             shape = std::span<const int64_t>(arrayType.shape).subspan(indexCount);
             return true;
         }
-        // Indexed-access result/data contract: the type must be the addressed
-        // element's / remaining-dims sub-array's TOTAL width (shape of the
-        // value itself is a view and may differ; see stateValueGeometryOk).
+        // Indexed access consumes/produces packed bits.  The shape on the
+        // value is only a view and need not match the state's remaining
+        // dimensions (the GRH contract checks the addressed total width).
         bool indexedAccessTypeMatches(const Type *actual, uint32_t width) noexcept
         {
             return actual && actual->kind == TypeKind::Logic && actual->width == width;
@@ -401,16 +375,18 @@ namespace wolvrix::lib::grhsim
                     unconditional = true;
                 }
                 else if (name == "core.output.write") required = SimPhase::Output;
-                else if (name == "core.state.write" || name == "core.state.writeArray" ||
-                         name == "core.state.fill")
+                else if (name == "core.state.write" || name == "core.state.writeMask" ||
+                         name == "core.state.writeArray" || name == "core.state.writeArrayMask" ||
+                         name == "core.state.fill" || name == "core.state.latchWrite")
                 {
+                    latchWrite = name == "core.state.latchWrite";
                     // Stage-06 class-aware routing: writes to mem-class states
                     // commit in P_mem; writes to regLatch-class states take
                     // the General NBA path. On an unclassified model the
                     // target's shape decides (shaped = array = legacy Mem
                     // default); an unresolvable ref falls back the same way
                     // (the structural checks report it separately).
-                    required = SimPhase::Mem;
+                    required = SimPhase::LargeSink;
                     std::span<const ObjectRef> refs;
                     try
                     {
@@ -426,20 +402,15 @@ namespace wolvrix::lib::grhsim
                         const auto &state = model.states()[refs[0].index - 1];
                         if (classified)
                         {
-                            if (state.storeClass == StateStoreClass::RegLatch)
+                            if (state.storeClass == StateStoreClass::SmallSink)
                                 required = SimPhase::General;
                         }
                         else if (validId(state.type, model.types().size()) &&
                                  model.types()[state.type.index - 1].shape.empty())
                             required = SimPhase::General;
                     }
-                    else if (name == "core.state.write")
+                    else if (name == "core.state.write" || name == "core.state.writeMask")
                         required = SimPhase::General;
-                }
-                else if (name == "core.state.latchWrite")
-                {
-                    required = SimPhase::General;
-                    latchWrite = true;
                 }
                 if (!required || (op.phase == SimPhase::None && !unconditional)) continue;
                 if (latchWrite && op.phase == SimPhase::Output) continue;
@@ -501,7 +472,7 @@ namespace wolvrix::lib::grhsim
                         model.text(param.name) == "event_edges")
                         error("semantic seal requires the lowered event_acts form; "
                               "event_edges survived (grhsim.lower-edge-detect)", context);
-                if (op.phase != SimPhase::Mem) continue;
+                if (op.phase != SimPhase::LargeSink) continue;
                 for (const auto operand : operands)
                 {
                     if (operand.generation != 0 || !operand.valid() ||
@@ -656,8 +627,11 @@ namespace wolvrix::lib::grhsim
                                                       ? model.text(op.opType)
                                                       : std::string_view{};
                     bool shapeOk = true;
-                    if (name == "core.state.write") shapeOk = operands.size() == 3;
-                    else if (name == "core.state.writeArray") shapeOk = operands.size() >= 4;
+                    if (name == "core.state.write" || name == "core.state.writeMask")
+                        shapeOk = operands.size() >= 2;
+                    else if (name == "core.state.writeArray" ||
+                             name == "core.state.writeArrayMask")
+                        shapeOk = operands.size() >= 3;
                     else if (name == "core.state.fill")
                         shapeOk = operands.size() == 2;
                     else if (name == "core.system.task") shapeOk = refs.empty();
@@ -714,7 +688,8 @@ namespace wolvrix::lib::grhsim
                 if (op.phase == SimPhase::Output) hasOutput = true;
 
             const auto stateWriteType = [](std::string_view name) {
-                return name == "core.state.write" || name == "core.state.writeArray" ||
+                return name == "core.state.write" || name == "core.state.writeMask" ||
+                       name == "core.state.writeArray" || name == "core.state.writeArrayMask" ||
                        name == "core.state.fill" || name == "core.state.latchWrite";
             };
 
@@ -1160,11 +1135,8 @@ namespace wolvrix::lib::grhsim
                     {
                         for (const ValueId index : operands)
                         {
-                            // stage-07: an index is read as a flat integer; a
-                            // shape view on the index value is benign (packed-
-                            // first doctrine, same as the GRH-side contract).
                             const Type *indexType = valueType(model, index);
-                            if (!indexType || indexType->kind != TypeKind::Logic)
+                            if (!logicAnyShape(indexType))
                             {
                                 error("core.state.readArray indices must be logic values",
                                       context());
@@ -1178,12 +1150,18 @@ namespace wolvrix::lib::grhsim
                     }
                 }
                 else if (opName == "core.state.write" ||
+                         opName == "core.state.writeMask" ||
                          opName == "core.state.writeArray" ||
+                         opName == "core.state.writeArrayMask" ||
                          opName == "core.state.fill" ||
                          opName == "core.state.latchWrite")
                 {
-                    // write:      [updateCond, nextValue, mask, events...]
-                    // writeArray: [updateCond, i0..ik-1, data, mask, events...]
+                    // write:      [updateCond, nextValue, events...]
+                    // writeMask: [updateCond, nextValue, mask, events...]
+                    // writeArray: [updateCond, i0..ik-1, data, events...]
+                    // writeArrayMask: [updateCond, i0..ik-1, data, mask, events...]
+                    // A legacy masked write/writeArray form is accepted while
+                    // old v3 checkpoints are being migrated.
                     // fill:       [updateCond, data, events...]
                     // latchWrite: [updateCond, nextValue, mask] (level-sensitive)
                     const std::size_t events =
@@ -1197,21 +1175,29 @@ namespace wolvrix::lib::grhsim
                         error("core.state write op must have 0 results and 1 state ref",
                               context());
                     }
-                    else if (opName == "core.state.write")
+                    else if (opName == "core.state.write" || opName == "core.state.writeMask")
                     {
-                        bool valid = operands.size() == 3 + events &&
+                        const bool masked = opName == "core.state.writeMask" ||
+                                            (opName == "core.state.write" &&
+                                             operands.size() == 3 + events);
+                        const std::size_t expected = 2 + events + (masked ? 1 : 0);
+                        bool valid = operands.size() == expected &&
                                      logicAnyShape(valueType(model, operands[0])) &&
                                      stateValueGeometryOk(valueType(model, operands[1]),
                                                           *target);
-                        const Type *mask = operands.size() >= 3 ? valueType(model, operands[2])
-                                                                : nullptr;
-                        valid = valid && logicAnyShape(mask) && mask->width == target->width;
+                        const Type *mask = masked && operands.size() >= 3 + events
+                                               ? valueType(model, operands[2])
+                                               : nullptr;
+                        valid = valid && (!masked || (logicAnyShape(mask) &&
+                                                       mask->width == target->width));
                         if (!valid)
                         {
                             const Type *data = operands.size() >= 2 ? valueType(model, operands[1])
                                                                     : nullptr;
-                            error("core.state.write must be [updateCond, nextValue(state type), "
-                                  "mask(full-width scalar), events...] (operands=" +
+                            error(std::string(opName) +
+                                      " must be [updateCond, nextValue(state type)" +
+                                      (masked ? ", mask(full-width scalar)" : "") +
+                                      ", events...] (operands=" +
                                       std::to_string(operands.size()) + " events=" +
                                       std::to_string(events) + " data=" +
                                       (data ? std::to_string(data->width) + "b shape=" +
@@ -1224,57 +1210,51 @@ namespace wolvrix::lib::grhsim
                                   context());
                         }
                     }
-                    else if (opName == "core.state.writeArray")
+                    else if (opName == "core.state.writeArray" ||
+                             opName == "core.state.writeArrayMask")
                     {
-                        uint32_t accessWidth = 0;
-                        std::span<const int64_t> accessShape;
-                        if (target->shape.empty() || operands.size() < 4 + events)
-                        {
-                            error("core.state.writeArray must target a shaped state with "
-                                  "[updateCond, i0..ik-1, data, mask, events...]",
-                                  context());
-                        }
-                        else
-                        {
-                            const std::size_t indexCount = operands.size() - 3 - events;
+                        auto validIndexedLayout = [&](bool masked) {
+                            if (target->shape.empty()) return false;
+                            const std::size_t base = 2 + events + (masked ? 1 : 0);
+                            if (operands.size() < base + 1) return false;
+                            const std::size_t indexCount = operands.size() - base;
+                            uint32_t accessWidth = 0;
+                            std::span<const int64_t> accessShape;
                             if (!indexedAccessGeometry(*target, indexCount, accessWidth,
                                                        accessShape))
-                            {
-                                error("core.state.writeArray index count is out of the state "
-                                      "rank range",
-                                      context());
-                            }
-                            else
-                            {
-                                bool valid = logicAnyShape(valueType(model, operands[0]));
-                                for (std::size_t i = 1; i <= indexCount && valid; ++i)
-                                {
-                                    // stage-07: an index is read as a flat
-                                    // integer; a shape view on it is benign
-                                    // (packed-first doctrine).
-                                    const Type *indexType = valueType(model, operands[i]);
-                                    valid = indexType && indexType->kind == TypeKind::Logic;
-                                }
-                                if (valid &&
-                                    !indexedAccessTypeMatches(
-                                        valueType(model, operands[1 + indexCount]),
-                                        accessWidth))
-                                    valid = false;
-                                const Type *mask = valueType(model, operands[2 + indexCount]);
-                                if (valid && (!logicAnyShape(mask) || mask->width != accessWidth))
-                                    valid = false;
-                                if (!valid)
-                                    error("core.state.writeArray indices must be scalar logic, "
-                                          "data must be the addressed element / remaining-dims "
-                                          "sub-array type and mask its full-width scalar",
-                                          context());
-                            }
+                                return false;
+                            if (!logicAnyShape(valueType(model, operands[0]))) return false;
+                            for (std::size_t i = 1; i <= indexCount; ++i)
+                                if (!logicAnyShape(valueType(model, operands[i]))) return false;
+                            if (!indexedAccessTypeMatches(
+                                    valueType(model, operands[1 + indexCount]), accessWidth))
+                                return false;
+                            if (!masked) return true;
+                            const Type *mask = valueType(model, operands[2 + indexCount]);
+                            return logicAnyShape(mask) && mask->width == accessWidth;
+                        };
+                        const bool masked = opName == "core.state.writeArrayMask";
+                        const bool valid = masked ? validIndexedLayout(true)
+                                                  // Compatibility: old writeArray carried a
+                                                  // synthesized/explicit full mask.
+                                                  : (validIndexedLayout(false) ||
+                                                     validIndexedLayout(true));
+                        if (!valid)
+                        {
+                            error(std::string(opName) +
+                                      " must target a shaped state with [updateCond, "
+                                      "i0..ik-1, data" +
+                                      (masked ? ", mask" : ", [mask]") +
+                                      ", events...]; indices must be scalar logic, data "
+                                      "must be the addressed element / remaining-dims "
+                                      "sub-array type and mask its full-width scalar",
+                                  context());
                         }
                     }
                     else if (opName == "core.state.fill")
                     {
                         bool valid = operands.size() == 2 + events && !target->shape.empty() &&
-                                     scalarLogic(valueType(model, operands[0]));
+                                     logicAnyShape(valueType(model, operands[0]));
                         if (valid)
                         {
                             // Broadcast (element-width data) or packed
@@ -1285,8 +1265,6 @@ namespace wolvrix::lib::grhsim
                             valid = data && data->kind == TypeKind::Logic && elementWidth &&
                                     (data->width == *elementWidth ||
                                      data->width == target->width);
-                            if (valid && data->width == *elementWidth)
-                                valid = data->shape.empty();
                         }
                         if (!valid)
                             error("core.state.fill must be [updateCond, data(element-width or "
@@ -1330,10 +1308,8 @@ namespace wolvrix::lib::grhsim
                     {
                         for (std::size_t i = 1; i < operands.size(); ++i)
                         {
-                            // stage-07: an index is read as a flat integer; a
-                            // shape view on it is benign.
                             const Type *indexType = valueType(model, operands[i]);
-                            if (!indexType || indexType->kind != TypeKind::Logic)
+                            if (!logicAnyShape(indexType))
                             {
                                 error("core.compute.sliceArray indices must be logic values",
                                       context());
@@ -1493,8 +1469,12 @@ namespace wolvrix::lib::grhsim
                         if (!validId(event, model.values().size())) valid = false;
                         else {
                             const auto typeId = model.values()[event.index - 1].type;
-                            if (!validId(typeId, model.types().size()) ||
-                                model.types()[typeId.index - 1].kind != TypeKind::Logic) valid = false;
+                            if (!validId(typeId, model.types().size())) valid = false;
+                            else {
+                                const auto &eventType = model.types()[typeId.index - 1];
+                                if (eventType.kind != TypeKind::Logic || eventType.width != 1 ||
+                                    !eventType.shape.empty()) valid = false;
+                            }
                         }
                     }
                     const Parameter *edge = findParameter(model, parameters, "edge");
@@ -1516,7 +1496,7 @@ namespace wolvrix::lib::grhsim
                         if (!std::holds_alternative<std::string>(prevInit->value) ||
                             std::get<std::string>(prevInit->value).empty()) valid = false;
                     }
-                    if (!valid) error("core.event.edgeDet requires exactly one logic event operand, no results/object refs and four parameters: edge (posedge|negedge|both string), act/prev (non-negative int64 store indices) and prevInit (non-empty constant literal string)", context());
+                    if (!valid) error("core.event.edgeDet requires exactly one unshaped 1-bit logic event operand, no results/object refs and four parameters: edge (posedge|negedge|both string), act/prev (non-negative int64 store indices) and prevInit (non-empty constant literal string)", context());
                 }
 
                 const Parameter *edges = findParameter(model, parameters, "event_edges");
@@ -1560,7 +1540,17 @@ namespace wolvrix::lib::grhsim
                     if (!model.strings().valid(step.kind) ||
                         !registry.hasInitStep(model.text(step.kind)))
                         error("init step has an unknown dialect reference", context());
-                    validParameters(model, model.parameters(step), diagnostics, context);
+                    const auto parameters = model.parameters(step);
+                    validParameters(model, parameters, diagnostics, context);
+                    if (model.text(step.kind) == "core.init.const" &&
+                        validId(model.states()[record.state.index - 1].type, model.types().size()) &&
+                        model.types()[model.states()[record.state.index - 1].type.index - 1].kind == TypeKind::Logic)
+                    {
+                        const Parameter *value = findParameter(model, parameters, "value");
+                        if (parameters.size() != 1 || !value ||
+                            !std::holds_alternative<std::string>(value->value))
+                            error("logic core.init.const requires one total-width value literal string", context());
+                    }
                 }
             }
             catch (const std::exception &ex)

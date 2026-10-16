@@ -33,7 +33,6 @@ namespace wolvrix::lib::grhsim
             const CpuPartitionTree &tree;
             const CpuDataLayout &layout;
             const CpuSchedulePlan &schedule;
-            const CpuNamedStore *boundary = nullptr;
             const CpuNamedStore *prevEvent = nullptr;
             std::vector<PartitionId> supernodeOrder; // ordinal -> partition
             std::vector<Range> scanIntervals;        // C6 EmitFunction intervals tiling [0, N)
@@ -126,14 +125,14 @@ namespace wolvrix::lib::grhsim
             chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::Core, 0, 0, coreLines});
 
             // Init stream: steps, then the constant-boundary preloads and
-            // prevEvent inits (1 line each), then the regLatchStoreNext sync.
-            if (ctx.boundary)
+            // prevEvent inits (1 line each), then the smallSinkStoreNext sync.
+            if (ctx.layout.namedStores)
             {
                 std::vector<uint64_t> items;
                 for (const auto &record : model.initRecords())
                     for (const auto &step : model.steps(record))
                         items.push_back(estimateInitStepLines(model, record.state, step));
-                const auto totals = cpuInitStreamTotals(model, *ctx.boundary);
+                const auto totals = cpuInitStreamTotals(model, *ctx.layout.namedStores);
                 items.insert(items.end(), totals.boundaryPreloads + totals.prevEvents + 1, 1);
                 packStream(chunks, CpuEmitChunkKind::Init, items, chunkCap);
             }
@@ -240,7 +239,7 @@ namespace wolvrix::lib::grhsim
                     // on XiangShan aggregate vs ~2950 estimated: 81% of the
                     // whole TU plan was phantom mem lines).
                     items.push_back(estimatedCpuOpLines(model, entry.writeOp) + 8);
-                packStream(chunks, CpuEmitChunkKind::Mem, items, chunkCap);
+                packStream(chunks, CpuEmitChunkKind::LargeSink, items, chunkCap);
             }
 
             // Output cone.
@@ -267,10 +266,9 @@ namespace wolvrix::lib::grhsim
             PlanContext ctx{model, mapping.partitionTree, *mapping.dataLayout, *mapping.schedule};
             for (const auto &store : *ctx.layout.namedStores)
             {
-                if (store.kind == CpuNamedStoreKind::Boundary) ctx.boundary = &store;
                 if (store.kind == CpuNamedStoreKind::PrevEvent) ctx.prevEvent = &store;
             }
-            if (!ctx.boundary || !ctx.prevEvent)
+            if (!ctx.prevEvent)
                 throw std::runtime_error("CPU TU planning requires the named-store layout");
             ctx.supernodeOrder = generalSupernodeOrder(ctx.tree);
             const auto &root = ctx.tree.partitions[ctx.tree.root.index - 1];

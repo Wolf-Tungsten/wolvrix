@@ -21,15 +21,23 @@ namespace wolvrix::lib::transform
     //   padded read:     kSliceArray(concat(replicate(arr[p]), arr...), idx)
     //                    -> kRegisterReadArrayPort(arr, idx < N ? idx : p)
     //
+    // With guardedWrites enabled (two-state only), also merge multi-write
+    // guarded decoders after register-write-normalize. Whole/dynamic writes
+    // remain ordered barriers; each recovered source must cover its complete
+    // in-bounds address domain and admit a common priority order across rows.
+    //
     // Rewritten cones are swept locally (dead ops removed even when their wire
     // values carry declared symbols — the fold retires those wires; runs after
     // xmr-resolve so no cross-module reference can point into them).
     class MuxTreeFoldPass : public Pass
     {
     public:
-        MuxTreeFoldPass();
+        explicit MuxTreeFoldPass(bool guardedWrites = false);
 
         PassResult run() override;
+
+    private:
+        bool guardedWrites_;
     };
 
 } // namespace wolvrix::lib::transform

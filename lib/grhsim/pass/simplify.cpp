@@ -38,7 +38,7 @@ namespace wolvrix::lib::grhsim
         }};
 
         constexpr std::array<SimPhase, 4> kPhaseOrder{
-            SimPhase::Event, SimPhase::General, SimPhase::Mem, SimPhase::Output};
+            SimPhase::Event, SimPhase::General, SimPhase::LargeSink, SimPhase::Output};
 
         bool parsePositive(std::string_view text, uint32_t &value)
         {

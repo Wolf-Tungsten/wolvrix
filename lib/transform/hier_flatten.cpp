@@ -2,6 +2,7 @@
 
 #include "core/grh.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <string>
@@ -43,6 +44,9 @@ namespace wolvrix::lib::transform
             std::unordered_map<std::string, int> instanceCounts;
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string,
                                wolvrix::lib::grh::ValueIdHash> renamedValues;
+            std::unordered_map<wolvrix::lib::grh::ValueId,
+                               std::vector<std::pair<std::vector<int64_t>, wolvrix::lib::grh::ValueId>>,
+                               wolvrix::lib::grh::ValueIdHash> inputShapeViews;
             std::function<void(const wolvrix::lib::grh::Graph &, std::string)> graphError;
             std::function<void(const wolvrix::lib::grh::Graph &, const wolvrix::lib::grh::Operation &,
                                std::string)> opError;
@@ -274,6 +278,39 @@ namespace wolvrix::lib::transform
             target.setValueShape(targetValue, childShape);
         }
 
+        wolvrix::lib::grh::ValueId mapInputPortShape(wolvrix::lib::grh::Graph &target,
+                                                     wolvrix::lib::grh::ValueId childValue,
+                                                     wolvrix::lib::grh::ValueId targetValue,
+                                                     const wolvrix::lib::grh::Graph &childGraph,
+                                                     InlineState &state)
+        {
+            const std::span<const int64_t> shape = childGraph.valueShape(childValue);
+            if (shape.empty() || !target.valueShape(targetValue).empty() ||
+                target.valueWidth(targetValue) != childGraph.valueWidth(childValue))
+            {
+                return targetValue;
+            }
+            auto &views = state.inputShapeViews[targetValue];
+            for (const auto &[viewShape, view] : views)
+            {
+                if (std::equal(shape.begin(), shape.end(), viewShape.begin(), viewShape.end()))
+                {
+                    return view;
+                }
+            }
+            const wolvrix::lib::grh::ValueId view =
+                target.createValue(target.makeInternalValSym(), target.valueWidth(targetValue),
+                                   target.valueSigned(targetValue), target.valueType(targetValue), shape);
+            const wolvrix::lib::grh::OperationId assign =
+                target.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                       target.makeInternalOpSym());
+            target.addOperand(assign, targetValue);
+            target.addResult(assign, view);
+            views.emplace_back(std::vector<int64_t>(shape.begin(), shape.end()), view);
+            state.changed = true;
+            return view;
+        }
+
         bool inlineInstanceInfo(const wolvrix::lib::grh::Graph &sourceGraph,
                                 const InstanceInfo &info,
                                 const ValueMap &valueMap,
@@ -455,9 +492,10 @@ namespace wolvrix::lib::transform
                     state.graphError(sourceGraph, "Flatten missing mapping for instance input operand");
                     return false;
                 }
-                propagatePortShape(target, childValue, *targetValue, *child);
+                const auto mappedInput = mapInputPortShape(target, childValue, *targetValue,
+                                                            *child, state);
                 maybeRenameMappedValue(childValue, *targetValue, portName);
-                childPortMap.emplace(childValue, *targetValue);
+                childPortMap.emplace(childValue, mappedInput);
             }
 
             const auto childOutputs = child->outputPorts();
@@ -558,13 +596,14 @@ namespace wolvrix::lib::transform
                 const auto &childInout = childInouts[childIndex];
                 propagatePortShape(target, childInout.out, *outValue, *child);
                 propagatePortShape(target, childInout.oe, *oeValue, *child);
-                propagatePortShape(target, childInout.in, *inValue, *child);
+                const auto mappedInput = mapInputPortShape(target, childInout.in, *inValue,
+                                                            *child, state);
                 maybeRenameMappedValue(childInout.out, *outValue, std::string_view());
                 maybeRenameMappedValue(childInout.oe, *oeValue, std::string_view());
                 maybeRenameMappedValue(childInout.in, *inValue, std::string_view());
                 childPortMap.emplace(childInout.out, *outValue);
                 childPortMap.emplace(childInout.oe, *oeValue);
-                childPortMap.emplace(childInout.in, *inValue);
+                childPortMap.emplace(childInout.in, mappedInput);
             }
             if (state.failed)
             {

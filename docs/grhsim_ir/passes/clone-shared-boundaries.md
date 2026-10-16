@@ -2,7 +2,7 @@
 
 `cpu.st.clone-shared-boundaries` clones cheap shared bijection producers **once
 per consuming supernode** when the clone eliminates a real P_general supernode
-boundary — a boundary value costs a boundaryValueStore slot, a per-round change
+boundary — a boundary value costs a `nonSinkBoundaryStore` slot, a per-round change
 comparison and consumer activations, so deleting it is the win; the clones are
 absorbed into their consuming supernode and never become boundaries.
 
@@ -42,13 +42,13 @@ A candidate is cloned only when **all** hold:
 
 1. the live consumer count is in `[2, --max-fanout]` (default 8);
 2. every live consumer outside the source's own supernode is a same-phase
-   `core.compute.*` op inside a non-sink General supernode — a `Mem`-phase
-   write sampling the value, a sink op, an Event/Output branch consumer or a
+   `core.compute.*` op inside a nonSink General supernode — a `LargeSink`-phase
+   write sampling the value, a smallSink op, an Event/Output branch consumer or a
    side-effecting op keeps the boundary alive and blocks the clone (DPI calls,
    random sampling and side-effecting system tasks are therefore never
    cloned). Consumers local to the source's supernode simply keep the source;
 3. the result is a **real supernode boundary** (its consumers land in
-   different C2 supernodes, or it is sampled by a `Mem`-phase write — case 2
+   different C2 supernodes, or it is sampled by a `LargeSink`-phase write — case 2
    already vetoes that);
 4. inside every target supernode the clone can be placed ahead of its
    earliest consumer while following every locally produced operand

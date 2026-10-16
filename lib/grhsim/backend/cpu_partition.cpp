@@ -610,10 +610,28 @@ namespace wolvrix::lib::grhsim
                 for (auto node : cluster) attach(tree, supernode, nodes[nonSinkNodes[node]]);
                 ++nonSinkSupernodes;
             }
-            // Sink clustering: one supernode per canonical event signature.
+            // Sink clustering: declaration priority is the outer key, then
+            // the canonical event signature. Later same-state writes have
+            // higher priority and are scheduled after earlier writes.
             // A sink node must carry a single signature across its ops (C1
             // forms singleton sink nodes, so this is structural).
-            std::map<std::vector<int64_t>, std::vector<uint32_t>> signatureGroups;
+            std::vector<uint32_t> priorityOfOp(model.operations().size() + 1, 0);
+            std::vector<uint32_t> perState(model.states().size() + 1, 0);
+            for (const auto &op : model.operations())
+            {
+                if (op.phase != SimPhase::General) continue;
+                const auto name = model.text(op.opType);
+                if (!isCpuPhaseMemWriteOp(name) && name != "core.state.latchWrite") continue;
+                const auto refs = model.objectRefs(op);
+                if (refs.size() == 1 && refs[0].kind == ObjectKind::State)
+                    priorityOfOp[op.id.index] = perState[refs[0].index]++;
+            }
+            using SinkGroupKey = std::pair<uint32_t, std::vector<int64_t>>;
+            const auto sinkGroupLess = [](const SinkGroupKey &left, const SinkGroupKey &right) {
+                if (left.first != right.first) return left.first < right.first;
+                return left.second < right.second;
+            };
+            std::map<SinkGroupKey, std::vector<uint32_t>, decltype(sinkGroupLess)> signatureGroups(sinkGroupLess);
             uint64_t sinkOps = 0;
             for (const auto index : sinkNodes)
             {
@@ -627,12 +645,18 @@ namespace wolvrix::lib::grhsim
                     if (acts != signature)
                         throw std::runtime_error("sink node carries mixed event signatures");
                 }
-                signatureGroups[signature].push_back(index);
+                const uint32_t priority = ops.empty() ? 0 : priorityOfOp[ops.front().index];
+                for (const auto op : ops)
+                    if (priorityOfOp[op.index] != priority)
+                        throw std::runtime_error("sink node carries mixed write priorities");
+                signatureGroups[{priority, signature}].push_back(index);
                 sinkOps += ops.size();
             }
             uint64_t escapeSupernodes = 0, eventSupernodes = 0, guardSupernodes = 0, guardOps = 0;
-            for (const auto &[signature, members] : signatureGroups)
+            for (auto group = signatureGroups.begin(); group != signatureGroups.end(); ++group)
             {
+                const auto &signature = group->first.second;
+                const auto &members = group->second;
                 // A1: inside a nonempty signature, subdivide by shared write
                 // enable. A singleton core.state.write node whose en
                 // (operands[0]) producer is not a constant joins the group of
@@ -655,7 +679,9 @@ namespace wolvrix::lib::grhsim
                         if (ops.size() != 1) { ordinary.push_back(index); continue; }
                         const auto &op = model.operations()[ops.front().index - 1];
                         const auto operands = model.operands(op);
-                        if (model.text(op.opType) != "core.state.write" || operands.size() != 3)
+                        if ((model.text(op.opType) != "core.state.write" &&
+                             model.text(op.opType) != "core.state.writeMask") ||
+                            (operands.size() != 2 && operands.size() != 3))
                         { ordinary.push_back(index); continue; }
                         const auto producer = graph.producer[operands[0].index];
                         if (!producer ||
@@ -676,7 +702,7 @@ namespace wolvrix::lib::grhsim
                     const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
                     auto &attrs = tree.partitions[supernode.index - 1].attrs;
                     attrs.eventActs = signature;
-                    attrs.supernodeCategory = CpuSupernodeCategory::SinkEvent;
+                    attrs.supernodeCategory = CpuSupernodeCategory::SmallSinkEvent;
                     attrs.enableGuard = static_cast<int64_t>(enable);
                     for (auto node : group) attach(tree, supernode, nodes[node]);
                     ++eventSupernodes; ++guardSupernodes; guardOps += group.size();
@@ -685,8 +711,8 @@ namespace wolvrix::lib::grhsim
                 const auto supernode = addPartition(tree, phase, CpuPartitionKind::Supernode);
                 auto &attrs = tree.partitions[supernode.index - 1].attrs;
                 attrs.eventActs = signature;
-                attrs.supernodeCategory = signature.empty() ? CpuSupernodeCategory::SinkEscape
-                                                            : CpuSupernodeCategory::SinkEvent;
+                attrs.supernodeCategory = signature.empty() ? CpuSupernodeCategory::SmallSinkEscape
+                                                            : CpuSupernodeCategory::SmallSinkEvent;
                 for (auto node : ordinary) attach(tree, supernode, nodes[node]);
                 if (signature.empty()) ++escapeSupernodes; else ++eventSupernodes;
             }
@@ -764,7 +790,7 @@ namespace wolvrix::lib::grhsim
                 functionLines += lines;
             }
             closeFunction(static_cast<uint32_t>(supernodes.size()));
-            for (auto branchPhase : {CpuPhase::Event, CpuPhase::Mem, CpuPhase::Output})
+            for (auto branchPhase : {CpuPhase::Event, CpuPhase::LargeSink, CpuPhase::Output})
             {
                 const auto branch = phasePartition(tree, branchPhase);
                 auto ops = std::move(tree.partitions[branch.index - 1].ops);
@@ -910,7 +936,7 @@ namespace wolvrix::lib::grhsim
                 auto &tree = mapping.partitionTree;
                 tree.root = addPartition(tree, {}, CpuPartitionKind::Root);
                 const std::array<CpuPhase, 4> order{CpuPhase::Event, CpuPhase::General,
-                                                    CpuPhase::Mem, CpuPhase::Output};
+                                                    CpuPhase::LargeSink, CpuPhase::Output};
                 std::vector<PartitionId> branches;
                 for (auto branchPhase : order)
                 {
@@ -922,7 +948,7 @@ namespace wolvrix::lib::grhsim
                 event.ops = orderFlatPhaseOps(model, SimPhase::Event, true);
                 auto &mem = tree.partitions[branches[2].index - 1];
                 for (const auto &op : model.operations())
-                    if (op.phase == SimPhase::Mem) mem.ops.push_back(op.id);
+                    if (op.phase == SimPhase::LargeSink) mem.ops.push_back(op.id);
                 auto &output = tree.partitions[branches[3].index - 1];
                 output.ops = orderFlatPhaseOps(model, SimPhase::Output, false);
                 std::vector<OpId> generalOps, sinkOps;

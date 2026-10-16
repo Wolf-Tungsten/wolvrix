@@ -22,12 +22,12 @@ grhsim.used-bits              # 位需求分析、窄化及死锥清理
 
 ```text
 --scope whole|phase       默认 whole
---phase event|general|mem|output   仅随 --scope phase 使用，限定单个计算分区
+--phase event|general|large_sink|output   仅随 --scope phase 使用，限定单个计算分区
 --max-rounds N            正整数，默认 8
 ```
 
 - `whole`：每轮对全图执行一遍子流程。
-- `phase`：每轮按 Event -> General -> Mem -> Output 逐分区执行子流程，各分区只改写本
+- `phase`：每轮按 Event -> General -> LargeSink -> Output 逐分区执行子流程，各分区只改写本
   分区的 op。`--phase` 进一步限定单一分区（定向调试用）。
 
 生产接线（M5d-5）：A6 以 `--scope whole` 运行于全图优化段；B6 以 `--scope phase` 运行于

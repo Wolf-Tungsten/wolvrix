@@ -25,24 +25,22 @@ keep their phase:
 | --- | --- |
 | `core.event.edgeDet` | `Event` (defensive; B2 already tags them) |
 | `core.output.write` | `Output` (defensive; B3 already tags them) |
-| `core.state.write` on a scalar target | `General` |
-| `core.state.latchWrite` | `General` (B4's timeslot write-backs stay `Output`) |
-| `core.state.writeArray`/`fill`, and `write` on an array (shaped) target | **class-aware**, see below |
+| `core.state.write`/`writeMask`/`writeArray`/`writeArrayMask`/`fill`/`latchWrite` | **class-aware**, see below (B4's timeslot write-backs stay `Output`) |
 | everything else (compute, reads, event-free `system.task`/`dpi.call`) | `General` |
 
-The P_mem write duty follows the **target state's store class** (A7
+The `P_large_sink` write duty follows the **target state's store class** (A7
 [`grhsim.select-state-stores`](select-state-stores.md)):
 
-- target classified `mem` → `Mem` (P_mem samples the write parameters and
+- target classified `largeSink` → `LargeSink` (`P_large_sink` samples the write parameters and
   commits in place);
-- target classified `regLatch` → `General` (the write joins the supernode
+- target classified `smallSink` → `General` (the write joins the supernode
   fabric and commits through the next-buffer/publish path — this includes
-  writes on small arrays);
+  scalar and array writes);
 - no classification present → legacy shape-based fallback (shaped target =
-  array → `Mem`, scalar `write` → `General`), so pre-A7 flows and hand-built
+  array → `LargeSink`, scalar writes → `General`), so pre-A7 flows and hand-built
   test models are unchanged; an unresolvable target ref mirrors the same
-  fallback (`General` for the scalar-capable `write`, `Mem` for the
-  array-only `writeArray`/`fill`).
+  fallback (`General` for the scalar-capable `write`, `LargeSink` for the
+  array-only `writeArray`/`writeArrayMask`/`fill`).
 
 The pass requires B3 to have run when outputs exist: tagging an
 `output.write` `Output` while its operand is still General-produced violates
@@ -50,15 +48,17 @@ the Output cone containment check in the standing verifier (run
 `extract-output-cones` first, as the production pipeline does).
 
 `verifyPhaseAttribution` enforces the same class-aware table for every
-attributed op on a classified model (both directions: a `Mem`-phase write to a
-`regLatch` state and a `General`-phase write to a `mem` state are rejected), so
+attributed op on a classified model (both directions: a `LargeSink`-phase write to a
+`smallSink` state and a `General`-phase write to a `largeSink` state are rejected), so
 the attribution stays honest under later rewrites.
+Classification should therefore be final before this pass; changing a state's
+class after its writes have been attributed makes the model inconsistent.
 
 ## Diagnostics and options
 
 The pass takes no arguments. The info line reports `attributed`,
 `phase_event`/`phase_general`/`phase_mem`/`phase_output`,
-`mem_writes_reglatch` (array-target writes that took the General path via the class
+`mem_writes_reglatch` (legacy diagnostic key: shaped-target writes that took the General path via the class
 rule) and `already_attributed`. A second run is a no-op.
 
 ## Consumed by the final mapping (M5d-6)
@@ -81,7 +81,7 @@ requires:
 
 1. **total phase attribution** — no `SimPhase::None` op remains;
 2. **lowered event form** — no `event_edges` parameter survives (B2 has run);
-3. **P_mem sampling locality** — every `Mem`-phase write operand is produced by
+3. **P_large_sink sampling locality** — every `LargeSink`-phase write operand is produced by
    a `General`-phase op (Event cone values never leave P_event; P_output runs
    after the round loop).
 

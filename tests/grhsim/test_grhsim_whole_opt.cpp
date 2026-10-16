@@ -467,7 +467,7 @@ namespace
                    grhsim::ValueId mask, grhsim::ValueId event)
         {
             const std::vector<std::string> edges{"posedge"};
-            model.addOperation("core.state.write", std::array{enable, data, mask, event}, {},
+            model.addOperation("core.state.writeMask", std::array{enable, data, mask, event}, {},
                                std::array{grhsim::ObjectRef::state(state)},
                                std::array{grhsim::Parameter{model.intern("event_edges"), edges}});
         }
@@ -578,7 +578,7 @@ namespace
         for (const auto &op : model.operations())
         {
             const auto refs = model.objectRefs(op);
-            if (model.text(op.opType) != "core.state.write" || refs.size() != 1 ||
+            if (model.text(op.opType) != "core.state.writeMask" || refs.size() != 1 ||
                 refs[0].index != packed->id.index)
                 continue;
             const auto operands = model.operands(op);

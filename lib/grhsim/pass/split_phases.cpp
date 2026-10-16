@@ -7,7 +7,7 @@
 //
 //   - core.event.edgeDet -> Event (defensive; B2 already tags them);
 //   - core.output.write -> Output (defensive; B3 already tags them);
-//   - state write ops (core.state.write/writeArray/fill): the P_mem write
+//   - state write ops (core.state.write/writeMask/writeArray/writeArrayMask/fill): the P_mem write
 //     duty follows the TARGET STATE's store class (A7
 //     grhsim.select-state-stores) — mem-class arrays commit in P_mem, while
 //     writes on regLatch-class states (including small arrays) join General
@@ -23,7 +23,7 @@
 // verifyPhaseAttribution enforces the same class-aware table, and the B8
 // seal (grhsim.verify --seal semantic) certifies totality at the end of the
 // partition stage. The legacy CPU backend still schedules all mem write op
-// types in P_mem (its memStore layout implements the same NBA contract);
+// types in P_mem (its largeSinkStore layout implements the same NBA contract);
 // consuming the class-aware attribution for layout/emit is M5d-6.
 
 #include "grhsim/pass/split_phases.hpp"
@@ -40,8 +40,9 @@ namespace wolvrix::lib::grhsim
     {
         bool isStateWriteOpType(std::string_view type) noexcept
         {
-            return type == "core.state.write" || type == "core.state.writeArray" ||
-                   type == "core.state.fill";
+            return type == "core.state.write" || type == "core.state.writeMask" ||
+                   type == "core.state.writeArray" || type == "core.state.writeArrayMask" ||
+                   type == "core.state.fill" || type == "core.state.latchWrite";
         }
 
         // Whether the write commits in P_mem. On a classified model the target
@@ -66,10 +67,10 @@ namespace wolvrix::lib::grhsim
             }
             if (refs.empty() || refs[0].kind != ObjectKind::State ||
                 refs[0].index == 0 || refs[0].index > model.states().size())
-                return type != "core.state.write";
+                return type != "core.state.write" && type != "core.state.writeMask";
             const auto &state = model.states()[refs[0].index - 1];
             if (model.hasStateStoreClassification())
-                return state.storeClass != StateStoreClass::RegLatch;
+                return state.storeClass != StateStoreClass::SmallSink;
             if (state.type.generation != 0 || !state.type.valid() ||
                 state.type.index > model.types().size())
                 return true;
@@ -127,13 +128,13 @@ namespace wolvrix::lib::grhsim
                             }
                             catch (const std::exception &)
                             {
-                                shaped = type != "core.state.write";
+                                shaped = type != "core.state.write" && type != "core.state.writeMask";
                             }
                             if (shaped) ++memWritesRegLatch; else ++attributedGeneral;
                         }
                         else
                         {
-                            phase = SimPhase::Mem;
+                            phase = SimPhase::LargeSink;
                             ++attributedMem;
                         }
                     }

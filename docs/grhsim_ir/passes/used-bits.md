@@ -21,12 +21,12 @@
   `used` 前缀。左移量、条件 operand 全使用。
 - 非透明族（`div/mod/lshr/ashr`、比较、归约、`logicAnd/Or/Not`、`sliceDynamic/
   sliceArray`）：operand 全使用（结果的低位依赖 operand 的全部位）。
-- `state.read` 把结果的 `used` 并入状态的 `usedState`；`write/latchWrite` 把
+- `state.read` 把结果的 `used` 并入状态的 `usedState`；`write/writeMask/latchWrite` 把
   `data`/`mask` operand 提升到状态的写口需求：**可收窄状态**（见下）为 `usedState`，
   不可收窄状态一律按 operand 全宽——否则存活写口会引用已被收窄的值。
 
 状态的结构收窄资格（与不动点无关，先于分析计算）：logic 二态、init 全为
-const/random、只以 read/write/latchWrite 目标身份被引用、写口 data/mask 与状态
+const/random、只以 read/write/writeMask/latchWrite 目标身份被引用、写口 data/mask 与状态
 等宽。event history 身份被引用的状态不满足资格。
 
 前缀性质保证：收窄一个值时，其全部消费者都只需要低 `[0, k)` 位，因此边界处只需截断
@@ -41,11 +41,11 @@ const/random、只以 read/write/latchWrite 目标身份被引用、写口 data/
    （emit 内联时按新宽度截断）。
 2. **边界 slice（Case B）**：非透明 op 保持原宽，结果经复用已有或新建的
    `sliceStatic(0, k-1)` 供下游收窄锥使用。
-3. **状态收窄**：logic 二态状态（init 全为 const/random、引用者仅为 read/write/
+3. **状态收窄**：logic 二态状态（init 全为 const/random、引用者仅为 read/write/writeMask/
    latchWrite、写口 data/mask 与状态等宽）连同读、写、init 一起重建为窄宽度；event
    history 引用不变。
 4. **死锥消除**：结果全死的 `core.compute.*` / `state.read` / `readArray`，以及
-   `usedState == 0` 状态的 `write/latchWrite`；最后清扫不再被任何存活 op 引用的
+   `usedState == 0` 状态的 `write/writeMask/latchWrite`；最后清扫不再被任何存活 op 引用的
    logic 二态状态（含孤儿 event history）。system/dpi/数组写口等副作用 op 不删除。
 
 变换后所有存活形态仍走既有 emit 路径：`sliceStatic`、`assign` 与各算术/位运算 op 的

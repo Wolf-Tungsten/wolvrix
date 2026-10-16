@@ -26,14 +26,16 @@ namespace wolvrix::lib::grhsim
         }
 
         // Stage-06 state access family: read/readArray (whole / indexed read),
-        // write/writeArray (whole / indexed masked write) and fill (broadcast
-        // or packed whole-array write); same-state writes apply in op
+        // write/writeMask and writeArray/writeArrayMask (unmasked / masked
+        // whole and indexed writes), plus fill (broadcast or packed
+        // whole-array write); same-state writes apply in op
         // declaration order (stage-03 semantics). The retired regWrite/mem*
         // names are no longer registered.
-        constexpr std::array<std::string_view, 47> ops = {
+        constexpr std::array<std::string_view, 49> ops = {
             "core.input.read", "core.output.write",
             "core.state.read", "core.state.readArray", "core.state.write",
-            "core.state.writeArray", "core.state.fill", "core.state.latchWrite",
+            "core.state.writeMask", "core.state.writeArray", "core.state.writeArrayMask",
+            "core.state.fill", "core.state.latchWrite",
             "core.system.function", "core.system.task", "core.dpi.call",
             "core.compute.constant", "core.compute.add", "core.compute.sub",
             "core.compute.mul", "core.compute.div", "core.compute.mod",

@@ -1,8 +1,8 @@
 // grhsim.select-state-stores (M5d-4, pipeline stage A7): the single semantic
 // store classification decision point. Every state is assigned
-// StateStoreClass::RegLatch (small/scalar states committed by the P_publish
-// whole-block next->current copy) or StateStoreClass::Mem (large contiguous
-// arrays committed in place by P_mem from sampled write parameters). The
+// StateStoreClass::SmallSink (small states committed by the P_publish
+// whole-block next->current copy) or StateStoreClass::LargeSink (large states
+// committed in place by P_large_sink from sampled write parameters). The
 // decision uses the optimized size, contiguity and update cost of each state;
 // downstream passes (B5 split-phases, C3 layout-named-stores, emit) consume
 // the annotation and must not re-derive the classification from the state's
@@ -75,13 +75,12 @@ namespace wolvrix::lib::grhsim
             ok = linearBitSize(model, state.type, bits);
             if (!ok) return StateStoreClass::None;
             bytes = bits / 8 + (bits % 8 != 0 ? 1 : 0);
-            // Stage-06: the mem class criterion is a SHAPED (array) logic state
-            // whose total byte size crosses the threshold; scalars stay
-            // RegLatch regardless of size.
+            // Shape does not determine the sink class; only the state size
+            // decides which commit path owns it.
             const Type &type = model.types()[state.type.index - 1];
-            if (type.kind == TypeKind::Logic && !type.shape.empty() && bytes >= memMinBytes)
-                return StateStoreClass::Mem;
-            return StateStoreClass::RegLatch;
+            if (type.kind == TypeKind::Logic && bytes >= memMinBytes)
+                return StateStoreClass::LargeSink;
+            return StateStoreClass::SmallSink;
         }
 
         class SelectStateStoresPass final : public Pass
@@ -104,7 +103,8 @@ namespace wolvrix::lib::grhsim
                     if (refs.empty() || refs[0].kind != ObjectKind::State ||
                         refs[0].index > model.states().size())
                         continue;
-                    if (name == "core.state.write" || name == "core.state.writeArray" ||
+                    if (name == "core.state.write" || name == "core.state.writeMask" ||
+                        name == "core.state.writeArray" || name == "core.state.writeArrayMask" ||
                         name == "core.state.fill" || name == "core.state.latchWrite")
                         ++writes[refs[0].index];
                     else if (name == "core.state.read" || name == "core.state.readArray")
@@ -139,14 +139,14 @@ namespace wolvrix::lib::grhsim
                                       !options_.reclassify;
                     const StateStoreClass finalClass = skip ? state.storeClass : target;
                     if (skip) ++kept;
-                    else if (target == StateStoreClass::Mem) ++mem;
+                    else if (target == StateStoreClass::LargeSink) ++mem;
                     else ++regLatch;
                     if (!skip && state.storeClass != target)
                     {
                         model.setStateStoreClass(state.id, target);
                         changed = true;
                     }
-                    if (finalClass == StateStoreClass::Mem) memBytes += bytes;
+                    if (finalClass == StateStoreClass::LargeSink) memBytes += bytes;
                     else regLatchBytes += bytes;
                     rows.push_back({state.id.index, finalClass, bits, bytes});
                 }

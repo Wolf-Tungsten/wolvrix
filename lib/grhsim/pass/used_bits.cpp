@@ -38,12 +38,14 @@ namespace wolvrix::lib::grhsim
             // and is never narrowed, so this is a conservative full-use sink).
             if (name == "core.output.write" || name == "core.system.task" ||
                 name == "core.dpi.call" || name == "core.state.writeArray" ||
+                name == "core.state.writeArrayMask" ||
                 name == "core.state.fill" || name == "core.state.readArray" ||
                 name == "core.system.function" ||
                 name == "core.event.edgeDet") return UseRule::sinkFull;
             if (name == "core.input.read") return UseRule::inputRead;
             if (name == "core.state.read") return UseRule::stateRead;
-            if (name == "core.state.write" || name == "core.state.latchWrite") return UseRule::stateWrite;
+            if (name == "core.state.write" || name == "core.state.writeMask" ||
+                name == "core.state.latchWrite") return UseRule::stateWrite;
             if (!name.starts_with("core.compute.")) return UseRule::none;
             const auto kind = name.substr(std::string_view("core.compute.").size());
             if (kind == "constant") return UseRule::none;
@@ -70,6 +72,31 @@ namespace wolvrix::lib::grhsim
                    kind == "sub" || kind == "mul" || kind == "shl" || kind == "mux" ||
                    kind == "bitSelect" || kind == "prioritySelect" || kind == "concat" ||
                    kind == "replicate" || kind == "sliceStatic";
+        }
+
+        // State writes are edge-lowered before the phase-scoped simplify pass:
+        // write is [cond, data], writeMask/latchWrite are [cond, data, mask],
+        // and any legacy trailing event operands precede the event_edges
+        // annotation. Keep the old masked write form readable while making the
+        // unmasked write layout explicit.
+        std::size_t annotatedEventCount(const GrhSimModel &model, const SimOp &op)
+        {
+            for (const auto &parameter : model.parameters(op))
+            {
+                if (model.text(parameter.name) != "event_edges") continue;
+                if (const auto *edges = std::get_if<std::vector<std::string>>(&parameter.value))
+                    return edges->size();
+            }
+            return 0;
+        }
+
+        bool stateWriteHasMask(const GrhSimModel &model, const SimOp &op)
+        {
+            const auto name = model.text(op.opType);
+            if (name == "core.state.writeMask" || name == "core.state.latchWrite") return true;
+            if (name != "core.state.write") return false;
+            const std::size_t events = annotatedEventCount(model, op);
+            return model.operands(op).size() >= 3 + events;
         }
 
         struct UsedBitsAnalysis
@@ -171,9 +198,13 @@ namespace wolvrix::lib::grhsim
                             if (rule == UseRule::stateWrite)
                             {
                                 const auto operands = model.operands(op);
-                                if (operands.size() < 3 ||
+                                const bool masked = stateWriteHasMask(model, op);
+                                const std::size_t events = annotatedEventCount(model, op);
+                                const std::size_t minimum = 2 + (masked ? 1 : 0) + events;
+                                if (operands.size() < minimum ||
                                     widthValue[operands[1].index] != widthState[state.id.index] ||
-                                    widthValue[operands[2].index] != widthState[state.id.index])
+                                    (masked && widthValue[operands[2].index] !=
+                                                   widthState[state.id.index]))
                                     eligible = false;
                                 continue;
                             }
@@ -277,30 +308,31 @@ namespace wolvrix::lib::grhsim
                     case UseRule::stateWrite:
                     {
                         if (refs.empty() || refs[0].kind != ObjectKind::State) break;
-                        // write/latchWrite layout: [updateCond, data, mask,
-                        // events...]. Ineligible states never narrow, so their
-                        // write data/mask stay fully used; only narrowable
-                        // states propagate the state's own used prefix. A
-                        // shaped (array) target is never eligible: its data is
-                        // an array value (no widthValue entry, retained by
-                        // construction) but its full-width scalar mask must
-                        // still be raised to full use.
-                        if (operands.size() >= 3)
+                        // write layout: [updateCond, data, events...];
+                        // writeMask/latchWrite add [mask] before events.
+                        // Ineligible states never narrow, so their write
+                        // data/mask stay fully used; only narrowable states
+                        // propagate the state's own used prefix.
+                        const bool masked = stateWriteHasMask(model, op);
+                        const std::size_t eventCount = annotatedEventCount(model, op);
+                        const std::size_t eventStart = 2 + (masked ? 1 : 0);
+                        if (operands.size() >= eventStart + eventCount)
                         {
                             raiseValue(operands[0], widthValue[operands[0].index]);
                             if (stateEligible[refs[0].index])
                             {
                                 const uint32_t request = usedState[refs[0].index];
                                 raiseValue(operands[1], request);
-                                raiseValue(operands[2], request);
+                                if (masked) raiseValue(operands[2], request);
                             }
                             else
                             {
                                 raiseValue(operands[1], widthValue[operands[1].index]);
-                                raiseValue(operands[2], widthValue[operands[2].index]);
+                                if (masked)
+                                    raiseValue(operands[2], widthValue[operands[2].index]);
                             }
-                            for (auto value : operands.subspan(3))
-                                raiseValue(value, widthValue[value.index]);
+                            for (std::size_t i = eventStart; i < operands.size(); ++i)
+                                raiseValue(operands[i], widthValue[operands[i].index]);
                         }
                         break;
                     }
@@ -665,12 +697,20 @@ namespace wolvrix::lib::grhsim
                         if (refs.empty() || refs[0].index != s) continue;
                         if (model.text(op.opType) == "core.state.read") continue; // phase 1
                         const std::vector<ValueId> args(model.operands(op).begin(), model.operands(op).end());
+                        const bool masked = stateWriteHasMask(model, op);
+                        const std::size_t eventStart = 2 + (masked ? 1 : 0);
+                        if (args.size() < eventStart)
+                            throw std::runtime_error("used-bits state write has an invalid operand layout");
                         const ValueId data = adapt(finalOf(args[1]), narrowed, stateSigned, false);
-                        const ValueId mask = adapt(finalOf(args[2]), narrowed, stateSigned, false);
-                        if (!data.valid() || !mask.valid())
+                        const ValueId mask = masked
+                            ? adapt(finalOf(args[2]), narrowed, stateSigned, false)
+                            : ValueId::invalid();
+                        if (!data.valid() || (masked && !mask.valid()))
                             throw std::runtime_error("used-bits prefix property violated at a state write");
-                        std::vector<ValueId> operands{finalOf(args[0]), data, mask};
-                        for (std::size_t a = 3; a < args.size(); ++a) operands.push_back(finalOf(args[a]));
+                        std::vector<ValueId> operands{finalOf(args[0]), data};
+                        if (masked) operands.push_back(mask);
+                        for (std::size_t a = eventStart; a < args.size(); ++a)
+                            operands.push_back(finalOf(args[a]));
                         std::vector<ObjectRef> newRefs{ObjectRef::state(newState)};
                         for (std::size_t r = 1; r < refs.size(); ++r) newRefs.push_back(refs[r]);
                         const std::vector<Parameter> params(model.parameters(op).begin(), model.parameters(op).end());
@@ -914,7 +954,8 @@ namespace wolvrix::lib::grhsim
                         ++stats.deadOps;
                         continue;
                     }
-                    if (name == "core.state.write" || name == "core.state.latchWrite")
+                    if (name == "core.state.write" || name == "core.state.writeMask" ||
+                        name == "core.state.latchWrite")
                     {
                         const auto refs = model.objectRefs(op);
                         if (!refs.empty() && refs[0].kind == ObjectKind::State &&

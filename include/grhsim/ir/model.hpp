@@ -195,10 +195,10 @@ namespace wolvrix::lib::grhsim
     // the single decision point that assigns every state its store class.
     // None means the model predates classification; consumers must reject
     // None once any state is classified (the verifier enforces totality).
-    // RegLatch states are small: writes merge into a next buffer and
-    // P_publish commits them with one whole-block copy (NBA). Mem states are
-    // large contiguous arrays: write parameters are sampled before P_mem,
-    // which commits them in place in declaration order. Stage-06: the class
+    // SmallSink states use a next buffer; P_publish commits them with one
+    // whole-block copy (NBA). LargeSink states are large contiguous arrays:
+    // write parameters are sampled before P_large_sink, which commits them in
+    // place with declaration-order priority. Stage-06: the class
     // criterion is the state's total byte size alone, decoupled from the op
     // family that accesses it (the same write/writeArray/fill ops serve both
     // classes). The class is a semantic annotation; backends must consume it
@@ -206,8 +206,8 @@ namespace wolvrix::lib::grhsim
     enum class StateStoreClass : uint8_t
     {
         None,
-        RegLatch,
-        Mem
+        SmallSink,
+        LargeSink
     };
 
     struct StateObject
@@ -306,7 +306,7 @@ namespace wolvrix::lib::grhsim
         OriginId origin;
     };
 
-    // Six-phase simulation model (P_input/P_event/P_general/P_mem/P_publish/
+    // Six-phase simulation model (P_input/P_event/P_general/P_large_sink/P_publish/
     // P_output) op attribution. None means the op is not yet attributed; the
     // lowering passes assign phases (P_input and P_publish have no ops).
     enum class SimPhase : uint8_t
@@ -314,7 +314,7 @@ namespace wolvrix::lib::grhsim
         None,
         Event,
         General,
-        Mem,
+        LargeSink,
         Output
     };
 
@@ -344,19 +344,19 @@ namespace wolvrix::lib::grhsim
     };
 
     // Compute/Commit are the removed legacy compute/commit pipeline's phases
-    // (M5d-6); the six-phase pipeline uses Event/General/Mem/Output for its
+    // (M5d-6); the six-phase pipeline uses Event/General/LargeSink/Output for its
     // four phase branches. Old enum values are kept stable for checkpoint
     // compatibility.
-    enum class CpuPhase : uint8_t { None, Compute, Commit, Event, General, Mem, Output };
+    enum class CpuPhase : uint8_t { None, Compute, Commit, Event, General, LargeSink, Output };
     // EventDomain/ActiveWord are legacy partition kinds (M5d-6 removed the
     // producers); values kept stable for checkpoint compatibility.
     enum class CpuPartitionKind : uint8_t { Root, Phase, EventDomain, Supernode, Node, ActiveWord, EmitFunction };
     // V2 (M1) supernode classification: NonSink supernodes hold only
-    // value-producing ops and stay in the merge framework; SinkEvent
-    // supernodes hold only no-result (sink) ops sharing one nonempty event
-    // signature; SinkEscape supernodes hold only event-free sink ops and fire
+    // value-producing ops and stay in the merge framework; SmallSinkEvent
+    // supernodes hold only no-result small-sink ops sharing one nonempty event
+    // signature; SmallSinkEscape supernodes hold only event-free small-sink ops and fire
     // unconditionally every round. Enum values stay stable for checkpoints.
-    enum class CpuSupernodeCategory : uint8_t { NonSink, SinkEscape, SinkEvent };
+    enum class CpuSupernodeCategory : uint8_t { NonSink, SmallSinkEscape, SmallSinkEvent };
     // SplitPhase..Schedule was the legacy two-phase pipeline (removed in
     // M5d-6). The six-phase pipeline appends SplitPhases (four-way split,
     // no longer produced since M5d-6: cpu.st.build-general-nodes initializes
@@ -419,14 +419,14 @@ namespace wolvrix::lib::grhsim
         // V2 (M1): the supernode's sink classification. Engaged exactly on
         // the General-branch supernodes from the GeneralSupernodes stage on.
         // For sink supernodes attrs.eventActs doubles as the event signature
-        // (empty for SinkEscape, the common nonempty act set for SinkEvent).
+        // (empty for SmallSinkEscape, the common nonempty act set for SmallSinkEvent).
         std::optional<CpuSupernodeCategory> supernodeCategory;
-        // A1: on a SinkEvent supernode carved out by shared-enable
+        // A1: on a SmallSinkEvent supernode carved out by shared-enable
         // subdivision (cpu.st.merge-general-supernodes), the value index of
         // the members' common write enable (the regWrite en operand). Every
         // op in the supernode is individually guarded by that value, so the
         // emitter ANDs one read of it into the call-site gate. Engaged only
-        // on SinkEvent supernodes from the GeneralSupernodes stage on.
+        // on SmallSinkEvent supernodes from the GeneralSupernodes stage on.
         std::optional<int64_t> enableGuard;
     };
 
@@ -446,7 +446,21 @@ namespace wolvrix::lib::grhsim
     };
 
     enum class CpuTypeKind : uint8_t { Bool, UInt, SInt, F32, F64, String, Array };
-    enum class CpuNamedStoreKind : uint8_t { RegLatch, Mem, Boundary, PrevEvent, EventAct, TimeslotTrigger, ActiveFlags };
+    enum class CpuNamedStoreKind : uint8_t
+    {
+        SmallSink,
+        LargeSink,
+        Input,
+        NonSinkBoundary,
+        SmallSinkEnableBoundary,
+        SmallSinkPayloadBoundary,
+        LargeSinkEnableBoundary,
+        LargeSinkPayloadBoundary,
+        PrevEvent,
+        EventAct,
+        TimeslotTrigger,
+        ActiveFlags
+    };
 
     struct CpuType
     {
@@ -473,9 +487,12 @@ namespace wolvrix::lib::grhsim
 
     struct CpuNamedStore
     {
-        CpuNamedStoreKind kind = CpuNamedStoreKind::RegLatch;
+        CpuNamedStoreKind kind = CpuNamedStoreKind::SmallSink;
         std::vector<CpuStoreField> fields;
         uint64_t sizeBytes = 0;
+        // Dense bit order for the optional emitted enable-word cache. The
+        // cache is derived from fields/input ports and is not in sizeBytes.
+        std::vector<ValueId> enableBitValues;
         friend bool operator==(const CpuNamedStore &, const CpuNamedStore &) = default;
     };
 
@@ -483,8 +500,8 @@ namespace wolvrix::lib::grhsim
     {
         uint32_t pointerBytes = 8;
         std::vector<CpuType> types;
-        // Six-phase named store layout (regLatchStore/memStore/
-        // boundaryValueStore/prevEventStore/eventActStore/timeslotTriggerFlag/
+        // Six-phase named store layout (smallSinkStore/largeSinkStore/
+        // six boundary stores/prevEventStore/eventActStore/timeslotTriggerFlag/
         // activeFlags), filled by cpu.st.layout-named-stores (C3). The legacy
         // object/value/frame/runtime arenas were removed in M5d-6.
         std::optional<std::vector<CpuNamedStore>> namedStores;
@@ -537,10 +554,10 @@ namespace wolvrix::lib::grhsim
     };
 
     // V2 (M2): one P_event static activation entry — firing event act `act`
-    // (the edgeDet op's act index) raises dataActiveFlag on the NON-SINK
+    // (the edgeDet op's act index) raises nonSinkActiveFlag on the NON-SINK
     // supernodes that hold an op carrying that act (bit i = supernode
-    // ordinal i). Sink supernodes never appear: a SinkEvent supernode gates
-    // directly on its eventActStore signature and a SinkEscape supernode
+    // ordinal i). Small-sink supernodes never appear: a SmallSinkEvent supernode gates
+    // directly on its eventActStore signature and a SmallSinkEscape supernode
     // fires unconditionally every round.
     struct CpuEventActivation
     {
@@ -589,13 +606,13 @@ namespace wolvrix::lib::grhsim
         // readArrays included); the key set is no longer limited to the
         // output/event state dependency closure E. V2 (M2): all three fanout
         // tables target NON-SINK supernodes only — sink supernodes fire on
-        // their eventActStore signature (SinkEvent) or unconditionally
-        // (SinkEscape), never on dataActiveFlag.
+        // their eventActStore signature (SmallSinkEvent) or unconditionally
+        // (SmallSinkEscape), never on nonSinkActiveFlag.
         std::vector<CpuFanoutEntry<StateId>> commitStateFanout;
         // Six-phase static tables, filled by cpu.st.build-event-activation-map
         // (C4, the pre-v2 build-event-bitmaps) / cpu.st.build-mem-write-plan
         // (C5) / cpu.st.build-phase-schedule (C7): the event act -> non-sink
-        // supernode activation map applied by P_event, the P_mem write plan
+        // supernode activation map applied by P_event, the P_large_sink write plan
         // (priority order, reader tables, event-free writes), and the event
         // act -> timeslot flag triggers collected from the Output-phase
         // timeslot tasks. The legacy quiescence/round-seed/input-shadow/
@@ -614,7 +631,7 @@ namespace wolvrix::lib::grhsim
     //                drivers, the system-task driver (exactly one chunk).
     //   Init       — init() chunk over the init stream: flattened init steps,
     //                then constant-boundary preloads, then prevEvent inits,
-    //                then the regLatchStoreNext sync (offset/count in items).
+    //                then the smallSinkStoreNext sync (offset/count in items).
     //   Event      — pEvent cone chunk: range of the Event branch's flat ops.
     //   GeneralScan— pGeneral scan chunk: supernode ordinal range, aligned to
     //                the C6 EmitFunction intervals unless one interval alone
@@ -632,13 +649,13 @@ namespace wolvrix::lib::grhsim
     //                partIndex -> helper-range mapping is recomputed
     //                deterministically from the C6 helperChunks and the unit
     //                cap (cpuSupernodePartRanges).
-    //   Mem        — pMem chunk: range of the memWritePlan entries.
+    //   Mem        — pLargeSink chunk: range of the memWritePlan entries.
     //   Output     — pOutput chunk: range of the Output branch's flat ops.
     //   Dump       — dumpState chunk: range of the canonical dump item list
     //                (inputs, outputs, then the named-store fields in store
     //                order: regLatch, mem, boundary, prevEvent, eventAct,
     //                timeslot, activeFlags).
-    enum class CpuEmitChunkKind : uint8_t { Core, Init, Event, GeneralScan, Supernode, Mem, Output, Dump, SupernodePart };
+    enum class CpuEmitChunkKind : uint8_t { Core, Init, Event, GeneralScan, Supernode, LargeSink, Output, Dump, SupernodePart };
 
     struct CpuEmitChunk
     {

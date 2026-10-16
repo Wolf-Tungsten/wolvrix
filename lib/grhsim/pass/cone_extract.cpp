@@ -25,7 +25,7 @@ namespace wolvrix::lib::grhsim
             {
             case SimPhase::Event: return ".ev";
             case SimPhase::General: return ".gen";
-            case SimPhase::Mem: return ".mem";
+            case SimPhase::LargeSink: return ".mem";
             case SimPhase::Output: return ".out";
             case SimPhase::None: return "";
             }

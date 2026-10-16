@@ -552,12 +552,12 @@ namespace
 
         const Messages messages = runPass(model, "grhsim.select-state-stores");
         using grhsim::StateStoreClass;
-        if (classOf(model, "cnt") != StateStoreClass::RegLatch ||
-            classOf(model, "smallMem") != StateStoreClass::RegLatch)
+        if (classOf(model, "cnt") != StateStoreClass::SmallSink ||
+            classOf(model, "smallMem") != StateStoreClass::SmallSink)
             return fail("small states were not classified regLatch");
-        if (classOf(model, "bigMem") != StateStoreClass::Mem ||
-            classOf(model, "seqMem") != StateStoreClass::Mem ||
-            classOf(model, "fillMem") != StateStoreClass::Mem)
+        if (classOf(model, "bigMem") != StateStoreClass::LargeSink ||
+            classOf(model, "seqMem") != StateStoreClass::LargeSink ||
+            classOf(model, "fillMem") != StateStoreClass::LargeSink)
             return fail("large arrays were not classified mem");
         if (const auto n = infoValue(messages, "grhsim.select-state-stores", "state_stores_reg_latch="))
         {
@@ -590,7 +590,7 @@ namespace
             const Messages messages = runPass(fixture.model, "grhsim.select-state-stores",
                                               std::array<std::string_view, 2>{"--mem-min-bytes", "4"});
             using grhsim::StateStoreClass;
-            if (classOf(fixture.model, "smallMem") != StateStoreClass::Mem)
+            if (classOf(fixture.model, "smallMem") != StateStoreClass::LargeSink)
                 return fail("threshold 4 did not move the small array to mem");
             if (!messagesContain(messages, "state_stores_mem=4"))
                 return fail("threshold run did not classify all four arrays as mem");
@@ -599,7 +599,7 @@ namespace
             ContractFixture fixture;
             runPass(fixture.model, "grhsim.select-state-stores",
                     std::array<std::string_view, 2>{"--mem-min-bytes", "4096"});
-            if (classOf(fixture.model, "bigMem") != grhsim::StateStoreClass::RegLatch)
+            if (classOf(fixture.model, "bigMem") != grhsim::StateStoreClass::SmallSink)
                 return fail("large threshold did not keep the big array in regLatch");
         }
         if (!passCreationFails("grhsim.select-state-stores",
@@ -637,12 +637,12 @@ namespace
         for (const auto &state : model.states())
             if (model.text(state.name) == "bigMem")
             {
-                model.setStateStoreClass(state.id, grhsim::StateStoreClass::RegLatch);
+                model.setStateStoreClass(state.id, grhsim::StateStoreClass::SmallSink);
                 break;
             }
         runPass(model, "grhsim.select-state-stores",
                 std::array<std::string_view, 2>{"--reclassify", "true"});
-        if (classOf(model, "bigMem") != grhsim::StateStoreClass::Mem)
+        if (classOf(model, "bigMem") != grhsim::StateStoreClass::LargeSink)
             return fail("reclassify did not restore the mem class");
         if (!verifies(model)) return fail("reclassified model rejected");
         return 0;
@@ -653,8 +653,8 @@ namespace
         // Unclassified checkpoints keep the four-element state rows.
         ContractFixture unclassified;
         const std::string plain = storeJson(unclassified.model);
-        if (plain.find(",\"regLatch\"]") != std::string::npos ||
-            plain.find(",\"mem\"]") != std::string::npos)
+        if (plain.find(",\"smallSink\"]") != std::string::npos ||
+            plain.find(",\"largeSink\"]") != std::string::npos)
             return fail("unclassified checkpoint carries store class elements");
         {
             Messages messages;
@@ -671,17 +671,20 @@ namespace
         Messages loadMessages;
         auto loaded = loadJson(classified, &loadMessages);
         if (!loaded) return fail("classified checkpoint does not load");
-        if (classOf(*loaded, "bigMem") != grhsim::StateStoreClass::Mem ||
-            classOf(*loaded, "smallMem") != grhsim::StateStoreClass::RegLatch)
+        if (classOf(*loaded, "bigMem") != grhsim::StateStoreClass::LargeSink ||
+            classOf(*loaded, "smallMem") != grhsim::StateStoreClass::SmallSink)
             return fail("classified checkpoint lost the store classes");
         if (storeJson(*loaded) != classified)
             return fail("classified checkpoint is not byte stable");
-        // Unknown class strings are rejected at load time. (The fixture has
-        // no Mem-phase ops, so `,"mem"]` only terminates mem state rows.)
+        // Unknown class strings are rejected at load time. This fixture has
+        // no large-sink phase ops, so the token only terminates state rows.
         std::string corrupted = classified;
+        const std::string classToken = ",\"largeSink\"]";
+        if (corrupted.find(classToken) == std::string::npos)
+            return fail("classified checkpoint has no large-sink state row to corrupt");
         for (std::string::size_type at = 0;
-             (at = corrupted.find(",\"mem\"]", at)) != std::string::npos;)
-            corrupted.replace(at, 7, ",\"bogus\"]");
+             (at = corrupted.find(classToken, at)) != std::string::npos;)
+            corrupted.replace(at, classToken.size(), ",\"bogus\"]");
         Messages corruptMessages;
         if (loadJson(corrupted, &corruptMessages))
             return fail("checkpoint with an unknown store class loaded");
@@ -700,48 +703,42 @@ namespace
             for (const auto &state : model.states())
                 if (model.text(state.name) == "cnt")
                 {
-                    model.setStateStoreClass(state.id, StateStoreClass::RegLatch);
+                    model.setStateStoreClass(state.id, StateStoreClass::SmallSink);
                     break;
                 }
             if (!messagesContain(verifyMessages(model), "store classification is not total"))
                 return fail("partial classification was not rejected");
         }
-        // The mem class requires a shaped (array) state.
+        // A scalar logic state may use the large-sink class when its size
+        // reaches the threshold.
         {
-            ContractFixture fixture;
-            auto &model = fixture.model;
+            grhsim::GrhSimModel model("select-state-stores-large-scalar");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const auto wide = model.logicType(512, false, grhsim::LogicDomain::TwoState);
+            const auto state = addStateInit(model, "wide", wide, "512'h0");
             runPass(model, "grhsim.select-state-stores");
-            for (const auto &state : model.states())
-                if (model.text(state.name) == "cnt")
-                {
-                    model.setStateStoreClass(state.id, StateStoreClass::Mem);
-                    break;
-                }
-            if (!messagesContain(verifyMessages(model),
-                                 "mem store class requires a shaped (array) state"))
-                return fail("mem class on a scalar state was not rejected");
+            if (model.states()[state.index - 1].storeClass != StateStoreClass::LargeSink ||
+                !verifies(model))
+                return fail("large scalar was not classified into largeSinkStore");
         }
-        // A mem-class state may not be written by latchWrite (P_mem owns the
-        // commit); a whole-array write is class-neutral and only needs the
-        // class-consistent phase.
+        // A large scalar latchWrite follows the same class-aware phase rule.
         {
-            grhsim::GrhSimModel model("select-state-stores-badwrite");
+            grhsim::GrhSimModel model("select-state-stores-large-latch");
             model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
             const auto bit = model.logicType(1, false, grhsim::LogicDomain::TwoState);
-            const auto wide = model.logicType(64, false, grhsim::LogicDomain::TwoState);
-            const auto mem = addArrayState(model, "mem", wide, 64, "64'h0");
-            const auto memType = model.states()[mem.index - 1].type;
+            const auto wide = model.logicType(512, false, grhsim::LogicDomain::TwoState);
+            const auto state = addStateInit(model, "wide", wide, "512'h0");
             const auto one = addConstant(model, bit, "1'h1");
-            const auto data = model.addValue(memType);
-            model.addOperation("core.compute.constant", {}, std::array{data}, {},
-                               std::array{grhsim::Parameter{model.intern("constValue"),
-                                                            std::string("0")}});
-            model.addOperation("core.state.latchWrite", std::array{one, data, data}, {},
-                               std::array{grhsim::ObjectRef::state(mem)});
-            model.setStateStoreClass(mem, StateStoreClass::Mem);
-            const Messages messages = verifyMessages(model);
-            if (!messagesContain(messages, "targets a mem-class state"))
-                return fail("latchWrite on a mem-class state was not rejected");
+            const auto data = addConstant(model, wide, "512'h1");
+            const auto mask = addConstant(model, wide, "512'h1");
+            const auto write = model.addOperation("core.state.latchWrite",
+                                                   std::array{one, data, mask}, {},
+                                                   std::array{grhsim::ObjectRef::state(state)});
+            model.setStateStoreClass(state, StateStoreClass::LargeSink);
+            model.setOperationPhase(write, grhsim::SimPhase::General);
+            if (verifies(model)) return fail("General-phase large scalar latchWrite was accepted");
+            model.setOperationPhase(write, grhsim::SimPhase::LargeSink);
+            if (!verifies(model)) return fail("large-sink scalar latchWrite was rejected");
         }
         // The write family is class-neutral (stage-06): a whole-array write of
         // a mem-class state passes phase attribution as a P_mem write instead
@@ -763,12 +760,12 @@ namespace
             const auto mask = addConstant(model, maskType, "0");
             const auto write = model.addOperation("core.state.write", std::array{one, data, mask},
                                                   {}, std::array{grhsim::ObjectRef::state(mem)});
-            model.setStateStoreClass(mem, StateStoreClass::Mem);
+            model.setStateStoreClass(mem, StateStoreClass::LargeSink);
             // Wrong phase first: a mem-class write must commit in P_mem.
             model.setOperationPhase(write, grhsim::SimPhase::General);
             if (verifies(model))
                 return fail("General-phase whole-array write on a mem-class state was accepted");
-            model.setOperationPhase(write, grhsim::SimPhase::Mem);
+            model.setOperationPhase(write, grhsim::SimPhase::LargeSink);
             if (!verifies(model))
                 return fail("Mem-phase whole-array write on a mem-class state was rejected");
         }
@@ -789,8 +786,8 @@ namespace
         runPass(model, "grhsim.select-state-stores");
         using grhsim::StateStoreClass;
         auto clone = model.clone();
-        if (classOf(clone, "bigMem") != StateStoreClass::Mem ||
-            classOf(clone, "orphan") != StateStoreClass::RegLatch)
+        if (classOf(clone, "bigMem") != StateStoreClass::LargeSink ||
+            classOf(clone, "orphan") != StateStoreClass::SmallSink)
             return fail("clone lost the store classes");
         std::vector<uint8_t> removeOps(model.operations().size() + 1, 0);
         std::vector<uint8_t> removeStates(model.states().size() + 1, 0);
@@ -798,8 +795,8 @@ namespace
             if (model.text(state.name) == "orphan") removeStates[state.id.index] = 1;
         model.compact(removeOps, removeStates);
         if (model.states().size() != 2) return fail("compact did not remove the orphan state");
-        if (classOf(model, "bigMem") != StateStoreClass::Mem ||
-            classOf(model, "q") != StateStoreClass::RegLatch)
+        if (classOf(model, "bigMem") != StateStoreClass::LargeSink ||
+            classOf(model, "q") != StateStoreClass::SmallSink)
             return fail("compact lost the survivors' store classes");
         if (!verifies(model)) return fail("compacted classified model rejected");
         return 0;
@@ -837,7 +834,7 @@ namespace
             std::size_t prevStates = 0;
             for (const auto &state : model.states())
             {
-                if (state.storeClass != StateStoreClass::RegLatch)
+                if (state.storeClass != StateStoreClass::SmallSink)
                     return fail("a state was not classified regLatch");
                 if (model.text(state.name).starts_with("__tslot_prev_")) ++prevStates;
             }
@@ -882,12 +879,12 @@ namespace
         addOutputWrite(model, "oQ", slice);
 
         runPass(model, "grhsim.select-state-stores");
-        if (classOf(model, "q") != grhsim::StateStoreClass::RegLatch)
+        if (classOf(model, "q") != grhsim::StateStoreClass::SmallSink)
             return fail("fixture state was not classified regLatch");
         runPass(model, "grhsim.used-bits");
         if (model.states().size() != 1) return fail("used-bits did not keep exactly one state");
         const auto &state = model.states().front();
-        if (state.storeClass != grhsim::StateStoreClass::RegLatch)
+        if (state.storeClass != grhsim::StateStoreClass::SmallSink)
             return fail("narrowed state lost the regLatch class");
         if (model.types()[state.type.index - 1].width != 4)
             return fail("fixture state was not narrowed");

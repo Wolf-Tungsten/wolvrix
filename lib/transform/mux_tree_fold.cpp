@@ -1,12 +1,15 @@
 #include "transform/mux_tree_fold.hpp"
 
 #include "core/grh.hpp"
+#include "register_write_internal.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -208,15 +211,17 @@ namespace wolvrix::lib::transform
         class Folder
         {
         public:
-            explicit Folder(Graph &graph) : graph_(graph) {}
+            explicit Folder(Graph &graph, bool guardedWrites) : graph_(graph), booleans_(graph),
+                                                               guardedWrites_(guardedWrites) {}
 
             bool run()
             {
                 foldReadTrees();
                 foldWriteGroups();
+                if (guardedWrites_) foldGuardedWriteGroups();
                 foldPadReads();
                 sweepDead();
-                return readTreesFolded_ + writeGroupsFolded_ + padReadsFolded_ > 0;
+                return readTreesFolded_ + writeGroupsFolded_ + padReadsFolded_ + sweptOps_ > 0;
             }
 
             int64_t readTreesFolded() const { return readTreesFolded_; }
@@ -263,7 +268,8 @@ namespace wolvrix::lib::transform
                     }
                     const Operation op = graph_.getOperation(def);
                     if ((op.kind() == OperationKind::kAssign || op.kind() == OperationKind::kConcat) &&
-                        op.operands().size() == 1)
+                        op.operands().size() == 1 &&
+                        graph_.valueWidth(value) == graph_.valueWidth(op.operands()[0]))
                     {
                         value = op.operands()[0];
                         continue;
@@ -311,8 +317,9 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
 
-            std::optional<EqConstMatch> asEqConst(ValueId value) const
+            std::optional<EqConstMatch> asEqConst(ValueId value, unsigned depth = 0) const
             {
+                if (depth > 16) return std::nullopt;
                 value = strip(value);
                 const OperationId def = defOf(value);
                 if (!def.valid())
@@ -320,11 +327,33 @@ namespace wolvrix::lib::transform
                     return std::nullopt;
                 }
                 const OperationKind kind = graph_.opKind(def);
+                const Operation op = graph_.getOperation(def);
+                if (op.operands().size() == 1 && graph_.valueWidth(value) == 1)
+                {
+                    const auto input = strip(op.operands()[0]);
+                    if (kind == OperationKind::kReduceOr || kind == OperationKind::kReduceNor ||
+                        (kind == OperationKind::kLogicNot && graph_.valueWidth(input) > 1))
+                        return EqConstMatch{input, 0, kind != OperationKind::kReduceOr};
+                    if ((kind == OperationKind::kReduceAnd || kind == OperationKind::kReduceNand) &&
+                        graph_.valueWidth(input) <= 64)
+                    {
+                        const auto width = graph_.valueWidth(input);
+                        const auto maximum = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+                        return EqConstMatch{input, maximum, kind == OperationKind::kReduceAnd};
+                    }
+                    if (kind == OperationKind::kNot || kind == OperationKind::kLogicNot)
+                    {
+                        if (auto match = asEqConst(input, depth + 1))
+                        {
+                            match->isEq = !match->isEq;
+                            return match;
+                        }
+                    }
+                }
                 if (kind != OperationKind::kEq && kind != OperationKind::kNe)
                 {
                     return std::nullopt;
                 }
-                const Operation op = graph_.getOperation(def);
                 if (op.operands().size() != 2)
                 {
                     return std::nullopt;
@@ -535,6 +564,11 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
+                const auto lhsShape = graph_.valueShape(lhs), rhsShape = graph_.valueShape(rhs);
+                if (graph_.valueWidth(lhs) != graph_.valueWidth(rhs) ||
+                    graph_.valueSigned(lhs) != graph_.valueSigned(rhs) ||
+                    !std::equal(lhsShape.begin(), lhsShape.end(), rhsShape.begin(), rhsShape.end()))
+                    return false;
                 const OperationId lhsDef = defOf(lhs);
                 const OperationId rhsDef = defOf(rhs);
                 if (!lhsDef.valid() || !rhsDef.valid())
@@ -545,6 +579,9 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
+                if (!isSweepableKind(graph_.opKind(lhsDef)) ||
+                    graph_.opResults(lhsDef).size() != 1 || graph_.opResults(rhsDef).size() != 1)
+                    return false;
                 const auto lhsAttrs = graph_.opAttrs(lhsDef);
                 const auto rhsAttrs = graph_.opAttrs(rhsDef);
                 if (lhsAttrs.size() != rhsAttrs.size())
@@ -1367,6 +1404,341 @@ namespace wolvrix::lib::transform
                 ++writeGroupsFolded_;
             }
 
+            // Guarded assignments produced by register-write-normalize. Unlike
+            // pattern W, one entry may have several mutually exclusive writes,
+            // and reset / whole writes form barriers rather than rejecting the
+            // entire register. Keep the full declaration order at each barrier.
+            struct GuardedPort
+            {
+                OperationId source;
+                ValueId pointer, enable, data;
+                std::unordered_set<uint64_t> rows;
+            };
+
+            using Clause = std::vector<ValueId>;
+            using Clauses = std::vector<Clause>;
+
+            struct DataArm
+            {
+                ValueId data;
+                std::vector<write_detail::Literal> path;
+            };
+
+            bool dataArms(ValueId data, std::vector<write_detail::Literal> &path,
+                          std::vector<DataArm> &arms, unsigned &budget)
+            {
+                if (!budget || path.size() > 64) return false;
+                --budget;
+                data = strip(data);
+                const auto def = defOf(data);
+                if (def.valid() && graph_.opKind(def) == OperationKind::kMux)
+                {
+                    const auto op = graph_.getOperation(def);
+                    if (op.operands().size() != 3 || graph_.valueWidth(op.operands()[0]) != 1) return false;
+                    path.emplace_back(op.operands()[0], true);
+                    if (!dataArms(op.operands()[1], path, arms, budget)) return false;
+                    path.back().second = false;
+                    if (!dataArms(op.operands()[2], path, arms, budget)) return false;
+                    path.pop_back();
+                    return true;
+                }
+                arms.push_back({data, path});
+                return arms.size() <= 64;
+            }
+
+            std::optional<Clauses> guardClauses(ValueId value, int depth = 0)
+            {
+                if (depth > 128) return std::nullopt;
+                value = strip(value);
+                if (const auto c = asConstUint(value))
+                    return *c ? Clauses{Clause{}} : Clauses{};
+                const auto def = defOf(value);
+                if (!def.valid()) return Clauses{Clause{value}};
+                const auto kind = graph_.opKind(def);
+                const auto args = graph_.opOperands(def);
+                const bool isAnd = kind == OperationKind::kAnd || kind == OperationKind::kLogicAnd;
+                const bool isOr = kind == OperationKind::kOr || kind == OperationKind::kLogicOr;
+                if ((!isAnd && !isOr) || args.size() != 2 || graph_.valueWidth(value) != 1)
+                    return Clauses{Clause{value}};
+                auto left = guardClauses(args[0], depth + 1);
+                auto right = guardClauses(args[1], depth + 1);
+                if (!left || !right) return std::nullopt;
+                if (isOr)
+                {
+                    if (left->size() + right->size() > 64) return std::nullopt;
+                    left->insert(left->end(), right->begin(), right->end());
+                    return left;
+                }
+                if (left->size() * right->size() > 64) return std::nullopt;
+                Clauses result;
+                for (const auto &a : *left)
+                    for (const auto &b : *right)
+                    {
+                        Clause clause = a;
+                        clause.insert(clause.end(), b.begin(), b.end());
+                        result.push_back(std::move(clause));
+                    }
+                return result;
+            }
+
+            std::optional<Clauses> minimalGuardClauses(ValueId value)
+            {
+                auto expanded = guardClauses(value);
+                if (!expanded) return std::nullopt;
+                const auto less = [](ValueId a, ValueId b) { return a.index < b.index; };
+                Clauses result;
+                for (auto clause : *expanded)
+                {
+                    for (auto &term : clause) term = strip(term);
+                    std::sort(clause.begin(), clause.end(), less);
+                    clause.erase(std::unique(clause.begin(), clause.end()), clause.end());
+                    std::vector<write_detail::Literal> facts;
+                    for (auto term : clause) facts.emplace_back(term, true);
+                    if (write_detail::contradictory(graph_, facts)) continue;
+                    const auto includes = [&](const Clause &a, const Clause &b) {
+                        return std::includes(a.begin(), a.end(), b.begin(), b.end(), less);
+                    };
+                    if (std::any_of(result.begin(), result.end(), [&](const Clause &prior) {
+                        return includes(clause, prior);
+                    })) continue;
+                    std::erase_if(result, [&](const Clause &prior) { return includes(prior, clause); });
+                    result.push_back(std::move(clause));
+                }
+                return result;
+            }
+
+            ValueId substituteRow(ValueId value, uint64_t row, ValueId pointer,
+                                  std::unordered_map<ValueId, ValueId, ValueIdHash> &memo, int depth = 0)
+            {
+                value = strip(value);
+                if (const auto it = memo.find(value); it != memo.end()) return it->second;
+                if (depth > 128) return value;
+                ValueId result = value;
+                if (graph_.valueWidth(value) == 1)
+                {
+                    if (const auto c = asConstUint(value)) result = booleans_.literal(*c != 0);
+                    else if (const auto def = defOf(value); def.valid())
+                    {
+                        const auto args = graph_.opOperands(def);
+                        const auto kind = graph_.opKind(def);
+                        if (auto eq = asEqConst(value); eq && eq->constant == row &&
+                            graph_.valueWidth(eq->ptr) == graph_.valueWidth(pointer) &&
+                            !graph_.valueSigned(eq->ptr))
+                        {
+                            auto a = strip(eq->ptr), b = pointer;
+                            if (sameValue(a, b, 32)) result = booleans_.literal(eq->isEq);
+                            else
+                            {
+                                if (b.index < a.index) std::swap(a, b);
+                                result = booleans_.gate(eq->isEq ? OperationKind::kEq : OperationKind::kNe, a, b);
+                            }
+                        }
+                        else if ((kind == OperationKind::kNot || kind == OperationKind::kLogicNot) &&
+                                 args.size() == 1 && graph_.valueWidth(args[0]) == 1)
+                            result = booleans_.negate(substituteRow(args[0], row, pointer, memo, depth + 1));
+                        else if ((kind == OperationKind::kAnd || kind == OperationKind::kLogicAnd ||
+                                  kind == OperationKind::kOr || kind == OperationKind::kLogicOr) && args.size() == 2)
+                        {
+                            // Copy IDs before the recursive calls append gates.
+                            const auto a = args[0], b = args[1];
+                            const auto lhs = substituteRow(a, row, pointer, memo, depth + 1);
+                            const auto rhs = substituteRow(b, row, pointer, memo, depth + 1);
+                            result = booleans_.combine(kind == OperationKind::kAnd || kind == OperationKind::kLogicAnd
+                                                      ? OperationKind::kAnd : OperationKind::kOr, lhs, rhs);
+                        }
+                    }
+                }
+                memo.emplace(value, result);
+                return result;
+            }
+
+            uint64_t pointerMaximum(ValueId value, int depth = 0)
+            {
+                value = strip(value);
+                if (auto c = asConstUint(value)) return *c;
+                const auto width = graph_.valueWidth(value);
+                uint64_t bound = width < 63 ? (UINT64_C(1) << width) - 1 : UINT64_MAX;
+                const auto def = defOf(value);
+                if (!def.valid() || depth > 16) return bound;
+                const auto args = graph_.opOperands(def);
+                if (graph_.opKind(def) == OperationKind::kConcat && width < 63)
+                {
+                    bound = 0;
+                    for (auto arg : args)
+                        bound = (bound << graph_.valueWidth(arg)) | pointerMaximum(arg, depth + 1);
+                }
+                return bound;
+            }
+
+            std::optional<std::vector<GuardedPort>> planGuardedSegment(
+                const std::vector<OperationId> &writes, int64_t elementCount, std::string &failure)
+            {
+                const auto reject = [&](std::string why) -> std::optional<std::vector<GuardedPort>> {
+                    failure = std::move(why);
+                    return std::nullopt;
+                };
+                if (writes.size() < 2) return reject("segment-too-small");
+                std::vector<GuardedPort> ports;
+                std::map<uint64_t, std::vector<std::size_t>> orderByRow;
+                const auto reference = graph_.getOperation(writes.front());
+                const auto start = wolvrix::lib::grh::firstEventOperandIndex(reference);
+                if (!start) return reject("missing-event-signature");
+                for (auto id : writes)
+                {
+                    const auto op = graph_.getOperation(id);
+                    const auto eventStart = wolvrix::lib::grh::firstEventOperandIndex(op);
+                    if (!eventStart || *start != *eventStart ||
+                        op.attr("eventEdge") != reference.attr("eventEdge") ||
+                        op.operands().size() != reference.operands().size()) return reject("event-signature-mismatch");
+                    for (std::size_t i = *start; i < op.operands().size(); ++i)
+                        if (!sameValue(op.operands()[i], reference.operands()[i], 16)) return reject("event-value-mismatch");
+                    const auto row = asConstUint(op.operands()[1]);
+                    if (!row || *row >= static_cast<uint64_t>(elementCount)) return reject("invalid-static-row");
+                    std::vector<DataArm> arms;
+                    std::vector<write_detail::Literal> path;
+                    unsigned budget = 256;
+                    if (!dataArms(op.operands()[2], path, arms, budget)) return reject("data-expansion-budget");
+                    for (const auto &arm : arms)
+                    {
+                        auto guard = op.operands()[0];
+                        for (const auto &[condition, positive] : arm.path)
+                            guard = booleans_.combine(OperationKind::kAnd, guard,
+                                positive ? condition : booleans_.negate(condition));
+                        const auto clauses = minimalGuardClauses(guard);
+                        if (!clauses) return reject("guard-expansion-budget");
+                        for (const auto &clause : *clauses)
+                        {
+                            std::optional<EqConstMatch> anchor;
+                            for (auto term : clause)
+                            {
+                                auto eq = asEqConst(term);
+                                if (eq && eq->isEq && eq->constant == *row &&
+                                    !graph_.valueSigned(eq->ptr) && graph_.valueShape(eq->ptr).empty())
+                                { anchor = eq; break; }
+                            }
+                            if (!anchor) return reject("no-address-equality-row-" + std::to_string(*row));
+                            const auto pointer = strip(anchor->ptr);
+                            auto enable = booleans_.literal(true);
+                            std::unordered_map<ValueId, ValueId, ValueIdHash> memo;
+                            std::vector<ValueId> terms;
+                            for (auto term : clause)
+                                terms.push_back(substituteRow(term, *row, pointer, memo));
+                            std::sort(terms.begin(), terms.end(), [](ValueId a, ValueId b) { return a.index < b.index; });
+                            terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+                            for (auto term : terms)
+                                enable = booleans_.combine(OperationKind::kAnd, enable, term);
+                            std::size_t slot = 0;
+                            for (; slot < ports.size(); ++slot)
+                                if (sameValue(pointer, ports[slot].pointer, 32) &&
+                                    enable == ports[slot].enable && sameValue(arm.data, ports[slot].data, 32)) break;
+                            if (slot == ports.size())
+                            {
+                                if (ports.size() >= 128) return reject("source-budget-row-" + std::to_string(*row));
+                                ports.push_back({id, pointer, enable, arm.data, {}});
+                            }
+                            ports[slot].rows.insert(*row);
+                            orderByRow[*row].push_back(slot);
+                        }
+                    }
+                }
+                if (ports.empty()) return reject("no-live-sources");
+                if (ports.size() >= writes.size()) return reject("no-port-reduction");
+                for (const auto &port : ports)
+                {
+                    const uint64_t maximum = pointerMaximum(port.pointer);
+                    const uint64_t count = maximum >= static_cast<uint64_t>(elementCount - 1)
+                                               ? elementCount : maximum + 1;
+                    if (port.rows.size() != count)
+                        return reject("row-coverage-" + std::to_string(port.rows.size()) + "/" + std::to_string(count) +
+                            " pointer=" + std::string(graph_.getValue(port.pointer).symbolText()) +
+                            " enable=" + std::string(graph_.getValue(port.enable).symbolText()) +
+                            " data=" + std::string(graph_.getValue(port.data).symbolText()));
+                    for (uint64_t row = 0; row < count; ++row)
+                        if (!port.rows.contains(row)) return reject("missing-row-" + std::to_string(row));
+                }
+                // Folding must admit one common priority order across rows.
+                std::vector<std::set<std::size_t>> next(ports.size());
+                std::vector<unsigned> indegree(ports.size());
+                for (const auto &[row, order] : orderByRow)
+                    for (std::size_t i = 1; i < order.size(); ++i)
+                        if (order[i - 1] != order[i] && next[order[i - 1]].insert(order[i]).second)
+                            ++indegree[order[i]];
+                std::set<std::size_t> ready;
+                for (std::size_t i = 0; i < ports.size(); ++i) if (!indegree[i]) ready.insert(i);
+                std::vector<GuardedPort> ordered;
+                while (!ready.empty())
+                {
+                    const auto id = *ready.begin();
+                    ready.erase(ready.begin());
+                    ordered.push_back(ports[id]);
+                    for (auto successor : next[id]) if (!--indegree[successor]) ready.insert(successor);
+                }
+                if (ordered.size() != ports.size()) return reject("priority-cycle");
+                return ordered;
+            }
+
+            void foldGuardedWriteGroups()
+            {
+                std::map<std::string, std::vector<OperationId>> groups;
+                for (auto id : graph_.operations())
+                {
+                    if (!id.valid() || erased_.contains(id) ||
+                        !wolvrix::lib::grh::isRegisterWritePortKind(graph_.opKind(id))) continue;
+                    const auto attr = graph_.getOperation(id).attr("regSymbol");
+                    if (const auto *symbol = attr ? std::get_if<std::string>(&*attr) : nullptr)
+                        groups[*symbol].push_back(id);
+                }
+                for (const auto &[symbol, writes] : groups)
+                {
+                    const auto *reg = findRegister(symbol);
+                    if (!reg) continue;
+                    std::vector<GuardedPort> replacement;
+                    std::vector<OperationId> segment;
+                    bool changed = false;
+                    const auto flush = [&] {
+                        std::string failure;
+                        if (auto folded = planGuardedSegment(segment, reg->elemCount, failure))
+                        {
+                            replacement.insert(replacement.end(), folded->begin(), folded->end());
+                            changed = true;
+                        }
+                        else
+                        {
+                            if (std::getenv("WOLVRIX_MUXFOLD_DEBUG") && segment.size() >= 32)
+                                debugLines.push_back("guarded-write " + symbol + " writes=" +
+                                    std::to_string(segment.size()) + " first=" + failure);
+                            for (auto id : segment) replacement.push_back({id, {}, {}, {}, {}});
+                        }
+                        segment.clear();
+                    };
+                    for (auto id : writes)
+                    {
+                        const auto op = graph_.getOperation(id);
+                        if (op.kind() == OperationKind::kRegisterWriteArrayPort &&
+                            wolvrix::lib::grh::arrayPortIndexCount(op) == 1 &&
+                            op.operands().size() >= 3 && asConstUint(op.operands()[1]))
+                            segment.push_back(id);
+                        else
+                        {
+                            flush();
+                            replacement.push_back({id, {}, {}, {}, {}});
+                        }
+                    }
+                    flush();
+                    if (!changed) continue;
+                    for (const auto &port : replacement)
+                    {
+                        const auto source = graph_.getOperation(port.source);
+                        std::vector<ValueId> args(source.operands().begin(), source.operands().end());
+                        if (port.pointer.valid())
+                        { args[0] = port.enable; args[1] = port.pointer; args[2] = port.data; }
+                        write_detail::copyWrite(graph_, source, args);
+                    }
+                    for (auto id : writes) { erased_.insert(id); graph_.eraseOp(id); }
+                    ++writeGroupsFolded_;
+                }
+            }
+
             // ---- pattern P: padded-concat dynamic read -> clamped array read ----
 
             // Map a concat input (an element-width slice) to its source register
@@ -2011,6 +2383,8 @@ namespace wolvrix::lib::transform
             }
 
             Graph &graph_;
+            write_detail::BooleanBuilder booleans_;
+            bool guardedWrites_;
             std::unordered_map<std::string, RegisterInfo> regs_;
             std::unordered_set<OperationId, OperationIdHash> erased_;
             std::unordered_set<ValueId, ValueIdHash> foldedTreeResults_;
@@ -2026,10 +2400,10 @@ namespace wolvrix::lib::transform
 
     } // namespace
 
-    MuxTreeFoldPass::MuxTreeFoldPass()
+    MuxTreeFoldPass::MuxTreeFoldPass(bool guardedWrites)
         : Pass("mux-tree-fold", "mux-tree-fold",
                "Fold constant-index mux trees / per-element write decoders / padded-concat "
-               "reads back into dynamic array accesses")
+               "reads back into dynamic array accesses"), guardedWrites_(guardedWrites)
     {
     }
 
@@ -2039,7 +2413,7 @@ namespace wolvrix::lib::transform
         for (const auto &entry : design().graphs())
         {
             Graph &graph = *entry.second;
-            Folder folder(graph);
+            Folder folder(graph, guardedWrites_);
             const bool folded = folder.run();
             if (folded)
             {

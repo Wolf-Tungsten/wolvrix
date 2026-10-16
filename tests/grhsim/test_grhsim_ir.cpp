@@ -112,7 +112,7 @@ namespace
         bool foundWrite = false;
         for (const auto &op : model->operations())
         {
-            if (model->text(op.opType) != "core.state.write") continue;
+            if (model->text(op.opType) != "core.state.writeMask") continue;
             foundWrite = true;
             const auto refs = model->objectRefs(op);
             if (refs.size() != 1 || refs[0].kind != grhsim::ObjectKind::State)
@@ -127,7 +127,7 @@ namespace
             if (operands.size() != 4)
                 return fail("register write lost its trailing event operand");
         }
-        if (!foundWrite) return fail("core.state.write is missing");
+        if (!foundWrite) return fail("core.state.writeMask is missing");
         for (const auto &state : model->states())
             if (model->text(state.name).starts_with("__event_"))
                 return fail("convert materialized an event-history state");
@@ -1939,23 +1939,23 @@ namespace {
                 std::array{one, next, mask}, {}, std::array{ObjectRef::state(lq)}), SimPhase::General);
             model.setOperationPhase(model.addOperation("core.state.writeArray",
                 std::array{one, one, one, one, clk}, {}, std::array{ObjectRef::state(mem)}, edges()),
-                SimPhase::Mem);
+                SimPhase::LargeSink);
             model.setOperationPhase(model.addOperation("core.state.fill",
                 std::array{one, one, clk}, {}, std::array{ObjectRef::state(fillMem)}, edges()),
-                SimPhase::Mem);
+                SimPhase::LargeSink);
             // Whole-array write (the stage-06 write absorbs the old assign
             // form): data is the state's full type, mask its full bit width.
             model.setOperationPhase(model.addOperation("core.state.write",
                 std::array{one, row, mask16, clk}, {}, std::array{ObjectRef::state(wholeMem)}, edges()),
-                SimPhase::Mem);
+                SimPhase::LargeSink);
             // Two writes on one state apply in declaration order, later
             // writes winning (the stage-06 sequence-write replacement).
             model.setOperationPhase(model.addOperation("core.state.writeArray",
                 std::array{one, one, zero, one, clk}, {}, std::array{ObjectRef::state(seqMem)},
-                edges()), SimPhase::Mem);
+                edges()), SimPhase::LargeSink);
             model.setOperationPhase(model.addOperation("core.state.writeArray",
                 std::array{one, one, one, one, clk}, {}, std::array{ObjectRef::state(seqMem)},
-                edges()), SimPhase::Mem);
+                edges()), SimPhase::LargeSink);
             const auto read = model.addValue(word);
             // The output cone is self-contained (M2b verifier): the read
             // feeding an Output-phase output.write must be Output itself.
@@ -2020,6 +2020,22 @@ namespace {
             model.setOperationPhase(model.addOperation("core.event.edgeDet", std::array{clk}, {}, {}, params),
                                     SimPhase::Event);
             if (verify(model)) return fail("edgeDet without an edge parameter passed verification");
+        }
+        for (const bool shaped : {false, true})
+        {
+            GrhSimModel model(shaped ? "edge_det_shaped" : "edge_det_wide");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const std::array<int64_t, 1> shape{1};
+            const auto eventType = shaped ? model.logicType(1, false, LogicDomain::TwoState, shape)
+                                          : model.logicType(2, false, LogicDomain::TwoState);
+            const auto port = model.addInput("event", eventType);
+            const auto event = model.addValue(eventType);
+            model.setOperationPhase(model.addOperation("core.input.read", {}, std::array{event},
+                                                       std::array{ObjectRef::input(port)}), SimPhase::Event);
+            edgeDet(model, event, "posedge", 0, 0);
+            if (verify(model))
+                return fail(shaped ? "shaped 1-bit edgeDet passed verification"
+                                   : "wide scalar edgeDet passed verification");
         }
         {
             GrhSimModel model("edge_det_bad_edge"); model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
@@ -2193,9 +2209,8 @@ namespace {
                                      std::array{result}, std::array{ObjectRef::state(f.state)});
             }))
             return status;
-        // stage-07: a shape view on an index value is benign — the index is
-        // read as a flat integer (packed-first doctrine, same as the GRH-side
-        // contract), so a shaped logic index must be accepted.
+        // Packed-first: an index consumes the flattened logic bits, so its
+        // shape view does not affect readArray validity.
         {
             Rank2Fixture fixture;
             const auto result = fixture.model.addValue(fixture.sub);
@@ -2276,9 +2291,9 @@ namespace {
             const auto elemRead = f.model.addValue(f.element);
             f.model.addOperation("core.state.readArray", std::array{f.i0, f.i1}, std::array{elemRead},
                                  std::array{ObjectRef::state(f.state)});
-            f.model.addOperation("core.state.writeArray", std::array{f.en, f.i0, f.data12, f.mask12v},
+            f.model.addOperation("core.state.writeArray", std::array{f.en, f.i0, f.data12},
                                  {}, std::array{ObjectRef::state(f.state)});
-            f.model.addOperation("core.state.writeArray",
+            f.model.addOperation("core.state.writeArrayMask",
                                  std::array{f.en, f.i0, f.i1, f.data4, f.mask4v}, {},
                                  std::array{ObjectRef::state(f.state)});
             f.model.addOperation("core.state.fill", std::array{f.en, f.data4}, {},
@@ -2342,8 +2357,8 @@ namespace {
                     ++elemReads;
                     elemReadTypeOk = resultType().width == 4 && resultType().shape.empty();
                 }
-                else if (name == "core.state.writeArray" && operands.size() == 4) ++subWrites;
-                else if (name == "core.state.writeArray" && operands.size() == 5) ++elemWrites;
+                else if (name == "core.state.writeArray" && operands.size() == 3) ++subWrites;
+                else if (name == "core.state.writeArrayMask" && operands.size() == 5) ++elemWrites;
                 else if (name == "core.state.fill") ++fills;
                 else if (name == "core.state.write") ++writes;
             }

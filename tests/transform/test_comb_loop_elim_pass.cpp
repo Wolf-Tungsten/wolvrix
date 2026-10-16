@@ -265,6 +265,48 @@ namespace
         return 0;
     }
 
+    int test_false_loop_dynamic_slice_nested_offset()
+    {
+        using namespace wolvrix::lib::grh;
+        for (const int64_t index : {0, 11})
+        {
+            Design design;
+            Graph &graph = design.createGraph("g_dyn_nested_offset");
+            const auto input = makeValue(graph, "input", 20);
+            const auto output = makeValue(graph, "output", 1);
+            const auto bus = makeValue(graph, "bus", 21);
+            const auto lane = makeValue(graph, "lane", 12);
+            graph.bindInputPort("input", input);
+            graph.bindOutputPort("output", output);
+
+            // bus = {input, output}; lane = bus[20:9] = input[19:8].
+            // The apparent cycle vanishes when the slices select input.
+            makeConcat(graph, "bus_concat", {input, output}, bus);
+            makeSliceStatic(graph, bus, lane, 9, 20, "lane_slice");
+            const auto selector = makeConst(graph, "selector", 4, "4'd" + std::to_string(index));
+            const auto select = makeSliceDynamic(graph, lane, selector, output, 1, "select");
+
+            PassManager manager;
+            manager.addPass(std::make_unique<CombLoopElimPass>());
+            manager.addPass(std::make_unique<GrhVerifyPass>());
+            PassDiagnostics diagnostics;
+            const auto result = manager.run(design, diagnostics);
+            if (!result.success || diagnostics.hasError())
+                return fail("Nested constant-index slice should eliminate the false loop");
+
+            const auto rewritten = graph.getOperation(select);
+            if (rewritten.kind() != OperationKind::kSliceStatic ||
+                rewritten.operands().size() != 1 || rewritten.operands()[0] != input)
+                return fail("Retargeted constant-index slice must select the input with a static offset");
+            const auto low = rewritten.attr("sliceStart");
+            const auto high = rewritten.attr("sliceEnd");
+            if (!low || !high || std::get<int64_t>(*low) != index + 8 ||
+                std::get<int64_t>(*high) != index + 8 || rewritten.attr("sliceWidth"))
+                return fail("Retargeted nested slice lost its input[19:8] offset");
+        }
+        return 0;
+    }
+
     int test_false_loop_dynamic_slice_retargeted()
     {
         wolvrix::lib::grh::Design design;
@@ -1420,6 +1462,10 @@ int main()
         return rc;
     }
     if (int rc = test_true_loop_reported(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_false_loop_dynamic_slice_nested_offset(); rc != 0)
     {
         return rc;
     }

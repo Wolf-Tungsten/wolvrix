@@ -570,19 +570,22 @@ namespace wolvrix::lib::grhsim
                     const auto dataAt = [&](std::size_t index) {
                         if (index < operands.size()) addCandidate(operands[index], op.id, "storage-data");
                     };
-                    if (name == "core.state.write" || name == "core.state.latchWrite") dataAt(1);
+                    if (name == "core.state.write" || name == "core.state.writeMask" ||
+                        name == "core.state.latchWrite") dataAt(1);
                     else if (name == "core.state.fill") dataAt(1);
-                    else if (name == "core.state.writeArray")
+                    else if (name == "core.state.writeArray" || name == "core.state.writeArrayMask")
                     {
-                        // [en, i0..ik-1, data, mask, events...]: data is the
-                        // penultimate operand before the trailing events. The
+                        // [en, i0..ik-1, data, (mask), events...]: data is the
+                        // last payload operand before the trailing events. The
                         // pre-lowering form carries len(event_edges) event
                         // operands; the lowered event_acts form has no tail.
                         uint64_t events = 0;
                         for (const auto &p : model.parameters(op))
                             if (model.text(p.name) == "event_edges")
                                 events = std::get<std::vector<std::string>>(p.value).size();
-                        if (operands.size() >= events + 4) dataAt(operands.size() - events - 2);
+                        const bool masked = name == "core.state.writeArrayMask";
+                        if (operands.size() >= events + (masked ? 4 : 3))
+                            dataAt(operands.size() - events - (masked ? 2 : 1));
                     }
                 }
 

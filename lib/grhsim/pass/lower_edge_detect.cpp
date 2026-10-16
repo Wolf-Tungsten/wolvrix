@@ -28,40 +28,10 @@ namespace wolvrix::lib::grhsim
 
         bool isEventConsumerType(std::string_view name) noexcept
         {
-            return name == "core.state.write" || name == "core.state.writeArray" ||
+            return name == "core.state.write" || name == "core.state.writeMask" ||
+                   name == "core.state.writeArray" || name == "core.state.writeArrayMask" ||
                    name == "core.state.fill" || name == "core.system.task" ||
                    name == "core.dpi.call";
-        }
-
-        // Stage-06: the write family is target-neutral (core.state.write serves
-        // both scalar states — the retired regWrite — and whole-array writes),
-        // so the op name alone no longer decides who waits for B5. A rewritten
-        // write keeps phase None (left for grhsim.split-phases' class-aware
-        // routing) exactly when its target state is shaped; scalar writes and
-        // latchWrites join P_general like the old regWrite. Unresolvable refs
-        // mirror verifyPhaseAttribution's fallback (writeArray/fill are
-        // array-only, so they stay None).
-        bool writeKeepsPhaseNone(const GrhSimModel &model, const SimOp &op, std::string_view name)
-        {
-            if (name == "core.state.writeArray" || name == "core.state.fill") return true;
-            if (name != "core.state.write") return false;
-            std::span<const ObjectRef> refs;
-            try
-            {
-                refs = model.objectRefs(op);
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
-            if (refs.empty() || refs[0].kind != ObjectKind::State ||
-                refs[0].index == 0 || refs[0].index > model.states().size())
-                return false;
-            const StateObject &state = model.states()[refs[0].index - 1];
-            if (state.type.generation != 0 || !state.type.valid() ||
-                state.type.index > model.types().size())
-                return true;
-            return !model.types()[state.type.index - 1].shape.empty();
         }
 
         bool validEdge(std::string_view edge) noexcept
@@ -377,9 +347,10 @@ namespace wolvrix::lib::grhsim
                         if (!inserted) continue;
                         const auto &type =
                             model.types()[model.values()[event.index - 1].type.index - 1];
-                        if (type.kind != TypeKind::Logic)
+                        if (type.kind != TypeKind::Logic || type.width != 1 ||
+                            !type.shape.empty())
                         {
-                            diagnostics.error("event operand must be a core.logic value",
+                            diagnostics.error("event operand must be unshaped 1-bit core.logic",
                                               "operations[" +
                                                   std::to_string(op.id.index - 1) + "]");
                             return {false, false, {}};
@@ -469,12 +440,14 @@ namespace wolvrix::lib::grhsim
                                                        model.results(op).end());
                     const auto opType = std::string(model.text(op.opType));
                     model.replaceOperation(op.id, opType, newOperands, results, newRefs, newParams);
-                    // Shaped-target writes keep phase None for the B5 semantic
-                    // split (grhsim.split-phases, class-aware); every other
-                    // consumer joins P_general.
-                    model.setOperationPhase(op.id, writeKeepsPhaseNone(model, op, opType)
-                                                       ? SimPhase::None
-                                                       : SimPhase::General);
+                    // State size is classified after event lowering. Keep all
+                    // writes unattributed until the class-aware phase split.
+                    const bool stateWrite = opType == "core.state.write" ||
+                                            opType == "core.state.writeMask" ||
+                                            opType == "core.state.writeArray" ||
+                                            opType == "core.state.writeArrayMask" ||
+                                            opType == "core.state.fill";
+                    model.setOperationPhase(op.id, stateWrite ? SimPhase::None : SimPhase::General);
                 }
 
                 // Sweep any unreferenced __event_* history state left by a

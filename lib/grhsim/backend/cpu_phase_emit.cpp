@@ -161,18 +161,38 @@ namespace wolvrix::lib::grhsim
             }
             return text;
         }
-        // Packs `rows` consecutive rows of the flat store array `store`,
+        // Address one element of a nested, row-major physical array. Packed
+        // value bridges still enumerate linear bit rows, while the store
+        // declaration retains every source dimension.
+        std::string rowAccessText(const std::string &store, std::span<const int64_t> shape,
+                                  const std::string &row)
+        {
+            std::string cell = store;
+            for (std::size_t dimension = 0; dimension < shape.size(); ++dimension)
+            {
+                uint64_t stride = 1;
+                for (std::size_t next = dimension + 1; next < shape.size(); ++next)
+                    stride *= static_cast<uint64_t>(shape[next]);
+                std::string index = "(" + row + ")";
+                if (stride != 1) index += "/" + std::to_string(stride);
+                if (dimension != 0) index = "(" + index + ")%" + std::to_string(shape[dimension]);
+                cell += '[' + index + ']';
+            }
+            return cell;
+        }
+        // Packs `rows` consecutive rows of the shaped store array `store`,
         // starting at the row expression `baseRow` (empty = row 0), into the
         // total-width flat value. Physical cells hold clean elementWidth-bit
         // values (the padding invariant), so each row is truncated before the
         // shift; the shift stays below the container width (no UB). With
         // rowCount > 0, rows at/after rowCount read as zero (the legacy
         // sliceArray out-of-range semantics).
-        std::string packStoreRows(const std::string &store, const std::string &baseRow, uint64_t rows,
+        std::string packStoreRows(const std::string &store, std::span<const int64_t> shape,
+                                  const std::string &baseRow, uint64_t rows,
                                   uint32_t elementWidth, uint32_t totalWidth, uint64_t rowCount = 0)
         {
             const std::string rowIndex = baseRow.empty() ? std::string("cpu_j") : baseRow + "+cpu_j";
-            const std::string cell = store + '[' + rowIndex + ']';
+            const std::string cell = rowAccessText(store, shape, rowIndex);
             std::string element = elementWidth > 64 ? cell : truncRaw("(std::uint64_t)(" + cell + ")", elementWidth);
             if (rowCount)
             {
@@ -181,6 +201,21 @@ namespace wolvrix::lib::grhsim
                 element = "((" + rowIndex + ")<" + std::to_string(rowCount) + "?" + element + ":" + zero + ")";
             }
             const std::string loop = "for(std::size_t cpu_j=0;cpu_j<" + std::to_string(rows) + ";++cpu_j)";
+            if (totalWidth > 64 && baseRow.empty() && !rowCount &&
+                rows * elementWidth == totalWidth &&
+                (elementWidth == 8 || elementWidth == 16 || elementWidth == 32 || elementWidth == 64))
+            {
+                // These cells have no padding: on little-endian targets their
+                // array image already is the packed value. In particular, a
+                // subsequent constant slice can become a single scalar load
+                // instead of repacking hundreds of rows on every read.
+                return "([&](){ " + wideType(totalWidth) + " cpu_pk=0;\n"
+                       "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                       "std::memcpy(&cpu_pk,&" + store + "," + std::to_string(totalWidth / 8) + ");\n"
+                       "#else\n" + loop + "cpu_pk|=(" + wideType(totalWidth) + ")(" + element +
+                       ")<<(cpu_j*" + std::to_string(elementWidth) + ");\n"
+                       "#endif\nreturn cpu_pk;}())";
+            }
             if (totalWidth > 64)
                 return "([&](){ " + wideType(totalWidth) + " cpu_pk=0;" + loop + "cpu_pk|=(" + wideType(totalWidth) +
                        ")(" + element + ")<<(cpu_j*" + std::to_string(elementWidth) + ");return cpu_pk;}())";
@@ -522,6 +557,8 @@ namespace wolvrix::lib::grhsim
                   regFieldByState_(model.states().size() + 1),
                   memFieldByState_(model.states().size() + 1),
                   boundaryByValue_(model.values().size() + 1),
+                  boundaryByUse_(model.values().size() + 1),
+                  boundaryFieldsByValue_(model.values().size() + 1),
                   boundaryByInput_(model.inputs().size() + 1),
                   inputFanout_(model.values().size() + 1),
                   supernodeFanout_(model.values().size() + 1),
@@ -532,17 +569,24 @@ namespace wolvrix::lib::grhsim
                 for (const auto &store : stores_)
                     switch (store.kind)
                     {
-                    case CpuNamedStoreKind::RegLatch: regLatchStore_ = &store; break;
-                    case CpuNamedStoreKind::Mem: memStore_ = &store; break;
-                    case CpuNamedStoreKind::Boundary: boundaryStore_ = &store; break;
+                    case CpuNamedStoreKind::SmallSink: smallSinkStore_ = &store; break;
+                    case CpuNamedStoreKind::LargeSink: largeSinkStore_ = &store; break;
+                    case CpuNamedStoreKind::Input: boundaryStores_[0] = &store; break;
+                    case CpuNamedStoreKind::NonSinkBoundary: boundaryStores_[1] = &store; break;
+                    case CpuNamedStoreKind::SmallSinkEnableBoundary: boundaryStores_[2] = &store; break;
+                    case CpuNamedStoreKind::SmallSinkPayloadBoundary: boundaryStores_[3] = &store; break;
+                    case CpuNamedStoreKind::LargeSinkEnableBoundary: boundaryStores_[4] = &store; break;
+                    case CpuNamedStoreKind::LargeSinkPayloadBoundary: boundaryStores_[5] = &store; break;
                     case CpuNamedStoreKind::PrevEvent: prevEventStore_ = &store; break;
                     case CpuNamedStoreKind::EventAct: eventActStore_ = &store; break;
                     case CpuNamedStoreKind::TimeslotTrigger: timeslotStore_ = &store; break;
                     case CpuNamedStoreKind::ActiveFlags: activeStore_ = &store; break;
                     }
-                if (!regLatchStore_ || !memStore_ || !boundaryStore_ || !prevEventStore_ || !eventActStore_ ||
-                    !timeslotStore_ || !activeStore_)
-                    throw std::runtime_error("CPU six-phase emit requires all seven named stores");
+                if (!smallSinkStore_ || !largeSinkStore_ || !prevEventStore_ || !eventActStore_ ||
+                    !timeslotStore_ || !activeStore_ ||
+                    std::any_of(boundaryStores_.begin(), boundaryStores_.end(),
+                                [](const CpuNamedStore *store) { return !store; }))
+                    throw std::runtime_error("CPU six-phase emit requires all twelve named stores");
 
                 order_ = generalSupernodeOrder(tree_);
                 supernodeCount_ = static_cast<uint32_t>(order_.size());
@@ -607,7 +651,7 @@ namespace wolvrix::lib::grhsim
                 // V2 (M2): the P_event activation map (act -> non-sink
                 // supernodes holding an op with that act) replaces the pre-v2
                 // influence bitmaps; emitEdgeDet ORs the fired acts' words
-                // straight into dataActiveFlag (eventActiveFlag is gone).
+                // straight into nonSinkActiveFlag (eventActiveFlag is gone).
                 if (schedule_.eventActivation)
                     for (const auto &entry : *schedule_.eventActivation)
                         activationByAct_[entry.act] = &entry;
@@ -640,20 +684,25 @@ namespace wolvrix::lib::grhsim
                         maxTimeslotFlag_ = std::max(maxTimeslotFlag_, trigger.flag);
                     }
 
-                for (const auto &field : regLatchStore_->fields) regFieldByState_[field.state.index] = &field;
-                for (const auto &field : memStore_->fields) memFieldByState_[field.state.index] = &field;
-                for (const auto &field : boundaryStore_->fields)
-                {
-                    if (field.value) boundaryByValue_[field.value.index] = &field;
-                    else if (field.aux < model_.inputs().size()) boundaryByInput_[field.aux + 1] = &field;
-                    // M5d-7: string-typed boundary fields live in the separate
-                    // boundaryStrings array so the store struct stays trivially
-                    // copyable (memset reset in init); a 684k-field struct
-                    // value-initializing one std::string member never
-                    // finishes -O1 compilation (measured on XS).
-                    if (layout_.types[field.type.index - 1].kind == CpuTypeKind::String)
-                        boundaryStringSlot_[&field] = boundaryStringCount_++;
-                }
+                for (const auto &field : smallSinkStore_->fields) regFieldByState_[field.state.index] = &field;
+                for (const auto &field : largeSinkStore_->fields) memFieldByState_[field.state.index] = &field;
+                for (std::size_t storeIndex = 0; storeIndex < boundaryStores_.size(); ++storeIndex)
+                    for (const auto &field : boundaryStores_[storeIndex]->fields)
+                    {
+                        boundaryKindByField_[&field] = boundaryStores_[storeIndex]->kind;
+                        if (storeIndex == 0)
+                            boundaryByInput_[field.aux + 1] = &field;
+                        else if (field.value)
+                        {
+                            if (!boundaryByValue_[field.value.index]) boundaryByValue_[field.value.index] = &field;
+                            boundaryByUse_[field.value.index][storeIndex - 1] = &field;
+                            boundaryFieldsByValue_[field.value.index].push_back(&field);
+                        }
+                        // String boundary fields stay outside the trivially
+                        // resettable store structs.
+                        if (layout_.types[field.type.index - 1].kind == CpuTypeKind::String)
+                            boundaryStringSlot_[&field] = boundaryStringCount_++;
+                    }
                 const auto ordinals = [&](std::span<const PartitionId> targets) {
                     std::vector<uint32_t> result;
                     result.reserve(targets.size());
@@ -666,6 +715,31 @@ namespace wolvrix::lib::grhsim
                     supernodeFanout_[row.source.index] = ordinals(row.targets.activate);
                 for (const auto &row : schedule_.commitStateFanout)
                     stateFanout_[row.source.index] = ordinals(row.targets.activate);
+
+                // Repeated event-free writers can temporarily change a state
+                // and restore it in the same round. Notify readers only for
+                // the final change, otherwise these writes never quiesce.
+                std::vector<uint32_t> freeWrites(model_.states().size() + 1);
+                for (const auto &op : model_.operations())
+                {
+                    if (op.phase != SimPhase::General && op.phase != SimPhase::LargeSink) continue;
+                    if (!isCpuPhaseMemWriteOp(model_.text(op.opType)) ||
+                        !readCpuPhaseEventActs(model_, op).empty()) continue;
+                    const auto refs = model_.objectRefs(op);
+                    if (refs.size() == 1 && refs[0].kind == ObjectKind::State)
+                        ++freeWrites[refs[0].index];
+                }
+                for (const auto &field : smallSinkStore_->fields)
+                    if (freeWrites[field.state.index] > 1 && !stateFanout_[field.state.index].empty())
+                        smallFinalChange_.insert(field.state.index);
+                if (schedule_.memWritePlan)
+                    for (const auto &entry : *schedule_.memWritePlan)
+                    {
+                        const auto &op = model_.operations()[entry.writeOp.index - 1];
+                        const auto state = model_.objectRefs(op).front().index;
+                        if (freeWrites[state] > 1 && !entry.readers.empty())
+                            largeFinalChange_.try_emplace(state, entry.readers);
+                    }
                 activeLocals_.assign(model_.values().size() + 1, 0);
 
                 std::unordered_map<std::string, uint32_t> randomSlots;
@@ -706,15 +780,15 @@ namespace wolvrix::lib::grhsim
                 // Constant-valued boundary fields are preloaded at init() so a
                 // consumer can never observe a stale zero before the producer
                 // supernode fires; the producer's compare-store then never fires.
-                for (const auto &field : boundaryStore_->fields)
-                {
-                    if (!field.value) continue;
-                    const auto producer = producers_[field.value.index];
-                    if (!producer) continue;
-                    const auto &op = model_.operations()[producer.index - 1];
-                    if (model_.text(op.opType) != "core.compute.constant") continue;
-                    constBoundaryInit_.emplace(&field, expression(op));
-                }
+                for (std::size_t storeIndex = 1; storeIndex < boundaryStores_.size(); ++storeIndex)
+                    for (const auto &field : boundaryStores_[storeIndex]->fields)
+                    {
+                        const auto producer = producers_[field.value.index];
+                        if (!producer) continue;
+                        const auto &op = model_.operations()[producer.index - 1];
+                        if (model_.text(op.opType) != "core.compute.constant") continue;
+                        constBoundaryInit_.emplace(&field, expression(op));
+                    }
                 // Input port -> fanout ordinals, via the input.read producers of
                 // the inputFanout row source values.
                 for (uint32_t valueIndex = 0; valueIndex < inputFanout_.size(); ++valueIndex)
@@ -749,7 +823,7 @@ namespace wolvrix::lib::grhsim
                         case CpuEmitChunkKind::GeneralScan: chunkIds_[key] = scanChunks_.size(); scanChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Supernode: supernodeChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::SupernodePart: supernodePartChunks_.push_back(chunk); break;
-                        case CpuEmitChunkKind::Mem: chunkIds_[key] = memChunks_.size(); memChunks_.push_back(chunk); break;
+                        case CpuEmitChunkKind::LargeSink: chunkIds_[key] = memChunks_.size(); memChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Output: chunkIds_[key] = outputChunks_.size(); outputChunks_.push_back(chunk); break;
                         case CpuEmitChunkKind::Dump: chunkIds_[key] = dumpChunks_.size(); dumpChunks_.push_back(chunk); break;
                         }
@@ -798,7 +872,7 @@ namespace wolvrix::lib::grhsim
                 // Init stream metadata (the cpu_init_<k> chunks iterate it by
                 // position): flattened steps, then the constant-boundary
                 // preloads in store offset order, then the prevEvent inits in
-                // act order, then the regLatchStoreNext sync.
+                // act order, then the smallSinkStoreNext sync.
                 for (const auto &record : model_.initRecords())
                     for (const auto &step : model_.steps(record))
                         initSteps_.push_back({record.state, &step});
@@ -825,54 +899,66 @@ namespace wolvrix::lib::grhsim
                     if (covered != supernodeCount_)
                         throw std::runtime_error("CPU six-phase emit TU plan scan chunks do not tile the supernodes");
                 }
-                // P_mem enable shadow bitmap (default on; --mem-enable-bitmap off
-                // disables): the per-port write enable used to be re-read from its
-                // scattered BoundaryValueStore field every round; here each 1-bit
-                // two-state boundary-backed enable gets one dense bit. The bit
-                // mirrors the field through every write path (publishBoundary /
-                // publishDpiResult / pInput hooks, plus a wholesale build at the
-                // end of init()).
-                if (memEnableBitmap_ && schedule_.memWritePlan)
-                {
-                    const auto tryAssign = [&](ValueId enable) {
-                        if (!enable || enable.index >= producers_.size()) return;
-                        if (enableBitOfValue_.contains(enable.index)) return;
-                        if (staticScalars_.contains(enable.index) || staticStrings_.contains(enable.index)) return;
-                        const auto &enableType = type(enable);
-                        // Scalar 1-bit two-state only — a shaped value's
-                        // boundary field is a per-row array, which the bitmap
-                        // sync hooks (scalar value texts) cannot mirror.
-                        if (enableType.kind != TypeKind::Logic || enableType.domain != LogicDomain::TwoState ||
-                            enableType.width != 1 || !enableType.shape.empty())
-                            return;
-                        const CpuStoreField *field = boundaryByValue_[enable.index];
+                // The layout records a stable bit order for the two enable
+                // boundary stores. Each bit mirrors a scalar boundary field
+                // (or an input port read that bypasses a boundary field).
+                const auto mapEnableBitmap = [&](EnableBitmap &bitmap, const CpuNamedStore &store,
+                                                 CpuBoundaryUse use) {
+                    for (const auto enable : store.enableBitValues)
+                    {
+                        const CpuStoreField *field = boundaryByUse_[enable.index][static_cast<std::size_t>(use)];
                         uint32_t inputIndex = 0;
                         if (!field)
                         {
-                            // input.read without its own republish field reads the
-                            // input port's boundary field directly (expression()).
                             const auto producer = producers_[enable.index];
-                            if (!producer) return;
                             const auto &producerOp = model_.operations()[producer.index - 1];
-                            if (model_.text(producerOp.opType) != "core.input.read") return;
                             const auto refs = model_.objectRefs(producerOp);
-                            if (refs.size() != 1 || refs[0].kind != ObjectKind::Input) return;
-                            inputIndex = refs[0].index;
-                            field = inputIndex < boundaryByInput_.size() ? boundaryByInput_[inputIndex] : nullptr;
+                            inputIndex = refs.front().index;
+                            field = boundaryByInput_[inputIndex];
                         }
-                        if (!field) return;
-                        const auto bit = static_cast<uint32_t>(enableBits_.size());
-                        enableBits_.push_back(field);
-                        enableBitOfValue_[enable.index] = bit;
-                        if (inputIndex)
-                            inputEnableBit_[inputIndex] = bit;
-                        else
-                            fieldEnableBit_[field] = bit;
-                    };
-                    for (const auto &entry : *schedule_.memWritePlan)
-                        for (const auto enable : memEnableOperands(model_.operations()[entry.writeOp.index - 1]))
-                            tryAssign(enable);
-                    memEnableWords_ = static_cast<uint32_t>((enableBits_.size() + 63) / 64);
+                        const auto bit = static_cast<uint32_t>(bitmap.fields.size());
+                        bitmap.fields.push_back(field);
+                        bitmap.bitOfValue[enable.index] = bit;
+                        if (inputIndex) bitmap.inputBits[inputIndex] = bit;
+                        else bitmap.fieldBits[field] = bit;
+                    }
+                };
+                mapEnableBitmap(smallEnable_, *boundaryStores_[2], CpuBoundaryUse::SmallSinkEnable);
+                if (memEnableBitmap_)
+                    mapEnableBitmap(largeEnable_, *boundaryStores_[4], CpuBoundaryUse::LargeSinkEnable);
+                smallSinkEnableBits_.resize(supernodeCount_);
+                smallSinkPriority_.resize(supernodeCount_);
+                std::vector<uint32_t> perState(model_.states().size() + 1, 0);
+                std::vector<uint32_t> priorityOfOp(model_.operations().size() + 1);
+                for (const auto &op : model_.operations())
+                {
+                    if (op.phase != SimPhase::General) continue;
+                    const auto name = model_.text(op.opType);
+                    if (!isCpuPhaseMemWriteOp(name) && name != "core.state.latchWrite") continue;
+                    const auto refs = model_.objectRefs(op);
+                    if (refs.size() == 1 && refs[0].kind == ObjectKind::State)
+                        priorityOfOp[op.id.index] = perState[refs[0].index]++;
+                }
+                for (uint32_t ordinal = nonSinkCount_; ordinal < supernodeCount_; ++ordinal)
+                {
+                    bool allWrites = !supernodeOps_[ordinal].empty();
+                    std::vector<uint32_t> bits;
+                    for (const auto opId : supernodeOps_[ordinal])
+                    {
+                        const auto &op = model_.operations()[opId.index - 1];
+                        const auto enables = memEnableOperands(op);
+                        if (enables.size() != 1) { allWrites = false; break; }
+                        const auto bit = smallEnable_.bitOfValue.find(enables.front().index);
+                        if (bit == smallEnable_.bitOfValue.end()) { allWrites = false; break; }
+                        bits.push_back(bit->second);
+                        smallSinkPriority_[ordinal] = priorityOfOp[opId.index];
+                    }
+                    if (allWrites)
+                    {
+                        std::sort(bits.begin(), bits.end());
+                        bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+                        smallSinkEnableBits_[ordinal] = std::move(bits);
+                    }
                 }
                 // Spill frames: values produced in one chunk of an op list and
                 // consumed in another (or at the output commit point) become
@@ -918,9 +1004,9 @@ namespace wolvrix::lib::grhsim
             const CpuTranslationUnitPlan &tuPlan_;
             std::string prefix_, class_;
 
-            const CpuNamedStore *regLatchStore_ = nullptr;
-            const CpuNamedStore *memStore_ = nullptr;
-            const CpuNamedStore *boundaryStore_ = nullptr;
+            const CpuNamedStore *smallSinkStore_ = nullptr;
+            const CpuNamedStore *largeSinkStore_ = nullptr;
+            std::array<const CpuNamedStore *, 6> boundaryStores_{};
             const CpuNamedStore *prevEventStore_ = nullptr;
             const CpuNamedStore *eventActStore_ = nullptr;
             const CpuNamedStore *timeslotStore_ = nullptr;
@@ -940,7 +1026,13 @@ namespace wolvrix::lib::grhsim
             std::vector<OpId> eventOps_, outputOps_;
 
             std::vector<const CpuStoreField *> regFieldByState_, memFieldByState_;
+            std::set<uint32_t> smallFinalChange_;
+            std::map<uint32_t, std::vector<CpuMemReader>> largeFinalChange_;
             std::vector<const CpuStoreField *> boundaryByValue_, boundaryByInput_, prevByAct_;
+            std::vector<std::array<const CpuStoreField *, 5>> boundaryByUse_;
+            std::vector<std::vector<const CpuStoreField *>> boundaryFieldsByValue_;
+            std::map<const CpuStoreField *, CpuNamedStoreKind> boundaryKindByField_;
+            mutable CpuBoundaryUse readContext_ = CpuBoundaryUse::NonSink;
             std::map<uint32_t, DetInfo> detByAct_;
             std::map<uint32_t, const CpuEventActivation *> activationByAct_;
             std::vector<std::vector<uint32_t>> triggersByAct_;
@@ -960,7 +1052,7 @@ namespace wolvrix::lib::grhsim
             std::unordered_map<uint64_t, uint32_t> chunkIds_;
             // Init stream: flattened (state, step) pairs, then constant-boundary
             // preloads (store offset order), then prevEvent inits (act order),
-            // then the regLatchStoreNext sync line.
+            // then the smallSinkStoreNext sync line.
             std::vector<std::pair<StateId, const InitStep *>> initSteps_;
             std::vector<const CpuStoreField *> constBoundaryFields_;
             std::vector<uint32_t> detActs_;
@@ -997,17 +1089,22 @@ namespace wolvrix::lib::grhsim
             std::set<uint32_t> randomSupernodes_;
             uint32_t randomSampleCount_ = 0;
 
-            // P_mem enable shadow bitmap state (memEnableBitmap_ = the
-            // --mem-enable-bitmap emit option): enableBits_[bit] = the boundary
-            // field bit `bit` mirrors; enableBitOfValue_ drives the port-side
-            // guard rewrite; fieldEnableBit_/inputEnableBit_ drive the
-            // compare-store/pInput sync hooks.
+            struct EnableBitmap
+            {
+                std::string_view storeName;
+                std::vector<const CpuStoreField *> fields;
+                std::unordered_map<uint32_t, uint32_t> bitOfValue;
+                std::map<const CpuStoreField *, uint32_t> fieldBits;
+                std::unordered_map<uint32_t, uint32_t> inputBits;
+                uint32_t words() const { return static_cast<uint32_t>((fields.size() + 63) / 64); }
+            };
+            EnableBitmap smallEnable_{"smallSinkEnableBoundaryStore"};
+            EnableBitmap largeEnable_{"largeSinkEnableBoundaryStore"};
+            std::vector<std::vector<uint32_t>> smallSinkEnableBits_;
+            std::vector<uint32_t> smallSinkPriority_;
+            // P_large_sink bitmap can be disabled for profiling. The
+            // smallSink bitmap always backs its call-site batch skip.
             bool memEnableBitmap_ = true;
-            std::vector<const CpuStoreField *> enableBits_;
-            std::unordered_map<uint32_t, uint32_t> enableBitOfValue_;
-            std::map<const CpuStoreField *, uint32_t> fieldEnableBit_;
-            std::unordered_map<uint32_t, uint32_t> inputEnableBit_;
-            uint32_t memEnableWords_ = 0;
 
             // P_mem write-occurs activation knob (memWriteOnWrite_ = the
             // --mem-write-activate on-write emit option): drop the per-cell
@@ -1044,6 +1141,16 @@ namespace wolvrix::lib::grhsim
             bool containsString(const Type &type) const;
             bool isScalarLogic(const Type &type) const;
             std::string cppType(const Type &type) const;
+            std::string cppValueType(const Type &type) const;
+            std::string unpackValue(const std::string &packed, const Type &type) const;
+            // Emit shaped compute values directly when all operands already
+            // have row-backed storage. This avoids the packed _BitInt bridge
+            // for simple element-wise array operations.
+            std::optional<std::string> directShapedExpression(const SimOp &op) const;
+            // A directly constant shaped value can be emitted as a constexpr
+            // aggregate. This keeps the packed literal and its row slices out
+            // of every supernode invocation.
+            std::optional<std::string> constantArrayInitializer(ValueId value) const;
             std::string cppStoreType(CpuTypeId id) const;
             uint64_t storageBytes(const Type &type) const;
             // Stack-local scalar element view of a shaped (array) logic type:
@@ -1088,6 +1195,7 @@ namespace wolvrix::lib::grhsim
             // cpu_v<index> local, a boundary store field, or the producer's store
             // read (input port field / regLatch field / mem cell / wide literal).
             std::string read(ValueId value) const;
+            std::string readAs(ValueId value, CpuBoundaryUse use) const;
             // Declares the value's cpu_v local (or reference) when it has no
             // boundary field; the text later read() calls resolve to.
             void declareLocal(std::ostream &out, ValueId result, const std::string &expr) const;
@@ -1113,9 +1221,9 @@ namespace wolvrix::lib::grhsim
             std::string bodyGuard(const SimOp &op, uint32_t current) const;
             std::string callCondition(ValueId condition) const;
             // Fanout activation statements. When a firing supernode ordinal is
-            // given, later ordinals raise dataActiveFlag directly (same-round
+            // given, later ordinals raise nonSinkActiveFlag directly (same-round
             // successor firing) and earlier/self ordinals queue into
-            // dataActiveFlagNext; otherwise every target raises `array`.
+            // nonSinkActiveFlagNext; otherwise every target raises `array`.
             void activateOrdinals(std::ostream &out, std::span<const uint32_t> ordinals,
                                   std::string_view array) const;
             void activateFanout(std::ostream &out, std::span<const uint32_t> ordinals,
@@ -1132,7 +1240,7 @@ namespace wolvrix::lib::grhsim
             // Compare-store of a computed boundary value; on a real change the
             // supernodeFanout ordinals fire (same-round split by current).
             void publishBoundary(std::ostream &out, ValueId result, const std::string &expr,
-                                 uint32_t current) const;
+                                  uint32_t current, bool arrayValue = false) const;
 
             // ----- Per-op emission -----
             void emitCompute(std::ostream &out, const SimOp &op, uint32_t current) const;
@@ -1140,18 +1248,19 @@ namespace wolvrix::lib::grhsim
             void emitRegWrite(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitMemWrite(std::ostream &out, const SimOp &op, const CpuMemWritePlanEntry &plan,
                               bool actHoisted = false, std::set<uint32_t> *burstReaders = nullptr,
-                              bool forceOnChange = false) const;
+                              bool forceOnChange = false, bool enableHoisted = false) const;
             // Enable operand of a write/writeArray/fill op (always the first
             // operand); empty for every other op kind.
             std::vector<ValueId> memEnableOperands(const SimOp &op) const;
             // The port enable condition: dense bitmap bit test when the enable
             // is shadowed, otherwise the plain read() text.
             std::string memEnableGuard(ValueId enable) const;
-            // Keep memEnableBits[bit] in sync after a write of the mirrored
+            // Keep largeSinkEnableBoundaryStore.enabledWords[bit] in sync after a write of the mirrored
             // boundary field changed it to `valueText`.
-            std::string memEnableSync(uint32_t bit, const std::string &valueText) const;
+            std::string enableSync(const EnableBitmap &bitmap, uint32_t bit,
+                                   const std::string &valueText) const;
             // General-phase regLatch-class array writes (M5d-6): NBA merge
-            // into regLatchStoreNext inside the owning supernode.
+            // into smallSinkStoreNext inside the owning supernode.
             void emitGeneralMemWrite(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitSystemTask(std::ostream &out, const SimOp &op, uint32_t current) const;
             void emitOutputTask(std::ostream &out, const SimOp &op) const;
@@ -1198,6 +1307,12 @@ namespace wolvrix::lib::grhsim
             void deactivateCrossing(const std::vector<uint32_t> &frame) const;
             // cpu_v<index> or cpu_f.v<index> when the value is frame-spilled.
             std::string localRef(ValueId value) const;
+            // A supernode spill frame is normally value-initialized because a
+            // guarded producer may leave a field untouched.  Pure compute and
+            // state-read producers are emitted as unconditional assignments;
+            // their frame can therefore start uninitialized and avoid a large
+            // memset on every supernode call.
+            bool frameNeedsZeroInit(const std::vector<uint32_t> &fields) const;
             // Boundary field storage reference: boundaryValueStore.<name>, or
             // boundaryStrings[<i>] for hoisted string fields.
             std::string boundaryRef(const CpuStoreField *field) const;
@@ -1239,7 +1354,7 @@ namespace wolvrix::lib::grhsim
             void pInputBody(std::ostream &out) const;
             void pEventBody(std::ostream &out) const;
             void pGeneralBody(std::ostream &out) const;
-            void pMemBody(std::ostream &out) const;
+            void pLargeSinkBody(std::ostream &out) const;
             void pPublishBody(std::ostream &out) const;
             void pOutputBody(std::ostream &out) const;
             void evalBody(std::ostream &out) const;
@@ -1293,7 +1408,7 @@ namespace wolvrix::lib::grhsim
             // Only values whose producer creates an irreplaceable local need a
             // frame slot. Constants fold into use sites; input.read/state.read
             // results re-read their store field in any chunk (the port boundary
-            // fields and regLatchStore/memStore are stable across a chunk
+            // fields and smallSinkStore/largeSinkStore are stable across a chunk
             // sequence). readArray results are NOT freely re-readable: the
             // re-expression re-reads the index operands, whose locals may be
             // dead — so readArray results spill like compute values. The commit
@@ -1347,15 +1462,50 @@ namespace wolvrix::lib::grhsim
         {
             if (const auto it = boundaryStringSlot_.find(field); it != boundaryStringSlot_.end())
                 return "boundaryStrings[" + std::to_string(it->second) + ']';
-            return "boundaryValueStore." + std::string(model_.text(field->name));
+            const auto kind = boundaryKindByField_.at(field);
+            std::string_view store;
+            switch (kind)
+            {
+            case CpuNamedStoreKind::Input: store = "inputStore"; break;
+            case CpuNamedStoreKind::NonSinkBoundary: store = "nonSinkBoundaryStore"; break;
+            case CpuNamedStoreKind::SmallSinkEnableBoundary: store = "smallSinkEnableBoundaryStore"; break;
+            case CpuNamedStoreKind::SmallSinkPayloadBoundary: store = "smallSinkPayloadBoundaryStore"; break;
+            case CpuNamedStoreKind::LargeSinkEnableBoundary: store = "largeSinkEnableBoundaryStore"; break;
+            case CpuNamedStoreKind::LargeSinkPayloadBoundary: store = "largeSinkPayloadBoundaryStore"; break;
+            default: throw std::runtime_error("CPU boundary field has a non-boundary store kind");
+            }
+            return std::string(store) + '.' + std::string(model_.text(field->name));
         }
         void SixPhaseEmitter::frameStruct(std::ostream &out, std::string_view name,
-                                          const std::vector<uint32_t> &fields) const
+                             const std::vector<uint32_t> &fields) const
         {
             out << "struct " << name << "{\n";
             for (const auto index : fields)
-                out << cppType(type(ValueId{index, 0})) << " v" << index << "{};\n";
+                // The driver decides whether the frame needs value
+                // initialization.  Keeping the members plain lets the safe
+                // uninitialized case avoid zeroing the whole aggregate.
+                out << cppValueType(type(ValueId{index, 0})) << " v" << index << ";\n";
             out << "};\n";
+        }
+        bool SixPhaseEmitter::frameNeedsZeroInit(const std::vector<uint32_t> &fields) const
+        {
+            for (const auto index : fields)
+            {
+                if (index >= producers_.size() || !producers_[index]) return true;
+                const auto &producer = model_.operations()[producers_[index].index - 1];
+                const auto name = model_.text(producer.opType);
+                // emitDpiCall wraps the call in its condition; a missed call
+                // must leave the frame result at the IR-defined zero value.
+                // The ordinary compute and state-read paths assign their
+                // result unconditionally whenever the enclosing supernode
+                // runs.  Other producer families are kept conservative.
+                if (name == "core.dpi.call") return true;
+                if (!(name.starts_with("core.compute.") ||
+                      name == "core.state.read" || name == "core.state.readArray" ||
+                      name == "core.system.function"))
+                    return true;
+            }
+            return false;
         }
         void SixPhaseEmitter::precomputeStagedOutputWrites()
         {
@@ -1377,8 +1527,10 @@ namespace wolvrix::lib::grhsim
                     throw std::runtime_error("CPU six-phase emit malformed output latchWrite");
                 const auto *field =
                     refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
+                if (!field && refs[0].index < memFieldByState_.size())
+                    field = memFieldByState_[refs[0].index];
                 if (!field)
-                    throw std::runtime_error("CPU six-phase emit output latchWrite target is not a regLatch state");
+                    throw std::runtime_error("CPU six-phase emit output latchWrite target has no sink store field");
                 StagedOutputWrite staged;
                 staged.field = field;
                 staged.enable = read(operands[0]);
@@ -1406,9 +1558,7 @@ namespace wolvrix::lib::grhsim
             return type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
                 type.width > 0 && type.width <= 64;
         }
-        // The C++ type of a VALUE (locals, frame fields, port members): a
-        // shaped logic value is its total-width flat bit vector (width already
-        // contains the shape), indistinguishable from an equal-width scalar.
+        // The packed C++ type used while evaluating logic expressions.
         std::string SixPhaseEmitter::cppType(const Type &type) const
         {
             if (type.kind == TypeKind::String) return "std::string";
@@ -1421,6 +1571,28 @@ namespace wolvrix::lib::grhsim
             if (type.width == 1 && !type.isSigned) return "bool";
             return "std::" + std::string(type.isSigned ? "int" : "uint") +
                    std::to_string(type.width <= 8 ? 8 : type.width <= 16 ? 16 : type.width <= 32 ? 32 : 64) + "_t";
+        }
+        std::string SixPhaseEmitter::cppValueType(const Type &type) const
+        {
+            if (type.shape.empty()) return cppType(type);
+            std::string result = cppType(arrayElementType(type));
+            for (std::size_t dimension = type.shape.size(); dimension-- > 0;)
+                result = "std::array<" + result + "," + std::to_string(type.shape[dimension]) + ">";
+            return result;
+        }
+        std::string SixPhaseEmitter::unpackValue(const std::string &packed, const Type &type) const
+        {
+            if (type.shape.empty()) return packed;
+            const auto rows = shapeElementCount(type.shape);
+            const auto elementWidth = typeElementWidth(type);
+            if (!rows || !elementWidth)
+                throw std::runtime_error("CPU six-phase emit shaped value has an invalid shape");
+            const Type element = arrayElementType(type);
+            return "([&](){" + cppValueType(type) + " cpu_array{};const auto cpu_packed=" + packed +
+                   ";for(std::size_t cpu_j=0;cpu_j<" + std::to_string(*rows) + ";++cpu_j)" +
+                   rowAccessText("cpu_array", type.shape, "cpu_j") + '=' +
+                   normalize(rowSliceText("cpu_packed", "cpu_j", *elementWidth, type.width), element) +
+                   ";return cpu_array;}())";
         }
         std::string SixPhaseEmitter::cppStoreType(CpuTypeId id) const
         {
@@ -1461,6 +1633,165 @@ namespace wolvrix::lib::grhsim
             element.isSigned = type.isSigned;
             element.domain = type.domain;
             return element;
+        }
+        std::optional<std::string> SixPhaseEmitter::constantArrayInitializer(ValueId value) const
+        {
+            const auto &valueType = type(value);
+            if (valueType.kind != TypeKind::Logic || valueType.domain != LogicDomain::TwoState ||
+                valueType.shape.empty())
+                return std::nullopt;
+            const auto rows = shapeElementCount(valueType.shape);
+            const auto elementWidth = typeElementWidth(valueType);
+            // Keep generated source bounded for very large literal arrays. The
+            // existing packed path remains correct for those values.
+            if (!rows || !elementWidth || *rows < 16 || *rows > 4096 || *elementWidth > 64)
+                return std::nullopt;
+            if (value.index >= producers_.size()) return std::nullopt;
+
+            using Bits = std::vector<uint8_t>;
+            std::unordered_map<uint32_t, Bits> cache;
+            std::unordered_set<uint32_t> failed, active;
+            const auto resizeBits = [](const Bits &source, uint32_t width) {
+                Bits result(width, 0);
+                for (uint32_t bit = 0; bit < width && bit < source.size(); ++bit) result[bit] = source[bit];
+                return result;
+            };
+            const auto asUnsigned = [](const Bits &bits) {
+                uint64_t result = 0;
+                for (uint32_t bit = 0; bit < bits.size() && bit < 64; ++bit)
+                    result |= uint64_t(bits[bit]) << bit;
+                return result;
+            };
+            const auto resolve = [&](const auto &self, ValueId current) -> std::optional<Bits> {
+                if (const auto it = cache.find(current.index); it != cache.end()) return it->second;
+                if (failed.contains(current.index) || active.contains(current.index) ||
+                    current.index >= producers_.size())
+                    return std::nullopt;
+                const auto &currentType = type(current);
+                if (currentType.kind != TypeKind::Logic || currentType.domain != LogicDomain::TwoState ||
+                    currentType.width == 0)
+                    return std::nullopt;
+                const auto producer = producers_[current.index];
+                if (!producer) return std::nullopt;
+                const auto &op = model_.operations()[producer.index - 1];
+                const auto name = model_.text(op.opType);
+                active.insert(current.index);
+                std::optional<Bits> resolved;
+                if (name == "core.compute.constant")
+                {
+                    std::string text;
+                    const auto params = model_.parameters(op);
+                    if (const auto *literalText = parameter<std::string>(model_, params, "value"))
+                        text = *literalText;
+                    else if (const auto *literalText = parameter<std::string>(model_, params, "constValue"))
+                        text = *literalText;
+                    else if (const auto *integer = parameter<int64_t>(model_, params, "value"))
+                        text = std::to_string(*integer);
+                    else if (const auto *integer = parameter<int64_t>(model_, params, "constValue"))
+                        text = std::to_string(*integer);
+                    else if (const auto *boolean = parameter<bool>(model_, params, "value"))
+                        text = *boolean ? "1" : "0";
+                    else if (const auto *boolean = parameter<bool>(model_, params, "constValue"))
+                        text = *boolean ? "1" : "0";
+                    if (!text.empty())
+                        try
+                        {
+                            auto parsed = slang::SVInt::fromString(text).resize(currentType.width);
+                            parsed.flattenUnknowns();
+                            const auto *raw = parsed.getRawPtr();
+                            Bits bits(currentType.width, 0);
+                            for (uint32_t bit = 0; bit < currentType.width; ++bit)
+                                bits[bit] = uint8_t((raw[bit / 64] >> (bit % 64)) & 1u);
+                            resolved = std::move(bits);
+                        }
+                        catch (const std::exception &) { }
+                }
+                else if (name.starts_with("core.compute."))
+                {
+                    const auto kind = name.substr(13);
+                    const auto operands = model_.operands(op);
+                    const auto operand = [&](std::size_t index) -> std::optional<Bits> {
+                        if (index >= operands.size()) return std::nullopt;
+                        return self(self, operands[index]);
+                    };
+                    if (kind == "not" && operands.size() == 1)
+                    {
+                        if (auto source = operand(0))
+                        {
+                            auto bits = resizeBits(*source, currentType.width);
+                            for (auto &bit : bits) bit ^= 1u;
+                            resolved = std::move(bits);
+                        }
+                    }
+                    else if (kind == "assign" && operands.size() == 1)
+                    {
+                        if (auto source = operand(0)) resolved = resizeBits(*source, currentType.width);
+                    }
+                    else if (kind == "concat" && operands.size() >= 2)
+                    {
+                        Bits bits(currentType.width, 0);
+                        uint64_t offset = 0;
+                        bool ok = true;
+                        for (std::size_t index = operands.size(); index-- > 0;)
+                        {
+                            auto source = operand(index);
+                            if (!source) { ok = false; break; }
+                            for (uint64_t bit = 0; bit < source->size() && offset + bit < bits.size(); ++bit)
+                                bits[offset + bit] = (*source)[bit];
+                            offset += source->size();
+                        }
+                        if (ok) resolved = std::move(bits);
+                    }
+                    else if ((kind == "and" || kind == "or" || kind == "xor" || kind == "xnor") &&
+                             operands.size() == 2)
+                    {
+                        auto lhs = operand(0); auto rhs = operand(1);
+                        if (lhs && rhs)
+                        {
+                            lhs = resizeBits(*lhs, currentType.width);
+                            rhs = resizeBits(*rhs, currentType.width);
+                            Bits bits(currentType.width, 0);
+                            for (uint32_t bit = 0; bit < currentType.width; ++bit)
+                            {
+                                bits[bit] = kind == "and" ? ((*lhs)[bit] & (*rhs)[bit]) :
+                                            kind == "or" ? ((*lhs)[bit] | (*rhs)[bit]) :
+                                            ((*lhs)[bit] ^ (*rhs)[bit]);
+                                if (kind == "xnor") bits[bit] ^= 1u;
+                            }
+                            resolved = std::move(bits);
+                        }
+                    }
+                    else if (kind == "mux" && operands.size() == 3)
+                    {
+                        auto select = operand(0); auto lhs = operand(1); auto rhs = operand(2);
+                        if (select && lhs && rhs)
+                            resolved = resizeBits(asUnsigned(*select) ? *lhs : *rhs, currentType.width);
+                    }
+                }
+                active.erase(current.index);
+                if (resolved) cache.emplace(current.index, *resolved);
+                else failed.insert(current.index);
+                return resolved;
+            };
+            const auto constantBits = resolve(resolve, value);
+            if (!constantBits) return std::nullopt;
+            const Type element = arrayElementType(valueType);
+            const auto scalar = [&](uint64_t row) {
+                const uint64_t bitBase = row * uint64_t(*elementWidth);
+                uint64_t elementBits = 0;
+                for (uint32_t bit = 0; bit < *elementWidth; ++bit)
+                    if ((*constantBits)[bitBase + bit]) elementBits |= UINT64_C(1) << bit;
+                return literal(std::to_string(elementBits), element);
+            };
+            // Assignment form avoids the fragile nested-brace rules of
+            // std::array-of-std::array initialization for rank >= 3 while
+            // remaining a constant expression. The lambda is evaluated once
+            // at compile time for a static constexpr local.
+            std::string result = "([]() constexpr {" + cppValueType(valueType) + " cpu_array{};";
+            for (uint64_t row = 0; row < *rows; ++row)
+                result += rowAccessText("cpu_array", valueType.shape, std::to_string(row)) + '=' + scalar(row) + ';';
+            result += "return cpu_array;}())";
+            return result;
         }
         std::string SixPhaseEmitter::normalize(std::string expression, const Type &type) const
         {
@@ -1557,9 +1888,23 @@ namespace wolvrix::lib::grhsim
                 if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
             // Frame-spilled (M5d-7) values resolve through the chunk driver's
             // frame in every chunk; plain locals only live in one function.
-            if (crossingLocals_[value.index]) return localRef(value);
-            if (activeLocals_[value.index]) return localRef(value);
-            if (const auto *field = boundaryByValue_[value.index])
+            if (crossingLocals_[value.index] || activeLocals_[value.index])
+            {
+                const auto &valueType = type(value);
+                if (valueType.shape.empty()) return localRef(value);
+                const auto rows = shapeElementCount(valueType.shape);
+                const auto elementWidth = typeElementWidth(valueType);
+                if (!rows || !elementWidth)
+                    throw std::runtime_error("CPU six-phase emit shaped local value has an invalid shape");
+                return packStoreRows(localRef(value), valueType.shape, "", *rows,
+                                     *elementWidth, valueType.width);
+            }
+            const auto *field = boundaryByUse_[value.index][static_cast<std::size_t>(readContext_)];
+            if (!field && readContext_ != CpuBoundaryUse::NonSink)
+                throw std::runtime_error("CPU six-phase sink operand lacks its enable/payload boundary field: v" +
+                                         std::to_string(value.index));
+            if (!field) field = boundaryByValue_[value.index];
+            if (field)
             {
                 // A shaped (array) value's boundary field is the flat per-row
                 // array; compute consumers expect the packed total-width
@@ -1571,7 +1916,7 @@ namespace wolvrix::lib::grhsim
                     const auto elementWidth = typeElementWidth(valueType);
                     if (!rows || !elementWidth)
                         throw std::runtime_error("CPU six-phase emit shaped value has an invalid shape");
-                    return packStoreRows(boundaryRef(field), "", *rows, *elementWidth, valueType.width);
+                    return packStoreRows(boundaryRef(field), valueType.shape, "", *rows, *elementWidth, valueType.width);
                 }
                 return boundaryRef(field);
             }
@@ -1587,6 +1932,14 @@ namespace wolvrix::lib::grhsim
                                      " produced by " + std::string(name) + " (op " +
                                      std::to_string(producer.index) + ")");
         }
+        std::string SixPhaseEmitter::readAs(ValueId value, CpuBoundaryUse use) const
+        {
+            const auto previous = readContext_;
+            readContext_ = use;
+            const auto result = read(value);
+            readContext_ = previous;
+            return result;
+        }
         std::optional<std::string> SixPhaseEmitter::rowBackedArrayText(ValueId value) const
         {
             // Flat local/constant forms win (read() resolves them first); only
@@ -1594,13 +1947,17 @@ namespace wolvrix::lib::grhsim
             if (value.index >= producers_.size()) return std::nullopt;
             if (staticScalars_.contains(value.index) || staticStrings_.contains(value.index))
                 return std::nullopt;
-            if (crossingLocals_[value.index] || activeLocals_[value.index]) return std::nullopt;
+            if (crossingLocals_[value.index] || activeLocals_[value.index])
+                return type(value).shape.empty() ? std::nullopt
+                                                 : std::optional<std::string>(localRef(value));
             if (value.index < boundaryByValue_.size() && boundaryByValue_[value.index])
             {
                 // The layout maps a shaped value to a per-row array field;
                 // double-check the physical type (a flat-scalar field means
                 // the value's storage is not row-indexable).
-                const CpuStoreField *field = boundaryByValue_[value.index];
+                const CpuStoreField *field = boundaryByUse_[value.index][
+                    static_cast<std::size_t>(readContext_)];
+                if (!field) field = boundaryByValue_[value.index];
                 if (layout_.types[field->type.index - 1].kind != CpuTypeKind::Array)
                     return std::nullopt;
                 return boundaryRef(field);
@@ -1618,9 +1975,9 @@ namespace wolvrix::lib::grhsim
                 const auto &target = stateType(StateId{refs[0].index, 0});
                 if (target.shape.empty()) return std::nullopt;
                 if (refs[0].index < memFieldByState_.size() && memFieldByState_[refs[0].index])
-                    return "memStore." + std::string(model_.text(memFieldByState_[refs[0].index]->name));
+                    return "largeSinkStore." + std::string(model_.text(memFieldByState_[refs[0].index]->name));
                 if (refs[0].index < regFieldByState_.size() && regFieldByState_[refs[0].index])
-                    return "regLatchStore." + std::string(model_.text(regFieldByState_[refs[0].index]->name));
+                    return "smallSinkStore." + std::string(model_.text(regFieldByState_[refs[0].index]->name));
                 return std::nullopt;
             }
             if (name == "core.input.read")
@@ -1636,16 +1993,346 @@ namespace wolvrix::lib::grhsim
             }
             return std::nullopt;
         }
+        std::optional<std::string> SixPhaseEmitter::directShapedExpression(const SimOp &op) const
+        {
+            const auto results = model_.results(op);
+            if (results.size() != 1) return std::nullopt;
+            const auto result = results[0];
+            const auto &resultType = type(result);
+            if (resultType.kind != TypeKind::Logic || resultType.domain != LogicDomain::TwoState ||
+                resultType.shape.empty())
+                return std::nullopt;
+            const auto rows = shapeElementCount(resultType.shape);
+            const auto resultWidth = typeElementWidth(resultType);
+            if (!rows || !resultWidth || !*rows || !*resultWidth) return std::nullopt;
+            const auto operands = model_.operands(op);
+            const auto name = model_.text(op.opType);
+
+            // A partial array read already has row-backed storage at its
+            // source.  The generic expression path packs that row block into
+            // a flat value and unpackValue() immediately slices it back into
+            // an std::array.  Keep the value in its physical row form and
+            // copy the addressed rows directly into the result aggregate.
+            // This is particularly common in aggregate XiangShan models,
+            // where a single dynamic index reads a small sub-array from a
+            // large table.
+            if (name == "core.state.read" || name == "core.state.readArray")
+            {
+                const auto refs = model_.objectRefs(op);
+                if (refs.size() != 1 || refs[0].kind != ObjectKind::State)
+                    return std::nullopt;
+                const StateId target{refs[0].index, 0};
+                const auto &array = stateType(target);
+                if (array.kind != TypeKind::Logic || array.shape.empty())
+                    return std::nullopt;
+                // A whole-array state.read has no index operands. The result
+                // must retain the state's row shape for this direct bridge;
+                // a flat view still uses the packed expression path below.
+                if (name == "core.state.read" &&
+                    (resultType.shape != array.shape ||
+                     typeElementWidth(resultType) != typeElementWidth(array)))
+                    return std::nullopt;
+                if (name == "core.state.readArray" &&
+                    (operands.empty() || operands.size() >= array.shape.size()))
+                    return std::nullopt;
+                const auto sourceWidth = typeElementWidth(array);
+                const auto blockRows = name == "core.state.read"
+                    ? shapeElementCount(array.shape)
+                    : shapeElementCount(std::span<const int64_t>(array.shape).subspan(operands.size()));
+                if (!sourceWidth || !blockRows || *sourceWidth != *resultWidth || *blockRows != *rows)
+                    return std::nullopt;
+                const bool inMem = refs[0].index < memFieldByState_.size() && memFieldByState_[refs[0].index];
+                const CpuStoreField *field = inMem ? memFieldByState_[refs[0].index]
+                     : refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
+                if (!field) return std::nullopt;
+                const std::string store = (inMem ? "largeSinkStore." : "smallSinkStore.") +
+                                          std::string(model_.text(field->name));
+                std::string baseRow;
+                if (name == "core.state.readArray")
+                {
+                    std::vector<std::string> indices;
+                    indices.reserve(operands.size());
+                    for (const auto index : operands)
+                        indices.push_back("static_cast<std::size_t>(" + read(index) + ")");
+                    baseRow = linearIndexText(array.shape, array.shape.size(), indices);
+                }
+                const Type element = arrayElementType(resultType);
+                // A whole-array read and a contiguous sub-array read have the
+                // same row element representation on both sides.  Copy the
+                // row image in one operation instead of emitting one nested
+                // indexing expression per element.  The physical store keeps
+                // row-major std::array storage, so the address of the first
+                // addressed row covers the complete result aggregate.
+                const std::string sourceRow = baseRow.empty() ? "0" : baseRow;
+                if (name == "core.state.read" ||
+                    (name == "core.state.readArray" && *rows > 1))
+                    return "([&]{" + cppValueType(resultType) + " cpu_array{};std::memcpy(&cpu_array,&" +
+                           rowAccessText(store, array.shape, sourceRow) + ",sizeof(cpu_array));return cpu_array;}())";
+                std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                for (uint64_t row = 0; row < *rows; ++row)
+                {
+                    const std::string rowText = baseRow + '+' + std::to_string(row);
+                    body += rowAccessText("cpu_array", resultType.shape, std::to_string(row)) + '=' +
+                            normalize(rowAccessText(store, array.shape, rowText), element) + ';';
+                }
+                body += "return cpu_array;}())";
+                return body;
+            }
+
+            if (!name.starts_with("core.compute.")) return std::nullopt;
+            const auto kind = name.substr(13);
+
+            // A shaped sliceArray with fewer indices than the base rank is
+            // another row-block read.  rowBackedArrayText() covers state and
+            // boundary arrays as well as shaped locals produced earlier in
+            // the same supernode, so the copy remains entirely in row form.
+            if (kind == "sliceArray" && !operands.empty())
+            {
+                const auto &baseType = type(operands[0]);
+                const std::size_t indexCount = operands.size() - 1;
+                if (!baseType.shape.empty() && indexCount < baseType.shape.size())
+                    if (const auto source = rowBackedArrayText(operands[0]))
+                    {
+                        const auto sourceWidth = typeElementWidth(baseType);
+                        const auto blockRows = shapeElementCount(
+                            std::span<const int64_t>(baseType.shape).subspan(indexCount));
+                        if (sourceWidth && blockRows && *sourceWidth == *resultWidth && *blockRows == *rows)
+                        {
+                            std::vector<std::string> indices;
+                            indices.reserve(indexCount);
+                            for (std::size_t j = 0; j < indexCount; ++j)
+                                indices.push_back("static_cast<std::size_t>(" + read(operands[1 + j]) + ")");
+                            const std::string baseRow =
+                                linearIndexText(baseType.shape, baseType.shape.size(), indices);
+                            const Type element = arrayElementType(resultType);
+                            if (*rows > 1)
+                            {
+                                // The addressed suffix is contiguous in the
+                                // row-backed source. Preserve the same
+                                // row-major image with one copy instead of
+                                // rebuilding every element of the aggregate.
+                                return "([&]{" + cppValueType(resultType) + " cpu_array{};std::memcpy(&cpu_array,&" +
+                                       rowAccessText(*source, baseType.shape, baseRow) +
+                                       ",sizeof(cpu_array));return cpu_array;}())";
+                            }
+                            std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                            for (uint64_t row = 0; row < *rows; ++row)
+                            {
+                                const std::string sourceRow = baseRow + '+' + std::to_string(row);
+                                body += rowAccessText("cpu_array", resultType.shape, std::to_string(row)) + '=' +
+                                        normalize(rowAccessText(*source, baseType.shape, sourceRow), element) + ';';
+                            }
+                            body += "return cpu_array;}())";
+                            return body;
+                        }
+                    }
+            }
+
+            // A statically aligned slice of a row-backed aggregate can use
+            // the same direct row copy.  Unaligned or differently shaped
+            // slices retain the packed path because their element boundaries
+            // no longer coincide with physical rows.
+            if (kind == "sliceStatic" && !operands.empty())
+            {
+                const auto &baseType = type(operands[0]);
+                if (!baseType.shape.empty())
+                    if (const auto source = rowBackedArrayText(operands[0]))
+                    {
+                        const auto sourceWidth = typeElementWidth(baseType);
+                        const auto start = parameter<int64_t>(model_, model_.parameters(op), "sliceStart");
+                        const auto sourceRows = shapeElementCount(baseType.shape);
+                        if (sourceWidth && start && *start >= 0 && *start % *sourceWidth == 0 &&
+                            typeElementWidth(baseType) == resultWidth &&
+                            *start / *sourceWidth + *rows <= sourceRows.value_or(0))
+                        {
+                            const Type element = arrayElementType(resultType);
+                            const uint64_t firstRow = static_cast<uint64_t>(*start) / *sourceWidth;
+                            if (firstRow == 0 && *rows == sourceRows && *rows > 1)
+                                return "([&]{" + cppValueType(resultType) + " cpu_array{};std::memcpy(&cpu_array,&" +
+                                       *source + ",sizeof(cpu_array));return cpu_array;}())";
+                            std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                            for (uint64_t row = 0; row < *rows; ++row)
+                            {
+                                const std::string sourceRow = std::to_string(firstRow + row);
+                                body += rowAccessText("cpu_array", resultType.shape, std::to_string(row)) + '=' +
+                                        normalize(rowAccessText(*source, baseType.shape, sourceRow), element) + ';';
+                            }
+                            body += "return cpu_array;}())";
+                            return body;
+                        }
+                    }
+            }
+
+            const auto sameShape = [&](ValueId value) {
+                const auto &sourceType = type(value);
+                if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState ||
+                    sourceType.shape != resultType.shape || typeElementWidth(sourceType) != resultWidth)
+                    return std::optional<std::string>{};
+                return rowBackedArrayText(value);
+            };
+            if (kind == "replicate" && operands.size() == 1)
+            {
+                // Replication of one scalar element into an aggregate can be
+                // materialized directly in the row representation. The
+                // generic path first builds a wide _BitInt and then slices it
+                // back into rows, which is especially costly for 64-bit
+                // elements repeated hundreds of times.
+                const auto &sourceType = type(operands[0]);
+                const auto rep = parameter<int64_t>(model_, model_.parameters(op), "rep");
+                if (sourceType.kind == TypeKind::Logic && sourceType.domain == LogicDomain::TwoState &&
+                    sourceType.shape.empty() && resultType.shape.size() == 1 && sourceType.width == resultWidth &&
+                    rep && *rep >= 0 &&
+                    static_cast<uint64_t>(*rep) >= *rows)
+                {
+                    const Type element = arrayElementType(resultType);
+                    const auto value = normalize(read(operands[0]), element);
+                    std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                    body += "cpu_array.fill(" + value + ");return cpu_array;}())";
+                    return body;
+                }
+            }
+            if (kind == "concat" && operands.size() >= 2)
+            {
+                struct Source
+                {
+                    std::string text;
+                    const Type *type = nullptr;
+                    uint64_t rows = 0;
+                };
+                std::vector<Source> sources;
+                sources.reserve(operands.size());
+                uint64_t totalRows = 0;
+                for (const auto operand : operands)
+                {
+                    const auto &sourceType = type(operand);
+                    const auto elementWidth = typeElementWidth(sourceType);
+                    const auto sourceRows = shapeElementCount(sourceType.shape);
+                    const auto sourceText = sourceType.shape.empty() ? std::nullopt : rowBackedArrayText(operand);
+                    if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState ||
+                        !elementWidth || !sourceRows || *elementWidth != *resultWidth || !sourceText)
+                        return std::nullopt;
+                    sources.push_back({*sourceText, &sourceType, *sourceRows});
+                    totalRows += *sourceRows;
+                }
+                if (totalRows != *rows) return std::nullopt;
+                const Type element = arrayElementType(resultType);
+                if (resultType.shape.size() == 1)
+                {
+                    // A one-dimensional shaped value is contiguous in its
+                    // row representation. Copy complete operand ranges in
+                    // bulk instead of constructing one aggregate element at
+                    // a time in a large generated lambda.
+                    std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                    uint64_t destinationRow = 0;
+                    for (std::size_t index = sources.size(); index-- > 0;)
+                    {
+                        const auto &source = sources[index];
+                        body += "std::copy_n(" + source.text + ".data()," + std::to_string(source.rows) +
+                                ",cpu_array.data()+" + std::to_string(destinationRow) + ");";
+                        destinationRow += source.rows;
+                    }
+                    body += "return cpu_array;}())";
+                    return body;
+                }
+                std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                uint64_t destinationRow = 0;
+                // The last concat operand occupies the low rows, just as it
+                // occupies the low bits of the packed representation.
+                for (std::size_t index = sources.size(); index-- > 0;)
+                {
+                    const auto &source = sources[index];
+                    for (uint64_t row = 0; row < source.rows; ++row, ++destinationRow)
+                        body += rowAccessText("cpu_array", resultType.shape,
+                                              std::to_string(destinationRow)) + '=' +
+                                normalize(rowAccessText(source.text, source.type->shape,
+                                                         std::to_string(row)), element) + ';';
+                }
+                body += "return cpu_array;}())";
+                return body;
+            }
+            if (kind == "assign" && operands.size() == 1)
+            {
+                // Aggregate assignment is element-preserving when the shape
+                // and element width match. C++ aggregate assignment also
+                // handles the signed/unsigned spelling conversion safely.
+                if (const auto source = sameShape(operands[0])) return *source;
+                return std::nullopt;
+            }
+            if ((kind == "not" || kind == "and" || kind == "or" || kind == "xor" || kind == "xnor") &&
+                (operands.size() == 1 || operands.size() == 2))
+            {
+                std::vector<std::string> source;
+                source.reserve(operands.size());
+                for (const auto operand : operands)
+                {
+                    const auto value = sameShape(operand);
+                    if (!value) return std::nullopt;
+                    source.push_back(*value);
+                }
+                const Type element = arrayElementType(resultType);
+                std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                for (uint64_t row = 0; row < *rows; ++row)
+                {
+                    const auto cell = [&](std::size_t index) {
+                        return rowAccessText(source[index], resultType.shape, std::to_string(row));
+                    };
+                    std::string value;
+                    if (kind == "not") value = "~(" + cell(0) + ")";
+                    else value = "(" + cell(0) + (kind == "and" ? "&" : kind == "or" ? "|" : "^") +
+                                      cell(1) + ")";
+                    if (kind == "xnor") value = "~(" + value + ")";
+                    body += rowAccessText("cpu_array", resultType.shape, std::to_string(row)) + '=' +
+                            normalize(value, element) + ';';
+                }
+                body += "return cpu_array;}())";
+                return body;
+            }
+            if (kind == "mux" && operands.size() == 3)
+            {
+                const auto lhs = sameShape(operands[1]);
+                const auto rhs = sameShape(operands[2]);
+                if (!lhs || !rhs) return std::nullopt;
+                const Type element = arrayElementType(resultType);
+                const auto select = read(operands[0]);
+                std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                for (uint64_t row = 0; row < *rows; ++row)
+                {
+                    const auto lhsCell = rowAccessText(*lhs, resultType.shape, std::to_string(row));
+                    const auto rhsCell = rowAccessText(*rhs, resultType.shape, std::to_string(row));
+                    body += rowAccessText("cpu_array", resultType.shape, std::to_string(row)) +
+                            '=' + normalize("(" + select + ")?" + lhsCell + ":" + rhsCell, element) + ';';
+                }
+                body += "return cpu_array;}())";
+                return body;
+            }
+            return std::nullopt;
+        }
         void SixPhaseEmitter::declareLocal(std::ostream &out, ValueId result, const std::string &expr) const
         {
+            const auto &resultType = type(result);
+            if (!resultType.shape.empty())
+                if (const auto initializer = constantArrayInitializer(result))
+                {
+                    const auto valueType = cppValueType(resultType);
+                    if (crossingLocals_[result.index])
+                        out << localRef(result) << '=' << *initializer << ";\n";
+                    else
+                    {
+                        out << "static constexpr " << valueType << " cpu_v" << result.index << '='
+                            << *initializer << ";\n";
+                        activeLocals_[result.index] = 1;
+                    }
+                    return;
+                }
+            const std::string value = unpackValue(expr, resultType);
             // Frame-spilled values assign their pre-declared frame field; the
             // driver value-initializes the frame before the first chunk runs.
             if (crossingLocals_[result.index])
             {
-                out << localRef(result) << '=' << expr << ";\n";
+                out << localRef(result) << '=' << value << ";\n";
                 return;
             }
-            out << "const " << cppType(type(result)) << " cpu_v" << result.index << '=' << expr << ";\n";
+            out << "const " << cppValueType(resultType) << " cpu_v" << result.index << '=' << value << ";\n";
             activeLocals_[result.index] = 1;
         }
 
@@ -1948,7 +2635,7 @@ namespace wolvrix::lib::grhsim
                 if (refs.size() != 1 || refs[0].kind != ObjectKind::Input ||
                     refs[0].index >= boundaryByInput_.size() || !boundaryByInput_[refs[0].index])
                     throw std::runtime_error("CPU six-phase emit input read has no boundary field");
-                const std::string slot = "boundaryValueStore." + std::string(model_.text(boundaryByInput_[refs[0].index]->name));
+                const std::string slot = boundaryRef(boundaryByInput_[refs[0].index]);
                 // A shaped (array) port's boundary field is the flat per-row
                 // array; the value is the packed total-width vector. The
                 // INPUT's type decides the storage shape (the result value
@@ -1960,7 +2647,7 @@ namespace wolvrix::lib::grhsim
                 const auto elementWidth = typeElementWidth(inputType);
                 if (!rows || !elementWidth)
                     throw std::runtime_error("CPU six-phase emit shaped input read has an invalid shape");
-                return packStoreRows(slot, "", *rows, *elementWidth, result.width);
+                return packStoreRows(slot, inputType.shape, "", *rows, *elementWidth, result.width);
             }
             if (name == "core.state.read")
             {
@@ -1972,7 +2659,7 @@ namespace wolvrix::lib::grhsim
                 if (!inReg && !inMem)
                     throw std::runtime_error("CPU six-phase emit state read has no named-store field");
                 const CpuStoreField *field = inReg ? regFieldByState_[refs[0].index] : memFieldByState_[refs[0].index];
-                const std::string slot = (inReg ? "regLatchStore." : "memStore.") + std::string(model_.text(field->name));
+                const std::string slot = (inReg ? "smallSinkStore." : "largeSinkStore.") + std::string(model_.text(field->name));
                 // Whole-array read: pack the flat row array into the
                 // total-width vector (row j -> bits [j*elementWidth, ...)).
                 // The STATE's shape decides (the result value may legally
@@ -1983,7 +2670,7 @@ namespace wolvrix::lib::grhsim
                 const auto elementWidth = typeElementWidth(target);
                 if (!rows || !elementWidth)
                     throw std::runtime_error("CPU six-phase emit shaped state read has an invalid shape");
-                return packStoreRows(slot, "", *rows, *elementWidth, result.width);
+                return packStoreRows(slot, target.shape, "", *rows, *elementWidth, result.width);
             }
             if (name == "core.state.readArray")
             {
@@ -1997,7 +2684,7 @@ namespace wolvrix::lib::grhsim
                 const auto elementWidth = typeElementWidth(array);
                 if (array.shape.empty() || !elementWidth || operands.size() > array.shape.size())
                     throw std::runtime_error("CPU array read target is not a shaped logic state");
-                // mem-class arrays live in the single memStore; regLatch-class
+                // mem-class arrays live in the single largeSinkStore; regLatch-class
                 // arrays (M5d-6) read the currently visible regLatch row (NBA:
                 // same-round writes are not visible until P_publish).
                 const bool inMem = refs[0].index < memFieldByState_.size() && memFieldByState_[refs[0].index];
@@ -2005,7 +2692,7 @@ namespace wolvrix::lib::grhsim
                      : refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
                 if (!field)
                     throw std::runtime_error("CPU six-phase emit array read has no named-store field");
-                const std::string slot = (inMem ? "memStore." : "regLatchStore.") + std::string(model_.text(field->name));
+                const std::string slot = (inMem ? "largeSinkStore." : "smallSinkStore.") + std::string(model_.text(field->name));
                 // Row-major linearization over the state shape: row =
                 // sum_j idx_j * prod(shape[j+1:]) (stride 1 keeps the bare
                 // index — the legacy single-index emission shape).
@@ -2015,13 +2702,17 @@ namespace wolvrix::lib::grhsim
                     indices.push_back("static_cast<std::size_t>(" + raw(j) + ")");
                 const std::string row = linearIndexText(array.shape, array.shape.size(), indices);
                 if (operands.size() == array.shape.size())
-                    return slot + '[' + row + ']';
+                {
+                    std::string cell = slot;
+                    for (const auto &index : indices) cell += '[' + index + ']';
+                    return cell;
+                }
                 // k < rank: the sub-array spans the contiguous row block
                 // [row, row + prod(shape[k:])); pack it like a whole read.
                 const auto blockRows = shapeElementCount(std::span<const int64_t>(array.shape).subspan(operands.size()));
                 if (!blockRows)
                     throw std::runtime_error("CPU array read sub-array shape is invalid");
-                return packStoreRows(slot, row, *blockRows, *elementWidth, result.width);
+                return packStoreRows(slot, array.shape, row, *blockRows, *elementWidth, result.width);
             }
             if (name == "core.compute.constant")
             {
@@ -2096,7 +2787,7 @@ namespace wolvrix::lib::grhsim
                             // Out-of-range reads yield zero (the legacy
                             // sliceArray clamp semantics), same as the generic
                             // flat-vector path. Wide elements stay _BitInt.
-                            const std::string cell = *store + "[" + row + "]";
+                            const std::string cell = rowAccessText(*store, baseType.shape, row);
                             if (width > 64)
                                 return "(static_cast<std::size_t>(" + row + ")>=" +
                                        std::to_string(*rowCount) + "?" + wideTrunc("0", width) + ":" + cell + ")";
@@ -2112,7 +2803,46 @@ namespace wolvrix::lib::grhsim
                         const auto elementWidth = typeElementWidth(baseType);
                         if (!blockRows || !elementWidth)
                             throw std::runtime_error("CPU sliceArray base value has an invalid shape");
-                        return packStoreRows(*store, row, *blockRows, *elementWidth, width, *rowCount);
+                        return packStoreRows(*store, baseType.shape, row, *blockRows, *elementWidth, width, *rowCount);
+                    }
+                }
+            }
+            // Stage-07 fast path: a static bit slice of a row-backed shaped
+            // value is commonly how aggregate lowering reads individual
+            // elements (for example, 6-bit entries from a 520-row table).
+            // The generic path first packs every row into a wide _BitInt and
+            // then shifts it back out, even when the slice is exactly one
+            // physical row.  Address aligned slices directly in the backing
+            // array; this preserves the packed little-endian row order while
+            // making the common case O(1) instead of O(number of rows).
+            if (kind == "sliceStatic" && !operands.empty())
+            {
+                const auto &baseType = type(operands[0]);
+                if (!baseType.shape.empty())
+                {
+                    if (const auto store = rowBackedArrayText(operands[0]))
+                    {
+                        const auto elementWidth = typeElementWidth(baseType);
+                        const auto rowCount = shapeElementCount(baseType.shape);
+                        const auto start = number("sliceStart");
+                        if (elementWidth && rowCount && *elementWidth &&
+                            start % *elementWidth == 0 && start + width <= baseType.width)
+                        {
+                            const auto firstRow = start / *elementWidth;
+                            const auto rows = (uint64_t(width) + *elementWidth - 1) / *elementWidth;
+                            if (rows == 1 && width <= *elementWidth)
+                            {
+                                const auto cell = rowAccessText(*store, baseType.shape,
+                                                                std::to_string(firstRow));
+                                if (width > 64)
+                                    return wideTrunc("(" + cell + ")", width);
+                                return truncRaw("(std::uint64_t)(" + cell + ")", width);
+                            }
+                            if (width % *elementWidth == 0 && rows * *elementWidth == width)
+                                return packStoreRows(*store, baseType.shape,
+                                                     std::to_string(firstRow), rows,
+                                                     *elementWidth, width, *rowCount);
+                        }
                     }
                 }
             }
@@ -2196,19 +2926,43 @@ namespace wolvrix::lib::grhsim
                         }
                         return joined;
                     }
-                    // Large concats use the statement form: a left-nested
-                    // expression with hundreds of << operators exhausts the
-                    // clang parser stack (measured on the XS bloomFilter
-                    // concat). Semantics are identical to the chain above.
-                    std::string body = "([&](){ " + wideType(width) + " cpu_cat=(" + low(0, width) + ");\n";
-                    for (std::size_t i = 1; i < operands.size(); ++i)
+                    // Balance large concats and widen only at each join. A
+                    // full-result-width shift chain makes SelectionDAG combine
+                    // pathological on the XS 16384-bit concat. Named partials
+                    // also bound parser nesting independently of fan-in.
+                    std::vector<std::pair<std::size_t, uint64_t>> parts;
+                    uint64_t remaining = width;
+                    for (std::size_t i = operands.size(); i-- > 0 && remaining;)
                     {
-                        const auto rhsWidth = type(operands[i]).width;
-                        if (rhsWidth >= width) { body += "cpu_cat=(" + low(i, width) + ");\n"; continue; }
-                        body += "cpu_cat=((" + wideType(width) + ")(cpu_cat)<<" + std::to_string(rhsWidth) +
-                                "|(" + low(i, rhsWidth) + "));\n";
+                        const auto bits = std::min<uint64_t>(type(operands[i]).width, remaining);
+                        parts.emplace_back(i, bits);
+                        remaining -= bits;
                     }
-                    body += "return cpu_cat&" + wideMask(width) + ";}())";
+                    std::reverse(parts.begin(), parts.end());
+                    std::string body = "([&](){\n";
+                    uint32_t next = 0;
+                    const auto join = [&](const auto &self, std::size_t begin, std::size_t end)
+                        -> std::pair<std::string, uint64_t> {
+                        if (end - begin == 1)
+                        {
+                            const auto [operand, bits] = parts[begin];
+                            const auto nativeType = bits <= 64 ? "std::uint64_t" : wideType(bits);
+                            // A signed 64-bit leaf must become unsigned before
+                            // widening, or its sign bits overwrite its neighbor.
+                            return {"((" + nativeType + ")(" + low(operand, bits) + "))", bits};
+                        }
+                        const auto middle = begin + (end - begin) / 2;
+                        const auto lhs = self(self, begin, middle);
+                        const auto rhs = self(self, middle, end);
+                        const auto bits = lhs.second + rhs.second;
+                        const auto nativeType = bits <= 64 ? "std::uint64_t" : wideType(bits);
+                        const auto name = "cpu_cat_" + std::to_string(next++);
+                        body += "const " + nativeType + " " + name + "=((" + nativeType + ")(" +
+                                lhs.first + ")<<" + std::to_string(rhs.second) + "|(" + rhs.first + "));\n";
+                        return {name, bits};
+                    };
+                    const auto result = join(join, 0, parts.size());
+                    body += "return (" + wideType(width) + ")(" + result.first + ");}())";
                     return body;
                 }
                 if ((kind == "sliceStatic" || kind == "sliceDynamic") && type(operands[0]).width > 64)
@@ -2399,9 +3153,9 @@ namespace wolvrix::lib::grhsim
                                              uint32_t current) const
         {
             // Same-round split: a successor later in the supernode scan fires this
-            // round (dataActiveFlag); an earlier/self successor waits for the next
-            // round (dataActiveFlagNext). current == ~0 (outside P_general) queues
-            // every target into dataActiveFlagNext.
+            // round (nonSinkActiveFlag); an earlier/self successor waits for the next
+            // round (nonSinkActiveFlagNext). current == ~0 (outside P_general) queues
+            // every target into nonSinkActiveFlagNext.
             const auto dataActive = model_.text(activeStore_->fields[0].name);
             const auto dataNext = model_.text(activeStore_->fields[1].name);
             std::vector<uint32_t> now, later;
@@ -2447,72 +3201,96 @@ namespace wolvrix::lib::grhsim
             activateOrdinalsCond(out, later, dataNext, cond);
         }
         void SixPhaseEmitter::publishBoundary(std::ostream &out, ValueId result, const std::string &expr,
-                                              uint32_t current) const
+                                              uint32_t current, bool arrayValue) const
         {
-            const auto *field = boundaryByValue_[result.index];
-            if (!field) { declareLocal(out, result, expr); return; }
-            const auto slot = boundaryRef(field);
-            const auto hook = fieldEnableBit_.find(field);
+            const auto &fields = boundaryFieldsByValue_[result.index];
+            if (fields.empty()) { declareLocal(out, result, expr); return; }
             const auto &resultType = type(result);
-            if (!resultType.shape.empty())
+            std::optional<std::string> constantAggregate;
+            if (!resultType.shape.empty()) constantAggregate = constantArrayInitializer(result);
+            const std::string constantName = "cpu_const_array_" + std::to_string(result.index);
+            if (constantAggregate)
+                out << "static constexpr " << cppValueType(resultType) << ' ' << constantName << '='
+                    << *constantAggregate << ";\n";
+            const bool shared = fields.size() > 1;
+            if (shared) out << "{const auto &cpu_shared_value=" << expr << ";\n";
+            const std::string source = shared ? "cpu_shared_value" : expr;
+            for (const auto *field : fields)
             {
-                // Shaped (array) value publish: the boundary field is the flat
-                // per-row array while the value moves as the packed
-                // total-width vector — unpack row-wise (the per-element form
-                // of the legacy whole-array store). Enable-bitmap hooks never
-                // engage (1-bit enables are scalar-only).
-                const auto rows = shapeElementCount(resultType.shape);
-                const auto elementWidth = typeElementWidth(resultType);
-                if (!rows || !elementWidth)
-                    throw std::runtime_error("CPU six-phase emit shaped boundary value has an invalid shape");
-                const Type element = arrayElementType(resultType);
-                const std::string rowExpr =
-                    normalize(rowSliceText("cpu_value", "cpu_j", *elementWidth, resultType.width), element);
-                out << "{const auto cpu_value=" << expr << ";\n";
-                if (hook == fieldEnableBit_.end() && supernodeFanout_[result.index].empty())
+                const auto slot = boundaryRef(field);
+                const auto smallHook = smallEnable_.fieldBits.find(field);
+                const auto largeHook = largeEnable_.fieldBits.find(field);
+                const bool hasHook = smallHook != smallEnable_.fieldBits.end() ||
+                                     largeHook != largeEnable_.fieldBits.end();
+                const bool notify = field == fields.front();
+                if (!resultType.shape.empty())
                 {
-                    out << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)" << slot << "[cpu_j]=" << rowExpr
-                        << ";\n}\n";
-                    return;
+                    const auto rows = shapeElementCount(resultType.shape);
+                    const auto elementWidth = typeElementWidth(resultType);
+                    if (!rows || !elementWidth)
+                        throw std::runtime_error("CPU six-phase emit shaped boundary value has an invalid shape");
+                    const Type element = arrayElementType(resultType);
+                    const std::string rowExpr = constantAggregate
+                        ? rowAccessText(constantName, resultType.shape, "cpu_j")
+                        : arrayValue
+                            ? rowAccessText("cpu_value", resultType.shape, "cpu_j")
+                            : normalize(rowSliceText("cpu_value", "cpu_j", *elementWidth, resultType.width), element);
+                    out << "{const auto &cpu_value=" << (constantAggregate ? constantName : source) << ";\n";
+                    if (!hasHook && (!notify || supernodeFanout_[result.index].empty()))
+                    {
+                        out << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)"
+                            << rowAccessText(slot, resultType.shape, "cpu_j") << '=' << rowExpr
+                            << ";\n}\n";
+                        continue;
+                    }
+                    out << "bool cpu_chg=false;\n"
+                        << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j){const auto cpu_e=" << rowExpr
+                        << ";auto &cpu_c=" << rowAccessText(slot, resultType.shape, "cpu_j")
+                        << ";if(cpu_c!=cpu_e){cpu_c=cpu_e;cpu_chg=true;}}\n"
+                        << "if(cpu_chg){\n";
+                    if (notify)
+                    {
+                        flagOutputDirty(out, outputReadValues_.contains(result.index));
+                        activateFanout(out, supernodeFanout_[result.index], current);
+                    }
+                    out << "}}\n";
+                    continue;
                 }
-                out << "bool cpu_chg=false;\n"
-                    << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j){const auto cpu_e=" << rowExpr
-                    << ";auto &cpu_c=" << slot << "[cpu_j];if(cpu_c!=cpu_e){cpu_c=cpu_e;cpu_chg=true;}}\n"
-                    << "if(cpu_chg){\n";
-                flagOutputDirty(out, outputReadValues_.contains(result.index));
-                activateFanout(out, supernodeFanout_[result.index], current);
-                out << "}}\n";
-                return;
+                if (!hasHook && (!notify || supernodeFanout_[result.index].empty()))
+                {
+                    out << slot << '=' << source << ";\n";
+                    continue;
+                }
+                if (boundaryStringSlot_.contains(field))
+                {
+                    out << "{const auto &cpu_value=" << source << ";if(" << slot << "!=cpu_value){"
+                        << slot << "=cpu_value;";
+                    if (notify)
+                    {
+                        flagOutputDirty(out, outputReadValues_.contains(result.index));
+                        activateFanout(out, supernodeFanout_[result.index], current);
+                    }
+                    if (smallHook != smallEnable_.fieldBits.end())
+                        out << enableSync(smallEnable_, smallHook->second, "cpu_value");
+                    if (largeHook != largeEnable_.fieldBits.end())
+                        out << enableSync(largeEnable_, largeHook->second, "cpu_value");
+                    out << "}}\n";
+                    continue;
+                }
+                out << "{const auto &cpu_value=" << source << ";const bool cpu_chg=" << slot
+                    << "!=cpu_value;" << slot << "=cpu_value;\n";
+                if (smallHook != smallEnable_.fieldBits.end())
+                    out << enableSync(smallEnable_, smallHook->second, "cpu_value");
+                if (largeHook != largeEnable_.fieldBits.end())
+                    out << enableSync(largeEnable_, largeHook->second, "cpu_value");
+                if (notify)
+                {
+                    flagOutputDirty(out, outputReadValues_.contains(result.index));
+                    activateFanoutCond(out, supernodeFanout_[result.index], current, "cpu_chg");
+                }
+                out << "}\n";
             }
-            // Dead-compare elimination: when nothing consumes the change event
-            // (no supernode fanout to activate, no shadow-bitmap hook to sync),
-            // if(slot!=v){slot=v;} is exactly slot=v — and cheaper, since the
-            // compare form puts a load->compare->branch chain on the publish
-            // path while the plain store is fire-and-forget.
-            if (hook == fieldEnableBit_.end() && supernodeFanout_[result.index].empty())
-            {
-                out << slot << '=' << expr << ";\n";
-                return;
-            }
-            // E-flat (gsim-shape publish): scalars publish branchlessly — the
-            // store is unconditional and the change bit masks the fanout flag
-            // ORs; same flag semantics, no per-value branch. Strings keep the
-            // conditional store: their copy cost dominates, and they are rare.
-            if (boundaryStringSlot_.contains(field))
-            {
-                out << "{const auto cpu_value=" << expr << ";if(" << slot << "!=cpu_value){" << slot << "=cpu_value;";
-                flagOutputDirty(out, outputReadValues_.contains(result.index));
-                out << "\n";
-                if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, "cpu_value");
-                activateFanout(out, supernodeFanout_[result.index], current);
-                out << "}}\n";
-                return;
-            }
-            out << "{const auto cpu_value=" << expr << ";const bool cpu_chg=" << slot << "!=cpu_value;" << slot <<
-                   "=cpu_value;\n";
-            if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, "cpu_value");
-            activateFanoutCond(out, supernodeFanout_[result.index], current, "cpu_chg");
-            out << "}\n";
+            if (shared) out << "}\n";
         }
 
         // ----- Per-op emission -----
@@ -2521,20 +3299,23 @@ namespace wolvrix::lib::grhsim
             const auto name = model_.text(op.opType);
             if (name == "core.system.task") { emitSystemTask(out, op, current); return; }
             if (name == "core.dpi.call") { emitDpiCall(out, op, current); return; }
-            if (name == "core.state.write" || name == "core.state.latchWrite")
+            if (name == "core.state.write" || name == "core.state.writeMask" ||
+                name == "core.state.latchWrite")
             {
                 // A write on a shaped (array) state is a whole-array write and
                 // follows the array write path; scalar write/latchWrite is the
                 // register RMW.
                 const auto refs = model_.objectRefs(op);
-                const bool shapedTarget = name == "core.state.write" && !refs.empty() &&
+                const bool shapedTarget = (name == "core.state.write" ||
+                                           name == "core.state.writeMask") && !refs.empty() &&
                     refs[0].kind == ObjectKind::State && refs[0].index >= 1 &&
                     refs[0].index <= model_.states().size() &&
                     !stateType(StateId{refs[0].index, 0}).shape.empty();
                 if (shapedTarget) { emitGeneralMemWrite(out, op, current); return; }
                 emitRegWrite(out, op, current); return;
             }
-            if (name == "core.state.writeArray" || name == "core.state.fill")
+            if (name == "core.state.writeArray" || name == "core.state.writeArrayMask" ||
+                name == "core.state.fill")
             { emitGeneralMemWrite(out, op, current); return; }
             if (model_.results(op).size() != 1)
                 throw std::runtime_error("CPU six-phase emit unsupported result arity: " + std::string(name));
@@ -2552,6 +3333,28 @@ namespace wolvrix::lib::grhsim
                 return;
             }
             const auto &resultType = type(result);
+            if (!resultType.shape.empty())
+                if (const auto direct = directShapedExpression(op))
+                {
+                    // A shaped boundary value is physically an array. Keep
+                    // the direct row-wise expression all the way through the
+                    // compare-store so it never crosses the packed _BitInt
+                    // bridge just to be unpacked again by publishBoundary.
+                    if (boundaryByValue_[result.index])
+                    {
+                        publishBoundary(out, result, *direct, current, true);
+                        return;
+                    }
+                    if (crossingLocals_[result.index])
+                        out << localRef(result) << '=' << *direct << ";\n";
+                    else
+                    {
+                        out << "const " << cppValueType(resultType) << " cpu_v" << result.index << '='
+                            << *direct << ";\n";
+                        activeLocals_[result.index] = 1;
+                    }
+                    return;
+                }
             // Wide two-state compute ops need no dedicated path: they are
             // plain _BitInt expressions and flow through the generic
             // normalize + publishBoundary/declareLocal tail below (the
@@ -2582,21 +3385,11 @@ namespace wolvrix::lib::grhsim
                 throw std::runtime_error("CPU six-phase emit edgeDet act has no prevEvent field");
             const auto prevSlot = "prevEventStore." + std::string(model_.text(prevByAct_[*act]->name));
             const std::string cur = read(event);
-            // Two-state full-width edge semantics (runtime helpers): posedge =
-            // any-bit-nonzero now vs all-zero before, negedge the mirror.
-            // Shaped (array) events are rejected — same as the retired Array
-            // kind was (the prevEvent mirror store is scalar-shaped).
+            // The IR contract permits only an unshaped 1-bit event. CPU emit
+            // currently implements its two-state form.
             std::string hit;
-            if (eventType.kind == TypeKind::Logic && eventType.shape.empty() &&
-                eventType.domain == LogicDomain::TwoState && eventType.width > 64)
-            {
-                // Full-width any-bit edge on clean _BitInt values
-                // (grhsim_event_*_words semantics).
-                if (*edge == "posedge") hit = "((" + cur + ")!=0&&(" + prevSlot + ")==0)";
-                else if (*edge == "negedge") hit = "((" + cur + ")==0&&(" + prevSlot + ")!=0)";
-                else hit = "(((" + cur + ")!=0&&(" + prevSlot + ")==0)||((" + cur + ")==0&&(" + prevSlot + ")!=0))";
-            }
-            else if (isScalarLogic(eventType) && eventType.shape.empty())
+            if (eventType.kind == TypeKind::Logic && eventType.width == 1 &&
+                eventType.shape.empty() && eventType.domain == LogicDomain::TwoState)
             {
                 const auto curW = "static_cast<std::uint64_t>(" + cur + ")";
                 const auto prevW = "static_cast<std::uint64_t>(" + prevSlot + ")";
@@ -2604,13 +3397,13 @@ namespace wolvrix::lib::grhsim
                 else if (*edge == "negedge") hit = "grhsim_event_negedge(" + curW + "," + prevW + ")";
                 else hit = "(grhsim_event_posedge(" + curW + "," + prevW + ")||grhsim_event_negedge(" + curW + "," + prevW + "))";
             }
-            else throw std::runtime_error("CPU six-phase emit edgeDet event must be two-state logic");
+            else throw std::runtime_error("CPU six-phase emit edgeDet event must be unshaped 1-bit two-state logic");
             out << "if(" << hit << "){\n"
                 << "eventActStore[" << *act / 8 << "]|=std::uint8_t(1u<<" << *act % 8 << ");\n";
             // V2 (M2): OR the act's activation words (bit i == ordinal i, the
             // non-sink supernodes holding an op with this act) straight into
-            // dataActiveFlag — eventActiveFlag and the dual gate are gone.
-            // V3-M1: the activation words and dataActiveFlag share the same
+            // nonSinkActiveFlag — eventActiveFlag and the dual gate are gone.
+            // V3-M1: the activation words and nonSinkActiveFlag share the same
             // bit-per-supernode layout, so the activation is a plain word OR.
             if (const auto it = activationByAct_.find(static_cast<uint32_t>(*act));
                 it != activationByAct_.end() && std::any_of(it->second->supernodeWords.begin(), it->second->supernodeWords.end(),
@@ -2630,7 +3423,11 @@ namespace wolvrix::lib::grhsim
         {
             const auto operands = model_.operands(op);
             const auto refs = model_.objectRefs(op);
-            if (refs.empty() || refs[0].kind != ObjectKind::State || operands.size() != 3)
+            const auto name = model_.text(op.opType);
+            const bool masked = name == "core.state.writeMask" || name == "core.state.latchWrite" ||
+                                (name == "core.state.write" && operands.size() == 3);
+            if (refs.empty() || refs[0].kind != ObjectKind::State ||
+                operands.size() != (masked ? 3u : 2u))
                 throw std::runtime_error("CPU six-phase emit malformed state write");
             const std::string guard = bodyGuard(op, current);
             const auto *field = refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
@@ -2641,31 +3438,35 @@ namespace wolvrix::lib::grhsim
             // through emitGeneralMemWrite.
             if (!targetType.shape.empty())
                 throw std::runtime_error("CPU six-phase emit scalar state write on an array state");
-            const std::string nextSlot = "regLatchStoreNext." + std::string(model_.text(field->name));
-            const std::string curSlot = "regLatchStore." + std::string(model_.text(field->name));
-            // Merge base is regLatchStoreNext (read-modify-write across same-round
+            const std::string nextSlot = "smallSinkStoreNext." + std::string(model_.text(field->name));
+            const std::string curSlot = "smallSinkStore." + std::string(model_.text(field->name));
+            // Merge base is smallSinkStoreNext (read-modify-write across same-round
             // writers); the fanout compare runs against the currently visible
-            // regLatchStore value so readers fire only on a true change.
-            out << "if((" << guard << ")&&" << read(operands[0]) << "){\n";
+            // smallSinkStore value so readers fire only on a true change.
+            out << "if((" << guard << ")&&"
+                << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable) << "){\n";
+            const std::string mask = masked ? read(operands[2]) : literal("-1", targetType);
             if (isScalarLogic(targetType))
             {
-                const std::string merged = normalize("(static_cast<std::uint64_t>(" + nextSlot + ")&~static_cast<std::uint64_t>(" + read(operands[2]) +
-                    "))|(static_cast<std::uint64_t>(" + read(operands[1]) + ")&static_cast<std::uint64_t>(" + read(operands[2]) + "))", targetType);
+                const std::string merged = normalize("(static_cast<std::uint64_t>(" + nextSlot + ")&~static_cast<std::uint64_t>(" + mask +
+                    "))|(static_cast<std::uint64_t>(" + read(operands[1]) + ")&static_cast<std::uint64_t>(" + mask + "))", targetType);
                 out << "{const auto cpu_merged=" << merged << ";if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
                 flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
-                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
+                if (!smallFinalChange_.contains(target.index))
+                    activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
             }
             else if (targetType.kind == TypeKind::Logic && targetType.domain == LogicDomain::TwoState)
             {
                 // grhsim_merge_words_masked natively: (base & ~mask) | (data & mask).
-                const std::string merged = normalize("(" + nextSlot + "&~(" + read(operands[2]) + "))|(" +
-                                                         read(operands[1]) + "&(" + read(operands[2]) + "))",
+                const std::string merged = normalize("(" + nextSlot + "&~(" + mask + "))|(" +
+                                                         read(operands[1]) + "&(" + mask + "))",
                                                      targetType);
                 out << "{const auto cpu_merged=" << merged << ";if(" << nextSlot << "!=cpu_merged){if(" << curSlot << "!=cpu_merged){\n";
                 flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
-                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
+                if (!smallFinalChange_.contains(target.index))
+                    activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
                 out << "}" << nextSlot << "=cpu_merged;}}\n";
             }
@@ -2676,29 +3477,37 @@ namespace wolvrix::lib::grhsim
         {
             const auto name = model_.text(op.opType);
             const auto operands = model_.operands(op);
-            // write [en, data, mask]; writeArray [en, i0..ik-1, data, mask];
-            // fill [en, data] — the enable is always the first operand.
-            if (name == "core.state.write" && operands.size() == 3) return {operands[0]};
-            if (name == "core.state.writeArray" && operands.size() >= 4) return {operands[0]};
+            // write [en, data], writeMask/latchWrite [en, data, mask];
+            // writeArray [en, i0..ik-1, data], writeArrayMask [en, ...,
+            // data, mask], fill [en, data] — enable is always first.
+            if ((name == "core.state.write" || name == "core.state.writeMask" ||
+                 name == "core.state.latchWrite") && operands.size() >= 2)
+                return {operands[0]};
+            if ((name == "core.state.writeArray" || name == "core.state.writeArrayMask") &&
+                operands.size() >= 3) return {operands[0]};
             if (name == "core.state.fill" && operands.size() == 2) return {operands[0]};
             return {};
         }
         std::string SixPhaseEmitter::memEnableGuard(ValueId enable) const
         {
             if (memEnableBitmap_)
-                if (const auto it = enableBitOfValue_.find(enable.index); it != enableBitOfValue_.end())
-                    return "((memEnableBits[" + std::to_string(it->second / 64) + "]>>" +
+                if (const auto it = largeEnable_.bitOfValue.find(enable.index);
+                    it != largeEnable_.bitOfValue.end())
+                    return "((largeSinkEnableBoundaryStore.enabledWords[" + std::to_string(it->second / 64) + "]>>" +
                            std::to_string(it->second % 64) + ")&UINT64_C(1))";
-            return read(enable);
+            return readAs(enable, CpuBoundaryUse::LargeSinkEnable);
         }
-        std::string SixPhaseEmitter::memEnableSync(uint32_t bit, const std::string &valueText) const
+        std::string SixPhaseEmitter::enableSync(const EnableBitmap &bitmap, uint32_t bit,
+                                                const std::string &valueText) const
         {
-            const std::string word = "memEnableBits[" + std::to_string(bit / 64) + ']';
+            const std::string word = std::string(bitmap.storeName) + ".enabledWords[" +
+                                     std::to_string(bit / 64) + ']';
             const std::string mask = u64Const(1ull << (bit % 64));
             return word + "=(" + valueText + ")?(" + word + "|" + mask + "):(" + word + "&~" + mask + ");\n";
         }
         void SixPhaseEmitter::emitMemWrite(std::ostream &out, const SimOp &op, const CpuMemWritePlanEntry &plan,
-                                           bool actHoisted, std::set<uint32_t> *burstReaders, bool forceOnChange) const
+                                           bool actHoisted, std::set<uint32_t> *burstReaders, bool forceOnChange,
+                                           bool enableHoisted) const
         {
             const auto name = model_.text(op.opType);
             const auto operands = model_.operands(op);
@@ -2707,16 +3516,17 @@ namespace wolvrix::lib::grhsim
                 throw std::runtime_error("CPU six-phase emit mem write requires a state target");
             const StateId target{refs[0].index, 0};
             const auto &array = stateType(target);
-            if (array.kind != TypeKind::Logic || array.shape.empty())
-                throw std::runtime_error("CPU six-phase emit mem write target is not an array");
-            const Type element = arrayElementType(array);
-            const auto rowCountOpt = shapeElementCount(array.shape);
+            if (array.kind != TypeKind::Logic)
+                throw std::runtime_error("CPU six-phase emit large-sink write target is not logic");
+            const Type element = array.shape.empty() ? array : arrayElementType(array);
+            const auto rowCountOpt = array.shape.empty() ? std::optional<uint64_t>(1)
+                                                         : shapeElementCount(array.shape);
             if (!rowCountOpt)
                 throw std::runtime_error("CPU six-phase emit mem write target has an invalid shape");
             const uint64_t rowCount = *rowCountOpt;
             const auto *field = target.index < memFieldByState_.size() ? memFieldByState_[target.index] : nullptr;
-            if (!field) throw std::runtime_error("CPU six-phase emit mem write target has no memStore field");
-            const std::string mem = "memStore." + std::string(model_.text(field->name));
+            if (!field) throw std::runtime_error("CPU six-phase emit mem write target has no largeSinkStore field");
+            const std::string mem = "largeSinkStore." + std::string(model_.text(field->name));
             // Row-major strides over the state shape (element-row units).
             std::vector<uint64_t> strides(array.shape.size(), 1);
             for (std::size_t d = array.shape.size(); d-- > 1;)
@@ -2724,20 +3534,22 @@ namespace wolvrix::lib::grhsim
             // Event-gated writes read the act bits (P_event owns edge detection);
             // eventFree writes enter every round and converge via cell change
             // detection (plan §123). Boundary-backed 1-bit enables consult the
-            // dense memEnableBits shadow bitmap (memEnableGuard) instead of
+            // dense enable boundary bitmap (memEnableGuard) instead of
             // re-reading the scattered boundary field.
             const std::string guard = actGuard(op);
             const auto dataNext = model_.text(activeStore_->fields[1].name);
             // Write-occurs activation (--mem-write-activate on-write) drops the
             // per-cell compare; event-free writes re-enter every round and must
             // keep it, otherwise their readers never quiesce.
-            const bool onWrite = memWriteOnWrite_ && !forceOnChange;
+            const bool finalChange = largeFinalChange_.contains(target.index);
+            const bool onWrite = memWriteOnWrite_ && !forceOnChange && !finalChange;
             // Reader activation for one actually-changed row: a static-row reader
             // fires only on an exact address overlap; a dynamic-row reader fires
             // on any change (plan §132-135). A statically known write row folds
             // the overlap test at emit time.
             const auto activateReaders = [&](const std::string &rowText, std::optional<uint64_t> constRow) {
                 flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
+                if (finalChange) return;
                 for (const auto &reader : plan.readers)
                 {
                     const auto ordinal = reader.owner.index < ordinalOf_.size() ? ordinalOf_[reader.owner.index] : ~0u;
@@ -2768,7 +3580,12 @@ namespace wolvrix::lib::grhsim
             // readers activate on write-occurs.
             const auto writeCell = [&](const std::string &rowText, std::optional<uint64_t> constRow,
                                        const std::string &data, const std::string *mask) {
-                const std::string cell = mem + "[" + rowText + "]";
+                const std::string cell = rowAccessText(mem, array.shape, rowText);
+                const auto rememberCell = [&] {
+                    if (finalChange)
+                        out << "cpu_largeBefore" << target.index << ".try_emplace("
+                            << rowText << ',' << cell << ");\n";
+                };
                 if (isScalarLogic(element))
                 {
                     const std::string next = mask
@@ -2783,8 +3600,9 @@ namespace wolvrix::lib::grhsim
                         else activateReaders(rowText, constRow);
                         return;
                     }
-                    out << "{auto &cpu_cell=" << cell << ";const auto cpu_next=" << next << ";if(cpu_cell!=cpu_next){cpu_cell=cpu_next;\n"
-                        << "GRHSIM_PERF_COUNT(touchedWriteCount);\n";
+                    out << "{auto &cpu_cell=" << cell << ";const auto cpu_next=" << next << ";if(cpu_cell!=cpu_next){\n";
+                    rememberCell();
+                    out << "cpu_cell=cpu_next;\nGRHSIM_PERF_COUNT(touchedWriteCount);\n";
                     activateReaders(rowText, constRow);
                     out << "}}\n";
                     return;
@@ -2810,9 +3628,11 @@ namespace wolvrix::lib::grhsim
                         out << "{const auto cpu_merged=" << normalize("(" + cell + "&~(" + *mask + "))|(" + data +
                                                                        "&(" + *mask + "))",
                                                                        element)
-                            << ";if(" << cell << "!=cpu_merged){" << cell << "=cpu_merged;\n";
+                            << ";if(" << cell << "!=cpu_merged){\n";
                     else
-                        out << "if(" << cell << "!=" << data << "){" << cell << '=' << data << ";\n";
+                        out << "if(" << cell << "!=" << data << "){\n";
+                    rememberCell();
+                    out << cell << '=' << (mask ? "cpu_merged" : data) << ";\n";
                     out << "GRHSIM_PERF_COUNT(touchedWriteCount);\n";
                     activateReaders(rowText, constRow);
                     // The masked branch opened an extra cpu_merged block.
@@ -2866,27 +3686,36 @@ namespace wolvrix::lib::grhsim
                 return true;
             };
             if (guard != "true" && !actHoisted) out << "if(" << guard << "){\n";
-            if (name == "core.state.writeArray")
+            if (name == "core.state.writeArray" || name == "core.state.writeArrayMask")
             {
-                // [en, i0..ik-1, data, mask]: k == rank writes one element row
+                // [en, i0..ik-1, data, (mask)]: k == rank writes one element row
                 // (the legacy single-row shape); k < rank writes the
                 // contiguous sub-array row block [row, row + prod(shape[k:])).
-                if (operands.size() < 4) throw std::runtime_error("CPU array write has invalid arity");
-                const std::size_t indexCount = operands.size() - 3;
-                if (indexCount > array.shape.size())
-                    throw std::runtime_error("CPU array write index count exceeds the state rank");
-                const std::string maskText = read(operands[2 + indexCount]);
+                const auto layout = cpuIndexedWriteLayout(model_, op, array);
+                if (!layout.valid) throw std::runtime_error("CPU array write has invalid arity or geometry");
+                const bool masked = layout.masked;
+                const std::size_t indexCount = layout.indexCount;
                 const std::string dataText = read(operands[1 + indexCount]);
+                const std::string maskText = masked ? read(operands[2 + indexCount]) : std::string();
                 std::string rowText; std::optional<uint64_t> constRow;
                 if (!rowOf(operands.subspan(1, indexCount), rowText, constRow))
                     out << "// cpu_mem_write_dead row=" << rowText << "\n";
                 else if (indexCount == array.shape.size())
                 {
-                    out << "if(" << memEnableGuard(operands[0]);
-                    if (!constRow) out << "&&static_cast<std::size_t>(" << rowText << ")<" << rowCount;
-                    out << "){\n";
-                    writeCell(rowText, constRow, dataText, &maskText);
-                    out << "}\n";
+                    const bool needGuard = !enableHoisted || !constRow;
+                    if (needGuard)
+                    {
+                        out << "if(";
+                        if (!enableHoisted) out << memEnableGuard(operands[0]);
+                        if (!constRow)
+                        {
+                            if (!enableHoisted) out << "&&";
+                            out << "static_cast<std::size_t>(" << rowText << ")<" << rowCount;
+                        }
+                        out << "){\n";
+                    }
+                    writeCell(rowText, constRow, dataText, masked ? &maskText : nullptr);
+                    if (needGuard) out << "}\n";
                 }
                 else
                 {
@@ -2905,34 +3734,50 @@ namespace wolvrix::lib::grhsim
                         // legality is the verifier's contract).
                         const auto accessWidth = static_cast<uint32_t>(element.width * *blockRows);
                         const std::string dataSlice = rowSliceText(dataText, "cpu_j", element.width, accessWidth);
-                        const std::string maskSlice = rowSliceText(maskText, "cpu_j", element.width, accessWidth);
-                        out << "if(" << memEnableGuard(operands[0]);
-                        if (!constRow)
-                            out << "&&static_cast<std::size_t>(" << rowText << ")+" << *blockRows << "<=" << rowCount;
-                        out << "){\n";
+                        const std::string maskSlice = masked ?
+                            rowSliceText(maskText, "cpu_j", element.width, accessWidth) : std::string();
+                        const bool needGuard = !enableHoisted || !constRow;
+                        if (needGuard)
+                        {
+                            out << "if(";
+                            if (!enableHoisted) out << memEnableGuard(operands[0]);
+                            if (!constRow)
+                            {
+                                if (!enableHoisted) out << "&&";
+                                out << "static_cast<std::size_t>(" << rowText << ")+" << *blockRows << "<=" << rowCount;
+                            }
+                            out << "){\n";
+                        }
                         out << "for(std::size_t cpu_j=0;cpu_j<" << *blockRows << ";++cpu_j){\n";
-                        writeCell(rowText + "+cpu_j", std::nullopt, dataSlice, &maskSlice);
-                        out << "}\n}\n";
+                        writeCell(rowText + "+cpu_j", std::nullopt, dataSlice,
+                                  masked ? &maskSlice : nullptr);
+                        out << "}\n";
+                        if (needGuard) out << "}\n";
                     }
                 }
             }
-            else if (name == "core.state.write")
+            else if (name == "core.state.write" || name == "core.state.writeMask" ||
+                     name == "core.state.latchWrite")
             {
                 // Whole-array write (stage-06: absorbs the retired whole-array
                 // assign): data and mask are full-width flat values, sliced
                 // per row. A constant all-ones mask folds to plain data
                 // stores.
-                if (operands.size() != 3) throw std::runtime_error("CPU state write has invalid arity");
+                const bool masked = name == "core.state.writeMask" ||
+                                    name == "core.state.latchWrite" || operands.size() == 3;
+                if (operands.size() != (masked ? 3u : 2u))
+                    throw std::runtime_error("CPU state write has invalid arity");
                 const std::string data = read(operands[1]);
-                const bool fullMask = isAllOnesConstant(operands[2], array.width);
+                const bool fullMask = !masked || isAllOnesConstant(operands[2], array.width);
                 const std::string maskText = fullMask ? std::string() : read(operands[2]);
                 const std::string dataSlice = rowSliceText(data, "cpu_row", element.width, array.width);
                 const std::string maskSlice =
                     fullMask ? std::string() : rowSliceText(maskText, "cpu_row", element.width, array.width);
-                out << "if(" << memEnableGuard(operands[0]) << "){\n"
-                    << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
+                if (!enableHoisted) out << "if(" << memEnableGuard(operands[0]) << "){\n";
+                out << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
                 writeCell("cpu_row", std::nullopt, dataSlice, fullMask ? nullptr : &maskSlice);
-                out << "}\n}\n";
+                out << "}\n";
+                if (!enableHoisted) out << "}\n";
             }
             else if (name == "core.state.fill")
             {
@@ -2943,14 +3788,15 @@ namespace wolvrix::lib::grhsim
                 const auto &dataType = type(operands[1]);
                 const bool packedFill = dataType.kind == TypeKind::Logic &&
                                         dataType.width == array.width && array.width != element.width;
-                out << "if(" << memEnableGuard(operands[0]) << "){\n"
-                    << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
+                if (!enableHoisted) out << "if(" << memEnableGuard(operands[0]) << "){\n";
+                out << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
                 if (!packedFill)
                     writeCell("cpu_row", std::nullopt, data, nullptr);
                 else
                     writeCell("cpu_row", std::nullopt, rowSliceText(data, "cpu_row", element.width, array.width),
                               nullptr);
-                out << "}\n}\n";
+                out << "}\n";
+                if (!enableHoisted) out << "}\n";
             }
             else throw std::runtime_error("CPU six-phase emit unsupported mem write op: " + std::string(name));
             if (guard != "true" && !actHoisted) out << "}\n";
@@ -2958,9 +3804,9 @@ namespace wolvrix::lib::grhsim
         // General-phase regLatch-class array writes (M5d-6, stage-06 op
         // family write/writeArray/fill on a shaped state): the write lives
         // inside its General supernode and commits NBA-style into
-        // regLatchStoreNext. The merge base is the NEXT row (read-modify-write
+        // smallSinkStoreNext. The merge base is the NEXT row (read-modify-write
         // across same-round writers, in op order), while the fanout compare
-        // runs against the currently visible regLatchStore row so stateFanout
+        // runs against the currently visible smallSinkStore row so stateFanout
         // readers fire (next round, after P_publish) only on a true change —
         // the same activation contract as emitRegWrite, per row.
         void SixPhaseEmitter::emitGeneralMemWrite(std::ostream &out, const SimOp &op, uint32_t current) const
@@ -2983,24 +3829,25 @@ namespace wolvrix::lib::grhsim
             if (!field)
                 throw std::runtime_error("CPU six-phase emit general mem write target is not a "
                                          "regLatch-class state");
-            const std::string nextArray = "regLatchStoreNext." + std::string(model_.text(field->name));
-            const std::string curArray = "regLatchStore." + std::string(model_.text(field->name));
+            const std::string nextArray = "smallSinkStoreNext." + std::string(model_.text(field->name));
+            const std::string curArray = "smallSinkStore." + std::string(model_.text(field->name));
             const std::string guard = bodyGuard(op, current);
             // Row-major strides over the state shape (element-row units).
             std::vector<uint64_t> strides(array.shape.size(), 1);
             for (std::size_t d = array.shape.size(); d-- > 1;)
                 strides[d - 1] = strides[d] * static_cast<uint64_t>(array.shape[d]);
-            // State fanout always queues into dataActiveFlagNext.
+            // State fanout always queues into nonSinkActiveFlagNext.
             const auto activateState = [&] {
                 flagOutputDirty(out, outputReadStates_.contains(refs[0].index));
-                activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
+                if (!smallFinalChange_.contains(target.index))
+                    activateOrdinals(out, stateFanout_[refs[0].index], model_.text(activeStore_->fields[1].name));
                 out << "GRHSIM_PERF_COUNT(touchedStateShadowCount);\n";
             };
             const auto writeCell = [&](const std::string &rowText, std::optional<uint64_t> constRow,
                                        const std::string &data, const std::string *mask) {
                 (void)constRow;
-                const std::string nextCell = nextArray + "[" + rowText + "]";
-                const std::string curCell = curArray + "[" + rowText + "]";
+                const std::string nextCell = rowAccessText(nextArray, array.shape, rowText);
+                const std::string curCell = rowAccessText(curArray, array.shape, rowText);
                 if (isScalarLogic(element))
                 {
                     const std::string merged = mask
@@ -3073,25 +3920,25 @@ namespace wolvrix::lib::grhsim
                 return true;
             };
             if (guard != "true") out << "if(" << guard << "){\n";
-            if (name == "core.state.writeArray")
+            if (name == "core.state.writeArray" || name == "core.state.writeArrayMask")
             {
-                // [en, i0..ik-1, data, mask]: k == rank writes one element
+                // [en, i0..ik-1, data, (mask)]: k == rank writes one element
                 // row; k < rank RMWs the contiguous sub-array row block.
-                if (operands.size() < 4) throw std::runtime_error("CPU array write has invalid arity");
-                const std::size_t indexCount = operands.size() - 3;
-                if (indexCount > array.shape.size())
-                    throw std::runtime_error("CPU array write index count exceeds the state rank");
-                const std::string maskText = read(operands[2 + indexCount]);
+                const auto layout = cpuIndexedWriteLayout(model_, op, array);
+                if (!layout.valid) throw std::runtime_error("CPU array write has invalid arity or geometry");
+                const bool masked = layout.masked;
+                const std::size_t indexCount = layout.indexCount;
                 const std::string dataText = read(operands[1 + indexCount]);
+                const std::string maskText = masked ? read(operands[2 + indexCount]) : std::string();
                 std::string rowText; std::optional<uint64_t> constRow;
                 if (!rowOf(operands.subspan(1, indexCount), rowText, constRow))
                     out << "// cpu_mem_write_dead row=" << rowText << "\n";
                 else if (indexCount == array.shape.size())
                 {
-                    out << "if(" << read(operands[0]);
+                    out << "if(" << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable);
                     if (!constRow) out << "&&static_cast<std::size_t>(" << rowText << ")<" << rowCount;
                     out << "){\n";
-                    writeCell(rowText, constRow, dataText, &maskText);
+                    writeCell(rowText, constRow, dataText, masked ? &maskText : nullptr);
                     out << "}\n";
                 }
                 else
@@ -3111,30 +3958,34 @@ namespace wolvrix::lib::grhsim
                         // the verifier's contract).
                         const auto accessWidth = static_cast<uint32_t>(element.width * *blockRows);
                         const std::string dataSlice = rowSliceText(dataText, "cpu_j", element.width, accessWidth);
-                        const std::string maskSlice = rowSliceText(maskText, "cpu_j", element.width, accessWidth);
-                        out << "if(" << read(operands[0]);
+                        const std::string maskSlice = masked ?
+                            rowSliceText(maskText, "cpu_j", element.width, accessWidth) : std::string();
+                        out << "if(" << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable);
                         if (!constRow)
                             out << "&&static_cast<std::size_t>(" << rowText << ")+" << *blockRows << "<=" << rowCount;
                         out << "){\n";
                         out << "for(std::size_t cpu_j=0;cpu_j<" << *blockRows << ";++cpu_j){\n";
-                        writeCell(rowText + "+cpu_j", std::nullopt, dataSlice, &maskSlice);
+                        writeCell(rowText + "+cpu_j", std::nullopt, dataSlice,
+                                  masked ? &maskSlice : nullptr);
                         out << "}\n}\n";
                     }
                 }
             }
-            else if (name == "core.state.write")
+            else if (name == "core.state.write" || name == "core.state.writeMask")
             {
                 // Whole-array write (stage-06): full-width flat data/mask,
                 // sliced per row; a constant all-ones mask folds to plain
                 // per-row stores.
-                if (operands.size() != 3) throw std::runtime_error("CPU state write has invalid arity");
+                const bool masked = name == "core.state.writeMask" || operands.size() == 3;
+                if (operands.size() != (masked ? 3u : 2u))
+                    throw std::runtime_error("CPU state write has invalid arity");
                 const std::string data = read(operands[1]);
-                const bool fullMask = isAllOnesConstant(operands[2], array.width);
+                const bool fullMask = !masked || isAllOnesConstant(operands[2], array.width);
                 const std::string maskText = fullMask ? std::string() : read(operands[2]);
                 const std::string dataSlice = rowSliceText(data, "cpu_row", element.width, array.width);
                 const std::string maskSlice =
                     fullMask ? std::string() : rowSliceText(maskText, "cpu_row", element.width, array.width);
-                out << "if(" << read(operands[0]) << "){\n"
+                out << "if(" << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable) << "){\n"
                     << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
                 writeCell("cpu_row", std::nullopt, dataSlice, fullMask ? nullptr : &maskSlice);
                 out << "}\n}\n";
@@ -3148,7 +3999,7 @@ namespace wolvrix::lib::grhsim
                 const auto &dataType = type(operands[1]);
                 const bool packedFill = dataType.kind == TypeKind::Logic &&
                                         dataType.width == array.width && array.width != element.width;
-                out << "if(" << read(operands[0]) << "){\n"
+                out << "if(" << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable) << "){\n"
                     << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
                 if (!packedFill)
                     writeCell("cpu_row", std::nullopt, data, nullptr);
@@ -3320,36 +4171,7 @@ namespace wolvrix::lib::grhsim
                 source = "cpu_dpi_normalized";
                 out << "auto " << source << '=' << normalize(temporary, target) << ";\n";
             }
-            if (const auto *field = boundaryByValue_[result.index])
-            {
-                const auto slot = boundaryRef(field);
-                const auto hook = fieldEnableBit_.find(field);
-                // Same dead-compare rule as publishBoundary: no fanout and no
-                // hook -> the change test guards nothing.
-                if (hook == fieldEnableBit_.end() && supernodeFanout_[result.index].empty())
-                    out << slot << "=std::move(" << source << ");\n";
-                else
-                {
-                    // Same E-flat split as publishBoundary: scalars publish
-                    // branchlessly; strings/arrays keep the conditional store.
-                    const bool conditional = boundaryStringSlot_.contains(field) ||
-                        layout_.types[field->type.index - 1].kind == CpuTypeKind::Array;
-                    if (conditional)
-                    {
-                        out << "if(" << slot << "!=" << source << "){" << slot << "=std::move(" << source << ");\n";
-                        if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, source);
-                        activateFanout(out, supernodeFanout_[result.index], current);
-                        out << "}\n";
-                    }
-                    else
-                    {
-                        out << "const bool cpu_chg=" << slot << "!=" << source << ";" << slot << "=std::move(" <<
-                               source << ");\n";
-                        if (hook != fieldEnableBit_.end()) out << memEnableSync(hook->second, source);
-                        activateFanoutCond(out, supernodeFanout_[result.index], current, "cpu_chg");
-                    }
-                }
-            }
+            if (boundaryByValue_[result.index]) publishBoundary(out, result, source, current);
             else out << localRef(result) << "=std::move(" << source << ");\n";
             out << "}\n";
         }
@@ -3358,7 +4180,7 @@ namespace wolvrix::lib::grhsim
             if (!id) return "void";
             const auto &type = model_.types()[id.index - 1];
             if (!type.shape.empty())
-                throw std::runtime_error("CPU DPI shaped (array) argument ABI is not implemented");
+                throw std::runtime_error("CPU DPI aggregate parameter/return ABI is not implemented (P1)");
             if (type.kind == TypeKind::Logic && type.width == 1) return "std::uint8_t";
             return cppType(type);
         }
@@ -3388,33 +4210,54 @@ namespace wolvrix::lib::grhsim
             if (operands.size() != 1 || refs.size() != 1 || refs[0].kind != ObjectKind::Output)
                 throw std::runtime_error("CPU six-phase emit malformed output write");
             const auto &output = model_.outputs()[refs[0].index - 1];
-            out << "this->" << identifier(model_.text(output.name)) << '=' << read(operands[0]) << ";\n";
+            const auto member = "this->" + identifier(model_.text(output.name));
+            const auto &outputType = model_.types()[output.type.index - 1];
+            if (outputType.shape.empty())
+            {
+                out << member << '=' << read(operands[0]) << ";\n";
+                return;
+            }
+            const auto rows = shapeElementCount(outputType.shape);
+            const auto elementWidth = typeElementWidth(outputType);
+            if (!rows || !elementWidth)
+                throw std::runtime_error("CPU six-phase emit shaped output port has an invalid shape");
+            const Type element = arrayElementType(outputType);
+            out << "{const auto cpu_packed=" << read(operands[0]) << ";\n"
+                << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)"
+                << rowAccessText(member, outputType.shape, "cpu_j") << '='
+                << normalize(rowSliceText("cpu_packed", "cpu_j", *elementWidth,
+                                          outputType.width), element) << ";}\n";
         }
         void SixPhaseEmitter::commitStagedOutputWrites(std::ostream &out) const
         {
             // Timeslot history write-backs commit after every P_output op ran, so
             // the in-body ne comparisons all observed the previous eval's values.
-            // P_publish already equalized regLatchStore/regLatchStoreNext, so the
+            // P_publish already equalized smallSinkStore/smallSinkStoreNext, so the
             // commit lands in both to keep the round-start invariant.
             for (const auto &staged : stagedOutputWrites_)
             {
                 const auto &target = stateType(staged.field->state);
                 const std::string name(model_.text(staged.field->name));
+                const bool small = staged.field->state.index < regFieldByState_.size() &&
+                                   regFieldByState_[staged.field->state.index];
+                const std::string slot = std::string(small ? "smallSinkStore." : "largeSinkStore.") + name;
+                const std::string syncNext = small ? "smallSinkStoreNext." + name + "=cpu_merged;\n"
+                                                   : std::string();
                 out << "if(" << staged.enable << "){\n";
                 if (isScalarLogic(target))
                 {
-                    out << "{const auto cpu_merged=" << normalize("(static_cast<std::uint64_t>(regLatchStore." + name +
+                    out << "{const auto cpu_merged=" << normalize("(static_cast<std::uint64_t>(" + slot +
                             ")&~static_cast<std::uint64_t>(" + staged.mask + "))|(static_cast<std::uint64_t>(" + staged.data +
                             ")&static_cast<std::uint64_t>(" + staged.mask + "))", target) << ";\n"
-                        << "if(regLatchStore." << name << "!=cpu_merged){GRHSIM_PERF_COUNT(touchedStateShadowCount);\n"
-                        << "regLatchStore." << name << "=cpu_merged;\nregLatchStoreNext." << name << "=cpu_merged;\n}}\n";
+                        << "if(" << slot << "!=cpu_merged){GRHSIM_PERF_COUNT(touchedStateShadowCount);\n"
+                        << slot << "=cpu_merged;\n" << syncNext << "}}\n";
                 }
                 else if (target.kind == TypeKind::Logic && target.domain == LogicDomain::TwoState)
                 {
-                    out << "{const auto cpu_merged=" << normalize("(regLatchStore." + name + "&~(" + staged.mask + "))|(" +
+                    out << "{const auto cpu_merged=" << normalize("(" + slot + "&~(" + staged.mask + "))|(" +
                                                                       staged.data + "&(" + staged.mask + "))", target) << ";\n"
-                        << "if(regLatchStore." << name << "!=cpu_merged){GRHSIM_PERF_COUNT(touchedStateShadowCount);\n"
-                        << "regLatchStore." << name << "=cpu_merged;\nregLatchStoreNext." << name << "=cpu_merged;\n}}\n";
+                        << "if(" << slot << "!=cpu_merged){GRHSIM_PERF_COUNT(touchedStateShadowCount);\n"
+                        << slot << "=cpu_merged;\n" << syncNext << "}}\n";
                 }
                 else throw std::runtime_error("CPU six-phase emit output latchWrite target type is not two-state logic");
                 out << "}\n";
@@ -3426,16 +4269,21 @@ namespace wolvrix::lib::grhsim
         {
             for (const auto &type : model_.types())
                 if (type.kind == TypeKind::Logic && type.domain != LogicDomain::TwoState)
-                    throw std::runtime_error("CPU six-phase emit requires two-state logic types");
+                    throw std::runtime_error(type.shape.empty()
+                        ? "CPU six-phase emit requires two-state logic types"
+                        : "CPU six-phase emit does not support four-state aggregate types");
             for (const auto &state : model_.states())
                 if (containsString(model_.types()[state.type.index - 1]))
                     throw std::runtime_error("CPU six-phase emit string state initialization and commit are not implemented");
             std::set<std::string> names{class_, "init", "eval", "dumpState", "set_runtime_profile_enabled",
                 "dump_runtime_profile", "configure_waveform", "perf_counters", "PerfCounters", "pInput", "pEvent",
-                "pGeneral", "pMem", "pPublish", "pOutput",
-                "regLatchStore", "regLatchStoreNext", "memStore", "boundaryValueStore", "prevEventStore",
-                "eventActStore", "timeslotTriggerFlag", "memEnableBits", "cpu_rng", "perf_", "RegLatchStore", "MemStore",
-                "BoundaryValueStore", "PrevEventStore", "boundaryStrings"};
+                "pGeneral", "pLargeSink", "pPublish", "pOutput",
+                "smallSinkStore", "smallSinkStoreNext", "largeSinkStore", "inputStore", "nonSinkBoundaryStore",
+                "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore",
+                "largeSinkPayloadBoundaryStore", "prevEventStore", "eventActStore", "timeslotTriggerFlag",
+                "cpu_rng", "perf_", "SmallSinkStore", "LargeSinkStore", "InputStore",
+                "NonSinkBoundaryStore", "SmallSinkEnableBoundaryStore", "SmallSinkPayloadBoundaryStore",
+                "LargeSinkEnableBoundaryStore", "LargeSinkPayloadBoundaryStore", "PrevEventStore", "boundaryStrings"};
             // M5d-7 chunk members and spill frame types share the class scope;
             // register them with duplicate detection so a pathological op name
             // (e.g. one that makes sn_12_c0 collide with a chunk name) fails
@@ -3444,10 +4292,12 @@ namespace wolvrix::lib::grhsim
                 if (!names.insert(name).second)
                     throw std::runtime_error("CPU generated member name collides: " + name);
             };
+            for (const auto &[state, readers] : largeFinalChange_)
+                claim("cpu_largeBefore" + std::to_string(state));
             for (uint32_t i = 0; i < initChunks_.size(); ++i) claim("cpu_init_" + std::to_string(i));
             for (uint32_t i = 0; i < eventChunks_.size(); ++i) claim("pEvent_c" + std::to_string(i));
             for (uint32_t i = 0; i < scanChunks_.size(); ++i) claim("pGeneral_c" + std::to_string(i));
-            for (uint32_t i = 0; i < memChunks_.size(); ++i) claim("pMem_c" + std::to_string(i));
+            for (uint32_t i = 0; i < memChunks_.size(); ++i) claim("pLargeSink_c" + std::to_string(i));
             for (uint32_t i = 0; i < outputChunks_.size(); ++i) claim("pOutput_c" + std::to_string(i));
             for (uint32_t i = 0; i < dumpChunks_.size(); ++i) claim("cpu_dump_" + std::to_string(i));
             if (!eventFrame_.empty()) claim("EventFrame");
@@ -3641,12 +4491,8 @@ namespace wolvrix::lib::grhsim
                                     if (const auto *text = parameter<std::string>(model_, params, "value"))
                                         zero = initLiteral(*text, element) == literal("0", element);
                                 }
-                                else if (const auto *values = parameter<std::vector<std::string>>(model_, params, "value"))
-                                {
-                                    zero = true;
-                                    for (const auto &text : *values)
-                                        if (initLiteral(text, element) != literal("0", element)) { zero = false; break; }
-                                }
+                                else if (const auto *text = parameter<std::string>(model_, params, "value"))
+                                    zero = initLiteral(*text, target) == literal("0", target);
                             }
                             else if (kind == "core.init.fill")
                                 if (const auto *text = parameter<std::string>(model_, params, "value"))
@@ -3714,12 +4560,12 @@ namespace wolvrix::lib::grhsim
             // The store follows the state's classification (M5d-6): regLatch
             // covers scalars and regLatch-class arrays, mem the mem-class
             // arrays. Initializers write the current buffer; initGlue syncs
-            // regLatchStoreNext afterwards.
+            // smallSinkStoreNext afterwards.
             const bool inRegLatch = id.index < regFieldByState_.size() && regFieldByState_[id.index];
             const auto *field = inRegLatch ? regFieldByState_[id.index]
                                            : (id.index < memFieldByState_.size() ? memFieldByState_[id.index] : nullptr);
             if (!field) throw std::runtime_error("CPU six-phase emit state has no named-store field");
-            const std::string slot = (inRegLatch ? "regLatchStore." : "memStore.") + std::string(model_.text(field->name));
+            const std::string slot = (inRegLatch ? "smallSinkStore." : "largeSinkStore.") + std::string(model_.text(field->name));
             const bool elide = initZeroElidable(step);
             if (!elide) out << "{\n";
             if (!array)
@@ -3741,21 +4587,23 @@ namespace wolvrix::lib::grhsim
                 return;
             }
 
-            // Array (shaped state) initializers address flat row-major rows.
+            // Array initializers address row-major elements of the nested store.
             const auto rowCountOpt = shapeElementCount(target.shape);
             if (!rowCountOpt)
                 throw std::runtime_error("CPU six-phase emit array state has an invalid shape");
             const uint64_t rowCount = *rowCountOpt;
             if (kind == "core.init.const")
             {
-                const auto *values = parameter<std::vector<std::string>>(model_, params, "value");
-                if (!values || values->size() != rowCount)
-                    throw std::runtime_error("CPU array const initializer requires exactly count element literals");
-                if (!elide && !values->empty())
+                const auto *text = parameter<std::string>(model_, params, "value");
+                if (!text)
+                    throw std::runtime_error("CPU array const initializer requires one total-width literal");
+                if (!elide)
                 {
-                    out << "static const " << cppType(element) << " data[]={\n";
-                    for (const auto &text : *values) out << initLiteral(text, element) << ",\n";
-                    out << "};\nstd::memcpy(" << slot << ".data(),data,sizeof(data));\n";
+                    out << "const auto cpu_value=" << initLiteral(*text, target) << ";\n"
+                        << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row)"
+                        << rowAccessText(slot, target.shape, "cpu_row") << '='
+                        << normalize(rowSliceText("cpu_value", "cpu_row", element.width, target.width), element)
+                        << ";\n";
                 }
             }
             else if (kind == "core.init.fill" || kind == "core.init.readmem")
@@ -3778,12 +4626,13 @@ namespace wolvrix::lib::grhsim
                     if (!elide)
                     {
                         if (zero)
-                            out << "std::memset(" << slot << ".data()+" << first * rowBytes << ",0," << size * rowBytes << ");\n";
+                            out << "std::memset(reinterpret_cast<char*>(&" << slot << ")+" << first * rowBytes
+                                << ",0," << size * rowBytes << ");\n";
                         else
                         {
                             if (text) out << "static const auto data=" << initLiteral(*text, element) << ";\n";
                             out << "for(std::size_t row=" << first << ";row<" << end << ";++row){\n"
-                                << "auto &dst=" << slot << "[row];\n";
+                                << "auto &dst=" << rowAccessText(slot, target.shape, "row") << ";\n";
                             if (text) out << "dst=data;\n";
                             else randomInit(out, element, "dst", "cpu_rng");
                             out << "}\n";
@@ -3799,7 +4648,8 @@ namespace wolvrix::lib::grhsim
                         for (const auto &[row, data] : rows) out << row << ',';
                         out << "};\nstatic const " << cppType(element) << " data[]={\n";
                         for (const auto &[row, data] : rows) out << data << ",\n";
-                        out << "};\nfor(std::size_t i=0;i<" << rows.size() << ";++i)" << slot << "[rows[i]]=data[i];\n";
+                        out << "};\nfor(std::size_t i=0;i<" << rows.size() << ";++i)"
+                            << rowAccessText(slot, target.shape, "rows[i]") << "=data[i];\n";
                     }
                 }
             }
@@ -3822,6 +4672,7 @@ namespace wolvrix::lib::grhsim
         void SixPhaseEmitter::header(std::ostream &out) const
         {
             out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
+            if (!largeFinalChange_.empty()) out << "#include <unordered_map>\n";
             if (waveform_) out << "#include <memory>\n";
             if (memWriteOnWrite_)
                 out << "// emit option: --mem-write-activate on-write (write-occurs reader activation)\n";
@@ -3861,8 +4712,8 @@ namespace wolvrix::lib::grhsim
             // Contract §1.2: the interface port members open the class body (the
             // first public block's leading run of member declarations).
             out << "class " << class_ << " {\npublic:\n";
-            for (const auto &input : model_.inputs()) out << cppType(model_.types()[input.type.index - 1]) << ' ' << identifier(model_.text(input.name)) << "{};\n";
-            for (const auto &output : model_.outputs()) out << cppType(model_.types()[output.type.index - 1]) << ' ' << identifier(model_.text(output.name)) << "{};\n";
+            for (const auto &input : model_.inputs()) out << cppValueType(model_.types()[input.type.index - 1]) << ' ' << identifier(model_.text(input.name)) << "{};\n";
+            for (const auto &output : model_.outputs()) out << cppValueType(model_.types()[output.type.index - 1]) << ' ' << identifier(model_.text(output.name)) << "{};\n";
             out << "\n" << class_ << "()=default;\nvoid init();\nvoid eval();\nvoid dumpState(std::FILE *stream) const;\n"
                 << "void set_runtime_profile_enabled(bool){}\nvoid dump_runtime_profile() const {}\n";
             if (waveform_)
@@ -3903,12 +4754,32 @@ namespace wolvrix::lib::grhsim
             if (hasSystemTasks_)
                 out << "bool cpu_first_eval=true;\nstd::array<bool," << onceTasks_.size() << "> cpu_system_done{};\n"
                     << "void cpu_system_task(std::string_view,std::span<const grhsim_task_arg>);\n";
-            storeStruct(out, "RegLatchStore", *regLatchStore_);
-            out << "RegLatchStore regLatchStore;\nRegLatchStore regLatchStoreNext;\n";
-            storeStruct(out, "MemStore", *memStore_);
-            out << "MemStore memStore;\n";
-            storeStruct(out, "BoundaryValueStore", *boundaryStore_);
-            out << "BoundaryValueStore boundaryValueStore;\n";
+            storeStruct(out, "SmallSinkStore", *smallSinkStore_);
+            out << "SmallSinkStore smallSinkStore;\nSmallSinkStore smallSinkStoreNext;\n";
+            storeStruct(out, "LargeSinkStore", *largeSinkStore_);
+            out << "LargeSinkStore largeSinkStore;\n";
+            // Only repeated event-free writers need old values for final
+            // change detection. Save changed cells sparsely, never copy a RAM.
+            for (const auto &[state, readers] : largeFinalChange_)
+            {
+                const auto &type = stateType(StateId{state, 0});
+                out << "std::unordered_map<std::size_t,"
+                    << cppType(type.shape.empty() ? type : arrayElementType(type))
+                    << "> cpu_largeBefore" << state << ";\n";
+            }
+            constexpr std::array<std::string_view, 6> boundaryTypes{
+                "InputStore", "NonSinkBoundaryStore", "SmallSinkEnableBoundaryStore",
+                "SmallSinkPayloadBoundaryStore", "LargeSinkEnableBoundaryStore",
+                "LargeSinkPayloadBoundaryStore"};
+            constexpr std::array<std::string_view, 6> boundaryNames{
+                "inputStore", "nonSinkBoundaryStore", "smallSinkEnableBoundaryStore",
+                "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore",
+                "largeSinkPayloadBoundaryStore"};
+            for (std::size_t i = 0; i < boundaryStores_.size(); ++i)
+            {
+                storeStruct(out, boundaryTypes[i], *boundaryStores_[i]);
+                out << boundaryTypes[i] << ' ' << boundaryNames[i] << ";\n";
+            }
             if (boundaryStringCount_)
                 out << "std::array<std::string," << boundaryStringCount_ << "> boundaryStrings; // hoisted string boundary fields\n";
             storeStruct(out, "PrevEventStore", *prevEventStore_);
@@ -3917,11 +4788,6 @@ namespace wolvrix::lib::grhsim
             // timeslot flags are one byte per task, index == the flag index.
             out << "std::array<std::uint8_t," << std::max<uint64_t>(eventActStore_->sizeBytes, 1) << "> eventActStore{};\n";
             out << "std::array<std::uint8_t," << std::max<uint64_t>(timeslotStore_->sizeBytes, 1) << "> timeslotTriggerFlag{};\n";
-            // P_mem enable shadow bitmap: bit i mirrors the i-th bitmapped
-            // mem-write enable's boundary field (built in init(), kept in sync
-            // by the boundary compare-store / pInput write paths).
-            if (memEnableBitmap_ && memEnableWords_)
-                out << "std::array<std::uint64_t," << memEnableWords_ << "> memEnableBits{};\n";
             for (const auto &field : activeStore_->fields)
                 out << cppStoreType(field.type) << ' ' << model_.text(field.name) << "{}; // supernodes=" << field.aux << '\n';
             out << "std::uint64_t cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
@@ -3929,7 +4795,7 @@ namespace wolvrix::lib::grhsim
             if (randomSampleCount_)
                 out << "std::array<std::uint64_t," << randomSampleCount_ << "> cpu_random_values{};\n"
                     << "std::array<bool," << randomSampleCount_ << "> cpu_random_sampled{};\n";
-            out << "void pInput();\nvoid pEvent();\nvoid pGeneral();\nvoid pMem();\nbool pPublish();\nvoid pOutput();\n";
+            out << "void pInput();\nvoid pEvent();\nvoid pGeneral();\nvoid pLargeSink();\nbool pPublish();\nvoid pOutput();\n";
             // M5d-7 multi-TU: spill frame structs (cross-chunk locals) and the
             // chunk member declarations. Frame structs nest inside the class;
             // chunk functions live in the unit .cpp the C8 plan assigned.
@@ -3958,7 +4824,7 @@ namespace wolvrix::lib::grhsim
                 out << ");\n";
             }
             for (uint32_t i = 0; i < scanChunks_.size(); ++i) out << "void pGeneral_c" << i << "();\n";
-            for (uint32_t i = 0; i < memChunks_.size(); ++i) out << "void pMem_c" << i << "();\n";
+            for (uint32_t i = 0; i < memChunks_.size(); ++i) out << "void pLargeSink_c" << i << "();\n";
             for (uint32_t i = 0; i < outputChunks_.size(); ++i)
             {
                 out << "void pOutput_c" << i << '(';
@@ -3995,11 +4861,16 @@ namespace wolvrix::lib::grhsim
                 out << cppStoreType(field.type) << ' ' << model_.text(field.name) << ";";
                 switch (store.kind)
                 {
-                case CpuNamedStoreKind::RegLatch:
-                case CpuNamedStoreKind::Mem:
+                case CpuNamedStoreKind::SmallSink:
+                case CpuNamedStoreKind::LargeSink:
                     if (field.state) out << " // state=" << model_.text(model_.states()[field.state.index - 1].name);
                     break;
-                case CpuNamedStoreKind::Boundary:
+                case CpuNamedStoreKind::Input:
+                case CpuNamedStoreKind::NonSinkBoundary:
+                case CpuNamedStoreKind::SmallSinkEnableBoundary:
+                case CpuNamedStoreKind::SmallSinkPayloadBoundary:
+                case CpuNamedStoreKind::LargeSinkEnableBoundary:
+                case CpuNamedStoreKind::LargeSinkPayloadBoundary:
                     if (field.value)
                     {
                         const auto &value = model_.values()[field.value.index - 1];
@@ -4018,6 +4889,10 @@ namespace wolvrix::lib::grhsim
                 }
                 out << '\n';
             }
+            const auto words = store.kind == CpuNamedStoreKind::SmallSinkEnableBoundary
+                ? smallEnable_.words() : store.kind == CpuNamedStoreKind::LargeSinkEnableBoundary
+                ? largeEnable_.words() : 0;
+            if (words) out << "std::array<std::uint64_t," << words << "> enabledWords;\n";
             out << "};\n";
         }
         void SixPhaseEmitter::unitCpp(std::ostream &out, const CpuTranslationUnit &unit) const
@@ -4100,7 +4975,7 @@ namespace wolvrix::lib::grhsim
                     supernodeHelperRange(out, chunk.offset, range.offset, range.offset + range.count);
                     break;
                 }
-                case CpuEmitChunkKind::Mem: memChunkFn(out, chunkId(chunk), chunk); break;
+                case CpuEmitChunkKind::LargeSink: memChunkFn(out, chunkId(chunk), chunk); break;
                 case CpuEmitChunkKind::Output: outputChunkFn(out, chunkId(chunk), chunk); break;
                 case CpuEmitChunkKind::Dump: dumpChunkFn(out, chunkId(chunk), chunk); break;
                 }
@@ -4114,7 +4989,7 @@ namespace wolvrix::lib::grhsim
             pInputBody(out);
             pEventBody(out);
             pGeneralBody(out);
-            pMemBody(out);
+            pLargeSinkBody(out);
             pPublishBody(out);
             pOutputBody(out);
             evalBody(out);
@@ -4124,6 +4999,10 @@ namespace wolvrix::lib::grhsim
         }
         void SixPhaseEmitter::supernodeBody(std::ostream &out, uint32_t ordinal) const
         {
+            const auto previousContext = readContext_;
+            readContext_ = *tree_.partitions[order_[ordinal].index - 1].attrs.supernodeCategory ==
+                                   CpuSupernodeCategory::NonSink
+                               ? CpuBoundaryUse::NonSink : CpuBoundaryUse::SmallSinkPayload;
             std::fill(activeLocals_.begin(), activeLocals_.end(), 0);
             // fanout 合写：函数体先进缓冲，旗标写累积到局部变量，尾端一次写回。
             std::ostringstream body;
@@ -4137,6 +5016,7 @@ namespace wolvrix::lib::grhsim
             out << body.str();
             flagAccumWriteBack(out);
             out << "}\n";
+            readContext_ = previousContext;
         }
         // V3-M2: the sn_<ordinal> driver (wrapper) alone — emitted by the
         // Supernode chunk of a split supernode; the __c<i> helpers live in
@@ -4146,7 +5026,9 @@ namespace wolvrix::lib::grhsim
             const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
             const auto &frame = supernodeFrames_[ordinal];
             out << "void " << class_ << "::" << supernodeName(ordinal) << "(){\n";
-            if (!frame.empty()) out << "SnFrame" << ordinal << " cpu_f{};\n";
+            if (!frame.empty())
+                out << "SnFrame" << ordinal << " cpu_f"
+                    << (frameNeedsZeroInit(frame) ? "{}" : "") << ";\n";
             for (std::size_t i = 0; i < attrs.helperChunks.size(); ++i)
                 out << supernodeName(ordinal) << "__c" << i << '(' << (frame.empty() ? "" : "cpu_f") << ");\n";
             out << "}\n";
@@ -4158,6 +5040,9 @@ namespace wolvrix::lib::grhsim
                                                    uint32_t end) const
         {
             const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+            const auto previousContext = readContext_;
+            readContext_ = *attrs.supernodeCategory == CpuSupernodeCategory::NonSink
+                               ? CpuBoundaryUse::NonSink : CpuBoundaryUse::SmallSinkPayload;
             const auto &frame = supernodeFrames_[ordinal];
             for (std::size_t i = begin; i < end; ++i)
             {
@@ -4183,6 +5068,7 @@ namespace wolvrix::lib::grhsim
                 flagAccumWriteBack(out);
                 out << "}\n";
             }
+            readContext_ = previousContext;
         }
         void SixPhaseEmitter::supernodeChunkFns(std::ostream &out, uint32_t ordinal) const
         {
@@ -4249,8 +5135,9 @@ namespace wolvrix::lib::grhsim
                                                  "invalid shape");
                     const Type element = arrayElementType(valueType);
                     out << "{const auto cpu_value=" << init << ";\n"
-                        << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)" << boundaryRef(field)
-                        << "[cpu_j]="
+                        << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)"
+                        << rowAccessText(boundaryRef(field), valueType.shape, "cpu_j")
+                        << "="
                         << normalize(rowSliceText("cpu_value", "cpu_j", *elementWidth, valueType.width), element)
                         << ";\n}\n";
                     return;
@@ -4266,7 +5153,7 @@ namespace wolvrix::lib::grhsim
                     << initLiteral(det.prevInit, type(det.event)) << ";\n";
                 return;
             }
-            out << "regLatchStoreNext=regLatchStore;\n";
+            out << "smallSinkStoreNext=smallSinkStore;\n";
         }
         void SixPhaseEmitter::eventChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
         {
@@ -4279,7 +5166,7 @@ namespace wolvrix::lib::grhsim
         void SixPhaseEmitter::scanRange(std::ostream &out, uint32_t begin, uint32_t end) const
         {
             // V2 (M2) firing rules by supernode category: a non-sink
-            // supernode fires on dataActiveFlag (cleared on fire); a sink
+            // supernode fires on nonSinkActiveFlag (cleared on fire); a sink
             // event cluster fires on its eventActStore signature (the
             // signature IS the gate — no flag involved); a sink escape
             // supernode fires unconditionally every round.
@@ -4316,30 +5203,67 @@ namespace wolvrix::lib::grhsim
                 }
                 out << "}\n";
             }
-            for (; ordinal < end; ++ordinal)
-            {
-                const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+            const auto emitSinkCall = [&](uint32_t sinkOrdinal, bool actHoisted) {
+                const auto &attrs = tree_.partitions[order_[sinkOrdinal].index - 1].attrs;
                 switch (*attrs.supernodeCategory)
                 {
-                case CpuSupernodeCategory::SinkEscape:
+                case CpuSupernodeCategory::SmallSinkEscape:
                     out << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
-                        << supernodeName(ordinal) << "();\n";
+                        << supernodeName(sinkOrdinal) << "();\n";
                     break;
-                case CpuSupernodeCategory::SinkEvent:
-                    // A1: a guard-subdivided cluster gates on its signature
-                    // AND one read of the members' shared write enable (a
-                    // boundary/state/input read, exactly what the member
-                    // state writes see as their en operand).
-                    out << "if(" << actBitsGuard(*attrs.eventActs);
-                    if (attrs.enableGuard)
-                        out << "&&" << read(ValueId{static_cast<uint32_t>(*attrs.enableGuard), 0});
-                    out << "){\n"
-                        << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
-                        << supernodeName(ordinal) << "();\n}\n";
+                case CpuSupernodeCategory::SmallSinkEvent:
+                    if (!actHoisted || attrs.enableGuard)
+                    {
+                        out << "if(";
+                        if (!actHoisted) out << actBitsGuard(*attrs.eventActs);
+                        if (attrs.enableGuard)
+                        {
+                            if (!actHoisted) out << "&&";
+                            out << readAs(ValueId{static_cast<uint32_t>(*attrs.enableGuard), 0},
+                                          CpuBoundaryUse::SmallSinkEnable);
+                        }
+                        out << "){\n";
+                    }
+                    out << "GRHSIM_PERF_COUNT(computeBatchExecCount);\n"
+                        << supernodeName(sinkOrdinal) << "();\n";
+                    if (!actHoisted || attrs.enableGuard) out << "}\n";
                     break;
                 case CpuSupernodeCategory::NonSink:
                     throw std::runtime_error("CPU six-phase emit non-sink supernode beyond the ordinal prefix");
                 }
+            };
+            while (ordinal < end)
+            {
+                if (smallSinkEnableBits_[ordinal].empty())
+                {
+                    emitSinkCall(ordinal++, false);
+                    continue;
+                }
+                const auto &attrs = tree_.partitions[order_[ordinal].index - 1].attrs;
+                uint32_t runEnd = ordinal + 1;
+                while (runEnd < end && !smallSinkEnableBits_[runEnd].empty() &&
+                       smallSinkPriority_[runEnd] == smallSinkPriority_[ordinal] &&
+                       tree_.partitions[order_[runEnd].index - 1].attrs.eventActs == attrs.eventActs)
+                    ++runEnd;
+                std::map<uint32_t, uint64_t> wordMasks;
+                for (uint32_t i = ordinal; i < runEnd; ++i)
+                    for (const auto bit : smallSinkEnableBits_[i])
+                        wordMasks[bit / 64] |= 1ull << (bit % 64);
+                if (!attrs.eventActs->empty()) out << "if(" << actBitsGuard(*attrs.eventActs) << "){\n";
+                out << "if((";
+                bool first = true;
+                for (const auto &[word, mask] : wordMasks)
+                {
+                    if (!first) out << '|';
+                    first = false;
+                    out << "(smallSinkEnableBoundaryStore.enabledWords[" << word << ']'
+                        << '&' << u64Const(mask) << ')';
+                }
+                out << ")!=UINT64_C(0)){\n";
+                for (uint32_t i = ordinal; i < runEnd; ++i) emitSinkCall(i, true);
+                out << "}\n";
+                if (!attrs.eventActs->empty()) out << "}\n";
+                ordinal = runEnd;
             }
         }
         void SixPhaseEmitter::scanChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
@@ -4350,11 +5274,16 @@ namespace wolvrix::lib::grhsim
         }
         void SixPhaseEmitter::memChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
         {
-            out << "void " << class_ << "::pMem_c" << id << "(){\n";
+            const auto previousContext = readContext_;
+            readContext_ = CpuBoundaryUse::LargeSinkPayload;
+            out << "void " << class_ << "::pLargeSink_c" << id << "(){\n";
             if (schedule_.memWritePlan)
             {
                 const auto &plan = *schedule_.memWritePlan;
-                // Two-level grouping, both semantics-preserving:
+                // Priority buckets are outermost; inside one priority, act
+                // clustering hoists the guard and enable-word runs skip empty
+                // write groups. The plan is ordered from lower to higher
+                // priority so later writes overwrite earlier writes directly.
                 // 1. Act clustering (Q2b): maximal runs of entries sharing the
                 //    same eventActStore guard get one hoisted test instead of a
                 //    per-port re-read. Ports only read eventActStore (P_event
@@ -4372,7 +5301,7 @@ namespace wolvrix::lib::grhsim
                     const auto &entryOp = model_.operations()[entry.writeOp.index - 1];
                     const std::string guard = actGuard(entryOp);
                     uint32_t end = i + 1;
-                    while (end < chunk.count &&
+                    while (end < chunk.count && plan[chunk.offset + end].priority == entry.priority &&
                            actGuard(model_.operations()[plan[chunk.offset + end].writeOp.index - 1]) == guard)
                         ++end;
                     const bool hoisted = guard != "true";
@@ -4385,66 +5314,79 @@ namespace wolvrix::lib::grhsim
                     uint32_t k = i;
                     while (k < end)
                     {
-                        const auto entryWords = [&](uint32_t k, std::set<uint32_t> &words) {
-                            const auto enables =
-                                memEnableOperands(model_.operations()[plan[chunk.offset + k].writeOp.index - 1]);
-                            if (enables.empty()) return false;
-                            for (const auto enable : enables)
-                            {
-                                const auto it = enableBitOfValue_.find(enable.index);
-                                if (it == enableBitOfValue_.end()) return false;
-                                words.insert(it->second / 64);
-                            }
-                            return true;
+                        // Consecutive aggregate writes often share one scalar
+                        // enable (one preserved array port fans out to many
+                        // rows).  Keep the event/priority order, but hoist the
+                        // exact bitmap-bit test around the whole run so the
+                        // generated code does not repeat the same branch for
+                        // every row write.  The outer word guard remains a
+                        // cheap skip when all bits in this run are clear.
+                        const auto entryBit = [&](uint32_t position)
+                            -> std::optional<std::pair<ValueId, uint32_t>> {
+                            const auto enables = memEnableOperands(
+                                model_.operations()[plan[chunk.offset + position].writeOp.index - 1]);
+                            if (enables.size() != 1) return std::nullopt;
+                            const auto it = largeEnable_.bitOfValue.find(enables.front().index);
+                            if (it == largeEnable_.bitOfValue.end()) return std::nullopt;
+                            return std::pair<ValueId, uint32_t>{enables.front(), it->second};
                         };
-                        std::set<uint32_t> words;
-                        if (!entryWords(k, words))
+                        const auto firstBit = entryBit(k);
+                        if (!firstBit)
                         {
                             emitMemWrite(out, model_.operations()[plan[chunk.offset + k].writeOp.index - 1],
                                          plan[chunk.offset + k], hoisted, nullptr, eventFree);
                             ++k;
                             continue;
                         }
+                        std::set<uint32_t> words;
                         uint32_t runEnd = k + 1;
                         while (runEnd < end)
                         {
-                            std::set<uint32_t> more;
-                            if (!entryWords(runEnd, more)) break;
-                            words.insert(more.begin(), more.end());
+                            if (!entryBit(runEnd)) break;
                             ++runEnd;
                         }
-                        if (runEnd - k < 2)
+                        for (uint32_t position = k; position < runEnd; ++position)
+                            words.insert(entryBit(position)->second / 64);
+                        const bool wordGuard = runEnd - k >= 2;
+                        if (wordGuard)
                         {
-                            emitMemWrite(out, model_.operations()[plan[chunk.offset + k].writeOp.index - 1],
-                                         plan[chunk.offset + k], hoisted, nullptr, eventFree);
-                            k = runEnd;
-                            continue;
+                            out << "if((";
+                            bool first = true;
+                            for (const auto word : words)
+                            {
+                                if (!first) out << '|';
+                                first = false;
+                                out << "largeSinkEnableBoundaryStore.enabledWords[" << word << ']';
+                            }
+                            out << ")!=UINT64_C(0)){\n";
                         }
-                        out << "if((";
-                        bool first = true;
-                        for (const auto word : words)
+                        uint32_t groupBegin = k;
+                        while (groupBegin < runEnd)
                         {
-                            if (!first) out << '|';
-                            first = false;
-                            out << "memEnableBits[" << word << ']';
+                            const auto groupBit = entryBit(groupBegin);
+                            const auto groupEnable = groupBit->first;
+                            uint32_t groupEnd = groupBegin + 1;
+                            while (groupEnd < runEnd && entryBit(groupEnd)->second == groupBit->second)
+                                ++groupEnd;
+                            out << "if(" << memEnableGuard(groupEnable) << "){\n";
+                            std::set<uint32_t> burst;
+                            for (uint32_t position = groupBegin; position < groupEnd; ++position)
+                                emitMemWrite(out,
+                                             model_.operations()[plan[chunk.offset + position].writeOp.index - 1],
+                                             plan[chunk.offset + position], hoisted,
+                                             (memWriteOnWrite_ && !eventFree) ? &burst : nullptr,
+                                             eventFree, true);
+                            if (!burst.empty())
+                            {
+                                const auto dataNext = model_.text(activeStore_->fields[1].name);
+                                for (const auto ordinal : burst)
+                                    out << dataNext << '[' << ordinal / 64 << "]|="
+                                        << u64Const(1ull << (ordinal % 64)) << ";\n";
+                            }
+                            out << "}\n";
+                            groupBegin = groupEnd;
                         }
-                        out << ")!=UINT64_C(0)){\n";
-                        std::set<uint32_t> burst;
-                        for (uint32_t m = k; m < runEnd; ++m)
-                            emitMemWrite(out, model_.operations()[plan[chunk.offset + m].writeOp.index - 1],
-                                         plan[chunk.offset + m], hoisted,
-                                         (memWriteOnWrite_ && !eventFree) ? &burst : nullptr, eventFree);
-                        // Write-occurs activation burst (on-write mode): one
-                        // union of the run's reader ordinals, set once when any
-                        // enable in the word group fired.
-                        if (!burst.empty())
-                        {
-                            const auto dataNext = model_.text(activeStore_->fields[1].name);
-                            for (const auto ordinal : burst)
-                                out << dataNext << '[' << ordinal / 64 << "]|=" << u64Const(1ull << (ordinal % 64))
-                                    << ";\n";
-                        }
-                        out << "}\n";
+                        if (wordGuard) out << "}\n";
                         k = runEnd;
                     }
                     if (hoisted) out << "}\n";
@@ -4452,6 +5394,7 @@ namespace wolvrix::lib::grhsim
                 }
             }
             out << "}\n";
+            readContext_ = previousContext;
         }
         void SixPhaseEmitter::outputChunkFn(std::ostream &out, uint32_t id, const CpuEmitChunk &chunk) const
         {
@@ -4502,8 +5445,15 @@ namespace wolvrix::lib::grhsim
                 return;
             }
             position -= model_.outputs().size();
-            for (const auto *store : {regLatchStore_, memStore_, boundaryStore_, prevEventStore_,
-                                      eventActStore_, timeslotStore_, activeStore_})
+            const std::array<const CpuNamedStore *, 12> dumpStores{
+                smallSinkStore_, largeSinkStore_, boundaryStores_[0], boundaryStores_[1],
+                boundaryStores_[2], boundaryStores_[3], boundaryStores_[4], boundaryStores_[5],
+                prevEventStore_, eventActStore_, timeslotStore_, activeStore_};
+            constexpr std::array<std::string_view, 6> boundaryNames{
+                "inputStore", "nonSinkBoundaryStore", "smallSinkEnableBoundaryStore",
+                "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore",
+                "largeSinkPayloadBoundaryStore"};
+            for (const auto *store : dumpStores)
             {
                 if (position >= store->fields.size())
                 {
@@ -4511,12 +5461,12 @@ namespace wolvrix::lib::grhsim
                     continue;
                 }
                 const auto &field = store->fields[position];
-                if (store == regLatchStore_ || store == memStore_)
+                if (store == smallSinkStore_ || store == largeSinkStore_)
                 {
                     // Large arrays dump as an fnv1a hash in any store
                     // (regLatch-class arrays joined the regLatch store in
                     // M5d-6).
-                    const auto storeName = store == regLatchStore_ ? "regLatchStore" : "memStore";
+                    const auto storeName = store == smallSinkStore_ ? "smallSinkStore" : "largeSinkStore";
                     const auto &type = layout_.types[field.type.index - 1];
                     if (type.kind == CpuTypeKind::Array && type.count > 64)
                     {
@@ -4531,19 +5481,18 @@ namespace wolvrix::lib::grhsim
                     else dumpStateField(out, storeName, field);
                     return;
                 }
-                if (store == boundaryStore_)
+                const auto boundaryIt = std::find(boundaryStores_.begin(), boundaryStores_.end(), store);
+                if (boundaryIt != boundaryStores_.end())
                 {
-                    // The dump label keeps the store field name (trace
-                    // consumers parse it); hoisted strings print from
-                    // boundaryStrings.
+                    const auto storeName = boundaryNames[boundaryIt - boundaryStores_.begin()];
                     const auto &fieldType = layout_.types[field.type.index - 1];
                     if (fieldType.kind == CpuTypeKind::UInt && fieldType.width > 64)
                     {
-                        wideLine("boundaryValueStore." + std::string(model_.text(field.name)), boundaryRef(&field),
+                        wideLine(std::string(storeName) + "." + std::string(model_.text(field.name)), boundaryRef(&field),
                                  fieldType.width);
                         return;
                     }
-                    out << "std::fprintf(stream,\"boundaryValueStore." << model_.text(field.name) << "=\");" << prefix_
+                    out << "std::fprintf(stream,\"" << storeName << '.' << model_.text(field.name) << "=\");" << prefix_
                         << "_dump::grhsim_dump_value(stream," << boundaryRef(&field)
                         << ");std::fputc('\\n',stream);\n";
                     return;
@@ -4578,7 +5527,7 @@ namespace wolvrix::lib::grhsim
         {
             // Load changed input ports into their boundary fields and flag the
             // input.read fanout. Pure-event inputs carry no inputFanout row, so
-            // their write lands without raising dataActiveFlag (spec §3.3).
+            // their write lands without raising nonSinkActiveFlag (spec §3.3).
             const auto dataActive = model_.text(activeStore_->fields[0].name);
             out << "void " << class_ << "::pInput(){\n";
             activateOrdinals(out, std::vector<uint32_t>(randomSupernodes_.begin(), randomSupernodes_.end()), dataActive);
@@ -4586,26 +5535,22 @@ namespace wolvrix::lib::grhsim
             {
                 const auto *field = input.id.index < boundaryByInput_.size() ? boundaryByInput_[input.id.index] : nullptr;
                 if (!field) throw std::runtime_error("CPU six-phase emit input port has no boundary field");
-                const auto slot = "boundaryValueStore." + std::string(model_.text(field->name));
+                const auto slot = boundaryRef(field);
                 const auto member = "this->" + identifier(model_.text(input.name));
                 const auto &inputType = model_.types()[input.type.index - 1];
                 if (!inputType.shape.empty())
                 {
-                    // Shaped (array) port: the member is the packed
-                    // total-width vector, the boundary field the flat per-row
-                    // array — unpack row-wise with change detection (the
-                    // enable-bitmap hook never engages: 1-bit enables are
-                    // scalar-only).
+                    // Shaped ports and inputStore fields have the same nested
+                    // geometry; compare cells without copying the port.
                     const auto rows = shapeElementCount(inputType.shape);
                     const auto elementWidth = typeElementWidth(inputType);
                     if (!rows || !elementWidth)
                         throw std::runtime_error("CPU six-phase emit shaped input port has an invalid shape");
-                    const Type element = arrayElementType(inputType);
-                    const std::string rowExpr =
-                        normalize(rowSliceText("cpu_value", "cpu_j", *elementWidth, inputType.width), element);
-                    out << "{const auto cpu_value=" << member << ";bool cpu_chg=false;\n"
+                    const std::string rowExpr = rowAccessText("cpu_value", inputType.shape, "cpu_j");
+                    out << "{const auto &cpu_value=" << member << ";bool cpu_chg=false;\n"
                         << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j){const auto cpu_e=" << rowExpr
-                        << ";auto &cpu_c=" << slot << "[cpu_j];if(cpu_c!=cpu_e){cpu_c=cpu_e;cpu_chg=true;}}\n"
+                        << ";auto &cpu_c=" << rowAccessText(slot, inputType.shape, "cpu_j")
+                        << ";if(cpu_c!=cpu_e){cpu_c=cpu_e;cpu_chg=true;}}\n"
                         << "if(cpu_chg){";
                     flagOutputDirty(out, outputReadInputs_.contains(input.id.index));
                     out << "\n";
@@ -4616,8 +5561,12 @@ namespace wolvrix::lib::grhsim
                 out << "if(" << slot << "!=" << member << "){" << slot << '=' << member << ";";
                 flagOutputDirty(out, outputReadInputs_.contains(input.id.index));
                 out << "\n";
-                if (const auto it = inputEnableBit_.find(input.id.index); it != inputEnableBit_.end())
-                    out << memEnableSync(it->second, member);
+                if (const auto it = smallEnable_.inputBits.find(input.id.index);
+                    it != smallEnable_.inputBits.end())
+                    out << enableSync(smallEnable_, it->second, member);
+                if (const auto it = largeEnable_.inputBits.find(input.id.index);
+                    it != largeEnable_.inputBits.end())
+                    out << enableSync(largeEnable_, it->second, member);
                 activateOrdinals(out, inputPortFanout_[input.id.index - 1], dataActive);
                 out << "}\n";
             }
@@ -4644,10 +5593,26 @@ namespace wolvrix::lib::grhsim
             for (uint32_t i = 0; i < scanChunks_.size(); ++i) out << "pGeneral_c" << i << "();\n";
             out << "}\n";
         }
-        void SixPhaseEmitter::pMemBody(std::ostream &out) const
+        void SixPhaseEmitter::pLargeSinkBody(std::ostream &out) const
         {
-            out << "void " << class_ << "::pMem(){\n";
-            for (uint32_t i = 0; i < memChunks_.size(); ++i) out << "pMem_c" << i << "();\n";
+            out << "void " << class_ << "::pLargeSink(){\n";
+            for (uint32_t i = 0; i < memChunks_.size(); ++i) out << "pLargeSink_c" << i << "();\n";
+            for (const auto &[state, readers] : largeFinalChange_)
+            {
+                const auto &type = stateType(StateId{state, 0});
+                const auto cell = rowAccessText("largeSinkStore." + std::string(model_.text(memFieldByState_[state]->name)),
+                                               type.shape, "cpu_row");
+                out << "for(const auto &[cpu_row,cpu_old]:cpu_largeBefore" << state
+                    << "){if(" << cell << "!=cpu_old){\n";
+                for (const auto &reader : readers)
+                {
+                    const auto ordinal = ordinalOf_[reader.owner.index];
+                    if (reader.staticRow) out << "if(cpu_row==" << *reader.staticRow << ')';
+                    out << model_.text(activeStore_->fields[1].name) << '[' << ordinal / 64
+                        << "]|=" << u64Const(1ull << (ordinal % 64)) << ";\n";
+                }
+                out << "}}\ncpu_largeBefore" << state << ".clear();\n";
+            }
             out << "}\n";
         }
         void SixPhaseEmitter::pPublishBody(std::ostream &out) const
@@ -4655,10 +5620,17 @@ namespace wolvrix::lib::grhsim
             const auto dataActive = model_.text(activeStore_->fields[0].name);
             const auto dataNext = model_.text(activeStore_->fields[1].name);
             out << "bool " << class_ << "::pPublish(){\n"
-                << "GRHSIM_PERF_COUNT(commitBatchExecCount);\n"
-                << "bool cpu_fixed=true;\nfor(std::size_t cpu_i=0;cpu_i<" << dataNext << ".size();++cpu_i)if(" << dataNext << "[cpu_i]){cpu_fixed=false;break;}\n"
+                << "GRHSIM_PERF_COUNT(commitBatchExecCount);\n";
+            for (const auto state : smallFinalChange_)
+            {
+                const auto name = model_.text(regFieldByState_[state]->name);
+                out << "if(smallSinkStoreNext." << name << "!=smallSinkStore." << name << "){\n";
+                activateOrdinals(out, stateFanout_[state], dataNext);
+                out << "}\n";
+            }
+            out << "bool cpu_fixed=true;\nfor(std::size_t cpu_i=0;cpu_i<" << dataNext << ".size();++cpu_i)if(" << dataNext << "[cpu_i]){cpu_fixed=false;break;}\n"
                 << "for(std::size_t cpu_i=0;cpu_i<" << dataNext << ".size();++cpu_i){" << dataActive << "[cpu_i]|=" << dataNext << "[cpu_i];" << dataNext << "[cpu_i]=0;}\n"
-                << "std::memcpy(&regLatchStore,&regLatchStoreNext,sizeof(regLatchStore));\n"
+                << "std::memcpy(&smallSinkStore,&smallSinkStoreNext,sizeof(smallSinkStore));\n"
                 << "return cpu_fixed;\n}\n";
         }
         void SixPhaseEmitter::pOutputBody(std::ostream &out) const
@@ -4697,7 +5669,7 @@ namespace wolvrix::lib::grhsim
                 << "bool cpu_converged=false;\n"
                 << "for(std::uint32_t cpu_round=1;cpu_round<=100000;++cpu_round){\n"
                 << "GRHSIM_PERF_COUNT(totalRoundCount);\n"
-                << "pEvent();\npGeneral();\npMem();\n"
+                << "pEvent();\npGeneral();\npLargeSink();\n"
                 << "if(pPublish()){cpu_converged=true;\n"
                 << "if(cpu_round==1){GRHSIM_PERF_COUNT(round1Count);}else if(cpu_round==2){GRHSIM_PERF_COUNT(round2Count);}\n"
                 << "break;}\n"
@@ -4731,10 +5703,21 @@ namespace wolvrix::lib::grhsim
                 else
                     out << member << '=' << structName << "{};\n";
             };
-            resetStore("regLatchStore", "RegLatchStore", *regLatchStore_);
-            resetStore("regLatchStoreNext", "RegLatchStore", *regLatchStore_);
-            resetStore("memStore", "MemStore", *memStore_);
-            resetStore("boundaryValueStore", "BoundaryValueStore", *boundaryStore_);
+            resetStore("smallSinkStore", "SmallSinkStore", *smallSinkStore_);
+            resetStore("smallSinkStoreNext", "SmallSinkStore", *smallSinkStore_);
+            resetStore("largeSinkStore", "LargeSinkStore", *largeSinkStore_);
+            for (const auto &[state, readers] : largeFinalChange_)
+                out << "cpu_largeBefore" << state << ".clear();\n";
+            constexpr std::array<std::string_view, 6> boundaryTypes{
+                "InputStore", "NonSinkBoundaryStore", "SmallSinkEnableBoundaryStore",
+                "SmallSinkPayloadBoundaryStore", "LargeSinkEnableBoundaryStore",
+                "LargeSinkPayloadBoundaryStore"};
+            constexpr std::array<std::string_view, 6> boundaryNames{
+                "inputStore", "nonSinkBoundaryStore", "smallSinkEnableBoundaryStore",
+                "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore",
+                "largeSinkPayloadBoundaryStore"};
+            for (std::size_t i = 0; i < boundaryStores_.size(); ++i)
+                resetStore(boundaryNames[i], boundaryTypes[i], *boundaryStores_[i]);
             resetStore("prevEventStore", "PrevEventStore", *prevEventStore_);
             out << "eventActStore.fill(0);\ntimeslotTriggerFlag.fill(0);\n";
             const auto dataActive = model_.text(activeStore_->fields[0].name);
@@ -4759,19 +5742,24 @@ namespace wolvrix::lib::grhsim
                 << "cpu_rng=UINT64_C(0x6a09e667f3bcc909);\n";
             if (!randomFunctions_.empty()) out << "cpu_random_values.fill(0);\ncpu_random_sampled.fill(false);\n";
             // M5d-7: the init stream (steps, constant-boundary preloads,
-            // prevEvent inits, regLatchStoreNext sync) runs in the
+            // prevEvent inits, smallSinkStoreNext sync) runs in the
             // cpu_init_<k> chunk members.
             for (uint32_t i = 0; i < initChunks_.size(); ++i) out << "cpu_init_" << i << "();\n";
-            // P_mem enable shadow bitmap: build once from the boundary fields
-            // after the whole init stream (constant preloads included) ran.
-            if (memEnableBitmap_ && !enableBits_.empty())
-            {
+            // Build both enable bitmaps after constant boundary preloads.
+            const auto initEnableBitmap = [&](const EnableBitmap &bitmap) {
+                if (bitmap.fields.empty()) return;
                 std::map<uint32_t, std::vector<std::pair<uint32_t, const CpuStoreField *>>> byWord;
-                for (uint32_t bit = 0; bit < enableBits_.size(); ++bit)
-                    byWord[bit / 64].emplace_back(bit % 64, enableBits_[bit]);
+                for (uint32_t bit = 0; bit < bitmap.fields.size(); ++bit)
+                    byWord[bit / 64].emplace_back(bit % 64, bitmap.fields[bit]);
                 for (const auto &[word, entries] : byWord)
                 {
-                    out << "memEnableBits[" << word << "]=";
+                    // Keep cold initialization bounded even with 100k enables.
+                    // Without noinline, LLVM merges the chunks back into the
+                    // giant init function and MachineCombiner takes minutes.
+                    constexpr uint32_t wordsPerChunk = 8;
+                    if (word % wordsPerChunk == 0)
+                        out << "[this]() __attribute__((noinline)) {\n";
+                    out << bitmap.storeName << ".enabledWords[" << word << "]=";
                     bool first = true;
                     for (const auto &[off, field] : entries)
                     {
@@ -4780,8 +5768,12 @@ namespace wolvrix::lib::grhsim
                         out << '(' << boundaryRef(field) << '?' << u64Const(1ull << off) << ":UINT64_C(0))";
                     }
                     out << ";\n";
+                    if (word % wordsPerChunk == wordsPerChunk - 1 || word + 1 == byWord.size())
+                        out << "}();\n";
                 }
-            }
+            };
+            initEnableBitmap(smallEnable_);
+            initEnableBitmap(largeEnable_);
             out << "}\n";
         }
         void SixPhaseEmitter::dumpStateBody(std::ostream &out) const
@@ -4816,15 +5808,13 @@ namespace wolvrix::lib::grhsim
             // image), Reals (dumped as their 64-bit pattern) and shaped
             // (array) symbols. Strings, four-state values and symbols folded
             // into a supernode-local are skipped. Stage-06 §8 Q3: a shaped
-            // state/boundary symbol registers one FST var PER ELEMENT
+            // state/boundary/port symbol registers one FST var PER ELEMENT
             // (name[i0][i1]..., row-major; GTKWave folds the bracket names
             // into an array tree) over the flat row-array storage — the
             // per-element addressing lifts the old element-width restriction
             // (wide elements dump through their u64-word image like wide
             // scalars). An array whose physical byte volume exceeds
-            // kWaveMaxBytes is skipped whole (no partial dump). A shaped PORT
-            // has no per-row storage (the interface member is the packed
-            // total-width vector) and dumps as one flat var.
+            // kWaveMaxBytes is skipped whole (no partial dump).
             constexpr uint64_t kWaveMaxBytes = 512;
             // Flat-storage dumpability: {width, bytes} of the single var.
             const auto flatShape = [&](const Type &type) -> std::optional<std::pair<uint32_t, uint64_t>> {
@@ -4878,6 +5868,7 @@ namespace wolvrix::lib::grhsim
                 {
                     objectType = &model_.types()[it->second.index - 1];
                     baseRef = "this->" + identifier(symbol);
+                    rowArray = !objectType->shape.empty();
                 }
                 else if (const auto it = stateByName.find(symbol); it != stateByName.end())
                 {
@@ -4885,7 +5876,7 @@ namespace wolvrix::lib::grhsim
                     const auto *field = state.index < regFieldByState_.size() ? regFieldByState_[state.index] : nullptr;
                     if (!field) continue; // mem-class state (memory contents stay out of the FST)
                     objectType = &stateType(state);
-                    baseRef = "regLatchStore." + std::string(model_.text(field->name));
+                    baseRef = "smallSinkStore." + std::string(model_.text(field->name));
                     rowArray = true;
                 }
                 else if (const auto it = valueByName.find(symbol); it != valueByName.end())
@@ -4894,7 +5885,7 @@ namespace wolvrix::lib::grhsim
                     const auto *field = value.index < boundaryByValue_.size() ? boundaryByValue_[value.index] : nullptr;
                     if (!field) continue; // folded into a supernode-local value
                     objectType = &type(value);
-                    baseRef = "boundaryValueStore." + std::string(model_.text(field->name));
+                    baseRef = boundaryRef(field);
                     rowArray = true;
                 }
                 else
@@ -4918,7 +5909,9 @@ namespace wolvrix::lib::grhsim
                         }
                         for (const uint64_t index : indices)
                             signal.name += '[' + std::to_string(index) + ']';
-                        signal.ref = baseRef + '[' + std::to_string(row) + ']';
+                        signal.ref = baseRef;
+                        for (const uint64_t index : indices)
+                            signal.ref += '[' + std::to_string(index) + ']';
                         signal.width = array->elementWidth;
                         signal.bytes = array->elementBytes;
                         signal.prevOff = static_cast<uint32_t>(prevWords);

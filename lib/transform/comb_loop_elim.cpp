@@ -1916,12 +1916,26 @@ namespace wolvrix::lib::transform
                         graph.replaceOperand(opId, 0, newBase);
                         changed = true;
                     }
-                    if (newLow != low)
+                    // A constant dynamic index was relative to the old
+                    // slice. Preserve the combined offset by making this a
+                    // static slice; sliceStart/End do not affect a dynamic
+                    // slice while its old index operand remains attached.
+                    if (opKind == OperationKind::kSliceDynamic)
+                    {
+                        graph.setOpKind(opId, OperationKind::kSliceStatic);
+                        while (graph.opOperands(opId).size() > 1)
+                        {
+                            graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
+                        }
+                        graph.eraseAttr(opId, "sliceWidth");
+                        changed = true;
+                    }
+                    if (newLow != low || opKind == OperationKind::kSliceDynamic)
                     {
                         graph.setAttr(opId, "sliceStart", newLow);
                         changed = true;
                     }
-                    if (newHigh != high)
+                    if (newHigh != high || opKind == OperationKind::kSliceDynamic)
                     {
                         graph.setAttr(opId, "sliceEnd", newHigh);
                         changed = true;

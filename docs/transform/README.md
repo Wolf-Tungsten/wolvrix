@@ -37,6 +37,8 @@ with wolvrix.Session() as sess:
 | [`latch-transparent-read`](latch-transparent-read.md) | model latch transparency | latch-heavy RTL |
 | [`slice-index-const`](slice-index-const.md) | convert constant dynamic slices to static slices | simplify slicing patterns |
 | [`multidriven-guard`](multidriven-guard.md) | detect multiple-driver conflicts | structural checking before flattening |
+| [`register-write-normalize`](register-write-normalize.md) | extract guarded writes and remove proven array hold paths | two-state array access recovery before scheduling |
+| [`mux-tree-fold`](register-write-normalize.md#动态写恢复) | recover dynamic accesses from expanded array decoders | aggregate array read/write recovery |
 | [`strip-debug`](strip-debug.md) | separate debug logic from main logic | DPI and system-task isolation |
 | [`xmr-resolve`](xmr-resolve.md) | resolve cross-module references | hierarchical cleanup |
 | [`memory-init-check`](memory-init-check.md) | validate memory initialization consistency | memory checking |

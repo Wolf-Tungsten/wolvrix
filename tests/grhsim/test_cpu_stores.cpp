@@ -263,6 +263,13 @@ namespace
         return nullptr;
     }
 
+    const CpuStoreField *findValueField(const CpuNamedStore &store, ValueId value)
+    {
+        for (const auto &field : store.fields)
+            if (field.value == value) return &field;
+        return nullptr;
+    }
+
     const CpuFanoutEntry<ValueId> *findValueFanout(
         const std::vector<CpuFanoutEntry<ValueId>> &fanout, ValueId source)
     {
@@ -279,12 +286,12 @@ namespace
         return nullptr;
     }
 
-    // M5d-6 C segment: classify (all arrays mem — these fixtures pin the P_mem
-    // write-plan shape), attribute (B5), then C1 init + C2 merge.
+    // M5d-6 C segment: classify the fixture's 2-byte array as LargeSink and
+    // its 1-byte scalar states as SmallSink, then attribute and build mapping.
     void runMappingPipeline(GrhSimModel &model)
     {
         runPass(model, "grhsim.select-state-stores",
-                std::array<std::string_view, 2>{"--mem-min-bytes", "0"});
+                std::array<std::string_view, 2>{"--mem-min-bytes", "2"});
         runPass(model, "grhsim.split-phases");
         runPass(model, "cpu.st.build-general-nodes");
         runPass(model, "cpu.st.merge-general-supernodes");
@@ -424,7 +431,7 @@ namespace
 
 namespace
 {
-    // cpu.st.layout-named-stores: the seven stores in fixed order, mem write
+    // cpu.st.layout-named-stores: the twelve stores in fixed order, mem write
     // operand slot names, prevEvent/eventAct cluster naming with uniquified
     // act bits, and the activeFlags byte arrays sized by the supernode count.
     void namedStoreLayoutTest()
@@ -434,26 +441,29 @@ namespace
         require(verifies(model), "layout: fixture rejected");
         runMappingPipeline(model);
         const auto messages = runPass(model, "cpu.st.layout-named-stores");
-        // One rename per eventAct bit (clk0__posedge/clk1__posedge/rst__negedge
-        // were already claimed by the prevEvent slots).
+        // The same source can now have fields in several boundary stores;
+        // the global namer disambiguates those along with eventAct fields.
         require(infoValue(messages, "cpu.st.layout-named-stores", "renamed_count=") ==
-                std::optional<uint64_t>(3), "layout: renamed count wrong");
+                std::optional<uint64_t>(7), "layout: renamed count wrong");
         const auto &mapping = *model.cpuMapping();
         require(mapping.stage == CpuMappingStage::LayoutNamedStores, "layout: stage wrong");
         require(mapping.dataLayout && mapping.dataLayout->namedStores, "layout: stores missing");
         const auto &layout = *mapping.dataLayout;
         // M5d-6: the layout payload is just the type table plus named stores
         // (the legacy arenas are gone).
-        const std::array<CpuNamedStoreKind, 7> kinds{
-            CpuNamedStoreKind::RegLatch, CpuNamedStoreKind::Mem, CpuNamedStoreKind::Boundary,
-            CpuNamedStoreKind::PrevEvent, CpuNamedStoreKind::EventAct,
-            CpuNamedStoreKind::TimeslotTrigger, CpuNamedStoreKind::ActiveFlags};
+        const std::array<CpuNamedStoreKind, 12> kinds{
+            CpuNamedStoreKind::SmallSink, CpuNamedStoreKind::LargeSink, CpuNamedStoreKind::Input,
+            CpuNamedStoreKind::NonSinkBoundary, CpuNamedStoreKind::SmallSinkEnableBoundary,
+            CpuNamedStoreKind::SmallSinkPayloadBoundary, CpuNamedStoreKind::LargeSinkEnableBoundary,
+            CpuNamedStoreKind::LargeSinkPayloadBoundary, CpuNamedStoreKind::PrevEvent,
+            CpuNamedStoreKind::EventAct, CpuNamedStoreKind::TimeslotTrigger,
+            CpuNamedStoreKind::ActiveFlags};
         require(layout.namedStores->size() == kinds.size(), "layout: store count wrong");
         for (std::size_t i = 0; i < kinds.size(); ++i)
             require(layout.namedStores->at(i).kind == kinds[i], "layout: store order wrong");
 
         // regLatch: one Bool field per non-array state; mem: one array field.
-        const auto &regLatch = store(mapping, CpuNamedStoreKind::RegLatch);
+        const auto &regLatch = store(mapping, CpuNamedStoreKind::SmallSink);
         require(regLatch.fields.size() == 5, "layout: reg latch field count wrong");
         for (const char *name : {"q0", "q1", "q3", "q4", "q5"})
         {
@@ -462,39 +472,41 @@ namespace
             require(layout.types[field->type.index - 1].kind == CpuTypeKind::Bool,
                     "layout: reg latch field type wrong");
         }
-        const auto &mem = store(mapping, CpuNamedStoreKind::Mem);
+        const auto &mem = store(mapping, CpuNamedStoreKind::LargeSink);
         require(mem.fields.size() == 1, "layout: mem field count wrong");
         const auto *m1Field = findField(model, mem, "m1");
         require(m1Field && m1Field->state == fixture.m1, "layout: mem field wrong");
         require(layout.types[m1Field->type.index - 1].kind == CpuTypeKind::Array &&
                 layout.types[m1Field->type.index - 1].count == 16, "layout: mem field type wrong");
 
-        // boundary: six input ports (aux = port index) plus the
-        // cross-supernode / mem-operand value set with dedicated slot names.
-        // V2-M1: sink operands cross supernode boundaries by construction
-        // (writes sit in their own sink supernodes), so the write cones'
-        // enable/data/mask values hold boundary slots too.
-        const auto &boundary = store(mapping, CpuNamedStoreKind::Boundary);
-        require(boundary.fields.size() == 25, "layout: boundary field count wrong");
+        const auto &inputs = store(mapping, CpuNamedStoreKind::Input);
+        require(inputs.fields.size() == 6, "layout: input field count wrong");
         const std::array<std::string_view, 6> ports{"clk0", "clk1", "rst", "d1", "dsh", "md"};
         for (uint32_t i = 0; i < ports.size(); ++i)
         {
-            const auto *field = findField(model, boundary, ports[i]);
+            const auto *field = findField(model, inputs, ports[i]);
             require(field && !field->value && field->aux == i,
-                    "layout: boundary port field wrong");
+                    "layout: input port field wrong");
         }
-        for (const char *name : {"shn", "m1__w0__enable", "m1__w0__addr", "m1__w0__data",
-                                 "m1__w0__mask", "m1__w1__enable", "m1__w1__addr",
-                                 "m1__w1__data", "m1__w1__mask"})
-            require(findField(model, boundary, name), "layout: boundary value field missing");
-        for (const char *name : {"c0", "x1g", "mrv0", "mrv1", "y"})
-            require(findField(model, boundary, name), "layout: sink operand boundary field missing");
-        require(findField(model, boundary, "m1__w0__data")->value == fixture.mdv,
+        const auto &nonSink = store(mapping, CpuNamedStoreKind::NonSinkBoundary);
+        const auto &smallEnable = store(mapping, CpuNamedStoreKind::SmallSinkEnableBoundary);
+        const auto &smallPayload = store(mapping, CpuNamedStoreKind::SmallSinkPayloadBoundary);
+        const auto &largeEnable = store(mapping, CpuNamedStoreKind::LargeSinkEnableBoundary);
+        const auto &largePayload = store(mapping, CpuNamedStoreKind::LargeSinkPayloadBoundary);
+        for (const auto &field : nonSink.fields)
+            require(field.value && !field.state, "layout: non-sink boundary field ownership wrong");
+        require(findValueField(smallPayload, fixture.shnv) &&
+                findValueField(smallPayload, fixture.x1v) == nullptr,
+                "layout: small-sink payload classification wrong");
+        require(findValueField(largePayload, fixture.mdv) &&
+                findValueField(largePayload, fixture.row3),
+                "layout: large-sink payload classification wrong");
+        require(!smallEnable.fields.empty() && !largeEnable.fields.empty(),
+                "layout: sink enable boundaries missing");
+        require(findField(model, largePayload, "m1__w0__data")->value == fixture.mdv,
                 "layout: mem data slot value wrong");
-        require(findField(model, boundary, "m1__w0__addr")->value == fixture.row3,
+        require(findField(model, largePayload, "m1__w0__addr")->value == fixture.row3,
                 "layout: mem addr slot value wrong");
-        require(findField(model, boundary, "shn")->value == fixture.shnv,
-                "layout: shared cone slot value wrong");
 
         // prevEvent: one slot per cluster, named <signal>__<edge>.
         const auto &prevEvent = store(mapping, CpuNamedStoreKind::PrevEvent);
@@ -542,7 +554,7 @@ namespace
         require(supernodeCount > 0, "layout: no supernodes");
         const auto wordCount = std::max<std::size_t>((supernodeCount + 63) / 64, 1);
         const auto &active = store(mapping, CpuNamedStoreKind::ActiveFlags);
-        const std::array<std::string_view, 2> activeNames{"dataActiveFlag", "dataActiveFlagNext"};
+        const std::array<std::string_view, 2> activeNames{"nonSinkActiveFlag", "nonSinkActiveFlagNext"};
         require(active.fields.size() == activeNames.size(), "layout: active flags count wrong");
         for (std::size_t i = 0; i < activeNames.size(); ++i)
         {
@@ -616,22 +628,23 @@ namespace
 
         runMappingPipeline(model);
         const auto messages = runPass(model, "cpu.st.layout-named-stores");
-        // Two eventAct renames plus the dup port (the state claimed "dup").
+        // Two eventAct renames, the dup port, and one cross-store value.
         require(infoValue(messages, "cpu.st.layout-named-stores", "renamed_count=") ==
-                std::optional<uint64_t>(3), "naming: renamed count wrong");
+                std::optional<uint64_t>(4), "naming: renamed count wrong");
         const auto &mapping = *model.cpuMapping();
-        const auto &regLatch = store(mapping, CpuNamedStoreKind::RegLatch);
+        const auto &regLatch = store(mapping, CpuNamedStoreKind::SmallSink);
         for (const char *name : {"top_dut_q", "int_", "_3x", "dup"})
             require(findField(model, regLatch, name), "naming: sanitized state name missing");
-        const auto &boundary = store(mapping, CpuNamedStoreKind::Boundary);
-        require(findField(model, boundary, "we_ird"), "naming: sanitized port name missing");
-        require(findField(model, boundary, "dup_" + std::to_string(dup.index)),
+        const auto &inputs = store(mapping, CpuNamedStoreKind::Input);
+        const auto &payload = store(mapping, CpuNamedStoreKind::SmallSinkPayloadBoundary);
+        require(findField(model, inputs, "we_ird"), "naming: sanitized port name missing");
+        require(findField(model, inputs, "dup_" + std::to_string(dup.index)),
                 "naming: cross-store name was not uniquified");
-        require(findField(model, boundary, "not_" + std::to_string(nv.index)),
+        require(findField(model, payload, "not_" + std::to_string(nv.index)),
                 "naming: unnamed not fallback missing");
-        require(findField(model, boundary, "readR_" + std::to_string(rv.index)),
+        require(findField(model, payload, "readR_" + std::to_string(rv.index)),
                 "naming: unnamed input read fallback missing");
-        require(findField(model, boundary, "slice_" + std::to_string(sv.index)),
+        require(findField(model, payload, "slice_" + std::to_string(sv.index)),
                 "naming: unnamed slice fallback missing");
         roundTrip(model);
     }
@@ -702,7 +715,7 @@ namespace
         const auto &mapping = *model.cpuMapping();
         const auto *latchSupernode = supernodeOf(mapping, wl);
         require(bool(latchSupernode), "latch: write has no supernode");
-        require(latchSupernode->attrs.supernodeCategory == CpuSupernodeCategory::SinkEscape,
+        require(latchSupernode->attrs.supernodeCategory == CpuSupernodeCategory::SmallSinkEscape,
                 "latch: event-free write is not in the escape class");
         require(mapping.schedule->eventActivation->empty(),
                 "latch: escape/sink-only carriers must leave the map empty");
@@ -809,7 +822,7 @@ namespace
         roundTrip(model);
     }
 
-    // cpu.st.build-mem-write-plan: per-state declaration-rank priority, exact
+    // cpu.st.build-mem-write-plan: ascending declaration-rank priority, exact
     // static-row readers, conservative dynamic readers, and the event-free
     // mark.
     void writePlanTest()
@@ -828,9 +841,9 @@ namespace
         const auto &plan = *mapping.schedule->memWritePlan;
         require(plan.size() == 2, "mem plan: entry count wrong");
         require(plan[0].writeOp == fixture.mw0 && plan[0].priority == 0 && !plan[0].eventFree,
-                "mem plan: first entry wrong");
+                "mem plan: lower-priority entry wrong");
         require(plan[1].writeOp == fixture.mw1 && plan[1].priority == 1 && plan[1].eventFree,
-                "mem plan: second entry wrong");
+                "mem plan: highest-priority entry wrong");
         const auto staticOwner = supernodeOf(mapping, fixture.mr0)->id;
         const auto dynamicOwner = supernodeOf(mapping, fixture.mr1)->id;
         // V2-M1: the event-free mem readers share one non-sink supernode
@@ -851,6 +864,67 @@ namespace
             require(foundDynamic, "mem plan: dynamic reader missing");
         }
         roundTrip(model);
+    }
+
+    void multiDimStaticReaderTest()
+    {
+        GrhSimModel model("multi_dim_static_reader");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const auto bit = model.logicType(1, false, LogicDomain::TwoState);
+        const auto index = model.logicType(2, false, LogicDomain::TwoState);
+        const auto byte = model.logicType(8, false, LogicDomain::TwoState);
+        const std::array<int64_t, 2> shape{2, 3};
+        const auto array = model.logicType(48, false, LogicDomain::TwoState, shape);
+        const auto state = addState(model, "array", array, "0");
+        const auto zero = addConstant(model, bit, "1'b0");
+        const auto one = addConstant(model, bit, "1'b1");
+        const auto two = addConstant(model, index, "2'd2");
+        const auto fullMask = addConstant(model, byte, "8'hff");
+        const auto data = addConstant(model, byte, "8'h5a");
+        const auto dynamicPort = model.addInput("dynamic_index", index);
+        const auto dynamicIndex = addReadOp(model, dynamicPort, "dynamic_index", SimPhase::None, false);
+        const auto read = [&](std::array<ValueId, 2> indices) {
+            const auto value = model.addValue(byte);
+            model.addOperation("core.state.readArray", indices, std::array{value},
+                               std::array{ObjectRef::state(state)});
+        };
+        read({zero, two});
+        read({one, zero});
+        read({zero, dynamicIndex});
+        model.addOperation("core.state.writeArray", std::array{one, zero, two, data, fullMask}, {},
+                           std::array{ObjectRef::state(state)});
+        require(verifies(model), "multi-dimensional static reader fixture rejected");
+        runMappingPipeline(model);
+        runPass(model, "cpu.st.layout-named-stores");
+        runPass(model, "cpu.st.build-event-activation-map");
+        runPass(model, "cpu.st.build-mem-write-plan");
+        const auto &plan = *model.cpuMapping()->schedule->memWritePlan;
+        require(plan.size() == 1, "multi-dimensional static reader plan size wrong");
+        bool row2 = false, row3 = false, dynamic = false;
+        for (const auto &reader : plan.front().readers)
+        {
+            row2 |= reader.staticRow == std::optional<uint64_t>(2);
+            row3 |= reader.staticRow == std::optional<uint64_t>(3);
+            dynamic |= !reader.staticRow;
+        }
+        require(row2 && row3 && dynamic, "multi-dimensional static reader rows were folded incorrectly");
+    }
+
+    void edgeDetScalarContractTest()
+    {
+        const auto check = [](uint32_t width, std::span<const int64_t> shape, bool accepted) {
+            GrhSimModel model("edge_det_scalar_contract");
+            model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+            const auto type = model.logicType(width, false, LogicDomain::TwoState, shape);
+            const auto port = model.addInput("event", type);
+            const auto event = addReadOp(model, port, "event", SimPhase::Event, true);
+            addEdgeDet(model, event, 0);
+            require(verifies(model) == accepted, "edgeDet scalar contract accepted the wrong operand shape");
+        };
+        check(1, {}, true);
+        check(8, {}, false);
+        const std::array<int64_t, 1> shape{1};
+        check(1, shape, false);
     }
 
     // cpu.st.build-phase-schedule: the three fanout tables (event-only inputs
@@ -925,7 +999,7 @@ namespace
                     "schedule: general task wrong");
         require(tasks[generalFunctions.size() + 1].execution == CpuExecution::AlwaysScanCommit &&
                 tasks[generalFunctions.size() + 1].partition ==
-                    branch(mapping, CpuPhase::Mem).children.front(),
+                    branch(mapping, CpuPhase::LargeSink).children.front(),
                 "schedule: mem task wrong");
         require(tasks[generalFunctions.size() + 2].execution == CpuExecution::EvalEnd &&
                 tasks[generalFunctions.size() + 2].partition ==
@@ -1073,11 +1147,16 @@ namespace
         require(eventAct.fields.empty() && eventAct.sizeBytes == 0, "empty: event act wrong");
         require(store(mapping, CpuNamedStoreKind::TimeslotTrigger).fields.empty(),
                 "empty: timeslot triggers wrong");
-        require(store(mapping, CpuNamedStoreKind::RegLatch).fields.empty() &&
-                store(mapping, CpuNamedStoreKind::Mem).fields.empty() &&
-                store(mapping, CpuNamedStoreKind::Boundary).fields.empty() &&
+        require(store(mapping, CpuNamedStoreKind::SmallSink).fields.empty() &&
+                store(mapping, CpuNamedStoreKind::LargeSink).fields.empty() &&
                 store(mapping, CpuNamedStoreKind::PrevEvent).fields.empty(),
                 "empty: stores not empty");
+        for (const auto kind : {CpuNamedStoreKind::Input, CpuNamedStoreKind::NonSinkBoundary,
+                                CpuNamedStoreKind::SmallSinkEnableBoundary,
+                                CpuNamedStoreKind::SmallSinkPayloadBoundary,
+                                CpuNamedStoreKind::LargeSinkEnableBoundary,
+                                CpuNamedStoreKind::LargeSinkPayloadBoundary})
+            require(store(mapping, kind).fields.empty(), "empty: boundary store not empty");
         const auto &schedule = *mapping.schedule;
         require(schedule.eventActivation->empty() && schedule.memWritePlan->empty() &&
                 schedule.timeslotTriggers->empty() && schedule.inputFanout.empty() &&
@@ -1103,6 +1182,8 @@ int main()
         latchEscapeTest();
         eventActivationCoverageTest();
         writePlanTest();
+        multiDimStaticReaderTest();
+        edgeDetScalarContractTest();
         phaseScheduleTest();
         verifierRejectsTest();
         emptyModelTest();

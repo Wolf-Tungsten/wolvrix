@@ -769,7 +769,7 @@ namespace
             return fail("simplify accepted --max-rounds 0");
         if (!defaultPassRegistry().create("grhsim.simplify",
                                           std::array<std::string_view, 4>{"--scope", "phase",
-                                                                          "--phase", "mem"}, error))
+                                                                          "--phase", "large_sink"}, error))
             return fail("simplify rejected a valid scope/phase combination");
         if (defaultPassRegistry().create("grhsim.const-fold",
                                          std::array<std::string_view, 1>{"--bogus"}, error))

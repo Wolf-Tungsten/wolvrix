@@ -718,7 +718,7 @@ namespace
         if (phaseOf(regOp) != grhsim::SimPhase::General) return fail("write not General");
         if (phaseOf(smallOp) != grhsim::SimPhase::General)
             return fail("regLatch-class mem write not attributed General");
-        if (phaseOf(bigOp) != grhsim::SimPhase::Mem)
+        if (phaseOf(bigOp) != grhsim::SimPhase::LargeSink)
             return fail("mem-class mem write not attributed Mem");
         if (infoValue(messages, "grhsim.split-phases", "mem_writes_reglatch=") !=
             std::optional<uint64_t>(1))
@@ -755,7 +755,7 @@ namespace
         const auto lmem = addArrayState(legacy, "mem", lbyte, 4, "8'h00");
         const auto lop = addWriteArray(legacy, lmem, lwe, la, ld, lmask);
         runPass(legacy, "grhsim.split-phases");
-        if (legacy.operations()[lop.index - 1].phase != grhsim::SimPhase::Mem)
+        if (legacy.operations()[lop.index - 1].phase != grhsim::SimPhase::LargeSink)
             return fail("unclassified model lost the legacy all-Mem attribution");
 
         if (!passCreationFails("grhsim.split-phases", std::array<std::string_view, 2>{"--x", "1"}))
@@ -789,7 +789,7 @@ namespace
         {
             auto [model, smallOp, bigOp] = build();
             (void)bigOp;
-            model.setOperationPhase(smallOp, grhsim::SimPhase::Mem);
+            model.setOperationPhase(smallOp, grhsim::SimPhase::LargeSink);
             if (verifies(model))
                 return fail("Mem-phase mem write on a regLatch-class state was accepted");
         }
@@ -805,7 +805,7 @@ namespace
         {
             auto [model, smallOp, bigOp] = build();
             model.setOperationPhase(smallOp, grhsim::SimPhase::General);
-            model.setOperationPhase(bigOp, grhsim::SimPhase::Mem);
+            model.setOperationPhase(bigOp, grhsim::SimPhase::LargeSink);
             if (!verifies(model)) return fail("class-consistent attribution rejected");
         }
         return 0;
@@ -865,7 +865,7 @@ namespace
             const grhsim::SimOp *write = nullptr;
             for (const auto &op : model.operations())
             {
-                if (op.phase != grhsim::SimPhase::Mem) continue;
+                if (op.phase != grhsim::SimPhase::LargeSink) continue;
                 const auto refs = model.objectRefs(op);
                 if (!refs.empty() && refs[0].index == bigMem.index) write = &op;
             }
@@ -1327,7 +1327,7 @@ namespace
         {
             if (!model.text(state.name).starts_with("__tslot_prev_")) continue;
             ++kept;
-            if (state.storeClass != grhsim::StateStoreClass::RegLatch)
+            if (state.storeClass != grhsim::StateStoreClass::SmallSink)
                 return fail("timeslot prev state lost its regLatch class");
             bool outputLatchWrite = false;
             for (const auto &op : model.operations())

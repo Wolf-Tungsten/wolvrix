@@ -7,7 +7,7 @@ event inputs so the P_input stage can skip data-activity tracking for them.
 
 A `core.input.read` is a pure event input when its result is used **only** in
 event operand positions — the trailing `len(event_edges)` operand slots of
-event-sensitive ops (`core.state.write`, `writeArray` and `fill`,
+event-sensitive ops (`core.state.write`, `writeMask`, `writeArray`, `writeArrayMask` and `fill`,
 `core.system.task`, `core.dpi.call`). Such an op gains a bool parameter
 `event_only=true`:
 
@@ -30,4 +30,4 @@ compaction, so the stored checkpoint stays byte-stable across runs.
 The marker is metadata for later passes and backends:
 `grhsim.lower-edge-detect` clones the cone (parameter included) into P_event
 and sweeps the original read when it becomes dead; P_event then detects edges
-on pure event inputs instead of P_input setting `dataActiveFlag` for them.
+on pure event inputs instead of P_input setting `nonSinkActiveFlag` for them.

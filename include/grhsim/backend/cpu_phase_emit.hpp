@@ -9,7 +9,7 @@ namespace wolvrix::lib::grhsim
 {
     // M5 six-phase CPU C++ emit: consumes a TranslationUnits-stage cpu mapping
     // (C8 plan-translation-units) and generates the P_input/P_event/P_general/
-    // P_mem/P_publish/P_output model described by the simulation-model refactor
+    // P_large_sink/P_publish/P_output model described by the simulation-model refactor
     // plan as multiple size-bounded translation units: one shared header
     // (ports, stores, chunk member declarations, spill frames, DPI imports)
     // plus one .cpp per planned unit and a multi-source Makefile. With
@@ -18,9 +18,9 @@ namespace wolvrix::lib::grhsim
     // translation units and libfst rules in the generated Makefile.
     // Registered under the public "cpu.st.emit-cpp" pass name.
     // `memEnableBitmap` (the --mem-enable-bitmap option, default on) emits the
-    // dense P_mem enable shadow bitmap and its sync hooks.
+    // dense P_large_sink enable boundary bitmap and its sync hooks.
     // `memWriteOnWrite` (the --mem-write-activate on-write option, default
-    // on-write) drops the P_mem per-cell change compare and activates the
+    // on-write) drops the P_large_sink per-cell change compare and activates the
     // array's readers once per enable-word run (write-occurs); event-free
     // writes keep the on-change compare for fixpoint convergence.
     PassResult emitSixPhaseCpuCpp(const GrhSimModel &model, const std::filesystem::path &directory,

@@ -2,6 +2,7 @@
 #include "core/transform.hpp"
 #include "transform/instance_inline.hpp"
 
+#include <array>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -76,6 +77,75 @@ namespace
 
 int main()
 {
+    {
+        wolvrix::lib::grh::Design design;
+        auto &child = design.createGraph("child_shape");
+        auto &top = design.createGraph("top_shape");
+        design.markAsTop("top_shape");
+        const std::array<int64_t, 1> one{1};
+        const auto childArray = child.createValue(child.internSymbol("array"), 1, false,
+                                                  wolvrix::lib::grh::ValueType::Logic, one);
+        const auto childIndex = child.createValue(child.internSymbol("index"), 1, false);
+        const auto childResult = child.createValue(child.internSymbol("result"), 1, false);
+        child.bindInputPort("array", childArray);
+        child.bindInputPort("index", childIndex);
+        child.bindOutputPort("result", childResult);
+        const auto slice = child.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                                 child.makeInternalOpSym());
+        child.addOperand(slice, childArray);
+        child.addOperand(slice, childIndex);
+        child.addResult(slice, childResult);
+
+        const auto zero = top.createValue(top.internSymbol("zero"), 1, false);
+        const auto zeroOp = top.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
+                                                top.makeInternalOpSym());
+        top.addResult(zeroOp, zero);
+        top.setAttr(zeroOp, "constValue", std::string("1'b0"));
+        const auto mem = top.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                             top.internSymbol("mem"));
+        top.setAttr(mem, "width", int64_t{2});
+        top.setAttr(mem, "isSigned", false);
+        top.setAttr(mem, "shape", std::vector<int64_t>{2});
+        const auto readValue = top.createValue(top.internSymbol("read"), 1, false);
+        const auto read = top.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadArrayPort,
+                                              top.makeInternalOpSym());
+        top.addOperand(read, zero);
+        top.addResult(read, readValue);
+        top.setAttr(read, "regSymbol", std::string("mem"));
+        top.bindOutputPort("read", readValue);
+
+        const auto childOutput = top.createValue(top.internSymbol("child_output"), 1, false);
+        const auto instance = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance,
+                                                  top.makeInternalOpSym());
+        top.addOperand(instance, zero);
+        top.addOperand(instance, zero);
+        top.addResult(instance, childOutput);
+        top.setAttr(instance, "moduleName", std::string("child_shape"));
+        top.setAttr(instance, "instanceName", std::string("u_child"));
+        top.bindOutputPort("child_output", childOutput);
+
+        PassDiagnostics diagnostics;
+        if (!runInlinePass(design, "top_shape.u_child", diagnostics, true))
+            return fail("shared scalar index instance-inline failed");
+        if (!top.valueShape(zero).empty() || top.opOperands(read)[0] != zero)
+            return fail("instance-inline changed the shared scalar array index shape");
+        bool foundShapedView = false;
+        for (const auto op : top.operations())
+        {
+            if (top.opKind(op) != wolvrix::lib::grh::OperationKind::kSliceArray)
+                continue;
+            const auto base = top.opOperands(op)[0];
+            const auto baseDef = top.valueDef(base);
+            foundShapedView = base != zero && top.valueShape(base).size() == 1 &&
+                              top.valueShape(base)[0] == 1 && baseDef.valid() &&
+                              top.opKind(baseDef) == wolvrix::lib::grh::OperationKind::kAssign &&
+                              top.opOperands(baseDef)[0] == zero &&
+                              top.valueShape(top.opOperands(op)[1]).empty();
+        }
+        if (!foundShapedView)
+            return fail("instance-inline did not isolate the child array view");
+    }
+
     {
         wolvrix::lib::grh::Design design;
         auto &leaf = design.createGraph("leaf");

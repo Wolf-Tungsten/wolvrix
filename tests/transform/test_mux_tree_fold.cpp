@@ -55,6 +55,24 @@ namespace
         return op;
     }
 
+    grh::OperationId makeRegister(grh::Graph &graph, const std::string &sym, int64_t width)
+    {
+        const grh::OperationId op =
+            graph.createOperation(grh::OperationKind::kRegister, graph.internSymbol(sym));
+        graph.setAttr(op, "width", width);
+        graph.setAttr(op, "isSigned", false);
+        return op;
+    }
+
+    grh::OperationId makeLatch(grh::Graph &graph, const std::string &sym, int64_t width)
+    {
+        const grh::OperationId op =
+            graph.createOperation(grh::OperationKind::kLatch, graph.internSymbol(sym));
+        graph.setAttr(op, "width", width);
+        graph.setAttr(op, "isSigned", false);
+        return op;
+    }
+
     grh::ValueId makeReadElem(grh::Graph &graph, const std::string &regSym,
                               const std::string &name, grh::ValueId constIndex,
                               int64_t elemWidth)
@@ -66,6 +84,19 @@ namespace
         graph.addOperand(op, constIndex);
         graph.addResult(op, val);
         graph.setAttr(op, "regSymbol", regSym);
+        return val;
+    }
+
+    grh::ValueId makeReadWhole(grh::Graph &graph, const std::string &storageSym,
+                               const std::string &name, int64_t width, bool latch = false)
+    {
+        const grh::ValueId val =
+            graph.createValue(graph.internSymbol(name), static_cast<int32_t>(width), false);
+        const grh::OperationKind kind = latch ? grh::OperationKind::kLatchReadPort
+                                              : grh::OperationKind::kRegisterReadPort;
+        const grh::OperationId op = graph.createOperation(kind, graph.internSymbol(name + "_op"));
+        graph.addResult(op, val);
+        graph.setAttr(op, latch ? "latchSymbol" : "regSymbol", storageSym);
         return val;
     }
 
@@ -118,6 +149,53 @@ namespace
         graph.addOperand(op, clock);
         graph.setAttr(op, "regSymbol", regSym);
         graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+    }
+
+    grh::OperationId makeWholeWrite(grh::Graph &graph, const std::string &name,
+                                    const std::string &regSym, grh::ValueId enable,
+                                    grh::ValueId data, grh::ValueId clock,
+                                    bool masked = false, grh::ValueId mask = {})
+    {
+        const grh::OperationKind kind = masked ? grh::OperationKind::kRegisterWriteMaskPort
+                                               : grh::OperationKind::kRegisterWritePort;
+        const grh::OperationId op = graph.createOperation(kind, graph.internSymbol(name));
+        graph.addOperand(op, enable);
+        graph.addOperand(op, data);
+        if (masked) graph.addOperand(op, mask);
+        graph.addOperand(op, clock);
+        graph.setAttr(op, "regSymbol", regSym);
+        graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+        return op;
+    }
+
+    grh::OperationId makeLatchWrite(grh::Graph &graph, const std::string &name,
+                                    const std::string &latchSym, grh::ValueId enable,
+                                    grh::ValueId data, grh::ValueId mask)
+    {
+        const grh::OperationId op = graph.createOperation(
+            grh::OperationKind::kLatchWritePort, graph.internSymbol(name));
+        graph.addOperand(op, enable);
+        graph.addOperand(op, data);
+        graph.addOperand(op, mask);
+        graph.setAttr(op, "latchSymbol", latchSym);
+        return op;
+    }
+
+    grh::OperationId makeArrayMaskWrite(grh::Graph &graph, const std::string &name,
+                                        const std::string &regSym, grh::ValueId enable,
+                                        grh::ValueId index, grh::ValueId data,
+                                        grh::ValueId mask, grh::ValueId clock)
+    {
+        const grh::OperationId op = graph.createOperation(
+            grh::OperationKind::kRegisterWriteArrayMaskPort, graph.internSymbol(name));
+        graph.addOperand(op, enable);
+        graph.addOperand(op, index);
+        graph.addOperand(op, data);
+        graph.addOperand(op, mask);
+        graph.addOperand(op, clock);
+        graph.setAttr(op, "regSymbol", regSym);
+        graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+        return op;
     }
 
     int countKind(grh::Graph &graph, grh::OperationKind kind)
@@ -638,6 +716,177 @@ namespace
         return 0;
     }
 
+    bool isAndOf(const grh::Graph &graph, grh::ValueId value,
+                 grh::ValueId lhs, grh::ValueId rhs)
+    {
+        const auto def = graph.valueDef(value);
+        if (!def.valid() || graph.opKind(def) != grh::OperationKind::kAnd)
+        {
+            return false;
+        }
+        const auto operands = graph.opOperands(def);
+        return operands.size() == 2 &&
+               ((operands[0] == lhs && operands[1] == rhs) ||
+                (operands[0] == rhs && operands[1] == lhs));
+    }
+
+    int testGlobalWriteFamilies()
+    {
+        // Whole scalar register writes use kRegisterReadPort as their
+        // identity value.  The old-value arm must become a write enable.
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("scalar_register");
+            makeRegister(graph, "q", 8);
+            const auto clock = makeInput(graph, "clk", 1);
+            const auto enable = makeInput(graph, "enable", 1);
+            const auto hold = makeInput(graph, "hold", 1);
+            const auto data = makeInput(graph, "data", 8);
+            const auto old = makeReadWhole(graph, "q", "old", 8);
+            const auto next = makeMux(graph, "next", 8, hold, data, old);
+            makeWholeWrite(graph, "write", "q", enable, next, clock);
+
+            PassManager manager;
+            manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("global scalar register: normalization failed");
+            grh::OperationId write;
+            for (const auto id : graph.operations())
+                if (id.valid() && graph.opKind(id) == grh::OperationKind::kRegisterWritePort)
+                    write = id;
+            if (!write.valid()) return fail("global scalar register: write disappeared");
+            const auto operands = graph.opOperands(write);
+            if (operands.size() != 3 || operands[1] != data ||
+                !isAndOf(graph, operands[0], enable, hold))
+                return fail("global scalar register: old-value path was not guarded");
+        }
+
+        // Masked whole writes have the same identity rule; the mask remains
+        // attached to the sparse write and is never folded into the payload.
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("masked_register");
+            makeRegister(graph, "q", 8);
+            const auto clock = makeInput(graph, "clk", 1);
+            const auto enable = makeInput(graph, "enable", 1);
+            const auto hold = makeInput(graph, "hold", 1);
+            const auto data = makeInput(graph, "data", 8);
+            const auto mask = makeInput(graph, "mask", 8);
+            const auto old = makeReadWhole(graph, "q", "old", 8);
+            const auto next = makeMux(graph, "next", 8, hold, data, old);
+            makeWholeWrite(graph, "write", "q", enable, next, clock, true, mask);
+
+            PassManager manager;
+            manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("global masked register: normalization failed");
+            grh::OperationId write;
+            for (const auto id : graph.operations())
+                if (id.valid() && graph.opKind(id) == grh::OperationKind::kRegisterWriteMaskPort)
+                    write = id;
+            if (!write.valid()) return fail("global masked register: write disappeared");
+            const auto operands = graph.opOperands(write);
+            if (operands.size() != 4 || operands[1] != data || operands[2] != mask ||
+                !isAndOf(graph, operands[0], enable, hold))
+                return fail("global masked register: mask or guard changed");
+        }
+
+        // A latch write has no event operands and uses latchSymbol/read-port
+        // attributes, but otherwise follows the same identity transformation.
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("latch");
+            makeLatch(graph, "l", 8);
+            const auto enable = makeInput(graph, "enable", 1);
+            const auto hold = makeInput(graph, "hold", 1);
+            const auto data = makeInput(graph, "data", 8);
+            const auto mask = makeConst(graph, "mask", 8, "8'hff");
+            const auto old = makeReadWhole(graph, "l", "old", 8, true);
+            const auto next = makeMux(graph, "next", 8, hold, data, old);
+            makeLatchWrite(graph, "write", "l", enable, next, mask);
+
+            PassManager manager;
+            manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("global latch: normalization failed");
+            grh::OperationId write;
+            for (const auto id : graph.operations())
+                if (id.valid() && graph.opKind(id) == grh::OperationKind::kLatchWritePort)
+                    write = id;
+            if (!write.valid()) return fail("global latch: write disappeared");
+            const auto operands = graph.opOperands(write);
+            if (operands.size() != 3 || operands[1] != data || operands[2] != mask ||
+                !isAndOf(graph, operands[0], enable, hold))
+                return fail("global latch: old-value path was not guarded");
+        }
+
+        // Array mask writes use [enable, index, data, mask, events...].
+        // Their one-index constant row is eligible for the same sparse form.
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("masked_array");
+            makeRegisterArray(graph, "arr", 8, 4);
+            const auto clock = makeInput(graph, "clk", 1);
+            const auto enable = makeInput(graph, "enable", 1);
+            const auto hold = makeInput(graph, "hold", 1);
+            const auto data = makeInput(graph, "data", 8);
+            const auto mask = makeInput(graph, "mask", 8);
+            const auto index = makeConst(graph, "index", 2, "2'd1");
+            const auto old = makeReadElem(graph, "arr", "old", index, 8);
+            const auto next = makeMux(graph, "next", 8, hold, data, old);
+            makeArrayMaskWrite(graph, "write", "arr", enable, index, next, mask, clock);
+
+            PassManager manager;
+            manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("global masked array: normalization failed");
+            grh::OperationId write;
+            for (const auto id : graph.operations())
+                if (id.valid() && graph.opKind(id) == grh::OperationKind::kRegisterWriteArrayMaskPort)
+                    write = id;
+            if (!write.valid()) return fail("global masked array: write disappeared");
+            const auto operands = graph.opOperands(write);
+            if (operands.size() != 5 || operands[1] != index || operands[2] != data ||
+                operands[3] != mask || !isAndOf(graph, operands[0], enable, hold))
+                return fail("global masked array: mask or guard changed");
+        }
+
+        // Whole writes to an aggregate are also safe: the identity is the
+        // aggregate kRegisterReadPort, rather than an element read.
+        {
+            grh::Design design;
+            auto &graph = design.createGraph("whole_array");
+            makeRegisterArray(graph, "arr", 8, 4);
+            const auto clock = makeInput(graph, "clk", 1);
+            const auto enable = makeInput(graph, "enable", 1);
+            const auto hold = makeInput(graph, "hold", 1);
+            const auto data = makeInput(graph, "data", 32);
+            const auto old = makeReadWhole(graph, "arr", "old", 32);
+            const auto next = makeMux(graph, "next", 32, hold, data, old);
+            makeWholeWrite(graph, "write", "arr", enable, next, clock);
+
+            PassManager manager;
+            manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("global whole array: normalization failed");
+            grh::OperationId write;
+            for (const auto id : graph.operations())
+                if (id.valid() && graph.opKind(id) == grh::OperationKind::kRegisterWritePort)
+                    write = id;
+            if (!write.valid()) return fail("global whole array: write disappeared");
+            const auto operands = graph.opOperands(write);
+            if (operands.size() != 3 || operands[1] != data ||
+                !isAndOf(graph, operands[0], enable, hold))
+                return fail("global whole array: old-value path was not guarded");
+        }
+        return 0;
+    }
+
     int testGuardedFoldRejections()
     {
         for (int scenario = 0; scenario < 4; ++scenario)
@@ -790,6 +1039,7 @@ int main()
     if (int rc = testGuardedWriteNormalization(true)) return rc;
     if (int rc = testIdentityOverridesEarlierWrite()) return rc;
     if (int rc = testTwoStateOptIn()) return rc;
+    if (int rc = testGlobalWriteFamilies()) return rc;
     if (int rc = testGuardedFoldRejections()) return rc;
     if (int rc = testWholeWriteBarrier()) return rc;
     if (int rc = testBoundedPointerDomain()) return rc;

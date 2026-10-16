@@ -7,10 +7,13 @@
 // ordinal is fixed by merge-general-supernodes (C2) as the General branch's
 // child order; function packing (C6) only records intervals over it.
 
+#include "grhsim/dialect/compute.hpp"
+#include "grhsim/dialect/masked_or.hpp"
 #include "grhsim/ir/model.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -301,6 +304,16 @@ namespace wolvrix::lib::grhsim
         return values;
     }
 
+    inline uint32_t estimatedCpuOpWork(const GrhSimModel &model, const SimOp &op)
+    {
+        if (model.text(op.opType) == "cpu.compute.maskedOr")
+        {
+            return static_cast<uint32_t>(std::min<uint64_t>(2 * maskedOrTermCount(model, op) - 1,
+                                                          std::numeric_limits<uint32_t>::max()));
+        }
+        return 1;
+    }
+
     // Emitted-line estimate for one op, shared by the C6 function packing and
     // the C8 TU planning heuristics (M5d-7). A heuristic, not a contract: it
     // only steers chunk sizes, never correctness.
@@ -308,6 +321,8 @@ namespace wolvrix::lib::grhsim
     {
         const auto &op = model.operations()[id.index - 1];
         uint64_t lines = 4 + op.operands.count + op.results.count;
+        if (model.text(op.opType) == "cpu.compute.maskedOr")
+            lines += 12 + (maskedOrViews(model, op) ? 2 * maskedOrTermCount(model, op) : 0);
         for (auto value : model.results(op))
         {
             const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];

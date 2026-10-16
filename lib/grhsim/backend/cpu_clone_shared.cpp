@@ -184,7 +184,7 @@ namespace wolvrix::lib::grhsim
                     const auto &consumers = users[result.index];
                     if (consumers.size() < 2 || consumers.size() > options_.maxFanout) continue;
                     if (std::none_of(consumers.begin(), consumers.end(), [&](OpId user) {
-                        return model.text(model.operations()[user.index - 1].opType).starts_with("core.compute.");
+                        return isPureComputeOp(model.text(model.operations()[user.index - 1].opType));
                     })) continue;
                     sources[source.id.index] = varying;
                     ++candidates;
@@ -263,7 +263,7 @@ namespace wolvrix::lib::grhsim
                         // consumer, side effect) keeps the boundary alive and
                         // blocks the clone.
                         if (op.phase != sourcePhase ||
-                            !model.text(op.opType).starts_with("core.compute.") || !owner ||
+                            !isPureComputeOp(model.text(op.opType)) || !owner ||
                             *tree.partitions[owner.index - 1].attrs.supernodeCategory !=
                                 CpuSupernodeCategory::NonSink)
                         {

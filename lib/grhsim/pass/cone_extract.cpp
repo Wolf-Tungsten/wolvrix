@@ -1,4 +1,5 @@
 #include "grhsim/pass/cone_extract.hpp"
+#include "grhsim/dialect/compute.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -37,7 +38,7 @@ namespace wolvrix::lib::grhsim
         bool sweepable(const GrhSimModel &model, const SimOp &op)
         {
             const auto name = model.text(op.opType);
-            return name.starts_with("core.compute.") || name == "core.input.read" ||
+            return isPureComputeOp(name) || name == "core.input.read" ||
                    name == "core.state.read" || name == "core.state.readArray";
         }
     } // namespace

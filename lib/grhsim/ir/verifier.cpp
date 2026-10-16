@@ -1331,6 +1331,44 @@ namespace wolvrix::lib::grhsim
                 {
                     error("core.dpi.call must reference its function first", context());
                 }
+                else if (opName == "cpu.compute.maskedOr") {
+                    const Type *result = results.size() == 1 ? valueType(model, results[0]) : nullptr;
+                    const auto twoState = [](const Type *type) {
+                        return type && type->kind == TypeKind::Logic && type->width &&
+                               type->domain == LogicDomain::TwoState;
+                    };
+                    bool valid = refs.empty() && twoState(result);
+                    if (parameters.empty())
+                    {
+                        const Type *mask = operands.size() == 2 ? valueType(model, operands[0]) : nullptr;
+                        const Type *data = operands.size() == 2 ? valueType(model, operands[1]) : nullptr;
+                        valid = valid && twoState(mask) && twoState(data) && mask->shape.empty() &&
+                            mask->width >= 2 && data->shape.size() == 1 && data->shape[0] == mask->width &&
+                            data->width == uint64_t(mask->width) * result->width;
+                    }
+                    else
+                    {
+                        const std::vector<int64_t> *views = nullptr;
+                        if (parameters.size() == 1 && model.text(parameters[0].name) == "views")
+                            views = std::get_if<std::vector<int64_t>>(&parameters[0].value);
+                        valid = valid && views && views->size() >= 8 && views->size() % 4 == 0;
+                        for (const auto value : operands) valid &= twoState(valueType(model, value));
+                        for (std::size_t i = 0; valid && i < views->size(); i += 4)
+                            for (const auto j : {0u, 2u})
+                            {
+                                const auto slot = (*views)[i + j], offset = (*views)[i + j + 1];
+                                if (slot < 0 || uint64_t(slot) >= operands.size() || offset < 0)
+                                { valid = false; break; }
+                                const auto bits = j == 0 ? 1u : result->width;
+                                if (uint64_t(offset) + bits > valueType(model, operands[slot])->width)
+                                { valid = false; break; }
+                            }
+                    }
+                    if (!valid)
+                        error("cpu.compute.maskedOr requires two-state logic operands/result and no refs; "
+                              "either (N-bit scalar mask, [N] W-bit array), N>=2, or a views int vector "
+                              "with N>=2 in-range [selectOperand, selectBit, dataOperand, dataOffset] tuples", context());
+                }
                 else if (opName == "core.compute.bitSelect") {
                     bool valid = operands.size() == 3 && results.size() == 1 &&
                                  refs.empty() && parameters.empty();

@@ -6,6 +6,7 @@
 #include "grhsim/pass/bitwise_predicates.hpp"
 #include "grhsim/pass/bitwise_muxes.hpp"
 #include "grhsim/pass/mux_chain_fold.hpp"
+#include "grhsim/pass/recover_masked_or.hpp"
 #include "grhsim/pass/pack_bit_registers.hpp"
 #include "grhsim/pass/used_bits.hpp"
 #include "grhsim/pass/select_state_stores.hpp"
@@ -185,6 +186,7 @@ namespace wolvrix::lib::grhsim
         registerBitwisePredicatesPass(registry);
         registerBitwiseMuxesPass(registry);
         registerMuxChainFoldPass(registry);
+        registerRecoverMaskedOrPass(registry);
         registerPackBitRegistersPass(registry);
         registerUsedBitsPass(registry);
         registerSelectStateStoresPass(registry);

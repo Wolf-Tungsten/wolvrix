@@ -3,6 +3,10 @@
 本文定义 GrhSIM IR 的 pass 模型和 Python 编排接口。Pass 可以由 C++ 或 Python 实现，但都通过
 同一套 Python API 组合和执行。
 
+CPU 流程与实现中的 pass 顺序见 [CPU ST flow](../flows/cpu-st.md)。可选 B7
+[`cpu.st.recover-masked-or`](recover-masked-or.md) 在 semantic seal 之前恢复
+`cpu.compute.maskedOr`，其 operands、匹配边界、报告及开关在该页定义。
+
 ## 1. 边界
 
 Pass manager 构建或修改 [GrhSIM IR Overview](../overview.md) 中定义的 `GrhSimModel`，包括其

@@ -282,7 +282,7 @@ namespace wolvrix::lib::grhsim
             {
                 const auto &op = model.operations()[it->index - 1];
                 const auto type = model.text(op.opType);
-                bool absorb = type.starts_with("core.compute.") || type == "core.input.read" ||
+                bool absorb = isPureComputeOp(type) || type == "core.input.read" ||
                               type == "core.state.read" || type == "core.state.readArray";
                 if (semantic)
                     for (auto value : model.results(op))
@@ -296,13 +296,14 @@ namespace wolvrix::lib::grhsim
                         if (target == absent) target = owner[user.index];
                         else if (target != owner[user.index]) absorb = false;
                     }
-                if (!absorb || target == absent || (!semantic && sizes[target] >= maxOps) ||
-                    (semantic && semanticMaxOps && sizes[target] >= semanticMaxOps))
+                const auto work = estimatedCpuOpWork(model, op);
+                if (!absorb || target == absent || (!semantic && uint64_t(sizes[target]) + work > maxOps) ||
+                    (semantic && semanticMaxOps && uint64_t(sizes[target]) + work > semanticMaxOps))
                 {
                     target = sizes.size(); sizes.push_back(0);
                 }
                 owner[op.id.index] = target;
-                ++sizes[target];
+                sizes[target] += work;
             }
             std::vector<std::vector<OpId>> nodeOps(sizes.size());
             for (auto id : graph.topo) nodeOps[owner[id.index]].push_back(id);
@@ -568,7 +569,10 @@ namespace wolvrix::lib::grhsim
             Clusters clusters(nonSinkNodes.size());
             for (uint32_t i = 0; i < nonSinkNodes.size(); ++i)
             {
-                sizes.push_back(tree.partitions[nodes[nonSinkNodes[i]].index - 1].ops.size());
+                uint32_t work = 0;
+                for (const auto id : tree.partitions[nodes[nonSinkNodes[i]].index - 1].ops)
+                    work += estimatedCpuOpWork(model, model.operations()[id.index - 1]);
+                sizes.push_back(work);
                 clusters[i].push_back(i);
                 for (auto op : tree.partitions[nodes[nonSinkNodes[i]].index - 1].ops) owner[op.index] = i;
             }

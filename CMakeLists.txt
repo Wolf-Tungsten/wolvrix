@@ -130,6 +130,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/pass/bitwise_predicates.cpp
     lib/grhsim/pass/bitwise_muxes.cpp
     lib/grhsim/pass/mux_chain_fold.cpp
+    lib/grhsim/pass/recover_masked_or.cpp
     lib/grhsim/pass/used_bits.cpp
     lib/grhsim/pass/pack_bit_registers.cpp
     lib/grhsim/pass/select_state_stores.cpp
@@ -370,6 +371,15 @@ target_compile_definitions(grhsim-ir-tests
 )
 
 register_test_exe(grhsim-ir-tests)
+
+add_executable(grhsim-masked-or-tests tests/grhsim/test_masked_or.cpp)
+target_link_libraries(grhsim-masked-or-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-masked-or-tests PRIVATE
+    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim/masked_or"
+    WOLVRIX_MASKED_OR_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/grhsim/data/cpu_masked_or.mk"
+    WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}"
+)
+register_test_exe(grhsim-masked-or-tests)
 
 add_executable(grhsim-simplify-tests
     tests/grhsim/test_grhsim_simplify.cpp

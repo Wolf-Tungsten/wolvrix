@@ -30,6 +30,7 @@ The pass errors out on any `SimPhase::None` op, pointing at
      nodes, and C2 clusters them into smallSink supernodes by priority and event signature.
    - **NonSink ops** (value-producing, event-carrying ones included) go
      through the reverse-topological cone absorption: `core.compute.*`,
+     `cpu.compute.maskedOr`,
      `core.input.read`, `core.state.read` and `core.state.readArray` absorb
      into their result's only user node; shared values (used by several
      nodes) and ops whose users include ops outside the nonSink set (a smallSink
@@ -38,6 +39,8 @@ The pass errors out on any `SimPhase::None` op, pointing at
      this nonSink frame — their values become enable/payload boundary values sampled by the
      smallSink supernodes.
    - The capacity knob is `--max-op-in-compute-node` (default 128).
+     Capacity uses estimated primitive work: `maskedOr` with N elements costs
+     2N-1, other ops cost 1. C2 uses the same weights for merge capacity.
    - `--semantic-nodes` (default 0, S1 exploration): every value targeted by
      a `DeclProvenance` Value slice (a source-level declared signal) anchors
      its own node — its producer op is never absorbed downstream — and the

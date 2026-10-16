@@ -1,5 +1,6 @@
 #include "grhsim/pass/used_bits.hpp"
 
+#include "grhsim/dialect/compute.hpp"
 #include "grhsim/ir/model.hpp"
 #include "simplify_internal.hpp"
 
@@ -44,6 +45,7 @@ namespace wolvrix::lib::grhsim
                 name == "core.event.edgeDet") return UseRule::sinkFull;
             if (name == "core.input.read") return UseRule::inputRead;
             if (name == "core.state.read") return UseRule::stateRead;
+            if (name == "cpu.compute.maskedOr") return UseRule::fullUse;
             if (name == "core.state.write" || name == "core.state.writeMask" ||
                 name == "core.state.latchWrite") return UseRule::stateWrite;
             if (!name.starts_with("core.compute.")) return UseRule::none;
@@ -947,7 +949,7 @@ namespace wolvrix::lib::grhsim
                     for (auto result : results)
                         dead = dead && analysis.widthValue[result.index] != 0 &&
                                analysis.used[result.index] == 0;
-                    if (dead && (name.starts_with("core.compute.") || name == "core.state.read" ||
+                    if (dead && (isPureComputeOp(name) || name == "core.state.read" ||
                                  name == "core.state.readArray"))
                     {
                         removeOps[i + 1] = 1;

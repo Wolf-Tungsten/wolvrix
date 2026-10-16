@@ -74,7 +74,9 @@ event_edges 与读写安全分析），然后 `grhsim.simplify(scope=whole)` 全
 time-slot 结构降级；[`grhsim.split-phases`](../passes/grhsim-split-phases.md)（B5）按
 A7 分类完成类感知相位归属（`largeSink` 类状态的写归 P_large_sink，`smallSink` 类状态
 的写归 P_general），`grhsim.simplify(scope=phase)`（B6）逐分区独立化简
-（保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），最后
+（保留分区接口与副作用根、禁止跨阶段 CSE、共享状态位需求取全分区并集），可选
+[`cpu.st.recover-masked-or`](../passes/recover-masked-or.md)（B7）恢复 mask/array
+选择规约，支持连续数组及离散位视图，再由
 `grhsim.verify --seal semantic`（B8）封板语义层（总相位归属、无 event_edges 残留、
 P_large_sink 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clone-shared-compute`）撤除：
 边界感知克隆移入 mapping 段（C2.5，见下），**B8 之后除注册的 C 段微调 pass 外不再有
@@ -83,6 +85,10 @@ P_large_sink 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clon
 集成开关新增 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1`（B6 调试开关）；`--used-bits` 与
 `--bitwise-predicates` 旋钮随独立调用段的移除而成为空操作（两者都只在
 `grhsim.simplify` 内部固定点中运行）。
+
+B7 通过 `XS_WOLF_GRHSIM_IR_MASKED_OR=1` 开启，默认 0；匹配阈值
+`XS_WOLF_GRHSIM_IR_MASKED_OR_MIN_TERMS` 默认为 16 个元素。它只改变各 phase 内的
+纯计算/读结构，保留观察点与数组快照；不会在 C 段布局或调度完成后偷偷融合长链。
 
 既有化简子 pass 经统一入口 [`grhsim.simplify`](../passes/simplify.md) 以固定子序列
 迭代至不动点（A6 全图 + B6 分区），支持 whole/phase 两种 scope。子序列包含

@@ -774,6 +774,18 @@ namespace wolvrix::lib::grhsim
                             onceTasks_.emplace(op.id.index, onceTasks_.size());
                     }
                 }
+                maskedArrayReads_.assign(model_.values().size() + 1, 0);
+                for (const auto &op : model_.operations())
+                    if (model_.text(op.opType) == "core.state.read")
+                        for (const auto result : model_.results(op))
+                            if (!type(result).shape.empty()) maskedArrayReads_[result.index] = 1;
+                for (const auto &op : model_.operations())
+                {
+                    const auto operands = model_.operands(op);
+                    for (std::size_t i = 0; i < operands.size(); ++i)
+                        if (model_.text(op.opType) != "cpu.compute.maskedOr")
+                            maskedArrayReads_[operands[i].index] = 0;
+                }
                 for (uint32_t ordinal = 0; ordinal < supernodeCount_; ++ordinal)
                     for (const auto opId : supernodeOps_[ordinal])
                         if (randomFunctions_.contains(opId.index)) randomSupernodes_.insert(ordinal);
@@ -1118,6 +1130,9 @@ namespace wolvrix::lib::grhsim
             // Per-function value locals: values with a live cpu_v<index> local in
             // the function currently being emitted.
             mutable std::vector<char> activeLocals_;
+            // Whole state-array values used only by maskedOr stay as ambient
+            // store views, including across helper chunks; no aggregate copy.
+            std::vector<char> maskedArrayReads_;
             // stage-07 fanout 合写：激活旗标在函数内写入局部累积变量、函数尾
             // 一次写回 ActiveFlags——store 密集函数里同一 flag 词的 |= 互相触发
             // DAGCombiner worklist 重排队（实测 visitSTORE 94%、单 TU 80min+）；
@@ -1187,6 +1202,7 @@ namespace wolvrix::lib::grhsim
             void waveformGlue(std::ostream &out) const;
             static std::string escapeWaveName(std::string_view name);
             std::string normalize(std::string expression, const Type &type) const;
+            std::string maskedOrExpression(const SimOp &op) const;
             std::string literal(std::string_view text, const Type &type) const;
             std::string initLiteral(std::string_view text, const Type &type) const;
             void randomInit(std::ostream &out, const Type &type, std::string_view destination,
@@ -1500,7 +1516,7 @@ namespace wolvrix::lib::grhsim
                 // result unconditionally whenever the enclosing supernode
                 // runs.  Other producer families are kept conservative.
                 if (name == "core.dpi.call") return true;
-                if (!(name.starts_with("core.compute.") ||
+                if (!(isPureComputeOp(name) ||
                       name == "core.state.read" || name == "core.state.readArray" ||
                       name == "core.system.function"))
                     return true;
@@ -1973,7 +1989,8 @@ namespace wolvrix::lib::grhsim
                 const auto refs = model_.objectRefs(op);
                 if (refs.size() != 1 || refs[0].kind != ObjectKind::State) return std::nullopt;
                 const auto &target = stateType(StateId{refs[0].index, 0});
-                if (target.shape.empty()) return std::nullopt;
+                if (target.shape.empty() || target.shape != type(value).shape ||
+                    typeElementWidth(target) != typeElementWidth(type(value))) return std::nullopt;
                 if (refs[0].index < memFieldByState_.size() && memFieldByState_[refs[0].index])
                     return "largeSinkStore." + std::string(model_.text(memFieldByState_[refs[0].index]->name));
                 if (refs[0].index < regFieldByState_.size() && regFieldByState_[refs[0].index])
@@ -1988,7 +2005,8 @@ namespace wolvrix::lib::grhsim
                     return std::nullopt;
                 const auto &inputType =
                     model_.types()[model_.inputs()[refs[0].index - 1].type.index - 1];
-                if (inputType.shape.empty()) return std::nullopt;
+                if (inputType.shape.empty() || inputType.shape != type(value).shape ||
+                    typeElementWidth(inputType) != typeElementWidth(type(value))) return std::nullopt;
                 return boundaryRef(boundaryByInput_[refs[0].index]);
             }
             return std::nullopt;
@@ -2619,6 +2637,158 @@ namespace wolvrix::lib::grhsim
             return fields;
         }
 
+        std::string SixPhaseEmitter::maskedOrExpression(const SimOp &op) const
+        {
+            const auto operands = model_.operands(op);
+            const auto width = type(model_.results(op)[0]).width;
+            const auto resultType = width > 64 ? wideType(width) : "std::uint64_t";
+            const auto truncate = [&](const std::string &value, uint32_t bits) {
+                return bits > 64 ? wideTrunc("static_cast<" + wideType(bits) + ">(" + value + ")", bits) :
+                    "(static_cast<std::uint64_t>(" + value + ")&" + maskLiteral(bits) + ")";
+            };
+            std::string expr = "([&](){" + resultType + " cpu_ma_result=0;";
+            const std::string early = width == 1 ? "if(cpu_ma_result!=0)return cpu_ma_result;" : "";
+            const auto *views = maskedOrViews(model_, op);
+            if (!views)
+            {
+                const auto count = type(operands[0]).width;
+                const auto direct = rowBackedArrayText(operands[1]);
+                expr += direct ? "const auto &cpu_ma_data=(" + *direct + ");" :
+                                 "const auto cpu_ma_data=(" + read(operands[1]) + ");";
+                if (count > 64)
+                    expr += "for(std::size_t cpu_ma_word=0;cpu_ma_word<" + std::to_string((uint64_t(count) + 63) / 64) +
+                            ";++cpu_ma_word){std::uint64_t cpu_ma_mask=static_cast<std::uint64_t>((" +
+                            read(operands[0]) + ")>>(cpu_ma_word*64));";
+                else expr += "std::uint64_t cpu_ma_mask=" + truncate(read(operands[0]), count) + ";";
+                expr += "while(cpu_ma_mask!=0){const auto cpu_ma_index=std::countr_zero(cpu_ma_mask)";
+                if (count > 64) expr += "+cpu_ma_word*64";
+                expr += ";";
+                const auto element = direct ? "cpu_ma_data[cpu_ma_index]" :
+                    "(cpu_ma_data>>(cpu_ma_index*" + std::to_string(width) + "))";
+                expr += "cpu_ma_result|=" + truncate(element, width) + ";" + early +
+                        "cpu_ma_mask&=cpu_ma_mask-1;}";
+                if (count > 64) expr += '}';
+                return expr + "return cpu_ma_result;}())";
+            }
+
+            using Data = std::pair<uint32_t, uint32_t>;
+            using Bits = std::map<uint32_t, std::vector<Data>>;
+            std::map<std::pair<uint32_t, uint32_t>, Bits> groups;
+            for (std::size_t i = 0; i < views->size(); i += 4)
+                groups[{uint32_t((*views)[i]), uint32_t((*views)[i + 1] / 64)}]
+                    [uint32_t((*views)[i + 1] % 64)].emplace_back((*views)[i + 2], (*views)[i + 3]);
+
+            const auto fitsRow = [&](uint32_t slot, uint32_t offset, uint32_t bits) {
+                const auto element = typeElementWidth(type(operands[slot]));
+                return element && offset % *element + uint64_t(bits) <= *element;
+            };
+            const auto extract = [&](uint32_t slot, const std::string &offset, uint32_t bits, bool withinRow) {
+                const auto value = operands[slot];
+                const auto &sourceType = type(value);
+                std::string source, shift = offset;
+                uint32_t sourceWidth = sourceType.width;
+                if (withinRow)
+                    if (const auto rows = rowBackedArrayText(value))
+                    {
+                        sourceWidth = *typeElementWidth(sourceType);
+                        source = rowAccessText(*rows, sourceType.shape,
+                            "(" + offset + ")/" + std::to_string(sourceWidth));
+                        shift = bits == sourceWidth ? "0" : "(" + offset + ")%" + std::to_string(sourceWidth);
+                    }
+                if (source.empty()) source = read(value);
+                // Signed narrow storage must be shifted as an unsigned bit pattern.
+                if (sourceWidth <= 64) source = "static_cast<std::uint64_t>(" + source + ")";
+                if (shift != "0") source = "((" + source + ")>>(" + shift + "))";
+                return truncate(source, bits);
+            };
+            for (const auto &[key, bits] : groups)
+            {
+                const auto [selectSlot, word] = key;
+                uint64_t filter = 0;
+                for (const auto &[bit, data] : bits) filter |= uint64_t(1) << bit;
+                const auto start = word * 64;
+                const auto maskWidth = std::min<uint32_t>(64, type(operands[selectSlot]).width - start);
+                std::string mask;
+                if (type(operands[selectSlot]).shape.empty() || fitsRow(selectSlot, start, maskWidth))
+                    mask = extract(selectSlot, std::to_string(start), maskWidth, true);
+                else
+                {
+                    // A mask stored as separate rows is packed a word at a
+                    // time, reading only the referenced bits, never the array.
+                    std::vector<std::string> terms;
+                    for (const auto &[bit, data] : bits)
+                        terms.push_back("(" + extract(selectSlot, std::to_string(start + bit), 1, true) +
+                                        "<<" + std::to_string(bit) + ")");
+                    while (terms.size() > 1)
+                    {
+                        std::vector<std::string> next;
+                        for (std::size_t i = 0; i < terms.size(); i += 2)
+                            next.push_back(i + 1 == terms.size() ? terms[i] : "(" + terms[i] + "|" + terms[i + 1] + ")");
+                        terms = std::move(next);
+                    }
+                    mask = terms.front();
+                }
+                expr += "{std::uint64_t cpu_ma_mask=(" + mask + ")&UINT64_C(" + std::to_string(filter) + ");";
+                bool common = true, rowSafe = true;
+                const auto dataSlot = bits.begin()->second.front().first;
+                for (const auto &[bit, data] : bits)
+                    for (const auto &[slot, offset] : data)
+                    {
+                        common &= data.size() == 1 && slot == dataSlot;
+                        rowSafe &= fitsRow(slot, offset, width);
+                    }
+                std::string offset;
+                if (common)
+                {
+                    const auto firstBit = bits.begin()->first;
+                    const auto firstOffset = bits.begin()->second[0].second;
+                    int64_t stride = 0;
+                    if (bits.size() > 1)
+                    {
+                        auto next = std::next(bits.begin());
+                        stride = (int64_t(next->second[0].second) - firstOffset) / (next->first - firstBit);
+                    }
+                    const int64_t base = int64_t(firstOffset) - int64_t(firstBit) * stride;
+                    bool affine = base >= 0 && stride >= 0;
+                    for (const auto &[bit, data] : bits)
+                        affine &= int64_t(data[0].second) == base + int64_t(bit) * stride;
+                    if (affine)
+                        offset = "UINT64_C(" + std::to_string(base) + ")+cpu_ma_index*UINT64_C(" + std::to_string(stride) + ")";
+                    else
+                    {
+                        // Only static indices are stored; payload values stay
+                        // in their original rows / snapshots.
+                        expr += "static constexpr std::uint32_t cpu_ma_offsets[64]={";
+                        for (uint32_t bit = 0; bit < 64; ++bit)
+                        {
+                            if (bit) expr += ',';
+                            const auto it = bits.find(bit);
+                            expr += std::to_string(it == bits.end() ? 0 : it->second[0].second);
+                        }
+                        expr += "};";
+                        offset = "cpu_ma_offsets[cpu_ma_index]";
+                    }
+                }
+                expr += "while(cpu_ma_mask!=0){const auto cpu_ma_index=std::countr_zero(cpu_ma_mask);";
+                if (common)
+                    expr += "cpu_ma_result|=" + extract(dataSlot, offset, width, rowSafe) + ";";
+                else
+                {
+                    expr += "switch(cpu_ma_index){";
+                    for (const auto &[bit, data] : bits)
+                    {
+                        expr += "case " + std::to_string(bit) + ":";
+                        for (const auto &[slot, off] : data)
+                            expr += "cpu_ma_result|=" + extract(slot, std::to_string(off), width, fitsRow(slot, off, width)) + ";";
+                        expr += "break;";
+                    }
+                    expr += '}';
+                }
+                expr += early + "cpu_ma_mask&=cpu_ma_mask-1;}}";
+            }
+            return expr + "return cpu_ma_result;}())";
+        }
+
         std::string SixPhaseEmitter::expression(const SimOp &op) const
         {
             const auto name = model_.text(op.opType); const auto operands = model_.operands(op);
@@ -2757,6 +2927,8 @@ namespace wolvrix::lib::grhsim
                        ");cpu_random_sampled[" + std::to_string(slot) + "]=true;cpu_anyOutChange_=true;}return cpu_random_values[" +
                        std::to_string(slot) + "]; }())";
             }
+            if (name == "cpu.compute.maskedOr")
+                return maskedOrExpression(op);
             if (!name.starts_with("core.compute.")) throw std::runtime_error("CPU six-phase emit unsupported operation: " + std::string(name));
             const auto kind = name.substr(13);
             // Stage-06 fast path: sliceArray on a row-backed shaped value
@@ -3323,6 +3495,8 @@ namespace wolvrix::lib::grhsim
             // Constants fold into their use sites; a constant boundary field is
             // preloaded at init() and never republished.
             if (staticScalars_.contains(result.index) || staticStrings_.contains(result.index)) return;
+            if (maskedArrayReads_[result.index] && !boundaryByValue_[result.index] &&
+                !crossingLocals_[result.index]) return;
             if (name == "core.input.read")
             {
                 // The natural read text is the input port's boundary field; only
@@ -4671,7 +4845,7 @@ namespace wolvrix::lib::grhsim
         }
         void SixPhaseEmitter::header(std::ostream &out) const
         {
-            out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
+            out << "#pragma once\n#include \"" << prefix_ << "_runtime.hpp\"\n#include <bit>\n#include <cstdio>\n#include <cstring>\n#include <stdexcept>\n#include <type_traits>\n";
             if (!largeFinalChange_.empty()) out << "#include <unordered_map>\n";
             if (waveform_) out << "#include <memory>\n";
             if (memWriteOnWrite_)

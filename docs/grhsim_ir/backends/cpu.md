@@ -333,11 +333,12 @@ P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEve
 签名，SinkEscape 每轮无条件；A1 守卫细分的 SinkEvent 在签名门之后再 AND 一次
 `enableGuard` value 的读取——形如 `if(actBitsGuard(sig) && read(enableGuard))`，
 该 value 即成员 write 共有的 en 操作数，经 boundaryValueStore（或
-input/state 读取重发）现成可读，语义上与体内逐 op 的 en 判断等价）。V3-M1 起 dataActiveFlag/dataActiveFlagNext 为
-bit-per-supernode 的 u64 字数组：扫描先按字外层跳过（一个非零判断覆盖 64 个静默
-超节点），字内逐位读 live word 检测并清位点火——同轮 fanout 目标恒在扫描方向前方
-（activateFanout 的 ordinal>current 规则），live word 语义与旧逐字节循环逐点等价；
-fanout 置位与 P_event 激活一律按字批量掩码 OR，P_publish 的并入与收敛判定同为字级。
+input/state 读取重发）现成可读，语义上与体内逐 op 的 en 判断等价）。当前
+dataActiveFlag/dataActiveFlagNext 使用 gsim 兼容的 byte-packed 位图：bit `i % 8`
+位于 byte `i / 8`，扫描先按字节外层跳过（一个非零判断覆盖 8 个静默超节点），
+字节内逐位读 live byte 检测并清位点火——同轮 fanout 目标恒在扫描方向前方
+（activateFanout 的 ordinal>current 规则），live byte 语义与旧逐字节循环逐点等价；
+fanout 置位与 P_event 激活一律按字节批量掩码 OR，P_publish 的并入与收敛判定同为字节级。
 V2-M3 起 sink 超节点体内不再保留逐 op event guard
 （SinkEvent 全体 op 与超节点签名同集，调用点门控已覆盖；en、地址等数据条件保留）；
 非 sink 超节点内的事件 op 与 P_mem 写口仍保留逐 op event guard 精判，负责最终语义

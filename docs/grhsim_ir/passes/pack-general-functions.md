@@ -17,9 +17,9 @@ Two steps:
    ranges drive the emit-side chunk members (`sn_<i>__c<j>`) — one per chunk,
    with cross-chunk locals spilled through the supernode's `SnFrame<i>` frame
    struct; the C8 TU plan keeps a supernode's chunks in one translation unit.
-   The six-phase model gates nonSink supernodes through `nonSinkActiveFlag`
-   u64 words; the partition tree never contains `ActiveWord` (or `EventDomain`)
-   partitions.
+   The six-phase model gates nonSink supernodes through the byte-packed
+   `nonSinkActiveFlag` array (eight flags per byte); the partition tree never
+   contains `ActiveWord` (or `EventDomain`) partitions.
 2. Emit functions: the General branch's supernodes are **not** remounted
    (resolution 2 — supernode ordinals are decoupled from function packing).
    Each `EmitFunction` is a trailing leaf appended after the supernodes and

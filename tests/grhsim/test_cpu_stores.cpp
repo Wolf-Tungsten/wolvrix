@@ -547,12 +547,12 @@ namespace
                 model.text(timeslot.fields.front().name) == "strobe",
                 "layout: timeslot trigger field wrong");
 
-        // activeFlags: two u64 word arrays with one bit per General supernode
-        // (V3-M1 bit-packing; V2-M2 removed eventActiveFlag). aux keeps the
-        // supernode count; each field holds ceil(N/64) words.
+        // activeFlags: two byte arrays with one bit per General supernode
+        // (gsim-compatible 8-bit packing; V2-M2 removed eventActiveFlag). aux
+        // keeps the supernode count; each field holds ceil(N/8) bytes.
         const auto supernodeCount = supernodes(mapping).size();
         require(supernodeCount > 0, "layout: no supernodes");
-        const auto wordCount = std::max<std::size_t>((supernodeCount + 63) / 64, 1);
+        const auto wordCount = std::max<std::size_t>((supernodeCount + 7) / 8, 1);
         const auto &active = store(mapping, CpuNamedStoreKind::ActiveFlags);
         const std::array<std::string_view, 2> activeNames{"nonSinkActiveFlag", "nonSinkActiveFlagNext"};
         require(active.fields.size() == activeNames.size(), "layout: active flags count wrong");
@@ -560,16 +560,16 @@ namespace
         {
             const auto &field = active.fields[i];
             require(model.text(field.name) == activeNames[i] &&
-                    field.aux == supernodeCount && field.offset == i * wordCount * 8,
+                    field.aux == supernodeCount && field.offset == i * wordCount,
                     "layout: active flags field wrong");
             const auto &type = layout.types[field.type.index - 1];
             require(type.kind == CpuTypeKind::Array && type.count == wordCount,
                     "layout: active flags field type wrong");
             const auto &word = layout.types[type.elementType.index - 1];
-            require(word.kind == CpuTypeKind::UInt && word.width == 64,
+            require(word.kind == CpuTypeKind::UInt && word.width == 8,
                     "layout: active flags word type wrong");
         }
-        require(active.sizeBytes == 2 * wordCount * 8, "layout: active flags size wrong");
+        require(active.sizeBytes == 2 * wordCount, "layout: active flags size wrong");
         roundTrip(model);
     }
 
@@ -1131,7 +1131,7 @@ namespace
         require(mapping.stage == CpuMappingStage::PhaseSchedule, "empty: stage wrong");
         const auto &layout = *mapping.dataLayout;
         const auto &active = store(mapping, CpuNamedStoreKind::ActiveFlags);
-        require(active.fields.size() == 2 && active.sizeBytes == 16,
+        require(active.fields.size() == 2 && active.sizeBytes == 2,
                 "empty: active flags shape wrong");
         for (const auto &field : active.fields)
         {
@@ -1140,7 +1140,7 @@ namespace
             require(type.kind == CpuTypeKind::Array && type.count == 1,
                     "empty: active flags type wrong");
             const auto &word = layout.types[type.elementType.index - 1];
-            require(word.kind == CpuTypeKind::UInt && word.width == 64,
+            require(word.kind == CpuTypeKind::UInt && word.width == 8,
                     "empty: active flags word type wrong");
         }
         const auto &eventAct = store(mapping, CpuNamedStoreKind::EventAct);

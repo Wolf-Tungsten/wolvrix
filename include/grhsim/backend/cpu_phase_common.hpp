@@ -22,6 +22,11 @@
 
 namespace wolvrix::lib::grhsim
 {
+    // Runtime activity flags follow gsim's layout: one byte stores the
+    // activation bits for eight consecutive General supernodes.  Keep this
+    // separate from the 64-bit enable bitmaps used by sink write guards.
+    inline constexpr uint32_t kActiveFlagBits = 8;
+
     inline const Parameter *findCpuPhaseParameter(const GrhSimModel &model,
                                                   std::span<const Parameter> parameters,
                                                   std::string_view name)
@@ -145,7 +150,7 @@ namespace wolvrix::lib::grhsim
     // Supernode children in tree order — fixed at C2 and untouched by C6's
     // function packing (EmitFunction leaves trail the supernodes and are
     // skipped here). Partition ids never reach the emitter; this 0..N-1
-    // sequence indexes the ActiveFlags bit words (V3-M1: bit per supernode)
+    // sequence indexes the byte-packed ActiveFlags bits (bit per supernode)
     // and the event bitmap words.
     inline std::vector<PartitionId> generalSupernodeOrder(const CpuPartitionTree &tree)
     {

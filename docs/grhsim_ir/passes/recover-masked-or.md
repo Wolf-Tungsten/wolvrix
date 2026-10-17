@@ -119,8 +119,9 @@ leaf can be unmasked logic or a preserved shared/observed OR boundary. TSV IDs
 refer to the input before compaction. The independent playground audit verifies
 all accepted trees and candidate decisions against that original graph.
 
-The playground flow enables this experimental B7 with
-`XS_WOLF_GRHSIM_IR_MASKED_OR=1`; default is 0 pending whole-workload timing.
+The playground flow enables B7 by default after the preserve-aggregate CoreMark
+100k validation (three alternating pairs: mean Host time 350.391 → 340.013 s).
+Set `XS_WOLF_GRHSIM_IR_MASKED_OR=0` to disable recovery for diagnostics.
 `XS_WOLF_GRHSIM_IR_MASKED_OR_MIN_TERMS` defaults to 16 and
 `XS_WOLF_GRHSIM_IR_MASKED_OR_REPORT` selects the TSV path. The Python entry
 accepts `--recover-masked-or` / `--no-recover-masked-or`,

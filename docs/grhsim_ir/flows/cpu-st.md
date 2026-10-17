@@ -82,13 +82,23 @@ P_large_sink 操作数产自 P_general）。V3-M3 起预测式 B7（`grhsim.clon
 边界感知克隆移入 mapping 段（C2.5，见下），**B8 之后除注册的 C 段微调 pass 外不再有
 任何语义改写**——旧管线的"后置化简 + 第二轮 mapping"往返段已拆除，CPU mapping
 （下表 C1–C8 八个 `cpu.st.*` pass 加 C2.5）在封板模型上只运行一次，单向推进。
-集成开关新增 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1`（B6 调试开关）；`--used-bits` 与
-`--bitwise-predicates` 旋钮随独立调用段的移除而成为空操作（两者都只在
-`grhsim.simplify` 内部固定点中运行）。
+集成开关 `XS_WOLF_GRHSIM_IR_PHASE_SIMPLIFY=0/1` 用于 B6 调试；已删除无效的
+`--used-bits` 与 `--bitwise-predicates` 旋钮，两者固定在 `grhsim.simplify`
+内部运行。bit 寄存器打包默认开启，调试时统一使用 `--no-pack-bit-registers`。
 
-B7 通过 `XS_WOLF_GRHSIM_IR_MASKED_OR=1` 开启，默认 0；匹配阈值
+B7 默认开启，可通过 `XS_WOLF_GRHSIM_IR_MASKED_OR=0` 关闭；匹配阈值
 `XS_WOLF_GRHSIM_IR_MASKED_OR_MIN_TERMS` 默认为 16 个元素。它只改变各 phase 内的
 纯计算/读结构，保留观察点与数组快照；不会在 C 段布局或调度完成后偷偷融合长链。
+
+playground 的标准 `make xs_wolf_grhsim_ir_emu` 固定使用 firtool
+`--preserve-aggregate=all`，产物位于 `ptmp/xs/`，无需额外 aggregate 或优化 flag。
+GRH 段固定执行 mux-tree-fold、register-write-normalize、guarded mux-tree-fold；
+XS 的 comb-pack 关闭，shared-boundary cloning、whole/phase simplify、state-store
+分类及 bit 寄存器打包开启。CPU 使用 `target_batch_count=0`、on-write 内存读者激活、
+enable bitmap、原生宽值、fanout 合写及 8-bit 活动位打包。
+重新生成会替换现有 C++ 模型；`make clean_xs_wolf_grhsim_ir clean_xs_rtl` 清除
+checkpoint、模型、emu 和生成 RTL 后，可从头重建。XS 标量流程和重复的
+`_aggregate` targets 已删除；构建/运行前检查 RTL 的 aggregate 生成记录。
 
 既有化简子 pass 经统一入口 [`grhsim.simplify`](../passes/simplify.md) 以固定子序列
 迭代至不动点（A6 全图 + B6 分区），支持 whole/phase 两种 scope。子序列包含

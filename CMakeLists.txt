@@ -902,6 +902,20 @@ target_compile_definitions(ingest-stmt-lowerer
 )
 register_test_exe(ingest-stmt-lowerer)
 
+# ingest: expression width boundaries
+add_executable(ingest-expression-width
+    tests/ingest/test_ingest_expression_width.cpp
+)
+target_link_libraries(ingest-expression-width
+    PRIVATE
+        wolvrix-lib
+)
+target_compile_definitions(ingest-expression-width
+    PRIVATE
+        WOLVRIX_INGEST_EXPRESSION_WIDTH_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/expression_width.sv"
+)
+register_test_exe(ingest-expression-width)
+
 # ingest: stmt lowerer error paths
 add_executable(ingest-stmt-lowerer-errors
     tests/ingest/test_ingest_stmt_lowerer_errors.cpp

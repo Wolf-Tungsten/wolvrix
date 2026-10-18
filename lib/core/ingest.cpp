@@ -3696,34 +3696,25 @@ struct StmtLowererState {
             return;
         }
 
+        std::vector<StructSplitLeaf> addressedLeaves;
+        if (!splitStructType(*expr.left().type, "", *plan.body, diagnostics,
+                             addressedLeaves) ||
+            addressedLeaves.size() != leafTargets.size())
+        {
+            reportUnsupported(expr, "Unsupported struct assignment leaf layout");
+            return;
+        }
+
         ExprNodeId guard = currentGuard(expr.sourceRange.start());
         for (std::size_t i = 0; i < leafTargets.size(); ++i)
         {
             LValueTarget& target = leafTargets[i];
             ExprNodeId value = values[i];
-            // Resize to the ADDRESSED width: the whole leaf when no slices,
-            // otherwise the sub-array addressed by the leading index slices
-            // (mirrors the pass-4 sub-width computation).
-            int64_t addressedWidth = static_cast<int64_t>(target.width);
-            if (!target.slices.empty())
-            {
-                if (const SignalInfo* info = findSignalBySymbol(plan, target.target))
-                {
-                    std::size_t dimCount = 0;
-                    while (dimCount < target.slices.size() &&
-                           dimCount < info->shape.size() &&
-                           target.slices[dimCount].kind == WriteSliceKind::BitSelect)
-                    {
-                        ++dimCount;
-                    }
-                    int64_t subWidth = info->width > 0 ? info->width : 1;
-                    for (std::size_t d = dimCount; d < info->shape.size(); ++d)
-                    {
-                        subWidth *= info->shape[d] > 0 ? info->shape[d] : 1;
-                    }
-                    addressedWidth = subWidth;
-                }
-            }
+            // The selected SV type defines the addressed leaf width even
+            // when a leading unit extent folded its storage shape to scalar.
+            // Storage width here would pad an element before write-back
+            // splices it, overwriting neighboring elements.
+            const int64_t addressedWidth = aggregateLeafFlatWidth(addressedLeaves[i]);
             if (addressedWidth > 0)
             {
                 value = resizeValueToWidth(
@@ -10006,10 +9997,16 @@ private:
                 {
                     SignalInfo shrunk = *info;
                     const int64_t extent = std::max<int32_t>(1, shrunk.unpackedDims.front().extent);
+                    const int32_t subWidth = static_cast<int32_t>(
+                        std::max<int64_t>(1, signalTotalWidth(*info) / extent));
                     shrunk.unpackedDims.erase(shrunk.unpackedDims.begin());
                     if (!shrunk.shape.empty() && shrunk.shape.front() == extent)
                     {
                         shrunk.shape.erase(shrunk.shape.begin());
+                    }
+                    if (shrunk.shape.empty())
+                    {
+                        shrunk.width = subWidth;
                     }
                     static thread_local std::deque<SignalInfo> shrunkPool;
                     shrunkPool.push_back(std::move(shrunk));
@@ -10019,10 +10016,18 @@ private:
                 {
                     SignalInfo shrunk = *info;
                     const int64_t extent = std::max<int32_t>(1, shrunk.packedDimInfos.front().extent);
+                    const int32_t subWidth = static_cast<int32_t>(
+                        std::max<int64_t>(1, signalTotalWidth(*info) / extent));
                     shrunk.packedDimInfos.erase(shrunk.packedDimInfos.begin());
                     if (!shrunk.shape.empty() && shrunk.shape.front() == extent)
                     {
                         shrunk.shape.erase(shrunk.shape.begin());
+                    }
+                    // A folded leaf has no shape to carry the consumed
+                    // extent; subsequent selects must use the narrowed width.
+                    if (shrunk.shape.empty())
+                    {
+                        shrunk.width = subWidth;
                     }
                     static thread_local std::deque<SignalInfo> shrunkPool;
                     shrunkPool.push_back(std::move(shrunk));
@@ -10391,6 +10396,13 @@ private:
                                     ? std::numeric_limits<int32_t>::max()
                                     : static_cast<int32_t>(width);
             }
+        };
+
+        auto lowerWithExprWidth = [&](const slang::ast::Expression& operand) {
+            const uint64_t width = std::min<uint64_t>(
+                computeExprWidth(operand), std::numeric_limits<int32_t>::max());
+            WidthContextScope widthScope(*this, static_cast<int32_t>(width));
+            return lowerExpression(operand);
         };
 
         if (auto loopConst = evalLoopLocalInt(expr))
@@ -10979,7 +10991,10 @@ private:
                 reportUnsupported(expr, "Unsupported unary operator");
                 return kInvalidPlanIndex;
             }
-            ExprNodeId operand = lowerExpression(unary->operand());
+            const bool isBoolean = *opKind != wolvrix::lib::grh::OperationKind::kNot;
+            // Logical and reduction operands are self-determined.
+            ExprNodeId operand = isBoolean ? lowerWithExprWidth(unary->operand())
+                                           : lowerExpression(unary->operand());
             if (operand == kInvalidPlanIndex)
             {
                 return kInvalidPlanIndex;
@@ -10987,12 +11002,7 @@ private:
             node.kind = ExprNodeKind::Operation;
             node.op = *opKind;
             node.operands = {operand};
-            if (*opKind == wolvrix::lib::grh::OperationKind::kReduceAnd ||
-                *opKind == wolvrix::lib::grh::OperationKind::kReduceOr ||
-                *opKind == wolvrix::lib::grh::OperationKind::kReduceXor ||
-                *opKind == wolvrix::lib::grh::OperationKind::kReduceNand ||
-                *opKind == wolvrix::lib::grh::OperationKind::kReduceNor ||
-                *opKind == wolvrix::lib::grh::OperationKind::kReduceXnor)
+            if (isBoolean)
             {
                 node.widthHint = 1;
             }
@@ -11042,8 +11052,16 @@ private:
                 }
                 return shifted;
             }
-            ExprNodeId lhs = lowerExpression(binary->left());
-            ExprNodeId rhs = lowerExpression(binary->right());
+            const bool isBoolean =
+                slang::ast::OpInfo::isComparison(binary->op) ||
+                *opKind == wolvrix::lib::grh::OperationKind::kLogicAnd ||
+                *opKind == wolvrix::lib::grh::OperationKind::kLogicOr;
+            // Start boolean operands from their elaborated types, including
+            // comparison sizing, instead of inheriting the result width.
+            ExprNodeId lhs = isBoolean ? lowerWithExprWidth(binary->left())
+                                       : lowerExpression(binary->left());
+            ExprNodeId rhs = isBoolean ? lowerWithExprWidth(binary->right())
+                                       : lowerExpression(binary->right());
             if (lhs == kInvalidPlanIndex || rhs == kInvalidPlanIndex)
             {
                 return kInvalidPlanIndex;
@@ -11155,7 +11173,7 @@ private:
                 reportUnsupported(expr, "Conditional expression with patterns unsupported");
             }
             const slang::ast::Expression& condExpr = *cond->conditions.front().expr;
-            ExprNodeId condId = lowerExpression(condExpr);
+            ExprNodeId condId = lowerWithExprWidth(condExpr);
             if (condId != kInvalidPlanIndex && condId < lowering.values.size())
             {
                 const int32_t condWidth = lowering.values[condId].widthHint;
@@ -11208,6 +11226,7 @@ private:
             node.op = wolvrix::lib::grh::OperationKind::kMux;
             node.operands = {condId, lhs, rhs};
             node.tempSymbol = makeTempSymbol();
+            applyExprWidthHint(node);
             ExprNodeId muxResult = addNodeForExpr(std::move(node));
             if (widthContext > 0 && muxResult != kInvalidPlanIndex)
             {

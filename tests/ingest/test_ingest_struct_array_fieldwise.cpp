@@ -167,10 +167,53 @@ int testFieldWiseStructArray(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testPartialStructWrites(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "ingest_struct_array_partial_write");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile partial struct writes");
+    }
+    wolvrix::lib::ingest::ConvertDriver driver;
+    const auto design = driver.convert(bundle->compilation->getRoot());
+    if (!driver.diagnostics().empty()) {
+        return fail("Unexpected partial struct write diagnostics");
+    }
+    const auto* graph = design.findGraph("ingest_struct_array_partial_write");
+    if (!graph) {
+        return fail("Missing partial struct write graph");
+    }
+    unsigned registers = 0;
+    unsigned concats = 0;
+    for (const auto id : graph->operations()) {
+        const auto op = graph->getOperation(id);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
+            ++registers;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kConcat) {
+            ++concats;
+            // The largest leaf is four 8-bit masks. No partial update may
+            // concatenate a complete leaf in place of one addressed element.
+            for (const auto result : op.results()) {
+                if (graph->getValue(result).width() > 32) {
+                    return fail("Partial struct write exceeds leaf storage: " +
+                                std::string(op.symbolText()) + " width=" +
+                                std::to_string(graph->getValue(result).width()));
+                }
+            }
+        }
+    }
+    if (registers != 9 || concats == 0) {
+        return fail("Missing static, dynamic or nested struct write coverage");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
     const std::filesystem::path sourcePath =
         WOLF_SV_INGEST_STRUCT_ARRAY_FIELDWISE_DATA_PATH;
-    return testFieldWiseStructArray(sourcePath);
+    if (testFieldWiseStructArray(sourcePath) != 0) {
+        return 1;
+    }
+    return testPartialStructWrites(sourcePath);
 }

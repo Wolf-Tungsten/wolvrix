@@ -17,6 +17,9 @@ namespace wolvrix::lib::grhsim
     // (configure_waveform/dump at every eval boundary) plus extra setup
     // translation units and libfst rules in the generated Makefile.
     // Registered under the public "cpu.st.emit-cpp" pass name.
+    // Aggregate state views, shaped concats and whole-array concat writes
+    // automatically use direct row copies when their geometry and boundary
+    // visibility permit it; these optimizations have no configuration flags.
     // `memEnableBitmap` (the --mem-enable-bitmap option, default on) emits the
     // dense P_large_sink enable boundary bitmap and its sync hooks.
     // `memWriteOnWrite` (the --mem-write-activate on-write option, default

@@ -184,6 +184,15 @@ GrhSIM emit 中明确拒绝。
 折叠（RHS 为常量）/ 逐元素展开（RHS 元素结构已知时逐元素 store）/ 循环拷贝（一般情形，
 按行主序 for 循环拷贝）；元素写始终是单条索引 store，不拼位。
 
+Aggregate 直写优化默认生效，不提供额外开关。flat state 的 shaped read 在元素宽为
+8/16/32/64 bit 且布局一致时直接复制行镜像；shaped concat 优先拼接 row-backed
+数组和 scalar 的行，字节对齐时使用 `memcpy`，不足一字节的元素逐行赋值。例如
+`concat(6'b110110, array<2 bit>[4])` 的低四行来自数组，高三行依次为 `2,1,3`。
+一维 scalar concat 若每个 operand 恰为一行，则 whole-array write 直接消费各行，
+继续使用原有写掩码、变化检测和 reader 激活逻辑。sink 中只有当前 boundary context
+可读的 lane 才能展开；不满足几何或可见性条件时保留原打包路径。字节镜像复制在
+小端目标启用，大端目标使用逐行提取。
+
 FST 波形对数组一律**逐元素注册 var**，使用方括号规范名 `arr[i0][i1]...`（GTKWave 折叠
 为数组树）；总字节超过 `kWaveMaxBytes`（512）的数组整个不 dump（不做截断式部分
 dump），宽元素逐元素走 _BitInt u64-word 镜像路径——逐元素化同时解除了旧"元素宽 ∈

@@ -322,12 +322,20 @@ namespace
         const auto u8 = model.logicType(8, false, LogicDomain::TwoState);
         const auto four = model.logicType(5, false, LogicDomain::FourState);
         const auto wide = model.logicType(129, false, LogicDomain::TwoState);
+        const auto array = model.logicType(8, false, LogicDomain::TwoState, std::array<int64_t, 1>{4});
         const auto input = [&](const char *name, TypeId type) {
             const auto port = model.addInput(name, type); const auto value = model.addValue(type);
             model.addOperation("core.input.read", {}, std::array{value}, std::array{ObjectRef::input(port)});
             return value;
         };
         const auto a = input("a", u5), b = input("b", four);
+        const auto arrayInput = input("array", array);
+        const auto arrayAlias = model.addValue(array), arrayAlias2 = model.addValue(array);
+        model.addOperation("core.compute.assign", std::array{arrayInput}, std::array{arrayAlias});
+        model.addOperation("core.compute.assign", std::array{arrayAlias}, std::array{arrayAlias2});
+        const auto arrayPort = model.addOutput("array_y", array);
+        model.addOperation("core.output.write", std::array{arrayAlias2}, {},
+                           std::array{ObjectRef::output(arrayPort)});
         const auto w = input("w", wide);
         const auto wideAlias = model.addValue(wide);
         model.addOperation("core.compute.assign", std::array{w}, std::array{wideAlias});
@@ -373,12 +381,18 @@ namespace
         if (!pass) return fail("identity pass factory: " + error);
         manager.addPass(std::move(pass));
         diag::Diagnostics diagnostics; const auto result = manager.run(model, diagnostics);
-        if (!result.success || !result.changed || model.operations().size() != before - 6 ||
+        if (!result.success || !result.changed || model.operations().size() != before - 8 ||
             model.semanticRevision() != revision + 1)
-            return fail("identity pass did not remove exactly the type-preserving chain");
+            return fail("identity pass did not remove exactly the scalar and shaped type-preserving chains");
         for (const auto &op : model.operations())
-            if (model.text(op.opType) == "core.output.write" && model.operands(op)[0] != a)
-                return fail("identity pass did not reconnect output to original producer");
+            if (model.text(op.opType) == "core.output.write")
+            {
+                const auto output = model.objectRefs(op)[0].index;
+                if (output == arrayPort.index && model.operands(op)[0] != arrayInput)
+                    return fail("identity pass did not reconnect shaped output to original producer");
+                if (output == port.index && model.operands(op)[0] != a)
+                    return fail("identity pass did not reconnect output to original producer");
+            }
         const auto again = manager.run(model, diagnostics);
         if (!again.success || again.changed) return fail("identity pass is not idempotent on cycles/conversions");
         std::stringstream serialized;

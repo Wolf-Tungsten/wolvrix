@@ -1166,6 +1166,13 @@ namespace wolvrix::lib::grhsim
             // aggregate. This keeps the packed literal and its row slices out
             // of every supernode invocation.
             std::optional<std::string> constantArrayInitializer(ValueId value) const;
+            // A whole-array write whose flat data is a concat of one scalar
+            // lane per physical row can bypass the wide concat value.  Return
+            // low-row-first lane expressions when the exact, side-effect-free
+            // shape is present; callers retain the normal per-row change and
+            // activation logic.
+            std::optional<std::vector<std::string>> directConcatRows(ValueId value, const Type &element,
+                                                                      uint64_t rowCount) const;
             std::string cppStoreType(CpuTypeId id) const;
             uint64_t storageBytes(const Type &type) const;
             // Stack-local scalar element view of a shaped (array) logic type:
@@ -1809,6 +1816,67 @@ namespace wolvrix::lib::grhsim
             result += "return cpu_array;}())";
             return result;
         }
+        std::optional<std::vector<std::string>> SixPhaseEmitter::directConcatRows(ValueId value,
+                                                                                   const Type &element,
+                                                                                   uint64_t rowCount) const
+        {
+            // Keep this path bounded: it is intended for the common packed
+            // array write, not for turning an arbitrary giant concat into a
+            // giant initializer in every generated function.
+            if (!rowCount || rowCount > 4096 || element.width == 0 || element.width > 64 ||
+                value.index >= producers_.size())
+                return std::nullopt;
+            const auto producer = producers_[value.index];
+            if (!producer) return std::nullopt;
+            const auto &op = model_.operations()[producer.index - 1];
+            if (model_.text(op.opType) != "core.compute.concat") return std::nullopt;
+            const auto valueType = type(value);
+            if (valueType.kind != TypeKind::Logic || valueType.domain != LogicDomain::TwoState ||
+                valueType.shape.size() != 0 || valueType.width != rowCount * uint64_t(element.width))
+                return std::nullopt;
+            const auto operands = model_.operands(op);
+            if (operands.size() != rowCount) return std::nullopt;
+
+            std::vector<std::string> rows;
+            rows.reserve(rowCount);
+            // Concat operands are listed MSB first; physical row zero is the
+            // low element, hence the reverse traversal.  Each lane must be an
+            // exact scalar row so no partial-width extraction or padding rule
+            // is hidden by this fast path.
+            for (std::size_t index = operands.size(); index-- > 0;)
+            {
+                const auto operand = operands[index];
+                const auto &sourceType = type(operand);
+                if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState ||
+                    !sourceType.shape.empty() || sourceType.width != element.width)
+                    return std::nullopt;
+                // A direct row write in a sink supernode bypasses the
+                // boundary field of the concat result and reads each lane
+                // separately.  Only do that when every lane is itself
+                // available in this supernode.  Otherwise the packed concat
+                // must remain intact: its result may have the sink payload
+                // boundary even though an intermediate lane is non-local.
+                if (readContext_ != CpuBoundaryUse::NonSink &&
+                    !staticScalars_.contains(operand.index) &&
+                    !staticStrings_.contains(operand.index) &&
+                    !crossingLocals_[operand.index] && !activeLocals_[operand.index] &&
+                    !boundaryByUse_[operand.index][static_cast<std::size_t>(readContext_)])
+                    return std::nullopt;
+                // Do not duplicate an expression with observable sampling or
+                // foreign-call effects.  Ordinary local/boundary reads and
+                // pure compute results remain eligible.
+                if (operand.index < producers_.size() && producers_[operand.index])
+                {
+                    const auto &sourceOp = model_.operations()[producers_[operand.index].index - 1];
+                    const auto sourceName = model_.text(sourceOp.opType);
+                    if (sourceName == "core.system.function" || sourceName == "core.dpi.call" ||
+                        sourceName == "core.system.task")
+                        return std::nullopt;
+                }
+                rows.push_back(normalize(read(operand), element));
+            }
+            return rows;
+        }
         std::string SixPhaseEmitter::normalize(std::string expression, const Type &type) const
         {
             if (type.kind == TypeKind::String || type.kind == TypeKind::Real) return expression;
@@ -2041,7 +2109,45 @@ namespace wolvrix::lib::grhsim
                     return std::nullopt;
                 const StateId target{refs[0].index, 0};
                 const auto &array = stateType(target);
-                if (array.kind != TypeKind::Logic || array.shape.empty())
+                if (array.kind != TypeKind::Logic)
+                    return std::nullopt;
+                // Preserve-aggregate lowering can attach an aggregate view to
+                // a flat state.  The state is then stored as one wide
+                // _BitInt, while the value result is an std::array with the
+                // same row geometry.  Unpacking that value row by row is a
+                // particularly expensive path for wide XiangShan registers
+                // (for example, 300 rows of 64 bits).  The little-endian
+                // object image is already the row-major image, so copy it in
+                // one operation.  Keep the existing packed extraction as a
+                // portable fallback for targets where the image is not
+                // directly row-addressable.
+                if (name == "core.state.read" && array.shape.empty())
+                {
+                    const auto stateRows = shapeElementCount(resultType.shape);
+                    const auto elementWidth = typeElementWidth(resultType);
+                    if (!stateRows || !elementWidth || *stateRows != *rows ||
+                        array.width != resultType.width || array.width != *rows * *elementWidth ||
+                        (*elementWidth != 8 && *elementWidth != 16 && *elementWidth != 32 && *elementWidth != 64))
+                        return std::nullopt;
+                    const bool inMem = refs[0].index < memFieldByState_.size() && memFieldByState_[refs[0].index];
+                    const CpuStoreField *field = inMem ? memFieldByState_[refs[0].index]
+                         : refs[0].index < regFieldByState_.size() ? regFieldByState_[refs[0].index] : nullptr;
+                    if (!field) return std::nullopt;
+                    const std::string store = (inMem ? "largeSinkStore." : "smallSinkStore.") +
+                                              std::string(model_.text(field->name));
+                    const Type element = arrayElementType(resultType);
+                    std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};\n"
+                        "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                        "std::memcpy(&cpu_array,&" + store + ",sizeof(cpu_array));\n"
+                        "#else\n";
+                    for (uint64_t row = 0; row < *rows; ++row)
+                        body += rowAccessText("cpu_array", resultType.shape, std::to_string(row)) + '=' +
+                                normalize(rowSliceText(store, std::to_string(row), *elementWidth,
+                                                        resultType.width), element) + ';';
+                    body += "\n#endif\nreturn cpu_array;}())";
+                    return body;
+                }
+                if (array.shape.empty())
                     return std::nullopt;
                 // A whole-array state.read has no index operands. The result
                 // must retain the state's row shape for this direct bridge;
@@ -2211,6 +2317,254 @@ namespace wolvrix::lib::grhsim
             }
             if (kind == "concat" && operands.size() >= 2)
             {
+                // A mixed aggregate/scalar concat is another common
+                // preserve-aggregate shape: a row-backed array is joined
+                // with one or more 64-bit-aligned wide scalar values, and
+                // the result is immediately consumed as an array.  The
+                // packed path below would build the complete _BitInt and
+                // then unpack every row again.  Copy the physical row image
+                // directly when the row storage has no sub-byte padding.
+                // Keep this deliberately narrow: byte-sized elements and
+                // 64-bit-aligned scalar widths make the byte image identical
+                // to the little-endian packed representation; all other
+                // shapes retain the existing semantic path (including its
+                // big-endian fallback).
+                if (resultType.shape.size() == 1 &&
+                    (*resultWidth == 8 || *resultWidth == 16 || *resultWidth == 32 || *resultWidth == 64))
+                {
+                    struct DirectSource
+                    {
+                        std::string text;
+                        const Type *type = nullptr;
+                        uint64_t rows = 0;
+                        bool scalar = false;
+                    };
+                    std::vector<DirectSource> directSources;
+                    directSources.reserve(operands.size());
+                    uint64_t directRows = 0;
+                    bool direct = true;
+                    for (const auto operand : operands)
+                    {
+                        const auto &sourceType = type(operand);
+                        if (sourceType.kind != TypeKind::Logic || sourceType.domain != LogicDomain::TwoState)
+                        {
+                            direct = false;
+                            break;
+                        }
+                        if (sourceType.shape.empty())
+                        {
+                            if (sourceType.width == 0 || sourceType.width % 64 != 0 ||
+                                sourceType.width % *resultWidth != 0 || sourceType.width != wideContainer(sourceType.width))
+                            {
+                                direct = false;
+                                break;
+                            }
+                            const uint64_t rows = sourceType.width / *resultWidth;
+                            directSources.push_back({read(operand), &sourceType, rows, true});
+                            directRows += rows;
+                            continue;
+                        }
+                        const auto sourceRows = shapeElementCount(sourceType.shape);
+                        if (!sourceRows || typeElementWidth(sourceType) != resultWidth)
+                        {
+                            direct = false;
+                            break;
+                        }
+                        auto source = rowBackedArrayText(operand);
+                        // A shaped value produced earlier in the same
+                        // supernode is already stored in the local/frame
+                        // row representation, even when it is not marked as
+                        // a boundary-backed array by the layout lookup.
+                        // Keep that value on the direct path as well; the
+                        // generic fallback would otherwise repack it through
+                        // a wide _BitInt before immediately unpacking it.
+                        if (!source && (crossingLocals_[operand.index] || activeLocals_[operand.index]))
+                            source = localRef(operand);
+                        if (source)
+                        {
+                            directSources.push_back({*source, &sourceType, *sourceRows, false});
+                            directRows += *sourceRows;
+                            continue;
+                        }
+                        // A shaped view can still be backed by one flat
+                        // wide state field (the common preserve-aggregate
+                        // state-read form). Its logical rows are contiguous
+                        // in the _BitInt object, so treat that representation
+                        // like a scalar source and copy its byte image.
+                        if (sourceType.width == 0 || sourceType.width % 64 != 0 ||
+                            sourceType.width % *resultWidth != 0 ||
+                            sourceType.width != wideContainer(sourceType.width))
+                        {
+                            direct = false;
+                            break;
+                        }
+                        directSources.push_back({read(operand), &sourceType,
+                                                 sourceType.width / *resultWidth, true});
+                        directRows += sourceType.width / *resultWidth;
+                    }
+                    if (direct && directRows == *rows)
+                    {
+                        const uint64_t elementBytes = *resultWidth / 8;
+                        std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                        uint64_t destinationRow = 0;
+                        std::size_t scalarIndex = 0;
+                        std::vector<std::string> scalarNames(directSources.size());
+                        for (std::size_t index = directSources.size(); index-- > 0;)
+                        {
+                            const auto &source = directSources[index];
+                            const uint64_t bytes = source.rows * elementBytes;
+                            if (source.scalar)
+                            {
+                                const std::string name = "cpu_packed_" + std::to_string(scalarIndex++);
+                                scalarNames[index] = name;
+                                body += "const auto " + name + "=" + source.text + ';';
+                            }
+                            destinationRow += source.rows;
+                        }
+                        body += "\n#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n";
+                        destinationRow = 0;
+                        for (std::size_t index = directSources.size(); index-- > 0;)
+                        {
+                            const auto &source = directSources[index];
+                            const uint64_t bytes = source.rows * elementBytes;
+                            body += "std::memcpy(cpu_array.data()+" + std::to_string(destinationRow) + ",&" +
+                                    (source.scalar ? scalarNames[index] : source.text) + "," +
+                                    std::to_string(bytes) + ");";
+                            destinationRow += source.rows;
+                        }
+                        body += "\n#else\n";
+                        destinationRow = 0;
+                        const Type element = arrayElementType(resultType);
+                        for (std::size_t index = directSources.size(); index-- > 0;)
+                        {
+                            const auto &source = directSources[index];
+                            for (uint64_t row = 0; row < source.rows; ++row)
+                            {
+                                const std::string destination =
+                                    rowAccessText("cpu_array", resultType.shape,
+                                                  std::to_string(destinationRow + row));
+                                const std::string value = source.scalar
+                                    ? rowSliceText(scalarNames[index], "cpu_row", *resultWidth,
+                                                   source.type->width)
+                                    : rowAccessText(source.text, source.type->shape, "cpu_row");
+                                body += "for(std::size_t cpu_row=" + std::to_string(row) + ";cpu_row<" +
+                                        std::to_string(row + 1) + ";++cpu_row)" + destination + '=' +
+                                        normalize(value, element) + ';';
+                            }
+                            destinationRow += source.rows;
+                        }
+                        body += "\n#endif\n";
+                        body += "return cpu_array;}())";
+                        return body;
+                    }
+                }
+                // The byte-image path above cannot apply to packed elements
+                // narrower than a byte.  Those are common in XiangShan
+                // tables (2/4/5-bit lanes): the generic path would first
+                // build a large _BitInt concat and immediately slice it back
+                // into the row-backed result.  When at least one operand is
+                // scalar, preserve the concat's MSB-first ordering by
+                // assigning each physical row directly.  This deliberately
+                // keeps the source expression count one per scalar operand,
+                // so a system/DPI call is never duplicated or reordered.
+                {
+                    struct DirectRowSource
+                    {
+                        std::string text;
+                        const Type *type = nullptr;
+                        uint64_t rows = 0;
+                        bool scalar = false;
+                    };
+                    std::vector<DirectRowSource> directSources;
+                    directSources.reserve(operands.size());
+                    uint64_t directRows = 0;
+                    bool direct = true;
+                    bool hasScalar = false;
+                    for (const auto operand : operands)
+                    {
+                        const auto &sourceType = type(operand);
+                        if (sourceType.kind != TypeKind::Logic ||
+                            sourceType.domain != LogicDomain::TwoState)
+                        {
+                            direct = false;
+                            break;
+                        }
+                        if (operand.index < producers_.size() && producers_[operand.index])
+                        {
+                            const auto &sourceOp = model_.operations()[producers_[operand.index].index - 1];
+                            const auto sourceName = model_.text(sourceOp.opType);
+                            if (sourceName == "core.system.function" || sourceName == "core.dpi.call" ||
+                                sourceName == "core.system.task")
+                            {
+                                direct = false;
+                                break;
+                            }
+                        }
+                        if (sourceType.shape.empty())
+                        {
+                            if (!*resultWidth || sourceType.width == 0 ||
+                                sourceType.width % *resultWidth != 0)
+                            {
+                                direct = false;
+                                break;
+                            }
+                            const uint64_t rowsFromScalar = sourceType.width / *resultWidth;
+                            directSources.push_back({read(operand), &sourceType, rowsFromScalar, true});
+                            directRows += rowsFromScalar;
+                            hasScalar = true;
+                            continue;
+                        }
+                        const auto sourceRows = shapeElementCount(sourceType.shape);
+                        if (!sourceRows || typeElementWidth(sourceType) != resultWidth)
+                        {
+                            direct = false;
+                            break;
+                        }
+                        auto source = rowBackedArrayText(operand);
+                        if (!source && (crossingLocals_[operand.index] || activeLocals_[operand.index]))
+                            source = localRef(operand);
+                        if (!source)
+                        {
+                            direct = false;
+                            break;
+                        }
+                        directSources.push_back({*source, &sourceType, *sourceRows, false});
+                        directRows += *sourceRows;
+                    }
+                    if (direct && hasScalar && directRows == *rows)
+                    {
+                        const Type element = arrayElementType(resultType);
+                        std::string body = "([&]{" + cppValueType(resultType) + " cpu_array{};";
+                        std::size_t scalarIndex = 0;
+                        std::vector<std::string> scalarNames(directSources.size());
+                        for (std::size_t index = 0; index < directSources.size(); ++index)
+                            if (directSources[index].scalar)
+                            {
+                                const std::string name = "cpu_packed_" + std::to_string(scalarIndex++);
+                                scalarNames[index] = name;
+                                body += "const auto " + name + "=" + directSources[index].text + ';';
+                            }
+                        uint64_t destinationRow = 0;
+                        for (std::size_t index = directSources.size(); index-- > 0;)
+                        {
+                            const auto &source = directSources[index];
+                            for (uint64_t row = 0; row < source.rows; ++row)
+                            {
+                                const std::string destination =
+                                    rowAccessText("cpu_array", resultType.shape,
+                                                  std::to_string(destinationRow + row));
+                                const std::string value = source.scalar
+                                    ? rowSliceText(scalarNames[index], std::to_string(row), *resultWidth,
+                                                   source.type->width)
+                                    : rowAccessText(source.text, source.type->shape, std::to_string(row));
+                                body += destination + '=' + normalize(value, element) + ';';
+                            }
+                            destinationRow += source.rows;
+                        }
+                        body += "return cpu_array;}())";
+                        return body;
+                    }
+                }
                 struct Source
                 {
                     std::string text;
@@ -4172,15 +4526,32 @@ namespace wolvrix::lib::grhsim
                 const bool masked = name == "core.state.writeMask" || operands.size() == 3;
                 if (operands.size() != (masked ? 3u : 2u))
                     throw std::runtime_error("CPU state write has invalid arity");
-                const std::string data = read(operands[1]);
+                const auto directRows = directConcatRows(operands[1], element, rowCount);
+                const std::string data = directRows ? std::string() : read(operands[1]);
                 const bool fullMask = !masked || isAllOnesConstant(operands[2], array.width);
                 const std::string maskText = fullMask ? std::string() : read(operands[2]);
-                const std::string dataSlice = rowSliceText(data, "cpu_row", element.width, array.width);
                 const std::string maskSlice =
                     fullMask ? std::string() : rowSliceText(maskText, "cpu_row", element.width, array.width);
-                out << "if(" << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable) << "){\n"
-                    << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
-                writeCell("cpu_row", std::nullopt, dataSlice, fullMask ? nullptr : &maskSlice);
+                out << "if(" << readAs(operands[0], CpuBoundaryUse::SmallSinkEnable) << "){\n";
+                if (directRows)
+                {
+                    // Keep each lane expression evaluated once while avoiding
+                    // a total-width _BitInt concat and its row-slice loop.
+                    out << "const std::array<" << cppType(element) << ',' << rowCount << "> cpu_direct_data{{";
+                    for (std::size_t index = 0; index < directRows->size(); ++index)
+                    {
+                        if (index) out << ',';
+                        out << (*directRows)[index];
+                    }
+                    out << "}};\nfor(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
+                    writeCell("cpu_row", std::nullopt, "cpu_direct_data[cpu_row]", fullMask ? nullptr : &maskSlice);
+                }
+                else
+                {
+                    const std::string dataSlice = rowSliceText(data, "cpu_row", element.width, array.width);
+                    out << "for(std::size_t cpu_row=0;cpu_row<" << rowCount << ";++cpu_row){\n";
+                    writeCell("cpu_row", std::nullopt, dataSlice, fullMask ? nullptr : &maskSlice);
+                }
                 out << "}\n}\n";
             }
             else if (name == "core.state.fill")

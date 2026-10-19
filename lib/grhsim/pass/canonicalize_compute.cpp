@@ -323,8 +323,14 @@ namespace wolvrix::lib::grhsim
                         !model.objectRefs(op).empty() || !model.parameters(op).empty()) continue;
                     const auto typeId = model.values()[results[0].index - 1].type;
                     const auto &type = model.types()[typeId.index - 1];
+                    // An exact-type assign is a pure value alias.  This also
+                    // holds for preserve-aggregate shaped Logic values: the
+                    // shape is part of the interned type, so replacing the
+                    // alias cannot change array geometry or index meaning.
+                    // Keep the phase and out-of-scope guards identical to the
+                    // scalar path; they are what make the rewrite safe across
+                    // the sealed six-phase partition boundary.
                     if (type.kind == TypeKind::Logic && type.domain == LogicDomain::TwoState &&
-                        type.shape.empty() &&
                         typeId == model.values()[operands[0].index - 1].type &&
                         !outOfScopeConsumer[results[0].index] &&
                         phaseCompatible(op.phase, phaseOf(operands[0])))

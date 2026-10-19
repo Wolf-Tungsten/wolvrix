@@ -3126,6 +3126,31 @@ namespace
         });
     }
 
+    // A flat state may be viewed as a preserve-aggregate value by the
+    // lowering.  Its bits already have the row-major image of the aggregate;
+    // the emitter should bridge that view with one byte copy rather than
+    // unpacking every row through a wide temporary.
+    void flatStateAggregateViewTest(const std::filesystem::path &root)
+    {
+        GrhSimModel model("phase_flat_state_aggregate_view");
+        model.addDialect("core", "1", "wolvrix.grhsim.core.v2");
+        const std::array<int64_t, 2> shape{2, 3};
+        const auto flat = model.logicType(48, false, LogicDomain::TwoState);
+        const auto aggregate = model.logicType(48, false, LogicDomain::TwoState, shape);
+        const auto state = addState(model, "state", flat, "48'h060504030201");
+        const auto view = model.addValue(aggregate, "view");
+        model.addOperation("core.state.read", {}, std::array{view}, std::array{ObjectRef::state(state)});
+        addOutputWrite(model, "o", aggregate, view);
+        require(verifies(model), "flat-state aggregate-view fixture rejected");
+        runSixPhasePipeline(model, false);
+        compileAndRun(model, root / "flat_state_aggregate_view", {
+            {{}, {{"o", "UINT64_C(0x060504030201)"}}},
+        });
+        const auto source = concatModelSources(root / "flat_state_aggregate_view" / "model");
+        require(source.find("std::memcpy(&cpu_array,&smallSinkStore.state,sizeof(cpu_array));") != std::string::npos,
+                "flat-state aggregate view did not use the direct row-image copy");
+    }
+
     // A shaped compute constant is a local value when it feeds another
     // operation. It must be emitted as a static aggregate: rebuilding the
     // packed literal and unpacking every row on every supernode call is a
@@ -3227,6 +3252,30 @@ namespace
         const auto mixedType = model.logicType(166, false, LogicDomain::TwoState);
         addOutputWrite(model, "mixed", mixedType, addCompute(model, "core.compute.concat", mixedType,
             "mixed_concat", {a, b, c, c, c, c, c, c, lo}));
+        const std::array<int64_t, 1> mixedArrayShape{8};
+        const std::array<int64_t, 1> mixedOperandShape{4};
+        const auto mixedArrayOperand = model.logicType(256, false, LogicDomain::TwoState, mixedOperandShape);
+        const auto mixedArrayType = model.logicType(512, false, LogicDomain::TwoState, mixedArrayShape);
+        const auto arrayInput = addInputRead(model, "array_input", mixedArrayOperand);
+        const auto packedInput = addInputRead(model, "packed_input",
+                                              model.logicType(256, false, LogicDomain::TwoState));
+        const auto mixedArrayValue = addCompute(model, "core.compute.concat", mixedArrayType,
+                                                 "mixed_array_concat", {arrayInput, packedInput});
+        addOutputWrite(model, "mixed_array", mixedArrayType, mixedArrayValue);
+        // Sub-byte mixed concat: the 6-bit scalar contributes the low three
+        // 2-bit rows and the four-row aggregate contributes the high rows.
+        // This is the shape that used to build a wide temporary only to slice
+        // it straight back into the output array.
+        const std::array<int64_t, 1> narrowArrayShape{4};
+        const auto narrowArrayOperand = model.logicType(8, false, LogicDomain::TwoState, narrowArrayShape);
+        const auto narrowArrayType = model.logicType(14, false, LogicDomain::TwoState,
+                                                       std::array<int64_t, 1>{7});
+        const auto narrowArrayInput = addInputRead(model, "narrow_array_input", narrowArrayOperand);
+        const auto narrowPackedInput = addInputRead(model, "narrow_packed_input",
+                                                     model.logicType(6, false, LogicDomain::TwoState));
+        const auto narrowArrayValue = addCompute(model, "core.compute.concat", narrowArrayType,
+                                                  "narrow_array_concat", {narrowArrayInput, narrowPackedInput});
+        addOutputWrite(model, "narrow_array", narrowArrayType, narrowArrayValue);
         // The XS failure shape: thousands of narrow pieces form a 16k-bit
         // array. Check every output bit, including updates of both flag inputs.
         const std::array<int64_t, 1> shape{256};
@@ -3239,9 +3288,23 @@ namespace
         addOutputWrite(model, "large", array, joined);
         require(verifies(model), "large concat fixture rejected");
         runSixPhasePipeline(model, false);
+        const std::string arrayBits =
+            "(((unsigned _BitInt(256))UINT64_C(0x4444444444444444)<<192)|"
+            "((unsigned _BitInt(256))UINT64_C(0x3333333333333333)<<128)|"
+            "((unsigned _BitInt(256))UINT64_C(0x2222222222222222)<<64)|"
+            "UINT64_C(0x1111111111111111))";
+        const std::string packedBits =
+            "(((unsigned _BitInt(256))UINT64_C(0x8888888888888888)<<192)|"
+            "((unsigned _BitInt(256))UINT64_C(0x7777777777777777)<<128)|"
+            "((unsigned _BitInt(256))UINT64_C(0x6666666666666666)<<64)|"
+            "UINT64_C(0x5555555555555555))";
+        const std::string mixedArrayExpected =
+            "(((unsigned _BitInt(512))(" + arrayBits + ")<<256)|((unsigned _BitInt(512))(" + packedBits + ")))";
         compileAndRun(model, root / "large_concat", {
-            {{{"a", "0"}, {"b", "0"}, {"c", "0"}, {"hi", "false"}, {"lo", "false"}},
-             {{"mixed", "0"}, {"large", "repeat_byte(0)"}}},
+            {{{"a", "0"}, {"b", "0"}, {"c", "0"}, {"hi", "false"}, {"lo", "false"},
+              {"array_input", "0"}, {"packed_input", "0"}, {"narrow_array_input", "0"},
+              {"narrow_packed_input", "0"}},
+             {{"mixed", "0"}, {"large", "repeat_byte(0)"}, {"mixed_array", "0"}, {"narrow_array", "0"}}},
             {{{"a", "((unsigned _BitInt(128))1<<64)|UINT64_C(0x123456789abcdef0)"},
               {"b", "UINT64_C(0xfedcba9876543210)"}, {"c", "21"}, {"hi", "true"}, {"lo", "false"}},
              {{"mixed", "((unsigned _BitInt(192))sim.a<<101)|((unsigned _BitInt(192))(std::uint64_t)sim.b<<37)|UINT64_C(0xaaaaaaaaa)"},
@@ -3250,11 +3313,20 @@ namespace
             {{{"a", "((unsigned _BitInt(128))1<<65)-1"}, {"b", "~UINT64_C(0)"},
               {"c", "63"}, {"hi", "true"}},
              {{"mixed", "((unsigned _BitInt(192))1<<166)-1"}, {"large", "repeat_byte(0xff)"}}},
+            {{{"array_input", arrayBits}, {"packed_input", packedBits}}, {{"mixed_array", mixedArrayExpected}}},
+            {{{"narrow_array_input", "UINT64_C(0x1d)"}, {"narrow_packed_input", "UINT64_C(0x36)"}},
+             {{"narrow_array", "UINT64_C(0x776)"}}},
         }, false,
         "#include <cstring>\n"
         "unsigned _BitInt(16384) repeat_byte(std::uint8_t byte){\n"
         "std::array<std::uint64_t,256> words;words.fill(UINT64_C(0x0101010101010101)*byte);\n"
         "unsigned _BitInt(16384) bits;std::memcpy(&bits,words.data(),sizeof(bits));return bits;}\n");
+        const auto source = concatModelSources(root / "large_concat" / "model");
+        require(source.find("std::memcpy(cpu_array.data()+0,&cpu_packed_0,32);") != std::string::npos,
+                "mixed aggregate/scalar concat did not use the direct row copy");
+        require(source.find("const auto cpu_packed_0=") != std::string::npos &&
+                source.find("cpu_array[(0)]=static_cast<std::uint8_t>") != std::string::npos,
+                "sub-byte mixed concat did not use direct row assignments");
     }
 
     // M5d-7 multi-TU emit: a 128-bit combinational add chain (one big
@@ -3463,6 +3535,7 @@ int main()
         multiDimValueFlowTest(root, false);
         multiDimValueFlowTest(root, true);
         multiDimConstInitTest(root);
+        flatStateAggregateViewTest(root);
         shapedConstantLocalTest(root);
         wholeArrayWriteReadTest(root, false);
         wholeArrayWriteReadTest(root, true);

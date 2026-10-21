@@ -991,6 +991,7 @@ namespace wolvrix::lib::grhsim
                 crossingLocals_.assign(model_.values().size() + 1, 0);
                 precomputeStagedOutputWrites();
                 if (waveform_) collectWaveformSignals();
+                buildViewRoots();
             }
 
             // Emission entry points (emitSixPhaseCpuCpp drives these).
@@ -1075,6 +1076,14 @@ namespace wolvrix::lib::grhsim
             // Scratch: values spilled to the frame of the chunk list currently
             // being emitted (their cpu_v local becomes the cpu_f.v field).
             mutable std::vector<char> crossingLocals_;
+            // View elision: an equal-width two-state single-operand
+            // core.compute.assign whose result lives entirely inside one
+            // chunk (no boundary field, no frame crossing, not constant)
+            // emits nothing; reads alias the operand's storage instead.
+            // Indexed by value index; an invalid ValueId means no alias.
+            // Built once at the end of the constructor so constructor-time
+            // read()/expression() snapshots keep their legacy resolution.
+            std::vector<ValueId> viewRoot_;
 
             std::vector<std::vector<uint32_t>> inputFanout_, supernodeFanout_, stateFanout_;
             // String-typed boundary fields hoisted out of the (trivially
@@ -1326,6 +1335,8 @@ namespace wolvrix::lib::grhsim
             // Captures the latchWrite staged texts with the final local/frame
             // resolution (the commit runs after all output chunks).
             void precomputeStagedOutputWrites();
+            // One-shot view-alias construction; see viewRoot_.
+            void buildViewRoots();
             void activateCrossing(const std::vector<uint32_t> &frame) const;
             void deactivateCrossing(const std::vector<uint32_t> &frame) const;
             // cpu_v<index> or cpu_f.v<index> when the value is frame-spilled.
@@ -1480,6 +1491,51 @@ namespace wolvrix::lib::grhsim
         std::string SixPhaseEmitter::localRef(ValueId value) const
         {
             return (crossingLocals_[value.index] ? "cpu_f.v" : "cpu_v") + std::to_string(value.index);
+        }
+        void SixPhaseEmitter::buildViewRoots()
+        {
+            viewRoot_.assign(model_.values().size() + 1, ValueId{});
+            std::vector<char> crossingAny(model_.values().size() + 1, 0);
+            const auto markFrame = [&](const std::vector<uint32_t> &frame) {
+                for (const uint32_t index : frame) crossingAny[index] = 1;
+            };
+            for (const auto &frame : supernodeFrames_) markFrame(frame);
+            markFrame(eventFrame_);
+            markFrame(outputFrame_);
+            for (const auto &op : model_.operations())
+            {
+                if (model_.text(op.opType) != "core.compute.assign") continue;
+                const auto operands = model_.operands(op);
+                const auto results = model_.results(op);
+                if (operands.size() != 1 || results.size() != 1) continue;
+                const ValueId result = results[0];
+                if (result.index >= viewRoot_.size()) continue;
+                if (boundaryByValue_[result.index] || !boundaryFieldsByValue_[result.index].empty() ||
+                    staticScalars_.contains(result.index) || staticStrings_.contains(result.index) ||
+                    maskedArrayReads_[result.index] || crossingAny[result.index])
+                    continue;
+                bool boundaryUse = false;
+                for (const auto *field : boundaryByUse_[result.index]) boundaryUse |= field != nullptr;
+                if (boundaryUse) continue;
+                const auto &resultType = type(result);
+                const auto &operandType = type(operands[0]);
+                if (resultType.kind != TypeKind::Logic || operandType.kind != TypeKind::Logic ||
+                    resultType.domain != LogicDomain::TwoState || operandType.domain != LogicDomain::TwoState ||
+                    resultType.width == 0 || resultType.width != operandType.width)
+                    continue;
+                ValueId root = operands[0];
+                while (root.index < viewRoot_.size() && viewRoot_[root.index]) root = viewRoot_[root.index];
+                // A masked-read root re-expands its full lambda at every
+                // read site; aliasing would duplicate that work per consumer.
+                if (root.index < maskedArrayReads_.size() && maskedArrayReads_[root.index]) continue;
+                const auto &rootType = type(root);
+                // The root's flat read must be trivial: either the root is
+                // flat itself, or it holds the identical row geometry (a
+                // pure rename whose row access can forward as well).
+                if (rootType.shape.empty() ||
+                    (!resultType.shape.empty() && rootType.shape == resultType.shape))
+                    viewRoot_[result.index] = root;
+            }
         }
         std::string SixPhaseEmitter::boundaryRef(const CpuStoreField *field) const
         {
@@ -1979,6 +2035,7 @@ namespace wolvrix::lib::grhsim
 
         std::string SixPhaseEmitter::read(ValueId value) const
         {
+            if (value.index < viewRoot_.size() && viewRoot_[value.index]) return read(viewRoot_[value.index]);
             if (const auto it = staticScalars_.find(value.index); it != staticScalars_.end()) return it->second;
             if (type(value).kind == TypeKind::String)
                 if (const auto it = staticStrings_.find(value.index); it != staticStrings_.end()) return it->second;
@@ -2041,6 +2098,16 @@ namespace wolvrix::lib::grhsim
             // Flat local/constant forms win (read() resolves them first); only
             // values that would pack from per-row storage qualify.
             if (value.index >= producers_.size()) return std::nullopt;
+            if (value.index < viewRoot_.size() && viewRoot_[value.index])
+            {
+                // An elided view owns no storage. Forward row access only for
+                // a pure rename (identical row geometry); anything else falls
+                // back to the flat packed read at the call site.
+                const ValueId root = viewRoot_[value.index];
+                if (!type(value).shape.empty() && type(root).shape == type(value).shape)
+                    return rowBackedArrayText(root);
+                return std::nullopt;
+            }
             if (staticScalars_.contains(value.index) || staticStrings_.contains(value.index))
                 return std::nullopt;
             if (crossingLocals_[value.index] || activeLocals_[value.index])
@@ -3900,6 +3967,8 @@ namespace wolvrix::lib::grhsim
             // Constants fold into their use sites; a constant boundary field is
             // preloaded at init() and never republished.
             if (staticScalars_.contains(result.index) || staticStrings_.contains(result.index)) return;
+            // Elided views own no storage; their reads alias the operand.
+            if (result.index < viewRoot_.size() && viewRoot_[result.index]) return;
             if (maskedArrayReads_[result.index] && !boundaryByValue_[result.index] &&
                 !crossingLocals_[result.index]) return;
             if (name == "core.input.read")

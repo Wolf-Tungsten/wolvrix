@@ -1611,11 +1611,23 @@ namespace wolvrix::lib::grhsim
             if (!rows || !elementWidth)
                 throw std::runtime_error("CPU six-phase emit shaped value has an invalid shape");
             const Type element = arrayElementType(type);
-            return "([&](){" + cppValueType(type) + " cpu_array{};const auto cpu_packed=" + packed +
-                   ";for(std::size_t cpu_j=0;cpu_j<" + std::to_string(*rows) + ";++cpu_j)" +
+            const std::string loop = "for(std::size_t cpu_j=0;cpu_j<" + std::to_string(*rows) + ";++cpu_j)" +
                    rowAccessText("cpu_array", type.shape, "cpu_j") + '=' +
-                   normalize(rowSliceText("cpu_packed", "cpu_j", *elementWidth, type.width), element) +
-                   ";return cpu_array;}())";
+                   normalize(rowSliceText("cpu_packed", "cpu_j", *elementWidth, type.width), element) + ';';
+            if (*rows * uint64_t(*elementWidth) == type.width &&
+                (*elementWidth == 8 || *elementWidth == 16 || *elementWidth == 32 || *elementWidth == 64))
+            {
+                // These cells have no padding: on little-endian targets the
+                // packed object image already is the row-major array image.
+                // Copy it in one operation instead of shifting the full-width
+                // value once per row (an O(rows*width) loop).
+                return "([&](){" + cppValueType(type) + " cpu_array{};const auto cpu_packed=" + packed +
+                       ";\n#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                       "std::memcpy(&cpu_array,&cpu_packed," + std::to_string(type.width / 8) +
+                       ");\n#else\n" + loop + "\n#endif\nreturn cpu_array;}())";
+            }
+            return "([&](){" + cppValueType(type) + " cpu_array{};const auto cpu_packed=" + packed +
+                   ";" + loop + "return cpu_array;}())";
         }
         std::string SixPhaseEmitter::cppStoreType(CpuTypeId id) const
         {
@@ -3770,13 +3782,42 @@ namespace wolvrix::lib::grhsim
                         : arrayValue
                             ? rowAccessText("cpu_value", resultType.shape, "cpu_j")
                             : normalize(rowSliceText("cpu_value", "cpu_j", *elementWidth, resultType.width), element);
+                    // Packed source into a no-padding row array: the flat
+                    // object image already is the row-major array image, so
+                    // little-endian targets can copy/compare it in one
+                    // operation instead of per-row wide shifts.
+                    const bool packedImage = !constantAggregate && !arrayValue &&
+                        *rows * uint64_t(*elementWidth) == resultType.width &&
+                        (*elementWidth == 8 || *elementWidth == 16 || *elementWidth == 32 || *elementWidth == 64);
+                    const std::string imageBytes = std::to_string(resultType.width / 8);
                     out << "{const auto &cpu_value=" << (constantAggregate ? constantName : source) << ";\n";
                     if (!hasHook && (!notify || supernodeFanout_[result.index].empty()))
                     {
+                        if (packedImage)
+                        {
+                            out << "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                                << "std::memcpy(&" << slot << ",&cpu_value," << imageBytes << ");\n#else\n"
+                                << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)"
+                                << rowAccessText(slot, resultType.shape, "cpu_j") << '=' << rowExpr
+                                << ";\n#endif\n}\n";
+                            continue;
+                        }
                         out << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j)"
                             << rowAccessText(slot, resultType.shape, "cpu_j") << '=' << rowExpr
                             << ";\n}\n";
                         continue;
+                    }
+                    if (packedImage)
+                    {
+                        out << "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                            << "const bool cpu_chg=std::memcmp(&" << slot << ",&cpu_value," << imageBytes << ")!=0;\n"
+                            << "if(cpu_chg){std::memcpy(&" << slot << ",&cpu_value," << imageBytes << ");\n";
+                        if (notify)
+                        {
+                            flagOutputDirty(out, outputReadValues_.contains(result.index));
+                            activateFanout(out, supernodeFanout_[result.index], current);
+                        }
+                        out << "}}\n#else\n";
                     }
                     out << "bool cpu_chg=false;\n"
                         << "for(std::size_t cpu_j=0;cpu_j<" << *rows << ";++cpu_j){const auto cpu_e=" << rowExpr
@@ -3789,6 +3830,7 @@ namespace wolvrix::lib::grhsim
                         activateFanout(out, supernodeFanout_[result.index], current);
                     }
                     out << "}}\n";
+                    if (packedImage) out << "#endif\n";
                     continue;
                 }
                 if (!hasHook && (!notify || supernodeFanout_[result.index].empty()))

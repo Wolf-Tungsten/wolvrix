@@ -138,7 +138,7 @@ int main()
             const auto baseDef = top.valueDef(base);
             foundShapedView = base != zero && top.valueShape(base).size() == 1 &&
                               top.valueShape(base)[0] == 1 && baseDef.valid() &&
-                              top.opKind(baseDef) == wolvrix::lib::grh::OperationKind::kAssign &&
+                              top.opKind(baseDef) == wolvrix::lib::grh::OperationKind::kAssignAs &&
                               top.opOperands(baseDef)[0] == zero &&
                               top.valueShape(top.opOperands(op)[1]).empty();
         }

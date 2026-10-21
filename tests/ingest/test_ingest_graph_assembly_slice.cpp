@@ -158,6 +158,7 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
             }
             break;
         case wolvrix::lib::grh::OperationKind::kAssign:
+        case wolvrix::lib::grh::OperationKind::kAssignAs:
             if (op.operands().size() == 1 && op.results().size() == 1) {
                 const wolvrix::lib::grh::Value result = graph->getValue(op.results()[0]);
                 if (result.symbolText() == "small_lanes") {

@@ -268,12 +268,19 @@ shape 恒对应 "canonical index 0 = 最低元素地址" 的布局；SV 源中�
 边界合法）；合法 SV 源中 unpacked 数组不可能参与算术/移位/归约（前端直接拒绝），因此
 **不设 op 白名单/黑名单**。
 
-shape 感知点（真正读 shape 的地方）只有四个：
+但 shape 是 value 的**类型成分**：跨 shape（或跨符号性）的连接不是改名，必须通过
+`kAssignAs`（§6.2.9）显式表达——它表达"bit 级内容不变的类型重解释"。`kAssign`
+收紧为严格同型改名；别名/重写通道不得把 shape 隐式回填给扁平 value（历史上
+`guardShapeAlias` 的回填曾把聚合 shape 染到输出端口与内部值上，见
+ptmp 归档的 CASE_009 / XS store 提交乱序调查）。
+
+shape 感知点（真正读 shape 的地方）只有五个：
 
 - `kSliceArray`：输入 Value 必须 shape 非空（见 §6.2.8）；
 - 声明 op 的 `shape` 属性（§6.4）与读口 result 的 shape 继承；
 - `kRegister` 数组端口族（索引读/写、部分索引、掩码、填充，§6.4）；
-- 实例端口连接的 shape 匹配（totalBits 必须一致，shape 不一致给 warning）。
+- 实例端口连接的 shape 匹配（totalBits 必须一致，shape 不一致给 warning）；
+- `kAssignAs` 的 result 类型声明（类型边界本身，见 §6.2.9）。
 
 **shape 推导惯例**（供 ingest/pass 构造 result Value 时使用，不是 verifier 约束；
 shape 缺失/未传播只损失结构信息，不影响正确性）：
@@ -901,6 +908,25 @@ res[0] = oper[0] ? oper[1] : oper[2]
 - **results**: `res[0]`，位宽 `W`
 - **attrs**: 无
 - **语义**: `res[0] = oper[0]`
+- **类型契约（stage-08 起收紧）**：`oper[0]` 与 `res[0]` 的 width / isSigned / shape
+  必须全等——kAssign 是严格的同型改名。bit 级内容不变的跨类型转换必须使用
+  `kAssignAs`，verifier 对违例报错。
+
+**kAssignAs**（位级重解释 / pack-unpack 转换）
+
+- **operands**: `oper[0]`（源信号，位宽 `W`）
+- **results**: `res[0]`，位宽必须等于 `W`（verifier 强制）
+- **attrs**: 无
+- **语义**: bit 内容恒等；`res[0]` 的 shape / isSigned 可与 `oper[0]` 不同。
+  用于 packed 聚合 ⇄ 扁平位向量之间的显式视图转换（如 `assign flat = aggReg`）。
+  位宽不等的转换不进本 op（由既有 resize/cast 路径处理）。
+
+#### 3. kAssignAs 与"shape 即类型"
+
+value 的 shape 是创建即定型的类型成分：op 定义其 result 的类型，别名通道
+（`replaceResult`/`replaceAllUses`）不再把 shape 回填给扁平 value。跨类型连接
+一律显式经过 kAssignAs，因此任何"删除一个 kAssign"式的优化在类型层面天然安全——
+它能删的只剩真正的同型改名。
 
 **kConcat**（位拼接）
 

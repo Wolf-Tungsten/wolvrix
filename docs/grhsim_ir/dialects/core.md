@@ -134,6 +134,7 @@ operands、results 或运算语义。当前直接承接以下关键结构：
 | --- | --- |
 | `kConstant` | `core.compute.constant` |
 | `kAssign` | `core.compute.assign` |
+| `kAssignAs` | `core.compute.assign` |
 | `kMux` | `core.compute.mux` |
 | `kConcat` | `core.compute.concat` |
 | `kSliceStatic` | `core.compute.sliceStatic` |

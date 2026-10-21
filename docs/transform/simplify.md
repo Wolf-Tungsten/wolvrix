@@ -6,7 +6,7 @@
 
 ## 详细说明
 
-该 pass 通过组合多个子 passes 的迭代执行，实现深度优化。每次迭代都会尝试进一步简化设计，直到没有更多优化可做或达到最大迭代次数。
+该 pass 按子 pass 的依赖关系迭代执行，直到没有需要重跑的子 pass 或达到最大迭代次数。
 
 ### 子 Passes
 
@@ -19,12 +19,38 @@
 ### 迭代流程
 
 ```
-for iter in 0..maxIterations:
-    run const-fold
-    run redundant-elim
-    run dead-code-elim
-    if no changes: break
+dirty = {const-fold, redundant-elim, dead-code-elim}
+for iter in 0..<maxIterations:
+    按 const-fold → redundant-elim → dead-code-elim 的顺序运行 dirty 子 pass
+    根据各子 pass 的变化更新 dirty
+    if dirty is empty: break
 ```
+
+常量折叠内部使用工作队列：一次扫描加入可折叠操作，折叠结果重定向之前将其
+用户入队。同一操作不会重复待处理，成功折叠的操作不再入队；操作擦除延迟到
+队列排空后。即使操作存储顺序是 `out = sum + 1`、`sum = 2 + 3`，也能在
+一次常量折叠调用中得到 `out = 6`。队列按图独立，不假设存储顺序是拓扑顺序。
+
+| 已执行子 pass 的变化 | 后续需要运行的子 pass |
+| --- | --- |
+| 常量折叠有变化 | 冗余消除、DCE |
+| 常量折叠后的切片或比较简化有变化 | 另需重跑常量折叠，处理新暴露的常量输入 |
+| 冗余消除有变化 | 常量折叠、冗余消除、DCE |
+| DCE 有变化 | 冗余消除：删除用户可能使赋值、concat 或 NOT/XOR 满足单用户条件 |
+| 子 pass 无变化 | 不使其他子 pass 失效 |
+
+DCE 在首轮裁剪图，之后积累删除需求，在常量折叠和冗余消除稳定后执行；到达
+`maxIterations` 上限时也执行待处理的 DCE。这样中间每次别名替换不必立即
+重算全图活性。DCE 已完成一次全图活性闭包，单独删除死操作不会产生新常量输入，因此不触发
+下一轮常量折叠或 DCE。常量池仍在每次 `const-fold` 调用时重建，不跨外层迭代缓存。
+
+冗余消除的 CSE 同样使用图内工作队列，合并结果前将被替换值的用户入队，
+使逆序存放的重复表达式链在一次调用中完成合并。每次替换输入都更新用户的
+版本标记，哈希表命中时校验代表操作的版本；已擦除或签名过期的条目不能作为
+合并目标，无需为每次命中重新构造代表操作的签名。类型和 shape 检查照常执行。
+
+日志保留 `simplify iteration=... changed=...`，并列出实际执行的子 pass、
+各自的 changed 值和耗时；没有出现在该轮日志中的子 pass 已跳过。
 
 ## 配置选项
 

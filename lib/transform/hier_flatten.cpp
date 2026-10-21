@@ -302,7 +302,7 @@ namespace wolvrix::lib::transform
                 target.createValue(target.makeInternalValSym(), target.valueWidth(targetValue),
                                    target.valueSigned(targetValue), target.valueType(targetValue), shape);
             const wolvrix::lib::grh::OperationId assign =
-                target.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                target.createOperation(target.assignKindFor(targetValue, view),
                                        target.makeInternalOpSym());
             target.addOperand(assign, targetValue);
             target.addResult(assign, view);
@@ -551,7 +551,7 @@ namespace wolvrix::lib::transform
                     }
                     wolvrix::lib::grh::SymbolId opSym = target.makeInternalOpSym();
                     wolvrix::lib::grh::OperationId assign =
-                        target.createOperation(wolvrix::lib::grh::OperationKind::kAssign, opSym);
+                        target.createOperation(target.assignKindFor(it->second, *targetValue), opSym);
                     target.addOperand(assign, it->second);
                     target.addResult(assign, *targetValue);
                     state.changed = true;

@@ -2177,7 +2177,8 @@ namespace wolvrix::lib::emit
         for (const auto opId : topGraph.operations())
         {
             const auto kind = topGraph.opKind(opId);
-            if (kind == wolvrix::lib::grh::OperationKind::kAssign)
+            if (kind == wolvrix::lib::grh::OperationKind::kAssign ||
+                kind == wolvrix::lib::grh::OperationKind::kAssignAs)
             {
                 const auto operands = topGraph.opOperands(opId);
                 const auto results = topGraph.opResults(opId);

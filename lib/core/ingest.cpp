@@ -22804,7 +22804,7 @@ private:
                 {
                     continue;
                 }
-                graph_.replaceAllUses(read.value, laneValue);
+                graph_.replaceAllUsesWithView(read.value, laneValue);
                 if (read.expr != kInvalidPlanIndex &&
                     read.expr < static_cast<ExprNodeId>(valueByExpr_.size()))
                 {
@@ -22823,6 +22823,25 @@ private:
                                    graph_.getValue(write.value).isSigned(), location);
             if (fullValue.valid())
             {
+                // shape 即类型：被替换的声明值可能带聚合 shape，而 fullValue
+                // 是扁平计算结果。别名两侧类型必须一致，因此给 fullValue 套一个
+                // 目标类型的 kAssignAs 视图。
+                const std::span<const int64_t> targetShape = graph_.valueShape(targetValue);
+                const std::span<const int64_t> fullShape = graph_.valueShape(fullValue);
+                if (!std::equal(targetShape.begin(), targetShape.end(),
+                                fullShape.begin(), fullShape.end()) &&
+                    graph_.valueWidth(targetValue) == graph_.valueWidth(fullValue))
+                {
+                    const wolvrix::lib::grh::ValueId view = graph_.createValue(
+                        makeInternalValueSymbol(), graph_.valueWidth(fullValue),
+                        graph_.valueSigned(fullValue), graph_.valueType(fullValue), targetShape);
+                    const wolvrix::lib::grh::OperationId viewOp =
+                        createOp(wolvrix::lib::grh::OperationKind::kAssignAs,
+                                 wolvrix::lib::grh::SymbolId::invalid(), location);
+                    graph_.addOperand(viewOp, fullValue);
+                    graph_.addResult(viewOp, view);
+                    fullValue = view;
+                }
                 graph_.replaceAllUses(targetValue, fullValue);
                 valueBySymbol_[target.index] = fullValue;
             }
@@ -23013,7 +23032,7 @@ private:
             }
 
             wolvrix::lib::grh::OperationId assignOp =
-                createOp(wolvrix::lib::grh::OperationKind::kAssign,
+                createOp(graph_.assignKindFor(merged, targetValue),
                          wolvrix::lib::grh::SymbolId::invalid(),
                          writeLoc);
             graph_.addOperand(assignOp, merged);
@@ -25351,7 +25370,7 @@ private:
             // stage-02 1-D bridge backfill (e.g. temps of non-array exprs).
             const int32_t width = normalizeWidth(node.sliceWidth > 0 ? node.sliceWidth
                                                                      : node.widthHint);
-            const wolvrix::lib::grh::ValueId baseValue = operands[0];
+            wolvrix::lib::grh::ValueId baseValue = operands[0];
             const int64_t baseWidth = graph_.getValue(baseValue).width();
             std::span<const int64_t> baseShape = graph_.valueShape(baseValue);
             if (baseShape.empty())
@@ -25359,7 +25378,19 @@ private:
                 if (baseWidth > 0 && width > 0 && baseWidth % width == 0)
                 {
                     const std::array<int64_t, 1> bridgeShape{baseWidth / width};
-                    graph_.setValueShape(baseValue, bridgeShape);
+                    // shape 创建即定型：不原地回填扁平 base，改用一个带 shape 的
+                    // kAssignAs 视图作为 kSliceArray 的 base。
+                    const wolvrix::lib::grh::SymbolId viewSym = makeInternalValueSymbol();
+                    wolvrix::lib::grh::ValueId view = graph_.createValue(
+                        viewSym, static_cast<int32_t>(baseWidth),
+                        graph_.valueSigned(baseValue), graph_.valueType(baseValue),
+                        std::span<const int64_t>(bridgeShape.data(), bridgeShape.size()));
+                    const wolvrix::lib::grh::OperationId viewOp =
+                        createOp(wolvrix::lib::grh::OperationKind::kAssignAs,
+                                 wolvrix::lib::grh::SymbolId::invalid(), node.location);
+                    graph_.addOperand(viewOp, baseValue);
+                    graph_.addResult(viewOp, view);
+                    baseValue = view;
                     baseShape = graph_.valueShape(baseValue);
                 }
                 else if (context_.diagnostics)
@@ -25396,7 +25427,7 @@ private:
                 createOp(wolvrix::lib::grh::OperationKind::kSliceArray,
                          wolvrix::lib::grh::SymbolId::invalid(),
                          node.location);
-            graph_.addOperand(op, operands[0]);
+            graph_.addOperand(op, baseValue);
             for (std::size_t i = 0; i < indexCount; ++i)
             {
                 graph_.addOperand(op, operands[1 + i]);
@@ -25488,6 +25519,15 @@ private:
         wolvrix::lib::grh::ValueId result =
             graph_.createValue(sym, width, node.isSigned, node.valueType);
         graph_.addResult(op, result);
+        // Type-honest assignment: a plan-level kAssign whose operand carries a
+        // different type than the freshly created (flat) result is a bit-level
+        // reinterpretation, which belongs to kAssignAs.
+        if (node.op == wolvrix::lib::grh::OperationKind::kAssign && !operands.empty() &&
+            graph_.assignKindFor(operands.front(), result) ==
+                wolvrix::lib::grh::OperationKind::kAssignAs)
+        {
+            graph_.setOpKind(op, wolvrix::lib::grh::OperationKind::kAssignAs);
+        }
         valueByExpr_[id] = result;
         return result;
     }
@@ -25570,7 +25610,7 @@ private:
                     continue;
                 }
                 wolvrix::lib::grh::OperationId op =
-                    createOp(wolvrix::lib::grh::OperationKind::kAssign,
+                    createOp(graph_.assignKindFor(nextValue, targetValue),
                              wolvrix::lib::grh::SymbolId::invalid(),
                              entry.location);
                 graph_.addOperand(op, nextValue);

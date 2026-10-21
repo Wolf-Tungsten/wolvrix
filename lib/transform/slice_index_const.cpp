@@ -159,6 +159,7 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             case wolvrix::lib::grh::OperationKind::kAssign:
+            case wolvrix::lib::grh::OperationKind::kAssignAs:
                 if (operands.size() != 1)
                 {
                     break;

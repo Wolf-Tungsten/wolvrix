@@ -6,7 +6,6 @@
 
 #include <memory>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace wolvrix::lib::transform
@@ -42,6 +41,9 @@ namespace wolvrix::lib::transform
 
         PassResult run() override;
 
+        // Slice/compare rewrites run after folding and may expose new folds.
+        bool needsRevisit() const noexcept { return needsRevisit_; }
+
     private:
         using ConstantStore = std::unordered_map<wolvrix::lib::grh::ValueId, ConstantValue, wolvrix::lib::grh::ValueIdHash>;
         using ConstantPool = std::unordered_map<ConstantKey, wolvrix::lib::grh::ValueId, ConstantKeyHash>;
@@ -52,7 +54,6 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::Graph &graph;
             ConstantStore &constants;  // Shared across graphs (values can reference constants from other graphs)
             std::unique_ptr<ConstantPool> pool;  // Per-graph constant pool for deduplication
-            std::unordered_set<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::OperationIdHash> foldedOps;  // Per-graph folded operations
             bool &failed;
             bool protectDeclaredSymbols = false;
             std::size_t dedupedConstants = 0;
@@ -74,6 +75,7 @@ namespace wolvrix::lib::transform
         bool simplifyUnsignedComparisons(GraphFoldContext &ctx);
 
         ConstantFoldOptions options_;
+        bool needsRevisit_ = false;
     };
 
 } // namespace wolvrix::lib::transform

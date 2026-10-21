@@ -730,5 +730,171 @@ int main()
         }
     }
 
+    // Reverse storage order must not limit propagation to maxIterations nodes.
+    // Both graphs reuse local id indices; the worklist must remain graph-local.
+    {
+        wolvrix::lib::grh::Design design;
+        for (const std::string name : {"reverse_a", "reverse_b"})
+        {
+            auto &graph = design.createGraph(name);
+            const auto one = makeConst(graph, "one", "one_op", 16, false, "16'd1");
+            std::vector<wolvrix::lib::grh::ValueId> chain{one};
+            for (int i = 1; i <= 64; ++i)
+            {
+                chain.push_back(graph.createValue(graph.internSymbol("v" + std::to_string(i)), 16, false));
+            }
+            for (int i = 64; i > 0; --i)
+            {
+                const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd);
+                graph.addOperand(op, chain[i - 1]);
+                graph.addOperand(op, one);
+                graph.addResult(op, chain[i]);
+            }
+            // Repeated operand slots must schedule this user only once.
+            const auto doubled = graph.createValue(graph.internSymbol("doubled"), 16, false);
+            const auto add = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd);
+            graph.addOperand(add, chain.back());
+            graph.addOperand(add, chain.back());
+            graph.addResult(add, doubled);
+            graph.bindOutputPort("out", doubled);
+        }
+        SimplifyOptions options;
+        options.maxIterations = 1;
+        PassManager manager;
+        manager.addPass(std::make_unique<SimplifyPass>(options));
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError())
+        {
+            return fail("Reverse-order worklist failed");
+        }
+        for (const auto &entry : design.graphs())
+        {
+            const auto &graph = *entry.second;
+            const auto def = graph.valueDef(graph.outputPortValue("out"));
+            const auto literal = getConstLiteral(graph, graph.getOperation(def));
+            if (!literal || !static_cast<bool>(*literal == slang::SVInt::fromString("16'd130")))
+            {
+                return fail("Reverse-order chain did not fold in one iteration");
+            }
+        }
+    }
+
+    // CSE must propagate aliases to consumers stored before their producers.
+    {
+        using namespace wolvrix::lib::grh;
+        Design design;
+        auto &graph = design.createGraph("reverse_cse");
+        const auto input = graph.createValue(graph.internSymbol("input"), 16, false);
+        graph.bindInputPort("input", input);
+        const auto one = makeConst(graph, "one", "one_op", 16, false, "16'd1");
+        std::vector<ValueId> left{input}, right{input};
+        for (int i = 1; i <= 32; ++i)
+        {
+            left.push_back(graph.createValue(graph.internSymbol("_val_l" + std::to_string(i)), 16, false));
+            right.push_back(graph.createValue(graph.internSymbol("_val_r" + std::to_string(i)), 16, false));
+        }
+        for (int i = 32; i > 0; --i)
+        {
+            for (const auto *chain : {&left, &right})
+            {
+                const auto op = graph.createOperation(OperationKind::kAdd);
+                graph.addOperand(op, (*chain)[i - 1]);
+                graph.addOperand(op, one);
+                graph.addResult(op, (*chain)[i]);
+            }
+        }
+        const auto out = graph.createValue(graph.internSymbol("out"), 16, false);
+        const auto consume = graph.createOperation(OperationKind::kXor);
+        graph.addOperand(consume, left.back());
+        graph.addOperand(consume, right.back());
+        graph.addResult(consume, out);
+        graph.bindOutputPort("out", out);
+        SimplifyOptions options;
+        options.maxIterations = 1;
+        PassManager manager;
+        manager.addPass(std::make_unique<SimplifyPass>(options));
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError() ||
+            graph.opOperands(consume)[0] != graph.opOperands(consume)[1])
+        {
+            return fail("Reverse-order CSE did not converge in one iteration");
+        }
+        std::size_t additions = 0;
+        for (const auto op : graph.operations())
+        {
+            additions += graph.opKind(op) == OperationKind::kAdd;
+        }
+        if (additions != 32)
+        {
+            return fail("CSE left duplicate arithmetic in the live cones");
+        }
+    }
+
+    // DCE can enable a single-user rewrite without creating constant operands.
+    {
+        using namespace wolvrix::lib::grh;
+        Design design;
+        auto &graph = design.createGraph("dce_single_user");
+        const auto a = graph.createValue(graph.internSymbol("a"), 4, false);
+        const auto b = graph.createValue(graph.internSymbol("b"), 4, false);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        const auto value = graph.createValue(graph.internSymbol("_val_xor"), 4, false);
+        const auto x = graph.createOperation(OperationKind::kXor, graph.internSymbol("xor"));
+        graph.addOperand(x, a);
+        graph.addOperand(x, b);
+        graph.addResult(x, value);
+        const auto out = graph.createValue(graph.internSymbol("out"), 4, false);
+        const auto n = graph.createOperation(OperationKind::kNot, graph.internSymbol("not"));
+        graph.addOperand(n, value);
+        graph.addResult(n, out);
+        graph.bindOutputPort("out", out);
+        const auto dead = graph.createOperation(OperationKind::kAdd, graph.internSymbol("dead"));
+        graph.addOperand(dead, value);
+        graph.addOperand(dead, a);
+        graph.addResult(dead, graph.createValue(graph.internSymbol("unused"), 4, false));
+        PassManager manager;
+        manager.addPass(std::make_unique<SimplifyPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError() ||
+            graph.findOperation("dead").valid() || graph.findOperation("not").valid() ||
+            graph.opKind(graph.valueDef(graph.outputPortValue("out"))) != OperationKind::kXnor)
+        {
+            return fail("DCE did not wake the single-user rewrite");
+        }
+    }
+
+    // A compare rewritten after the folding queue drains must wake folding.
+    {
+        using namespace wolvrix::lib::grh;
+        Design design;
+        auto &graph = design.createGraph("late_compare");
+        const auto input = graph.createValue(graph.internSymbol("input"), 4, false);
+        graph.bindInputPort("input", input);
+        const auto zero = makeConst(graph, "zero", "zero_op", 4, false, "4'd0");
+        const auto cmpValue = graph.createValue(graph.internSymbol("cmp"), 1, false);
+        const auto cmp = graph.createOperation(OperationKind::kGe);
+        graph.addOperand(cmp, input);
+        graph.addOperand(cmp, zero);
+        graph.addResult(cmp, cmpValue);
+        const auto out = graph.createValue(graph.internSymbol("out"), 1, false);
+        const auto n = graph.createOperation(OperationKind::kNot);
+        graph.addOperand(n, cmpValue);
+        graph.addResult(n, out);
+        graph.bindOutputPort("out", out);
+        PassManager manager;
+        manager.addPass(std::make_unique<SimplifyPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError())
+        {
+            return fail("Late compare folding failed");
+        }
+        const auto literal = getConstLiteral(graph, graph.getOperation(graph.valueDef(graph.outputPortValue("out"))));
+        if (!literal || !static_cast<bool>(*literal == slang::SVInt::fromString("1'b0")))
+        {
+            return fail("Late compare did not propagate to its consumer");
+        }
+    }
+
     return 0;
 }

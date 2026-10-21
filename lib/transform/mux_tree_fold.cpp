@@ -161,6 +161,7 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case OperationKind::kAssign:
+            case OperationKind::kAssignAs:
             case OperationKind::kMux:
             case OperationKind::kEq:
             case OperationKind::kNe:
@@ -267,7 +268,9 @@ namespace wolvrix::lib::transform
                         return value;
                     }
                     const Operation op = graph_.getOperation(def);
-                    if ((op.kind() == OperationKind::kAssign || op.kind() == OperationKind::kConcat) &&
+                    if ((op.kind() == OperationKind::kAssign ||
+                         op.kind() == OperationKind::kAssignAs ||
+                         op.kind() == OperationKind::kConcat) &&
                         op.operands().size() == 1 &&
                         graph_.valueWidth(value) == graph_.valueWidth(op.operands()[0]))
                     {
@@ -822,7 +825,7 @@ namespace wolvrix::lib::transform
                         index = makeIndexClamp(ptr, elemCount, tailIndex, pw);
                     }
                     const ValueId read = makeArrayRead(regSym, index, elemWidth);
-                    graph_.replaceAllUses(rootResult, read);
+                    graph_.replaceAllUsesWithView(rootResult, read);
                     for (const ValueId v : treeResults)
                     {
                         foldedTreeResults_.insert(v);
@@ -2072,7 +2075,7 @@ namespace wolvrix::lib::transform
                     graph_.addOperand(mux, padValue);
                     graph_.addResult(mux, folded);
                 }
-                graph_.replaceAllUses(result, folded);
+                graph_.replaceAllUsesWithView(result, folded);
                 sweepSeeds_.push_back(id);
                 sweepSeeds_.push_back(baseDef);
                 return true;
@@ -2142,7 +2145,7 @@ namespace wolvrix::lib::transform
                             continue;
                         }
                         const ValueId read = makeArrayRead(*sym, index, elemWidth);
-                        graph_.replaceAllUses(result, read);
+                        graph_.replaceAllUsesWithView(result, read);
                         sweepSeeds_.push_back(id);
                         ++padReadsFolded_;
                         continue;
@@ -2230,7 +2233,7 @@ namespace wolvrix::lib::transform
                             continue;
                         }
                         const ValueId read = makeArrayRead(regSym, index, elemWidth);
-                        graph_.replaceAllUses(result, read);
+                        graph_.replaceAllUsesWithView(result, read);
                         sweepSeeds_.push_back(id);
                         sweepSeeds_.push_back(baseDef);
                         ++padReadsFolded_;
@@ -2292,7 +2295,7 @@ namespace wolvrix::lib::transform
                         const ValueId clamped = makeIndexClamp(index, elemCount, *padSource, pw);
                         folded = makeArrayRead(regSym, clamped, elemWidth);
                     }
-                    graph_.replaceAllUses(result, folded);
+                    graph_.replaceAllUsesWithView(result, folded);
                     sweepSeeds_.push_back(id);
                     sweepSeeds_.push_back(baseDef);
                     ++padReadsFolded_;

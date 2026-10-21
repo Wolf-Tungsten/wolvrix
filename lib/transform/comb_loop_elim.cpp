@@ -471,6 +471,7 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             case OperationKind::kAssign:
+            case OperationKind::kAssignAs:
             {
                 const auto operands = graph.opOperands(defId);
                 if (operands.size() != 1 || !operands[0].valid())
@@ -1249,6 +1250,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kAssign:
+                case OperationKind::kAssignAs:
                 {
                     if (operands.size() != 1 || results.size() != 1)
                     {
@@ -1818,7 +1820,7 @@ namespace wolvrix::lib::transform
                 return true;
             };
 
-            if (baseDefKind == OperationKind::kAssign)
+            if (baseDefKind == OperationKind::kAssign || baseDefKind == OperationKind::kAssignAs)
             {
                 const auto baseOps = graph.opOperands(baseDefId);
                 if (baseOps.size() != 1)
@@ -2034,7 +2036,10 @@ namespace wolvrix::lib::transform
                         const int64_t operandWidth = graph.valueWidth(newBase);
                         if (newLow == 0 && newHigh + 1 == operandWidth)
                         {
-                            graph.setOpKind(opId, OperationKind::kAssign);
+                            const auto opResults = graph.opResults(opId);
+                            graph.setOpKind(opId, opResults.empty()
+                                                      ? OperationKind::kAssign
+                                                      : graph.assignKindFor(newBase, opResults.front()));
                             while (graph.opOperands(opId).size() > 1)
                             {
                                 graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
@@ -2174,6 +2179,7 @@ namespace wolvrix::lib::transform
                 switch (op.kind())
                 {
                 case OperationKind::kAssign:
+                case OperationKind::kAssignAs:
                 {
                     if (operands.size() != 1 || !operands[0].valid())
                     {
@@ -2825,7 +2831,13 @@ namespace wolvrix::lib::transform
                 const Operation op = graph.getOperation(opId);
                 try
                 {
-                    graph.setOpKind(opId, kind);
+                    // A single-source rewrite is a bit-level reinterpretation
+                    // when the source type differs from the result type.
+                    const OperationKind resolvedKind =
+                        (kind == OperationKind::kAssign && operands.size() == 1)
+                            ? graph.assignKindFor(operands.front(), result)
+                            : kind;
+                    graph.setOpKind(opId, resolvedKind);
                     for (std::size_t i = 0; i < operands.size(); ++i)
                     {
                         if (graph.getOperation(opId).operands().size() > i)
@@ -2874,6 +2886,10 @@ namespace wolvrix::lib::transform
             {
                 try
                 {
+                    if (kind == OperationKind::kAssign && operands.size() == 1)
+                    {
+                        kind = graph.assignKindFor(operands.front(), result);
+                    }
                     OperationId opId = graph.createOperation(kind);
                     for (ValueId operand : operands)
                     {
@@ -2925,6 +2941,7 @@ namespace wolvrix::lib::transform
                 switch (op.kind())
                 {
                 case OperationKind::kAssign:
+                case OperationKind::kAssignAs:
                 {
                     if (operands.size() != 1 || !operands[0].valid())
                     {
@@ -3579,7 +3596,7 @@ namespace wolvrix::lib::transform
                 const ValueId firstDst = pairs.front().second;
                 try
                 {
-                    graph.setOpKind(opId, OperationKind::kAssign);
+                    graph.setOpKind(opId, graph.assignKindFor(firstSrc, firstDst));
                     if (op.operands().empty())
                     {
                         graph.addOperand(opId, firstSrc);
@@ -3619,7 +3636,7 @@ namespace wolvrix::lib::transform
                 for (std::size_t i = 1; i < pairs.size(); ++i)
                 {
                     const auto &pair = pairs[i];
-                    OperationId newOp = graph.createOperation(OperationKind::kAssign);
+                    OperationId newOp = graph.createOperation(graph.assignKindFor(pair.first, pair.second));
                     graph.addOperand(newOp, pair.first);
                     graph.addResult(newOp, pair.second);
                     if (op.srcLoc())

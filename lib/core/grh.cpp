@@ -2718,6 +2718,7 @@ namespace wolvrix::lib::grh
             "kAShr",
             "kMux",
             "kAssign",
+            "kAssignAs",
             "kConcat",
             "kReplicate",
             "kSliceStatic",
@@ -3703,8 +3704,32 @@ namespace wolvrix::lib::grh
         throw std::runtime_error("GraphView is not available; freeze the graph first");
     }
 
+    OperationKind Graph::assignKindFor(ValueId src, ValueId dst) const
+    {
+        if (!src.valid() || !dst.valid())
+        {
+            return OperationKind::kAssign;
+        }
+        const int32_t srcWidth = valueWidth(src);
+        const int32_t dstWidth = valueWidth(dst);
+        if (srcWidth != dstWidth)
+        {
+            return OperationKind::kAssign;
+        }
+        const std::span<const int64_t> srcShape = valueShape(src);
+        const std::span<const int64_t> dstShape = valueShape(dst);
+        const bool sameShape = std::equal(srcShape.begin(), srcShape.end(),
+                                          dstShape.begin(), dstShape.end());
+        if (valueSigned(src) == valueSigned(dst) && sameShape)
+        {
+            return OperationKind::kAssign;
+        }
+        return OperationKind::kAssignAs;
+    }
+
     bool Graph::valueIsInput(ValueId id) const
     {
+
         if (builder_)
         {
             id.assertGraph(graphId_);
@@ -4138,48 +4163,21 @@ namespace wolvrix::lib::grh
             return;
         }
         const std::span<const int64_t> fromShape = valueShape(from);
-        if (fromShape.empty())
-        {
-            return;
-        }
         const std::span<const int64_t> toShape = valueShape(to);
-        if (toShape.empty())
-        {
-            // Backfill the alias shape only when the target width can carry
-            // it: a fragmenting rewrite (comb-loop-elim) legitimately
-            // replaces a whole-array result with one element-wide fragment,
-            // and forcing the array shape onto it would be inconsistent.
-            int64_t elementCount = 1;
-            for (const int64_t dim : fromShape)
-            {
-                if (dim <= 0 || elementCount > std::numeric_limits<int64_t>::max() / dim)
-                {
-                    elementCount = -1;
-                    break;
-                }
-                elementCount *= dim;
-            }
-            const int64_t toWidth = getValue(to).width();
-            if (elementCount > 0 && toWidth > 0 && toWidth % elementCount == 0)
-            {
-                setValueShape(to, fromShape);
-            }
-            return;
-        }
+        // shape 即类型：别名两侧的类型视图必须一致——任何 shape 不一致的
+        // 别名都是类型错误（历史上这里会把 shape 隐式回填给扁平目标）。
         if (!std::equal(fromShape.begin(), fromShape.end(), toShape.begin(), toShape.end()))
         {
             throw std::runtime_error(std::string(api) +
-                                     ": refusing to alias array values with different shapes");
+                                     ": refusing to alias values with different shapes");
         }
     }
 
     void Graph::replaceResult(OperationId op, std::size_t index, ValueId value)
     {
-        const auto results = opResults(op);
-        if (index < results.size())
-        {
-            guardShapeAlias(results[index], value, "replaceResult");
-        }
+        // 不在这里做 shape 校验：replaceResult 只改变 op 产出哪个 value，不改变
+        // 任何 value 自身的类型（shape 创建即定型，不可变）。op 自身的结果类型
+        // 契约由 grh.verify 事后强制。真正的别名通道是 replaceAllUses/eraseOp。
         GraphBuilder &builder = ensureBuilder();
         builder.replaceResult(op, index, value);
         // No cache invalidation needed - doesn't affect value/op/port lists
@@ -4191,6 +4189,35 @@ namespace wolvrix::lib::grh
         GraphBuilder &builder = ensureBuilder();
         builder.replaceAllUses(from, to);
         // No cache invalidation needed - doesn't affect value/op/port lists
+    }
+
+    ValueId Graph::replaceAllUsesWithView(ValueId from, ValueId to)
+    {
+        if (!from.valid() || !to.valid())
+        {
+            throw std::runtime_error("replaceAllUsesWithView: invalid value");
+        }
+        const std::span<const int64_t> fromShape = valueShape(from);
+        const std::span<const int64_t> toShape = valueShape(to);
+        const bool sameShape = std::equal(fromShape.begin(), fromShape.end(),
+                                          toShape.begin(), toShape.end());
+        if (sameShape && valueSigned(from) == valueSigned(to))
+        {
+            replaceAllUses(from, to);
+            return to;
+        }
+        if (valueWidth(from) != valueWidth(to))
+        {
+            throw std::runtime_error("replaceAllUsesWithView: width mismatch cannot be retyped");
+        }
+        // The view carries `from`'s type over `to`'s bits.
+        const ValueId view = createValue(makeInternalValSym(), valueWidth(from),
+                                         valueSigned(from), valueType(from), fromShape);
+        const OperationId viewOp = createOperation(OperationKind::kAssignAs, makeInternalOpSym());
+        addOperand(viewOp, to);
+        addResult(viewOp, view);
+        replaceAllUses(from, view);
+        return view;
     }
 
     bool Graph::eraseOperand(OperationId op, std::size_t index)
@@ -4231,6 +4258,14 @@ namespace wolvrix::lib::grh
 
     bool Graph::eraseOp(OperationId op, std::span<const ValueId> replacementResults)
     {
+        // The builder path aliases each old result to its replacement without
+        // shape checks; keep the type-honesty invariant on this shortcut too.
+        const auto results = opResults(op);
+        const std::size_t n = std::min(results.size(), replacementResults.size());
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            guardShapeAlias(results[i], replacementResults[i], "eraseOp");
+        }
         GraphBuilder &builder = ensureBuilder();
         SymbolId declaredSymbol;
         if (builder.opAlive(op))

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -18,7 +19,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -114,6 +114,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kAShr:
             case wolvrix::lib::grh::OperationKind::kMux:
             case wolvrix::lib::grh::OperationKind::kAssign:
+            case wolvrix::lib::grh::OperationKind::kAssignAs:
             case wolvrix::lib::grh::OperationKind::kConcat:
             case wolvrix::lib::grh::OperationKind::kReplicate:
             case wolvrix::lib::grh::OperationKind::kSliceStatic:
@@ -502,6 +503,9 @@ namespace wolvrix::lib::transform
                 folded = foldUnary(op, op.kind(), operands[0]);
                 break;
             case wolvrix::lib::grh::OperationKind::kAssign:
+            case wolvrix::lib::grh::OperationKind::kAssignAs:
+                // kAssignAs is a bit-identical retype: folding keeps the bits
+                // and normalizeToValue applies the result's own type/shape.
                 folded = operands[0];
                 break;
             case wolvrix::lib::grh::OperationKind::kConcat:
@@ -769,7 +773,7 @@ namespace wolvrix::lib::transform
                             continue;
                         }
                         const wolvrix::lib::grh::OperationId assignOp =
-                            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
+                            graph.createOperation(graph.assignKindFor(entry.operand, entry.result));
                         graph.addOperand(assignOp, entry.operand);
                         graph.addResult(assignOp, entry.result);
                         if (entry.srcLoc)
@@ -883,12 +887,12 @@ namespace wolvrix::lib::transform
 
         void replaceUsers(wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::ValueId oldValue, wolvrix::lib::grh::ValueId newValue, const std::function<void(std::string)> &onError)
         {
-            // Shape views survive aliasing: Graph::replaceAllUses backfills the
-            // shape onto flat replacements and rejects mismatched non-empty
-            // shapes (stage-07 core guarantee).
+            // Type-honest aliasing: when the replacement's type differs from
+            // the replaced value's, a kAssignAs view keeps the retype explicit.
+            wolvrix::lib::grh::ValueId aliased = newValue;
             try
             {
-                graph.replaceAllUses(oldValue, newValue);
+                aliased = graph.replaceAllUsesWithView(oldValue, newValue);
             }
             catch (const std::exception &ex)
             {
@@ -908,7 +912,7 @@ namespace wolvrix::lib::transform
             {
                 try
                 {
-                    graph.bindOutputPort(portName, newValue);
+                    graph.bindOutputPort(portName, aliased);
                 }
                 catch (const std::exception &ex)
                 {
@@ -998,21 +1002,41 @@ namespace wolvrix::lib::transform
         }
 
         bool iterationChanged = false;
-        std::vector<wolvrix::lib::grh::OperationId> opOrder(ctx.graph.operations().begin(), ctx.graph.operations().end());
+        std::deque<wolvrix::lib::grh::OperationId> worklist;
+        enum : uint8_t { Idle, Queued, Folded };
+        std::vector<uint8_t> queued;
+        auto enqueue = [&](wolvrix::lib::grh::OperationId opId) {
+            if (opId.index >= queued.size())
+            {
+                queued.resize(static_cast<std::size_t>(opId.index) + 1, Idle);
+            }
+            if (queued[opId.index] == Idle && isFoldable(ctx.graph.opKind(opId)))
+            {
+                queued[opId.index] = Queued;
+                worklist.push_back(opId);
+            }
+        };
+        for (const auto opId : ctx.graph.operations())
+        {
+            enqueue(opId);
+        }
         std::vector<wolvrix::lib::grh::OperationId> opsToErase;
         DeclaredMaterializationMap declaredAssigns;
 
-        for (const auto opId : opOrder)
+        while (!worklist.empty())
         {
+            const auto opId = worklist.front();
+            worklist.pop_front();
+            if (queued[opId.index] == Folded)
+            {
+                continue;
+            }
+            queued[opId.index] = Idle;
             // Lean screening first (stage-07): kind/result-type/constant-operand
             // checks read id/span accessors only; the fat Operation is
             // materialized once the op is known to fold.
             const wolvrix::lib::grh::OperationKind opKind = ctx.graph.opKind(opId);
             if (opKind == wolvrix::lib::grh::OperationKind::kConstant || !isFoldable(opKind))
-            {
-                continue;
-            }
-            if (ctx.foldedOps.find(opId) != ctx.foldedOps.end())
             {
                 continue;
             }
@@ -1070,6 +1094,13 @@ namespace wolvrix::lib::transform
                 wolvrix::lib::grh::ValueId newValue =
                     createReplacementConstant(ctx.graph, *ctx.pool, ctx.constants,
                                               ctx.protectDeclaredSymbols, op, idx, resId, sv);
+                // Queue before replacing uses: the old result loses its user
+                // list during the rewrite. Erasure is deferred until drained.
+                const auto resultValue = ctx.graph.getValue(resId);
+                for (const auto &use : resultValue.users())
+                {
+                    enqueue(use.operation);
+                }
                 replaceUsers(ctx.graph, resId, newValue, [&](const std::string &msg)
                              { this->error(ctx.graph, op, msg); ctx.failed = true; });
                 if (ctx.protectDeclaredSymbols && isDeclaredValue(ctx.graph, resId))
@@ -1081,7 +1112,7 @@ namespace wolvrix::lib::transform
 
             if (createdAllResults)
             {
-                ctx.foldedOps.insert(opId);
+                queued[opId.index] = Folded;
                 opsToErase.push_back(opId);
                 ++ctx.foldedOpsCount;
             }
@@ -1572,27 +1603,30 @@ namespace wolvrix::lib::transform
         graphChanged = collectConstants(ctx) || graphChanged;
         phaseTick("collectConstants");
 
-        // Phase 2: Iterative folding until convergence or max iterations
+        // Phase 2: Drain the folding worklist, independent of storage order.
         graphChanged = iterativeFolding(ctx) || graphChanged;
         phaseTick("iterativeFolding");
 
         // Phase 3: Simplify slice operations
-        graphChanged = simplifySlices(ctx) || graphChanged;
+        const bool slicesChanged = simplifySlices(ctx);
+        graphChanged = slicesChanged || graphChanged;
         phaseTick("simplifySlices");
 
-        // Phase 4: Eliminate dead constants
+        // Keep the pool's values alive until all constant creation is done.
+        const bool comparisonsChanged = simplifyUnsignedComparisons(ctx);
+        graphChanged = comparisonsChanged || graphChanged;
+        needsRevisit_ = needsRevisit_ || slicesChanged || comparisonsChanged;
+        phaseTick("simplifyUnsignedComparisons");
+
         graphChanged = eliminateDeadConstants(ctx) || graphChanged;
         phaseTick("eliminateDeadConstants");
-
-        // Phase 5: Simplify unsigned comparisons (e.g., x >= 0, x <= MAX)
-        graphChanged = simplifyUnsignedComparisons(ctx) || graphChanged;
-        phaseTick("simplifyUnsignedComparisons");
 
         return graphChanged;
     }
 
     PassResult ConstantFoldPass::run()
     {
+        needsRevisit_ = false;
         PassResult result;
         ConstantStore constants;
         bool failed = false;
@@ -1624,7 +1658,6 @@ namespace wolvrix::lib::transform
                     graph,
                     constants,  // Shared across graphs (constants can reference values from other graphs)
                     std::make_unique<ConstantPool>(),  // Fresh constant pool for this graph
-                    {},         // Fresh folded operations set
                     failed
                 };
                 ctx.protectDeclaredSymbols = keepDeclaredSymbols();

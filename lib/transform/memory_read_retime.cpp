@@ -857,7 +857,7 @@ namespace wolvrix::lib::transform
                                                            candidate.dataType,
                                                            "rom_data_read");
 
-            graph.replaceAllUses(candidate.readResult, dataOut);
+            graph.replaceAllUsesWithView(candidate.readResult, dataOut);
             rebindOutputPorts(graph, candidate.readResult, dataOut);
 
             if (!graph.eraseOp(candidate.memoryReadOp))
@@ -951,7 +951,7 @@ namespace wolvrix::lib::transform
                                                            candidate.dataType,
                                                            "ram_data_read");
 
-            graph.replaceAllUses(candidate.readResult, dataOut);
+            graph.replaceAllUsesWithView(candidate.readResult, dataOut);
             rebindOutputPorts(graph, candidate.readResult, dataOut);
             if (!graph.eraseOp(candidate.memoryReadOp))
             {

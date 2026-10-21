@@ -597,7 +597,7 @@ namespace wolvrix::lib::transform
                 {
                     graph.setValueShape(replacement, value.shape());
                 }
-                graph.replaceAllUses(target, replacement);
+                graph.replaceAllUsesWithView(target, replacement);
                 result.changed = true;
                 return replacement;
             }
@@ -625,7 +625,7 @@ namespace wolvrix::lib::transform
             {
                 graph.setValueShape(replacement, value.shape());
             }
-            graph.replaceAllUses(target, replacement);
+            graph.replaceAllUsesWithView(target, replacement);
             for (const auto &name : outputNames)
             {
                 graph.bindOutputPort(name, replacement);
@@ -1018,7 +1018,7 @@ namespace wolvrix::lib::transform
             }
             wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol(*leafGraph);
             wolvrix::lib::grh::OperationId assign =
-                createOp(*leafGraph, wolvrix::lib::grh::OperationKind::kAssign,
+                createOp(*leafGraph, leafGraph->assignKindFor(drivers.front(), *replacement),
                          opSym, "assign_write");
             leafGraph->addOperand(assign, drivers.front());
             leafGraph->addResult(assign, *replacement);
@@ -1091,7 +1091,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    graph.replaceAllUses(results.front(), *replacement);
+                    graph.replaceAllUsesWithView(results.front(), *replacement);
                     graph.eraseOp(opId);
                     result.changed = true;
                     continue;

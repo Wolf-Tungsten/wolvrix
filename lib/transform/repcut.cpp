@@ -375,6 +375,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kAShr:
             case wolvrix::lib::grh::OperationKind::kMux:
             case wolvrix::lib::grh::OperationKind::kAssign:
+            case wolvrix::lib::grh::OperationKind::kAssignAs:
             case wolvrix::lib::grh::OperationKind::kConcat:
             case wolvrix::lib::grh::OperationKind::kReplicate:
             case wolvrix::lib::grh::OperationKind::kSliceStatic:

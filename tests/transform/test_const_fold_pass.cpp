@@ -377,5 +377,67 @@ int main()
         }
     }
 
+    // Case: kAssignAs folds bit-identically into a flat constant view of a
+    // shaped constant.
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_assignas");
+        const std::vector<int64_t> arrShape{2};
+        const wolvrix::lib::grh::SymbolId arrSym = graph.internSymbol("arr_const");
+        wolvrix::lib::grh::ValueId arrConst =
+            graph.createValue(arrSym, 8, false, wolvrix::lib::grh::ValueType::Logic, arrShape);
+        wolvrix::lib::grh::OperationId constOp =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
+                                  graph.internSymbol("arr_const_op"));
+        graph.addResult(constOp, arrConst);
+        graph.setAttr(constOp, "constValue", std::string("8'hA5"));
+
+        wolvrix::lib::grh::ValueId flat = graph.createValue(graph.internSymbol("flat_view"), 8, false);
+        wolvrix::lib::grh::OperationId view =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssignAs,
+                                  graph.internSymbol("view0"));
+        graph.addOperand(view, arrConst);
+        graph.addResult(view, flat);
+
+        wolvrix::lib::grh::ValueId out = graph.createValue(graph.internSymbol("out"), 8, false);
+        graph.bindOutputPort("out", out);
+        wolvrix::lib::grh::OperationId assignOut =
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                  graph.internSymbol("assign0"));
+        graph.addOperand(assignOut, flat);
+        graph.addResult(assignOut, out);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<ConstantFoldPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during kAssignAs run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected kAssignAs constant propagation to succeed");
+        }
+        wolvrix::lib::grh::Value outValue = graph.getValue(graph.outputPortValue("out"));
+        if (!outValue.definingOp().valid() ||
+            graph.getOperation(outValue.definingOp()).kind() !=
+                wolvrix::lib::grh::OperationKind::kConstant)
+        {
+            return fail("kAssignAs did not fold to a constant");
+        }
+        auto literal = getConstLiteral(graph, graph.getOperation(outValue.definingOp()));
+        slang::SVInt expected = slang::SVInt::fromString("8'hA5").resize(8);
+        if (!literal || !static_cast<bool>((*literal == expected)))
+        {
+            return fail("kAssignAs fold changed the bits");
+        }
+    }
+
     return 0;
 }

@@ -8,9 +8,9 @@
 > no input left; measured results also showed disabling it was never a
 > regression. See
 > `pdocs/grh-ir-array-support/stage-07-preserve-aggregate-e2e.md` (end-to-end
-> preserve-aggregate design) and
+> preserve-aggregate design) and the old-route negative-result measurement
 > `pdocs/perf-optimization/20261007-040954-reg-to-mem-off-negative.md`
-> (negative-result measurement). The body below is kept verbatim as a
+> (removed in the 2026-10-19 non-aggregate cleanup; see git history). The body below is kept verbatim as a
 > historical record of the recognition rules, cost model, and
 > naming/reporting contracts — it describes a pass that no longer exists.
 

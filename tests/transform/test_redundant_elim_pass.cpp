@@ -269,5 +269,82 @@ int main()
             return fail("CSE merged flat index and shaped array values");
     }
 
+    // Regression (CASE_009): a kAssign across a shape boundary is an aggregate
+    // pack/unpack, not a pure rename. Inlining it would backfill the aggregate
+    // shape onto the flat destination via replaceResult, corrupting an output
+    // port's declared type.
+    {
+        wolvrix::lib::grh::Design portDesign;
+        auto &portGraph = portDesign.createGraph("assign_shape_port");
+        const auto reg = portGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                   portGraph.internSymbol("pri"));
+        portGraph.setAttr(reg, "width", int64_t{4});
+        portGraph.setAttr(reg, "isSigned", false);
+        portGraph.setAttr(reg, "shape", std::vector<int64_t>{2});
+        const std::array<int64_t, 1> aggShape{2};
+        const auto agg = portGraph.createValue(portGraph.internSymbol("_val_agg"), 4, false,
+                                               wolvrix::lib::grh::ValueType::Logic, aggShape);
+        const auto read = portGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                                                    portGraph.makeInternalOpSym());
+        portGraph.setAttr(read, "regSymbol", std::string("pri"));
+        portGraph.addResult(read, agg);
+        const auto flatOut = portGraph.createValue(portGraph.internSymbol("flat_out"), 4, false);
+        const auto pack = portGraph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                    portGraph.internSymbol("pack"));
+        portGraph.addOperand(pack, agg);
+        portGraph.addResult(pack, flatOut);
+        portGraph.bindOutputPort("flat_out", flatOut);
+
+        PassManager portManager;
+        portManager.addPass(std::make_unique<RedundantElimPass>());
+        PassDiagnostics portDiagnostics;
+        const PassManagerResult portResult = portManager.run(portDesign, portDiagnostics);
+        if (!portResult.success || portDiagnostics.hasError())
+            return fail("assign pack run failed");
+        if (!portGraph.findOperation("pack").valid())
+            return fail("aggregate pack assign into output port must not be inlined");
+        if (!portGraph.valueShape(flatOut).empty())
+            return fail("output port value must stay flat");
+        const wolvrix::lib::grh::ValueId portValue = portGraph.outputPorts().front().value;
+        if (portValue != flatOut)
+            return fail("output port must stay bound to the flat assign result");
+    }
+
+    {
+        wolvrix::lib::grh::Design tempDesign;
+        auto &tempGraph = tempDesign.createGraph("assign_shape_temp");
+        const auto reg = tempGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                   tempGraph.internSymbol("pri"));
+        tempGraph.setAttr(reg, "width", int64_t{4});
+        tempGraph.setAttr(reg, "isSigned", false);
+        tempGraph.setAttr(reg, "shape", std::vector<int64_t>{2});
+        const std::array<int64_t, 1> aggShape{2};
+        const auto agg = tempGraph.createValue(tempGraph.internSymbol("_val_agg"), 4, false,
+                                               wolvrix::lib::grh::ValueType::Logic, aggShape);
+        const auto read = tempGraph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                                                    tempGraph.makeInternalOpSym());
+        tempGraph.setAttr(read, "regSymbol", std::string("pri"));
+        tempGraph.addResult(read, agg);
+        const auto flatW = tempGraph.createValue(tempGraph.internSymbol("flat_w"), 4, false);
+        const auto pack = tempGraph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                    tempGraph.internSymbol("pack"));
+        tempGraph.addOperand(pack, agg);
+        tempGraph.addResult(pack, flatW);
+        tempGraph.bindOutputPort("flat_w_user", flatW);
+
+        PassManager tempManager;
+        tempManager.addPass(std::make_unique<RedundantElimPass>());
+        PassDiagnostics tempDiagnostics;
+        const PassManagerResult tempResult = tempManager.run(tempDesign, tempDiagnostics);
+        if (!tempResult.success || tempDiagnostics.hasError())
+            return fail("temp assign pack run failed");
+        if (!tempGraph.findOperation("pack").valid())
+            return fail("aggregate pack assign into flat temp must not be inlined");
+        if (!tempGraph.valueShape(flatW).empty())
+            return fail("flat temp value must stay flat");
+        if (tempGraph.getValue(flatW).definingOp() != pack)
+            return fail("flat temp must stay driven by the pack assign");
+    }
+
     return 0;
 }

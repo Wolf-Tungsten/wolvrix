@@ -839,11 +839,11 @@ namespace
         makeSliceArray(graph, b, {idx1}, r1, "read_b1");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
         makeConcat(graph, "concat_a", {a1in, xv}, aflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, aflat, a, "assign_a");
         makeSliceArray(graph, a, {idx0}, r2, "read_a0");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
         makeConcat(graph, "concat_b", {b1in, yv}, bflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, bflat, b, "assign_b");
 
         // External consumers keep using the array values (exercise the
         // shape-carrying reassembly view).
@@ -927,11 +927,11 @@ namespace
         const auto readB = makeSliceArray(graph, b, {idx1}, r1, "read_b1");
         makeBinaryOp(graph, OperationKind::kXor, r1, in0, xv, "xor_r1");
         makeConcat(graph, "concat_a", {a1in, xv}, aflat);
-        makeUnaryOp(graph, OperationKind::kAssign, aflat, a, "assign_a");
+        makeUnaryOp(graph, OperationKind::kAssignAs, aflat, a, "assign_a");
         const auto readA = makeSliceArray(graph, a, {idx0}, r2, "read_a0");
         makeBinaryOp(graph, OperationKind::kOr, r2, in0, yv, "or_r2");
         makeConcat(graph, "concat_b", {b1in, yv}, bflat);
-        makeUnaryOp(graph, OperationKind::kAssign, bflat, b, "assign_b");
+        makeUnaryOp(graph, OperationKind::kAssignAs, bflat, b, "assign_b");
         graph.bindOutputPort("out", yv);
 
         PassManager manager;
@@ -1011,7 +1011,7 @@ namespace
         makeSliceStatic(graph, readResult, feedback, 4, 7, "feedback_high");
         makeConcat(graph, "selected_concat", {inHigh, feedback}, selected);
         makeConcat(graph, "array_concat", {selected, inLow}, flat);
-        makeUnaryOp(graph, OperationKind::kAssign, flat, base, "array_alias");
+        makeUnaryOp(graph, OperationKind::kAssignAs, flat, base, "array_alias");
         graph.bindOutputPort("out", readResult);
 
         PassManager manager;
@@ -1067,11 +1067,11 @@ namespace
         makeSliceArray(graph, b, {idx}, r1, "read_b_dyn");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
         makeConcat(graph, "concat_a", {a1in, xv}, aflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, aflat, a, "assign_a");
         makeSliceArray(graph, a, {idx1}, s2, "read_a1");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, s2, in0, yv, "or_s2");
         makeConcat(graph, "concat_b", {b1in, yv}, bflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, bflat, b, "assign_b");
 
         const auto e0 = makeValue(graph, "e0", 8);
         const auto outv = makeValue(graph, "outv", 8);
@@ -1170,11 +1170,11 @@ namespace
         makeSliceArray(graph, b, {idx}, r1, "read_b_dyn");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
         makeConcat(graph, "concat_a", {a1in, xv}, aflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, aflat, a, "assign_a");
         makeSliceStatic(graph, a, s2, 0, 7, "read_a0");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, s2, in0, yv, "or_s2");
         makeConcat(graph, "concat_b", {b1in, yv}, bflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, bflat, b, "assign_b");
 
         const auto e0 = makeValue(graph, "e0", 8);
         makeSliceArray(graph, a, {idx}, e0, "ext_read_a_dyn");
@@ -1325,11 +1325,11 @@ namespace
         makeSliceArray(graph, b, {idx1}, r1, "read_b1");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
         makeConcat(graph, "concat_a", {a1in, xv}, aflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, aflat, a, "assign_a");
         makeSliceArray(graph, a, {idx0}, r2, "read_a0");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
         makeConcat(graph, "concat_b", {b1in, yv}, bflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, bflat, b, "assign_b");
 
         CombLoopElimOptions options;
         options.enableArrayFragmentation = false;
@@ -1398,11 +1398,11 @@ namespace
         makeSliceArray(graph, b, {idx0}, r1, "read_b0");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kXor, r1, in0, xv, "xor_r1");
         makeConcat(graph, "concat_a", {a1in, xv}, aflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, aflat, a, "assign_a");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, aflat, a, "assign_a");
         makeSliceArray(graph, a, {idx0}, r2, "read_a0");
         makeBinaryOp(graph, wolvrix::lib::grh::OperationKind::kOr, r2, in0, yv, "or_r2");
         makeConcat(graph, "concat_b", {b1in, yv}, bflat);
-        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssign, bflat, b, "assign_b");
+        makeUnaryOp(graph, wolvrix::lib::grh::OperationKind::kAssignAs, bflat, b, "assign_b");
 
         PassManager manager;
         manager.addPass(std::make_unique<CombLoopElimPass>());

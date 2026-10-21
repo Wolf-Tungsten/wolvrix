@@ -58,6 +58,7 @@ enum class OperationKind {
     kAShr,
     kMux,
     kAssign,
+    kAssignAs,
     kConcat,
     kReplicate,
     kSliceStatic,
@@ -809,6 +810,14 @@ public:
     ValueId inputPortValue(std::string_view name) const noexcept;
     ValueId outputPortValue(std::string_view name) const noexcept;
 
+    // Picks the assignment op kind for `src -> dst`: kAssign when the value
+    // types are identical (width, signedness and shape all equal), kAssignAs
+    // when the bits are preserved but the type differs (pack/unpack view).
+    // Width-mismatched pairs cannot be expressed by either op and still return
+    // kAssign so the legacy producer stays visible to the verifier.
+    OperationKind assignKindFor(ValueId src, ValueId dst) const;
+
+
     void addOperand(OperationId op, ValueId value);
     void addResult(OperationId op, ValueId value);
     void insertOperand(OperationId op, std::size_t index, ValueId value);
@@ -816,6 +825,14 @@ public:
     void replaceOperand(OperationId op, std::size_t index, ValueId value);
     void replaceResult(OperationId op, std::size_t index, ValueId value);
     void replaceAllUses(ValueId from, ValueId to);
+
+    // Aliases `from`'s uses to `to` with type honesty: identical types alias
+    // directly; otherwise a kAssignAs view typed like `from` is inserted so the
+    // (bit-identical) retype stays explicit. Returns the value actually aliased
+    // in place of `from`. Width-mismatched or invalid pairs throw via the
+    // underlying replaceAllUses / view construction.
+    ValueId replaceAllUsesWithView(ValueId from, ValueId to);
+
     bool eraseOperand(OperationId op, std::size_t index);
     bool eraseResult(OperationId op, std::size_t index);
     bool eraseOp(OperationId op);

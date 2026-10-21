@@ -760,6 +760,54 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kAssign:
+                {
+                    // kAssign is a strict same-type rename: the conversion
+                    // case belongs to kAssignAs.
+                    const auto operands = op.operands();
+                    const auto results = op.results();
+                    if (operands.size() != 1 || results.size() != 1 ||
+                        !operands.front().valid() || !results.front().valid())
+                    {
+                        error(*graph, op, "grh.verify: kAssign expects exactly one operand and one result");
+                        break;
+                    }
+                    const ValueId src = operands.front();
+                    const ValueId dst = results.front();
+                    const std::span<const int64_t> srcShape = graph->valueShape(src);
+                    const std::span<const int64_t> dstShape = graph->valueShape(dst);
+                    const bool sameShape = std::equal(srcShape.begin(), srcShape.end(),
+                                                      dstShape.begin(), dstShape.end());
+                    if (graph->valueWidth(src) != graph->valueWidth(dst) ||
+                        graph->valueSigned(src) != graph->valueSigned(dst) || !sameShape)
+                    {
+                        // P1: the guardShapeAlias backfill can still retype a
+                        // result after op creation, so this is a warning until
+                        // P2 removes the backfill channel.
+                        warning(*graph, op, "grh.verify: kAssign operand/result types differ "
+                                            "(width, isSigned, shape); use kAssignAs for a "
+                                            "bit-identical retype");
+                    }
+                    break;
+                }
+                case OperationKind::kAssignAs:
+                {
+                    // Bit-identical retype: only the total width is invariant;
+                    // shape/signedness may differ between operand and result.
+                    const auto operands = op.operands();
+                    const auto results = op.results();
+                    if (operands.size() != 1 || results.size() != 1 ||
+                        !operands.front().valid() || !results.front().valid())
+                    {
+                        error(*graph, op, "grh.verify: kAssignAs expects exactly one operand and one result");
+                        break;
+                    }
+                    if (graph->valueWidth(operands.front()) != graph->valueWidth(results.front()))
+                    {
+                        error(*graph, op, "grh.verify: kAssignAs operand/result widths must match");
+                    }
+                    break;
+                }
                 case OperationKind::kConcat:
                 {
                     // stage-07: a concat's result width must equal the sum of

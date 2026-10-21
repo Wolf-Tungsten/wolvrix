@@ -2409,6 +2409,7 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kLogicNot:
                 case wolvrix::lib::grh::OperationKind::kMux:
                 case wolvrix::lib::grh::OperationKind::kAssign:
+                case wolvrix::lib::grh::OperationKind::kAssignAs:
                 case wolvrix::lib::grh::OperationKind::kConcat:
                 case wolvrix::lib::grh::OperationKind::kReplicate:
                 case wolvrix::lib::grh::OperationKind::kSliceStatic:
@@ -2722,6 +2723,7 @@ namespace wolvrix::lib::emit
                     }
                     break;
                 case wolvrix::lib::grh::OperationKind::kAssign:
+                case wolvrix::lib::grh::OperationKind::kAssignAs:
                     if (!ops.empty())
                     {
                         int64_t resultWidth = graph->valueWidth(valueId);
@@ -3959,10 +3961,11 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case wolvrix::lib::grh::OperationKind::kAssign:
+                case wolvrix::lib::grh::OperationKind::kAssignAs:
                 {
                     if (operands.empty() || results.empty())
                     {
-                        reportError("kAssign missing operands or results", opContext);
+                        reportError("kAssign/kAssignAs missing operands or results", opContext);
                         break;
                     }
                     int64_t resultWidth = graph->valueWidth(results[0]);

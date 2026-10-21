@@ -372,7 +372,7 @@ namespace wolvrix::lib::transform
                 parent.createValue(parent.makeInternalValSym(), parent.valueWidth(parentValue),
                                    parent.valueSigned(parentValue), parent.valueType(parentValue), shape);
             const wolvrix::lib::grh::OperationId assign =
-                parent.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                parent.createOperation(parent.assignKindFor(parentValue, view),
                                        parent.makeInternalOpSym());
             parent.addOperand(assign, parentValue);
             parent.addResult(assign, view);
@@ -755,7 +755,7 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 const auto assignOp =
-                    target.createOperation(wolvrix::lib::grh::OperationKind::kAssign, target.makeInternalOpSym());
+                    target.createOperation(target.assignKindFor(alias.source, alias.target), target.makeInternalOpSym());
                 target.addOperand(assignOp, alias.source);
                 target.addResult(assignOp, alias.target);
                 target.setOpSrcLoc(assignOp, makeTransformSrcLoc("instance-inline", "alias_output"));

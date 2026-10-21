@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <span>
@@ -16,7 +17,6 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -411,12 +411,12 @@ namespace wolvrix::lib::transform
                           wolvrix::lib::grh::ValueId to,
                           const std::function<void(std::string)> &onError)
         {
-            // Shape views survive aliasing: Graph::replaceAllUses backfills the
-            // shape onto flat replacements and rejects mismatched non-empty
-            // shapes (stage-07 core guarantee).
+            // Type-honest aliasing: when the replacement's type differs from
+            // the replaced value's, a kAssignAs view keeps the retype explicit.
+            wolvrix::lib::grh::ValueId aliased = to;
             try
             {
-                graph.replaceAllUses(from, to);
+                aliased = graph.replaceAllUsesWithView(from, to);
             }
             catch (const std::exception &ex)
             {
@@ -436,7 +436,7 @@ namespace wolvrix::lib::transform
             {
                 try
                 {
-                    graph.bindOutputPort(portName, to);
+                    graph.bindOutputPort(portName, aliased);
                 }
                 catch (const std::exception &ex)
                 {
@@ -1009,6 +1009,17 @@ namespace wolvrix::lib::transform
                         {
                             continue;
                         }
+                        // The assign may be an aggregate pack/unpack rather than
+                        // a pure rename: a mismatched shape would backfill the
+                        // aggregate shape onto the (flat) output port value via
+                        // replaceResult, corrupting the port's declared type.
+                        const std::span<const int64_t> srcShape = graph.valueShape(srcId);
+                        const std::span<const int64_t> dstShape = graph.valueShape(dstId);
+                        if (!std::equal(srcShape.begin(), srcShape.end(),
+                                        dstShape.begin(), dstShape.end()))
+                        {
+                            continue;
+                        }
                         const wolvrix::lib::grh::OperationId defOpId = graph.valueDef(srcId);
                         if (!defOpId.valid() || defOpId == opId)
                         {
@@ -1065,6 +1076,17 @@ namespace wolvrix::lib::transform
                     }
                     if (graph.valueWidth(srcId) != graph.valueWidth(dstId) ||
                         graph.valueSigned(srcId) != graph.valueSigned(dstId))
+                    {
+                        continue;
+                    }
+                    // Same guard as the output-port branch above: a
+                    // shape-mismatched assign is an aggregate pack/unpack, and
+                    // inlining it backfills the aggregate shape onto a value
+                    // that was declared flat.
+                    const std::span<const int64_t> srcShape = graph.valueShape(srcId);
+                    const std::span<const int64_t> dstShape = graph.valueShape(dstId);
+                    if (!std::equal(srcShape.begin(), srcShape.end(),
+                                    dstShape.begin(), dstShape.end()))
                     {
                         continue;
                     }
@@ -1177,13 +1199,39 @@ namespace wolvrix::lib::transform
             {
                 wolvrix::lib::grh::OperationId op;
                 wolvrix::lib::grh::ValueId value;
+                uint64_t revision = 0;
             };
 
             std::unordered_map<OpSignature, CseEntry, OpSignatureHash> seen;
-            std::vector<wolvrix::lib::grh::OperationId> cseOps(graph.operations().begin(),
-                                                      graph.operations().end());
-            for (const auto opId : cseOps)
+            std::deque<wolvrix::lib::grh::OperationId> cseOps;
+            enum : uint8_t { Idle, Queued, Erased };
+            std::vector<uint8_t> queued;
+            std::vector<uint64_t> revisions;
+            auto enqueue = [&](wolvrix::lib::grh::OperationId opId) {
+                if (opId.index >= queued.size())
+                {
+                    queued.resize(static_cast<std::size_t>(opId.index) + 1, Idle);
+                    revisions.resize(queued.size(), 0);
+                }
+                if (queued[opId.index] == Idle && isCseCandidate(graph, opId))
+                {
+                    queued[opId.index] = Queued;
+                    cseOps.push_back(opId);
+                }
+            };
+            for (const auto opId : graph.operations())
             {
+                enqueue(opId);
+            }
+            while (!cseOps.empty())
+            {
+                const auto opId = cseOps.front();
+                cseOps.pop_front();
+                if (queued[opId.index] == Erased)
+                {
+                    continue;
+                }
+                queued[opId.index] = Idle;
                 // Lean screening (stage-07): candidate checks read id/span
                 // accessors only; kConstant never enters CSE (see
                 // isCseCandidate), so no mega constValue literal is copied
@@ -1202,9 +1250,17 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                auto [it, inserted] = seen.emplace(std::move(*sig), CseEntry{opId, resultId});
+                auto [it, inserted] = seen.emplace(std::move(*sig), CseEntry{opId, resultId, revisions[opId.index]});
                 if (inserted)
                 {
+                    continue;
+                }
+                // Only operand rewrites occur during CSE. Stamp their users so
+                // stale entries are rejected without rebuilding the signature
+                // of the representative on every collision.
+                if (queued[it->second.op.index] == Erased || revisions[it->second.op.index] != it->second.revision)
+                {
+                    it->second = CseEntry{opId, resultId, revisions[opId.index]};
                     continue;
                 }
                 const wolvrix::lib::grh::ValueId canonicalValue = it->second.value;
@@ -1224,9 +1280,21 @@ namespace wolvrix::lib::transform
                 }
                 auto onError = [&](const std::string &msg)
                 { this->error(graph, graph.getOperation(opId), msg); };
+                const auto resultValue = graph.getValue(resultId);
+                for (const auto &use : resultValue.users())
+                {
+                    enqueue(use.operation);
+                    // `enqueue` grows both state arrays for operation IDs
+                    // discovered through a user edge.  A user need not be a
+                    // CSE candidate (and can therefore have been absent from
+                    // the initial queue), so the revision stamp must be
+                    // written only after that growth has happened.
+                    ++revisions[use.operation.index];
+                }
                 replaceUsers(graph, resultId, canonicalValue, onError);
                 if (eraseOp(opId))
                 {
+                    queued[opId.index] = Erased;
                     graphChanged = true;
                 }
             }

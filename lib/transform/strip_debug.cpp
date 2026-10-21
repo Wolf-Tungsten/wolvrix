@@ -291,7 +291,7 @@ namespace wolvrix::lib::transform
         OperationId addAssign(Graph &graph, ValueId src, ValueId dst)
         {
             SymbolId opSym = graph.makeInternalOpSym();
-            OperationId op = graph.createOperation(OperationKind::kAssign, opSym);
+            OperationId op = graph.createOperation(graph.assignKindFor(src, dst), opSym);
             graph.addOperand(op, src);
             graph.addResult(op, dst);
             graph.setOpSrcLoc(op, makeTransformSrcLoc("strip-debug", "bridge_assign"));

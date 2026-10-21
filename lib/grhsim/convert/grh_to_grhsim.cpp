@@ -85,6 +85,7 @@ namespace wolvrix::lib::grhsim
             case OperationKind::kAShr: return "core.compute.ashr";
             case OperationKind::kMux: return "core.compute.mux";
             case OperationKind::kAssign: return "core.compute.assign";
+            case OperationKind::kAssignAs: return "core.compute.assign";
             case OperationKind::kConcat: return "core.compute.concat";
             case OperationKind::kReplicate: return "core.compute.replicate";
             case OperationKind::kSliceStatic: return "core.compute.sliceStatic";
@@ -368,6 +369,7 @@ namespace wolvrix::lib::grhsim
             .declProvenances = options.keepDeclaredSymbols ? graph->declaredSymbols().size() : 0});
 
         std::vector<grhsim::ValueId> valueMap(static_cast<std::size_t>(maxValueIndex) + 1);
+
         for (grh::ValueId valueId : graph->values())
         {
             const auto value = graph->getValue(valueId);
@@ -602,7 +604,6 @@ namespace wolvrix::lib::grhsim
         {
             const Operation op = graph->getOperation(opId);
             if (isDeclaration(op.kind())) continue;
-
             // stage-06 compatibility shim: GRH fold/alias products can leave a
             // kSliceArray whose base value lost its shape (flat). The form is
             // legal only as the single-index case, where the flat base is

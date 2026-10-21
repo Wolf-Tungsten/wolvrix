@@ -682,7 +682,7 @@ int testOldestArbiterResetGraphWholeRead(const std::filesystem::path& sourcePath
         return fail("priority_flat output has no defining op for " + std::string(moduleName));
     }
     const wolvrix::lib::grh::Operation assignOp = graph->getOperation(assignId);
-    if (assignOp.kind() != wolvrix::lib::grh::OperationKind::kAssign ||
+    if (assignOp.kind() != wolvrix::lib::grh::OperationKind::kAssignAs ||
         assignOp.operands().size() != 1) {
         return fail("priority_flat output should be assigned from aggregate whole read for " +
                     std::string(moduleName));

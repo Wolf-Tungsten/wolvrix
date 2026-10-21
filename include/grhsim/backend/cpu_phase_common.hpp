@@ -326,8 +326,15 @@ namespace wolvrix::lib::grhsim
     {
         const auto &op = model.operations()[id.index - 1];
         uint64_t lines = 4 + op.operands.count + op.results.count;
-        if (model.text(op.opType) == "cpu.compute.maskedOr")
+        const auto opName = model.text(op.opType);
+        if (opName == "cpu.compute.maskedOr")
             lines += 12 + (maskedOrViews(model, op) ? 2 * maskedOrTermCount(model, op) : 0);
+        if (opName == "core.system.task" && op.operands.count > 0)
+            // Each task arg is one grhsim_make_task_arg call in a braced
+            // std::array init; clang front-end cost measured ~14ms per arg on
+            // the XS PERF-counter fwrites (one 97-line TU took ~460s for its
+            // ~32k args), i.e. ~20 normal-line equivalents.
+            lines += 20 * (op.operands.count - 1);
         for (auto value : model.results(op))
         {
             const auto &type = model.types()[model.values()[value.index - 1].type.index - 1];

@@ -1671,7 +1671,7 @@ namespace wolvrix::lib::grhsim
                    rowAccessText("cpu_array", type.shape, "cpu_j") + '=' +
                    normalize(rowSliceText("cpu_packed", "cpu_j", *elementWidth, type.width), element) + ';';
             if (*rows * uint64_t(*elementWidth) == type.width &&
-                (*elementWidth == 8 || *elementWidth == 16 || *elementWidth == 32 || *elementWidth == 64))
+                (*elementWidth == 8 || *elementWidth == 16 || *elementWidth == 32 || *elementWidth % 64 == 0))
             {
                 // These cells have no padding: on little-endian targets the
                 // packed object image already is the row-major array image.
@@ -3503,10 +3503,34 @@ namespace wolvrix::lib::grhsim
                         // Bit fill: 0 - bit broadcasts the bit across the container.
                         return wideTrunc("((" + wideType(width) + ")0-" + widen(0) + ")", width);
                     const auto element = elemWidth > 64 ? raw(0) : truncRaw(raw(0), elemWidth);
-                    return "([&](){ " + wideType(width) + " cpu_rep=0;for(unsigned cpu_ri=0;cpu_ri<" +
-                           std::to_string(rep) + "&&cpu_ri*" + std::to_string(elemWidth) + "<" +
-                           std::to_string(width) + ";++cpu_ri) cpu_rep|=(" + wideType(width) + ")(" + element +
-                           ")<<(cpu_ri*" + std::to_string(elemWidth) + ");return cpu_rep&" + wideMask(width) + ";}())";
+                    const auto genericFill = "for(unsigned cpu_ri=0;cpu_ri<" + std::to_string(rep) + "&&cpu_ri*" +
+                                             std::to_string(elemWidth) + "<" + std::to_string(width) +
+                                             ";++cpu_ri) cpu_rep|=(" + wideType(width) + ")(" + element +
+                                             ")<<(cpu_ri*" + std::to_string(elemWidth) + ");";
+                    // Word fill: store the element straight into the container's
+                    // 64-bit words instead of shifting a growing wide
+                    // accumulator, which costs O(rep * container words) per call
+                    // (the XS 212x64->13568 sites were the measured hot spot).
+                    // Same little-endian layout guard as packStoreRows.
+                    if (width % 64 == 0 && 64 % elemWidth == 0 && rep * elemWidth >= width)
+                        return "([&](){ " + wideType(width) + " cpu_rep;\n"
+                               "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                               "std::uint64_t cpu_pat=(std::uint64_t)(" + element + ");for(unsigned cpu_s=" +
+                               std::to_string(elemWidth) +
+                               ";cpu_s<64;cpu_s<<=1) cpu_pat|=cpu_pat<<cpu_s;auto *cpu_w=reinterpret_cast<std::uint64_t*>(&cpu_rep);for(unsigned cpu_ri=0;cpu_ri<" +
+                               std::to_string(width / 64) +
+                               ";++cpu_ri) cpu_w[cpu_ri]=cpu_pat;\n#else\ncpu_rep=0;" + genericFill +
+                               "\n#endif\nreturn cpu_rep;}())";
+                    if (width % 64 == 0 && elemWidth > 64 && elemWidth % 64 == 0 && rep * elemWidth == width)
+                        return "([&](){ " + wideType(width) + " cpu_rep;\n"
+                               "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__\n"
+                               "auto const& cpu_elem=(" + element + ");for(unsigned cpu_ri=0;cpu_ri<" +
+                               std::to_string(rep) +
+                               ";++cpu_ri) std::memcpy(reinterpret_cast<std::uint64_t*>(&cpu_rep)+cpu_ri*" +
+                               std::to_string(elemWidth / 64) + ",&cpu_elem," + std::to_string(elemWidth / 8) +
+                               ");\n#else\ncpu_rep=0;" + genericFill + "\n#endif\nreturn cpu_rep;}())";
+                    return "([&](){ " + wideType(width) + " cpu_rep=0;" + genericFill + "return cpu_rep&" +
+                           wideMask(width) + ";}())";
                 }
                 if (kind == "concat" && operands.size() >= 2)
                 {
@@ -6776,8 +6800,24 @@ if(terminal){
                     << "CXXFLAGS ?= -std=c++20 -O3 -fno-strict-aliasing\n";
                 if (waveform_)
                     out << "CC ?= cc\nCFLAGS ?= -O2 -D_GNU_SOURCE\nLIBFST_SRC_DIR := " << libfstSourceDir() << '\n';
+                // difftest make compiles the listed TUs in order under -jN:
+                // front-load the heaviest units so the long poles start
+                // immediately. Sort by emitted source bytes (the best local
+                // proxy for clang cost: wide-op bodies and task-arg arrays
+                // both outsize their line counts) — the unit .cpp contents
+                // keep plan order, chunk tiling and scan semantics live in
+                // the sources, not in the compile order.
+                std::vector<uint64_t> tuBytes(tuPlan_.units.size(), 0);
+                for (std::size_t i = 0; i < tuPlan_.units.size(); ++i)
+                    tuBytes[i] = std::filesystem::file_size(directory / sources[i]);
+                std::vector<std::size_t> tuOrder(tuPlan_.units.size());
+                for (std::size_t i = 0; i < tuOrder.size(); ++i) tuOrder[i] = i;
+                std::stable_sort(tuOrder.begin(), tuOrder.end(), [&](std::size_t a, std::size_t b) {
+                    return tuBytes[a] > tuBytes[b];
+                });
                 out << "SOURCES :=";
-                for (const auto &source : sources) out << ' ' << source;
+                for (const auto i : tuOrder) out << ' ' << sources[i];
+                for (std::size_t i = tuPlan_.units.size(); i < sources.size(); ++i) out << ' ' << sources[i];
                 out << "\nOBJECTS := $(SOURCES:.cpp=.o)\n";
                 if (waveform_) out << "FST_OBJECTS := fstapi.o fastlz.o lz4.o\n";
                 out << "LIB := lib" << prefix_ << ".a\n";

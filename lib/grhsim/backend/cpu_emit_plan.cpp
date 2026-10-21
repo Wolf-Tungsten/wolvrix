@@ -10,8 +10,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // M5d-7 (C8): cpu.st.plan-translation-units plans the multi-TU emit. It
@@ -36,6 +38,9 @@ namespace wolvrix::lib::grhsim
             const CpuNamedStore *prevEvent = nullptr;
             std::vector<PartitionId> supernodeOrder; // ordinal -> partition
             std::vector<Range> scanIntervals;        // C6 EmitFunction intervals tiling [0, N)
+            std::vector<uint32_t> ordinalOf;                          // partition.index -> supernode ordinal (~0u if none)
+            std::unordered_map<uint32_t, std::vector<uint32_t>> valueFanout; // value.index -> activate ordinals
+            std::unordered_map<uint32_t, std::vector<uint32_t>> stateFanout; // state.index -> activate ordinals
         };
 
         uint64_t estimateInitStepLines(const GrhSimModel &model, StateId state, const InitStep &step)
@@ -79,14 +84,44 @@ namespace wolvrix::lib::grhsim
             return attrs.eventActs && !attrs.eventActs->empty() ? 4 : 3;
         }
 
-        uint64_t estimateSupernodeLines(const GrhSimModel &model, const CpuPartitionTree &tree,
-                                        PartitionId supernode)
+        // Supernode estimate = op lines + activity-flag fanout. Each
+        // change-detected write emits ~6 scaffold lines plus one
+        // flag-accumulate line per touched flag word, and each supernode
+        // function pays one local-accumulator decl plus one writeback per
+        // union word. The XS small-sink bodies fan out to dozens of words per
+        // write (the tu1069-71 bodies measured 20-29x over the op-line-only
+        // estimate, ~300-340s clang -O3 apiece).
+        uint64_t estimateSupernodeLines(const PlanContext &ctx, PartitionId supernode)
         {
-            const auto &partition = tree.partitions[supernode.index - 1];
+            const auto &model = ctx.model;
+            const auto &partition = ctx.tree.partitions[supernode.index - 1];
             uint64_t lines = 4 + 2 * partition.attrs.helperChunks.size();
+            std::set<uint32_t> unionWords;
+            const auto charge = [&](const std::vector<uint32_t> *ordinals) -> uint64_t {
+                if (!ordinals || ordinals->empty()) return 0;
+                std::set<uint32_t> words;
+                for (const auto ordinal : *ordinals) words.insert(ordinal / kActiveFlagBits);
+                unionWords.insert(words.begin(), words.end());
+                return 6 + words.size();
+            };
             for (const auto node : partition.children)
-                for (const auto op : tree.partitions[node.index - 1].ops)
+                for (const auto op : ctx.tree.partitions[node.index - 1].ops)
+                {
                     lines += estimatedCpuOpLines(model, op);
+                    const auto &operation = model.operations()[op.index - 1];
+                    for (const auto result : model.results(operation))
+                    {
+                        const auto it = ctx.valueFanout.find(result.index);
+                        lines += charge(it != ctx.valueFanout.end() ? &it->second : nullptr);
+                    }
+                    for (const auto ref : model.objectRefs(operation))
+                    {
+                        if (ref.kind != ObjectKind::State) continue;
+                        const auto it = ctx.stateFanout.find(ref.index);
+                        lines += charge(it != ctx.stateFanout.end() ? &it->second : nullptr);
+                    }
+                }
+            lines += 2 * unionWords.size();
             return lines;
         }
 
@@ -210,7 +245,7 @@ namespace wolvrix::lib::grhsim
             {
                 const auto supernode = ctx.supernodeOrder[ordinal];
                 const auto &attrs = ctx.tree.partitions[supernode.index - 1].attrs;
-                const auto estimate = estimateSupernodeLines(model, ctx.tree, supernode);
+                const auto estimate = estimateSupernodeLines(ctx, supernode);
                 if (estimate > unitCap && attrs.helperChunks.size() >= 2)
                 {
                     chunks.push_back(CpuEmitChunk{CpuEmitChunkKind::Supernode, ordinal, 1,
@@ -271,6 +306,21 @@ namespace wolvrix::lib::grhsim
             if (!ctx.prevEvent)
                 throw std::runtime_error("CPU TU planning requires the named-store layout");
             ctx.supernodeOrder = generalSupernodeOrder(ctx.tree);
+            ctx.ordinalOf.assign(ctx.tree.partitions.size() + 1, ~0u);
+            for (uint32_t i = 0; i < ctx.supernodeOrder.size(); ++i)
+                ctx.ordinalOf[ctx.supernodeOrder[i].index] = i;
+            const auto ordinalsOf = [&](const std::vector<PartitionId> &targets) {
+                std::vector<uint32_t> out;
+                out.reserve(targets.size());
+                for (const auto target : targets)
+                    if (target.index < ctx.ordinalOf.size() && ctx.ordinalOf[target.index] != ~0u)
+                        out.push_back(ctx.ordinalOf[target.index]);
+                return out;
+            };
+            for (const auto &row : ctx.schedule.computeSupernodeFanout)
+                ctx.valueFanout[row.source.index] = ordinalsOf(row.targets.activate);
+            for (const auto &row : ctx.schedule.commitStateFanout)
+                ctx.stateFanout[row.source.index] = ordinalsOf(row.targets.activate);
             const auto &root = ctx.tree.partitions[ctx.tree.root.index - 1];
             for (const auto branchId : root.children)
             {

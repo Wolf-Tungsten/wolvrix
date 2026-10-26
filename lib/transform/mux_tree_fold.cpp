@@ -161,7 +161,6 @@ namespace wolvrix::lib::transform
             switch (kind)
             {
             case OperationKind::kAssign:
-            case OperationKind::kAssignAs:
             case OperationKind::kMux:
             case OperationKind::kEq:
             case OperationKind::kNe:
@@ -269,7 +268,6 @@ namespace wolvrix::lib::transform
                     }
                     const Operation op = graph_.getOperation(def);
                     if ((op.kind() == OperationKind::kAssign ||
-                         op.kind() == OperationKind::kAssignAs ||
                          op.kind() == OperationKind::kConcat) &&
                         op.operands().size() == 1 &&
                         graph_.valueWidth(value) == graph_.valueWidth(op.operands()[0]))

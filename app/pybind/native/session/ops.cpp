@@ -100,11 +100,6 @@ namespace wolvrix::app::pybind
             (void)value;
             appendKey(key);
         }
-        for (const auto &[key, value] : session->grhsimModels)
-        {
-            (void)value;
-            appendKey(key);
-        }
         for (const auto &[key, value] : session->nativeValues)
         {
             (void)value;
@@ -324,12 +319,6 @@ namespace wolvrix::app::pybind
                 dstKey,
                 DesignHandle{it->second.design.clone(), it->second.compilation});
         }
-        else if (auto it = session->grhsimModels.find(srcKey); it != session->grhsimModels.end())
-        {
-            session->grhsimModels.insert_or_assign(
-                dstKey, it->second ? std::make_unique<wolvrix::lib::grhsim::GrhSimModel>(it->second->clone())
-                                   : nullptr);
-        }
         else if (auto it = session->nativeValues.find(srcKey); it != session->nativeValues.end())
         {
             session->nativeValues.insert_or_assign(dstKey, it->second ? it->second->clone() : nullptr);
@@ -386,11 +375,6 @@ namespace wolvrix::app::pybind
         {
             node.key() = dstKey;
             session->designs.insert(std::move(node));
-        }
-        else if (auto node = session->grhsimModels.extract(srcKey); !node.empty())
-        {
-            node.key() = dstKey;
-            session->grhsimModels.insert(std::move(node));
         }
         else if (auto node = session->nativeValues.extract(srcKey); !node.empty())
         {

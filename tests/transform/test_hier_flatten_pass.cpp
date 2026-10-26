@@ -3,6 +3,7 @@
 #include "core/transform.hpp"
 #include "transform/hier_flatten.hpp"
 
+#include <algorithm>
 #include <array>
 #include <initializer_list>
 #include <iostream>
@@ -631,7 +632,7 @@ int testSharedScalarIndexShape()
         const auto baseDef = top.valueDef(base);
         foundShapedView = base != zero && top.valueShape(base).size() == 1 &&
                           top.valueShape(base)[0] == 1 && baseDef.valid() &&
-                          top.opKind(baseDef) == wolvrix::lib::grh::OperationKind::kAssignAs &&
+                          top.opKind(baseDef) == wolvrix::lib::grh::OperationKind::kAssign &&
                           top.opOperands(baseDef)[0] == zero &&
                           top.valueShape(top.opOperands(op)[1]).empty();
     }
@@ -640,9 +641,107 @@ int testSharedScalarIndexShape()
 
 } // namespace
 
+int testDpiImportOriginMerge()
+{
+    // Two child graphs declare the same DPI import (shared declaration file,
+    // XiangShan assert.v pattern) and the top graph has its own copy. With
+    // originModules provenance stamping, the flatten-time merge must compare
+    // only the signature attrs and union the provenance.
+    wolvrix::lib::grh::Design design;
+    wolvrix::lib::grh::Graph &childA = design.createGraph("childA");
+    wolvrix::lib::grh::Graph &childB = design.createGraph("childB");
+    wolvrix::lib::grh::Graph &top = design.createGraph("top");
+    design.markAsTop("top");
+
+    auto setupChild = [](wolvrix::lib::grh::Graph &child) {
+        const auto sig = child.createValue(child.internSymbol("x"), 1, false);
+        child.bindInputPort("x", sig);
+        child.addDeclaredSymbol(child.getValue(sig).symbol());
+        const auto dpiSym = child.internSymbol("xs_assert_v2");
+        const auto dpiImport =
+            child.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, dpiSym);
+        child.setAttr(dpiImport, "argsDirection",
+                      std::vector<std::string>{"input", "input"});
+        child.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1, 64});
+        child.setAttr(dpiImport, "argsName",
+                      std::vector<std::string>{"filename", "line"});
+        child.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, true});
+        child.setAttr(dpiImport, "argsType",
+                      std::vector<std::string>{"string", "longint"});
+        child.setAttr(dpiImport, "hasReturn", false);
+    };
+    setupChild(childA);
+    setupChild(childB);
+
+    const auto topX = top.createValue(top.internSymbol("x"), 1, false);
+    top.bindInputPort("x", topX);
+    top.addDeclaredSymbol(top.getValue(topX).symbol());
+    const auto topDpiSym = top.internSymbol("xs_assert_v2");
+    const auto topDpi =
+        top.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, topDpiSym);
+    top.setAttr(topDpi, "argsDirection", std::vector<std::string>{"input", "input"});
+    top.setAttr(topDpi, "argsWidth", std::vector<int64_t>{1, 64});
+    top.setAttr(topDpi, "argsName", std::vector<std::string>{"filename", "line"});
+    top.setAttr(topDpi, "argsSigned", std::vector<bool>{false, true});
+    top.setAttr(topDpi, "argsType", std::vector<std::string>{"string", "longint"});
+    top.setAttr(topDpi, "hasReturn", false);
+
+    for (const char *module : {"childA", "childB"})
+    {
+        const auto instOp = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance,
+                                                top.makeInternalOpSym());
+        top.addOperand(instOp, topX);
+        top.setAttr(instOp, "moduleName", std::string(module));
+        top.setAttr(instOp, "instanceName", std::string("u_") + module);
+        top.setAttr(instOp, "inputPortName", std::vector<std::string>{"x"});
+        top.setAttr(instOp, "outputPortName", std::vector<std::string>{});
+    }
+
+    PassManager manager;
+    manager.addPass(std::make_unique<HierFlattenPass>());
+    PassDiagnostics diags;
+    const PassManagerResult result = manager.run(design, diags);
+    if (!result.success || diags.hasError())
+    {
+        return fail("hier-flatten failed on duplicate DPI imports with origin attrs");
+    }
+
+    wolvrix::lib::grh::OperationId found = wolvrix::lib::grh::OperationId::invalid();
+    unsigned count = 0;
+    for (const auto opId : top.operations())
+    {
+        const wolvrix::lib::grh::Operation op = top.getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kDpicImport &&
+            op.symbolText() == std::string_view("xs_assert_v2"))
+        {
+            found = opId;
+            ++count;
+        }
+    }
+    if (count != 1 || !found.valid())
+    {
+        return fail("Duplicate DPI imports must merge into a single op");
+    }
+    const auto origins = getOriginModules(top, found);
+    if (!origins || origins->size() != 3)
+    {
+        return fail("Merged DPI import must carry all three origin modules");
+    }
+    auto has = [&](std::string_view name) {
+        return std::find(origins->begin(), origins->end(), name) != origins->end();
+    };
+    if (!has("top") || !has("u_childA") || !has("u_childB"))
+    {
+        return fail("Merged DPI import origin set mismatch");
+    }
+    return 0;
+}
+
 int main()
 {
     if (const int result = testSharedScalarIndexShape(); result != 0)
+        return result;
+    if (const int result = testDpiImportOriginMerge(); result != 0)
         return result;
     wolvrix::lib::grh::Design design;
     wolvrix::lib::grh::Graph &child = design.createGraph("child");

@@ -30,7 +30,7 @@ with wolvrix.Session() as sess:
 | Pass | Purpose | Typical Use |
 | --- | --- | --- |
 | [`blackbox-guard`](blackbox-guard.md) | Create stub graphs for unresolved black boxes | importing incomplete designs |
-| [`activity-schedule`](activity-schedule.md) | build GrhSIM activity supernode schedule data | GrhSIM emit and schedule analysis |
+| [`activity-schedule`](activity-schedule.md) | build the retained ordinary-GRH activity analysis | schedule analysis; not the production CPU emitter's SinkSchedule |
 | [`comb-loop-elim`](comb-loop-elim.md) | detect and optionally repair combinational loops | loop cleanup and diagnostics |
 | [`hier-flatten`](hier-flatten.md) | flatten hierarchy | later optimization or verification |
 | [`instance-inline`](instance-inline.md) | inline a selected instance path | local expansion after partitioning |
@@ -44,6 +44,14 @@ with wolvrix.Session() as sess:
 | [`memory-init-check`](memory-init-check.md) | validate memory initialization consistency | memory checking |
 | [`repcut`](repcut.md) | partition one graph with RepCut | large-graph partitioning |
 | [`simplify`](simplify.md) | run standard IR simplifications | general cleanup and optimization |
+| [`grh-to-grhsim`](grhsim-transforms.md) | convert simulation writes/events/calls on the same GRH graph | flat, unpartitioned simulation form |
+| [`grhsim-simplify`](grhsim-transforms.md#grhsim-simplify) | simplify globally before partitioning, within each owner afterwards | preserve simulation effects and cloned computations |
+| [`grhsim-pack-bit-registers`](grhsim-transforms.md#packing-and-masked-or-recovery) | pack eligible bit states with shared fire controls | unpartitioned simulation optimization |
+| [`grhsim-recover-masked-or`](grhsim-transforms.md#packing-and-masked-or-recovery) | recover masked OR reductions | simulation computation optimization |
+| [`grhsim-split-event-and-output`](grhsim-transforms.md) | extract Event/Output closures and histories | first simulation owners |
+| [`grhsim-split-nonsink-and-sink`](grhsim-transforms.md) | classify General work and state writes by total size | NonSink, SmallSink and LargeSink |
+| [`grhsim-partition-nonsink`](grhsim-transforms.md#activity-partitioning) | form activity supernodes and leaves | activation granularity |
+| [`grhsim-partition-sink`](grhsim-transforms.md#sink-groups-and-sinkschedule) | preserve ordered writer runs and publish SinkSchedule | current CPU emission |
 | [`stats`](stats.md) | collect design statistics | analysis and debugging |
 
 ## Internal Passes Used By `simplify`
@@ -91,6 +99,10 @@ wolvrix \
 13. `stats`
 
 This is not a hard rule, but it is a reasonable starting point for a typical pipeline.
+
+For production simulation, follow the [unified GRH simulation flow](../grhsim.md)
+after the ordinary frontend pipeline. It defines its own split/partition order
+and does not consume `activity-schedule` results.
 
 ## Notes
 

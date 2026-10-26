@@ -1,6 +1,9 @@
 #include "transform/verify.hpp"
 
 #include "core/grh.hpp"
+#include "core/op_descriptor.hpp"
+#include "core/state.hpp"
+#include "transform/grhsim/ops.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -16,8 +19,10 @@ namespace wolvrix::lib::transform
     namespace
     {
         using wolvrix::lib::grh::AttributeValue;
+        using wolvrix::lib::grh::AttrKV;
         using wolvrix::lib::grh::Graph;
         using wolvrix::lib::grh::InoutPort;
+        using wolvrix::lib::grh::LogicalType;
         using wolvrix::lib::grh::Operation;
         using wolvrix::lib::grh::OperationId;
         using wolvrix::lib::grh::OperationKind;
@@ -25,6 +30,26 @@ namespace wolvrix::lib::transform
         using wolvrix::lib::grh::Value;
         using wolvrix::lib::grh::ValueId;
         using wolvrix::lib::grh::ValueType;
+
+        // Verification does not mutate the graph. Borrow operands and attrs;
+        // materialize a diagnostic snapshot only when reporting an error.
+        struct OperationView
+        {
+            const Graph &graph;
+            OperationId id;
+            OperationKind kind() const { return graph.opKind(id); }
+            auto operands() const { return graph.opOperands(id); }
+            auto results() const { return graph.opResults(id); }
+            auto attrs() const { return graph.opAttrs(id); }
+            auto srcLoc() const { return graph.opSrcLoc(id); }
+            std::optional<AttributeValue> attr(std::string_view key) const
+            {
+                for (const auto &entry : attrs())
+                    if (entry.key == key) return entry.value;
+                return std::nullopt;
+            }
+            operator Operation() const { return graph.getOperation(id); }
+        };
 
         std::string shapeText(std::span<const int64_t> shape)
         {
@@ -99,7 +124,7 @@ namespace wolvrix::lib::transform
         }
 
         template <typename T>
-        std::optional<T> attrAs(const Operation &op, std::string_view key)
+        std::optional<T> attrAs(const OperationView &op, std::string_view key)
         {
             std::optional<AttributeValue> attr = op.attr(key);
             if (!attr)
@@ -138,7 +163,7 @@ namespace wolvrix::lib::transform
 
         // Resolves the kRegister declaration referenced by a port op's
         // regSymbol attr. On failure `problem` describes why.
-        std::optional<RegisterDeclInfo> registerDeclForPort(Graph &graph, const Operation &op,
+        std::optional<RegisterDeclInfo> registerDeclForPort(Graph &graph, const OperationView &op,
                                                             std::string &problem)
         {
             std::optional<std::string> regSymbol = attrAs<std::string>(op, "regSymbol");
@@ -153,7 +178,7 @@ namespace wolvrix::lib::transform
                 problem = "references unknown register '" + *regSymbol + "'";
                 return std::nullopt;
             }
-            const Operation decl = graph.getOperation(declId);
+            const OperationView decl{graph, declId};
             if (decl.kind() != OperationKind::kRegister)
             {
                 problem = "regSymbol '" + *regSymbol + "' does not name a kRegister";
@@ -213,10 +238,25 @@ namespace wolvrix::lib::transform
                 error(*graph, "grh.verify: " + entry);
             }
 
+            try
+            {
+                if (const std::string problem = grhsim::verifyGraph(*graph); !problem.empty())
+                    error(*graph, "grh.verify: " + problem);
+            }
+            catch (const std::exception& exception)
+            {
+                error(*graph, "grh.verify: " + std::string(exception.what()));
+            }
+
             for (const ValueId valueId : graph->values())
             {
                 const Value value = graph->getValue(valueId);
                 const std::string name(value.symbolText());
+                try { value.logicalType().validate(); }
+                catch (const std::exception& exception)
+                {
+                    error(*graph, value, "grh.verify: " + std::string(exception.what()));
+                }
                 if (value.type() == ValueType::Logic && value.width() <= 0)
                 {
                     error(*graph, value, "grh.verify: Logic value width must be positive");
@@ -258,7 +298,13 @@ namespace wolvrix::lib::transform
 
             for (const OperationId opId : graph->operations())
             {
-                const Operation op = graph->getOperation(opId);
+                const OperationView op{*graph, opId};
+                if (const std::string problem = verifyOpDescriptor(*graph, opId); !problem.empty())
+                {
+                    error(*graph, op, "grh.verify: " + problem);
+                    continue;
+                }
+                if (findOpDescriptor(op.kind())->dialect != "grh") continue;
                 switch (op.kind())
                 {
                 case OperationKind::kRegister:
@@ -276,6 +322,23 @@ namespace wolvrix::lib::transform
                     if (!attrAs<bool>(op, "isSigned"))
                     {
                         error(*graph, op, "grh.verify: declaration op requires a bool isSigned attr");
+                    }
+                    try
+                    {
+                        stateLogicalType(*graph, opId);
+                        bool typedInit = false;
+                        for (const AttrKV& entry : op.attrs())
+                            typedInit |= entry.key.starts_with("initSpec");
+                        if (typedInit)
+                        {
+                            if (!op.attr("initSpecKinds"))
+                                throw std::invalid_argument("Incomplete typed InitSpec attributes");
+                            stateInitSpec(*graph, opId);
+                        }
+                    }
+                    catch (const std::exception& exception)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(exception.what()));
                     }
                     // `shape` is part of the declaration type contract (like
                     // `width`/`isSigned`), not a free-form attribute.
@@ -329,6 +392,18 @@ namespace wolvrix::lib::transform
                         break;
                     }
                     const Value result = graph->getValue(op.results().front());
+                    const OperationView declaration{*graph, decl->id};
+                    try
+                    {
+                        const LogicalType type = stateLogicalType(*graph, decl->id);
+                        if ((declaration.attr("valueType") && result.type() != type.kind) ||
+                            (declaration.attr("domain") && result.domain() != type.domain))
+                            error(*graph, op, "grh.verify: read result kind/domain differs from the declaration");
+                    }
+                    catch (const std::exception& exception)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(exception.what()));
+                    }
                     if (op.kind() == OperationKind::kRegisterReadPort)
                     {
                         if (!op.operands().empty())
@@ -760,52 +835,106 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kLatchReadPort:
+                case OperationKind::kLatchWritePort:
+                {
+                    const auto symbol = attrAs<std::string>(op, "latchSymbol");
+                    const auto target = symbol ? graph->findOperation(*symbol) : OperationId{};
+                    if (!target || graph->opKind(target) != OperationKind::kLatch)
+                    {
+                        error(*graph, op, "grh.verify: latch port must reference a kLatch declaration");
+                        break;
+                    }
+                    try
+                    {
+                        const LogicalType type = stateLogicalType(*graph, target);
+                        if (op.kind() == OperationKind::kLatchReadPort)
+                        {
+                            if (!op.operands().empty() || op.results().size() != 1)
+                                throw std::invalid_argument("Latch read expects no operands and one result");
+                            const auto actual = graph->valueLogicalType(op.results()[0]);
+                            if (actual.width != type.width ||
+                                (OperationView{*graph, target}.attr("valueType") && actual.kind != type.kind) ||
+                                (OperationView{*graph, target}.attr("domain") && actual.domain != type.domain))
+                                throw std::invalid_argument("Latch read type differs from the declaration");
+                        }
+                        else
+                        {
+                            if (op.operands().size() != 3 || !op.results().empty())
+                                throw std::invalid_argument("Latch write expects enable, data, mask and no results");
+                            const auto enable = graph->valueLogicalType(op.operands()[0]);
+                            if (enable.kind != ValueType::Logic || enable.width != 1 || !enable.shape.empty())
+                                throw std::invalid_argument("Latch enable must be one scalar Logic bit");
+                            if (graph->valueWidth(op.operands()[1]) != type.width ||
+                                graph->valueWidth(op.operands()[2]) != type.width)
+                                throw std::invalid_argument("Latch data/mask width differs from the declaration");
+                        }
+                    }
+                    catch (const std::exception& exception)
+                    {
+                        error(*graph, op, "grh.verify: " + std::string(exception.what()));
+                    }
+                    break;
+                }
                 case OperationKind::kAssign:
                 {
-                    // kAssign is a strict same-type rename: the conversion
-                    // case belongs to kAssignAs.
                     const auto operands = op.operands();
                     const auto results = op.results();
                     if (operands.size() != 1 || results.size() != 1 ||
-                        !operands.front().valid() || !results.front().valid())
+                        !operands[0].valid() || !results[0].valid())
                     {
                         error(*graph, op, "grh.verify: kAssign expects exactly one operand and one result");
                         break;
                     }
-                    const ValueId src = operands.front();
-                    const ValueId dst = results.front();
-                    const std::span<const int64_t> srcShape = graph->valueShape(src);
-                    const std::span<const int64_t> dstShape = graph->valueShape(dst);
-                    const bool sameShape = std::equal(srcShape.begin(), srcShape.end(),
-                                                      dstShape.begin(), dstShape.end());
-                    if (graph->valueWidth(src) != graph->valueWidth(dst) ||
-                        graph->valueSigned(src) != graph->valueSigned(dst) || !sameShape)
+                    if (graph->valueWidth(operands[0]) != graph->valueWidth(results[0]) ||
+                        graph->valueType(operands[0]) != graph->valueType(results[0]) ||
+                        graph->valueDomain(operands[0]) != graph->valueDomain(results[0]))
                     {
-                        // P1: the guardShapeAlias backfill can still retype a
-                        // result after op creation, so this is a warning until
-                        // P2 removes the backfill channel.
-                        warning(*graph, op, "grh.verify: kAssign operand/result types differ "
-                                            "(width, isSigned, shape); use kAssignAs for a "
-                                            "bit-identical retype");
+                        error(*graph, op, "grh.verify: kAssign requires equal widths and compatible kinds");
                     }
                     break;
                 }
-                case OperationKind::kAssignAs:
+                case OperationKind::kArrayCreate:
                 {
-                    // Bit-identical retype: only the total width is invariant;
-                    // shape/signedness may differ between operand and result.
                     const auto operands = op.operands();
                     const auto results = op.results();
-                    if (operands.size() != 1 || results.size() != 1 ||
-                        !operands.front().valid() || !results.front().valid())
+                    if (operands.empty() || results.size() != 1 || !results[0].valid() ||
+                        std::any_of(operands.begin(), operands.end(),
+                                    [](ValueId value) { return !value.valid(); }))
                     {
-                        error(*graph, op, "grh.verify: kAssignAs expects exactly one operand and one result");
+                        error(*graph, op, "grh.verify: kArrayCreate requires N>=1 operands and one result");
                         break;
                     }
-                    if (graph->valueWidth(operands.front()) != graph->valueWidth(results.front()))
+                    const Value first = graph->getValue(operands[0]);
+                    const Value result = graph->getValue(results[0]);
+                    std::vector<int64_t> expected{static_cast<int64_t>(operands.size())};
+                    expected.insert(expected.end(), first.shape().begin(), first.shape().end());
+                    bool valid = first.type() == ValueType::Logic && first.width() > 0 &&
+                                 result.type() == ValueType::Logic &&
+                                 result.isSigned() == first.isSigned() &&
+                                 result.domain() == first.domain() &&
+                                 shapesEqual(result.shape(), expected) &&
+                                 static_cast<uint64_t>(first.width()) * operands.size() ==
+                                     static_cast<uint64_t>(result.width());
+                    for (ValueId operand : operands)
                     {
-                        error(*graph, op, "grh.verify: kAssignAs operand/result widths must match");
+                        const Value element = graph->getValue(operand);
+                        valid = valid && element.type() == first.type() &&
+                                element.width() == first.width() &&
+                                element.isSigned() == first.isSigned() &&
+                                element.domain() == first.domain() &&
+                                shapesEqual(element.shape(), first.shape());
                     }
+                    for (const auto &attr : op.attrs())
+                        // Region ownership and sampling are common execution
+                        // annotations checked by grhsim::verifyGraph above;
+                        // they do not change arrayCreate's operand geometry.
+                        valid = valid && (attr.key == "originModules" ||
+                            attr.key == grhsim::kPartition || attr.key == "grhsim.sampleBoundary" ||
+                            attr.key == "grhsim.activity");
+                    if (!valid)
+                        error(*graph, op, "grh.verify: kArrayCreate requires identical Logic element types; "
+                                          "result must have width N*W, shape [N]+S and matching signedness/domain");
                     break;
                 }
                 case OperationKind::kConcat:

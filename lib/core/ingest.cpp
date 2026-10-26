@@ -3471,7 +3471,21 @@ struct StmtLowererState {
                                  std::vector<ExprNodeId>& leafValues) {
             for (std::size_t i = 0; i < leaves.size(); ++i)
             {
-                if (parts.size() == 1)
+                const auto targetType = analyzeStructLeafType(leaves[i], *plan.body, diagnostics);
+                const auto elementType = analyzeStructLeafType(parts.front().leafTypes[i], *plan.body, diagnostics);
+                std::vector<int64_t> arrayShape{static_cast<int64_t>(parts.size())};
+                arrayShape.insert(arrayShape.end(), elementType.shape.begin(), elementType.shape.end());
+                bool array = targetType.shape == arrayShape &&
+                    targetType.isSigned == elementType.isSigned &&
+                    aggregateLeafFlatWidth(leaves[i]) ==
+                        static_cast<int64_t>(parts.size()) * aggregateLeafFlatWidth(parts.front().leafTypes[i]);
+                for (const auto& part : parts)
+                {
+                    const auto type = analyzeStructLeafType(part.leafTypes[i], *plan.body, diagnostics);
+                    array = array && type.shape == elementType.shape && type.isSigned == elementType.isSigned &&
+                        aggregateLeafFlatWidth(part.leafTypes[i]) == aggregateLeafFlatWidth(parts.front().leafTypes[i]);
+                }
+                if (parts.size() == 1 && !array)
                 {
                     leafValues.push_back(parts.front().values[i]);
                     continue;
@@ -3490,14 +3504,21 @@ struct StmtLowererState {
                     }
                     total += width;
                 }
-                const int32_t widthHint =
+                const int32_t widthHint = array ? static_cast<int32_t>(aggregateLeafFlatWidth(leaves[i])) :
                     widthKnown && total > 0
                         ? static_cast<int32_t>(
                               std::min<int64_t>(total, std::numeric_limits<int32_t>::max()))
                         : 0;
-                leafValues.push_back(makeOperationWithWidth(
-                    wolvrix::lib::grh::OperationKind::kConcat, std::move(operands), widthHint,
-                    expr->sourceRange.start()));
+                if (array) std::reverse(operands.begin(), operands.end());
+                const auto constructed = makeOperationWithWidth(
+                    array ? wolvrix::lib::grh::OperationKind::kArrayCreate : wolvrix::lib::grh::OperationKind::kConcat,
+                    std::move(operands), widthHint,
+                    expr->sourceRange.start());
+                if (array) lowering.values[constructed].arrayElementType = wolvrix::lib::grh::LogicalType{
+                    elementType.valueType,
+                    static_cast<int32_t>(aggregateLeafFlatWidth(parts.front().leafTypes[i])),
+                    elementType.isSigned, wolvrix::lib::grh::LogicDomain::FourState, elementType.shape};
+                leafValues.push_back(constructed);
             }
         };
         if (expr->as_if<slang::ast::ReplicationExpression>())
@@ -8999,10 +9020,7 @@ private:
     // value may itself aggregate into several leaves (the caller flattens).
     // Lower one pattern component (struct field or scalar) into per-leaf
     // values of the component type.
-    // Lower an assignment pattern on a fixed-size array type to one flat
-    // value: per-element values concatenated row-major (packed arrays in
-    // positional order, unpacked arrays in reversed positional order so that
-    // index 0 lands on the LSB side). Returns invalid on failure.
+    // Lower a fixed-array pattern to one array value, low element first.
     ExprNodeId lowerArrayPatternValue(const slang::ast::Type& arrayType,
                                       const slang::ast::Expression& expr,
                                       slang::SourceLocation location)
@@ -9128,11 +9146,8 @@ private:
                 return kInvalidPlanIndex;
             }
         }
-        if (isUnpacked)
+        if (!isUnpacked)
         {
-            // GRH flat layout is row-major with lane 0 at the LSB; unpacked
-            // positional order runs ascending, so reverse for the MSB-first
-            // concat. Packed positional order already runs MSB-first.
             std::reverse(elements.begin(), elements.end());
         }
         int64_t total = 0;
@@ -9160,7 +9175,7 @@ private:
         }
         ExprNode node;
         node.kind = ExprNodeKind::Operation;
-        node.op = wolvrix::lib::grh::OperationKind::kConcat;
+        node.op = wolvrix::lib::grh::OperationKind::kArrayCreate;
         node.operands = std::move(elements);
         node.location = location;
         node.widthHint = static_cast<int32_t>(std::min<int64_t>(
@@ -9254,8 +9269,7 @@ private:
         return true;
     }
 
-    // Concat per-index leaf values into one array value (row-major flat
-    // layout; packed arrays keep positional order, unpacked reverse it).
+    // Construct per-index leaf values in canonical low-element-first order.
     // elementFlatWidth is the per-element (leaf) width taken from the type,
     // used when a lazily-lowered element carries no plan-stage width hint
     // (stage-07: defaulting that to 1 produced wrong-width concats).
@@ -9263,7 +9277,7 @@ private:
                                    int64_t elementFlatWidth,
                                    slang::SourceLocation location)
     {
-        if (isUnpacked)
+        if (!isUnpacked)
         {
             std::reverse(elements.begin(), elements.end());
         }
@@ -9280,7 +9294,7 @@ private:
         }
         ExprNode node;
         node.kind = ExprNodeKind::Operation;
-        node.op = wolvrix::lib::grh::OperationKind::kConcat;
+        node.op = wolvrix::lib::grh::OperationKind::kArrayCreate;
         node.operands = std::move(elements);
         node.location = location;
         node.widthHint = static_cast<int32_t>(std::min<int64_t>(
@@ -22825,7 +22839,7 @@ private:
             {
                 // shape 即类型：被替换的声明值可能带聚合 shape，而 fullValue
                 // 是扁平计算结果。别名两侧类型必须一致，因此给 fullValue 套一个
-                // 目标类型的 kAssignAs 视图。
+                // 目标类型的 kAssign 视图。
                 const std::span<const int64_t> targetShape = graph_.valueShape(targetValue);
                 const std::span<const int64_t> fullShape = graph_.valueShape(fullValue);
                 if (!std::equal(targetShape.begin(), targetShape.end(),
@@ -22836,7 +22850,7 @@ private:
                         makeInternalValueSymbol(), graph_.valueWidth(fullValue),
                         graph_.valueSigned(fullValue), graph_.valueType(fullValue), targetShape);
                     const wolvrix::lib::grh::OperationId viewOp =
-                        createOp(wolvrix::lib::grh::OperationKind::kAssignAs,
+                        createOp(wolvrix::lib::grh::OperationKind::kAssign,
                                  wolvrix::lib::grh::SymbolId::invalid(), location);
                     graph_.addOperand(viewOp, fullValue);
                     graph_.addResult(viewOp, view);
@@ -23032,7 +23046,7 @@ private:
             }
 
             wolvrix::lib::grh::OperationId assignOp =
-                createOp(graph_.assignKindFor(merged, targetValue),
+                createOp(wolvrix::lib::grh::OperationKind::kAssign,
                          wolvrix::lib::grh::SymbolId::invalid(),
                          writeLoc);
             graph_.addOperand(assignOp, merged);
@@ -24183,11 +24197,11 @@ private:
                     return kInvalidPlanIndex;
                 }
             }
-            if (isUnpacked)
+            if (!isUnpacked)
             {
                 std::reverse(elements.begin(), elements.end());
             }
-            return makeOperationNode(wolvrix::lib::grh::OperationKind::kConcat,
+            return makeOperationNode(wolvrix::lib::grh::OperationKind::kArrayCreate,
                                      std::move(elements), 0, expr.sourceRange.start());
         }
 
@@ -25379,14 +25393,14 @@ private:
                 {
                     const std::array<int64_t, 1> bridgeShape{baseWidth / width};
                     // shape 创建即定型：不原地回填扁平 base，改用一个带 shape 的
-                    // kAssignAs 视图作为 kSliceArray 的 base。
+                    // kAssign 视图作为 kSliceArray 的 base。
                     const wolvrix::lib::grh::SymbolId viewSym = makeInternalValueSymbol();
                     wolvrix::lib::grh::ValueId view = graph_.createValue(
                         viewSym, static_cast<int32_t>(baseWidth),
                         graph_.valueSigned(baseValue), graph_.valueType(baseValue),
                         std::span<const int64_t>(bridgeShape.data(), bridgeShape.size()));
                     const wolvrix::lib::grh::OperationId viewOp =
-                        createOp(wolvrix::lib::grh::OperationKind::kAssignAs,
+                        createOp(wolvrix::lib::grh::OperationKind::kAssign,
                                  wolvrix::lib::grh::SymbolId::invalid(), node.location);
                     graph_.addOperand(viewOp, baseValue);
                     graph_.addResult(viewOp, view);
@@ -25445,6 +25459,32 @@ private:
             return result;
         }
 
+        if (node.op == wolvrix::lib::grh::OperationKind::kArrayCreate)
+        {
+            wolvrix::lib::grh::ValueId result;
+            try {
+                if (node.arrayElementType) for (auto& value : operands) {
+                    const auto& type = *node.arrayElementType;
+                    if (graph_.valueLogicalType(value) == type) continue;
+                    if (graph_.valueWidth(value) != type.width || graph_.valueType(value) != type.kind)
+                        throw std::invalid_argument("Array constructor element width/type differs from its source type");
+                    const auto alias = createOp(wolvrix::lib::grh::OperationKind::kAssign,
+                        wolvrix::lib::grh::SymbolId::invalid(), node.location);
+                    const auto normalized = graph_.createValue(makeInternalValueSymbol(), type);
+                    graph_.addOperand(alias, value); graph_.addResult(alias, normalized);
+                    value = normalized;
+                }
+                result = graph_.createArray(operands);
+            }
+            catch (const std::invalid_argument& error) {
+                if (context_.diagnostics) context_.diagnostics->error(node.location, error.what());
+                valueByExpr_[id] = wolvrix::lib::grh::ValueId::invalid();
+                return wolvrix::lib::grh::ValueId::invalid();
+            }
+            maybeSetOpSrcLoc(graph_.valueDef(result), node.location);
+            valueByExpr_[id] = result;
+            return result;
+        }
         wolvrix::lib::grh::OperationId op =
             createOp(node.op, wolvrix::lib::grh::SymbolId::invalid(), node.location);
         for (const auto& operand : operands)
@@ -25519,15 +25559,6 @@ private:
         wolvrix::lib::grh::ValueId result =
             graph_.createValue(sym, width, node.isSigned, node.valueType);
         graph_.addResult(op, result);
-        // Type-honest assignment: a plan-level kAssign whose operand carries a
-        // different type than the freshly created (flat) result is a bit-level
-        // reinterpretation, which belongs to kAssignAs.
-        if (node.op == wolvrix::lib::grh::OperationKind::kAssign && !operands.empty() &&
-            graph_.assignKindFor(operands.front(), result) ==
-                wolvrix::lib::grh::OperationKind::kAssignAs)
-        {
-            graph_.setOpKind(op, wolvrix::lib::grh::OperationKind::kAssignAs);
-        }
         valueByExpr_[id] = result;
         return result;
     }
@@ -25610,7 +25641,7 @@ private:
                     continue;
                 }
                 wolvrix::lib::grh::OperationId op =
-                    createOp(graph_.assignKindFor(nextValue, targetValue),
+                    createOp(wolvrix::lib::grh::OperationKind::kAssign,
                              wolvrix::lib::grh::SymbolId::invalid(),
                              entry.location);
                 graph_.addOperand(op, nextValue);

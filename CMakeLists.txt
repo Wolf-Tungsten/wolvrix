@@ -107,49 +107,30 @@ endif()
 set(WOLVRIX_LIB_SOURCES
     lib/core/diagnostics.cpp
     lib/core/grh.cpp
+    lib/core/op_descriptor.cpp
+    lib/core/state.cpp
     lib/core/load.cpp
     lib/core/emit.cpp
     lib/core/toposort.cpp
     lib/emit/grhsim_runtime.cpp
+    lib/emit/grhsim/cpu-st-cpp.cpp
+    lib/emit/grhsim/function-writer.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
     lib/core/store.cpp
     lib/core/ingest.cpp
     lib/core/transform.cpp
-    lib/grhsim/ir/model.cpp
-    lib/grhsim/ir/verifier.cpp
-    lib/grhsim/dialect/registry.cpp
-    lib/grhsim/dialect/core.cpp
-    lib/grhsim/dialect/cpu.cpp
-    lib/grhsim/pass/pass.cpp
-    lib/grhsim/pass/simplify_internal.cpp
-    lib/grhsim/pass/const_fold.cpp
-    lib/grhsim/pass/simplify.cpp
-    lib/grhsim/pass/comb_pack.cpp
-    lib/grhsim/pass/canonicalize_compute.cpp
-    lib/grhsim/pass/bitwise_predicates.cpp
-    lib/grhsim/pass/bitwise_muxes.cpp
-    lib/grhsim/pass/mux_chain_fold.cpp
-    lib/grhsim/pass/recover_masked_or.cpp
-    lib/grhsim/pass/used_bits.cpp
-    lib/grhsim/pass/pack_bit_registers.cpp
-    lib/grhsim/pass/select_state_stores.cpp
-    lib/grhsim/pass/cone_extract.cpp
-    lib/grhsim/pass/classify_event_inputs.cpp
-    lib/grhsim/pass/lower_edge_detect.cpp
-    lib/grhsim/pass/extract_output_cones.cpp
-    lib/grhsim/pass/migrate_timeslot_tasks.cpp
-    lib/grhsim/pass/split_phases.cpp
-    lib/grhsim/backend/cpu.cpp
-    lib/grhsim/backend/cpu_partition.cpp
-    lib/grhsim/backend/cpu_layout.cpp
-    lib/grhsim/backend/cpu_schedule.cpp
-    lib/grhsim/backend/cpu_emit_plan.cpp
-    lib/grhsim/backend/cpu_phase_emit.cpp
-    lib/grhsim/backend/cpu_clone_shared.cpp
-    lib/grhsim/convert/grh_to_grhsim.cpp
-    lib/grhsim/io/json.cpp
     lib/transform/activity_schedule.cpp
+    lib/transform/grhsim/ops.cpp
+    lib/transform/grhsim/grh-to-grhsim.cpp
+    lib/transform/grhsim/simplify.cpp
+    lib/transform/grhsim/used-bits.cpp
+    lib/transform/grhsim/pack-bit-registers.cpp
+    lib/transform/grhsim/recover-masked-or.cpp
+    lib/transform/grhsim/split-event-and-output.cpp
+    lib/transform/grhsim/split-nonsink-and-sink.cpp
+    lib/transform/grhsim/partition-nonsink.cpp
+    lib/transform/grhsim/partition-sink.cpp
     lib/transform/demo_stats.cpp
     lib/transform/const_fold.cpp
     lib/transform/redundant_elim.cpp
@@ -355,117 +336,50 @@ target_link_libraries(grh-clone-tests
 
 register_test_exe(grh-clone-tests)
 
-# GrhSIM IR foundation
-add_executable(grhsim-ir-tests
-    tests/grhsim/test_grhsim_ir.cpp
-)
+add_executable(grh-sim-foundation-tests tests/grh/test_grh_sim_foundation.cpp)
+target_link_libraries(grh-sim-foundation-tests PRIVATE wolvrix-lib)
+register_test_exe(grh-sim-foundation-tests)
 
-target_link_libraries(grhsim-ir-tests
-    PRIVATE
-        wolvrix-lib
-)
+add_executable(grhsim-dialect-tests tests/transform/test_grhsim_dialect.cpp)
+target_link_libraries(grhsim-dialect-tests PRIVATE wolvrix-lib)
+register_test_exe(grhsim-dialect-tests)
 
-target_compile_definitions(grhsim-ir-tests
-    PRIVATE
-        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
-)
+add_executable(grh-to-grhsim-tests tests/transform/test_grh_to_grhsim.cpp)
+target_link_libraries(grh-to-grhsim-tests PRIVATE wolvrix-lib)
+register_test_exe(grh-to-grhsim-tests)
 
-register_test_exe(grhsim-ir-tests)
+add_executable(grhsim-transform-tests tests/transform/test_grhsim_transforms.cpp)
+target_link_libraries(grhsim-transform-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-transform-tests PRIVATE
+    WOLVRIX_GRHSIM_TRANSFORM_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts/grhsim-transforms")
+register_test_exe(grhsim-transform-tests)
 
-add_executable(grhsim-masked-or-tests tests/grhsim/test_masked_or.cpp)
-target_link_libraries(grhsim-masked-or-tests PRIVATE wolvrix-lib)
-target_compile_definitions(grhsim-masked-or-tests PRIVATE
-    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim/masked_or"
-    WOLVRIX_MASKED_OR_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/grhsim/data/cpu_masked_or.mk"
-    WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}"
-)
-register_test_exe(grhsim-masked-or-tests)
+add_executable(grhsim-virtual-partition-tests tests/transform/test_grhsim_virtual_partitions.cpp)
+target_link_libraries(grhsim-virtual-partition-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-virtual-partition-tests PRIVATE
+    WOLVRIX_GRHSIM_PARTITION_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts/grhsim-partitions/virtual")
+register_test_exe(grhsim-virtual-partition-tests)
 
-add_executable(grhsim-simplify-tests
-    tests/grhsim/test_grhsim_simplify.cpp
-)
+add_executable(grhsim-sink-schedule-tests tests/transform/test_grhsim_sink_schedule.cpp)
+target_link_libraries(grhsim-sink-schedule-tests PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-sink-schedule-tests PRIVATE
+    WOLVRIX_GRHSIM_PARTITION_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts/grhsim-partitions/sink")
+register_test_exe(grhsim-sink-schedule-tests)
 
-target_link_libraries(grhsim-simplify-tests
-    PRIVATE
-        wolvrix-lib
-)
+add_executable(grhsim-cpu-st-cpp-tests tests/emit/test_grhsim_cpu_st_cpp.cpp)
+target_link_libraries(grhsim-cpu-st-cpp-tests PRIVATE wolvrix-lib)
+target_include_directories(grhsim-cpu-st-cpp-tests PRIVATE tests/transform lib/emit/grhsim)
+target_compile_definitions(grhsim-cpu-st-cpp-tests PRIVATE
+    WOLVRIX_GRHSIM_PARTITION_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts/grhsim-cpu-st-cpp"
+    WOLVRIX_CPU_ST_TEST_FST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/external/libfst/src")
+register_test_exe(grhsim-cpu-st-cpp-tests)
 
-target_compile_definitions(grhsim-simplify-tests
-    PRIVATE
-        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
-)
-
-register_test_exe(grhsim-simplify-tests)
-
-add_executable(grhsim-whole-opt-tests
-    tests/grhsim/test_grhsim_whole_opt.cpp
-)
-
-target_link_libraries(grhsim-whole-opt-tests
-    PRIVATE
-        wolvrix-lib
-)
-
-target_compile_definitions(grhsim-whole-opt-tests
-    PRIVATE
-        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
-)
-
-register_test_exe(grhsim-whole-opt-tests)
-
-add_executable(grhsim-select-state-stores-tests
-    tests/grhsim/test_grhsim_select_state_stores.cpp
-)
-
-target_link_libraries(grhsim-select-state-stores-tests
-    PRIVATE
-        wolvrix-lib
-)
-
-target_compile_definitions(grhsim-select-state-stores-tests
-    PRIVATE
-        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
-)
-
-register_test_exe(grhsim-select-state-stores-tests)
-
-add_executable(grhsim-split-phases-tests
-    tests/grhsim/test_grhsim_split_phases.cpp
-)
-
-target_link_libraries(grhsim-split-phases-tests
-    PRIVATE
-        wolvrix-lib
-)
-
-target_compile_definitions(grhsim-split-phases-tests
-    PRIVATE
-        WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
-)
-
-register_test_exe(grhsim-split-phases-tests)
-
-add_executable(grhsim-event-lowering-tests tests/grhsim/test_grhsim_event_lowering.cpp)
-target_link_libraries(grhsim-event-lowering-tests PRIVATE wolvrix-lib)
-target_compile_definitions(grhsim-event-lowering-tests PRIVATE
-    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim")
-register_test_exe(grhsim-event-lowering-tests)
-add_executable(grhsim-cpu-phases-tests tests/grhsim/test_cpu_phases.cpp)
-target_link_libraries(grhsim-cpu-phases-tests PRIVATE wolvrix-lib)
-register_test_exe(grhsim-cpu-phases-tests)
-add_executable(grhsim-cpu-stores-tests tests/grhsim/test_cpu_stores.cpp)
-target_link_libraries(grhsim-cpu-stores-tests PRIVATE wolvrix-lib)
-register_test_exe(grhsim-cpu-stores-tests)
-find_program(WOLVRIX_TEST_VERILATOR verilator)
-add_executable(grhsim-cpu-phase-emit-tests tests/grhsim/test_cpu_phase_emit.cpp)
-target_link_libraries(grhsim-cpu-phase-emit-tests PRIVATE wolvrix-lib)
-target_compile_definitions(grhsim-cpu-phase-emit-tests PRIVATE
-    WOLVRIX_GRHSIM_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/grhsim"
-    WOLVRIX_GRHSIM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/grhsim/data"
-    WOLVRIX_TEST_LIBFST_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/external/libfst/src"
-    WOLVRIX_TEST_CXX="${CMAKE_CXX_COMPILER}")
-register_test_exe(grhsim-cpu-phase-emit-tests)
-set_tests_properties(grhsim-cpu-phase-emit-tests PROPERTIES SKIP_RETURN_CODE 77)
+# GRH array construction
+add_executable(array-create-tests tests/grh/test_array_create.cpp)
+target_link_libraries(array-create-tests PRIVATE wolvrix-lib)
+target_compile_definitions(array-create-tests PRIVATE
+    WOLVRIX_ARRAY_CREATE_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}/array_create")
+register_test_exe(array-create-tests)
 
 # core: toposort
 add_executable(core-toposort
@@ -527,6 +441,17 @@ target_compile_definitions(store-json-ir
 )
 
 register_test_exe(store-json-ir)
+
+add_executable(store-load-origin-attrs
+    tests/store/test_store_load_origin_attrs.cpp
+)
+
+target_link_libraries(store-load-origin-attrs
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(store-load-origin-attrs)
 
 add_executable(emit-sv-readmem
     tests/emit/test_emit_sv_readmem.cpp
@@ -691,6 +616,17 @@ target_link_libraries(transform-hier-flatten
 )
 
 register_test_exe(transform-hier-flatten)
+
+add_executable(transform-origin-attribution
+    tests/transform/test_origin_attribution.cpp
+)
+
+target_link_libraries(transform-origin-attribution
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-origin-attribution)
 
 add_executable(transform-instance-inline
     tests/transform/test_instance_inline_pass.cpp

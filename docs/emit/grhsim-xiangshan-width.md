@@ -1,5 +1,9 @@
 # XiangShan GrhSIM Emit Width Distribution and Wide-Op Lowering
 
+> Historical measurements for the retired emitter. The counts and lowering
+> below describe that version. Current storage/ABI and measurements are indexed
+> in the [unified GRH simulation workflow](../grhsim.md).
+
 This note summarizes how wide logic values appear in the current XiangShan GrhSIM emit flow, and how those wide operations are lowered into generated C++.
 
 ## Scope

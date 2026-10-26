@@ -1,11 +1,22 @@
 # GRH JSON 规范（StoreJson）
 
+仿真阶段也使用本格式：`grhsim`/`grhsim.cpu` 扩展操作、阶段属性、完整类型及
+虚拟归属保存在同一个 GRH Graph。独立 GrhSIM JSON loader 已删除；旧模型需从
+原始 SV/GRH 重新生成。SinkSchedule 与 emitter 私有计划不序列化，重载后的
+重建方法见 [仿真流程](../grhsim.md#python-and-checkpoints)。
+
 StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口。默认写入 `grh.json`（位于 `StoreOptions::outputDir`，缺省为当前工作目录），并通过 `StoreOptions::jsonMode` 控制排版：
 - `Compact`: 单行最紧凑格式。
 - `PrettyCompact`（默认）：保持顶层/Graph 缩进，但 `vals`/`ports`/`ops` 元素各占一行。
 - `Pretty`: 全量缩进换行（每个字段独立一行）。
 
 ## 顶层结构
+
+数组构造以普通 op 名 `kArrayCreate` 持久化，operands 按低元素到高元素排列。
+结果 value 必须记录 `shape=[N]+element.shape` 和 `w=N*element.w`；没有额外数组属性。
+例如两个 8 位标量按 operands `[a,b]` 构造的结果为 `w=16, shape=[2]`，低字节来自 a。
+载入后由 `grh.verify` 独立复核完整类型；容器布局不变。
+
 - `graphs`: 按图名升序排列的数组，每个元素为单个 Graph 描述。
 - `aliases`: 可选，别名对象。键为 alias，值为目标 Graph 名称（symbol）。
 - `declaredSymbols`: 用户定义模块名数组（必需，缺失视为错误）。
@@ -13,6 +24,11 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
 
 ## Graph 结构（按字段顺序输出）
 - `symbol`: 图名称（必需，缺失视为错误）。
+- `formatVersion`: 当前为 2，版本属于每个 Graph。
+- `dialects`: 方言名到整数版本的对象；基础 `grh:2` 必需，使用扩展 op 时声明对应版本，
+  如 `grhsim:1`、`grhsim.cpu:1`。未知方言、kind 或不支持的版本拒绝读取。
+- `metadata`: Graph 属性对象，负载编码与 op attrs 相同；保存转换阶段及逻辑域等语义。
+  分区/调度缓存、裸实体 ID、CPU 布局及 chunk 不进入此对象。
 - `declaredSymbols`: 模块内部声明的符号名数组（必需）。
 - `generateGroups`: 可选，generate 块内声明的副本分组数组（仅非空时写出，缺失视为空集合）。每项 `{ scope, name, symbols }`，均为符号文本：
   - `scope`: 无轮次的作用域路径（嵌套时以 `$` 连接块名，如 `gen_loop`、`outer$inner`）；hier-flatten 后叠加实例路径前缀（如 `u_inst$gen_loop`）。
@@ -22,6 +38,8 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `sym`: 符号名（必需，缺失视为错误）。
   - `w`: 位宽（数组值为总位宽，含全部维度）。
   - `sgn`: 是否有符号。
+  - `type`: kind 名称，`logic` / `real` / `string`；logic 可省略。
+  - `domain`: `2state` / `4state`，版本 2 必需，与 kind/width/sgn/shape 组成完整类型。
   - `shape`: 可选，int64 数组，非空时写出（见 grh-ir.md §2.3 的数组类型模型；
     元素位宽 = `w / ∏shape`，必须整除）。
   - `in` / `out` / `inout`: 输入/输出/inout 标记（`inout` 不可与 `in/out` 同时为真）。
@@ -128,6 +146,18 @@ JSON 中若仍保留该 op，表示流程未完成。
 
 ## 兼容性
 - Design 解析要求使用 `graphs/vals/ports/ops` 等新键名；属性对象支持 `t/k/kind` 与 `v/value`、`vs/values` 的兼容别名。
+- 无 formatVersion 的旧基础 GRH 默认为 FourState；不接受未知显式版本。
+  已删除的 `kAssignAs` 明确拒绝，提示重新生成。扩展 op 必须声明所属方言版本，
+  不能借无版本输入绕过检查。load 创建新设计实例，不恢复 revision 或 session 分析。
+- GrhSIM 形态仍使用本文容器，op 名为 `grhsim.edge-detect` 等注册名称；阶段保存在
+  metadata 的 `grhsim.stage`。`converted` 图无虚拟归属，后续归属为 op 的
+  `grhsim.partition:string[]`。公开 verifier 拒绝部分转换、非法阶段或不完整归属。
+  不使用旧 `wolvrix.grhsim.v3` 作为统一图的容器。
+- 状态的完整类型使用声明 attrs 的 `width/isSigned/valueType/domain/shape`。
+  typed InitSpec 保存为等长数组 `initSpecKinds/Values/Files/Formats/Starts/Counts/Seeds/HasSeeds/Random`，
+  数组完整键名均带 `initSpec` 前缀。kind 是 const/fill/readmem/random；start/count=-1
+  表示省略，hasSeeds 区分缺省 seed 与 seed=0。数组顺序就是初始化覆盖顺序。
+  setStateInitSpec 写入这组规范属性并移除旧 initKind/initValue/initFile/initStart/initLen。
 
 ## 示例
 ```json

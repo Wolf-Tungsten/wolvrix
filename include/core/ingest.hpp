@@ -334,6 +334,9 @@ struct ExprNode {
     std::string systemName;
     std::string xmrPath;
     std::vector<ExprNodeId> operands;
+    // Source element geometry for typed array constructors. Flat struct-field
+    // slices need an explicit equal-width assign before entering arrayCreate.
+    std::optional<wolvrix::lib::grh::LogicalType> arrayElementType;
     int32_t widthHint = 0;
     int32_t sliceWidth = 0;
     bool isSigned = false;

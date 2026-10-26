@@ -38,8 +38,6 @@ namespace wolvrix::app::pybind
     const slang::SourceManager *sessionDesignSourceManager(const SessionHandle &session,
                                                            std::string_view key);
     wolvrix::lib::grh::Design *sessionDesign(SessionHandle &session, std::string_view key);
-    wolvrix::lib::grhsim::GrhSimModel *sessionGrhSimModel(SessionHandle &session,
-                                                          std::string_view key);
 
     bool ensureSessionInsertable(const SessionHandle &session,
                                  std::string_view key,

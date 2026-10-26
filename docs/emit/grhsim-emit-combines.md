@@ -1,5 +1,8 @@
 # GrhSIM Emit Combine Framework
 
+> 历史 `grhsim-cpp` 方案。旧 emitter 已退役，正文保留设计背景；当前访问分析
+> 由 [grhsim-cpu-st-cpp](grhsim-cpu-st-cpp.md) 私有实现，S9 优化另行评估。
+
 ## 背景
 
 `grhsim-cpp` 目前主要按标准 GRH op 形态生成 C++。这种做法保持了 core GRH 的干净语义，但会把某些前端 lowering 形态原样带到仿真代码中。

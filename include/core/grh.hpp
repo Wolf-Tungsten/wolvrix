@@ -58,8 +58,8 @@ enum class OperationKind {
     kAShr,
     kMux,
     kAssign,
-    kAssignAs,
     kConcat,
+    kArrayCreate,
     kReplicate,
     kSliceStatic,
     kSliceDynamic,
@@ -96,6 +96,27 @@ enum class ValueType : uint8_t {
 
 std::string_view toString(ValueType type) noexcept;
 std::optional<ValueType> parseValueType(std::string_view text) noexcept;
+
+enum class LogicDomain : uint8_t {
+    TwoState,
+    FourState
+};
+
+std::string_view toString(LogicDomain domain) noexcept;
+std::optional<LogicDomain> parseLogicDomain(std::string_view text) noexcept;
+
+struct LogicalType {
+    ValueType kind = ValueType::Logic;
+    int32_t width = 1;
+    bool isSigned = false;
+    LogicDomain domain = LogicDomain::FourState;
+    std::vector<int64_t> shape;
+
+    void validate() const;
+    int32_t leafWidth() const;
+    LogicalType normalized() const;
+    friend bool operator==(const LogicalType&, const LogicalType&) = default;
+};
 
 using AttributeValue = std::variant<
     bool,
@@ -396,6 +417,7 @@ public:
     int32_t valueWidth(ValueId value) const;
     bool valueSigned(ValueId value) const;
     ValueType valueType(ValueId value) const;
+    LogicDomain valueDomain(ValueId value) const;
     // Packed-first structural view of an array value; empty span = scalar.
     // `valueWidth` always reports the total bit width; element width is
     // valueWidth / product(valueShape).
@@ -442,6 +464,7 @@ private:
     std::vector<int32_t> valueWidths_;
     std::vector<uint8_t> valueSigned_;
     std::vector<uint8_t> valueTypes_;
+    std::vector<uint8_t> valueDomains_;
     std::vector<Range> valueShapeRanges_;
     std::vector<int64_t> valueShapeDims_;
     std::vector<uint8_t> valueIsInput_;
@@ -471,7 +494,8 @@ public:
 
     ValueId addValue(SymbolId sym, int32_t width, bool isSigned,
                      ValueType type = ValueType::Logic,
-                     std::span<const int64_t> shape = {});
+                     std::span<const int64_t> shape = {},
+                     LogicDomain domain = LogicDomain::FourState);
     OperationId addOp(OperationKind kind, SymbolId sym);
     void addOperand(OperationId op, ValueId value);
     void addResult(OperationId op, ValueId value);
@@ -520,6 +544,7 @@ private:
         int32_t width = 0; // total bit width, including every array dimension
         bool isSigned = false;
         ValueType type = ValueType::Logic;
+        LogicDomain domain = LogicDomain::FourState;
         // Packed-first structural view of an array value; empty = scalar.
         // Row-major element layout with canonical index 0 at the lowest
         // element address; element width = width / product(shape). Logic
@@ -537,6 +562,9 @@ private:
         OperationKind kind = OperationKind::kConstant;
         SymbolId symbol;
         std::vector<ValueId> operands;
+        // Backlinks into each operand's mutable use-list. Enumeration order
+        // is unspecified; freeze reconstructs canonical operation order.
+        std::vector<std::size_t> operandUseIndices;
         std::vector<ValueId> results;
         std::vector<AttrKV> attrs;
         std::optional<SrcLoc> srcLoc;
@@ -592,6 +620,8 @@ public:
     int32_t width() const noexcept { return width_; }
     bool isSigned() const noexcept { return isSigned_; }
     ValueType type() const noexcept { return type_; }
+    LogicDomain domain() const noexcept { return domain_; }
+    LogicalType logicalType() const { return {type_, width_, isSigned_, domain_, shape_}; }
     // Array structural view; empty = scalar. `width()` stays the total bit
     // width, so element width = width() / product(shape()).
     std::span<const int64_t> shape() const noexcept { return shape_; }
@@ -606,7 +636,7 @@ private:
     friend class Graph;
 
     Value(ValueId id, SymbolId symbol, std::string symbolText, int32_t width, bool isSigned,
-          ValueType type, std::vector<int64_t> shape, bool isInput, bool isOutput, bool isInout,
+          ValueType type, LogicDomain domain, std::vector<int64_t> shape, bool isInput, bool isOutput, bool isInout,
           OperationId definingOp, std::span<const ValueUser> users,
           std::optional<SrcLoc> srcLoc, const Graph* owner, bool usersLoaded);
 
@@ -616,6 +646,7 @@ private:
     int32_t width_ = 0;
     bool isSigned_ = false;
     ValueType type_ = ValueType::Logic;
+    LogicDomain domain_ = LogicDomain::FourState;
     std::vector<int64_t> shape_;
     bool isInput_ = false;
     bool isOutput_ = false;
@@ -702,6 +733,11 @@ public:
     const GraphId& id() const noexcept { return graphId_; }
     Design& owner() const noexcept { return *owner_; }
 
+    std::span<const AttrKV> metadata() const noexcept { return metadata_; }
+    std::optional<AttributeValue> metadata(std::string_view key) const;
+    void setMetadata(std::string_view key, AttributeValue value);
+    bool eraseMetadata(std::string_view key);
+
     GraphSymbolTable& symbols() noexcept { return symbols_; }
     const GraphSymbolTable& symbols() const noexcept { return symbols_; }
     void reserveSymbolCapacity(std::size_t count);
@@ -766,12 +802,18 @@ public:
 
     ValueId createValue(SymbolId symbol, int32_t width, bool isSigned,
                         ValueType type = ValueType::Logic,
-                        std::span<const int64_t> shape = {});
+                        std::span<const int64_t> shape = {},
+                        LogicDomain domain = LogicDomain::FourState);
     ValueId createValue(int32_t width, bool isSigned,
                         ValueType type = ValueType::Logic,
-                        std::span<const int64_t> shape = {});
+                        std::span<const int64_t> shape = {},
+                        LogicDomain domain = LogicDomain::FourState);
+    ValueId createValue(SymbolId symbol, const LogicalType& type);
+    ValueId createValue(const LogicalType& type);
     OperationId createOperation(OperationKind kind, SymbolId symbol);
     OperationId createOperation(OperationKind kind);
+    // result[i] = elements[i]; adds an outer dimension, including N=1.
+    ValueId createArray(std::span<const ValueId> elements);
 
     ValueId findValue(SymbolId symbol) const noexcept;
     OperationId findOperation(SymbolId symbol) const noexcept;
@@ -782,6 +824,10 @@ public:
     int32_t valueWidth(ValueId value) const;
     bool valueSigned(ValueId value) const;
     ValueType valueType(ValueId value) const;
+    LogicDomain valueDomain(ValueId value) const;
+    LogicalType valueLogicalType(ValueId value) const;
+    // Explicit semantic type changes; callers must update producers and users.
+    void setValueLogicalType(ValueId value, const LogicalType& type);
     // Array structural view of a value; empty span = scalar. See
     // GraphView::valueShape for the layout contract.
     std::span<const int64_t> valueShape(ValueId value) const;
@@ -796,6 +842,9 @@ public:
     std::span<const AttrKV> opAttrs(OperationId op) const;
     std::optional<SrcLoc> opSrcLoc(OperationId op) const;
     Value getValue(ValueId id) const;
+    // Borrowed current use-list; invalidated by graph mutation or freeze.
+    // Enumeration order is unspecified. Copy it before mutating uses.
+    std::span<const ValueUser> valueUsers(ValueId value) const;
     Operation getOperation(OperationId id) const;
 
     void bindInputPort(std::string_view name, ValueId value);
@@ -810,12 +859,8 @@ public:
     ValueId inputPortValue(std::string_view name) const noexcept;
     ValueId outputPortValue(std::string_view name) const noexcept;
 
-    // Picks the assignment op kind for `src -> dst`: kAssign when the value
-    // types are identical (width, signedness and shape all equal), kAssignAs
-    // when the bits are preserved but the type differs (pack/unpack view).
-    // Width-mismatched pairs cannot be expressed by either op and still return
-    // kAssign so the legacy producer stays visible to the verifier.
-    OperationKind assignKindFor(ValueId src, ValueId dst) const;
+    // Full value type equality, including shape. Does not alias or retype values.
+    bool sameValueType(ValueId lhs, ValueId rhs) const;
 
 
     void addOperand(OperationId op, ValueId value);
@@ -827,7 +872,7 @@ public:
     void replaceAllUses(ValueId from, ValueId to);
 
     // Aliases `from`'s uses to `to` with type honesty: identical types alias
-    // directly; otherwise a kAssignAs view typed like `from` is inserted so the
+    // directly; otherwise a kAssign view typed like `from` is inserted so the
     // (bit-identical) retype stays explicit. Returns the value actually aliased
     // in place of `from`. Width-mismatched or invalid pairs throw via the
     // underlying replaceAllUses / view construction.
@@ -868,10 +913,7 @@ private:
     void ensurePortsCache() const;
     GraphBuilder& ensureBuilder();
     void removeSymbolFromGenerateGroups(SymbolId sym) noexcept;
-    // stage-07 shape contract for aliasing APIs: a flat replacement of a
-    // shaped value gets the shape backfilled (shape is a structural view, same
-    // total width by construction); aliasing two different non-empty shapes is
-    // rejected loudly instead of corrupting consumer geometry downstream.
+    // Alias replacement requires the complete value type to be identical.
     void guardShapeAlias(ValueId from, ValueId to, std::string_view api);
     const GraphView& view() const;
     Value valueFromView(ValueId id) const;
@@ -883,12 +925,14 @@ private:
     Design* owner_;
     std::string symbol_;
     GraphId graphId_{};
+    std::vector<AttrKV> metadata_;
     GraphSymbolTable symbols_;
     std::optional<GraphView> view_;
     std::optional<GraphBuilder> builder_;
     std::vector<SymbolId> declaredSymbols_;
     std::unordered_set<uint32_t> declaredSymbolSet_;
     std::vector<GenerateGroup> generateGroups_;
+    std::unordered_map<uint32_t, std::vector<std::size_t>> generateGroupsBySymbol_;
     mutable std::vector<ValueId> valuesCache_;
     mutable std::vector<OperationId> operationsCache_;
     mutable std::vector<Port> inputPortsCache_;
@@ -903,11 +947,14 @@ private:
 
 class Design {
 public:
-    Design() = default;
+    Design();
     Design(Design&& other) noexcept;
     Design& operator=(Design&& other) noexcept;
     Design(const Design&) = delete;
     Design& operator=(const Design&) = delete;
+
+    uint64_t instanceId() const noexcept { return instanceId_; }
+    uint64_t revision() const noexcept { return revision_; }
 
     Graph& createGraph(std::string name);
     Graph& cloneGraph(std::string_view sourceName, std::string newName);
@@ -936,10 +983,14 @@ public:
     static Design fromJsonString(std::string_view json);
 
 private:
+    friend class Graph;
+    void touch() noexcept { ++revision_; }
     Graph& addGraphInternal(std::unique_ptr<Graph> graph);
     void resetGraphOwners();
 
     DesignSymbolTable designSymbols_;
+    uint64_t instanceId_ = 0;
+    uint64_t revision_ = 0;
     std::unordered_map<std::string, std::unique_ptr<Graph>> graphs_;
     std::unordered_map<std::string, std::string> graphAliasBySymbol_;
     std::vector<std::string> graphOrder_;

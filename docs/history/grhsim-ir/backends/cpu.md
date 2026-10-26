@@ -1,0 +1,969 @@
+> Historical independent-IR design, retired on 2026-10-26. APIs, pass names and
+> implementation paths below describe that archived version. For the current
+> unified GRH simulator, see the [simulation workflow](../../../grhsim.md).
+
+# GrhSIM CPU 后端
+
+`core.compute.arrayCreate` 直接向调用方拥有的局部/frame 数组逐项写入，不返回大型
+`std::array` helper，不先物化总宽 `_BitInt`；宽元素仍按元素使用 `_BitInt`。
+输出与 whole/indexed 状态写共用目的地元素写入路径，优先读取兼容 row-backed 存储，
+打包位值才走位段提取。boundary 发布使用数组快照，后续 helper 按原 use context
+读取 boundary；状态写先保存源快照，保持 enable、mask、变化检测、reader 激活与写优先级。
+mapping 估算计入元素数，frame 分析使用全部 operands；真实扁平消费者按需打包。
+
+> **状态（2026-10-13）**：本文保留了部分 M5d-6 的七 store、`P_mem` 和旧调度说明，
+> 这些段落不再代表当前六阶段实现。当前 store、phase 与 schedule 字段以
+> `include/grhsim/ir/model.hpp` 和对应 pass 文档为准；§2.2 的多维数组 emit 约束
+> 已按当前实现更新。§5 中旧 emitter 行为段落仍作为设计背景保留。
+
+本文定义 CPU 后端的映射结构 `CpuBackendMapping`。[GrhSIM IR Overview](../overview.md)
+定义通用模型和后端边界；本文中的三个分量仅属于 CPU 后端，不是其他后端必须采用的结构。
+
+从模型输入到构建、运行和验收的步骤见 [CPU 单线程活动度仿真 Flow](../flows/cpu-st.md)。
+
+## 1. `CpuBackendMapping`
+
+```text
+CpuBackendMapping
+  data_layout: DataLayout
+  partition_tree: PartitionTree
+  schedule_plan: SchedulePlan
+```
+
+- `DataLayout` 为 I/O/S 对象和 graph value 选择 CPU 物理表示与存储位置；
+- `PartitionTree` 把 `G` 的 op 组织为层次化分区；
+- `SchedulePlan` 把分区映射到 NUMA node 和 CPU core，并规定执行顺序与跨 core 依赖。
+
+三个分量共同映射同一个 `GrhSimModel`，但不改变其 op、value、对象或执行语义。这里的排列只是
+数据结构的组成，不规定三个分量的生成顺序。
+
+## 2. `DataLayout`
+
+```text
+DataLayout
+  pointer_bytes: UInt32
+  types: CpuType[]                  # 独立物理类型表，CpuTypeId 稠密
+  namedStores: CpuNamedStore[]?     # 12 个具名 store，C3 起
+
+CpuNamedStore
+  kind: smallSink | largeSink | input | nonSinkBoundary
+      | smallSinkEnableBoundary | smallSinkPayloadBoundary
+      | largeSinkEnableBoundary | largeSinkPayloadBoundary
+      | prevEvent | eventAct | timeslotTrigger | activeFlags
+  fields: [{name, type, offset, state | value, aux}]
+  sizeBytes: UInt64
+```
+
+物理类型引用 [cpu 方言](../dialects/cpu.md) 中的一种类型。cpu 方言的类型在取值集合之外
+还定义了 CPU 内存中的物理表示（大小、对齐和存储结构），因此 `DataLayout` 不重复记录这些
+信息。方言语义类型到物理类型的典型对应（C3 为每个状态/boundary value 选择类型时应用）：
+
+| 语义类型 | cpu 类型 |
+| --- | --- |
+| `core.logic<1, false, 2-state>` | `cpu.bool` |
+| `core.logic<w, s, 2-state>` | `w <= 64` 时按 `s` 取 `cpu.uint8/16/32/64` 或 `cpu.sint8/16/32/64` 中最小能容纳 `w` 位者；`w > 64` 时取 `cpu.uint<w>`（存储恒无符号，signedness 在运算点恢复） |
+| `core.logic<w, s, 4-state>` | `cpu.array<V, 2>`，`V` 是对应的 2-state 表示 |
+| `core.real` | `cpu.f64` |
+| `core.string` | `cpu.str` |
+| 带 shape 的两态 `core.logic<w, s, d>`（数组） | 每个 shape 维度各嵌套一层 `cpu.array`，最外维在最外层；`shape=[2,3]` 映射为 `cpu.array<cpu.array<U,3>,2>`，`U` 对应元素位宽 `w/∏shape`，见 §2.2。四态 aggregate 不支持 emit。 |
+
+当前 `cpu.str` 的物理槽是 `pointer_bytes` 大小的字符串句柄，不是在字节 arena 中内嵌
+`std::string`。C++ emitter 让句柄指向独立的类型化字符串对象：object、boundary 和 input
+shadow 的字符串由模型持有；partition-local 字符串由 supernode 调用栈持有，生命周期覆盖
+其全部 helper chunk。`init()` 清空持久字符串并重新绑定被 arena 清零覆盖的句柄，析构由
+C++ RAII 完成。字符串 state 的初始化/提交尚未实现（shape 只配 `core.logic`，字符串数组
+不再是可表达的类型），emit 明确拒绝，不能走
+字节 memcpy 或把句柄解释为 `std::string` 对象内嵌。
+
+单结果 `core.compute.constant` 的两态 logic<1..64> 操作数在使用点直接发射为
+按原类型截断/符号扩展的 C++ literal，不物化到 local/boundary arena，也不发出
+常量变化通知。例如 `%one = constant logic<1,false> 1`、`%mask = constant
+logic<8,false> 255` 作为 `write` 的 enable 和 mask 时，消费者直接使用 true 和
+255，编译器可消去恒定的 enable 分支与全位掩码运算。`logic<5,true>` 的 `5'h1d`
+仍为 -3，`logic<1,false>` 仍按最低位截断，X/Z 沿用 two-state 投影为零的规则。
+所有 compute unit、commit domain 和端口活动位在 `init()` 时已激活，首次求值
+及重新初始化无需依赖常量生产者通知；常量后续不会变化。IR、mapping、任务顺序
+和布局中的槽保持不变。宽常量仍走原存储路径，DPI inout 从 literal 初始化独立
+可写临时值，再单独发布 result，不修改常量本身。
+
+输入和结果均为 unsigned two-state logic<1> 的 `core.compute.and/or` 直接发射
+bool 操作数的 `a & b` / `a | b`，省去通用 scalar cast 包装。
+[grhsim.bitwise-predicates](../passes/bitwise-predicates.md) 可在 mapping 之前将
+同类型 logical AND/OR 规范化到这些 op；两输入已求值且值域为 {0,1}，无需
+C++ 短路控制依赖。宽度、符号或 domain 不满足条件时沿用原规则。
+
+[grhsim.pack-bit-registers](../passes/pack-bit-registers.md) 使同控制bit寄存器共用
+至多64位的状态和提交操作。变换后重新mapping；emitter仍用已有scalar concat、
+slice和masked write路径。例如两个写口`q0<=d0; q1<=d1`成为一次
+`packed<={d1,d0}`，读者通过固定slice取得相应bit。packed的compute-only读取
+可沿用安全别名，直接用于commit的slice结果仍物化旧值快照。通知变为packed
+状态的读者并集，减少提交粒度的同时可能扩大唤醒范围；不以静态写口数量代替
+性能验证，也不改变quiescence投影的语义。
+
+不可变 `core.compute.constant` 字符串例外：emitter 在使用点直接引用已转义的
+`std::string` 常量表达式，不生成独立赋值或 local/boundary 字符串对象绑定；布局中的
+槽仍保留，mapping 不变。例如 guarded DPI 的字符串构造位于原有 `if (enable &&
+eventGuard)` 内，而非 guard 之前。动态字符串、DPI output/inout 的存储和保持语义不变。
+所有 compute supernode 初始化时已激活，常量不再需要运行期变化通知；此优化不改变
+调用次数、void 调用存活性、event 检测、history 采样或 compute/commit 分类。
+
+当前 CPU emitter 对 two-state logic state 及其数组（带 shape 的 logic state）完整应用显式
+初始化步骤：scalar `const`/`random`、array `const`/`fill`/`readmem`。数组 const 的
+`value` 是总位宽的单个 logic literal（不逐元素书写）；fill/readmem 的 `start`、`count`
+是非负线性行地址和行数（行主序摊平，见 core 方言第 2.1 节），缺省为 0 和剩余长度，
+显式 count=0 不写入。步骤按序覆盖，未覆盖的行、非法范围、
+缺失值和不支持的类型在发射文件前报错，不能以 arena 的清零替代语义初值。
+
+readmem 沿用 legacy 的发射期解析方式，共用注释/空白分词与十六进制 `@address` 解析器；
+相对文件名基于发射进程工作目录解析。数据 token 按 hex/bin 和元素位宽解码，X/Z 在
+two-state 目标中投影为 0，越宽高位截断。`@address` 是绝对行号，指定范围外的数据不写入；
+重复地址按文件顺序覆盖，短文件不会改写未提供数据的行。发射出的静态地址/数据表在
+`init()` 中直接写目标缓冲区，不在仿真时重新打开源文件。例如 8 行 byte 数组先
+`fill {value: "8'h55"}`，再 `readmem {file: "data.hex", format: "hex", start: 2, count: 2}`，
+文件内容 `aa @3 bb @0 ff` 仅把第 2/3 行改为 aa/bb，其余行仍为 55。
+
+random 使用 legacy SplitMix64 算法，每个宽值按低字到高字写入目标并截断尾字，fill 每行
+独立采样；不构造返回值宽数组。CPU backend 的无 seed RNG 初值为
+`0x6a09e667f3bcc909`，每次 `init()` 重置；显式整数 seed 以其 64-bit 位模式初始化该步骤
+的局部 RNG，不消耗共享流。此处规定的是 backend 的可复现随机策略，不声称随机序列与
+其他 SV 仿真器一致。real/string state 仍明确拒绝，不能视为已支持。
+
+位向量放入整数或宽整数时低位对齐：向量的第 0 位对应整数的最低位，超出位宽的高位
+按符号性填充（无符号补 0，有符号补符号位）。4-state 数组的第 0 个元素保存 value，
+第 1 个元素保存 known：某一位为 X 或 Z 时对应 known 位为 0，否则为 1。
+
+该对应是默认选择而非约束：只要 cpu 类型的取值集合覆盖语义类型的取值集合，`DataLayout`
+可以为同一语义类型选择不同的 cpu 类型。
+
+named stores 共同覆盖模型的持久数据：`smallSink`/`largeSink` 按 A7 `storeClass`
+覆盖 `S` 的每个状态，`input` 单独保存外部输入，`nonSinkBoundary` 保存 nonSink
+超节点间的 value。写参数按目标类别拆为 small/large 两套 enable/payload boundary
+store；其余 store 保存事件聚类、timeslot 标志与激活位图。`F` 中的外部函数声明
+不是数据对象，不在覆盖范围；超节点内部的临时 value 不占 named store 字段。
+
+一个 value 是否跨超节点，由 `G` 中的定义/使用关系和 `PartitionTree` 共同确定；C3 据此
+把跨 nonSink 超节点 value 收入 `nonSinkBoundary` store，不能改变 value 的生产者或使用者。
+
+`DataLayout` 不定义初始化语义，也不保存初值。`Init` 始终是 `GrhSimModel` 的分量，初始化
+语义（步骤种类、覆盖规则）完全由 core 方言定义（见 core 方言第 2.1 节），CPU 后端只负责
+执行：实例创建时，对每个 `S` 对象按其语义类型依次求值 `InitSpec` 的各个步骤，得到完整
+确定的语义初值，再按其 `cpu_type` 的物理表示逐层编码写入对象存储：
+
+- 标量和宽整数：按本节约定的位序与填充规则写入；
+- `cpu.array`：第 `k` 个元素编码到偏移 `k * stride` 处。
+
+初始化只写 `S` 对象；`I` 由调用方设置，`O` 由 op 写入。
+
+### 2.1 当前 `cpu.st.layout-named-stores`（C3）实现
+
+旧 `cpu.st.layout-data`（canonical object/value/frame/runtime arena、boundary 致密化、
+helperReadCaches）已在 M5d-6 删除。当前布局由 C3
+[`cpu.st.layout-named-stores`](../passes/layout-named-stores.md) 在 `GeneralSupernodes`
+stage 之后生成，产出 `LayoutNamedStores` stage，mapping 仍为 `complete=false`。CPU 类型表
+使用独立 `CpuTypeId`，不改写语义类型表；默认 registry 注册 `cpu` 类型方言，但禁止 CPU
+类型出现在语义类型表中。当前 ABI 固定为 64 位指针。
+
+`CpuDataLayout` 只含两个 payload：`types`（按 ID 稠密存储
+`kind/width/elementType/count/size/alignment`，结构相同的类型去重）与 `namedStores`
+（固定顺序的 12 个具名 store）。状态归 store 只消费 A7 `storeClass` 注解，未分类状态
+报错并指向 `grhsim.select-state-stores`；input、nonSink、smallSink enable/payload、
+largeSink enable/payload 分别建 store，largeSink 写参数槽位沿用
+`<state>__w<idx>__<role>` 命名。命名推演集中在 C3，emit 只消费；
+所有大小计算检查 UInt64 溢出。verifier 对 named stores 做结构校验（类型表稠密、store
+定序、字段名全图唯一、偏移对齐不重叠、状态双射、各类 boundary 按图重算、每聚类一条目），
+不再做旧 canonical 布局的重建比较。
+
+JSON 的 CPU layout 为 `[pointer_bytes, [types...], [named_stores...]?]` 位置化数组；
+未知枚举、缺失 layout 和 stage/payload 不一致均被拒绝。
+
+### 2.2 数组状态的布局与发射形状（stage-06）
+
+带 shape 的两态 `core.logic` state 按 shape **逐维嵌套**：
+`shape=[d0,d1,...,dn]` 对应 `cpu.array<cpu.array<...<U,dn>...,d1>,d0>`，其中
+`U` 是元素位宽对应的物理类型。生成的 C++ 字段、端口和 shaped 局部值也保留同一组
+维度，例如 8 位元素的 `[2,3]` 声明为 `std::array<std::array<std::uint8_t,3>,2>`。
+行主序元素仍连续存放；内部打包或线性偏移计算不改变多维声明。宽于 64 位的两态
+元素使用单个 `cpu.uint<elementWidth>` / C23 `_BitInt` 对象。四态 aggregate 在
+GrhSIM emit 中明确拒绝。
+
+`readArray`/`writeArray`/`sliceArray` 的多索引遵守逐维 shape，完整索引定位元素，
+部分索引取得剩余维度的子数组；必要的线性行号按
+`stride_j = ∏shape[j+1:]` 折叠，仅用于行主序偏移或静态 reader 匹配，不能替代
+生成类型中的多维结构。
+
+整体数组写（目标是数组状态的 `write`）的发射策略参照 gsim 的 `arrayCopy` 三档：常量
+折叠（RHS 为常量）/ 逐元素展开（RHS 元素结构已知时逐元素 store）/ 循环拷贝（一般情形，
+按行主序 for 循环拷贝）；元素写始终是单条索引 store，不拼位。
+
+Aggregate 直写优化默认生效，不提供额外开关。flat state 的 shaped read 在元素宽为
+8/16/32/64 bit 且布局一致时直接复制行镜像；shaped concat 优先拼接 row-backed
+数组和 scalar 的行，字节对齐时使用 `memcpy`，不足一字节的元素逐行赋值。例如
+`concat(6'b110110, array<2 bit>[4])` 的低四行来自数组，高三行依次为 `2,1,3`。
+一维 scalar concat 若每个 operand 恰为一行，则 whole-array write 直接消费各行，
+继续使用原有写掩码、变化检测和 reader 激活逻辑。sink 中只有当前 boundary context
+可读的 lane 才能展开；不满足几何或可见性条件时保留原打包路径。字节镜像复制在
+小端目标启用，大端目标使用逐行提取。
+
+FST 波形对数组一律**逐元素注册 var**，使用方括号规范名 `arr[i0][i1]...`（GTKWave 折叠
+为数组树）；总字节超过 `kWaveMaxBytes`（512）的数组整个不 dump（不做截断式部分
+dump），宽元素逐元素走 _BitInt u64-word 镜像路径——逐元素化同时解除了旧"元素宽 ∈
+{8,16,32,64}"的限制。largeSink 类 state 不进 FST。详见 §5 的 FST 波形小节。
+
+## 3. `PartitionTree`
+
+```text
+PartitionTree
+  root: PartitionId
+  partitions: Map<PartitionId, Partition>
+
+Partition
+  parent: PartitionId?
+  children: PartitionId[]
+  ops: OpId[]
+  attrs: PartitionAttrs
+
+PartitionAttrs
+  kind: root | phase | event_domain | supernode | node | active_word | emit_function
+  phase: none | compute | commit | event | general | large_sink | output
+  helper_chunks: [{offset: UInt32, count: UInt32}]
+  event_acts: Int64[]?                             # General 超节点命中的聚类并集（C2 起 engaged，无事件为空数组；sink 超节点上即事件签名）
+  supernode_range: {offset: UInt32, count: UInt32}?  # General 分枝尾随 EmitFunction 叶子（C6 起）
+  supernode_category: non_sink | small_sink_escape | small_sink_event?  # General 超节点分类
+  enable_guard: Int64?                             # 共享 en 细分的 SmallSinkEvent 超节点：成员共有写使能的 value index
+```
+
+`event_domain`/`active_word` kind 与 `compute`/`commit` phase 的枚举值仅为 checkpoint
+兼容保留，不再产生；旧 `event_gate`/`active_id`/`active_word` 字段已在 M5d-6 删除。
+`supernode_category` 在 V2-M1 引入：`non_sink` 超节点只含有返回值 op（走合并框架），
+`small_sink_event`/`small_sink_escape` 超节点只含无返回值 op（按优先级及事件签名聚类；空签名为逃逸类，
+每个 round 无条件激活）。V2-M1 之前的 checkpoint 缺少该字段，载入后由校验器拒绝。
+
+`PartitionTree` 满足以下约束：
+
+- `root` 是唯一没有 `parent` 的分区；
+- 每个非根分区恰好有一个父分区，父子引用必须互相一致且不能形成环；
+- 只有叶分区直接包含 `ops`，每个 `G` 中的 op 恰好属于一个叶分区；
+- 一个非叶分区覆盖其全部后代叶分区中的 op，根分区覆盖整个 `G`。
+
+CPU 后端可以把叶分区作为 node，把由若干子分区组成的非叶分区作为 supernode。node 和
+supernode 是 `PartitionTree` 中的层次关系，不是新的 graph op。
+
+value 仍然是 `G` 中的边。跨分区 value 可以由其生产 op 和使用 op 所属的叶分区推导，不在
+`PartitionTree` 中重复保存。
+
+### 3.1 单线程活动度分区（C 段）
+
+当前分区树由 C 段建立（各 pass 的机制见对应文档）：
+
+```text
+root
+  phase Event    -> emit_function -> ops         ; 锥拓扑序，edgeDet 殿后
+  phase General  -> supernode+ -> node+ -> ops   ; 超节点直挂 General 分枝，子节点顺序即序号
+                 -> emit_function+               ; 尾随叶子，只记 supernode_range 区间
+  phase LargeSink -> emit_function -> ops        ; op-id 序
+  phase Output   -> emit_function -> ops         ; 拓扑序
+```
+
+`kind` 标注树层次的用途，不增加独立的域、word 或函数实体。`CpuBackendMapping.stage`
+依次为 `GeneralNodes / GeneralSupernodes / LayoutNamedStores / EventActivationMap /
+MemWritePlan / GeneralFunctions / PhaseSchedule / TranslationUnits`（M5d-7 追加终态；
+`EventActivationMap` 在 V2-M2 前名为 `EventBitmaps`）；
+流水线顺序由 `cpuMappingStageRank` 给出（`GeneralFunctions` 的枚举数值在
+`MemWritePlan` 之前，但排在它之后）。每个 pass 只推进一个 stage：DataLayout 由第
+2.1 节的 C3 生成，SchedulePlan 由第 4.1 节的 C7 生成，TU 计划由 C8
+（[plan-translation-units](../passes/plan-translation-units.md)）生成。`PhaseSchedule`
+与 `TranslationUnits` 两个终态的 mapping 均为 `complete=true`，表示映射数据齐全；
+`cpu.st.emit-cpp` 只消费 `TranslationUnits` 映射生成模型，但完整映射本身不能替代
+生成代码的运行验收。
+
+历史注记：旧两阶段线的分区 pass（compute/commit 两枝、commit 事件域、active word 层）
+已在 M5d-6 删除；其逆拓扑锥吸收、out1/in1/sibling coarsen + 商图检查 + DP 分段与事件域
+合并禁止条件等算法思想由 C1/C2 继承（见
+[build-general-nodes](../passes/build-general-nodes.md) 与
+[merge-general-supernodes](../passes/merge-general-supernodes.md)）。
+
+### 3.2 持久化
+
+CPU mapping 由模型持有，backend 为 `cpu`，schema 为 `cpu.st.v1`。在 streaming
+`wolvrix.grhsim.v2` 的 mapping 行中，第五项为 schema 专属 payload：
+
+```text
+[backend, schema, complete, parameters, [stage, root, partitions, layout?, schedule?, tu_plan?]]
+partition = [id, parent, kind, phase, children, ops]
+          | [id, parent, kind, phase, children, ops, attr_tail]
+attr_tail = [[helper_offset, helper_count], ...]   -- helperChunks
+            [[event_act, ...]]?                    -- eventActs（C2 起）
+            [[range_offset, range_count]]?         -- supernodeRange（C6 起）
+            enable_guard?                          -- 标量 value index，仅 A1 守卫细分
+                                                     -- 的 SmallSinkEvent 超节点（category 标量之后）
+layout    = [pointer_bytes, [type, ...], [named_store, ...]?]
+schedule  = [numa_nodes, input_fanout, supernode_fanout, state_fanout,
+             event_activation?, mem_write_plan?, timeslot_triggers?]
+tu_plan   = [chunk_max_lines, unit_max_lines, [tu, ...]]        -- M5d-7（C8 起）
+tu        = [name, estimated_lines, [[kind, offset, count, estimated_lines], ...]]
+```
+
+attr_tail 与 schedule 尾部保持位置化追加：靠后的字段存在时，靠前的可选字段以空数组
+占位写出。ID 延续已有整数编码，parent 的 0 表示无父分区。枚举按 C++ 定义的顺序从 0
+编码，未知值在读取时拒绝；stage 早于 `SplitPhases` 的旧 checkpoint 被 verify 拒绝。
+旧的非 CPU mapping 行仍为四项，空 mappings 的旧 checkpoint 可直接读取。
+load 和 clone 为 mapping 绑定新模型 identity；semantic mutation 清除整个 mapping。
+
+## 4. `SchedulePlan`（M5d-6 历史说明）
+
+本节保留早期七 store / `P_mem` 版本的细节，当前六阶段调度和 fanout 以
+[CPU 单线程活动度仿真 Flow](../flows/cpu-st.md) 第 4–5 节为准。
+
+```text
+SchedulePlan
+  numa_nodes: NumaNodeSchedule[]
+  inputFanout: Map<ValueId, ActivationTargets>
+  computeSupernodeFanout: Map<ValueId, ActivationTargets>
+  commitStateFanout: Map<StateId, ActivationTargets>
+  eventActivation: [{act: UInt32, supernodeWords: UInt64[]}]?    # C4（只覆盖 nonSink 超节点）
+  memWritePlan: [{writeOp, priority, eventFree, readers}]?       # C5（保留旧结构名；目标是 largeSink）
+  timeslotTriggers: [{act: UInt32, flag: UInt32}]?               # C7
+
+ActivationTargets
+  activate: PartitionId[]
+
+NumaNodeSchedule
+  numa_node: NumaNodeId
+  cores: CpuCoreSchedule[]
+
+CpuCoreSchedule
+  core: CpuCoreId
+  tasks: ScheduledTask[]
+
+ScheduledTask
+  id: TaskId
+  partition: PartitionId
+  waits_for: TaskId[]
+  execution: AlwaysScanCommit | DataGated | EvalEnd
+```
+
+旧的 `quiescenceProjection`/`roundSeeds`/`inputShadows`/demonitor 字段已在 M5d-6 删除；
+`ActivityDrivenCompute`/`DomainGatedCommit` 执行方式枚举仅为 checkpoint 兼容保留。
+
+单线程方案的 task 引用 EmitFunction 叶子分区，只有一个 NUMA node 和 core，`waits_for`
+为空。task 顺序为 P_event（`AlwaysScanCommit`）→ P_general 各 EmitFunction
+（`DataGated`，执行其 `supernodeRange` 区间内的活动超节点；V2-M2 前名为
+`EventDataGated`）→ P_mem（`AlwaysScanCommit`）→ P_output（`EvalEnd`，round 循环外）；
+P_general 扫描按超节点类别点火（非 sink 查 dataActiveFlag，SinkEvent 查 eventActStore
+签名，SinkEscape 每轮无条件；A1 守卫细分的 SinkEvent 在签名门之后再 AND 一次
+`enableGuard` value 的读取——形如 `if(actBitsGuard(sig) && read(enableGuard))`，
+该 value 即成员 write 共有的 en 操作数，经 boundaryValueStore（或
+input/state 读取重发）现成可读，语义上与体内逐 op 的 en 判断等价）。当前
+dataActiveFlag/dataActiveFlagNext 使用 gsim 兼容的 byte-packed 位图：bit `i % 8`
+位于 byte `i / 8`，扫描先按字节外层跳过（一个非零判断覆盖 8 个静默超节点），
+字节内逐位读 live byte 检测并清位点火——同轮 fanout 目标恒在扫描方向前方
+（activateFanout 的 ordinal>current 规则），live byte 语义与旧逐字节循环逐点等价；
+fanout 置位与 P_event 激活一律按字节批量掩码 OR，P_publish 的并入与收敛判定同为字节级。
+V2-M3 起 sink 超节点体内不再保留逐 op event guard
+（SinkEvent 全体 op 与超节点签名同集，调用点门控已覆盖；en、地址等数据条件保留）；
+非 sink 超节点内的事件 op 与 P_mem 写口仍保留逐 op event guard 精判，负责最终语义
+判断。
+
+P_mem 写口的 enable 判定另有一层 `memEnableBits` 影子位图（`cpu.st.emit-cpp
+--mem-enable-bitmap`，默认 on）：emit 期为每个"boundary 字段承载的 1-bit 两态
+enable"（compare-store 发布的 value 字段，或 input.read 直读的输入端口字段）分配一个
+稠密位；位图由 init() 末尾按 boundary 字段一次性构建，之后由三条写路径同步——
+`publishBoundary`/`publishDpiResult` 的 compare-store 在字段真变化时同步置位/清零，
+`pInput` 的输入端口直写在变化时同步。P_mem 端口守卫因此从"每轮重读散布在
+BoundaryValueStore 大结构上的 enable 字段"变为稠密位测试；且每个 mem chunk 内
+enable 全部被影子化的极大连续 run 外包一层按字 OR 聚合跳过（不改变端口的计划优先级
+顺序：未被影子化的端口——常数 enable、regLatch/mem 回读 enable——仅仅结束一个
+run，不参与聚合）。常量 enable（如恒 1）保持折叠、不进位图。
+
+六阶段 emitter 在所有 `cpu_init_*` 常量预装完成后，每 8 个位图 word 用一个
+`noinline` lambda 初始化，避免数万 enable 的表达式被合并进同一个巨大 `init()`。
+这只拆分冷初始化代码；位图读取的字段及顺序不变。香山 aggregate 模型中，未拆分的
+1538 个 word 使 clang `-O3` 的 MachineCombiner 耗时超过 15 分钟。
+
+P_mem 端口另按 event act 聚类：同一 chunk 内共享同一 `eventActStore` 守卫的极大
+连续端口段只在段首判断一次守卫（端口体只读 eventActStore、不写，合并精确）；段内再
+套 enable 位图 run 聚合。此外，boundary 发布在"无超节点 fanout 且无位图 hook"时
+不再发射 compare-store——此时 `if(slot!=v){slot=v;}` 与 `slot=v;` 严格等价
+（变化事件无人消费），改为无条件 store，消掉发布路径上的 load→比较→分支依赖链
+（典型人群：只喂 P_mem/P_event/P_output 的字段——这些相都是无条件执行，不经
+dataActiveFlag 激活）。
+
+三张 fanout 表分别在输入差分、超节点 value 写站点、状态 publish 处消费。`activate` 只
+指向 General 超节点，且 V2-M2 起一律收窄为非 sink 超节点（sink 超节点不经
+dataActiveFlag 激活）。`commitStateFanout` 中的 state 真变化激活其读者；其中属于 E 的
+成员才驱动下一轮 fixed-point 求值。无扇出的 input/value 没有表项；输入表的键同时确定
+需要变化检测的输入。state 表的 key 覆盖所有被 General 相读取的状态（不再限于 Overview
+第 4.2 节的 E 闭包）；mem 类数组的读者另由 `memWritePlan` 的读者表激活。
+
+`NumaNodeId` 标识目标 CPU 的一个 NUMA 内存域，`CpuCoreId` 标识该内存域中的一个 CPU 执行核。
+二者都是 CPU 后端的目标资源 ID；这里的 CPU core 与 GrhSIM `core` 方言无关。每个
+`CpuCoreId` 只能属于一个 `NumaNodeSchedule`，task 在执行期间不能迁移到其他 core。
+
+`tasks` 的数组顺序就是同一 CPU core 上的执行顺序。不同 core 各自执行自己的 task 序列，
+因此可以并行；一个 task 必须等其全部 `waits_for` task 完成后才能开始。`waits_for` 用于表达
+跨 core 或跨 NUMA node 的必要顺序，同一 core 内的顺序不需要重复写入。
+
+一个 task 执行 `partition` 覆盖的全部 op。被 task 引用的分区必须互不包含，并共同覆盖根分区：
+每个叶分区恰好被自身或它的一个祖先分区所覆盖。这样既可以把 node 作为执行单元，也可以把
+包含多个 node 的 supernode 整体分配给一个 CPU core，而不会重复执行 op。
+
+task 从所在的 `CpuCoreSchedule` 继承 CPU core 和 NUMA node 归属。`DataLayout` 可以根据该归属
+区分同 core、同 NUMA node 和跨 NUMA node 的 value，但 value 的生产者和使用者仍由 `G`
+决定。
+
+所有 task 序列与 `waits_for` 合成的顺序必须无环，并覆盖 `G` 中跨 task value 的生产者到
+使用者关系。该顺序还必须满足方言规定的对象访问约束。
+
+### 4.1 M5d-6 `cpu.st.build-phase-schedule`（C7）实现记录
+
+旧 `cpu.st.build-schedule` 已在 M5d-6 删除。当前调度由 C7
+[`cpu.st.build-phase-schedule`](../passes/build-phase-schedule.md) 在 `GeneralFunctions`
+stage 之后生成：一个 NUMA node 0、core 0，task ID 从 1 开始，序列为 P_event → P_general
+各 EmitFunction 叶子 → P_mem → P_output，每个 EmitFunction 叶子恰好一个 task，
+`waitsFor` 为空。输入和 value 的 source 使用 ValueId，state 的 source 使用 StateId；各表
+按 source ID 排序，activate 按 C2 超节点序号排序去重。
+
+- `inputFanout` 覆盖 General 相 `input.read` 的所属超节点；`event_only` 标记的纯事件输入
+  无条目（由 P_event 覆盖）。
+- `computeSupernodeFanout` 只激活跨超节点消费者，不建立自激活边；Mem 相写消费者除外
+  （P_mem 每轮运行）；sink 消费者一律过滤（V2-M2，sink 不经 dataActiveFlag 激活）。
+- `commitStateFanout` 覆盖所有被 General 相读取的状态（`state.read` 及目标为 regLatch
+  类数组的 `readArray`），而不仅是 overview 第 4.2 节的输出/边沿状态依赖闭包 E；mem 类
+  数组的读者由 C5 写计划的读者表激活。
+- `timeslotTriggers` 是 Output 相 timeslot 任务的 timeslotFlag × event_acts 笛卡尔展开
+  （task op-id 序、单任务内 act 升序）。
+
+运行时消费这些表时必须遵守：
+
+1. 每轮的 P_event/P_general/P_mem 从同一旧状态快照求值（regLatch 写在 next 缓冲叠加）。
+2. publish 以 regLatchStoreNext 整块提交回 regLatchStore，E 的真变化决定是否继续迭代；
+   prevEvent 采样随本轮生效，不能冻结到 eval 结束。
+3. dataActiveFlagNext 与当前轮标志分开消费；轮末不能清掉刚由 state fanout 产生的激活。
+4. 所有超节点初始激活（sink 序号的标志位无人读取，见 flows/cpu-st 运行时契约）；事件
+   op 的逐 op event guard 在非 sink 体内与 P_mem 保留，sink 体内由调用点签名门控替代
+   （V2-M3）。
+
+### 4.2 当前 `cpu.st.plan-translation-units`（C8）与多 TU emit（M5d-7）
+
+`TranslationUnitPlan` 由 C8
+[`cpu.st.plan-translation-units`](../passes/plan-translation-units.md) 在
+`PhaseSchedule` stage 之后生成，挂为 mapping 的 `translationUnits` payload，stage 推进到
+终态 `TranslationUnits`：
+
+```text
+TranslationUnitPlan
+  chunk_max_estimated_lines: UInt64     # 记录的下限/上限，verify 按其重放计划
+  unit_max_estimated_lines: UInt64
+  units: [{name, estimated_lines, chunks: [{kind, offset, count, estimated_lines}]}]
+```
+
+块流顺序固定为 Core → Init → Event → GeneralScan → Supernode → Mem → Output → Dump
+（V3-M2 起拆分超节点的 SupernodePart 块紧随其 Supernode wrapper 块）；
+各 kind 的 `offset/count` 索引其规范流（定义见 pass 文档）。`GeneralScan` 区间对齐 C6 的
+EmitFunction 边界（区间单独超上限时按序号细分）；`Supernode` 块恰好一个超节点，其 C6
+`helperChunks` 成员函数同单元——估算超 unit 上限且 helperChunks≥2 的超节点例外（V3-M2）：
+该块只 emit `sn_<i>` 驱动（wrapper），helper 函数由紧随的若干 `SupernodePart` 块
+（offset=序号、count=part 序号，part→helper 区间经 `cpuSupernodePartRanges` 以 unit 上限
+确定性重放）分摊到多个 TU，消除单 TU 体积上限对 sink 巨簇的约束。verify 按记录的上限重放计划并要求完全一致。
+
+`cpu.st.emit-cpp` 按单元输出 `<prefix>_<name>.cpp` 与一个共享 `<prefix>.hpp`（端口、
+store、全部成员与块函数声明、spill 帧结构、dump 打印助手），外加不变的
+`<prefix>_runtime.hpp` 与多源 `Makefile`（`SOURCES` 承载完整清单，`make -j` 即并行编译，
+链接为单一静态库 `lib<prefix>.a`——下游 difftest/hdlbits/xs-bugcase 接线不变）。块函数的
+跨块局部值经类内嵌套的 spill 帧结构（`SnFrame<i>`/`EventFrame`/`OutputFrame`）传递：
+driver 在栈上值初始化帧并按序调用块函数（调用方提供缓冲、无大临时拷贝）。常量、
+`input.read`/`state.read` 结果在任意块内可重读，不进帧；`readArray` 结果与计算值一样
+进帧 spill（重读形式会重新求值索引操作数，其局部量可能已死——XS 整核模型上实证）。
+Output 锥额外把每个
+锥内生产的 latchWrite 操作数进帧，使暂存提交观察到提交前值。DPI import 声明不进公共头
+（测试台自定义同名 extern "C" 定义）；每个引用它们的单元在文件头自行声明。C++
+编译并行由 Makefile 的源文件清单给出；模拟器执行顺序（相位/轮次/块序）不变。
+
+公共头体积实测（XS 整核，M5d-7）：共享头 94.7MB（约 84.4 万行，含 boundary 68.4 万、
+regLatch 10.5 万字段与 4.5 万超节点声明）；clang++ 每 TU 头解析约 2s（约占编译 CPU
+19%），PCH 按实测暂不启用；g++ 13 解析该头超线性病态（单 TU >9min 未完成），本项目
+工具链固定 clang++（根 Makefile 导出 `CXX`，difftest grhsim.mk 继承）。store 结构体不
+带字段初始化器，init() 以 memset 复位（含 string 的 boundary 字段移入独立
+`boundaryStrings` 数组成员），避免巨型聚合体的值初始化临时量撑爆 -O1+。
+
+`PhaseSchedule` 与 `TranslationUnits` 两个终态要求外层 complete 为 true，其余阶段要求
+false；stage、payload 和 complete 不一致会被拒绝。完整 JSON、clone 和 semantic mutation
+保持既有 identity/revision 约束。
+
+## 5. 验证
+
+### CPU C++ 阶段计时
+
+当前六阶段 emitter **不实现运行时阶段计时**：`set_runtime_profile_enabled(bool)` 与
+`dump_runtime_profile()` 是空实现（保留接口形状供 XiangShan `EMU_RUNTIME_PROFILE=1`
+无改动调用；该开关在新模型上只多打一行 harness 日志，不产生 profile 数据）。旧
+emitter 的 `cpu_runtime_profile()`/`[grhsim-cpu-phase]` 分桶计时已随旧实现删除。
+
+唯一的模型内插桩是编译期 `WOLVRIX_GRHSIM_PERF`：为 1 时编译进
+`GRHSIM_PERF_COUNT` 计数与 `PerfCounters`/`perf_counters()`（eval/round1/round2/
+totalRound、computeBatch/commitBatch、touchedStateShadow/touchedWrite 计数）。运行
+性能测量以 emu 自报 Host time 与 `/usr/bin/time` 为准（M5d-8 口径），不依赖模型内
+计时。
+
+### FST 波形（declared-symbols 模式）
+
+`cpu.st.emit-cpp --waveform declared-symbols`（Python 流程脚本 `--emit-waveform`；XS
+根流程 `WOLVRIX_GRHSIM_WAVEFORM=1`）让模型携带 FST 波形采集：模型在每次 eval 边界
+（P_output 之后）对选中信号做变化检测并写 FST，时间轴为 eval 序号；difftest 侧的
+`waveform_tick()` 因此是 no-op，`--dump-wave [--wave-path <fst>]` 即可采集（缺省路径
+`grhsim.fst`）。
+
+信号集与旧 emitter 的 declared-symbols 模式同源：遍历 `declaredSymbols`，解析到接口
+端口、RegLatch 状态字段或已实体化的 boundary 字段者入选；mem 类状态（存储内容不进
+FST）、字符串/四态类型、无 live object 的符号（被优化掉的线网）、折叠为超节点局部
+的 value，以及总字节数超过 512（`kWaveMaxBytes`，与 dumpState 的哈希口径一致）的数组
+字段跳过（不做截断式部分 dump）。数组一律逐元素注册 var，方括号规范名
+`arr[i0][i1]...`（GTKWave 折叠为数组树）；宽元素逐元素走 _BitInt u64-word 镜像路径，
+不再有"元素宽 ∈ {8,16,32,64}"的限制（stage-06，见 §2.2）。
+
+产物与接线：注册表在 `<prefix>_wave_<g>.cpp`（每 4096 信号一个 `wave_setup_<k>` 成员
+函数、8 块一文件）——刻意不进 C8 TU 计划（计划与 emit 选项无关），只追加进生成
+`Makefile` 的 `SOURCES`；Makefile 同时补 vendored libfst 规则（fstapi/fastlz/lz4 与
+`-I$(LIBFST_SRC_DIR)`，随 wolvrix 源码树定位）。模型类新增
+`configure_waveform(bool[, path])`/`waveform_enabled()`；`emit` 关闭波形时
+`configure_waveform` 保持桩实现并在 `WOLVRIX_GRHSIM_WAVEFORM=1` 构建下提示改用
+`--waveform declared-symbols` 重发。消费方（驱动或 difftest emu）链接模型库需 `-lz`
+（fstapi 读端引用 zlib），difftest `grhsim.mk` 在 `WOLVRIX_GRHSIM_WAVEFORM=1` 时自动
+追加；模型头经 `<prefix>_runtime.hpp` 引入 `fstapi.h`，消费方编译需把 libfst 源目录
+加入包含路径（difftest 侧已带）。
+
+变化检测按字段整块 `memcmp`/`memcpy` 进 `waveform_prev_` 字缓冲，首次 dump 强制全量
+以给出初值；`configure_waveform(false)` 或析构会关闭并落盘。
+
+
+### Backend mapping 校验
+
+`CpuBackendMapping` 必须满足：
+
+- `DataLayout` 的 named stores 完整覆盖当前 `GrhSimModel` 的状态、输入端口与 boundary
+  value；每个物理类型都能解析，且其取值集合覆盖对应对象或 value 的语义类型；
+- `PartitionTree` 是一棵覆盖全部 op 且不重复归属 op 的树；root 下恰为
+  Event/General/Mem/Output 四个 phase 分枝，各分枝 op 相一致；只有叶分区含 op，不完整
+  mapping 按已生成的 stage（依 `cpuMappingStageRank`）校验；
+- Event/Output/General 分枝按树序展开后，每个 operand 的 producer 必须已执行；Mem 分枝
+  op id 升序；General 超节点的 `eventActs` 与扫 op 重算一致；
+- 超节点序号为 General 分枝子节点顺序；`GeneralFunctions` 起 EmitFunction 叶子的
+  `supernodeRange` 区间连续铺满 [0,N)；helper ranges 连续覆盖所属超节点；
+- 激活表的 `activate` 只引用 General 超节点（V2-M2 起只引用非 sink 超节点）；激活映射、
+  mem 写计划、fanout、task 与 trigger 按模型与分区树重算并要求完全一致；
+- NUMA node 和 CPU core ID 唯一，每个 CPU core 只属于一个 NUMA node；
+- task ID 唯一，`waits_for` 只引用当前计划中的 task；task 所引用的分区互不重叠并完整覆盖
+  `PartitionTree`；
+- core 内序列与 `waits_for` 共同构成无环顺序，并满足 graph 数据流和方言对象访问语义；
+- `CpuBackendMapping` 不增加、删除或改写 `GrhSimModel` 的 `Init` 条目。
+
+`GrhSimModel` 或其所引用的方言版本发生变化后，原有 `CpuBackendMapping` 失效，必须重新生成
+并验证。
+
+### CPU C++ 宽比较与移位量
+
+两态宽值（>64 位）是 `unsigned _BitInt` 对象，比较和移位**不再调用 runtime helper**，
+全部发射为原生表达式。无符号比较把两侧显式拓宽到公共容器后直接用原生关系运算符；
+双方均 signed 时先各自从自身位宽做符号扩展（gsim 的 shift-trick：
+`((_BitInt(M))((unsigned _BitInt(M))x << (M-w)) >> (M-w))`）再比较。mixed signedness
+与旧 helper 一致按零扩展处理。
+
+例如 signed 8 位 `-1` 与 signed 129 位 `-1` 比较相等；signed 8 位 `-1` 与 unsigned
+129 位 `255` 比较也相等，因为 mixed signedness 使用零扩展后的 8'hff。
+
+`shl/lshr` 的移位量直接与结果位宽比较：`amount >= width` 时结果为 0，三元运算同时
+保证移位量严格小于容器宽度（移位 >= 容器宽在 C 里是未定义行为）。`ashr` 先把被移值
+符号扩展到容器，移位量钳到 `容器宽 - 1`（超出位宽的移位在语义上饱和为全符号位），
+再掩回语义位宽。宽移位量按全精度与位宽比较——高字非零自然落入饱和分支，不会出现
+只读低 64 位的截断。
+
+六阶段 emitter 对超过 8 个操作数的宽 `concat` 生成平衡的拼接树，每层只拓宽到
+该层的实际位宽，并用命名局部变量限制 C++ 表达式嵌套深度。叶子先转成无符号位模式，
+防止 signed 64-bit 输入在拓宽时把符号位写进相邻字段。结果仍为原生 `_BitInt`；
+这样避免香山 3201 输入、16384 位拼接中，连续对整个结果移位引发的 SelectionDAG
+优化耗时。
+
+### CPU C++ 宽状态写入
+
+两态、1–64 位的 staged 标量写入先读取有效值：dirty 时使用当前 shadow，否则使用
+轮初 visible state。完整赋值和 masked 写入都先规范化到目标位宽；masked 写入基于有效值
+合并。新值与有效值相同时不登记 pending，也不写 shadow。第一次变化才登记 state、offset、
+size、fanout 范围和 projection 标记，并直接写入调用方持有的 shadow，不复制已被完整覆盖的旧值。
+后续变化复用同一 pending 条目，visible state 仍只在 publish 边界更新。
+
+例如 visible=0，同轮依次写 1、0，第二次必须与 shadow=1 比较并写回 0；不能因新值等于
+visible 就忽略第二次写入。已有 pending 条目保留到 publish，由最终值比较决定是否激活读者。
+事件 history 仍在原采样位置更新，不受 data enable 或是否触发写边沿影响。批量 history、
+memory cell、宽值和已证明可 direct-commit 的写口继续使用各自的路径。
+
+宽寄存器、锁存器和内存 cell 的 mask 写入直接以原生 `_BitInt` 表达式合并：
+`(staged & ~mask) | (data & mask)`（旧实现调用逐字 helper，语义相同），保留先前
+disjoint-mask 写口在同轮的修改。
+例如 129 位状态的两次写入分别选中 bits 0-63 与 64-128 时，publish 后同时包含两次更新，
+不能将第二次写入直接赋值为完整 data。标量 staging 以 state 为粒度，内存 staging 以 cell 为粒度。
+
+内存元素使用 `cpu_at<Element>(cpu_stage_cell(...), 0)`；stage helper 返回指定 cell 的 shadow
+地址，同轮第一次触及该行才复制 visible cell 并登记 pending，后续写口复用该行。
+dirty key 为每个数组分配的独立基址加行号；pending 保存 cell 字节偏移和长度，不扫描/复制整数组。
+`fill` 逐行使用同一路径，因此 fill 与 masked/索引写口混用仍保留声明顺序的覆盖关系。
+写入地址越界时不登记 pending，但仍采样 event history。
+同一 state 的多个写 op 各自先命中自己的显式 event，再按声明顺序逐个检查
+enable/索引/data 并应用（后写覆盖先写）；event history 的采样不依赖某个 enable 成立。
+
+### CPU C++ 状态发布
+
+event history 采样和一般 state 写入使用 shadow/pending，在 publish 阶段比较最终
+字节内容。后写必须基于本轮已有 shadow，不能始终基于 visible object。例如 visible=0，
+同轮先写 7 后写 0：最终 shadow=0，publish 不激活读者。任何提前排除不变写入的优化
+都必须保留这种覆盖顺序，并实测其比较/分支/代码体积成本，不能只按队列数量判断收益。
+
+每个 readArray 在 compute 时缓存实际读取 cell 的绝对字节偏移，包括地址为 local value 的情况。
+memory pending 发布时仅激活缓存偏移与变更 cell 相同的读端口所属 supernode；地址输入变化仍由
+原 compute/input fanout 激活读端口。缓存、dirty bits 和 pending 在 init 时一起清除。
+
+### CPU C++ 读取与变化发布
+
+对已有 commit-state fanout 的 state.read，若所有 value 使用者都在 compute，且不作为域 event，
+emitter 可将 value 解析为 state 引用并省去读取复制。state 发布的激活集合补入这些直接使用者，
+按活动字合并 mask。直接作为 commit operand 的读取仍保留 boundary/local 快照；不能把
+`q1 <= d; q2 <= q1` 的第二个输入改为 direct-commit 后的 q1。此优化不修改 IR 或 layout。
+
+一个内联 supernode 或 helper chunk 中，具有相同 activate/arm 集合的逻辑结果共享 changed 标志。
+每个结果比较并写回，块尾一次性以 mask 发布变化；宽位原地 helper 的返回标志也合并到该组，
+不引入额外数组快照。分组不会越过 supernode/chunk 边界；DPI 调用与其结果发布保持原语义。
+
+### CPU C++ 标量内存写入
+
+标量 memory cell（two-state logic 1–64 bit）先比较 masked next，再决定是否
+进入 shadow/pending。`writeArray` operands 依次是 enable、各维索引（1..rank 个）、data、
+event values；`writeArrayMask` 在 data 后再携带 mask；`fill` 的 enable/data 更新每行；同一 state 的多个写 op
+按声明顺序依次应用。`cpu_write_cell<T,Width>` 使用
+`key=memory_base+row` 和 `offset=array_offset+row*sizeof(T)`，从 dirty cell 的
+shadow 或干净 cell 的 visible 取 current，按元素宽度及 signedness 规范化
+`(current & ~mask) | (data & mask)`。next 等于 current 时无需拷贝、入队或写回；
+首次变化只加入一个带 memory 标记的 Pending，直接写 next，无需复制旧 cell。
+
+例如 visible 为 `8'ha0`，同一轮先按 `8'h0f` 写 `8'h05`，再全量写 `8'ha0`：
+第一口留下 shadow `a5`，第二口必须基于已有 shadow 恢复 `a0`；pending 保留到
+publication，由最终 visible/shadow 比较消去通知。干净 cell 的零 mask 或同值
+写入不创建 pending；已 dirty cell 保留原 pending。两个不同 row 分别跟踪，
+读者仍按最后读取的 row offset 精确激活。
+该路径沿用 scalar state 的写入顺序和分配策略。宽 cell 继续使用既有
+`cpu_stage_cell` 和就地宽值掩码 helper，helper ABI 不变。
+
+### CPU C++ 标量直接提交
+
+唯一写者的 1..64-bit、2-state 标量可使用 direct commit，但完整 object-ref pool
+中的引用必须全部归类为该唯一 write/latchWrite 的目标或 compute 的 state.read。
+任何 history、其他 commit/DPI/system ref、未知引用、多写者、memory 或宽值均回退。
+compute 已读取旧状态且 commit 没有其他观察者，因此该写站点计算的 masked/normalized
+值就是本次 G 的最终值，物理字节提前写回不可被中途观察。`q1 <= d; q2 <= q1`
+仍从 compute 已保存的旧 q1 value 计算 q2，不从已更新的对象重新读取。
+
+发生真变化时，小型 helper 复用原 state target 表，置 compute active bits 和
+**next-arm**，仅 E 成员累积下一轮条件。原 publish 将该条件与其他 pending 的最终
+变化合并并清除；init 也清除。非 E 状态更新不得增加轮次，既有 roundSeeds 保留。
+direct commit 不改变 phase/task/domain/event 策略，也不影响 DPI 真实调用与历史采样。
+
+专门非 E fixture 通过 void DPI 观察每次 G 的旧状态，要求每次 eval 恰一次调用，
+覆盖 signed 5-bit、unsigned 64-bit、bool、零/部分/全 mask、重复 eval 和 init。
+生成标记还检查多写者及普通写口写 history 的回退，防止提前记录中间变化。
+
+### GrhSIM 等价普通状态共享
+
+`grhsim.canonicalize-compute` 在纯计算 CSE 后共享确定性等价的普通状态，再重复
+纯计算 CSE，直到没有新的状态合并。每轮继续的前提是至少删除一个状态；不同
+反馈 value 的循环不推测等价。只处理 two-state logic 的唯一 write/latchWrite，
+完整对象引用必须仅为目标写口和 state.read；随机/文件/多步初始化及额外引用回退。
+状态类型、单条 `core.init.const` 的完整参数、写口种类、全部操作数及参数必须相同。
+每个事件 history 必须仅由本写口引用，且两边对应 history 的类型和确定性初值相同；
+共享或被读取的 history 回退。
+
+write 的操作数为 enable、data、mask，随后为各 event value；object refs 为
+目标状态，随后为各 event history，`event_edges` 指定对应边沿。latchWrite 使用
+前三个操作数。相同初值和逐轮相同输入保证状态与历史始终等价，所以保留组内一个
+状态/写口，把同一类型的 state.read 合并为一个 value，并删除副本及其私有 history。
+例如 `q0=0; q1=0; q0<=d; q1<=d` 在相同 enable/mask/事件下可共享，消费者中
+`q0 xor a` 与 `q1 xor a` 随之可被 CSE；初值不同、事件不同或 `q0<=q0; q1<=q1`
+均不按此规则合并。接口与 DPI/system 调用保留，写入仍使用 compute 阶段的快照。
+
+### CPU C++ 提交端口变化武装
+
+满足以下条件的 direct-commit 写口（write/latchWrite）按变化武装（change-armed）：
+enable/data/mask 三个操作数都是 boundary 存储的 2-state 1..64-bit logic，不是
+state.read 别名，且生产者仅限 `core.compute.*`、`core.state.read`、`core.state.readArray`
+（这些写站点都经过 computeGroup 的变化发布路径）。每个 task 内合格写口按 op 顺序
+编号，每 8 个组成一个 `cpu_pflags` 活动字节；`init()` 全部置 1，首轮必做完整求值。
+
+机制依据：写口目标状态只有唯一写者（direct commit 前提），两次求值之间 `current`
+不变；操作数是 boundary 持久值，只随 compute 的变化发布改写。因此若某个边沿求值时
+全部操作数与上次求值相同，则 `(current&~mask)|(data&mask)` 的重算结果必然等于
+`current`，写入与 `cpu_direct_state_changed` 通知都不会发生，跳过求值不可观察。
+常数操作数（如常量 enable）的写站点从不产生变化事件，相应端口在首轮后不再被武装，
+同样安全。
+
+武装端在 compute 侧：`computeGroup` 的分组键加入端口武装签名，使带端口目标的 value
+即使原无 fanout 也获得 `cpu_changed` 比较；组尾在原 fanout 激活之外追加
+`cpu_pflags[word] |= -changed & mask`。常量操作数没有写站点，天然不武装。
+
+消费端在 commit 任务的 main path：事件采样仍按原 op 顺序无条件发射（共享 history
+的覆盖顺序不变），合格写口的写块移到按 `cpu_pflags` 字节分组的武装段，位于其他
+写口之后；不同写口的目标状态互不相交、boundary 在 commit 期间稳定，该重排不
+改变任何状态内容。每个端口仅在武装位置位时求值，且仅当其边沿守卫（共享快照或
+内联边沿表达式，latch 为 true）成立才消费该位：边沿未触发时保留武装位到下一次
+执行。stable-history 整任务跳过与 inactive-edge 采样路径不消费武装位。被跳过的
+端口状态更新、pending 记录与轮次收敛结构（`again`/E）与原语义逐位一致。
+
+武装位持续直到被消费，跨 round、跨 eval 有效；同一 eval 内 compute 的新变化在
+下一轮重新武装。发射器诊断给出 `port_arm_ports/tasks/values/words`。
+
+### CPU C++ 共享边沿端口块的一次消费
+
+提交端口仍以持久 `cpu_pflags` 记录 enable/data/mask 变化。现有最多八字节扫描
+块内，若所有端口使用同一个非空缓存边沿快照，则先检查该快照一次。如果全部
+armable 端口在整个 task 内也共享该快照，则检查进一步提到所有扫描块的入口。
+无法按整个 task 共享时仍逐块判断，混合块保留原路径。边沿为假
+时不读取/消费端口位，边沿为真时按原次序检查武装位、enable 和实际值变化。
+本块端口的边沿已经相同，无需逐端口再次检查或累积 consumed。字节中八个位
+都有端口时消费后直接置 0；不足八个时仅清除实际端口掩码，保留其他位。
+
+例如某字节的五个端口都使用 `posedge(clk)`，有效掩码为 `0x1f`。下降沿时全部
+武装位保留；上升沿时按原序评估已武装端口，末尾执行 `pflags &= ~0x1f`。
+enable 为 false 的端口也消费该武装位，后续 enable 变化仍会重新武装。不同事件
+或不能缓存的 guard 继续逐端口消费，不合并。事件快照在原 history 采样之前计算，
+而 pflags 只由 compute 写入，因此边沿成立时清除这些位与逐位消费等价。
+history 采样、状态写入、通知、padding 位和跨 eval 的持久规则保持。
+诊断 `shared_edge_blocks/ports` 表示共享检查的块数和端口数。
+
+### CPU C++ 活动扫描字打包
+
+逐轮稠密扫描统一加字粒度空测试预过滤：调度循环中共享同一 8 字节 `cpu_flags`
+桶的相邻单字节任务检查、domain-arm 逐槽交接（`cpu_flags[s]=cpu_next_arms[s]` 加
+清零）、以及 commit 任务 `cpu_pflags` 武装段的逐字节走查，都先在桶范围上用
+`cpu_word8`（定长 `std::memcpy` 装入 `std::uint64_t`，字节序与空测试无关）检测
+是否全零。全零证明桶内每个字节检查都是无操作：没有任务会执行、没有槽需要拷贝
+或清除（交接桶测试 `next_arms|flags`，两侧都零时逐槽写本身就是恒等）、没有端口
+字会消费武装位；非零则进入桶并逐字节执行原逻辑，顺序与语义逐位不变。
+
+打包只覆盖同桶相邻且不少于 2 项的组，组内保持原发射顺序；多 word 任务、无
+条件任务、孤立槽位与不足 8 字节的尾组仍按原标量形式发射（尾组用收窄的定长
+`memcpy`，不越界）。预过滤只读取活动数组，不引入队列、不改变武装/消费/发布
+路径。发射器在写完模型后报告 `dispatch_packed_checks`、
+`handoff_packed_slots`、`port_arm_walk_packed_words`。
+
+### CPU C++ 边沿静默跳过
+
+compute supernode 的全部外部效应都来自边沿守卫的 system/DPI op（守卫项
+`(!hist && event)` / `(hist && !event)` 及其内嵌历史采样）时，该 supernode 在
+入口满足所有守卫项 `hist == event` 的激活是 provably inert：两个方向的边沿守卫
+都为假，内嵌历史采样是 `current == next` 的无操作（本轮内该 supernode 尚未执行，
+历史态不是 dirty，守卫读取的 `cpu_objects` 值正是采样 helper 要比较的 current；
+别名历史根本没有采样发射，`stage()` 直接返回，其守卫经 `object()` 解析读同一个
+代表元）。frame 清零、局部字符串与全部 frame-local 计算都是每次激活的临时量，
+没有跨 supernode 可见性。发射器把合格 supernode 的函数体包进
+`if((hist0)!=(event0) || ...){ ... }`，每次激活先求值；活动字节读取/清除、位
+消费与归还、播种、轮次与收敛结构完全不动，被跳过的执行与执行惰性函数体逐位
+一致：没有 pending 记录、没有 fanout、没有状态变化。
+
+合格性按 supernode 静态判定（全部 op 须通过）：边沿守卫的
+`core.system.task`/`core.dpi.call`（事件不在本 supernode 内产生、且是可见状态或
+boundary 读取——与 compute 守卫提升相同的不变量测试）贡献去重后的
+（别名解析 history，event）项；其余 op 只能是纯 frame-local 计算（不写
+boundary/object/shadow、无 fanout、无端口武装目标、不更新 `cpu_read_offsets`）。
+含无 `event_edges` 的电平调用、`core.output.write`、带返回值的 DPI、boundary
+写回的 supernode 不合格；任一守卫历史若在模型范围内被本 supernode 的边沿项之外
+引用（含别名前像）或为 batched history，同样不合格——共享历史按程序序覆盖
+pending 值，外部采样者会让被跳过的采样变得可观察。检查项为每个去重项的
+`(state(hist))!=(value(event))`，发射在 frame 清零之前。发射器诊断报告
+`compute_quiescence_units`/`compute_quiescence_terms`。
+
+### CPU C++ 端点门控链致密化
+
+event-gated 端点 supernode（assert/DPI 端点族）的体是几百个
+`if (cevent && pred) { body }` 门：事件守卫共享同一 `cpu_cevent_*` 局部量，
+`pred` 几乎总为假，门体（assert/fwrite 诊断）几乎从不执行。逐个发射时门体
+inline 在门链中，每次激活要跨过全部冷体取指。发射器在 computeGroup 内对
+**同一 guard 的连续门**做三个保持语义的结构变换：run ≥2 时外提
+`if (guard) { ... }`（G2，`guard && cond` 短路等价于嵌套）；run 内相邻且条件
+文本相同的门合并为单 `if` 多块体（G1，门体均为外部 void 调用、两调用间无仿真
+状态写，顺序与次数不变）；门体全部实参为 `core.compute.constant` 产出时条件包
+`__builtin_expect(!!(...),0)`（G3，编译器据此把从不执行的诊断体移出顺序取指
+路径；带运行时参数的事件流调用不加提示，避免惩罚频繁触发的体）。
+
+资格按 op 静态判定：须为 `core.system.task` 或空 results 的 `core.dpi.call`
+（空 results 保证无 output/inout 回写），带 computeGuardGroup 的 cachedGuard，
+且每条事件历史的 `stage()` 均为空操作（batched/aliased/direct-sampled）——
+仍有体内采样的门留在原路径，采样写位置逐字不动。常量、别名读与静态字符串等
+无发射 op 不打断 run。不同条件的门永不重排，副作用顺序保持。发射器诊断报告
+`gate_hoisted_runs`/`gate_hoisted_gates`/`gate_merged_gates`/`gate_cold_hints`。
+
+### CPU C++ 宽位运算活动度
+
+compute word 调度沿用 legacy 局部活动字节结构：读取 `cpu_flags[wordOffset]` 到
+`cpu_active_word` 并清空全局字节，然后依次检测/消费 supernode 位。当前 word 中严格
+靠后的 fanout 位 OR 到局部字节；当前/先前位及其他 word 保留全局写入。同一激活集合
+按 word offset 合并掩码，helper chunk 通过引用共享局部字节。word 退出时将未消费局部位
+OR 回全局，不覆盖已经排队的回边。例如当前 bit2 激活 bit1 和 bit5，bit5 本次即可执行，
+bit1 留在全局等待后续扫描。域 arm、DPI guard/history 和 commit 发布保持原语义。
+
+带 `computeSupernodeFanout` 的 two-state 宽值（大于 64 位）`and/or/xor/not` 使用
+`cpu_bitwise_words_changed<Operation>`：输入为 lhs/rhs 指针及各自 word 数、结果位宽、
+输出指针及其 word 数；not 的 rhs 为空且 word 数为零。每个结果 word 按 legacy
+指针 helper 的零扩展规则计算，先屏蔽结果宽度之外的位，再比较旧 word 并原位写回。
+返回 bool 表示任意 word 真变化，只有返回 true 才发射 mapping 已有的 fanout 激活。
+例如 129 位结果的最后一个 word 仅最低位有效；旧 padding 非零也会被清除并报告变化。
+
+输出为已初始化的持久 boundary 槽，不创建宽值副本或返回值数组；逐 word 运算支持
+输出与任一输入的精确指针别名。无 fanout 的局部输出仍调用原 legacy helper，不读取
+旧局部缓冲区。该变化不修改共享 legacy runtime、mapping、DPI/event 或状态提交。
+宽加减也使用 `cpu_arithmetic_words_changed<'+'/'-'>` 单遍计算最终 word，保持 legacy
+进位/借位和零扩展规则。宽移位使用 `cpu_shift_words_changed<'L'/'R'/'A'>`，参数依次为
+输入指针、输入 word 数、移位量、结果位宽、输出指针、输出 word 数；移位量仍由
+`grhsim_index_words` 饱和到结果位宽。左移逆序、右移顺序写出，算术右移先读取原符号位，
+随后直接合成补符号及末字截断后的 word，不预清零输出，也不保存整块旧值。
+例如 129 位算术右移 129 位，符号为 1 时输出 `[UINT64_MAX,UINT64_MAX,1]`；
+重复计算相同输出返回 false。仅有 fanout 的持久输出使用变化检测，其他输出保留原路径。
+
+### CPU C++ 多时钟回归
+
+发射器在同一个边沿域 commit task 内按采样等价类共享私有事件历史，适用于
+`DomainGatedCommit` 和 `AlwaysScanCommit`。每个 history 单独检查：全模型的
+object ref 必须全部是本 task 中 `write/writeMask/writeArray/writeArrayMask/fill` 的
+posedge/negedge 采样，且每次采样使用同一个、不经 state-read alias 的 boundary
+ValueId。history 与 event 类型相同，均为 unsigned two-state 1-bit；history 具有
+唯一常量初始化记录，publication 目标恰为本域 arm。同一 history 可以被本 task
+重复采样；被观察、被其他操作写入、跨 task 采样、采样不同事件或随机初始化的
+history 保留独立存储，不妨碍同 task 内其他 history 共享。
+
+共享键为 `(event ValueId, history TypeId, 规范化初始常量)`。例如同一 task 的三个
+posedge 操作引用历史 `[h0=0,h1=0,h2=1]` 且采样同一 `clk`，发射后前两个守卫
+读取 h0，第三个仍读取 h2；只暂存 h0 和 h2。每次 task 执行均无条件采样历史，
+因此相同初值的成员在所有 publication 边界保持相等。guard 始终读取 visible 值，
+代表的 shadow 更新不会提前暴露；代表沿用原域唤醒目标。IR state、layout 元数据和
+schedule 本身不变，发射器重定向私有存储访问并省略冗余 stage；原存储 arena 大小
+保持不变。重复 init 只向代表写入相同常量，不改变随机数序列。诊断
+`history_shared_states/tasks` 给出省略的状态数和受影响 task 数。
+
+混合示例：同 task 中 `h0=0` 被两个写端口采样 `clk`、`h1=0` 被一个写端口采样
+`clk`、`h2=0` 还被输出读取。前两者可共享 h0（代表元的两次原始采样仍保留），
+h2 保持独立。若 h0 的两次采样分别使用 `clk_a` 和 `clk_b`，则 h0 也保持独立；
+不能对 `h0←clk_a; h0←clk_b; h0←clk_a` 跨越中间写入去重。
+
+For tasks with shared private histories, repeated edge predicates are evaluated
+once into task-local `const bool cpu_edge_snapshot_N` values before payload
+writes. The key is the ordered list of `(event ValueId, resolved history StateId,
+edge polarity)`. For example, two writes using `!h0 && clk` reuse one snapshot;
+a write using `!h2 && clk` or `h0 && !clk` retains a distinct predicate. Singleton
+predicates remain inline. All commit operands retain pre-commit boundary values,
+and private histories change only at publication, so the snapshot stays valid
+through intervening payload writes. It is recomputed on every task invocation.
+Write order, unconditional history sampling, stable-history and inactive-edge
+exits, and publication remain unchanged. Only predicates whose every history
+passes the sampling proof can be cached; other predicates in the same task
+retain the existing path.
+
+CPU emitter 可以在同一边沿事件域的 commit 函数内部批量暂存私有 event history，
+包括因其他 history 冲突而使用 `AlwaysScanCommit` 的边沿域。
+资格为：history 仅有一个 object ref、state/event 类型相同且均为一个字节的 2-state
+1-bit logic、projection 为真、fanout 只有本域 arm、批内对象字节连续。至少四个 history
+组成短 pattern 批次；其余仍逐 op stage。DPI/system task 和 general commit 不参与。
+
+各 guard 仍读取独立旧值，批量 shadow 写在原函数末尾完成，publish 时对范围比较并
+按共同目标激活。没有合并 state、初值或不同域，也没有新增 task/调度条件。单值用
+memset，多值用至多八字节 pattern 的原地 memcpy；复用既有 pending ABI。
+emitter 的 history_batch 诊断给出实际覆盖和回退数量，不能仅凭该数量判断性能收益。
+
+批次的 `[offset, offset + count)` 范围由 pattern 完整覆盖，因此生成代码使用
+`cpu_stage_bytes_overwrite` 登记 dirty/pending 后直接取得 shadow 指针，省略 visible
+范围的预复制；普通 `cpu_stage_bytes` 仍保留预复制语义。publish 继续对最终 shadow
+与 visible 做 memcmp，所以批次与同轮其他写入产生相同的最终值时不会虚假激活读者。
+
+`DomainGatedCommit` 函数可从实际 op/event operands 合成一个有限的必要条件：
+所有 posedge 当前值及所有 negedge 当前值取反的 OR。条件为假时，payload 的全部
+edge guard 必为假，函数只按原 op/event 顺序采样 history，并执行同样的私有批次。
+条件为真时保留原逐 op guard/写入/采样。最多合并八个去重的 (ValueId, edge) 项，
+超过上限、无事件或不支持的 op 回退；general/AlwaysScanCommit 不参与。
+该路径不跳过 history、不冻结历史、不改 arm 或 E，不改变任何外部调用的执行。
+
+同一 (ValueId, edge) 项含至少 16 个独立、unsigned two-state 1-bit history 且每个
+槽均为一字节时，可以进一步只读检查 visible history：按 offset 去重排序，形成不跨
+间隙的连续区间，平均每段至少四字节才启用。posedge 项仅在当前值为真且任一区间有
+旧值 0 时可能触发，negedge 项仅在当前值为假且有旧值 1 时可能触发。单段直接
+`std::memchr`，多段使用 constexpr offset/size 表及短路循环，不分配或复制 history。
+稀疏/小组保留原电平必要条件。这个 OR 只决定是否走上述 sampling-only 分支，各
+history 的初值和完整 guard 仍独立；只有上述已证明等价的历史才能使用代表，
+不能读取 pending shadow。
+回归覆盖尾字节命中、混合边沿、不同初值、派生时钟、区间间隙、固定电平下数据变化
+和重复 init，并保留 shared-history 的 AlwaysScanCommit 测试。
+
+`DomainGatedCommit` 还可在原 body 之前检测整个 task 是否无效果：仅限
+`write/writeMask/writeArray/writeArrayMask/fill`，全部 event 为 posedge/negedge，全部 history
+均为 unsigned two-state 1-bit、一字节存储且各自只有一个 object ref。至少 16 个 history、
+至多八个不同的当前事件 ValueId 才启用。共享、被观察、被普通写口写入的 history
+以及 general/AlwaysScanCommit、DPI/system task 均不使用该检测。
+
+条件为每个 history 的 visible 值等于其当前事件值。成立时全部边沿守卫为假，且历史
+采样也不改变值；私有性排除了需要覆盖的其他 pending 写者，因此可直接返回而不暂存。
+任一 history 不同就完整保留原 guard/采样路径，不能据此冻结 history 或合并不同初值。
+已证明等价的共享历史按代表 offset 去重，避免重复扫描同一个值。
+按当前 ValueId 分组，连续历史字节以 memchr 查找相反布尔值，非连续历史以 constexpr
+offset 表逐字节比较，不扫描间隙、不创建副本，不改变 E、domain arm 或 fixed-point 规则。
+
+例如同一 task 的两个 posedge history 为 `[1,0]`、当前时钟为 1 时，检测必须失败，
+第二个守卫仍需触发；两者采样后均为 1，下一轮相同电平时才可跳过。如果下一次时钟
+下降到 0，即使 posedge 守卫都为假，也必须采样成 0，不能跳过该更新。
+
+CPU emitter 测试含三个独立多时钟 DUT，各自对照 Verilator 逐次 eval：
+
+- `cpu_chain`：双时钟、派生 gated clock、异步复位、latch、多 mask 写及写回原值。
+- `cpu_cdc`：posedge A / negedge B 计数器及双向两级采样，独立记分板检查同次 eval
+  双域触发时必须读旧值，覆盖计数回绕、不同频率、无输入变化的重复 eval 和异步复位。
+- `cpu_dual_ram`：双 posedge 域 masked memory write 与同步读捕获，独立记分板检查
+  read-before-write、异步复位、空闲域和全地址观测。排除 RTL 未定义的同时同地址双写。
+
+这里的 IR fixture 为手工构造，用于隔离 CPU mapping/emitter 语义，SV 供 Verilator
+参考；不是 ingest 端的自动等价证明，也不模拟硬件 CDC 亚稳态。全链路集成另由
+HDLBits 和 XiangShan 回归覆盖。
+
+### CPU C++ DPI 与系统任务
+
+`core.dpi.call` 留在 compute，按 `callCond && eventGuard` 发射实际 `extern "C"` 调用；
+没有 event 时 `eventGuard=true`，没有结果时仍发射调用。调用条件为假或未命中边沿时，
+boundary 中的旧返回值/output/inout 保持不变。所有 event history 均在调用条件之外采样，
+沿用当前 staged history/publish 路径，不改变 phase、event metadata 或 schedule。
+调用条件按 legacy 的非零判真规则处理；宽逻辑条件用归约 OR，不能只检查最低位。
+
+声明消费 `DpiSignature`，ABI 对齐 legacy：标量 input 按值，string input 为 `const char*`，
+宽 input 为 `const std::array<uint64_t,N>&`，output/inout 指向调用者临时存储。inout 先按
+声明类型归一化并装载输入，调用后依次发布返回值、output 和 inout，真变化时激活 mapping
+中的 fanout。宽结果屏蔽 padding；窄 signed 结果保留逻辑位宽的符号扩展，包括 signed 1-bit。
+Real 端口和 DPI 值使用 double。此 ABI 不是通用 svdpi/open-array ABI；任何带 shape
+的 DPI input/output/inout 参数和返回值均标记为不支持，aggregate ABI 未实现（P1），
+emit 必须显式拒绝。重复 symbol 的不兼容声明、调用数量/类型不匹配在写出文件之前报告错误。
+DPI C 声明只写入 compute task 源文件，不污染公共模型头文件。这沿用 legacy 的翻译单元
+边界，允许 harness 继续包含其原生接口声明；本机 scalar ABI 保持原始位模式，不承诺跨 ABI
+或通用 svdpi 兼容。
+
+例如声明参数顺序为 `(out output, acc inout, x input)` 且有返回值时：
+
+```text
+operands = [callCond, x, accBefore, clk]
+object_refs = [function, clkHistory]
+event_edges = [posedge]
+results = [returnValue, outValue, accAfter]
+C call = function(&outTemporary, &accTemporary, x)
+```
+
+系统任务复用 legacy runtime 的 `grhsim_make_task_arg`/`grhsim_format_task_message`，参数只在
+调用守卫命中时构造。支持 display/write/strobe/fdisplay/fwrite、info/warning/error 和
+fatal/finish/stop；strobe 延后到当前 eval 收敛时输出，terminal task 刷新输出并退出进程。
+标准 stdout/stderr 句柄支持 1/2 及 0x80000001/0x80000002，其他文件句柄目前显式报错。
+initial 无 timing 的 task 受首个 eval 门控；initial 带 timing 的 task 在首次实际触发后
+标记完成。final process、其他任务名和数组任务参数仍被 emit 明确拒绝，不能静默跳过。
+
+## 6. 参考
+
+- [GrhSIM IR Overview](../overview.md)
+- [Core Dialect](../dialects/core.md)
+- [CPU Dialect](../dialects/cpu.md)
+- [Pass System](../passes/overview.md)

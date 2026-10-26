@@ -631,8 +631,8 @@ int testOldestArbiterResetPackedArray(const std::filesystem::path& sourcePath,
                     std::string(moduleName));
     }
     if (!exprHasOpWidth(lowering, priorityWholeWrite->data,
-                        wolvrix::lib::grh::OperationKind::kConcat, priorityWidth)) {
-        return fail("priorityVecReg whole write is missing packed-array concat width " +
+                        wolvrix::lib::grh::OperationKind::kArrayCreate, priorityWidth)) {
+        return fail("priorityVecReg whole write is missing packed-array construction width " +
                     std::to_string(priorityWidth) + " for " + std::string(moduleName));
     }
 
@@ -682,7 +682,7 @@ int testOldestArbiterResetGraphWholeRead(const std::filesystem::path& sourcePath
         return fail("priority_flat output has no defining op for " + std::string(moduleName));
     }
     const wolvrix::lib::grh::Operation assignOp = graph->getOperation(assignId);
-    if (assignOp.kind() != wolvrix::lib::grh::OperationKind::kAssignAs ||
+    if (assignOp.kind() != wolvrix::lib::grh::OperationKind::kAssign ||
         assignOp.operands().size() != 1) {
         return fail("priority_flat output should be assigned from aggregate whole read for " +
                     std::string(moduleName));

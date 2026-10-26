@@ -166,6 +166,9 @@ namespace wolvrix::lib::transform::topo_guard
         {
             return true;
         }
+        if (graph.valueWidth(from) != graph.valueWidth(to) ||
+            graph.valueType(from) != graph.valueType(to) ||
+            graph.valueDomain(from) != graph.valueDomain(to)) return false;
         const std::span<const int64_t> fromShape = graph.valueShape(from);
         if (fromShape.empty())
         {

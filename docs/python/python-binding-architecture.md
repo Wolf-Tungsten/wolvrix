@@ -104,6 +104,16 @@ In this example, `stats.dut` is produced by one native stage and then consumed b
 
 ## Core Workflow
 
+Simulation follows this same workflow on an ordinary `design` key. Use
+`run_pass("grh-to-grhsim", ...)`, the simulation transforms and
+`emit_grhsim_cpu_st_cpp(...)` in the same session. `grhsim-partition-sink`
+publishes a typed SinkSchedule bound to the current design/top/revision;
+load, clone or mutation requires rebuilding it. It is not a separate model
+category and is not stored in JSON. The independent `lower_grhsim`,
+`run_grhsim_pass`, `run_grhsim_pipeline`, `load_grhsim`, `store_grhsim` and
+`list_grhsim_passes` APIs have been removed from both Python and native exports.
+See the [simulation workflow](../grhsim.md) for stages, checkpoints and options.
+
 The normal workflow looks like this:
 
 1. read or load a design into the session

@@ -1,7 +1,7 @@
 # ingest 聚合类型支持（数组与结构体）
 
 本文是 ingest 对 SystemVerilog 聚合类型（数组、结构体）处理的规范。它对应
-`pdocs/grh-ir-array-support/` stage-04 的实现，目标是：在不违反 GRH 类型系统
+`pdocs/grh-ir-array-support/` stage-04 / stage-08 的实现，目标是：在不违反 GRH 类型系统
 （同质数组）的前提下**尽可能保留源级聚合结构**，不再把一切平化成单向量。
 
 ## 1. 类型映射决策树
@@ -27,6 +27,14 @@
 4. **数组端口不再平化**：端口 value 带 shape；struct 端口同样字段级拆分为叶子端口。
 5. **动态 / 关联数组、队列**：报错。union 报错（字段重叠与拆分不兼容）。
    Real/String 的任何数组化报错。
+
+### 1.1 同型元素构造
+
+字段拆分后的 struct 数组 concat 若每项恰为一个同型外层元素、目标几何为 `[N]+S`，
+直接产生 `kArrayCreate`；SV MSB 优先次序转换为规范化低元素优先次序。
+数组 of struct assignment pattern 的逐元素组装同样使用该 op；packed/unpacked 的
+索引方向继续沿用原来的归一化规则。异宽、跨元素边界或其他目标几何的拼接仍为 `kConcat`。
+新 op 的结果类型由实际元素推导，不先生产扁平整数再恢复 shape。
 
 ## 2. 数组状态的分类阈值
 

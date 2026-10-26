@@ -11,7 +11,6 @@ __all__ = [
     "OpaqueValue",
     "Session",
     "format_diagnostics",
-    "list_grhsim_passes",
     "list_passes",
     "print_diagnostics",
 ]
@@ -235,143 +234,6 @@ class Session:
             dryrun=dryrun,
         )
 
-    def lower_grhsim(
-        self,
-        *,
-        design: str,
-        out_model: str = "grhsim.main",
-        top: str | None = None,
-        logic_domain: str = "4-state",
-        keep_origins: bool = True,
-        keep_declared_symbols: bool = True,
-        consume: bool = False,
-        replace: bool = False,
-    ) -> list[dict]:
-        self._ensure_open()
-        domain = str(logic_domain).strip().lower().replace("_", "-")
-        if domain in {"2state", "2-state"}:
-            domain = "2-state"
-        elif domain in {"4state", "4-state"}:
-            domain = "4-state"
-        else:
-            raise ValueError("logic_domain must be one of: 2-state, 4-state")
-        success, diagnostics = _native.session_lower_grhsim(
-            self._capsule,
-            design=design,
-            out_model=out_model,
-            top=top,
-            logic_domain=domain,
-            keep_origins=bool(keep_origins),
-            keep_declared_symbols=bool(keep_declared_symbols),
-            consume=bool(consume),
-            replace=bool(replace),
-        )
-        return self._complete_action(
-            "lower_grhsim",
-            diagnostics,
-            success=bool(success),
-            design=design,
-            out_model=out_model,
-            top=top,
-            consume=bool(consume),
-        )
-
-    def run_grhsim_pass(
-        self,
-        name: str,
-        *,
-        model: str = "grhsim.main",
-        args: list[str] | None = None,
-        **options,
-    ) -> list[dict]:
-        self._ensure_open()
-        pass_args = list(args or [])
-        for key in sorted(options):
-            value = options[key]
-            option = "--" + str(key).replace("_", "-")
-            if isinstance(value, bool):
-                pass_args.extend([option, "true" if value else "false"])
-            elif value is not None:
-                pass_args.extend([option, str(value)])
-        success, changed, diagnostics = _native.session_run_grhsim_pass(
-            self._capsule,
-            name=str(name),
-            model=model,
-            args=pass_args,
-        )
-        return self._complete_action(
-            "run_grhsim_pass",
-            diagnostics,
-            success=bool(success),
-            changed=bool(changed),
-            name=str(name),
-            model=model,
-        )
-
-    def run_grhsim_pipeline(
-        self,
-        passes: list[str | tuple[str, dict[str, Any]]],
-        *,
-        model: str = "grhsim.main",
-    ) -> list[dict]:
-        self._ensure_open()
-        diagnostics: list[dict] = []
-        for entry in passes:
-            if isinstance(entry, str):
-                name, options = entry, {}
-            else:
-                if not isinstance(entry, tuple) or len(entry) != 2 or not isinstance(entry[1], dict):
-                    raise TypeError("each GrhSIM pipeline entry must be a pass name or (name, options) tuple")
-                name, options = entry
-            diagnostics.extend(self.run_grhsim_pass(str(name), model=model, **options))
-            if not self._history[-1]["success"]:
-                break
-        return diagnostics
-
-    def load_grhsim(
-        self,
-        path: str,
-        *,
-        out_model: str = "grhsim.main",
-        replace: bool = False,
-    ) -> list[dict]:
-        self._ensure_open()
-        success, diagnostics = _native.session_load_grhsim(
-            self._capsule,
-            path=path,
-            out_model=out_model,
-            replace=bool(replace),
-        )
-        return self._complete_action(
-            "load_grhsim",
-            diagnostics,
-            success=bool(success),
-            path=path,
-            out_model=out_model,
-        )
-
-    def store_grhsim(
-        self,
-        *,
-        model: str = "grhsim.main",
-        output: str,
-        pretty: bool = False,
-    ) -> list[dict]:
-        self._ensure_open()
-        success, diagnostics = _native.session_store_grhsim(
-            self._capsule,
-            model=model,
-            output=output,
-            pretty=bool(pretty),
-        )
-        return self._complete_action(
-            "store_grhsim",
-            diagnostics,
-            success=bool(success),
-            model=model,
-            output=output,
-        )
-
     def store_json(
         self,
         *,
@@ -422,6 +284,41 @@ class Session:
             output=output,
         )
 
+    def graph_metadata(self, *, design: str, top: str | None = None) -> dict:
+        """Read the graph's serializable metadata, without copying its entities."""
+        self._ensure_open()
+        return _native.session_graph_metadata(self._capsule, design=design, top=top)
+
+    def emit_grhsim_cpu_st_cpp(
+        self,
+        *,
+        design: str,
+        output: str,
+        top: list[str] | None = None,
+        max_function_lines: int = 1024,
+        max_tu_bytes: int = 1024 * 1024,
+        max_round: int = 100000,
+        waveform: bool = False,
+        trace_underscore_values: bool = False,
+        mem_write_activate: str = "on-write",
+        mem_enable_bitmap: bool = True,
+        execution_counters: bool = False,
+    ) -> list[dict]:
+        """Emit the ordinary partitioned design with this session's SinkSchedule."""
+        self._ensure_open()
+        success, diagnostics = _native.session_emit_grhsim_cpu_st_cpp(
+            self._capsule, design=design, output=output, top=top or [],
+            max_function_lines=max_function_lines, max_tu_bytes=max_tu_bytes,
+            max_round=max_round, waveform=bool(waveform),
+            trace_underscore_values=bool(trace_underscore_values),
+            mem_write_activate=mem_write_activate, mem_enable_bitmap=bool(mem_enable_bitmap),
+            execution_counters=bool(execution_counters),
+        )
+        return self._complete_action(
+            "emit_grhsim_cpu_st_cpp", diagnostics, success=bool(success),
+            design=design, output=output,
+        )
+
     def emit_verilator_repcut_package(
         self,
         *,
@@ -470,15 +367,20 @@ def list_passes() -> list[str]:
     return list(_native.list_passes())
 
 
-def list_grhsim_passes() -> list[str]:
-    return list(_native.list_grhsim_passes())
-
-
 def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tuple[str, list[str]]:
     canonical_name = _canonical_pass_name(name)
     compiled = list(args)
     if canonical_name == "hier-flatten":
         compiled.extend(_compile_hier_flatten_kwargs(named))
+    elif canonical_name in _GRHSIM_PASS_OPTIONS:
+        allowed = _GRHSIM_PASS_OPTIONS[canonical_name]
+        local = dict(named)
+        for key in allowed:
+            value = local.pop(key, None)
+            if value is not None:
+                text = str(int(value)) if isinstance(value, bool) else str(value)
+                compiled.append(f"-{key.replace('_', '-')}={text}")
+        _ensure_no_extra_named(canonical_name, local)
     elif canonical_name == "comb-loop-elim":
         compiled.extend(_compile_comb_loop_elim_kwargs(named))
     elif canonical_name == "simplify":
@@ -500,6 +402,19 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
         keys = ", ".join(sorted(named))
         raise TypeError(f"{name} does not accept named pass parameters: {keys}")
     return canonical_name, compiled
+
+
+_GRHSIM_PASS_OPTIONS = {
+    "grh-to-grhsim": ("top", "logic_domain"),
+    "grhsim-simplify": ("top", "max_rounds"),
+    "grhsim-pack-bit-registers": ("top", "report"),
+    "grhsim-recover-masked-or": ("top", "min_terms", "report"),
+    "grhsim-split-event-and-output": ("top",),
+    "grhsim-split-nonsink-and-sink": ("top", "mem_min_bytes"),
+    "grhsim-partition-nonsink": ("top", "max_node_work", "max_supernode_work", "segment_penalty",
+                                "semantic_nodes", "clone_shared", "clone_max_fanout", "max_clones", "clone_lossy_compare"),
+    "grhsim-partition-sink": ("top", "enable_guard_min_size"),
+}
 
 
 def _canonical_pass_name(name: str) -> str:

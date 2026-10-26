@@ -1,4 +1,8 @@
-# GrhSIM 当前调度方法
+# 历史 GrhSIM 调度方法
+
+> 本文记录已退役的 `grhsim-cpp` emitter；正文的“当前”指当时版本。
+> 现行仿真采用 [统一 GRH 流程](../grhsim.md)、虚拟分区和 SinkSchedule。
+> 下文旧文件路径仅用于追溯，不是生产接口。
 
 本文按当前代码实现描述 GrhSIM 的调度方法。实现分两层：
 

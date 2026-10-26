@@ -227,6 +227,17 @@ Value 支持三种数据类型：
 
 ## 2.3 数组类型（shape）
 
+完整 `LogicalType` 是 `{kind,width,isSigned,domain,shape}`，domain 为 TwoState 或
+FourState；同位宽但不同 shape、signedness 或逻辑域的值并非同型。普通 alias 和
+公共子表达式替换必须保留完整类型。Real/String 不带数组形状，其规范类型为
+width=1、unsigned、FourState。状态声明通过同一 LogicalType 接口访问类型，并通过
+有序 InitSpec 访问初始化；声明、读口及写入数据的 kind/domain 必须一致。
+
+GRH 图容器允许注册方言 OpDescriptor，扩展 kind 由所属模块持有，不加入基础枚举。
+描述符定义名称/版本、effects、复制/合并许可和 operand/result/属性校验；
+grhsim 的独立写口、edge-detect、调用及 bitSelect/prioritySelect 定义在
+`transform/grhsim/ops.hpp`。基础 GRH 的写口与调用契约保持下文定义。
+
 GRH 的 Value 原生支持**单一元素类型、一维到多维、每维长度编译期确定**的数组，类型记作
 `UInt8[x][y]` 形式（元素类型 + 维度表 `[x, y]`）。数组 Value 仍服从 SSA：一个数组 Value
 只有一个定义 Operation。
@@ -268,25 +279,27 @@ shape 恒对应 "canonical index 0 = 最低元素地址" 的布局；SV 源中�
 边界合法）；合法 SV 源中 unpacked 数组不可能参与算术/移位/归约（前端直接拒绝），因此
 **不设 op 白名单/黑名单**。
 
-但 shape 是 value 的**类型成分**：跨 shape（或跨符号性）的连接不是改名，必须通过
-`kAssignAs`（§6.2.9）显式表达——它表达"bit 级内容不变的类型重解释"。`kAssign`
-收紧为严格同型改名；别名/重写通道不得把 shape 隐式回填给扁平 value（历史上
+但 shape 是 value 的**类型成分**：跨 shape（或跨符号性）的连接通过等宽
+`kAssign`（§6.2.9）显式表达，由完整输入/输出类型区分同型传递与类型重解释。
+别名/重写通道不得把 shape 隐式回填给扁平 value（历史上
 `guardShapeAlias` 的回填曾把聚合 shape 染到输出端口与内部值上，见
 ptmp 归档的 CASE_009 / XS store 提交乱序调查）。
 
-shape 感知点（真正读 shape 的地方）只有五个：
+shape 感知点（真正读 shape 的地方）包括：
 
 - `kSliceArray`：输入 Value 必须 shape 非空（见 §6.2.8）；
+- `kArrayCreate`：增加外层维度，完整元素类型和结果几何由 verifier 强制检查；
 - 声明 op 的 `shape` 属性（§6.4）与读口 result 的 shape 继承；
 - `kRegister` 数组端口族（索引读/写、部分索引、掩码、填充，§6.4）；
 - 实例端口连接的 shape 匹配（totalBits 必须一致，shape 不一致给 warning）；
-- `kAssignAs` 的 result 类型声明（类型边界本身，见 §6.2.9）。
+- `kAssign` 的完整输入/输出类型（等宽类型边界，见 §6.2.9）。
 
-**shape 推导惯例**（供 ingest/pass 构造 result Value 时使用，不是 verifier 约束；
-shape 缺失/未传播只损失结构信息，不影响正确性）：
+**shape 构造规则与推导惯例**（`kArrayCreate` 是 verifier 强制契约；其余项供
+ingest/pass 构造 result Value 时使用，未传播可选 shape 只损失结构信息）：
 
-- `kConcat`：操作数全同形 `[s..]` → result `[n, s..]`（n=操作数个数，沿 leading 维拼接）；
-  其余组合 → 标量。
+- `kArrayCreate`：`N` 个同型元素（总宽 `W`、shape `S`）→ 总宽 `N*W`、shape `[N]+S`；
+  这是强制契约，不是可选推导。`kConcat` 保留原有合法位拼接和既有 shaped 用法，
+  不能仅凭同宽判断数组构造。
 - `kMux` / `kRegisterReadPort` / `kLatchReadPort`：result 继承相应 shape（整体读 =
   声明的完整 shape）。
 - `kRegisterReadArrayPort`：索引数 k==rank → 标量（元素）；k<rank → result shape =
@@ -561,12 +574,14 @@ Graph 额外维护 **Generate Group** 列表（`generateGroups()`），作为 De
 - 同一模块的多实例产生各自独立的组（`scope` 前缀不同）；成员符号在内联中被丢弃时（如子图端口名被父图名取代）相应地从组中移除；组变空则不写入主图。
 - flatten 对已展平图是幂等的：前缀只在内联 `kInstance` 时叠加，而实例 op 随内联被删除，重复执行不会二次加前缀。
 
-**lower 到 GrhSIM IR 后的去向**：
+**转换为仿真方言后的去向**：
 
-`lower_grhsim`（`keep_declared_symbols=True`，默认）把 declaredSymbols 与 generateGroups
-原样携带为模型的只读 metadata，并为每个能解析到存活 value/state/function 的声明建立
-`declProvenance` 记录（direct 全覆盖 slice，数组声明保留形状），供 GrhSIM 侧优化与调试
-反查。表示、更新规则与 JSON 编码见 `docs/grhsim_ir/overview.md` 第 3.4.1 节。
+`grh-to-grhsim` 在同一个 GRH Graph 上替换写口、事件和调用；declaredSymbols、
+generateGroups、完整类型和来源继续使用原 GRH 结构。不存在独立 model 或
+`declProvenance` 镜像。状态打包保留原声明的 typed view；合并计算的来源采用
+有序去重 union，不能覆盖已有来源。统一 JSON 保存这些图事实，FST 和模块归属
+工具通过最终图与生成 manifest 绑定读取。见 [仿真方言](grhsim-dialect.md)及
+[标准流程](../grhsim.md)。
 
 ---
 
@@ -908,25 +923,15 @@ res[0] = oper[0] ? oper[1] : oper[2]
 - **results**: `res[0]`，位宽 `W`
 - **attrs**: 无
 - **语义**: `res[0] = oper[0]`
-- **类型契约（stage-08 起收紧）**：`oper[0]` 与 `res[0]` 的 width / isSigned / shape
-  必须全等——kAssign 是严格的同型改名。bit 级内容不变的跨类型转换必须使用
-  `kAssignAs`，verifier 对违例报错。
-
-**kAssignAs**（位级重解释 / pack-unpack 转换）
-
-- **operands**: `oper[0]`（源信号，位宽 `W`）
-- **results**: `res[0]`，位宽必须等于 `W`（verifier 强制）
-- **attrs**: 无
-- **语义**: bit 内容恒等；`res[0]` 的 shape / isSigned 可与 `oper[0]` 不同。
-  用于 packed 聚合 ⇄ 扁平位向量之间的显式视图转换（如 `assign flat = aggReg`）。
-  位宽不等的转换不进本 op（由既有 resize/cast 路径处理）。
-
-#### 3. kAssignAs 与"shape 即类型"
-
-value 的 shape 是创建即定型的类型成分：op 定义其 result 的类型，别名通道
-（`replaceResult`/`replaceAllUses`）不再把 shape 回填给扁平 value。跨类型连接
-一律显式经过 kAssignAs，因此任何"删除一个 kAssign"式的优化在类型层面天然安全——
-它能删的只剩真正的同型改名。
+- **类型契约**：输入和结果的 width、kind、domain 必须相同；isSigned 和 shape
+  可以不同。完整类型全等时表示同型传递，否则表示保持位图的显式类型视图。
+  结果保留自己的完整类型，不反向修改输入的 shape。位宽变化使用既有 resize/cast
+  路径，逻辑域投影使用显式转换流程。
+- **例子**：`assign : Logic<16,shape=[2]> → Logic<16,shape=[]>` 将两个 8 位元素
+  解释成一个 16 位向量，元素 0 仍位于低 8 位；`16 → 8` 非法。
+- **优化约束**：只有完整类型（kind / width / isSigned / domain / shape）相同才能
+  直接替换 SSA uses；异型 assign 不可当作同型 alias 删除。`kAssignAs` 已删除，旧
+  checkpoint 需要从源 SV 或当前 GRH 重新生成。
 
 **kConcat**（位拼接）
 
@@ -935,6 +940,19 @@ value 的 shape 是创建即定型的类型成分：op 定义其 result 的类�
 - **attrs**: 无
 - **语义**: `res[0] = {oper[0], oper[1], ..., oper[N-1]}`
 - **说明**: `oper[0]` 在高位，`oper[N-1]` 在低位
+
+**kArrayCreate**（数组构造）
+
+- **operands**：`e0, e1, ..., eN-1`，`N >= 1`，均为完整同型 Logic 值：总位宽 `W`、
+  signedness 和 shape `S` 全部相同。操作数本身可为子数组。
+- **results**：唯一结果，`width=N*W`、`shape=[N]+S`，继承元素 signedness；乘积不得溢出。
+- **attrs**：无语义属性（允许 `originModules` 来源信息）。
+- **语义**：`result[i]=ei`；扁平位段 `[i*W +: W]` 来自 `ei`，对应位拼接
+  `concat(eN-1,...,e0)`。不隐式扩展、截断或重解释元素类型。
+- **示例**：`arrayCreate(8'h11,8'h22)` 的 shape 为 `[2]`，扁平位图为 `16'h2211`；
+  两个 shape `[3]` 的值组成 `[2,3]`；单个标量组成 `[1]`，不能消去该维度。
+- **性质**：纯 SSA 组合构造，不分配状态，不重新执行输入的生产者。
+  数组消费者可逐元素处理；真正的扁平消费者才需要打包。SV 发射使用反序位拼接表达相同位图。
 
 **kReplicate**（位复制）
 

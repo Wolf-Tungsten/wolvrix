@@ -2409,8 +2409,8 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kLogicNot:
                 case wolvrix::lib::grh::OperationKind::kMux:
                 case wolvrix::lib::grh::OperationKind::kAssign:
-                case wolvrix::lib::grh::OperationKind::kAssignAs:
                 case wolvrix::lib::grh::OperationKind::kConcat:
+                case wolvrix::lib::grh::OperationKind::kArrayCreate:
                 case wolvrix::lib::grh::OperationKind::kReplicate:
                 case wolvrix::lib::grh::OperationKind::kSliceStatic:
                 case wolvrix::lib::grh::OperationKind::kSliceDynamic:
@@ -2723,13 +2723,25 @@ namespace wolvrix::lib::emit
                     }
                     break;
                 case wolvrix::lib::grh::OperationKind::kAssign:
-                case wolvrix::lib::grh::OperationKind::kAssignAs:
                     if (!ops.empty())
                     {
                         int64_t resultWidth = graph->valueWidth(valueId);
                         expr = inlineExpr.extendOperand(ops[0], resultWidth);
                     }
                     break;
+                case wolvrix::lib::grh::OperationKind::kArrayCreate:
+                {
+                    std::ostringstream array;
+                    array << '{';
+                    for (std::size_t i = ops.size(); i-- > 0;)
+                    {
+                        if (i + 1 != ops.size()) array << ", ";
+                        array << inlineExpr.concatOperandExpr(ops[i]);
+                    }
+                    array << '}';
+                    expr = array.str();
+                    break;
+                }
                 case wolvrix::lib::grh::OperationKind::kConcat:
                     if (!ops.empty())
                     {
@@ -3961,16 +3973,34 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case wolvrix::lib::grh::OperationKind::kAssign:
-                case wolvrix::lib::grh::OperationKind::kAssignAs:
                 {
                     if (operands.empty() || results.empty())
                     {
-                        reportError("kAssign/kAssignAs missing operands or results", opContext);
+                        reportError("kAssign missing operands or results", opContext);
                         break;
                     }
                     int64_t resultWidth = graph->valueWidth(results[0]);
                     const std::string rhs = baseExpr.extendOperand(operands[0], resultWidth);
                     addValueAssign(results[0], rhs, opId);
+                    ensureWireDecl(results[0]);
+                    break;
+                }
+                case wolvrix::lib::grh::OperationKind::kArrayCreate:
+                {
+                    if (operands.empty() || results.size() != 1)
+                    {
+                        reportError("kArrayCreate requires elements and one result", opContext);
+                        break;
+                    }
+                    std::ostringstream array;
+                    array << '{';
+                    for (std::size_t i = operands.size(); i-- > 0;)
+                    {
+                        if (i + 1 != operands.size()) array << ", ";
+                        array << baseExpr.concatOperandExpr(operands[i]);
+                    }
+                    array << '}';
+                    addValueAssign(results[0], array.str(), opId);
                     ensureWireDecl(results[0]);
                     break;
                 }

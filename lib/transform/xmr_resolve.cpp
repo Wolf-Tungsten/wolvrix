@@ -1018,7 +1018,7 @@ namespace wolvrix::lib::transform
             }
             wolvrix::lib::grh::SymbolId opSym = makeInternalOpSymbol(*leafGraph);
             wolvrix::lib::grh::OperationId assign =
-                createOp(*leafGraph, leafGraph->assignKindFor(drivers.front(), *replacement),
+                createOp(*leafGraph, wolvrix::lib::grh::OperationKind::kAssign,
                          opSym, "assign_write");
             leafGraph->addOperand(assign, drivers.front());
             leafGraph->addResult(assign, *replacement);

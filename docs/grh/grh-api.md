@@ -197,6 +197,9 @@ value.width();        // 位宽
 value.isInput();      // 是否为输入端口
 value.definingOp();   // 定义该 Value 的 Operation
 value.users();        // 使用者列表
+// 可变图的 users 枚举顺序不保证稳定；需要顺序时按显式属性或 op 顺序排序。
+// freeze 会按 operation/operand 顺序重新构建 use-list。
+graph.valueUsers(valueId); // 借用当前 use-list；图修改/freeze 后失效，修改期间需先复制。
 
 // Operation 信息
 Operation op = graph.getOperation(opId);
@@ -216,10 +219,21 @@ if (auto attr = op.attr("width")) {
 **标准流程：先申请符号，再创建实体。**
 **注意：value / operation 的 symbol 不能互相冲突。**
 
+完整类型使用 `LogicalType {kind, width, isSigned, domain, shape}`。`LogicDomain` 为
+`TwoState` / `FourState`，旧重载默认 FourState。`shape` 的乘积必须整除总位宽；
+Real/String 规范化为 width=1、unsigned、FourState、无 shape。
+`createValue(sym, type)`、`valueLogicalType(id)` 和 `setValueLogicalType(id, type)`
+分别创建、读取和显式改变完整类型；改变类型的调用者必须同步生产者与消费者。
+`sameValueType(a,b)` 比较完整类型，不能仅以位宽相等判定 SSA alias 合法。
+
 ```cpp
 // 创建 Value
 SymbolId sym = graph.internSymbol("data");
 ValueId value = graph.createValue(sym, 32, false);  // width=32, unsigned
+
+// 同型元素构造数组；自动推导总位宽、signedness 和 shape=[N]+element.shape。
+// createArray({})、元素类型不一致或总宽超过 int32 上限会抛异常。
+ValueId array = graph.createArray(std::array{lhs, rhs}); // array[0]=lhs, array[1]=rhs
 
 // 创建 Operation（opSym 不能与已有 value/op 的 symbol 冲突）
 SymbolId opSym = graph.internSymbol("add");
@@ -360,6 +374,28 @@ graph.eraseValueUnchecked(value);
 ---
 
 ## 4. Graph 的双模态
+
+`Design::instanceId()` 标识当前设计实例，`revision()` 是保守变更序号。Graph 的实体、
+类型、符号绑定、端口、属性、来源及冻结重编号会使 revision 变化；预留容量等操作也
+可以使缓存失效。只读遍历不会改变它。clone/load/设计替换获得新的实例身份。
+
+`freeze()` 会压缩存活实体、重编号 OperationId/ValueId，并将 generation 重置为 0。
+旧 ID 的数字可能重新指向另一实体，不能作为跨 revision 的永久引用。SymbolId 仅是
+当前符号表的编号，symbol 文本也允许重命名或转交。`setOpSymbol/setValueSymbol`
+是底层符号绑定接口，不自动改写 declaredSymbols、generateGroups 或 regSymbol /
+latchSymbol / targetImportSymbol；语义重命名须由调用者同步这些引用。符号转交时原
+成员关系可自然保留，不能把这个接口改成隐式搬迁所有来源的操作。
+
+跨 pass 的 resolved 分析用 `transform::DesignStamp::capture(graph)` 保存实例、revision
+及 top GraphId，消费前调用 `matches(graph)`，过期则重建。SessionStore typed slot 通过
+`requireSessionValue<T>()` 读取，缺失、空 slot 或类型错误均报错；克隆 session 中的
+resolved 分析不能跳过新实例检查。
+
+状态仍是原 `kRegister/kLatch` 声明。`core/state.hpp` 提供 stateLogicalType /
+setStateLogicalType 和有序 InitSpec 的读写接口。InitSpec 支持 Constant、Fill、Readmem、
+Random，保存范围、seed 及覆盖顺序；它不是另一份状态表。方言通过
+`core/op_descriptor.hpp` 注册静态 OpDescriptor，声明名称、版本、effects、CSE/clone
+许可和 verifier。未知 kind 不可被视为纯 op；PassManager 默认拒绝未声明支持的方言。
 
 Graph 有两种内部状态，影响遍历性能：
 

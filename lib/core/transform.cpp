@@ -1,4 +1,5 @@
 #include "core/transform.hpp"
+#include "core/op_descriptor.hpp"
 
 #include "transform/activity_schedule.hpp"
 #include "transform/blackbox_guard.hpp"
@@ -6,6 +7,14 @@
 #include "transform/dead_code_elim.hpp"
 #include "transform/demo_stats.hpp"
 #include "transform/hier_flatten.hpp"
+#include "transform/grhsim/grh-to-grhsim.hpp"
+#include "transform/grhsim/simplify.hpp"
+#include "transform/grhsim/pack-bit-registers.hpp"
+#include "transform/grhsim/recover-masked-or.hpp"
+#include "transform/grhsim/split-event-and-output.hpp"
+#include "transform/grhsim/split-nonsink-and-sink.hpp"
+#include "transform/grhsim/partition-nonsink.hpp"
+#include "transform/grhsim/partition-sink.hpp"
 #include "transform/instance_inline.hpp"
 #include "transform/latch_transparent_read.hpp"
 #include "transform/memory_init_check.hpp"
@@ -21,6 +30,7 @@
 #include "transform/xmr_resolve.hpp"
 
 #include <chrono>
+#include <charconv>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -349,6 +359,33 @@ namespace wolvrix::lib::transform
                 continue;
             }
 
+            std::string unsupported;
+            for (const auto& [graphName, graph] : design.graphs())
+            {
+                if (graph->metadata("grhsim.stage") && !pass->supportsDialect("grhsim"))
+                {
+                    unsupported = "grhsim";
+                    break;
+                }
+                for (const auto operation : graph->operations())
+                {
+                    const auto* descriptor = wolvrix::lib::grh::findOpDescriptor(graph->opKind(operation));
+                    if (!descriptor || !pass->supportsDialect(descriptor->dialect))
+                    {
+                        unsupported = descriptor ? std::string(descriptor->dialect) : "unknown";
+                        break;
+                    }
+                }
+                if (!unsupported.empty()) break;
+            }
+            if (!unsupported.empty())
+            {
+                diags.error(pass->id(), "Pass does not support dialect " + unsupported, "pipeline");
+                encounteredFailure = true;
+                if (options_.stopOnError) break;
+                continue;
+            }
+
             pass->setContext(&context);
             auto startTime = std::chrono::steady_clock::now();
             PassResult passResult = pass->run();
@@ -414,6 +451,14 @@ namespace wolvrix::lib::transform
             "dead-code-elim",
             "activity-schedule",
             "grh.verify",
+            "grh-to-grhsim",
+            "grhsim-simplify",
+            "grhsim-pack-bit-registers",
+            "grhsim-recover-masked-or",
+            "grhsim-split-event-and-output",
+            "grhsim-split-nonsink-and-sink",
+            "grhsim-partition-nonsink",
+            "grhsim-partition-sink",
             "latch-transparent-read",
             "memory-read-retime",
             "slice-index-const",
@@ -436,6 +481,94 @@ namespace wolvrix::lib::transform
                                    std::string &error)
     {
         const std::string normalized = normalizePassName(name);
+        if (normalized == "grhsim-split-event-and-output" || normalized == "grhsim-split-nonsink-and-sink" ||
+            normalized == "grhsim-partition-nonsink" || normalized == "grhsim-partition-sink")
+        {
+            grhsim::SplitEventAndOutputOptions eventOptions;
+            grhsim::SplitNonsinkAndSinkOptions splitOptions;
+            grhsim::PartitionNonsinkOptions nonsinkOptions;
+            grhsim::PartitionSinkOptions sinkOptions;
+            std::unordered_set<std::string> seen;
+            for (const auto argument : args)
+            {
+                const auto separator = argument.find('=');
+                if (separator == std::string_view::npos) { error = "Expected -key=value"; return nullptr; }
+                const auto key = argument.substr(0, separator), value = argument.substr(separator + 1);
+                if (!seen.emplace(key).second) { error = "Duplicate partition option"; return nullptr; }
+                if (key == "-top")
+                {
+                    if (value.empty()) { error = "Empty top graph"; return nullptr; }
+                    eventOptions.top = splitOptions.top = nonsinkOptions.top = sinkOptions.top = value;
+                    continue;
+                }
+                uint64_t number = 0;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+                { error = "Partition options require unsigned integers or 0/1 booleans"; return nullptr; }
+                if (normalized == "grhsim-split-nonsink-and-sink" && key == "-mem-min-bytes" && number <= INT64_MAX)
+                    splitOptions.memMinBytes = number;
+                else if (normalized == "grhsim-partition-sink" && key == "-enable-guard-min-size" && number <= UINT32_MAX)
+                    sinkOptions.enableGuardMinSize = number;
+                else if (normalized == "grhsim-partition-nonsink" && number <= UINT32_MAX)
+                {
+                    if (key == "-max-node-work" && number) nonsinkOptions.maxNodeWork = number;
+                    else if (key == "-max-supernode-work" && number) nonsinkOptions.maxSupernodeWork = number;
+                    else if (key == "-segment-penalty") nonsinkOptions.segmentPenalty = number;
+                    else if (key == "-semantic-nodes" && number <= 1) nonsinkOptions.semanticNodes = number;
+                    else if (key == "-clone-shared" && number <= 1) nonsinkOptions.cloneShared = number;
+                    else if (key == "-clone-max-fanout" && number) nonsinkOptions.cloneMaxFanout = number;
+                    else if (key == "-max-clones") nonsinkOptions.maxClones = number;
+                    else if (key == "-clone-lossy-compare" && number <= 1) nonsinkOptions.cloneLossyCompare = number;
+                    else { error = "Invalid activity partition option: " + std::string(key); return nullptr; }
+                }
+                else { error = "Invalid " + normalized + " option: " + std::string(key); return nullptr; }
+            }
+            if (normalized == "grhsim-split-event-and-output") return std::make_unique<grhsim::SplitEventAndOutputPass>(eventOptions);
+            if (normalized == "grhsim-split-nonsink-and-sink") return std::make_unique<grhsim::SplitNonsinkAndSinkPass>(splitOptions);
+            if (normalized == "grhsim-partition-nonsink") return std::make_unique<grhsim::PartitionNonsinkPass>(nonsinkOptions);
+            return std::make_unique<grhsim::PartitionSinkPass>(sinkOptions);
+        }
+        if (normalized == "grhsim-simplify" || normalized == "grhsim-pack-bit-registers" ||
+            normalized == "grhsim-recover-masked-or")
+        {
+            std::string top;
+            std::filesystem::path report;
+            uint32_t limit = normalized == "grhsim-simplify" ? 8 : 16;
+            for (const auto argument : args)
+            {
+                if (argument.starts_with("-top=")) top = argument.substr(5);
+                else if (argument.starts_with("-report=") && normalized != "grhsim-simplify") report = argument.substr(8);
+                else if ((argument.starts_with("-max-rounds=") && normalized == "grhsim-simplify") ||
+                         (argument.starts_with("-min-terms=") && normalized == "grhsim-recover-masked-or"))
+                {
+                    const auto value = argument.substr(argument.find('=') + 1);
+                    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), limit);
+                    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                        limit < (normalized == "grhsim-simplify" ? 1u : 2u))
+                    { error = "Invalid positive optimization limit"; return nullptr; }
+                }
+                else { error = "Unknown " + normalized + " option: " + std::string(argument); return nullptr; }
+            }
+            if (normalized == "grhsim-simplify") return std::make_unique<grhsim::SimplifyPass>(grhsim::SimplifyOptions{top, limit});
+            if (normalized == "grhsim-pack-bit-registers") return std::make_unique<grhsim::PackBitRegistersPass>(grhsim::PackBitRegistersOptions{top, report});
+            return std::make_unique<grhsim::RecoverMaskedOrPass>(grhsim::RecoverMaskedOrOptions{top, limit, report});
+        }
+        if (normalized == "grh-to-grhsim")
+        {
+            grhsim::GrhToGrhsimOptions options;
+            for (const auto argument : args)
+            {
+                if (argument.starts_with("-top=")) options.top = argument.substr(5);
+                else if (argument == "-logic-domain=2state") options.logicDomain = wolvrix::lib::grh::LogicDomain::TwoState;
+                else if (argument == "-logic-domain=4state") options.logicDomain = wolvrix::lib::grh::LogicDomain::FourState;
+                else
+                {
+                    error = "grh-to-grhsim accepts -top=<graph> and -logic-domain=2state|4state";
+                    return nullptr;
+                }
+            }
+            return std::make_unique<grhsim::GrhToGrhsimPass>(std::move(options));
+        }
         if (normalized == "xmr-resolve")
         {
             if (!args.empty())

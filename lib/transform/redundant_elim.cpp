@@ -1,8 +1,10 @@
 #include "transform/redundant_elim.hpp"
 
 #include "core/grh.hpp"
+#include "core/transform.hpp"
 
 #include "topo_guard.hpp"
+#include "slang/numeric/SVInt.h"
 
 #include <algorithm>
 #include <array>
@@ -105,10 +107,14 @@ namespace wolvrix::lib::transform
             std::vector<wolvrix::lib::grh::AttrKV> attrs;
             int32_t width = 0;
             bool isSigned = false;
+            wolvrix::lib::grh::ValueType type = wolvrix::lib::grh::ValueType::Logic;
+            wolvrix::lib::grh::LogicDomain domain = wolvrix::lib::grh::LogicDomain::FourState;
+            std::vector<int64_t> shape;
 
             bool operator==(const OpSignature &other) const
             {
-                if (kind != other.kind || width != other.width || isSigned != other.isSigned)
+                if (kind != other.kind || width != other.width || isSigned != other.isSigned ||
+                    type != other.type || domain != other.domain || shape != other.shape)
                 {
                     return false;
                 }
@@ -138,6 +144,9 @@ namespace wolvrix::lib::transform
                 std::size_t seed = static_cast<std::size_t>(sig.kind);
                 seed = hashCombine(seed, std::hash<int32_t>{}(sig.width));
                 seed = hashCombine(seed, std::hash<bool>{}(sig.isSigned));
+                seed = hashCombine(seed, static_cast<std::size_t>(sig.type));
+                seed = hashCombine(seed, static_cast<std::size_t>(sig.domain));
+                for (int64_t dim : sig.shape) seed = hashCombine(seed, std::hash<int64_t>{}(dim));
                 seed = hashCombine(seed, std::hash<std::size_t>{}(sig.operands.size()));
                 for (const auto &operand : sig.operands)
                 {
@@ -285,13 +294,28 @@ namespace wolvrix::lib::transform
                     return std::nullopt;
                 }
             }
-            sig.attrs.assign(attrs.begin(), attrs.end());
+            // originModules is def-site bookkeeping, not semantics: keep it
+            // out of equality/hash so structurally identical ops from
+            // different instance paths still CSE (R1); the merge unions it.
+            sig.attrs.reserve(attrs.size());
+            for (const auto &kv : attrs)
+            {
+                if (kv.key == kOriginModulesKey)
+                {
+                    continue;
+                }
+                sig.attrs.push_back(kv);
+            }
             std::stable_sort(sig.attrs.begin(), sig.attrs.end(),
                              [](const wolvrix::lib::grh::AttrKV &lhs, const wolvrix::lib::grh::AttrKV &rhs)
                              { return lhs.key < rhs.key; });
             const wolvrix::lib::grh::ValueId resultId = graph.opResults(opId)[0];
             sig.width = graph.valueWidth(resultId);
             sig.isSigned = graph.valueSigned(resultId);
+            sig.type = graph.valueType(resultId);
+            sig.domain = graph.valueDomain(resultId);
+            const auto shape = graph.valueShape(resultId);
+            sig.shape.assign(shape.begin(), shape.end());
             return sig;
         }
 
@@ -383,7 +407,8 @@ namespace wolvrix::lib::transform
                                            int32_t width,
                                            bool isSigned,
                                            std::string_view literal,
-                                           uint32_t &counter)
+                                           uint32_t &counter,
+                                           wolvrix::lib::grh::LogicDomain domain)
         {
             std::string base;
             if (!baseName.empty())
@@ -395,7 +420,7 @@ namespace wolvrix::lib::transform
             const wolvrix::lib::grh::SymbolId valueSym = graph.internSymbol(valueName);
             const wolvrix::lib::grh::SymbolId opSym = graph.internSymbol(opName);
             const wolvrix::lib::grh::ValueId val =
-                graph.createValue(valueSym, width, isSigned, wolvrix::lib::grh::ValueType::Logic);
+                graph.createValue(valueSym, width, isSigned, wolvrix::lib::grh::ValueType::Logic, {}, domain);
             const wolvrix::lib::grh::OperationId op =
                 graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant, opSym);
             graph.addResult(op, val);
@@ -412,7 +437,7 @@ namespace wolvrix::lib::transform
                           const std::function<void(std::string)> &onError)
         {
             // Type-honest aliasing: when the replacement's type differs from
-            // the replaced value's, a kAssignAs view keeps the retype explicit.
+            // the replaced value's, a kAssign view keeps the retype explicit.
             wolvrix::lib::grh::ValueId aliased = to;
             try
             {
@@ -521,6 +546,82 @@ namespace wolvrix::lib::transform
                 if (opKind == wolvrix::lib::grh::OperationKind::kAssign &&
                     operands.size() == 1 && results.size() == 1)
                 {
+                    using namespace wolvrix::lib::grh;
+                    const OperationId concat = graph.valueDef(operands[0]);
+                    if (concat.valid() && graph.opKind(concat) == OperationKind::kConcat)
+                    {
+                        const auto parts = graph.opOperands(concat);
+                        if (!parts.empty())
+                        {
+                            const Value first = graph.getValue(parts[0]);
+                            const Value result = graph.getValue(results[0]);
+                            std::vector<int64_t> shape{static_cast<int64_t>(parts.size())};
+                            shape.insert(shape.end(), first.shape().begin(), first.shape().end());
+                            bool exact = result.type() == ValueType::Logic && first.type() == ValueType::Logic &&
+                                result.width() == static_cast<int64_t>(first.width()) * parts.size() &&
+                                result.isSigned() == first.isSigned() &&
+                                result.domain() == first.domain() &&
+                                std::ranges::equal(result.shape(), shape);
+                            for (ValueId part : parts)
+                            {
+                                const Value value = graph.getValue(part);
+                                exact = exact && value.type() == first.type() && value.width() == first.width() &&
+                                    value.isSigned() == first.isSigned() && value.domain() == first.domain() &&
+                                    std::ranges::equal(value.shape(), first.shape());
+                            }
+                            if (exact)
+                            {
+                                const std::vector<ValueId> elements(parts.rbegin(), parts.rend());
+                                graph.eraseOperand(opId, 0);
+                                for (ValueId element : elements) graph.addOperand(opId, element);
+                                graph.setOpKind(opId, OperationKind::kArrayCreate);
+                                inheritOrigin(graph, opId, {concat});
+                                graphChanged = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if (opKind == wolvrix::lib::grh::OperationKind::kSliceArray &&
+                    operands.size() >= 2 && results.size() == 1)
+                {
+                    using namespace wolvrix::lib::grh;
+                    const OperationId base = graph.valueDef(operands[0]);
+                    const OperationId index = graph.valueDef(operands[1]);
+                    if (base.valid() && index.valid() && graph.opKind(base) == OperationKind::kArrayCreate &&
+                        graph.opKind(index) == OperationKind::kConstant)
+                    {
+                        std::optional<uint64_t> selected;
+                        for (const auto &attr : graph.opAttrs(index))
+                            if (attr.key == "constValue")
+                                if (const auto *text = std::get_if<std::string>(&attr.value))
+                                {
+                                    try { selected = slang::SVInt::fromString(*text).as<uint64_t>(); }
+                                    catch (const std::exception &) {}
+                                }
+                        const auto parts = graph.opOperands(base);
+                        if (selected && *selected < parts.size())
+                        {
+                            const ValueId element = parts[*selected];
+                            const bool whole = operands.size() == 2;
+                            if (!whole || graph.sameValueType(element, results[0]))
+                            {
+                                std::vector<ValueId> args{element};
+                                args.insert(args.end(), operands.begin() + 2, operands.end());
+                                while (!graph.opOperands(opId).empty()) graph.eraseOperand(opId, 0);
+                                for (ValueId arg : args) graph.addOperand(opId, arg);
+                                graph.setOpKind(opId, whole ? OperationKind::kAssign : OperationKind::kSliceArray);
+                                inheritOrigin(graph, opId, {base});
+                                graphChanged = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if (opKind == wolvrix::lib::grh::OperationKind::kAssign &&
+                    operands.size() == 1 && results.size() == 1)
+                {
                     const wolvrix::lib::grh::ValueId srcId = operands[0];
                     const wolvrix::lib::grh::ValueId dstId = results[0];
                     if (!srcId.valid() || !dstId.valid())
@@ -586,6 +687,7 @@ namespace wolvrix::lib::transform
                                                           opSym);
                                 graph.addResult(newConst, dstId);
                                 graph.setAttr(newConst, "constValue", literalText);
+                                inheritOrigin(graph, newConst, {opId, constOpId});
                                 graph.setOpSrcLoc(newConst,
                                                   makeTransformSrcLoc("redundant-elim", "clone_const"));
                                 graphChanged = true;
@@ -971,7 +1073,7 @@ namespace wolvrix::lib::transform
                         wolvrix::lib::grh::ValueId constOne =
                             createInlineConst(graph, graph.symbolText(graph.valueSymbol(resultId)),
                                               1, graph.valueSigned(resultId), "1'b1",
-                                              inlineConstCounter);
+                                              inlineConstCounter, graph.valueDomain(resultId));
                         replaceUsers(graph, resultId, constOne, onError);
                         eraseOp(opId);
                         graphChanged = true;
@@ -1004,8 +1106,7 @@ namespace wolvrix::lib::transform
                         {
                             continue;
                         }
-                        if (graph.valueWidth(srcId) != graph.valueWidth(dstId) ||
-                            graph.valueSigned(srcId) != graph.valueSigned(dstId))
+                        if (!graph.sameValueType(srcId, dstId))
                         {
                             continue;
                         }
@@ -1074,8 +1175,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    if (graph.valueWidth(srcId) != graph.valueWidth(dstId) ||
-                        graph.valueSigned(srcId) != graph.valueSigned(dstId))
+                    if (!graph.sameValueType(srcId, dstId))
                     {
                         continue;
                     }
@@ -1292,6 +1392,12 @@ namespace wolvrix::lib::transform
                     ++revisions[use.operation.index];
                 }
                 replaceUsers(graph, resultId, canonicalValue, onError);
+                // Union the erased op's originModules into the canonical op
+                // (signature ignores this attr; merge semantics = union).
+                if (const auto erasedOrigins = getOriginModules(graph, opId))
+                {
+                    mergeOriginModules(graph, it->second.op, *erasedOrigins);
+                }
                 if (eraseOp(opId))
                 {
                     queued[opId.index] = Erased;

@@ -1,6 +1,7 @@
 #include "transform/comb_loop_elim.hpp"
 
 #include "core/grh.hpp"
+#include "core/transform.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -471,7 +472,6 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             case OperationKind::kAssign:
-            case OperationKind::kAssignAs:
             {
                 const auto operands = graph.opOperands(defId);
                 if (operands.size() != 1 || !operands[0].valid())
@@ -510,6 +510,7 @@ namespace wolvrix::lib::transform
                 return shifted & mask;
             }
             case OperationKind::kConcat:
+            case OperationKind::kArrayCreate:
             {
                 const auto operands = graph.opOperands(defId);
                 if (operands.empty())
@@ -518,8 +519,10 @@ namespace wolvrix::lib::transform
                 }
                 uint64_t acc = 0;
                 int totalWidth = 0;
-                for (ValueId operand : operands)
+                for (std::size_t i = 0; i < operands.size(); ++i)
                 {
+                    const ValueId operand = operands[graph.opKind(defId) == OperationKind::kArrayCreate
+                        ? operands.size() - 1 - i : i];
                     if (!operand.valid())
                     {
                         return std::nullopt;
@@ -892,11 +895,12 @@ namespace wolvrix::lib::transform
                 int64_t cursor = totalWidth;
                 for (std::size_t i = 0; i < operands.size(); ++i)
                 {
-                    const int64_t width = widths[i];
+                    const std::size_t slot = op.kind() == OperationKind::kArrayCreate ? operands.size() - 1 - i : i;
+                    const int64_t width = widths[slot];
                     const int64_t hi = cursor - 1;
                     const int64_t lo = cursor - width;
                     cursor = lo;
-                    ValueId operand = operands[i];
+                    ValueId operand = operands[slot];
                     if (loopSet.find(operand) == loopSet.end() ||
                         loopSet.find(resultId) == loopSet.end())
                     {
@@ -1073,6 +1077,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kConcat:
+                case OperationKind::kArrayCreate:
                     if (!mapConcatRanges(graph, op, loopSet, succ, nodeSet, uncertain))
                     {
                         return false;
@@ -1250,7 +1255,6 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kAssign:
-                case OperationKind::kAssignAs:
                 {
                     if (operands.size() != 1 || results.size() != 1)
                     {
@@ -1820,7 +1824,7 @@ namespace wolvrix::lib::transform
                 return true;
             };
 
-            if (baseDefKind == OperationKind::kAssign || baseDefKind == OperationKind::kAssignAs)
+            if (baseDefKind == OperationKind::kAssign)
             {
                 const auto baseOps = graph.opOperands(baseDefId);
                 if (baseOps.size() != 1)
@@ -2036,10 +2040,7 @@ namespace wolvrix::lib::transform
                         const int64_t operandWidth = graph.valueWidth(newBase);
                         if (newLow == 0 && newHigh + 1 == operandWidth)
                         {
-                            const auto opResults = graph.opResults(opId);
-                            graph.setOpKind(opId, opResults.empty()
-                                                      ? OperationKind::kAssign
-                                                      : graph.assignKindFor(newBase, opResults.front()));
+                            graph.setOpKind(opId, OperationKind::kAssign);
                             while (graph.opOperands(opId).size() > 1)
                             {
                                 graph.eraseOperand(opId, graph.opOperands(opId).size() - 1);
@@ -2179,7 +2180,6 @@ namespace wolvrix::lib::transform
                 switch (op.kind())
                 {
                 case OperationKind::kAssign:
-                case OperationKind::kAssignAs:
                 {
                     if (operands.size() != 1 || !operands[0].valid())
                     {
@@ -2270,6 +2270,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kConcat:
+                case OperationKind::kArrayCreate:
                 {
                     if (operands.empty())
                     {
@@ -2299,11 +2300,12 @@ namespace wolvrix::lib::transform
                     int64_t cursor = totalWidth;
                     for (std::size_t i = 0; i < operands.size(); ++i)
                     {
-                        const int64_t width = widths[i];
+                        const std::size_t slot = op.kind() == OperationKind::kArrayCreate ? operands.size() - 1 - i : i;
+                        const int64_t width = widths[slot];
                         const int64_t hi = cursor - 1;
                         const int64_t lo = cursor - width;
                         cursor = lo;
-                        edges.push_back(MappingEdge{operands[i], resultId, 0, lo, width});
+                        edges.push_back(MappingEdge{operands[slot], resultId, 0, lo, width});
                     }
                     break;
                 }
@@ -2675,6 +2677,28 @@ namespace wolvrix::lib::transform
             std::unordered_set<ValueId, ValueIdHash> definedFragments;
             opsRewritten = 0;
 
+            // Loop-split synthesis inherits the union of every loop op's
+            // origins (def-site semantics; see kOriginModulesKey).
+            std::vector<std::string> loopOrigins;
+            for (const OperationId loopOp : loop.loopOps)
+            {
+                if (!loopOp.valid())
+                {
+                    continue;
+                }
+                if (const auto origins = getOriginModules(graph, loopOp))
+                {
+                    appendOriginModules(loopOrigins, *origins);
+                }
+            }
+            auto stampOrigins = [&](OperationId opId)
+            {
+                if (!loopOrigins.empty())
+                {
+                    graph.setAttr(opId, kOriginModulesKey, loopOrigins);
+                }
+            };
+
             auto getFragment = [&](ValueId valueId, const BitRange &range) -> std::optional<ValueId>
             {
                 const BitRange full{0, graph.getValue(valueId).width() - 1};
@@ -2718,6 +2742,7 @@ namespace wolvrix::lib::transform
                                                              graph.getValue(valueId).isSigned(),
                                                              graph.getValue(valueId).type());
                             graph.addResult(sliceOp, frag);
+                            stampOrigins(sliceOp);
                             fragmentMap.emplace(RangeNode{valueId, range}, frag);
                             return frag;
                         }
@@ -2751,6 +2776,7 @@ namespace wolvrix::lib::transform
                                                  graph.getValue(valueId).isSigned(),
                                                  graph.getValue(valueId).type());
                 graph.addResult(sliceOp, frag);
+                stampOrigins(sliceOp);
                 fragmentMap.emplace(RangeNode{valueId, range}, frag);
                 return frag;
             };
@@ -2805,6 +2831,7 @@ namespace wolvrix::lib::transform
                 ValueId fullView = graph.createValue(value.width(), value.isSigned(), value.type(),
                                                      value.shape());
                 graph.addResult(concatOp, fullView);
+                stampOrigins(concatOp);
                 fullViewCache.emplace(valueId, fullView);
                 return fullView;
             };
@@ -2831,13 +2858,7 @@ namespace wolvrix::lib::transform
                 const Operation op = graph.getOperation(opId);
                 try
                 {
-                    // A single-source rewrite is a bit-level reinterpretation
-                    // when the source type differs from the result type.
-                    const OperationKind resolvedKind =
-                        (kind == OperationKind::kAssign && operands.size() == 1)
-                            ? graph.assignKindFor(operands.front(), result)
-                            : kind;
-                    graph.setOpKind(opId, resolvedKind);
+                    graph.setOpKind(opId, kind);
                     for (std::size_t i = 0; i < operands.size(); ++i)
                     {
                         if (graph.getOperation(opId).operands().size() > i)
@@ -2886,16 +2907,13 @@ namespace wolvrix::lib::transform
             {
                 try
                 {
-                    if (kind == OperationKind::kAssign && operands.size() == 1)
-                    {
-                        kind = graph.assignKindFor(operands.front(), result);
-                    }
                     OperationId opId = graph.createOperation(kind);
                     for (ValueId operand : operands)
                     {
                         graph.addOperand(opId, operand);
                     }
                     graph.addResult(opId, result);
+                    stampOrigins(opId);
                     if (srcLoc)
                     {
                         graph.setOpSrcLoc(opId, *srcLoc);
@@ -2941,7 +2959,6 @@ namespace wolvrix::lib::transform
                 switch (op.kind())
                 {
                 case OperationKind::kAssign:
-                case OperationKind::kAssignAs:
                 {
                     if (operands.size() != 1 || !operands[0].valid())
                     {
@@ -3105,6 +3122,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 case OperationKind::kConcat:
+                case OperationKind::kArrayCreate:
                 {
                     if (operands.empty())
                     {
@@ -3130,7 +3148,8 @@ namespace wolvrix::lib::transform
                     int64_t cursor = totalWidth;
                     for (std::size_t i = 0; i < operands.size(); ++i)
                     {
-                        const int64_t width = widths[i];
+                        const std::size_t slot = op.kind() == OperationKind::kArrayCreate ? operands.size() - 1 - i : i;
+                        const int64_t width = widths[slot];
                         const int64_t hi = cursor - 1;
                         const int64_t lo = cursor - width;
                         cursor = lo;
@@ -3145,7 +3164,7 @@ namespace wolvrix::lib::transform
                                 return false;
                             }
                             BitRange opRange{seg.low - lo, seg.high - lo};
-                            auto srcFrag = getFragment(operands[i], opRange);
+                            auto srcFrag = getFragment(operands[slot], opRange);
                             auto dstFrag = getFragment(resultId, seg);
                             if (!srcFrag || !dstFrag || !addPair(opId, *srcFrag, *dstFrag))
                             {
@@ -3596,7 +3615,7 @@ namespace wolvrix::lib::transform
                 const ValueId firstDst = pairs.front().second;
                 try
                 {
-                    graph.setOpKind(opId, graph.assignKindFor(firstSrc, firstDst));
+                    graph.setOpKind(opId, wolvrix::lib::grh::OperationKind::kAssign);
                     if (op.operands().empty())
                     {
                         graph.addOperand(opId, firstSrc);
@@ -3636,9 +3655,10 @@ namespace wolvrix::lib::transform
                 for (std::size_t i = 1; i < pairs.size(); ++i)
                 {
                     const auto &pair = pairs[i];
-                    OperationId newOp = graph.createOperation(graph.assignKindFor(pair.first, pair.second));
+                    OperationId newOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
                     graph.addOperand(newOp, pair.first);
                     graph.addResult(newOp, pair.second);
+                    stampOrigins(newOp);
                     if (op.srcLoc())
                     {
                         graph.setOpSrcLoc(newOp, *op.srcLoc());
@@ -3704,6 +3724,7 @@ namespace wolvrix::lib::transform
                         graph.addOperand(newOp, operand);
                     }
                     graph.addResult(newOp, seg.result);
+                    stampOrigins(newOp);
                     if (op.srcLoc())
                     {
                         graph.setOpSrcLoc(newOp, *op.srcLoc());
@@ -3897,6 +3918,7 @@ namespace wolvrix::lib::transform
                     viewValue = graph.createValue(value.width(), value.isSigned(), value.type(),
                                                   value.shape());
                     graph.addResult(concatOp, viewValue);
+                    stampOrigins(concatOp);
                 }
                 viewMap.emplace(valueId, viewValue);
             }

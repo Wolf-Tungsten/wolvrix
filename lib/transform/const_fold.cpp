@@ -1,8 +1,10 @@
 #include "transform/const_fold.hpp"
 
 #include "core/grh.hpp"
+#include "core/transform.hpp"
 
 #include "topo_guard.hpp"
+#include "logic_eval.hpp"
 
 #include "slang/numeric/SVInt.h"
 
@@ -37,6 +39,8 @@ namespace wolvrix::lib::transform
         std::string literal;
         int32_t width = 0;
         bool isSigned = false;
+        wolvrix::lib::grh::ValueType type = wolvrix::lib::grh::ValueType::Logic;
+        wolvrix::lib::grh::LogicDomain domain = wolvrix::lib::grh::LogicDomain::FourState;
         // Shape is part of the identity: stage-01 values carry it, and
         // downstream shape-aware consumers (kSliceArray) reject a flat
         // substitute even when the bits are identical.
@@ -46,6 +50,7 @@ namespace wolvrix::lib::transform
         {
             return width == other.width &&
                    isSigned == other.isSigned &&
+                   type == other.type && domain == other.domain &&
                    shape == other.shape &&
                    literal == other.literal;
         }
@@ -58,6 +63,8 @@ namespace wolvrix::lib::transform
             std::size_t seed = std::hash<std::string>{}(key.literal);
             seed ^= std::hash<int32_t>{}(key.width) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             seed ^= std::hash<bool>{}(key.isSigned) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed ^= static_cast<std::size_t>(key.type) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed ^= static_cast<std::size_t>(key.domain) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             for (const int64_t dim : key.shape)
                 seed ^= std::hash<int64_t>{}(dim) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             return seed;
@@ -114,8 +121,8 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kAShr:
             case wolvrix::lib::grh::OperationKind::kMux:
             case wolvrix::lib::grh::OperationKind::kAssign:
-            case wolvrix::lib::grh::OperationKind::kAssignAs:
             case wolvrix::lib::grh::OperationKind::kConcat:
+            case wolvrix::lib::grh::OperationKind::kArrayCreate:
             case wolvrix::lib::grh::OperationKind::kReplicate:
             case wolvrix::lib::grh::OperationKind::kSliceStatic:
             case wolvrix::lib::grh::OperationKind::kSliceDynamic:
@@ -405,7 +412,8 @@ namespace wolvrix::lib::transform
             }
         }
 
-        std::optional<std::vector<slang::SVInt>> foldOperation(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Operation &op, const ConstantStore &store, const FoldOptions options, const std::function<void(std::string)> &onError, const std::function<void(std::string)> &onWarning)
+        std::optional<std::vector<slang::SVInt>> foldOperation(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Operation &op, const ConstantStore &store, const FoldOptions options, const std::function<void(std::string)> &onError, const std::function<void(std::string)> &onWarning,
+                                                             std::optional<wolvrix::lib::grh::OperationKind> kindOverride = {})
         {
             if (op.results().empty())
             {
@@ -438,7 +446,8 @@ namespace wolvrix::lib::transform
             }
 
             std::optional<slang::SVInt> folded;
-            switch (op.kind())
+            const auto kind = kindOverride.value_or(op.kind());
+            switch (kind)
             {
             case wolvrix::lib::grh::OperationKind::kSystemFunction: {
                 auto name = getStringAttr(graph, op, "name");
@@ -490,7 +499,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kShl:
             case wolvrix::lib::grh::OperationKind::kLShr:
             case wolvrix::lib::grh::OperationKind::kAShr:
-                folded = foldBinary(op, op.kind(), operands);
+                folded = foldBinary(op, kind, operands);
                 break;
             case wolvrix::lib::grh::OperationKind::kNot:
             case wolvrix::lib::grh::OperationKind::kLogicNot:
@@ -500,17 +509,22 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kReduceNor:
             case wolvrix::lib::grh::OperationKind::kReduceNand:
             case wolvrix::lib::grh::OperationKind::kReduceXnor:
-                folded = foldUnary(op, op.kind(), operands[0]);
+                folded = foldUnary(op, kind, operands[0]);
                 break;
             case wolvrix::lib::grh::OperationKind::kAssign:
-            case wolvrix::lib::grh::OperationKind::kAssignAs:
-                // kAssignAs is a bit-identical retype: folding keeps the bits
+                // kAssign is a bit-identical retype: folding keeps the bits
                 // and normalizeToValue applies the result's own type/shape.
                 folded = operands[0];
                 break;
             case wolvrix::lib::grh::OperationKind::kConcat:
                 folded = slang::SVInt::concat(operands);
                 break;
+            case wolvrix::lib::grh::OperationKind::kArrayCreate:
+            {
+                std::vector<slang::SVInt> reversed(operands.rbegin(), operands.rend());
+                folded = slang::SVInt::concat(reversed);
+                break;
+            }
             case wolvrix::lib::grh::OperationKind::kReplicate:
             {
                 auto repOpt = getIntAttr(graph, op, "rep");
@@ -706,6 +720,7 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueId operand;
             std::optional<std::string> constLiteral;
             std::optional<wolvrix::lib::grh::SrcLoc> srcLoc;
+            std::vector<std::string> origins;
         };
 
         using DeclaredMaterializationMap =
@@ -713,12 +728,27 @@ namespace wolvrix::lib::transform
                                std::vector<DeclaredMaterialization>,
                                wolvrix::lib::grh::OperationIdHash>;
 
+        std::vector<std::string> originsOfOp(const wolvrix::lib::grh::Operation &op)
+        {
+            const auto attr = op.attr(kOriginModulesKey);
+            if (!attr)
+            {
+                return {};
+            }
+            if (const auto *values = std::get_if<std::vector<std::string>>(&*attr))
+            {
+                return *values;
+            }
+            return {};
+        }
+
         void recordDeclaredAssign(DeclaredMaterializationMap &assigns,
                                   const wolvrix::lib::grh::Operation &op,
                                   wolvrix::lib::grh::ValueId result,
                                   wolvrix::lib::grh::ValueId operand)
         {
-            DeclaredMaterialization entry{result, operand, std::nullopt, op.srcLoc()};
+            DeclaredMaterialization entry{result, operand, std::nullopt, op.srcLoc(),
+                                          originsOfOp(op)};
             if (!entry.srcLoc)
             {
                 entry.srcLoc = makeTransformSrcLoc("const-fold", "declared_assign");
@@ -732,7 +762,7 @@ namespace wolvrix::lib::transform
                                  std::string_view literal)
         {
             DeclaredMaterialization entry{result, wolvrix::lib::grh::ValueId::invalid(),
-                                          std::string(literal), op.srcLoc()};
+                                          std::string(literal), op.srcLoc(), originsOfOp(op)};
             if (!entry.srcLoc)
             {
                 entry.srcLoc = makeTransformSrcLoc("const-fold", "declared_const");
@@ -764,6 +794,11 @@ namespace wolvrix::lib::transform
                         }
                         graph.addResult(constOp, entry.result);
                         graph.setAttr(constOp, "constValue", *entry.constLiteral);
+                        // Captured at record time; the source op is already erased here.
+                        if (!entry.origins.empty())
+                        {
+                            graph.setAttr(constOp, kOriginModulesKey, entry.origins);
+                        }
                     }
                     else
                     {
@@ -773,12 +808,16 @@ namespace wolvrix::lib::transform
                             continue;
                         }
                         const wolvrix::lib::grh::OperationId assignOp =
-                            graph.createOperation(graph.assignKindFor(entry.operand, entry.result));
+                            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
                         graph.addOperand(assignOp, entry.operand);
                         graph.addResult(assignOp, entry.result);
                         if (entry.srcLoc)
                         {
                             graph.setOpSrcLoc(assignOp, *entry.srcLoc);
+                        }
+                        if (!entry.origins.empty())
+                        {
+                            graph.setAttr(assignOp, kOriginModulesKey, entry.origins);
                         }
                     }
                 }
@@ -794,6 +833,8 @@ namespace wolvrix::lib::transform
             ConstantKey key;
             key.width = graph.valueWidth(valueId);
             key.isSigned = graph.valueSigned(valueId);
+            key.type = graph.valueType(valueId);
+            key.domain = graph.valueDomain(valueId);
             const auto shape = graph.valueShape(valueId);
             key.shape.assign(shape.begin(), shape.end());
             key.literal = formatConstLiteral(sv);
@@ -808,6 +849,15 @@ namespace wolvrix::lib::transform
             ConstantKey key = makeConstantKey(graph, resultValueId, value);
             if (auto it = pool.find(key); it != pool.end())
             {
+                // Pooled constants carry the union of every reuse's origins.
+                if (const auto origins = getOriginModules(graph, sourceOp.id()))
+                {
+                    if (const wolvrix::lib::grh::OperationId poolOp = graph.valueDef(it->second);
+                        poolOp.valid())
+                    {
+                        mergeOriginModules(graph, poolOp, *origins);
+                    }
+                }
                 return it->second;
             }
 
@@ -820,9 +870,11 @@ namespace wolvrix::lib::transform
             }
             const wolvrix::lib::grh::ValueId newValue =
                 graph.createValue(valueSym, width, graph.valueSigned(resultValueId),
-                                  graph.valueType(resultValueId), graph.valueShape(resultValueId));
+                                  graph.valueType(resultValueId), graph.valueShape(resultValueId),
+                                  graph.valueDomain(resultValueId));
             const wolvrix::lib::grh::OperationId constOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant, opSym);
             graph.addResult(constOp, newValue);
+            inheritOrigin(graph, constOp, {sourceOp.id()});
             // Reuse the canonical literal already computed for the pool key
             // (mega aggregate literals are expensive to format twice).
             graph.setAttr(constOp, "constValue", key.literal);
@@ -849,7 +901,8 @@ namespace wolvrix::lib::transform
             }
             const wolvrix::lib::grh::ValueId newValue =
                 graph.createValue(valueSym, width, graph.valueSigned(resultValueId),
-                                  graph.valueType(resultValueId), graph.valueShape(resultValueId));
+                                  graph.valueType(resultValueId), graph.valueShape(resultValueId),
+                                  graph.valueDomain(resultValueId));
             const wolvrix::lib::grh::OperationId constOp =
                 graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant, opSym);
             graph.addResult(constOp, newValue);
@@ -888,7 +941,7 @@ namespace wolvrix::lib::transform
         void replaceUsers(wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::ValueId oldValue, wolvrix::lib::grh::ValueId newValue, const std::function<void(std::string)> &onError)
         {
             // Type-honest aliasing: when the replacement's type differs from
-            // the replaced value's, a kAssignAs view keeps the retype explicit.
+            // the replaced value's, a kAssign view keeps the retype explicit.
             wolvrix::lib::grh::ValueId aliased = newValue;
             try
             {
@@ -922,6 +975,27 @@ namespace wolvrix::lib::transform
         }
 
     } // namespace
+
+    std::optional<slang::SVInt> detail::evaluateLogicOperation(
+        const grh::Graph& graph, grh::OperationId operation, std::span<const slang::SVInt> operands,
+        grh::OperationKind kind)
+    {
+        if (!isFoldable(kind) || graph.opOperands(operation).size() != operands.size() ||
+            graph.opResults(operation).size() != 1 ||
+            graph.valueType(graph.opResults(operation)[0]) != grh::ValueType::Logic) return {};
+        ConstantStore store;
+        const auto args = graph.opOperands(operation);
+        for (std::size_t i = 0; i < args.size(); ++i)
+        {
+            if (graph.valueType(args[i]) != grh::ValueType::Logic) return {};
+            store.emplace(args[i], ConstantValue{operands[i], operands[i].hasUnknown()});
+        }
+        const auto ignore = [](std::string) {};
+        const auto result = foldOperation(graph, graph.getOperation(operation), store,
+            {ConstantFoldOptions::XFoldMode::Propagate, ConstantFoldOptions::Semantics::FourState},
+            ignore, ignore, kind);
+        return result ? std::optional(result->front()) : std::nullopt;
+    }
 
     ConstantFoldPass::ConstantFoldPass()
         : Pass("const-fold", "const-fold"), options_({})
@@ -978,6 +1052,15 @@ namespace wolvrix::lib::transform
                         if (ctx.protectDeclaredSymbols && isDeclaredValue(ctx.graph, resId))
                         {
                             continue;
+                        }
+                        // Union the deduped constant's origins into the pooled one.
+                        if (const auto origins = getOriginModules(ctx.graph, opId))
+                        {
+                            if (const wolvrix::lib::grh::OperationId poolOp = ctx.graph.valueDef(it->second);
+                                poolOp.valid())
+                            {
+                                mergeOriginModules(ctx.graph, poolOp, *origins);
+                            }
                         }
                         replaceUsers(ctx.graph, resId, it->second, reportError);
                         dedupedConstants = true;
@@ -1108,6 +1191,16 @@ namespace wolvrix::lib::transform
                     recordDeclaredConst(declaredAssigns, op, resId, formatConstLiteral(sv));
                 }
                 iterationChanged = true;
+                // The folded op is about to be erased; the replacement
+                // constant inherits its origins.
+                if (const auto origins = getOriginModules(ctx.graph, opId))
+                {
+                    if (const wolvrix::lib::grh::OperationId newConstOp = ctx.graph.valueDef(newValue);
+                        newConstOp.valid())
+                    {
+                        mergeOriginModules(ctx.graph, newConstOp, *origins);
+                    }
+                }
             }
 
             if (createdAllResults)

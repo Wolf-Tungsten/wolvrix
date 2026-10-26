@@ -15,16 +15,13 @@ This model keeps design data, intermediate pass results, diagnostics, and debugg
 
 ## Build
 
+Run build, installation and test workflows through the playground Makefile,
+from the playground root:
+
 ```bash
 git submodule update --init --recursive
-cmake -S wolvrix -B wolvrix/build
-cmake --build wolvrix/build -j$(nproc)
-```
-
-Install the Python package:
-
-```bash
-python3 -m pip install --no-build-isolation -e .
+make build
+make py_install
 ```
 
 ## The Basic Python Workflow
@@ -149,9 +146,14 @@ Currently implemented:
 sess.store_json(*, design: str, output: str, mode="pretty-compact", top=None)
 sess.emit_sv(*, design: str, output: str, top=None, split_modules=False)
 sess.emit_verilator_repcut_package(*, design: str, output: str, top=None)
+sess.emit_grhsim_cpu_st_cpp(*, design: str, output: str, top=None, **options)
 ```
 
-These emitters do not yet consume extra session values, so they currently expose no `in_*` parameters. If you pass an unsupported `in_*`, the API raises an error instead of silently ignoring it.
+The simulation emitter requires the SinkSchedule published by
+`grhsim-partition-sink` for the current design in the same session. Simulation
+uses ordinary `run_pass` and GRH JSON; independent model APIs have been removed.
+See the [simulation workflow](docs/grhsim.md) for conversion, checkpoints and
+execution boundaries. Unsupported session arguments raise an error.
 
 ## Important Documents
 
@@ -160,9 +162,11 @@ If you are new to Wolvrix, read these in order:
 1. [docs/grh/grh-ir.md](docs/grh/grh-ir.md)
 2. [docs/transform/README.md](docs/transform/README.md)
 3. [docs/python/python-binding-architecture.md](docs/python/python-binding-architecture.md)
+4. [docs/grhsim.md](docs/grhsim.md)
 
 ## Tests
 
 ```bash
-ctest --test-dir wolvrix/build --output-on-failure
+make test_wolvrix
+make test_grhsim_cpu_st_cpp test_grhsim_flow
 ```

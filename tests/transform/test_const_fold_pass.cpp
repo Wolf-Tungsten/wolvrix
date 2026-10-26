@@ -377,7 +377,7 @@ int main()
         }
     }
 
-    // Case: kAssignAs folds bit-identically into a flat constant view of a
+    // Case: kAssign folds bit-identically into a flat constant view of a
     // shaped constant.
     {
         wolvrix::lib::grh::Design design;
@@ -394,7 +394,7 @@ int main()
 
         wolvrix::lib::grh::ValueId flat = graph.createValue(graph.internSymbol("flat_view"), 8, false);
         wolvrix::lib::grh::OperationId view =
-            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssignAs,
+            graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
                                   graph.internSymbol("view0"));
         graph.addOperand(view, arrConst);
         graph.addResult(view, flat);
@@ -418,24 +418,24 @@ int main()
         }
         catch (const std::exception &ex)
         {
-            return fail(std::string("Exception during kAssignAs run: ") + ex.what());
+            return fail(std::string("Exception during kAssign run: ") + ex.what());
         }
         if (!res.success || diags.hasError())
         {
-            return fail("Expected kAssignAs constant propagation to succeed");
+            return fail("Expected kAssign constant propagation to succeed");
         }
         wolvrix::lib::grh::Value outValue = graph.getValue(graph.outputPortValue("out"));
         if (!outValue.definingOp().valid() ||
             graph.getOperation(outValue.definingOp()).kind() !=
                 wolvrix::lib::grh::OperationKind::kConstant)
         {
-            return fail("kAssignAs did not fold to a constant");
+            return fail("kAssign did not fold to a constant");
         }
         auto literal = getConstLiteral(graph, graph.getOperation(outValue.definingOp()));
         slang::SVInt expected = slang::SVInt::fromString("8'hA5").resize(8);
         if (!literal || !static_cast<bool>((*literal == expected)))
         {
-            return fail("kAssignAs fold changed the bits");
+            return fail("kAssign fold changed the bits");
         }
     }
 

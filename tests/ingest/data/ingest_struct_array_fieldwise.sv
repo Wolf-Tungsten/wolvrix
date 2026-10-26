@@ -54,6 +54,35 @@ module ingest_struct_array_fieldwise (
     assign out_tag  = pad[rd_idx].tag  ^ mix[rd_idx[5:0]].tag  ^ banks[rd_idx[1:0]].tag ^ one.tag;
 endmodule
 
+// Stage-08: raw ingest must select array construction from source geometry,
+// for both range directions and when operands themselves are sub-arrays.
+module ingest_array_create (
+    output wire [31:0] descending_bits, ascending_bits, nested_bits, pattern_bits,
+    output wire [7:0] singleton_bits,
+    output wire [47:0] mixed_bits
+);
+    localparam logic [7:0] a = 8'h11, b = 8'h22, c = 8'h33, d = 8'h44;
+    typedef struct packed { logic [7:0] data; logic flag; } Entry;
+    wire Entry e0 = '{a, a[0]};
+    wire Entry e1 = '{b, b[0]};
+    wire Entry e2 = '{c, c[0]};
+    wire Entry e3 = '{d, d[0]};
+    wire Entry [3:0] descending = {e3, e2, e1, e0};
+    wire Entry [0:3] ascending = {e3, e2, e1, e0};
+    wire Entry [1:0][1:0] nested = '{'{e3, e2}, '{e1, e0}};
+    wire [7:0] pattern [0:3] = '{a, b, c, d};
+    wire [7:0] singleton [0:0] = '{a};
+    typedef struct packed { logic [3:0][3:0] lanes; logic flag; } ArrayEntry;
+    wire ArrayEntry shaped = '{16'h2211, 1'b0};
+    wire ArrayEntry [2:0] mixed = {17'h8866, shaped, shaped};
+    assign descending_bits = {descending[3].data, descending[2].data, descending[1].data, descending[0].data};
+    assign ascending_bits = {ascending[0].data, ascending[1].data, ascending[2].data, ascending[3].data};
+    assign nested_bits = {nested[1][1].data, nested[1][0].data, nested[0][1].data, nested[0][0].data};
+    assign pattern_bits = {pattern[3], pattern[2], pattern[1], pattern[0]};
+    assign singleton_bits = singleton[0];
+    assign mixed_bits = {mixed[2].lanes, mixed[1].lanes, mixed[0].lanes};
+endmodule
+
 // A leading unit extent folds all leaf shapes into scalar storage. Each
 // element assignment must still splice only 7 / 8 / 6 addressed bits.
 module ingest_struct_array_partial_write (

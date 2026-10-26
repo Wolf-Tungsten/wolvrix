@@ -1,7 +1,0 @@
-// Data starts at the requested lower bound; addresses are absolute hexadecimal.
-a_a/* adjacent comment */bB
-@0 ff
-@4 123
-@3 de @3 ad
-@6 ff
-@2 xZ

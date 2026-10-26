@@ -16,6 +16,7 @@ namespace wolvrix::lib::transform
         GrhVerifyPass();
 
         PassResult run() override;
+        bool supportsDialect(std::string_view) const noexcept override { return true; }
     };
 
 } // namespace wolvrix::lib::transform

@@ -27,7 +27,6 @@ namespace wolvrix::lib::transform::write_detail
             if (!def.valid()) break;
             const auto operands = graph.opOperands(def);
             if ((graph.opKind(def) != OperationKind::kAssign &&
-                 graph.opKind(def) != OperationKind::kAssignAs &&
                  graph.opKind(def) != OperationKind::kConcat) || operands.size() != 1 ||
                 graph.valueWidth(operands[0]) != graph.valueWidth(value)) break;
             value = operands[0];

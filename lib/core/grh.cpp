@@ -1,6 +1,8 @@
 #include "core/grh.hpp"
+#include "core/op_descriptor.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -163,6 +165,8 @@ namespace wolvrix::lib::grh
 
         void cloneGraphContents(const Graph &source, Graph &clone)
         {
+            for (const AttrKV& entry : source.metadata())
+                clone.setMetadata(entry.key, entry.value);
             std::unordered_map<uint32_t, SymbolId> symbolMap;
             symbolMap.reserve(source.values().size() + source.operations().size());
 
@@ -204,7 +208,8 @@ namespace wolvrix::lib::grh
                                                      srcValue.width(),
                                                      srcValue.isSigned(),
                                                      srcValue.type(),
-                                                     srcValue.shape());
+                                                     srcValue.shape(),
+                                                     srcValue.domain());
                 if (srcValue.srcLoc())
                 {
                     clone.setValueSrcLoc(dstValue, *srcValue.srcLoc());
@@ -887,6 +892,7 @@ namespace wolvrix::lib::grh
             data.width = width > 0 ? width : 1;
             data.isSigned = view.valueSigned_[i] != 0;
             data.type = type;
+            data.domain = view.valueDomain(valueId);
             if (!view.valueShapeRanges_.empty())
             {
                 const std::span<const int64_t> shape =
@@ -1097,13 +1103,24 @@ namespace wolvrix::lib::grh
         }
 
         builder.valueUsers_ = std::move(expectedUsers);
+        for (auto& operation : builder.operations_)
+            operation.operandUseIndices.resize(operation.operands.size());
+        for (const auto& users : builder.valueUsers_)
+            for (std::size_t i = 0; i < users.size(); ++i)
+                builder.operations_[builder.opIndex(users[i].operation)]
+                    .operandUseIndices[users[i].operandIndex] = i;
 
         return builder;
     }
 
     ValueId GraphBuilder::addValue(SymbolId sym, int32_t width, bool isSigned, ValueType type,
-                                   std::span<const int64_t> shape)
+                                   std::span<const int64_t> shape, LogicDomain domain)
     {
+        const LogicalType logical = LogicalType{type, width, isSigned, domain,
+                                                {shape.begin(), shape.end()}}.normalized();
+        width = logical.width;
+        isSigned = logical.isSigned;
+        domain = logical.domain;
         if (type == ValueType::Logic && width <= 0)
         {
             throw std::runtime_error("Value width must be positive");
@@ -1125,6 +1142,7 @@ namespace wolvrix::lib::grh
         data.width = width;
         data.isSigned = isSigned;
         data.type = type;
+        data.domain = domain;
         data.shape.assign(shape.begin(), shape.end());
         values_.push_back(std::move(data));
         valueUsers_.emplace_back();
@@ -2290,6 +2308,7 @@ namespace wolvrix::lib::grh
         view.valueWidths_.reserve(valueCount);
         view.valueSigned_.reserve(valueCount);
         view.valueTypes_.reserve(valueCount);
+        view.valueDomains_.reserve(valueCount);
         view.valueShapeRanges_.reserve(valueCount);
         view.valueIsInput_.reserve(valueCount);
         view.valueIsOutput_.reserve(valueCount);
@@ -2314,6 +2333,7 @@ namespace wolvrix::lib::grh
             view.valueWidths_.push_back(valueData.width);
             view.valueSigned_.push_back(valueData.isSigned ? 1 : 0);
             view.valueTypes_.push_back(static_cast<uint8_t>(valueData.type));
+            view.valueDomains_.push_back(static_cast<uint8_t>(valueData.domain));
             view.valueShapeRanges_.push_back(Range{view.valueShapeDims_.size(), valueData.shape.size()});
             view.valueShapeDims_.insert(view.valueShapeDims_.end(), valueData.shape.begin(),
                                         valueData.shape.end());
@@ -2445,6 +2465,9 @@ namespace wolvrix::lib::grh
         {
             throw std::runtime_error("ValueId refers to erased value");
         }
+        auto& indices = operations_[opIndex(op)].operandUseIndices;
+        if (indices.size() <= operandIndex) indices.resize(operandIndex + 1);
+        indices[operandIndex] = valueUsers_[valIdx].size();
         valueUsers_[valIdx].push_back(ValueUser{op, static_cast<uint32_t>(operandIndex)});
     }
 
@@ -2453,11 +2476,16 @@ namespace wolvrix::lib::grh
         const std::size_t valIdx = valueIndex(value);
         op.assertGraph(graphId_);
         auto &users = valueUsers_[valIdx];
-        for (std::size_t i = 0; i < users.size(); ++i)
+        const auto& indices = operations_[opIndex(op)].operandUseIndices;
+        if (operandIndex < indices.size())
         {
-            if (users[i].operation == op && users[i].operandIndex == operandIndex)
+            const std::size_t i = indices[operandIndex];
+            if (i < users.size() && users[i].operation == op && users[i].operandIndex == operandIndex)
             {
-                users.erase(users.begin() + static_cast<std::ptrdiff_t>(i));
+                const ValueUser moved = users.back();
+                users[i] = moved;
+                operations_[opIndex(moved.operation)].operandUseIndices[moved.operandIndex] = i;
+                users.pop_back();
                 return;
             }
         }
@@ -2470,6 +2498,7 @@ namespace wolvrix::lib::grh
         {
             removeValueUser(operands[operandIndex], op, operandIndex);
         }
+        operations_[opIndex(op)].operandUseIndices.clear();
     }
 
     void GraphBuilder::addOpUses(OperationId op, const std::vector<ValueId> &operands)
@@ -2500,13 +2529,20 @@ namespace wolvrix::lib::grh
         std::vector<ValueUser> users = valueUsers_[fromIdx];
         valueUsers_[fromIdx].clear();
         valueUsers_[fromIdx].reserve(users.size());
-        valueUsers_[toIdx].reserve(valueUsers_[toIdx].size() + users.size());
+        auto &destination = valueUsers_[toIdx];
+        const std::size_t required = destination.size() + users.size();
+        if (required > destination.capacity())
+        {
+            // Repeated aliases often converge on one clock, enable or constant.
+            // Exact-size reserves copy its complete use-list on every merge.
+            destination.reserve(std::max(required, destination.capacity() * 2));
+        }
 
         for (const auto &user : users)
         {
             if (skipOp && user.operation == *skipOp)
             {
-                valueUsers_[fromIdx].push_back(user);
+                addValueUser(from, user.operation, user.operandIndex);
                 continue;
             }
             const std::size_t opIdx = opIndex(user.operation);
@@ -2524,7 +2560,7 @@ namespace wolvrix::lib::grh
                 throw std::runtime_error("Value use-list out of sync with operands");
             }
             operands[user.operandIndex] = to;
-            valueUsers_[toIdx].push_back(ValueUser{user.operation, user.operandIndex});
+            addValueUser(to, user.operation, user.operandIndex);
         }
     }
 
@@ -2633,6 +2669,16 @@ namespace wolvrix::lib::grh
         symbolIndex_.erase(it);
     }
 
+    namespace {
+        uint64_t nextDesignInstance() noexcept
+        {
+            static std::atomic<uint64_t> next{1};
+            return next.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    Design::Design() : instanceId_(nextDesignInstance()) {}
+
     Design::Design(Design &&other) noexcept
     {
         *this = std::move(other);
@@ -2642,6 +2688,10 @@ namespace wolvrix::lib::grh
     {
         if (this != &other)
         {
+            instanceId_ = nextDesignInstance();
+            ++revision_;
+            other.instanceId_ = nextDesignInstance();
+            ++other.revision_;
             graphs_ = std::move(other.graphs_);
             graphAliasBySymbol_ = std::move(other.graphAliasBySymbol_);
             graphOrder_ = std::move(other.graphOrder_);
@@ -2718,8 +2768,8 @@ namespace wolvrix::lib::grh
             "kAShr",
             "kMux",
             "kAssign",
-            "kAssignAs",
             "kConcat",
+            "kArrayCreate",
             "kReplicate",
             "kSliceStatic",
             "kSliceDynamic",
@@ -2895,7 +2945,8 @@ namespace wolvrix::lib::grh
         auto index = static_cast<std::size_t>(kind);
         if (index >= std::size(kOperationNames))
         {
-            return "<unknown>";
+            const auto* descriptor = findOpDescriptor(kind);
+            return descriptor ? descriptor->name : "<unknown>";
         }
         return kOperationNames[index];
     }
@@ -2909,7 +2960,7 @@ namespace wolvrix::lib::grh
                 return static_cast<OperationKind>(i);
             }
         }
-        return std::nullopt;
+        return findDialectOperation(text);
     }
 
     bool isRegisterReadPortKind(OperationKind kind) noexcept
@@ -3076,8 +3127,94 @@ namespace wolvrix::lib::grh
         return std::nullopt;
     }
 
+    std::string_view toString(LogicDomain domain) noexcept
+    {
+        switch (domain)
+        {
+        case LogicDomain::TwoState: return "2state";
+        case LogicDomain::FourState: return "4state";
+        }
+        return "<unknown>";
+    }
+
+    std::optional<LogicDomain> parseLogicDomain(std::string_view text) noexcept
+    {
+        if (text == "2state") return LogicDomain::TwoState;
+        if (text == "4state") return LogicDomain::FourState;
+        return std::nullopt;
+    }
+
+    void LogicalType::validate() const
+    {
+        if (kind != ValueType::Logic && kind != ValueType::Real && kind != ValueType::String)
+            throw std::invalid_argument("Unknown logical value kind");
+        if (domain != LogicDomain::TwoState && domain != LogicDomain::FourState)
+            throw std::invalid_argument("Unknown logical domain");
+        if (kind == ValueType::Logic && width <= 0)
+            throw std::invalid_argument("Logic width must be positive");
+        validateValueShape(width, kind, shape, "LogicalType");
+    }
+
+    LogicalType LogicalType::normalized() const
+    {
+        validate();
+        LogicalType result = *this;
+        if (kind != ValueType::Logic)
+        {
+            result.width = 1;
+            result.isSigned = false;
+            result.domain = LogicDomain::FourState;
+        }
+        return result;
+    }
+
+    int32_t LogicalType::leafWidth() const
+    {
+        validate();
+        int64_t count = 1;
+        for (const int64_t dim : shape) count *= dim;
+        return kind == ValueType::Logic ? static_cast<int32_t>(width / count) : 1;
+    }
+
+    LogicDomain GraphView::valueDomain(ValueId value) const
+    {
+        const std::size_t index = valueIndex(value);
+        return static_cast<LogicDomain>(valueDomains_.at(index));
+    }
+
+    LogicDomain Graph::valueDomain(ValueId value) const
+    {
+        if (builder_)
+        {
+            const auto& data = builder_->values_.at(builder_->valueIndex(value));
+            if (!data.alive) throw std::runtime_error("ValueId refers to erased value");
+            return data.domain;
+        }
+        return view().valueDomain(value);
+    }
+
+    LogicalType Graph::valueLogicalType(ValueId value) const
+    {
+        const auto shape = valueShape(value);
+        return {valueType(value), valueWidth(value), valueSigned(value), valueDomain(value),
+                {shape.begin(), shape.end()}};
+    }
+
+    void Graph::setValueLogicalType(ValueId value, const LogicalType& type)
+    {
+        const LogicalType logical = type.normalized();
+        GraphBuilder& builder = ensureBuilder();
+        auto& data = builder.values_.at(builder.valueIndex(value));
+        if (!data.alive) throw std::runtime_error("Cannot type an erased value");
+        data.width = logical.width;
+        data.isSigned = logical.isSigned;
+        data.type = logical.kind;
+        data.domain = logical.domain;
+        data.shape = logical.shape;
+    }
+
     Value::Value(ValueId id, SymbolId symbol, std::string symbolText, int32_t width, bool isSigned,
-                 ValueType type, std::vector<int64_t> shape, bool isInput, bool isOutput, bool isInout,
+                 ValueType type, LogicDomain domain, std::vector<int64_t> shape, bool isInput, bool isOutput, bool isInout,
                  OperationId definingOp, std::span<const ValueUser> users,
                  std::optional<SrcLoc> srcLoc, const Graph *owner, bool usersLoaded)
         : id_(id),
@@ -3086,6 +3223,7 @@ namespace wolvrix::lib::grh
           width_(width),
           isSigned_(isSigned),
           type_(type),
+          domain_(domain),
           shape_(std::move(shape)),
           isInput_(isInput),
           isOutput_(isOutput),
@@ -3157,6 +3295,37 @@ namespace wolvrix::lib::grh
         view_ = builder.freeze();
     }
 
+    std::optional<AttributeValue> Graph::metadata(std::string_view key) const
+    {
+        for (const AttrKV& entry : metadata_)
+            if (entry.key == key) return entry.value;
+        return std::nullopt;
+    }
+
+    void Graph::setMetadata(std::string_view key, AttributeValue value)
+    {
+        if (key.empty() || !attributeValueIsJsonSerializable(value))
+            throw std::invalid_argument("Invalid graph metadata");
+        owner_->touch();
+        for (AttrKV& entry : metadata_)
+        {
+            if (entry.key != key) continue;
+            entry.value = std::move(value);
+            return;
+        }
+        metadata_.push_back({std::string(key), std::move(value)});
+    }
+
+    bool Graph::eraseMetadata(std::string_view key)
+    {
+        const auto it = std::find_if(metadata_.begin(), metadata_.end(),
+                                     [&](const AttrKV& entry) { return entry.key == key; });
+        if (it == metadata_.end()) return false;
+        owner_->touch();
+        metadata_.erase(it);
+        return true;
+    }
+
     SymbolId Graph::internSymbol(std::string_view text)
     {
         SymbolId existing = symbols_.lookup(text);
@@ -3176,6 +3345,7 @@ namespace wolvrix::lib::grh
             }
             return existing;
         }
+        owner_->touch();
         return symbols_.intern(text);
     }
 
@@ -3233,6 +3403,7 @@ namespace wolvrix::lib::grh
 
     void Graph::addDeclaredSymbol(SymbolId sym)
     {
+        owner_->touch();
         if (!sym.valid())
         {
             throw std::runtime_error("Declared symbol is invalid");
@@ -3249,6 +3420,7 @@ namespace wolvrix::lib::grh
 
     bool Graph::removeDeclaredSymbol(SymbolId sym)
     {
+        owner_->touch();
         if (!sym.valid())
         {
             throw std::runtime_error("Declared symbol is invalid");
@@ -3272,6 +3444,7 @@ namespace wolvrix::lib::grh
 
     void Graph::clearDeclaredSymbols()
     {
+        owner_->touch();
         declaredSymbols_.clear();
         declaredSymbolSet_.clear();
     }
@@ -3292,6 +3465,7 @@ namespace wolvrix::lib::grh
 
     std::size_t Graph::addGenerateGroup(SymbolId scope, SymbolId name)
     {
+        owner_->touch();
         if (!scope.valid() || !name.valid())
         {
             throw std::runtime_error("Generate group scope/name symbol is invalid");
@@ -3307,6 +3481,7 @@ namespace wolvrix::lib::grh
 
     void Graph::addGenerateGroupSymbol(std::size_t group, SymbolId symbol)
     {
+        owner_->touch();
         if (group >= generateGroups_.size())
         {
             throw std::runtime_error("Generate group index out of range");
@@ -3320,6 +3495,9 @@ namespace wolvrix::lib::grh
             throw std::runtime_error("Generate group symbol is not in the graph symbol table");
         }
         generateGroups_[group].symbols.push_back(symbol);
+        auto& memberships = generateGroupsBySymbol_[symbol.value];
+        if (std::find(memberships.begin(), memberships.end(), group) == memberships.end())
+            memberships.push_back(group);
     }
 
     const std::vector<Graph::GenerateGroup>& Graph::generateGroups() const noexcept
@@ -3370,21 +3548,25 @@ namespace wolvrix::lib::grh
 
     void Graph::removeSymbolFromGenerateGroups(SymbolId sym) noexcept
     {
-        if (!sym.valid() || generateGroups_.empty())
+        if (!sym.valid())
         {
             return;
         }
-        for (GenerateGroup& group : generateGroups_)
+        const auto found = generateGroupsBySymbol_.find(sym.value);
+        if (found == generateGroupsBySymbol_.end()) return;
+        for (const auto index : found->second)
         {
-            std::vector<SymbolId>& symbols = group.symbols;
+            std::vector<SymbolId>& symbols = generateGroups_[index].symbols;
             symbols.erase(std::remove(symbols.begin(), symbols.end(), sym), symbols.end());
         }
+        generateGroupsBySymbol_.erase(found);
     }
 
     void Graph::freeze()
     {
         if (builder_)
         {
+            owner_->touch();
             view_ = builder_->freeze();
             builder_.reset();
             invalidateCaches();
@@ -3467,10 +3649,10 @@ namespace wolvrix::lib::grh
     }
 
     ValueId Graph::createValue(SymbolId symbol, int32_t width, bool isSigned, ValueType type,
-                               std::span<const int64_t> shape)
+                               std::span<const int64_t> shape, LogicDomain domain)
     {
         GraphBuilder &builder = ensureBuilder();
-        ValueId id = builder.addValue(symbol, width, isSigned, type, shape);
+        ValueId id = builder.addValue(symbol, width, isSigned, type, shape, domain);
         // Incremental update: directly append to cache without full rebuild
         if (!valuesCacheDirty_)
         {
@@ -3480,9 +3662,19 @@ namespace wolvrix::lib::grh
     }
 
     ValueId Graph::createValue(int32_t width, bool isSigned, ValueType type,
-                               std::span<const int64_t> shape)
+                               std::span<const int64_t> shape, LogicDomain domain)
     {
-        return createValue(makeInternalValSym(), width, isSigned, type, shape);
+        return createValue(makeInternalValSym(), width, isSigned, type, shape, domain);
+    }
+
+    ValueId Graph::createValue(SymbolId symbol, const LogicalType& type)
+    {
+        return createValue(symbol, type.width, type.isSigned, type.kind, type.shape, type.domain);
+    }
+
+    ValueId Graph::createValue(const LogicalType& type)
+    {
+        return createValue(makeInternalValSym(), type);
     }
 
     OperationId Graph::createOperation(OperationKind kind, SymbolId symbol)
@@ -3500,6 +3692,40 @@ namespace wolvrix::lib::grh
     OperationId Graph::createOperation(OperationKind kind)
     {
         return createOperation(kind, makeInternalOpSym());
+    }
+
+    ValueId Graph::createArray(std::span<const ValueId> elements)
+    {
+        if (elements.empty())
+            throw std::invalid_argument("kArrayCreate requires at least one element");
+        const Value first = getValue(elements.front());
+        if (first.type() != ValueType::Logic || first.width() <= 0)
+            throw std::invalid_argument("kArrayCreate elements must be positive-width Logic values");
+        if (elements.size() > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) /
+                                  static_cast<uint32_t>(first.width()))
+            throw std::overflow_error("kArrayCreate total width exceeds int32 capacity");
+        std::vector<int64_t> shape{static_cast<int64_t>(elements.size())};
+        shape.insert(shape.end(), first.shape().begin(), first.shape().end());
+        for (const ValueId element : elements)
+        {
+            const Value value = getValue(element);
+            if (value.logicalType() != first.logicalType()) {
+                const auto describe = [&](const Value& item) {
+                    std::string text = std::string(item.symbolText()) + ":" + std::string(toString(item.type())) +
+                        "/" + std::to_string(item.width()) + "/" + (item.isSigned() ? "signed/" : "unsigned/") + std::string(toString(item.domain()));
+                    for (const auto extent : item.shape()) text += "[" + std::to_string(extent) + "]";
+                    return text;
+                };
+                throw std::invalid_argument("kArrayCreate elements must have identical full types (" + describe(first) + " versus " + describe(value) + ")");
+            }
+        }
+        const std::vector<ValueId> inputs(elements.begin(), elements.end());
+        const ValueId result = createValue(static_cast<int32_t>(elements.size() * first.width()),
+                                           first.isSigned(), ValueType::Logic, shape, first.domain());
+        const OperationId op = createOperation(OperationKind::kArrayCreate);
+        for (const ValueId element : inputs) addOperand(op, element);
+        addResult(op, result);
+        return result;
     }
 
     ValueId Graph::findValue(SymbolId symbol) const noexcept
@@ -3704,27 +3930,13 @@ namespace wolvrix::lib::grh
         throw std::runtime_error("GraphView is not available; freeze the graph first");
     }
 
-    OperationKind Graph::assignKindFor(ValueId src, ValueId dst) const
+    bool Graph::sameValueType(ValueId lhs, ValueId rhs) const
     {
-        if (!src.valid() || !dst.valid())
-        {
-            return OperationKind::kAssign;
-        }
-        const int32_t srcWidth = valueWidth(src);
-        const int32_t dstWidth = valueWidth(dst);
-        if (srcWidth != dstWidth)
-        {
-            return OperationKind::kAssign;
-        }
-        const std::span<const int64_t> srcShape = valueShape(src);
-        const std::span<const int64_t> dstShape = valueShape(dst);
-        const bool sameShape = std::equal(srcShape.begin(), srcShape.end(),
-                                          dstShape.begin(), dstShape.end());
-        if (valueSigned(src) == valueSigned(dst) && sameShape)
-        {
-            return OperationKind::kAssign;
-        }
-        return OperationKind::kAssignAs;
+        return valueWidth(lhs) == valueWidth(rhs) &&
+               valueSigned(lhs) == valueSigned(rhs) &&
+               valueType(lhs) == valueType(rhs) &&
+               valueDomain(lhs) == valueDomain(rhs) &&
+               std::ranges::equal(valueShape(lhs), valueShape(rhs));
     }
 
     bool Graph::valueIsInput(ValueId id) const
@@ -3977,6 +4189,13 @@ namespace wolvrix::lib::grh
         return valueFromView(id);
     }
 
+    std::span<const ValueUser> Graph::valueUsers(ValueId value) const
+    {
+        // Match the checked scalar accessors before borrowing storage.
+        (void)valueDef(value);
+        return valueUsersSpan(value);
+    }
+
     Operation Graph::getOperation(OperationId id) const
     {
         if (builder_)
@@ -4162,14 +4381,10 @@ namespace wolvrix::lib::grh
         {
             return;
         }
-        const std::span<const int64_t> fromShape = valueShape(from);
-        const std::span<const int64_t> toShape = valueShape(to);
-        // shape 即类型：别名两侧的类型视图必须一致——任何 shape 不一致的
-        // 别名都是类型错误（历史上这里会把 shape 隐式回填给扁平目标）。
-        if (!std::equal(fromShape.begin(), fromShape.end(), toShape.begin(), toShape.end()))
+        if (!sameValueType(from, to))
         {
             throw std::runtime_error(std::string(api) +
-                                     ": refusing to alias values with different shapes");
+                                     ": refusing to alias values with different types");
         }
     }
 
@@ -4198,10 +4413,7 @@ namespace wolvrix::lib::grh
             throw std::runtime_error("replaceAllUsesWithView: invalid value");
         }
         const std::span<const int64_t> fromShape = valueShape(from);
-        const std::span<const int64_t> toShape = valueShape(to);
-        const bool sameShape = std::equal(fromShape.begin(), fromShape.end(),
-                                          toShape.begin(), toShape.end());
-        if (sameShape && valueSigned(from) == valueSigned(to))
+        if (sameValueType(from, to))
         {
             replaceAllUses(from, to);
             return to;
@@ -4210,10 +4422,14 @@ namespace wolvrix::lib::grh
         {
             throw std::runtime_error("replaceAllUsesWithView: width mismatch cannot be retyped");
         }
+        if (valueType(from) != valueType(to) || valueDomain(from) != valueDomain(to))
+        {
+            throw std::runtime_error("replaceAllUsesWithView: incompatible value kinds");
+        }
         // The view carries `from`'s type over `to`'s bits.
         const ValueId view = createValue(makeInternalValSym(), valueWidth(from),
-                                         valueSigned(from), valueType(from), fromShape);
-        const OperationId viewOp = createOperation(OperationKind::kAssignAs, makeInternalOpSym());
+                                         valueSigned(from), valueType(from), fromShape, valueDomain(from));
+        const OperationId viewOp = createOperation(OperationKind::kAssign, makeInternalOpSym());
         addOperand(viewOp, to);
         addResult(viewOp, view);
         replaceAllUses(from, view);
@@ -4465,6 +4681,27 @@ namespace wolvrix::lib::grh
         }
         writer.writeValue(symbol_);
 
+        writer.writeProperty("formatVersion");
+        writer.writeValue(int64_t{2});
+        writer.writeProperty("dialects");
+        writer.startObject();
+        for (const auto& [dialect, version] : requiredDialects(*this))
+        {
+            writer.writeProperty(dialect);
+            writer.writeValue(static_cast<int64_t>(version));
+        }
+        writer.endObject();
+        writer.writeProperty("metadata");
+        writer.startObject();
+        for (const AttrKV& entry : metadata_)
+        {
+            writer.writeProperty(entry.key);
+            writer.startObject();
+            writeAttributeValue(writer, entry.value);
+            writer.endObject();
+        }
+        writer.endObject();
+
         writer.writeProperty("declaredSymbols");
         writer.startArray();
         for (const auto sym : declaredSymbols_)
@@ -4510,6 +4747,8 @@ namespace wolvrix::lib::grh
             writer.writeValue(value.isSigned());
             writer.writeProperty("type");
             writer.writeValue(std::string(toString(value.type())));
+            writer.writeProperty("domain");
+            writer.writeValue(toString(value.domain()));
             writer.writeProperty("in");
             writer.writeValue(value.isInput());
             writer.writeProperty("out");
@@ -4755,6 +4994,7 @@ namespace wolvrix::lib::grh
 
     GraphBuilder &Graph::ensureBuilder()
     {
+        owner_->touch();
         if (builder_)
         {
             return *builder_;
@@ -4843,6 +5083,7 @@ namespace wolvrix::lib::grh
                      graphView.valueWidth(id),
                      graphView.valueSigned(id),
                      graphView.valueType(id),
+                     graphView.valueDomain(id),
                      std::vector<int64_t>(graphView.valueShape(id).begin(), graphView.valueShape(id).end()),
                      graphView.valueIsInput(id),
                      graphView.valueIsOutput(id),
@@ -4879,6 +5120,7 @@ namespace wolvrix::lib::grh
                      data.width,
                      data.isSigned,
                      data.type,
+                     data.domain,
                      data.shape,
                      data.isInput,
                      data.isOutput,
@@ -4960,6 +5202,7 @@ namespace wolvrix::lib::grh
 
     Graph &Design::addGraphInternal(std::unique_ptr<Graph> graph)
     {
+        touch();
         auto sym = graph->symbol();
         auto [it, inserted] = graphs_.emplace(sym, std::move(graph));
         if (!inserted)
@@ -4972,6 +5215,7 @@ namespace wolvrix::lib::grh
 
     Graph &Design::createGraph(std::string symbol)
     {
+        touch();
         if (symbol.empty())
         {
             throw std::invalid_argument("Graph symbol must not be empty");
@@ -4988,6 +5232,7 @@ namespace wolvrix::lib::grh
 
     bool Design::deleteGraph(std::string_view name)
     {
+        touch();
         std::string key(name);
         std::string symbol;
         if (auto it = graphs_.find(key); it != graphs_.end())
@@ -5154,6 +5399,7 @@ namespace wolvrix::lib::grh
 
     SymbolId Design::internSymbol(std::string_view text)
     {
+        touch();
         return designSymbols_.intern(text);
     }
 
@@ -5173,6 +5419,7 @@ namespace wolvrix::lib::grh
 
     void Design::addDeclaredSymbol(SymbolId sym)
     {
+        touch();
         if (!sym.valid())
         {
             throw std::runtime_error("Declared symbol is invalid");
@@ -5189,6 +5436,7 @@ namespace wolvrix::lib::grh
 
     bool Design::removeDeclaredSymbol(SymbolId sym)
     {
+        touch();
         if (!sym.valid())
         {
             throw std::runtime_error("Declared symbol is invalid");
@@ -5212,6 +5460,7 @@ namespace wolvrix::lib::grh
 
     void Design::clearDeclaredSymbols()
     {
+        touch();
         declaredSymbols_.clear();
         declaredSymbolSet_.clear();
     }
@@ -5247,6 +5496,7 @@ namespace wolvrix::lib::grh
 
     void Design::registerGraphAlias(std::string alias, Graph &graph)
     {
+        touch();
         if (alias.empty())
         {
             return;
@@ -5256,6 +5506,7 @@ namespace wolvrix::lib::grh
 
     void Design::markAsTop(std::string_view graphSymbol)
     {
+        touch();
         if (!findGraph(graphSymbol))
         {
             throw std::runtime_error("Cannot mark unknown graph as top: " + std::string(graphSymbol));
@@ -5269,6 +5520,7 @@ namespace wolvrix::lib::grh
 
     void Design::unmarkAsTop(std::string_view graphSymbol)
     {
+        touch();
         if (!findGraph(graphSymbol))
         {
             throw std::runtime_error("Cannot unmark unknown graph as top: " + std::string(graphSymbol));

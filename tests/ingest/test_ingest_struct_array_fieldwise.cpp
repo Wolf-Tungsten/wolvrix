@@ -1,4 +1,7 @@
 #include "core/ingest.hpp"
+#include "core/transform.hpp"
+#include "transform/verify.hpp"
+#include "transform/const_fold.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -11,6 +14,7 @@
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/driver/Driver.h"
+#include "slang/numeric/SVInt.h"
 
 namespace {
 
@@ -207,6 +211,57 @@ int testPartialStructWrites(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testArrayConstruction(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "ingest_array_create");
+    if (!bundle || !bundle->compilation) return fail("Array construction fixture did not compile");
+    wolvrix::lib::ingest::ConvertDriver driver;
+    auto design = driver.convert(bundle->compilation->getRoot());
+    if (driver.diagnostics().hasError()) return fail("Array construction ingest failed");
+    wolvrix::lib::transform::PassManager verifier;
+    verifier.addPass(std::make_unique<wolvrix::lib::transform::GrhVerifyPass>());
+    wolvrix::lib::transform::PassDiagnostics diagnostics;
+    if (!verifier.run(design, diagnostics).success) return fail("Raw array constructor contract is invalid");
+    const auto *graph = design.findGraph("ingest_array_create");
+    if (!graph) return fail("Missing array construction graph");
+    unsigned scalarArrays = 0, nestedArrays = 0, singletons = 0;
+    for (const auto id : graph->operations()) {
+        const auto op = graph->getOperation(id);
+        if (op.kind() != wolvrix::lib::grh::OperationKind::kArrayCreate) continue;
+        const auto value = graph->getValue(op.results()[0]);
+        scalarArrays += value.shape().size() == 1 && value.shape()[0] == 4;
+        nestedArrays += value.shape().size() == 2 && value.shape()[0] == 2 && value.shape()[1] == 2;
+        singletons += value.shape().size() == 1 && value.shape()[0] == 1;
+    }
+    if (scalarArrays < 5 || nestedArrays < 2 || singletons == 0)
+        return fail("Raw ingest lost struct, range-direction, pattern or sub-array construction: scalar=" +
+                    std::to_string(scalarArrays) + " nested=" + std::to_string(nestedArrays) +
+                    " singleton=" + std::to_string(singletons));
+    wolvrix::lib::transform::PassManager folder;
+    folder.addPass(std::make_unique<wolvrix::lib::transform::ConstantFoldPass>());
+    if (!folder.run(design, diagnostics).success) return fail("Array order fixture failed to fold");
+    for (const char *name : {"descending_bits", "ascending_bits", "nested_bits", "pattern_bits", "singleton_bits", "mixed_bits"}) {
+        auto value = graph->outputPortValue(name);
+        bool found = false;
+        for (unsigned depth = 0; depth < 32; ++depth) {
+            const auto op = graph->getOperation(graph->valueDef(value));
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kConstant) {
+                const auto literal = std::get<std::string>(*op.attr("constValue"));
+                const auto expected = std::string_view(name) == "singleton_bits" ? UINT64_C(0x11) :
+                    std::string_view(name) == "mixed_bits" ? UINT64_C(0x443322112211) : UINT64_C(0x44332211);
+                if (slang::SVInt::fromString(literal).as<uint64_t>() != expected)
+                    return fail("Array constructor changed element order for " + std::string(name));
+                found = true;
+                break;
+            }
+            if ((op.kind() != wolvrix::lib::grh::OperationKind::kAssign) || op.operands().size() != 1)
+                return fail("Array order fixture did not fold: " + std::string(name));
+            value = op.operands()[0];
+        }
+        if (!found) return fail("Array order fixture alias cycle");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -215,5 +270,6 @@ int main() {
     if (testFieldWiseStructArray(sourcePath) != 0) {
         return 1;
     }
-    return testPartialStructWrites(sourcePath);
+    if (testPartialStructWrites(sourcePath) != 0) return 1;
+    return testArrayConstruction(sourcePath);
 }

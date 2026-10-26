@@ -1,6 +1,7 @@
 #include "native/module/methods.hpp"
 
 #include "emit/system_verilog.hpp"
+#include "emit/grhsim/cpu-st-cpp.hpp"
 #include "emit/verilator_repcut_package.hpp"
 #include "native/diagnostics/to_python.hpp"
 #include "native/session/storage.hpp"
@@ -11,6 +12,49 @@
 
 namespace wolvrix::app::pybind
 {
+
+    PyObject *py_session_emit_grhsim_cpu_st_cpp(PyObject *, PyObject *args, PyObject *kwargs)
+    {
+        PyObject *sessionObj = nullptr;
+        const char *designKey = nullptr;
+        const char *output = nullptr;
+        PyObject *topObj = Py_None;
+        unsigned long long maxFunctionLines = 1024;
+        unsigned long long maxTuBytes = 1024 * 1024;
+        unsigned long long maxRound = 100000;
+        int waveform = 0;
+        int traceUnderscore = 0;
+        const char *memWriteActivate = "on-write";
+        int memEnableBitmap = 1;
+        int executionCounters = 0;
+        static const char *kwlist[] = {"session", "design", "output", "top", "max_function_lines", "max_tu_bytes",
+                                      "max_round", "waveform", "trace_underscore_values", "mem_write_activate", "mem_enable_bitmap", "execution_counters", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OKKKppspp", const_cast<char **>(kwlist),
+                &sessionObj, &designKey, &output, &topObj, &maxFunctionLines, &maxTuBytes, &maxRound,
+                &waveform, &traceUnderscore, &memWriteActivate, &memEnableBitmap, &executionCounters)) return nullptr;
+        SessionHandle *session = getSessionHandle(sessionObj);
+        if (!session) return nullptr;
+        auto *design = sessionDesign(*session, designKey);
+        if (!design) { PyErr_Format(PyExc_KeyError, "design key not found: %s", designKey); return nullptr; }
+        wolvrix::lib::emit::EmitOptions options;
+        std::string error;
+        if (!parseStringList(topObj, options.topOverrides, error)) {
+            PyErr_SetString(PyExc_ValueError, error.c_str()); return nullptr;
+        }
+        options.outputDir = output;
+        options.session = &session->nativeValues;
+        options.traceUnderscoreValues = traceUnderscore != 0;
+        options.attributes = {{"max-function-lines", std::to_string(maxFunctionLines)},
+                              {"max-tu-bytes", std::to_string(maxTuBytes)}, {"max-round", std::to_string(maxRound)},
+                              {"waveform", waveform ? "declared-symbols" : "none"},
+                              {"mem-write-activate", memWriteActivate}, {"mem-enable-bitmap", memEnableBitmap ? "on" : "off"}};
+        if (executionCounters) options.attributes["execution-counters"] = "on";
+        wolvrix::lib::emit::EmitDiagnostics diagnostics;
+        wolvrix::lib::emit::GrhSimCpuStCpp emitter(&diagnostics);
+        const auto result = emitter.emit(*design, options);
+        return makeActionResult(result.success && !diagnostics.hasError(), diagnostics.messages(),
+                                sessionDesignSourceManager(*session, designKey));
+    }
 
     PyObject *py_session_emit_sv(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
     {

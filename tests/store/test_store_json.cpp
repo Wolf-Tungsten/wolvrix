@@ -52,9 +52,9 @@ namespace
         const std::vector<int64_t> memShape{4, 2};
         ValueId arr = graph.createValue(graph.internSymbol("arr"), 64, false, ValueType::Logic, memShape);
 
-        // kAssignAs: bit-identical retype of the array value into a flat view.
+        // kAssign: bit-identical retype of the array value into a flat view.
         ValueId arrFlat = graph.createValue(graph.internSymbol("arr_flat"), 64, false);
-        OperationId view = graph.createOperation(OperationKind::kAssignAs, graph.internSymbol("view0"));
+        OperationId view = graph.createOperation(OperationKind::kAssign, graph.internSymbol("view0"));
         graph.addOperand(view, arr);
         graph.addResult(view, arrFlat);
 
@@ -164,10 +164,10 @@ int main()
         return fail("Shape key missing in prettyCompact JSON");
     }
 
-    bool foundAssignAs = false;
+    bool foundAssignView = false;
     for (const OperationId opId : parsedDemo->operations())
     {
-        if (parsedDemo->opKind(opId) == OperationKind::kAssignAs)
+        if (parsedDemo->opKind(opId) == OperationKind::kAssign)
         {
             const auto operands = parsedDemo->opOperands(opId);
             const auto results = parsedDemo->opResults(opId);
@@ -175,13 +175,13 @@ int main()
                 parsedDemo->valueShape(operands.front()).size() == 2 &&
                 parsedDemo->valueShape(results.front()).empty())
             {
-                foundAssignAs = true;
+                foundAssignView = true;
             }
         }
     }
-    if (!foundAssignAs)
+    if (!foundAssignView)
     {
-        return fail("Round-trip parsed design lost the kAssignAs view");
+        return fail("Round-trip parsed design lost the kAssign view");
     }
 
     // Case 3: compact mode should differ from prettyCompact output and avoid newlines.

@@ -5,15 +5,20 @@
 #include "core/logging.hpp"
 #include "core/grh.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace wolvrix::lib::transform
@@ -73,6 +78,37 @@ namespace wolvrix::lib::transform
 
     using SessionStore = std::unordered_map<std::string, std::unique_ptr<SessionSlot>>;
 
+    template <typename T>
+    const T& requireSessionValue(const SessionStore* store, std::string_view key)
+    {
+        if (!store) throw std::runtime_error("A session is required for " + std::string(key));
+        const auto it = store->find(std::string(key));
+        if (it == store->end() || !it->second)
+            throw std::runtime_error("Missing session artifact: " + std::string(key));
+        const auto* slot = dynamic_cast<const SessionSlotValue<T>*>(it->second.get());
+        if (!slot)
+            throw std::runtime_error("Wrong session artifact type: " + std::string(key) +
+                                     " (stored " + std::string(it->second->kind()) + ")");
+        return slot->value;
+    }
+
+    struct DesignStamp
+    {
+        uint64_t instance = 0;
+        uint64_t revision = 0;
+        wolvrix::lib::grh::GraphId top;
+
+        static DesignStamp capture(const wolvrix::lib::grh::Graph& graph)
+        {
+            return {graph.owner().instanceId(), graph.owner().revision(), graph.id()};
+        }
+        bool matches(const wolvrix::lib::grh::Graph& graph) const noexcept
+        {
+            return instance == graph.owner().instanceId() &&
+                   revision == graph.owner().revision() && top == graph.id();
+        }
+    };
+
     struct PassContext
     {
         wolvrix::lib::grh::Design &design;
@@ -103,6 +139,131 @@ namespace wolvrix::lib::transform
         return loc;
     }
 
+    // `originModules` records the `$`-joined source module instance paths of
+    // each op's defining logic (def-site only, never data-dependency
+    // propagation). Merges/shares take the ordered-dedup union; clones carry
+    // it for free with the other attrs. Stamped by hier-flatten; pass-synth
+    // ops inherit it from their primary source op(s) via inheritOrigin.
+    inline constexpr std::string_view kOriginModulesKey = "originModules";
+
+    inline std::optional<std::vector<std::string>> getOriginModules(
+        const wolvrix::lib::grh::Graph &graph,
+        wolvrix::lib::grh::OperationId op)
+    {
+        // Graph has no lean single-attr accessor; the span scan is cheap
+        // (attribute lists are short) and keeps callers off fat Operation.
+        for (const wolvrix::lib::grh::AttrKV &kv : graph.opAttrs(op))
+        {
+            if (kv.key != kOriginModulesKey)
+            {
+                continue;
+            }
+            if (const auto *values = std::get_if<std::vector<std::string>>(&kv.value))
+            {
+                return *values;
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    inline void appendOriginModule(std::vector<std::string> &origins, std::string_view module)
+    {
+        if (module.empty())
+        {
+            return;
+        }
+        if (std::find(origins.begin(), origins.end(), module) == origins.end())
+        {
+            origins.emplace_back(module);
+        }
+    }
+
+    inline void appendOriginModules(std::vector<std::string> &origins,
+                                    const std::vector<std::string> &extra)
+    {
+        for (const std::string &module : extra)
+        {
+            appendOriginModule(origins, module);
+        }
+    }
+
+    inline void prependOriginModule(std::vector<std::string> &origins, std::string_view module)
+    {
+        if (module.empty())
+        {
+            return;
+        }
+        if (std::find(origins.begin(), origins.end(), module) != origins.end())
+        {
+            return;
+        }
+        origins.insert(origins.begin(), std::string(module));
+    }
+
+    // Ordered-dedup union of `extra` into op's originModules; sets the attr
+    // when absent and removes it when the union is empty. Returns true when
+    // the attribute changed.
+    inline bool mergeOriginModules(wolvrix::lib::grh::Graph &graph,
+                                   wolvrix::lib::grh::OperationId op,
+                                   const std::vector<std::string> &extra)
+    {
+        if (extra.empty()) return false;
+        const std::vector<std::string>* current = nullptr;
+        for (const auto& attribute : graph.opAttrs(op))
+            if (attribute.key == kOriginModulesKey) {
+                current = std::get_if<std::vector<std::string>>(&attribute.value);
+                break;
+            }
+        // Shared constants/expressions can have thousands of origin paths.
+        // Most reuses add no path: inspect borrowed data before copying it.
+        const auto missing = [&](const auto& module) {
+            return !module.empty() && (!current || std::find(current->begin(), current->end(), module) == current->end());
+        };
+        if (std::none_of(extra.begin(), extra.end(), missing)) return false;
+        std::vector<std::string> merged = current ? *current : std::vector<std::string>{};
+        const std::size_t before = merged.size();
+        appendOriginModules(merged, extra);
+        if (merged.empty())
+        {
+            if (before == 0)
+            {
+                return false;
+            }
+            return graph.eraseAttr(op, kOriginModulesKey);
+        }
+        if (merged.size() == before)
+        {
+            return false;
+        }
+        graph.setAttr(op, kOriginModulesKey, std::move(merged));
+        return true;
+    }
+
+    // Union of all source ops' originModules onto newOp; a fully sourceless
+    // synthesis (fresh guard/const) keeps the attr absent.
+    inline void inheritOrigin(wolvrix::lib::grh::Graph &graph,
+                              wolvrix::lib::grh::OperationId newOp,
+                              std::initializer_list<wolvrix::lib::grh::OperationId> srcOps)
+    {
+        std::vector<std::string> merged;
+        for (const wolvrix::lib::grh::OperationId src : srcOps)
+        {
+            if (!src.valid())
+            {
+                continue;
+            }
+            if (const auto origins = getOriginModules(graph, src))
+            {
+                appendOriginModules(merged, *origins);
+            }
+        }
+        if (!merged.empty())
+        {
+            graph.setAttr(newOp, kOriginModulesKey, std::move(merged));
+        }
+    }
+
     class Pass
     {
     public:
@@ -110,6 +271,7 @@ namespace wolvrix::lib::transform
         virtual ~Pass() = default;
 
         virtual PassResult run() = 0;
+        virtual bool supportsDialect(std::string_view dialect) const noexcept { return dialect == "grh"; }
 
         const std::string &id() const noexcept { return id_; }
         const std::string &name() const noexcept { return name_; }
@@ -218,6 +380,7 @@ namespace wolvrix::lib::transform
         void info(const wolvrix::lib::grh::Graph &graph, std::string message);
         void debug(const wolvrix::lib::grh::Graph &graph, std::string message);
         bool keepDeclaredSymbols() const noexcept { return context_ ? context_->keepDeclaredSymbols : true; }
+        SessionStore* session() noexcept { return context_ ? context_->session : nullptr; }
 
     private:
         friend class PassManager;

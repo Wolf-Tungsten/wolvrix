@@ -1,6 +1,7 @@
 #include "transform/instance_inline.hpp"
 
 #include "core/grh.hpp"
+#include "core/transform.hpp"
 
 #include <functional>
 #include <optional>
@@ -201,6 +202,43 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        // DPI import equivalence is a signature check: provenance attrs such
+        // as originModules differ per defining module and must not block the
+        // merge of duplicate import declarations.
+        bool dpiAttrsEqual(const wolvrix::lib::grh::Operation &lhs,
+                           const wolvrix::lib::grh::Operation &rhs)
+        {
+            auto attrCount = [](const wolvrix::lib::grh::Operation &op)
+            {
+                std::size_t count = 0;
+                for (const auto &attr : op.attrs())
+                {
+                    if (attr.key != kOriginModulesKey)
+                    {
+                        ++count;
+                    }
+                }
+                return count;
+            };
+            if (attrCount(lhs) != attrCount(rhs))
+            {
+                return false;
+            }
+            for (const auto &attr : lhs.attrs())
+            {
+                if (attr.key == kOriginModulesKey)
+                {
+                    continue;
+                }
+                auto rhsAttr = rhs.attr(attr.key);
+                if (!rhsAttr || *rhsAttr != attr.value)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         std::string joinPrefix(const std::vector<std::string> &segments)
         {
             std::string prefix;
@@ -337,46 +375,56 @@ namespace wolvrix::lib::transform
             return true;
         }
 
-        // stage-04: when the child port value carries an array shape and the
-        // parent-side connection value has none (same flat width), propagate
-        // the shape so child-internal array accesses survive the inline.
-        void propagatePortShape(wolvrix::lib::grh::Graph &parent,
-                                const wolvrix::lib::grh::Graph &child,
-                                wolvrix::lib::grh::ValueId childValue,
-                                wolvrix::lib::grh::ValueId parentValue)
-        {
-            const std::span<const int64_t> childShape = child.valueShape(childValue);
-            if (childShape.empty() || !parent.valueShape(parentValue).empty())
-            {
-                return;
-            }
-            if (parent.getValue(parentValue).width() != child.getValue(childValue).width())
-            {
-                return;
-            }
-            parent.setValueShape(parentValue, childShape);
-        }
-
-        wolvrix::lib::grh::ValueId mapInputPortShape(wolvrix::lib::grh::Graph &parent,
+        wolvrix::lib::grh::ValueId mapInputPortType(wolvrix::lib::grh::Graph &parent,
                                                      const wolvrix::lib::grh::Graph &child,
                                                      wolvrix::lib::grh::ValueId childValue,
-                                                     wolvrix::lib::grh::ValueId parentValue)
+                                                     wolvrix::lib::grh::ValueId parentValue,
+                                                     std::string &error)
         {
-            const std::span<const int64_t> shape = child.valueShape(childValue);
-            if (shape.empty() || !parent.valueShape(parentValue).empty() ||
-                parent.valueWidth(parentValue) != child.valueWidth(childValue))
+            const auto expected = child.valueLogicalType(childValue);
+            const auto actual = parent.valueLogicalType(parentValue);
+            if (actual == expected)
             {
                 return parentValue;
             }
+            if (actual.width != expected.width || actual.kind != expected.kind || actual.domain != expected.domain)
+            {
+                error = "instance-inline input port requires equal width and compatible kind/domain";
+                return {};
+            }
             const wolvrix::lib::grh::ValueId view =
-                parent.createValue(parent.makeInternalValSym(), parent.valueWidth(parentValue),
-                                   parent.valueSigned(parentValue), parent.valueType(parentValue), shape);
+                parent.createValue(parent.makeInternalValSym(), expected);
             const wolvrix::lib::grh::OperationId assign =
-                parent.createOperation(parent.assignKindFor(parentValue, view),
+                parent.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
                                        parent.makeInternalOpSym());
             parent.addOperand(assign, parentValue);
             parent.addResult(assign, view);
             return view;
+        }
+
+        bool mapOutputPortType(wolvrix::lib::grh::Graph &parent,
+                               const wolvrix::lib::grh::Graph &child,
+                               wolvrix::lib::grh::ValueId childValue,
+                               wolvrix::lib::grh::ValueId parentValue,
+                               ValueMap &portMap, std::vector<AliasOutput> &aliases,
+                               std::string &error)
+        {
+            const auto sourceType = child.valueLogicalType(childValue);
+            const auto targetType = parent.valueLogicalType(parentValue);
+            if (sourceType.width != targetType.width || sourceType.kind != targetType.kind ||
+                sourceType.domain != targetType.domain)
+            {
+                error = "instance-inline output port requires equal width and compatible kind/domain";
+                return false;
+            }
+            auto found = portMap.find(childValue);
+            if (found == portMap.end())
+            {
+                const auto value = sourceType == targetType ? parentValue : parent.createValue(sourceType);
+                found = portMap.emplace(childValue, value).first;
+            }
+            if (found->second != parentValue) aliases.push_back({found->second, parentValue});
+            return true;
         }
 
         bool buildPortMap(const wolvrix::lib::grh::Graph &child,
@@ -440,8 +488,9 @@ namespace wolvrix::lib::transform
                 {
                     childValue = child.inputPorts()[i].value;
                 }
-                portMap.emplace(childValue, mapInputPortShape(parent, child, childValue,
-                                                               instOp.operands()[i]));
+                const auto mapped = mapInputPortType(parent, child, childValue, instOp.operands()[i], error);
+                if (!mapped) return false;
+                portMap.emplace(childValue, mapped);
             }
 
             std::unordered_map<std::string_view, wolvrix::lib::grh::ValueId> childOutputsByName;
@@ -472,12 +521,8 @@ namespace wolvrix::lib::transform
                     childValue = child.outputPorts()[i].value;
                 }
                 const auto mapped = instOp.results()[i];
-                propagatePortShape(parent, child, childValue, mapped);
-                auto [it, inserted] = portMap.emplace(childValue, mapped);
-                if (!inserted && it->second != mapped)
-                {
-                    aliasOutputs.push_back(AliasOutput{it->second, mapped});
-                }
+                if (!mapOutputPortType(parent, child, childValue, mapped, portMap, aliasOutputs, error))
+                    return false;
             }
 
             std::unordered_map<std::string_view, std::size_t> childInoutsByName;
@@ -507,12 +552,12 @@ namespace wolvrix::lib::transform
                 const auto operandIndex = inputCount + i;
                 const auto outIndex = outputCount + i;
                 const auto oeIndex = outputCount + inoutCount + i;
-                portMap.emplace(port.in, mapInputPortShape(parent, child, port.in,
-                                                           instOp.operands()[operandIndex]));
-                portMap.emplace(port.out, instOp.results()[outIndex]);
-                portMap.emplace(port.oe, instOp.results()[oeIndex]);
-                propagatePortShape(parent, child, port.out, instOp.results()[outIndex]);
-                propagatePortShape(parent, child, port.oe, instOp.results()[oeIndex]);
+                const auto mappedInput = mapInputPortType(parent, child, port.in, instOp.operands()[operandIndex], error);
+                if (!mappedInput) return false;
+                portMap.emplace(port.in, mappedInput);
+                if (!mapOutputPortType(parent, child, port.out, instOp.results()[outIndex], portMap, aliasOutputs, error) ||
+                    !mapOutputPortType(parent, child, port.oe, instOp.results()[oeIndex], portMap, aliasOutputs, error))
+                    return false;
             }
 
             return true;
@@ -583,7 +628,7 @@ namespace wolvrix::lib::transform
                 }
                 // stage-04: preserve the array view on cloned values.
                 const auto newValue = target.createValue(newSym, value.width(), value.isSigned(),
-                                                         value.type(), value.shape());
+                                                         value.type(), value.shape(), value.domain());
                 if (value.srcLoc())
                 {
                     target.setValueSrcLoc(newValue, *value.srcLoc());
@@ -640,10 +685,26 @@ namespace wolvrix::lib::transform
                     {
                         const auto existing = target.getOperation(existingId);
                         if (existing.kind() != wolvrix::lib::grh::OperationKind::kDpicImport ||
-                            !attrsEqual(existing, op))
+                            !dpiAttrsEqual(existing, op))
                         {
                             reporter.opError(source, op, "instance-inline DPI import conflicts with existing operation");
                             return false;
+                        }
+                        // Same import declared in another module: union the
+                        // provenance instead of dropping it. A child op
+                        // without originModules belongs to the graph being
+                        // inlined.
+                        std::vector<std::string> origins =
+                            getOriginModules(source, opId).value_or(std::vector<std::string>{targetInfo.prefix});
+                        if (!origins.empty())
+                        {
+                            std::vector<std::string> merged =
+                                getOriginModules(target, existingId).value_or(std::vector<std::string>{});
+                            for (const std::string &module : origins)
+                            {
+                                appendOriginModule(merged, module);
+                            }
+                            target.setAttr(existingId, kOriginModulesKey, std::move(merged));
                         }
                         opRename.emplace(opName, opName);
                         continue;
@@ -704,6 +765,21 @@ namespace wolvrix::lib::transform
                 {
                     rewriteAttr(newOp, attr.key, attr.value);
                 }
+                // originModules rides along with the copied attrs; prepend the
+                // inlined instance's path (dedup, stable order).
+                {
+                    std::vector<std::string> origins =
+                        getOriginModules(target, newOp).value_or(std::vector<std::string>{});
+                    if (origins.empty())
+                    {
+                        origins.push_back(targetInfo.prefix);
+                    }
+                    else
+                    {
+                        prependOriginModule(origins, targetInfo.prefix);
+                    }
+                    target.setAttr(newOp, kOriginModulesKey, std::move(origins));
+                }
                 for (const auto operand : op.operands())
                 {
                     auto it = portMap.find(operand);
@@ -755,10 +831,13 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 const auto assignOp =
-                    target.createOperation(target.assignKindFor(alias.source, alias.target), target.makeInternalOpSym());
+                    target.createOperation(wolvrix::lib::grh::OperationKind::kAssign, target.makeInternalOpSym());
                 target.addOperand(assignOp, alias.source);
                 target.addResult(assignOp, alias.target);
                 target.setOpSrcLoc(assignOp, makeTransformSrcLoc("instance-inline", "alias_output"));
+                // Synthetic alias assign exists because of this instance.
+                target.setAttr(assignOp, kOriginModulesKey,
+                               std::vector<std::string>{targetInfo.prefix});
                 ++stats.aliasAssigns;
                 ++stats.opsCloned;
             }

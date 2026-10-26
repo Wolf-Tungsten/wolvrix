@@ -2,8 +2,8 @@
 
 ## 功能概述
 
-`activity-schedule` pass 为单个 graph 构建 GrhSIM 使用的静态 activity
-schedule，并把结果写入 session。当前只保留 plain 调度路径；其他实验调度路径和
+`activity-schedule` pass 为单个普通 GRH graph 构建静态 activity
+分析，并把结果写入 session。当前只保留 plain 调度路径；其他实验调度路径和
 相关诊断导出都不再作为实现或接口存在。
 
 这个 pass 不会生成新的 wrapper/module，但会：
@@ -15,10 +15,11 @@ schedule，并把结果写入 session。当前只保留 plain 调度路径；其
 - 构造 compute node / commit node 中间模型
 - 在 compute-node cluster DAG 上执行 plain coarsen 和连续分段
 - 展开最终 `computeSupernode` / `commitSupernode` 调度模型
-- 将 schedule 写入 session，供 `grhsim-cpp` emit 使用
+- 将 schedule 写入 session，供普通 GRH 调度分析使用
 
-完整运行时术语和静态到运行时映射见
-[GrhSIM Scheduling](../emit/grhsim-scheduling.md)。
+历史运行时映射见 [旧 GrhSIM Scheduling](../emit/grhsim-scheduling.md)。
+当前生产仿真使用 [GrhSIM transforms](grhsim-transforms.md) 与独立的 typed
+SinkSchedule，不消费本 pass 的结果；旧 `grhsim-cpp` emitter 已退役。
 
 ## 路径语义
 

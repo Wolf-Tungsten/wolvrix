@@ -1,4 +1,5 @@
 #include "core/load.hpp"
+#include "core/op_descriptor.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -833,6 +835,26 @@ namespace wolvrix::lib::load
                 graphStart = TimingClock::now();
             }
             const auto &graphObj = graphValue.asObject("graph");
+            bool versioned = false;
+            if (const auto version = graphObj.find("formatVersion"); version != graphObj.end())
+            {
+                if (version->second.asInt("graph.formatVersion") != 2)
+                    throw std::runtime_error("Unsupported GRH formatVersion; regenerate from SV");
+                versioned = true;
+            }
+            std::unordered_map<std::string, uint32_t> dialects;
+            if (const auto declared = graphObj.find("dialects"); declared != graphObj.end())
+            {
+                for (const auto& [name, entry] : declared->second.asObject("graph.dialects"))
+                {
+                    const auto supported = wolvrix::lib::grh::dialectVersion(name);
+                    if (!supported || entry.asInt("dialect version") != *supported)
+                        throw std::runtime_error("Unsupported GRH dialect/version: " + name);
+                    dialects.emplace(name, *supported);
+                }
+            }
+            if (versioned && !dialects.contains("grh"))
+                throw std::runtime_error("Versioned GRH requires its dialect version");
             auto symbolIt = graphObj.find("symbol");
             if (symbolIt == graphObj.end())
             {
@@ -844,6 +866,9 @@ namespace wolvrix::lib::load
                 throw std::runtime_error("Graph JSON symbol is empty");
             }
             Graph &graph = design.createGraph(graphSymbol);
+            if (const auto metadata = graphObj.find("metadata"); metadata != graphObj.end())
+                for (const auto& [key, entry] : metadata->second.asObject("graph.metadata"))
+                    graph.setMetadata(key, parseAttributeValue(entry));
             ++totalGraphs;
             if (timingEnabled)
             {
@@ -997,7 +1022,17 @@ namespace wolvrix::lib::load
                     throw std::runtime_error("Value symbol is empty");
                 }
                 int64_t width = widthIt->second.asInt("value.w");
+                if (width < std::numeric_limits<int32_t>::min() || width > std::numeric_limits<int32_t>::max())
+                    throw std::runtime_error("Value width exceeds int32 capacity");
                 bool isSigned = signIt->second.asBool("value.sgn");
+                auto domain = wolvrix::lib::grh::LogicDomain::FourState;
+                if (const auto entry = valueObj.find("domain"); entry != valueObj.end())
+                {
+                    const auto parsed = wolvrix::lib::grh::parseLogicDomain(entry->second.asString("value.domain"));
+                    if (!parsed) throw std::runtime_error("Unknown value domain");
+                    domain = *parsed;
+                }
+                else if (versioned) throw std::runtime_error("Versioned GRH value is missing domain");
                 wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
                 if (auto typeIt = valueObj.find("type"); typeIt != valueObj.end())
                 {
@@ -1040,7 +1075,7 @@ namespace wolvrix::lib::load
                     }
                 }
                 ValueId valueId = graph.createValue(valueSym, static_cast<int32_t>(width), isSigned, valueType,
-                                                    valueShape);
+                                                    valueShape, domain);
                 if (timingEnabled)
                 {
                     const auto now = TimingClock::now();
@@ -1418,8 +1453,16 @@ namespace wolvrix::lib::load
                     auto kind = parseOperationKind(kindIt->second.asString("operation.kind"));
                     if (!kind)
                     {
-                        throw std::runtime_error("Unknown operation kind: " + kindIt->second.asString("operation.kind"));
+                        const std::string& name = kindIt->second.asString("operation.kind");
+                        if (name == "kAssignAs")
+                            throw std::runtime_error("kAssignAs was removed; regenerate the checkpoint from SV");
+                        throw std::runtime_error("Unknown operation kind: " + name);
                     }
+
+                    const auto* descriptor = wolvrix::lib::grh::findOpDescriptor(*kind);
+                    if (descriptor->dialect != "grh" &&
+                        (!versioned || !dialects.contains(std::string(descriptor->dialect))))
+                        throw std::runtime_error("Dialect operation requires an explicit format/dialect version");
 
                     auto symIt = opObj.find("sym");
                     if (symIt == opObj.end())

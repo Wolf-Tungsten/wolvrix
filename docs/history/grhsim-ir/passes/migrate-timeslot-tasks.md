@@ -5,7 +5,7 @@
 # Timeslot task migration
 
 `grhsim.migrate-timeslot-tasks` is the fourth and last M2 lowering pass of
-the six-phase simulation model (`pdocs/simulation-model-refactor`). It runs
+the six-phase simulation model. It runs
 after `grhsim.lower-edge-detect` and `grhsim.extract-output-cones`, and
 migrates the time-slot system tasks — `core.system.task` ops whose `name`
 parameter is `strobe` or `monitor` — into P_output. Every other system task

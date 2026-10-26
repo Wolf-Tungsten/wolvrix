@@ -116,9 +116,9 @@ An effectful result used by Event/Output is marked `grhsim.sampleBoundary=true`
 on its General producer and consumed as a held sample. Pure/read cones are
 extracted separately; an original DPI/random operation is not duplicated.
 `grhsim.effectPolicy=single-original-call` graph metadata records this explicit
-policy. One frozen legacy fixture duplicates a DPI call in Output; its logs are
-retained as an explicitly approved behavior difference in the
-[frozen-observation validation](../../../pdocs/remove-grhsim-ir/20261026-r5-r6-validation.md).
+policy. One frozen legacy fixture duplicates a DPI call in Output; current
+emission deliberately retains the single original call site. See the
+[implementation overview](../../../pdocs/grhsim.md) for phase and call semantics.
 
 ## Optimization operations
 

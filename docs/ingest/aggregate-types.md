@@ -1,7 +1,6 @@
 # ingest 聚合类型支持（数组与结构体）
 
-本文是 ingest 对 SystemVerilog 聚合类型（数组、结构体）处理的规范。它对应
-`pdocs/grh-ir-array-support/` stage-04 / stage-08 的实现，目标是：在不违反 GRH 类型系统
+本文是 ingest 对 SystemVerilog 聚合类型（数组、结构体）处理的规范，目标是：在不违反 GRH 类型系统
 （同质数组）的前提下**尽可能保留源级聚合结构**，不再把一切平化成单向量。
 
 ## 1. 类型映射决策树

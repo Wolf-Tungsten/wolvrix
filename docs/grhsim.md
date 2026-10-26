@@ -119,8 +119,8 @@ compile commands, core/binding symbols and optionally a generated model.
 uses the `grhsim` route directly; retired optimization options fail
 explicitly, including when set to zero or an empty string.
 
-The [capability index](../../pdocs/remove-grhsim-ir/capability-evidence.md)
-maps each contract to implementation, tests and validation reports. The
+The [implementation overview](../../pdocs/grhsim.md)
+describes all six phases, transform passes, dialect operations and emitter layout. The
 [retired documentation](history/grhsim-ir/overview.md) records the old design;
 it does not define current APIs or production behavior. S9 array optimization
 starts from the accepted R7/R8 version and is a separate task.

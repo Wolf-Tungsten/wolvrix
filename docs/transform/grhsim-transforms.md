@@ -211,10 +211,10 @@ while the reference remains unpartitioned. FourState/Real/String history tests
 verify IR/checkpoint contracts; this test interpreter executes the TwoState
 Logic subset. Generated C++ ABI, activation and execution are separately
 tested by `make test_grhsim_cpu_st_cpp`, frozen observations, HDLBits,
-ROB and XS. The [capability index](../../../pdocs/remove-grhsim-ir/capability-evidence.md)
-keeps those evidence boundaries explicit.
+ROB and XS. The [implementation overview](../../../pdocs/grhsim.md)
+describes the current execution model and validation boundaries.
 
-The [implementation plan](../../../pdocs/remove-grhsim-ir/passes-and-emitter.md)
-defines ownership, sink-order and emitter boundaries. Chunking is
+The [implementation overview](../../../pdocs/grhsim.md)
+describes ownership, sink-order and emitter boundaries. Chunking is
 exclusively an emitter function-size option; it is never a virtual partition or
 a parameter to these transforms.

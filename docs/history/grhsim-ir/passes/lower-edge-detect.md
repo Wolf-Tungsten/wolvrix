@@ -5,7 +5,7 @@
 # Edge-detect lowering into P_event
 
 `grhsim.lower-edge-detect` is the second M2 lowering pass of the six-phase
-simulation model (`pdocs/simulation-model-refactor`). It migrates the raw
+simulation model. It migrates the raw
 event annotation form — an `event_edges` string-array parameter whose entries
 match the consumer's trailing event operands one to one — into the P_event
 form: one deduplicated `core.event.edgeDet` per `(event, edge)` cluster, an

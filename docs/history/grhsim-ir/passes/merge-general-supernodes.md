@@ -114,9 +114,7 @@ Integration knob: the XS/HDLBits pipeline scripts read
 `XS_WOLF_GRHSIM_IR_SINK_GUARD_MIN` (default `8`, `0` disables) and pass it
 as `--sink-enable-guard-min-size`; the XS script also accepts the
 `--sink-enable-guard-min-size` CLI override. For boundary-reduction
-exploration (plan record
-`pdocs/perf-optimization/20261005-170704-nonsink-semantic-partition-plan.md`,
-removed in the 2026-10-19 non-aggregate cleanup; see git history)
+exploration (historical plan records are available in git history)
 the scripts also read `XS_WOLF_GRHSIM_IR_COARSEN_MAX_OP` and pass it as
 `--coarsen-max-op` (default `0` = the coarsen merge weight cap follows
 `--max-op-in-compute-supernode`, the legacy behavior; a large value

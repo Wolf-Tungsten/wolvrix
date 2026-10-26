@@ -5,7 +5,7 @@
 # Event input classification
 
 `grhsim.classify-event-inputs` is the first M2 lowering pass of the six-phase
-simulation model (`pdocs/simulation-model-refactor`). It runs after
+simulation model. It runs after
 GRH-to-GrhSIM lowering and before `grhsim.lower-edge-detect`, and marks pure
 event inputs so the P_input stage can skip data-activity tracking for them.
 

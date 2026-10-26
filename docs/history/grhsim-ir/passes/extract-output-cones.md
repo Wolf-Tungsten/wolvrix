@@ -5,7 +5,7 @@
 # Output cone extraction
 
 `grhsim.extract-output-cones` is the third M2 lowering pass of the six-phase
-simulation model (`pdocs/simulation-model-refactor`). It runs after
+simulation model. It runs after
 `grhsim.lower-edge-detect` and before `grhsim.migrate-timeslot-tasks`, and
 moves the logic feeding the DUT outputs into P_output.
 

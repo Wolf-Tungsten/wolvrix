@@ -6,8 +6,7 @@
 namespace wolvrix::lib::transform
 {
 
-    // Structural verifier for GRH graphs (array-type refactor stage-01; see
-    // pdocs/grh-ir-array-support/stage-01-ir-array-types.md). Read-only: it
+    // Structural verifier for GRH graphs, including array types. Read-only: it
     // never mutates the design and reports every violation through
     // PassDiagnostics.
     class GrhVerifyPass : public Pass

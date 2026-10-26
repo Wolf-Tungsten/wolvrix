@@ -283,7 +283,7 @@ DPI call；一个 GRH op 仍只产生一个 core op。GRH 转换只产出这份�
 
 ### 6.1 边沿检测 op `core.event.edgeDet`
 
-`core.event.edgeDet` 是六阶段仿真模型（见 `pdocs/simulation-model-refactor`）中 `P_event`
+`core.event.edgeDet` 是历史六阶段仿真模型中 `P_event`
 阶段的边沿检测原语。它由 lowering pass（`grhsim.lower-edge-detect`）对事件敏感 op 的
 (event, edge) 组合去重聚类后生成；GRH 转换不直接产出该 op。与第 6 节的"历史状态 + 事件
 敏感 op 自判边沿"形态相比，edgeDet 把边沿判定从各消费 op 中剥离出来集中执行，消费 op

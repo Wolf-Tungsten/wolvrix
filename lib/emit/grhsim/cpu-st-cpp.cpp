@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <fstream>
 #include <functional>
@@ -165,8 +166,18 @@ private:
     std::map<Key, std::size_t> ordinal_;
     std::vector<Key> nonsink_;
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> storage_;
+    std::unordered_map<ValueId, std::string, grh::ValueIdHash> smallEnableBoundary_, smallPayloadBoundary_;
+    std::unordered_map<ValueId, std::size_t, grh::ValueIdHash> smallEnableOrdinal_;
     std::unordered_map<ValueId, std::set<std::size_t>, grh::ValueIdHash> fanout_;
     std::unordered_map<OperationId, std::set<std::size_t>, grh::OperationIdHash> stateFanout_;
+    struct IndexedState {
+        int64_t cells = 0;
+        std::set<std::size_t> fullFanout;
+        std::map<std::size_t, std::vector<OperationId>> readers;
+    };
+    struct IndexedRead { OperationId state; int64_t count = 0; };
+    std::unordered_map<OperationId, IndexedState, grh::OperationIdHash> indexedStates_;
+    std::unordered_map<OperationId, IndexedRead, grh::OperationIdHash> indexedReads_;
     std::unordered_set<OperationId, grh::OperationIdHash> stateRound_;
     std::unordered_map<OperationId, std::size_t, grh::OperationIdHash> stateOrdinal_;
     std::unordered_set<OperationId, grh::OperationIdHash> wholeArrayStates_;
@@ -174,6 +185,17 @@ private:
     std::unordered_map<OperationId, std::size_t, grh::OperationIdHash> largeWriteOrdinal_;
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> fireExpressions_;
     std::unordered_map<ValueId, bool, grh::ValueIdHash> viewOnly_;
+    std::unordered_map<ValueId, ValueId, grh::ValueIdHash> snapshotViews_;
+    std::unordered_set<OperationId, grh::OperationIdHash> identityElisions_;
+    struct LeafPlan {
+        enum class Kind { Source, Concat, Repeat, Mux };
+        Kind kind = Kind::Source;
+        ValueId source;
+        int64_t width = 0;
+        std::vector<LeafPlan> inputs;
+    };
+    std::unordered_map<OperationId, LeafPlan, grh::OperationIdHash> leafPlans_;
+    std::unordered_set<OperationId, grh::OperationIdHash> leafElisions_;
     std::vector<OperationId> states_, edges_, histories_;
     std::map<std::string, std::vector<Local>> fields_;
     std::map<std::string, std::set<std::string>> fieldDeclarations_;
@@ -222,6 +244,13 @@ private:
     std::string nextStateRef(OperationId state) const { return fieldRef("smallSinkStore", name(state), "smallSinkStoreNext"); }
     std::vector<OperationId> topological(const std::vector<OperationId>& ops) const;
     void analyze();
+    void analyzeIndexedReads();
+    void activateState(std::vector<Code>& code, OperationId state);
+    void touchState(std::vector<Code>& code, OperationId state, const std::string& start, int64_t count);
+    void analyzeSnapshotViews();
+    void analyzeLeafPlans();
+    void emitLeaves(std::vector<Code>& code, const std::string& destination, const LogicalType& target,
+                    const LeafPlan& plan, const std::string& offset = "0");
     ValueId arrayView(ValueId value) const;
     bool viewOnly(ValueId value);
     void field(std::string store, const std::string& type, const std::string& name) {
@@ -234,8 +263,15 @@ private:
         return "@" + name + "@";
     }
     std::string temporary(const std::string& type) { return local(type, "tmp" + std::to_string(temporary_++)); }
-    std::string read(ValueId id) {
+    std::string read(ValueId id, bool payload = false) {
+        if (owner_.size() == 3 && owner_[1] == "small-sink") {
+            if (payload)
+                if (const auto found = smallPayloadBoundary_.find(id); found != smallPayloadBoundary_.end()) return found->second;
+            if (const auto found = smallEnableBoundary_.find(id); found != smallEnableBoundary_.end()) return found->second;
+            if (const auto found = smallPayloadBoundary_.find(id); found != smallPayloadBoundary_.end()) return found->second;
+        }
         if (const auto found = storage_.find(id); found != storage_.end()) return found->second;
+        if (const auto found = snapshotViews_.find(id); found != snapshotViews_.end()) return read(found->second, payload);
         return local(cppType(graph_.valueLogicalType(id)), valueName(id));
     }
     std::string packed(ValueId id, std::vector<Code>& code);
@@ -247,6 +283,7 @@ private:
     void activate(std::vector<Code>& code, const std::set<std::size_t>& fanout, std::optional<std::size_t> current = {});
     void markState(std::vector<Code>& code, OperationId state);
     void publish(std::vector<Code>& code, ValueId value, const std::string& source);
+    void syncSmallBoundary(std::vector<Code>& code, ValueId value, const std::string& source);
     std::string fireExpression(ValueId value);
     std::string expression(OperationId op, ValueId result, std::vector<Code>& code);
     void operation(std::vector<Code>& code, OperationId op);
@@ -432,9 +469,52 @@ void CpuStEmitContext::analyze() {
         if (ready.empty()) ready.swap(nextSweep);
     }
     if (nonsink_.size() != dependencies.size()) throw std::invalid_argument("CPU nonsink virtual partition DAG is cyclic");
+    // Classify crossing values by the consumer cone, not just the producer.
+    // A value shared by enable, payload and nonsink users needs each view.
+    std::unordered_map<ValueId, unsigned, grh::ValueIdHash> smallRoles;
+    std::map<Key, std::unordered_map<ValueId, unsigned, grh::ValueIdHash>> visitedRoles;
+    std::function<void(ValueId, const Key&, unsigned)> classify = [&](ValueId value, const Key& key, unsigned role) {
+        auto& visited = visitedRoles[key][value];
+        if ((visited & role) || sim::isFire(graph_, value)) return;
+        visited |= role;
+        const auto producer = graph_.valueDef(value);
+        if (!producer || executionOwner(producer) != key) { smallRoles[value] |= role; return; }
+        for (const auto arg : graph_.opOperands(producer)) classify(arg, key, role);
+    };
+    for (const auto& run : schedule_.generalRuns) if (run.partitionKey[1] == "small-sink")
+        for (const auto writer : run.orderedWriters) {
+            const auto args = graph_.opOperands(writer);
+            const auto enableIndex = graph_.opKind(writer) == sim::kLatchWrite ? 0u : 1u;
+            classify(args[enableIndex], run.partitionKey, 1);
+            for (std::size_t i = enableIndex + 1; i < args.size(); ++i) classify(args[i], run.partitionKey, 2);
+        }
     for (const auto value : graph_.values()) {
         const auto users = graph_.valueUsers(value);
         const auto producer = graph_.valueDef(value);
+        const auto role = smallRoles.find(value);
+        if (role != smallRoles.end()) {
+            const auto member = valueName(value), type = cppType(graph_.valueLogicalType(value));
+            if (role->second & 1) {
+                field("smallSinkEnableBoundaryStore", type, member);
+                smallEnableBoundary_[value] = "smallSinkEnableBoundaryStore." + member;
+            }
+            if (role->second & 2) {
+                field("smallSinkPayloadBoundaryStore", type, member);
+                smallPayloadBoundary_[value] = "smallSinkPayloadBoundaryStore." + member;
+            }
+            // Only direct, externally published writer enables are safe to
+            // probe before entering the run. Local enables must be evaluated.
+            if (enableBitmap_ && graph_.valueWidth(value) == 1 &&
+                (!producer || graph_.opKind(producer) != OperationKind::kConstant))
+                for (const auto& user : users) {
+                    const auto& key = executionOwner(user.operation);
+                    if (key.size() == 3 && key[1] == "small-sink" && sim::isWriter(graph_.opKind(user.operation)) &&
+                        user.operandIndex == (graph_.opKind(user.operation) == sim::kLatchWrite ? 0u : 1u) &&
+                        (!producer || executionOwner(producer) != key)) {
+                        smallEnableOrdinal_.emplace(value, smallEnableOrdinal_.size()); break;
+                    }
+                }
+        }
         for (const auto& user : users) {
             const auto& target = executionOwner(user.operation);
             if (ordinal_.contains(target) && (!producer || executionOwner(producer) != target)) fanout_[value].insert(ordinal_.at(target));
@@ -447,7 +527,12 @@ void CpuStEmitContext::analyze() {
         const auto& key = executionOwner(producer);
         bool boundary = sim::attribute<bool>(graph_, producer, "grhsim.sampleBoundary").value_or(false);
         boundary |= waveform_ && graph_.isDeclaredSymbol(graph_.valueSymbol(value));
-        for (const auto& use : users) boundary |= executionOwner(use.operation) != key;
+        for (const auto& use : users) {
+            const auto& target = executionOwner(use.operation);
+            // Small consumers have dedicated fields. Other crossings and
+            // held/observed values retain their ordinary boundary view.
+            boundary |= target != key && !(target.size() == 3 && target[1] == "small-sink" && role != smallRoles.end());
+        }
         // Random/DPI results must retain their sample even in an inactive leaf.
         boundary |= graph_.opKind(producer) == sim::kDpiCall ||
             (graph_.opKind(producer) == sim::kSystemFunction && sim::systemFunctionEffect(graph_, producer) != "pure");
@@ -456,18 +541,46 @@ void CpuStEmitContext::analyze() {
             const std::string store = graph_.opKind(producer) == sim::kEdgeDetect ? "eventActStore" : "nonSinkBoundaryStore";
             storage_[value] = store + "." + valueName(value);
             field(store, cppType(graph_.valueLogicalType(value)), valueName(value));
-        }
+        } else if (smallEnableBoundary_.contains(value)) storage_[value] = smallEnableBoundary_.at(value);
+        else if (smallPayloadBoundary_.contains(value)) storage_[value] = smallPayloadBoundary_.at(value);
     }
+    if (!smallEnableOrdinal_.empty())
+        field("smallSinkEnableBoundaryStore", "std::array<std::uint64_t," + std::to_string((smallEnableOrdinal_.size() + 63) / 64) + ">", "words");
     for (const auto op : graph_.operations()) {
         const auto kind = graph_.opKind(op);
         if (kind != OperationKind::kRegisterReadPort && kind != OperationKind::kRegisterReadArrayPort && kind != OperationKind::kLatchReadPort) continue;
         const auto state = graph_.findOperation(attr(op, kind == OperationKind::kLatchReadPort ? "latchSymbol" : "regSymbol"));
         if (!state) throw std::invalid_argument("CPU state read target is missing");
-        if (ordinal_.contains(executionOwner(op))) stateFanout_[state].insert(ordinal_.at(executionOwner(op)));
-        else if (executionOwner(op).size() == 3 && executionOwner(op)[0] == "general") stateRound_.insert(state);
+        const auto key = executionOwner(op);
+        if (ordinal_.contains(key)) stateFanout_[state].insert(ordinal_.at(key));
+        // Event-owned reads have no activity bit. Publishing their state must
+        // still run the next detector round to observe NBA-derived edges.
+        else if (key == Key{"event"} || (key.size() == 3 && key[0] == "general")) stateRound_.insert(state);
     }
+    analyzeIndexedReads();
+    analyzeSnapshotViews();
     for (const auto op : graph_.operations()) if (graph_.opKind(op) == OperationKind::kAssign)
         (void)viewOnly(graph_.opResults(op)[0]);
+    // Remove only dead local projections into the proven identity views.
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        for (const auto op : graph_.operations()) {
+            const auto kind = graph_.opKind(op);
+            if (identityElisions_.contains(op) || (kind != OperationKind::kAssign && kind != OperationKind::kSliceStatic)) continue;
+            const auto results = graph_.opResults(op);
+            if (results.size() != 1) continue;
+            const auto id = results[0];
+            if (storage_.contains(id) || smallEnableBoundary_.contains(id) || smallPayloadBoundary_.contains(id) || graph_.valueIsOutput(id)) continue;
+            const auto users = graph_.valueUsers(id);
+            if (users.empty()) continue;
+            bool dead = true;
+            for (const auto& use : users)
+                dead &= executionOwner(use.operation) == executionOwner(op) && identityElisions_.contains(use.operation);
+            if (dead) { identityElisions_.insert(op); removed = true; }
+        }
+    }
+    analyzeLeafPlans();
     // Register capture fields before rendering accesses. Every function must
     // use the same layout regardless of the order in which writers are emitted.
     for (const auto op : graph_.operations()) if (sim::isWriter(graph_.opKind(op)) && large(sim::writerTarget(graph_, op))) {
@@ -485,6 +598,258 @@ void CpuStEmitContext::analyze() {
     for (auto& [value, reference] : storage_) {
         const auto separator = reference.find('.');
         reference = fieldRef(reference.substr(0, separator), reference.substr(separator + 1));
+    }
+}
+
+void CpuStEmitContext::analyzeIndexedReads() {
+    // Subscriptions belong to the last executed read, including held samples.
+    // Only pure nonsink owners may lose a state-triggered activation; effects
+    // retain the original on-write scheduling even when their data is unchanged.
+    std::set<std::size_t> effectOwners;
+    for (const auto& [key, ops] : members_) if (ordinal_.contains(key))
+        for (const auto op : ops) if (grh::operationEffect(graph_, op) == grh::OpEffect::External) {
+            effectOwners.insert(ordinal_.at(key)); break;
+        }
+    std::unordered_map<OperationId, IndexedState, grh::OperationIdHash> candidates;
+    for (const auto op : graph_.operations()) {
+        const auto kind = graph_.opKind(op);
+        if (kind != OperationKind::kRegisterReadPort && kind != OperationKind::kRegisterReadArrayPort) continue;
+        const auto state = graph_.findOperation(attr(op, "regSymbol"));
+        const auto& key = executionOwner(op);
+        if (!large(state) || !writeActivation(state) || !ordinal_.contains(key)) continue;
+        const auto type = grh::stateLogicalType(graph_, state);
+        if (type.shape.empty()) continue;
+        const auto owner = ordinal_.at(key);
+        auto& plan = candidates[state];
+        plan.cells = type.width / type.leafWidth();
+        if (graph_.opOperands(op).empty() || effectOwners.contains(owner)) plan.fullFanout.insert(owner);
+        else plan.readers[owner].push_back(op);
+    }
+    for (const auto state : states_) {
+        const auto found = candidates.find(state);
+        if (found == candidates.end()) continue;
+        auto& plan = found->second;
+        for (const auto owner : stateFanout_[state])
+            if (!plan.readers.contains(owner)) plan.fullFanout.insert(owner);
+        for (const auto owner : plan.fullFanout) plan.readers.erase(owner);
+        if (plan.readers.empty() || plan.cells >= std::numeric_limits<int64_t>::max() - 1) continue;
+        // Two sentinels: N means an executed out-of-range read; N+1 means
+        // no sample yet and must conservatively match every valid write.
+        const auto indexType = unsignedType(std::bit_width(static_cast<uint64_t>(plan.cells + 1)));
+        for (const auto& [owner, reads] : plan.readers) for (const auto read : reads) {
+            int64_t count = plan.cells;
+            const auto args = graph_.opOperands(read);
+            const auto type = grh::stateLogicalType(graph_, state);
+            for (std::size_t i = 0; i < args.size(); ++i) count /= type.shape[i];
+            indexedReads_.emplace(read, IndexedRead{state, count});
+            field("memoryReadIndexStore", indexType, "r" + std::to_string(read.index));
+        }
+        field("memoryTouchedStore", "std::array<std::uint64_t," + std::to_string((plan.cells + 63) / 64) + ">", name(state));
+        indexedStates_.emplace(state, std::move(plan));
+    }
+}
+
+void CpuStEmitContext::analyzeSnapshotViews() {
+    const auto localView = [&](ValueId value, const Key& key) {
+        const auto producer = graph_.valueDef(value);
+        return producer && executionOwner(producer) == key && !storage_.contains(value) &&
+            !smallEnableBoundary_.contains(value) && !smallPayloadBoundary_.contains(value) && !graph_.valueIsOutput(value);
+    };
+    for (const auto op : graph_.operations()) {
+        if (graph_.opKind(op) != OperationKind::kArrayCreate) continue;
+        const auto id = graph_.opResults(op)[0];
+        const auto type = graph_.valueLogicalType(id);
+        const auto& key = executionOwner(op);
+        if (type.shape.empty() || type.kind != grh::ValueType::Logic || !localView(id, key)) continue;
+        ValueId source; int64_t offset = 0; bool valid = true;
+        for (auto arg : graph_.opOperands(op)) {
+            while (localView(arg, key) && graph_.opKind(graph_.valueDef(arg)) == OperationKind::kAssign) {
+                const auto input = graph_.opOperands(graph_.valueDef(arg))[0];
+                if (graph_.valueLogicalType(input) != graph_.valueLogicalType(arg)) break;
+                arg = input;
+            }
+            const auto slice = graph_.valueDef(arg);
+            const auto partType = graph_.valueLogicalType(arg);
+            if (!localView(arg, key) || !partType.shape.empty() || partType != leafType(type) ||
+                graph_.opKind(slice) != OperationKind::kSliceStatic ||
+                sim::attribute<int64_t>(graph_, slice, "sliceStart").value_or(-1) != offset ||
+                sim::attribute<int64_t>(graph_, slice, "sliceEnd").value_or(-1) != offset + partType.width - 1) { valid = false; break; }
+            const auto input = graph_.opOperands(slice)[0];
+            if (!storage_.contains(input) || graph_.valueLogicalType(input) != type || (source && source != input)) { valid = false; break; }
+            source = input; offset += partType.width;
+        }
+        if (valid && source && offset == type.width) { snapshotViews_.emplace(id, source); identityElisions_.insert(op); }
+    }
+    // Preserve scalar view handling, while forwarding shaped aliases all the
+    // way to scalar consumers such as mux through their original snapshot.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto op : graph_.operations()) {
+            if (graph_.opKind(op) != OperationKind::kAssign) continue;
+            const auto id = graph_.opResults(op)[0]; const auto type = graph_.valueLogicalType(id);
+            const auto& key = executionOwner(op);
+            if (type.shape.empty() || snapshotViews_.contains(id) || !localView(id, key)) continue;
+            auto value = graph_.opOperands(op)[0];
+            while (graph_.valueShape(value).empty() && localView(value, key) &&
+                   graph_.opKind(graph_.valueDef(value)) == OperationKind::kAssign) {
+                const auto input = graph_.opOperands(graph_.valueDef(value))[0];
+                if (scalarType(graph_.valueLogicalType(value)) != scalarType(type) ||
+                    scalarType(graph_.valueLogicalType(input)) != scalarType(type)) break;
+                value = input;
+            }
+            if (const auto found = snapshotViews_.find(value); found != snapshotViews_.end() && graph_.valueLogicalType(value) == type && localView(value, key)) {
+                snapshotViews_.emplace(id, found->second); identityElisions_.insert(op); changed = true;
+            }
+        }
+    }
+}
+
+void CpuStEmitContext::analyzeLeafPlans() {
+    std::unordered_set<OperationId, grh::OperationIdHash> candidates;
+    const auto dataUse = [&](OperationId op, std::size_t index) {
+        return graph_.opKind(op) != OperationKind::kMux || index != 0;
+    };
+    for (const auto root : graph_.operations()) {
+        const auto kind = graph_.opKind(root);
+        if (kind != OperationKind::kAssign && kind != OperationKind::kConcat &&
+            kind != OperationKind::kReplicate && kind != OperationKind::kMux) continue;
+        const auto results = graph_.opResults(root);
+        if (results.size() != 1 || identityElisions_.contains(root)) continue;
+        const auto target = graph_.valueLogicalType(results[0]);
+        if (target.kind != grh::ValueType::Logic || target.shape.empty() ||
+            target.width <= 64 || target.leafWidth() > 64) continue;
+        const auto& key = executionOwner(root);
+        const auto compatible = [&](const LogicalType& type) {
+            return type.kind == target.kind && type.domain == target.domain &&
+                type.width % target.leafWidth() == 0;
+        };
+        std::unordered_set<OperationId, grh::OperationIdHash> followed;
+        std::size_t nodes = 0;
+        std::function<std::optional<LeafPlan>(ValueId, std::size_t)> valuePlan;
+        std::function<std::optional<LeafPlan>(OperationId, std::size_t)> operationPlan;
+        operationPlan = [&](OperationId op, std::size_t depth) -> std::optional<LeafPlan> {
+            if (depth > 64 || ++nodes > 4096) return {};
+            const auto args = graph_.opOperands(op);
+            const auto type = graph_.valueLogicalType(graph_.opResults(op)[0]);
+            if (!compatible(type)) return {};
+            const auto kind = graph_.opKind(op);
+            if (kind == OperationKind::kAssign) {
+                if (args.size() != 1 || graph_.valueWidth(args[0]) != type.width) return {};
+                return valuePlan(args[0], depth + 1);
+            }
+            LeafPlan plan; plan.width = type.width;
+            if (kind == OperationKind::kConcat) {
+                plan.kind = LeafPlan::Kind::Concat;
+                int64_t width = 0;
+                // The last concat operand supplies the low array leaves.
+                for (std::size_t i = args.size(); i-- > 0;) {
+                    auto input = valuePlan(args[i], depth + 1);
+                    if (!input) return {};
+                    width += input->width; plan.inputs.push_back(std::move(*input));
+                }
+                if (width != type.width || plan.inputs.empty()) return {};
+            } else if (kind == OperationKind::kReplicate) {
+                if (args.size() != 1) return {};
+                auto input = valuePlan(args[0], depth + 1);
+                const auto count = sim::attribute<int64_t>(graph_, op, "rep").value_or(0);
+                if (!input || count <= 0 || type.width / count != input->width || type.width % count) return {};
+                plan.kind = LeafPlan::Kind::Repeat; plan.inputs.push_back(std::move(*input));
+            } else if (kind == OperationKind::kMux) {
+                if (args.size() != 3 || graph_.valueWidth(args[1]) != type.width || graph_.valueWidth(args[2]) != type.width) return {};
+                auto yes = valuePlan(args[1], depth + 1), no = valuePlan(args[2], depth + 1);
+                if (!yes || !no) return {};
+                plan.kind = LeafPlan::Kind::Mux; plan.source = args[0];
+                plan.inputs.push_back(std::move(*yes)); plan.inputs.push_back(std::move(*no));
+            } else return {};
+            return plan;
+        };
+        valuePlan = [&](ValueId value, std::size_t depth) -> std::optional<LeafPlan> {
+            const auto type = graph_.valueLogicalType(value);
+            if (!compatible(type)) return {};
+            if (!type.shape.empty()) {
+                if (type.leafWidth() != target.leafWidth()) return {};
+                return LeafPlan{LeafPlan::Kind::Source, value, type.width, {}};
+            }
+            const auto producer = graph_.valueDef(value);
+            const bool privateValue = producer && executionOwner(producer) == key && !storage_.contains(value) &&
+                !smallEnableBoundary_.contains(value) && !smallPayloadBoundary_.contains(value) && !graph_.valueIsOutput(value);
+            if (privateValue) {
+                auto plan = operationPlan(producer, depth);
+                if (plan) { followed.insert(producer); return plan; }
+            }
+            // Materialized scalar snapshots remain terminals; do not chase
+            // their producers or create wide right-shift loops for them.
+            if (type.width <= 64) return LeafPlan{LeafPlan::Kind::Source, value, type.width, {}};
+            return {};
+        };
+        auto plan = operationPlan(root, 0);
+        if (!plan || plan->kind == LeafPlan::Kind::Source) continue;
+        leafPlans_.emplace(root, std::move(*plan));
+        candidates.insert(followed.begin(), followed.end());
+    }
+    // One target may expand a private scalar while another leaf width must
+    // read its materialized value. Pin every terminal in the final plans,
+    // including mux controls; a successful root alone is not use coverage.
+    std::unordered_set<OperationId, grh::OperationIdHash> materialized;
+    const auto retain = [&](auto&& self, const LeafPlan& plan) -> void {
+        if (plan.source) materialized.insert(graph_.valueDef(plan.source));
+        for (const auto& input : plan.inputs) self(self, input);
+    };
+    for (const auto& [op, plan] : leafPlans_) retain(retain, plan);
+    // A mux condition is still read at the consumer. Only data operands of
+    // a planned root or an already eliminated private node are covered.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto op : candidates) {
+            if (leafElisions_.contains(op) || materialized.contains(op)) continue;
+            const auto users = graph_.valueUsers(graph_.opResults(op)[0]);
+            if (users.empty()) continue;
+            bool dead = true;
+            for (const auto& use : users)
+                dead &= executionOwner(use.operation) == executionOwner(op) && dataUse(use.operation, use.operandIndex) &&
+                    (leafPlans_.contains(use.operation) || leafElisions_.contains(use.operation));
+            if (dead) { leafElisions_.insert(op); changed = true; }
+        }
+    }
+}
+
+void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& destination, const LogicalType& target,
+                                const LeafPlan& plan, const std::string& offset) {
+    const auto leaf = leafType(target);
+    const auto count = plan.width / leaf.width;
+    if (plan.kind == LeafPlan::Kind::Source) {
+        const auto type = graph_.valueLogicalType(plan.source);
+        const auto source = read(plan.source);
+        const auto i = temporary("std::size_t");
+        const auto value = type.shape.empty() ?
+            "(static_cast<std::uint64_t>(" + clean(source, type) + ") >> (" + i + " * " + std::to_string(leaf.width) + "))" :
+            clean(row(source, type.shape, i), leafType(type));
+        code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", {
+            Code::line(row(destination, target.shape, "(" + offset + "+" + i + ")") + " = " + clean(value, leaf) + ";")
+        }));
+    } else if (plan.kind == LeafPlan::Kind::Concat) {
+        int64_t first = 0;
+        for (const auto& input : plan.inputs) {
+            emitLeaves(code, destination, target, input, "(" + offset + "+" + std::to_string(first) + ")");
+            first += input.width / leaf.width;
+        }
+    } else if (plan.kind == LeafPlan::Kind::Repeat) {
+        const auto i = temporary("std::size_t");
+        std::vector<Code> body;
+        emitLeaves(body, destination, target, plan.inputs[0], "(" + offset + "+" + i + "*" + std::to_string(plan.inputs[0].width / leaf.width) + ")");
+        code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(plan.width / plan.inputs[0].width) + "; ++" + i + ")", std::move(body)));
+    } else {
+        const auto condition = temporary("bool");
+        code.push_back(Code::line(condition + " = static_cast<bool>(" + read(plan.source) + ");"));
+        std::vector<Code> yes, no;
+        emitLeaves(yes, destination, target, plan.inputs[0], offset);
+        emitLeaves(no, destination, target, plan.inputs[1], offset);
+        // Each branch is a standalone statement, including when the text
+        // writer moves them to separate bounded helpers. Sample once.
+        code.push_back(Code::block("if (" + condition + ")", std::move(yes)));
+        code.push_back(Code::block("if (!" + condition + ")", std::move(no)));
     }
 }
 
@@ -518,13 +883,16 @@ bool CpuStEmitContext::viewOnly(ValueId value) {
 }
 
 void CpuStEmitContext::activate(std::vector<Code>& code, const std::set<std::size_t>& destinations, std::optional<std::size_t> current) {
+    std::map<std::pair<bool, std::size_t>, std::uint32_t> masks;
     for (const auto target : destinations) {
         const bool next = current && target <= *current;
-        const auto flags = next ? "activeNext" : "activeCurrent";
-        const auto word = target / 8;
-        const auto bit = target % 8;
+        masks[{next, target / 8}] |= std::uint32_t{1} << (target % 8);
+    }
+    for (const auto& [key, mask] : masks) {
+        const auto flags = key.first ? "activeNext" : "activeCurrent";
+        const auto word = key.second;
         code.push_back(Code::line(std::string(flags) + "[" + std::to_string(word) + "] |= UINT8_C(" +
-            std::to_string(std::uint32_t{1} << bit) + ");"));
+            std::to_string(mask) + ");"));
     }
 }
 
@@ -533,13 +901,64 @@ void CpuStEmitContext::markState(std::vector<Code>& code, OperationId state) {
     code.push_back(Code::line("dirtyStateFlags[" + std::to_string(ordinal / 8) + "] |= UINT8_C(" +
         std::to_string(std::uint32_t{1} << (ordinal % 8)) + ");"));
 }
+void CpuStEmitContext::touchState(std::vector<Code>& code, OperationId state, const std::string& start, int64_t count) {
+    if (!indexedStates_.contains(state)) return;
+    const auto touched = fieldRef("memoryTouchedStore", name(state));
+    if (start == "0" && count == indexedStates_.at(state).cells)
+        code.push_back(Code::line(touched + ".fill(~UINT64_C(0));"));
+    else if (count == 1)
+        code.push_back(Code::line(touched + "[(" + start + ") / 64] |= UINT64_C(1) << ((" + start + ") % 64);"));
+    else code.push_back(Code::line("memory_touch_range(" + touched + ".data(), " + start + ", " + std::to_string(count) + ");"));
+}
+void CpuStEmitContext::activateState(std::vector<Code>& code, OperationId state) {
+    const auto found = indexedStates_.find(state);
+    if (found == indexedStates_.end()) {
+        activate(code, stateFanout_[state], std::numeric_limits<std::size_t>::max());
+        return;
+    }
+    const auto& plan = found->second;
+    activate(code, plan.fullFanout, std::numeric_limits<std::size_t>::max());
+    const auto touched = fieldRef("memoryTouchedStore", name(state));
+    for (const auto& [owner, reads] : plan.readers) {
+        std::string condition;
+        for (const auto read : reads) {
+            if (!condition.empty()) condition += " || ";
+            const auto start = fieldRef("memoryReadIndexStore", "r" + std::to_string(read.index));
+            const auto cells = std::to_string(plan.cells);
+            if (indexedReads_.at(read).count == 1)
+                condition += "(" + start + " > " + cells + " || (" + start + " < " + cells + " && (" + touched +
+                    "[" + start + " / 64] & (UINT64_C(1) << (" + start + " % 64)))))";
+            else condition += "memory_read_touched(" + touched + ".data(), " + start + ", " +
+                std::to_string(indexedReads_.at(read).count) + ", " + cells + ")";
+        }
+        std::vector<Code> hit;
+        activate(hit, {owner}, std::numeric_limits<std::size_t>::max());
+        code.push_back(Code::block("if (" + condition + ")", std::move(hit)));
+    }
+}
+void CpuStEmitContext::syncSmallBoundary(std::vector<Code>& code, ValueId id, const std::string& source) {
+    const auto sync = [&](const auto& boundaries) {
+        const auto found = boundaries.find(id);
+        if (found != boundaries.end() && found->second != source)
+            copy(code, found->second, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
+    };
+    sync(smallEnableBoundary_);
+    sync(smallPayloadBoundary_);
+    if (const auto found = smallEnableOrdinal_.find(id); found != smallEnableOrdinal_.end()) {
+        const auto bit = found->second;
+        const auto word = "smallSinkEnableBoundaryStore.words[" + std::to_string(bit / 64) + "]";
+        const auto mask = "(UINT64_C(1)<<" + std::to_string(bit % 64) + ")";
+        code.push_back(Code::line(word + " = (" + word + " & ~" + mask + ") | (static_cast<std::uint64_t>(" + source + ") << " + std::to_string(bit % 64) + ");"));
+    }
+}
 void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::string& source) {
-    const auto destination = read(id);
+    const auto destination = storage_.contains(id) ? storage_.at(id) : read(id);
     if (!storage_.contains(id)) { copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id)); return; }
     if (owner_ == Key{"event"} && sim::isFire(graph_, id)) {
         // An event pulse activates its consumers when asserted, including
         // consecutive asserted rounds. Clearing it is not a data change.
         copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
+        syncSmallBoundary(code, id, destination);
         std::vector<Code> triggered;
         activate(triggered, fanout_[id]);
         if (!triggered.empty()) code.push_back(Code::block("if (" + source + ")", std::move(triggered)));
@@ -547,6 +966,7 @@ void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::s
     }
     std::vector<Code> changed;
     copy(changed, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
+    syncSmallBoundary(changed, id, destination);
     activate(changed, fanout_[id], ordinal_.contains(owner_) ? std::optional(ordinal_.at(owner_)) : std::nullopt);
     code.push_back(Code::block("if (" + destination + " != " + source + ")", std::move(changed)));
 }
@@ -585,6 +1005,13 @@ std::string CpuStEmitContext::pack(std::vector<Code>& code, const std::string& s
 std::string CpuStEmitContext::packed(ValueId id, std::vector<Code>& code) {
     const auto type = graph_.valueLogicalType(id);
     if (type.shape.empty()) return read(id);
+    const auto producer = graph_.valueDef(id);
+    if (type.kind == grh::ValueType::Logic && producer && graph_.opKind(producer) == OperationKind::kConstant) {
+        auto packedType = scalarType(type); packedType.isSigned = false;
+        // Constants are immutable; concatenating their cleaned leaf patterns
+        // is their original normalized bit pattern, with no signed host cast.
+        return literal(bits(attr(producer, "constValue"), type.width, type.isSigned), packedType);
+    }
     if (const auto found = packedNames_.find(id); found != packedNames_.end()) return found->second;
     // A value can be packed independently in several static sink runs.  The
     // runs may later be grouped into one writer batch, so value-id-only names
@@ -633,6 +1060,49 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
     const auto t = [&](std::size_t i) { return scalarType(graph_.valueLogicalType(args[i])); };
     const auto c = [&](std::size_t i) { return convert(a(i), t(i), type); };
     const auto number = [&](std::string_view name) { return sim::attribute<int64_t>(graph_, op, name).value(); };
+    const auto staticSlice = [&](ValueId value, int64_t offset, int64_t width) -> std::optional<std::string> {
+        const auto sourceType = graph_.valueLogicalType(value);
+        if (sourceType.kind != grh::ValueType::Logic || offset < 0 || width <= 0 ||
+            width > sourceType.width || offset > sourceType.width - width) return std::nullopt;
+        const auto leaf = leafType(sourceType);
+        const auto start = sourceType.shape.empty() ? offset : offset % leaf.width;
+        // Large bit arrays retain the compact pack route rather than emit
+        // thousands of repeated leaf expressions for a whole-array window.
+        constexpr int64_t maxWindowLeaves = 32;
+        if (!sourceType.shape.empty() &&
+            (offset + width - 1) / leaf.width - offset / leaf.width >= maxWindowLeaves) return std::nullopt;
+        auto target = scalarType(sourceType); target.width = width; target.isSigned = false;
+        const auto saved = read(value);
+        const auto fragment = [&](int64_t index, int64_t shift) {
+            const auto source = sourceType.shape.empty() ? saved :
+                row(saved, sourceType.shape, std::to_string(index));
+            return "(static_cast<" + unsignedType(leaf.width) + ">(" + clean(source, leaf) +
+                ") >> " + std::to_string(shift) + ")";
+        };
+        // Array row zero contains the least significant leaf. Keep the saved
+        // view and mask each leaf's semantic width before an unsigned shift.
+        if (width <= leaf.width - start) return clean(fragment(offset / leaf.width, start), target);
+        std::vector<std::string> pieces;
+        const auto container = unsignedType(std::max<int64_t>(64, width));
+        for (int64_t consumed = 0; consumed < width;) {
+            const auto position = offset + consumed;
+            const auto shift = position % leaf.width;
+            auto piece = "static_cast<" + container + ">(" + fragment(position / leaf.width, shift) + ")";
+            if (consumed) piece = "(" + piece + " << " + std::to_string(consumed) + ")";
+            pieces.push_back(std::move(piece));
+            consumed += std::min(width - consumed, leaf.width - shift);
+        }
+        // Balance the expression without allocating a source-width packed
+        // temporary. Only the leaves intersecting the requested window load.
+        while (pieces.size() > 1) {
+            std::vector<std::string> merged;
+            for (std::size_t i = 0; i < pieces.size(); i += 2)
+                merged.push_back(i + 1 == pieces.size() ? std::move(pieces[i]) :
+                    "(" + pieces[i] + " | " + pieces[i + 1] + ")");
+            pieces = std::move(merged);
+        }
+        return clean(pieces.front(), target);
+    };
     static const std::map<OperationKind, std::string> binary{
         {OperationKind::kAdd, "+"}, {OperationKind::kSub, "-"}, {OperationKind::kMul, "*"},
         {OperationKind::kAnd, "&"}, {OperationKind::kOr, "|"}, {OperationKind::kXor, "^"},
@@ -735,8 +1205,21 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
         return terms.empty() ? "((" + unsignedType(type.width) + ")0)" : std::move(terms[0].first);
     }
     if (kind == OperationKind::kSliceStatic || kind == OperationKind::kSliceDynamic) {
+        if (kind == OperationKind::kSliceStatic && !graph_.valueLogicalType(args[0]).shape.empty())
+            if (const auto selected = staticSlice(args[0], number("sliceStart"), type.width)) return *selected;
         const auto offset = kind == OperationKind::kSliceStatic ? std::to_string(number("sliceStart")) :
             "static_cast<" + unsignedType(t(1).width) + ">(" + a(1) + ")";
+        const auto sourceType = graph_.valueLogicalType(args[0]);
+        if (kind == OperationKind::kSliceDynamic && !sourceType.shape.empty() && type.width == 1) {
+            const auto leaf = leafType(sourceType);
+            const auto index = "static_cast<std::size_t>(" + offset + ")";
+            const auto source = row(read(args[0]), sourceType.shape, "(" + index + " / " + std::to_string(leaf.width) + ")");
+            // Preserve the saved array view. Check the full-width unsigned
+            // offset before narrowing it, including the packed padding bits.
+            const auto selected = "(static_cast<" + unsignedType(leaf.width) + ">(" + clean(source, leaf) +
+                ") >> (" + index + " % " + std::to_string(leaf.width) + "))";
+            return "((" + offset + ") >= " + std::to_string(sourceType.width) + " ? 0 : (" + selected + " & 1))";
+        }
         const auto source = a(0);
         const auto container = t(0).width <= 64 ? 64 : (t(0).width + 63) / 64 * 64;
         // Narrow extraction from wide storage retains the measured aligned
@@ -751,10 +1234,12 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
         code.push_back(Code::line(accumulator + " = 0;"));
         if (const auto views = sim::attribute<std::vector<int64_t>>(graph_, op, "views")) {
             for (std::size_t i = 0; i < views->size(); i += 4) {
-                const auto control = a((*views)[i]);
-                const auto source = a((*views)[i + 2]);
-                code.push_back(Code::block("if ((" + control + " >> " + std::to_string((*views)[i + 1]) + ") & 1)", {
-                    Code::line(accumulator + " |= " + clean("(" + source + ") >> " + std::to_string((*views)[i + 3]), type) + ";")
+                const auto control = staticSlice(args[(*views)[i]], (*views)[i + 1], 1).value();
+                const auto selected = staticSlice(args[(*views)[i + 2]], (*views)[i + 3], type.width);
+                const auto source = selected ? *selected :
+                    clean("(" + a((*views)[i + 2]) + ") >> " + std::to_string((*views)[i + 3]), type);
+                code.push_back(Code::block("if (" + control + ")", {
+                    Code::line(accumulator + " |= " + source + ";")
                 }));
             }
         } else {
@@ -775,6 +1260,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     const auto kind = graph_.opKind(op);
     const auto args = graph_.opOperands(op), results = graph_.opResults(op);
     if (sim::isWriter(kind) || kind == sim::kHistoryWrite) return;
+    if (identityElisions_.contains(op) || leafElisions_.contains(op)) return;
     if (kind == OperationKind::kAssign && results.size() == 1 && viewOnly_.at(results[0])) return;
     countOperation(code, op);
     if (kind == sim::kSystemTask) { task(code, op); return; }
@@ -782,7 +1268,9 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     if (results.size() != 1) throw std::invalid_argument("CPU expects one result for compute/read operation");
     const auto id = results[0]; const auto type = graph_.valueLogicalType(id);
     const auto destination = storage_.contains(id) ? temporary(cppType(type)) : read(id);
-    if (kind == OperationKind::kConstant) {
+    if (const auto plan = leafPlans_.find(op); plan != leafPlans_.end()) {
+        emitLeaves(code, destination, type, plan->second);
+    } else if (kind == OperationKind::kConstant) {
         if (type.kind == grh::ValueType::String) code.push_back(Code::line(destination + " = " + quote(attr(op, "constValue")) + ";"));
         else if (type.kind == grh::ValueType::Real) {
                 const auto raw = graph_.getOperation(op).attr("constValue");
@@ -818,16 +1306,27 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         const auto state = graph_.findOperation(attr(op, kind == OperationKind::kLatchReadPort ? "latchSymbol" : "regSymbol"));
         auto sourceType = grh::stateLogicalType(graph_, state);
         std::string source = stateRef(state), condition = "true";
+        const auto subscription = indexedReads_.find(op);
+        std::string flatStart = "0";
+        int64_t stride = sourceType.width / sourceType.leafWidth();
         for (std::size_t i = 0; i < args.size(); ++i) {
             const auto index = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + read(args[i]) + ")";
             condition += " && " + index + " < " + std::to_string(sourceType.shape[i]);
             source += "[static_cast<std::size_t>(" + index + ")]";
+            stride /= sourceType.shape[i];
+            if (subscription != indexedReads_.end())
+                flatStart += " + static_cast<std::size_t>(" + index + ") * " + std::to_string(stride);
         }
         for (std::size_t i = 0; i < args.size(); ++i) sourceType.width /= sourceType.shape[i];
         sourceType.shape.erase(sourceType.shape.begin(), sourceType.shape.begin() + args.size());
         if (!args.empty()) {
             code.push_back(Code::line(destination + " = {};"));
             std::vector<Code> valid; copy(valid, destination, type, source, sourceType);
+            if (subscription != indexedReads_.end()) {
+                const auto slot = fieldRef("memoryReadIndexStore", "r" + std::to_string(op.index));
+                code.push_back(Code::line(slot + " = " + std::to_string(indexedStates_.at(state).cells) + ";"));
+                valid.push_back(Code::line(slot + " = " + flatStart + ";"));
+            }
             code.push_back(Code::block("if (" + condition + ")", std::move(valid)));
         } else copy(code, destination, type, source, sourceType);
     } else if (kind == OperationKind::kSliceArray) {
@@ -915,7 +1414,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         return;
     }
     const auto value = [&](std::size_t i) {
-        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", "w" + std::to_string(op.index) + "_" + std::to_string(i)) : read(args[i]);
+        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", "w" + std::to_string(op.index) + "_" + std::to_string(i)) : read(args[i], true);
     };
     std::string condition = inPlace ? enableSlot : latch ? read(args[0]) : "(" + read(args[0]) + " && " + read(args[1]) + ")";
     std::string start = "0";
@@ -951,6 +1450,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
             whole.push_back(Code::line(wholeDestination + " = " + data + ";"));
             markState(whole, state);
         } else if (writeActivation(state)) {
+            touchState(whole, state, "0", type.width / type.leafWidth());
             whole.push_back(Code::line(fieldRef("largeBeforeStore", name(state)) + " = true;"));
             whole.push_back(Code::line(wholeDestination + " = " + data + ";"));
             markState(whole, state);
@@ -997,6 +1497,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         write.push_back(Code::line(destination + " = " + changed + ";"));
         markState(write, state);
     }
+    if (inPlace && writeActivation(state)) touchState(body, state, start, count);
     body.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", std::move(write)));
     code.push_back(Code::block("if (" + condition + ")", std::move(body)));
 }
@@ -1095,6 +1596,7 @@ void CpuStEmitContext::buildPhases() {
             }
             const auto destination = read(port.value);
             std::vector<Code> changed{Code::line(destination + " = " + incoming + ";")};
+            syncSmallBoundary(changed, port.value, destination);
             activate(changed, fanout_[port.value]);
             code.push_back(Code::block("if (" + destination + " != " + incoming + ")", std::move(changed)));
         }
@@ -1167,23 +1669,62 @@ void CpuStEmitContext::buildPhases() {
     }
     std::map<Key, const sim::SinkGroup*> sinkGroups;
     for (const auto& group : schedule_.sinkGroups) sinkGroups.emplace(group.partitionKey, &group);
+    const auto smallEnableBit = [&](OperationId writerOp, const Key& key) -> std::optional<std::size_t> {
+        if (key[1] != "small-sink") return {};
+        const auto args = graph_.opOperands(writerOp);
+        const auto enable = args[graph_.opKind(writerOp) == sim::kLatchWrite ? 0 : 1];
+        const auto found = smallEnableOrdinal_.find(enable);
+        const auto producer = graph_.valueDef(enable);
+        if (found == smallEnableOrdinal_.end() || (producer && executionOwner(producer) == key)) return {};
+        return found->second;
+    };
+    const auto smallEnableProbe = [](const std::map<std::size_t, std::uint64_t>& masks) {
+        std::string result;
+        for (const auto& [word, mask] : masks) {
+            if (!result.empty()) result += " | ";
+            result += "(smallSinkEnableBoundaryStore.words[" + std::to_string(word) +
+                "] & UINT64_C(" + std::to_string(mask) + "))";
+        }
+        return "(" + result + ")";
+    };
     constexpr std::size_t runBatchSize = 128;
     std::size_t batchIndex = 0, batchRuns = 0;
     Function runBatch{"writer_run_batch0"};
     runBatch.zeroInitializeLocals = false;
     std::vector<std::string> writerBatchNames;
+    std::set<std::string> batchFires;
+    bool batchUnclocked = false;
     const auto finishBatch = [&] {
         if (batchRuns == 0) return;
+        // Check stable event pulses before entering split writer helpers. A
+        // guard inside every helper still fetches all of those helpers on
+        // falling edges and NBA settling rounds. Never hoist payload enables:
+        // an earlier run may publish a boundary read by a later run.
+        if (!batchUnclocked) {
+            std::string condition;
+            for (const auto& fire : batchFires)
+                condition += std::string(condition.empty() ? "" : " || ") + "(" + fire + ")";
+            std::vector<Code> guarded;
+            guarded.push_back(Code::block("if (" + condition + ")", std::move(runBatch.body)));
+            runBatch.body = std::move(guarded);
+        }
         const auto batchName = runBatch.name;
         addFunction(std::move(runBatch));
         writerBatchNames.push_back(batchName);
         ++batchIndex;
         batchRuns = 0;
+        batchFires.clear();
+        batchUnclocked = false;
         runBatch = Function{"writer_run_batch" + std::to_string(batchIndex)};
         runBatch.zeroInitializeLocals = false;
     };
     for (std::size_t index = 0; index < schedule_.generalRuns.size(); ++index) {
         const auto& run = schedule_.generalRuns[index];
+        const auto batchFire = sinkGroups.at(run.partitionKey)->fire;
+        const auto batchFireExpression = batchFire ? fireExpression(batchFire) : std::string{};
+        if (batchFires.size() == 16 && batchFire && !batchFires.contains(batchFireExpression)) finishBatch();
+        if (batchFire) batchFires.insert(batchFireExpression);
+        else batchUnclocked = true;
         Function runFunction{"writer_run" + std::to_string(index)};
         runFunction.zeroInitializeLocals = false;
         bool hasObservedPayload = false;
@@ -1204,21 +1745,27 @@ void CpuStEmitContext::buildPhases() {
                 for (const auto value : graph_.opOperands(writerOp)) visit(value);
             std::vector<Code> enabled;
             const auto ordered = topological(cone);
-            struct Demand { ValueId enable; bool unconditional = false; };
+            using EnableSet = std::map<uint32_t, ValueId>;
+            struct Demand { EnableSet enables; bool unconditional = false; };
             std::unordered_map<OperationId, Demand, grh::OperationIdHash> demand;
             for (const auto op : ordered) demand.emplace(op, Demand{});
-            const auto require = [&](ValueId value, ValueId enable, bool unconditional) {
+            const auto require = [&](ValueId value, const Demand& needed) {
                 const auto found = demand.find(graph_.valueDef(value));
                 if (found == demand.end()) return;
                 auto& target = found->second;
-                target.unconditional |= unconditional || (target.enable && target.enable != enable);
-                if (!target.enable) target.enable = enable;
+                target.unconditional |= needed.unconditional;
+                target.enables.insert(needed.enables.begin(), needed.enables.end());
             };
             for (const auto writerOp : run.orderedWriters) {
                 const auto args = graph_.opOperands(writerOp);
                 const bool latch = graph_.opKind(writerOp) == sim::kLatchWrite;
                 const auto enable = args[latch ? 0 : 1];
-                for (std::size_t i = 0; i < args.size(); ++i) require(args[i], enable, i < (latch ? 1u : 2u));
+                for (std::size_t i = 0; i < args.size(); ++i) {
+                    Demand needed;
+                    needed.enables.emplace(enable.index, enable);
+                    needed.unconditional = i < (latch ? 1u : 2u);
+                    require(args[i], needed);
+                }
             }
             for (auto it = ordered.rbegin(); it != ordered.rend(); ++it) {
                 auto& needed = demand.at(*it);
@@ -1227,35 +1774,69 @@ void CpuStEmitContext::buildPhases() {
                     needed.unconditional |= observed;
                     hasObservedPayload |= observed;
                 }
-                if (!needed.enable) needed.unconditional = true;
-                for (const auto value : graph_.opOperands(*it)) require(value, needed.enable, needed.unconditional);
+                if (needed.enables.empty()) needed.unconditional = true;
+                for (const auto value : graph_.opOperands(*it)) require(value, needed);
             }
-            std::unordered_map<ValueId, std::vector<OperationId>, grh::ValueIdHash> privateCones;
             for (const auto op : ordered) {
                 const auto& needed = demand.at(op);
                 if (needed.unconditional) operation(enabled, op);
-                else privateCones[needed.enable].push_back(op);
             }
             const auto unconditionalPacked = packed_;
+            const auto unconditionalPackedNames = packedNames_;
+            EnableSet payloadEnables;
+            std::vector<Code> sharedPayload;
+            const auto flushPayload = [&] {
+                if (sharedPayload.empty()) return;
+                std::string condition;
+                for (const auto& [index, enable] : payloadEnables)
+                    condition += (condition.empty() ? "" : " || ") + read(enable);
+                enabled.push_back(Code::block("if (" + condition + ")", std::move(sharedPayload)));
+                sharedPayload.clear();
+            };
+            // Demand flows backwards, so every producer's guard contains its
+            // consumer's guards. Keep forward order and guard-local packing.
+            for (const auto op : ordered) {
+                const auto& needed = demand.at(op);
+                if (needed.unconditional) { flushPayload(); continue; }
+                if (needed.enables != payloadEnables) flushPayload();
+                if (sharedPayload.empty()) {
+                    payloadEnables = needed.enables;
+                    packed_ = unconditionalPacked;
+                    packedNames_ = unconditionalPackedNames;
+                }
+                operation(sharedPayload, op);
+            }
+            flushPayload();
+            std::vector<Code> segment;
+            std::map<std::size_t, std::uint64_t> segmentMasks;
+            const auto flushSegment = [&] {
+                if (segment.empty()) return;
+                enabled.push_back(Code::block("if (" + smallEnableProbe(segmentMasks) + ")", std::move(segment)));
+                segment.clear(); segmentMasks.clear();
+            };
             for (const auto writerOp : run.orderedWriters) {
                 packed_ = unconditionalPacked;
+                packedNames_ = unconditionalPackedNames;
                 const auto args = graph_.opOperands(writerOp);
                 const auto enable = args[graph_.opKind(writerOp) == sim::kLatchWrite ? 0 : 1];
+                const auto bit = smallEnableBit(writerOp, run.partitionKey);
+                // Keep probes bounded and never bridge a constant or a local
+                // enable. In particular A/B/A priority runs stay A/B/A.
+                if (!bit || (!segmentMasks.contains(*bit / 64) && segmentMasks.size() == 8)) flushSegment();
+                auto& target = bit ? segment : enabled;
+                if (bit) segmentMasks[*bit / 64] |= std::uint64_t{1} << (*bit % 64);
                 std::vector<Code> payload;
-                if (const auto found = privateCones.find(enable); found != privateCones.end()) {
-                    for (const auto op : found->second) operation(payload, op);
-                    privateCones.erase(found);
-                }
                 writer(payload, writerOp, false);
                 if (std::find(group.guards.begin(), group.guards.end(), enable) != group.guards.end()) {
-                    enabled.insert(enabled.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
+                    target.insert(target.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
                     continue;
                 }
                 const auto condition = "if (" + read(enable) + ")";
-                if (!enabled.empty() && enabled.back().scope && enabled.back().text == condition)
-                    enabled.back().body.insert(enabled.back().body.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
-                else enabled.push_back(Code::block(condition, std::move(payload)));
+                if (!target.empty() && target.back().scope && target.back().text == condition)
+                    target.back().body.insert(target.back().body.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
+                else target.push_back(Code::block(condition, std::move(payload)));
             }
+            flushSegment();
             if (group.guards.empty()) code.insert(code.end(), std::make_move_iterator(enabled.begin()), std::make_move_iterator(enabled.end()));
             else {
                 std::string condition;
@@ -1273,6 +1854,16 @@ void CpuStEmitContext::buildPhases() {
             const auto producer = graph_.valueDef(value);
             return storage_.contains(value) && (!producer || executionOwner(producer) != run.partitionKey);
         };
+        if (!hasObservedPayload && run.partitionKey[1] == "small-sink") {
+            std::map<std::size_t, std::uint64_t> masks;
+            bool eligible = true;
+            for (const auto writerOp : run.orderedWriters) {
+                const auto bit = smallEnableBit(writerOp, run.partitionKey);
+                if (!bit) { eligible = false; break; }
+                masks[*bit / 64] |= std::uint64_t{1} << (*bit % 64);
+            }
+            if (eligible && masks.size() <= 8) guard += (guard.empty() ? "" : " && ") + smallEnableProbe(masks);
+        }
         if (std::all_of(group.guards.begin(), group.guards.end(), boundaryGuard))
             for (const auto value : group.guards) guard += (guard.empty() ? "" : " && ") + storage_.at(value);
         if (group.guards.empty() && !hasObservedPayload) {
@@ -1283,6 +1874,42 @@ void CpuStEmitContext::buildPhases() {
             if (boundaryGuard(enable) && std::all_of(run.orderedWriters.begin(), run.orderedWriters.end(),
                     [&](OperationId writer) { return enableOf(writer) == enable; }))
                 guard += (guard.empty() ? "" : " && ") + storage_.at(enable);
+            else {
+                // Distinct local enables often share a cheap boundary gate:
+                // gate & wide_bits[index]. Probe their common bool factors
+                // before evaluating any private enable or payload cone. Keep
+                // the probe at this run's original position so earlier runs
+                // can still publish boundary values used by a later run.
+                const auto factors = [&](ValueId root) {
+                    std::map<uint32_t, ValueId> result;
+                    std::set<uint32_t> seen;
+                    const auto visitFactor = [&](auto&& self, ValueId value) -> void {
+                        const auto type = graph_.valueLogicalType(value);
+                        if (type.kind != grh::ValueType::Logic || type.domain != grh::LogicDomain::TwoState ||
+                            type.width != 1 || !type.shape.empty() || !seen.insert(value.index).second) return;
+                        const auto producer = graph_.valueDef(value);
+                        if (producer && graph_.opKind(producer) == OperationKind::kConstant) return;
+                        if (boundaryGuard(value)) {
+                            result.emplace(value.index, value);
+                            return;
+                        }
+                        if (!producer || executionOwner(producer) != run.partitionKey) return;
+                        const auto kind = graph_.opKind(producer);
+                        if (kind != OperationKind::kAnd && kind != OperationKind::kLogicAnd &&
+                            kind != OperationKind::kAssign) return;
+                        for (const auto value : graph_.opOperands(producer)) self(self, value);
+                    };
+                    visitFactor(visitFactor, root);
+                    return result;
+                };
+                auto common = factors(enable);
+                for (std::size_t writer = 1; writer < run.orderedWriters.size() && !common.empty(); ++writer) {
+                    const auto next = factors(enableOf(run.orderedWriters[writer]));
+                    std::erase_if(common, [&](const auto& factor) { return !next.contains(factor.first); });
+                }
+                for (const auto& [index, factor] : common)
+                    guard += (guard.empty() ? "" : " && ") + storage_.at(factor);
+            }
         }
         if (guard.empty()) runBatch.body.insert(runBatch.body.end(),
             std::make_move_iterator(runBody.begin()), std::make_move_iterator(runBody.end()));
@@ -1324,18 +1951,37 @@ void CpuStEmitContext::buildPhases() {
     Function commitBatch{"commit_run_batch0"};
     commitBatch.zeroInitializeLocals = false;
     std::vector<std::string> commitBatchNames;
+    std::set<std::size_t> commitBatchWords;
     const auto finishCommitBatch = [&] {
         if (commitBatchRuns == 0) return;
+        if (enableBitmap_) {
+            std::string condition;
+            for (const auto word : commitBatchWords)
+                condition += std::string(condition.empty() ? "" : " | ") +
+                    "largeSinkEnableBoundaryStore.words[" + std::to_string(word) + "]";
+            std::vector<Code> guarded;
+            guarded.push_back(Code::block("if (" + condition + ")", std::move(commitBatch.body)));
+            commitBatch.body = std::move(guarded);
+        }
         const auto batchName = commitBatch.name;
         addFunction(std::move(commitBatch));
         commitBatchNames.push_back(batchName);
         ++commitBatchIndex;
         commitBatchRuns = 0;
+        commitBatchWords.clear();
         commitBatch = Function{"commit_run_batch" + std::to_string(commitBatchIndex)};
         commitBatch.zeroInitializeLocals = false;
     };
     for (std::size_t index = 0; index < schedule_.largeCommitRuns.size(); ++index) {
         const auto& run = schedule_.largeCommitRuns[index];
+        std::set<std::size_t> runWords;
+        for (const auto writerOp : run.orderedWriters) runWords.insert(largeWriteOrdinal_.at(writerOp) / 64);
+        if (enableBitmap_ && commitBatchRuns != 0) {
+            auto combinedWords = commitBatchWords;
+            combinedWords.insert(runWords.begin(), runWords.end());
+            if (combinedWords.size() > 8) finishCommitBatch();
+        }
+        commitBatchWords.insert(runWords.begin(), runWords.end());
         Function runFunction{"commit_run" + std::to_string(index)};
         runFunction.zeroInitializeLocals = false;
         inFunction(runFunction, run.partitionKey, [&](auto& code) {
@@ -1388,93 +2034,114 @@ void CpuStEmitContext::buildPhases() {
     addFunction(std::move(largeCommit));
 
     Function publishState{"pPublish"};
-    inFunction(publishState, {}, [&](auto& code) {
-        code.push_back(Code::line("pending_ = false;"));
-        std::vector<std::pair<std::size_t, std::vector<Code>>> dirtyCases;
-        for (const auto state : states_) {
-            const auto index = stateOrdinal_.at(state);
-            if (attr(state, "grhsim.history") == "output-end") {
-                // Keep the ordinal table dense.  Output-end history states do
-                // not publish, but their reserved bit still has to be
-                // consumed by the packed scan if a writer ever marks it.
-                dirtyCases.emplace_back(index, std::vector<Code>{Code::line(
-                    "dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
-                    std::to_string(std::uint32_t{1} << (index % 8)) + "));")});
-                continue;
-            }
-            std::vector<Code> body;
-            body.push_back(Code::line("dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
-                std::to_string(std::uint32_t{1} << (index % 8)) + "));"));
-            const bool observed = !stateFanout_[state].empty() || stateRound_.contains(state);
-            // A write-activated memory is an observable scheduling event even
-            // when this particular state currently has no value fanout.  Keep
-            // the extra fixed-point round so the activation semantics remain
-            // stable as readers are added or optimized away.
-            const bool requiresRound = observed || writeActivation(state);
-            const auto changed = [&] {
-                std::vector<Code> result{Code::line("GRHSIM_PERF_COUNT(touchedStateShadowCount);")};
-                if (requiresRound) {
-                    result.push_back(Code::line("pending_ = true;"));
-                    activate(result, stateFanout_[state], std::numeric_limits<std::size_t>::max());
+    publishState.body.push_back(Code::line("pending_ = false;"));
+    // Keep cold state-publish bodies behind a compact dirty-byte probe.
+    // Splitting one model-wide publish function otherwise calls every chunk
+    // each round, even when almost all of their state bytes are clean.
+    constexpr std::size_t publishBatchWords = 16;
+    const auto dirtyWords = (states_.size() + 7) / 8;
+    for (std::size_t firstWord = 0, batch = 0; firstWord < dirtyWords; firstWord += publishBatchWords, ++batch) {
+        const auto lastWord = std::min(dirtyWords, firstWord + publishBatchWords);
+        Function dirtyBatch{"pPublish_dirty_batch" + std::to_string(batch)};
+        dirtyBatch.zeroInitializeLocals = false;
+        inFunction(dirtyBatch, {}, [&](auto& code) {
+            std::vector<std::pair<std::size_t, std::vector<Code>>> dirtyCases;
+            for (std::size_t ordinal = firstWord * 8; ordinal < std::min(states_.size(), lastWord * 8); ++ordinal) {
+                const auto state = states_[ordinal];
+                const auto index = stateOrdinal_.at(state);
+                if (attr(state, "grhsim.history") == "output-end") {
+                    // Keep the ordinal table dense.  Output-end history states do
+                    // not publish, but their reserved bit still has to be
+                    // consumed by the packed scan if a writer ever marks it.
+                    dirtyCases.emplace_back(index, std::vector<Code>{Code::line(
+                        "dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
+                        std::to_string(std::uint32_t{1} << (index % 8)) + "));")});
+                    continue;
                 }
-                return result;
-            };
-            if (large(state)) {
-                const auto type = grh::stateLogicalType(graph_, state);
-                const auto before = fieldRef("largeBeforeStore", name(state));
-                if (writeActivation(state)) {
-                    body.push_back(Code::block("if (" + before + ")", changed()));
-                    body.push_back(Code::line(before + " = false;"));
-                } else {
-                    if (wholeArrayStates_.contains(state)) {
-                        const auto wholeBefore = fieldRef("largeWholeBeforeStore", name(state));
-                        const auto wholeDirty = fieldRef("largeWholeDirtyStore", name(state));
-                        body.push_back(Code::block("if (" + wholeDirty + ")", {
-                            Code::block("if (" + stateRef(state) + " != " + wholeBefore + ")", changed()),
-                            Code::line(wholeDirty + " = false;")
-                        }));
+                std::vector<Code> body;
+                body.push_back(Code::line("dirtyStateFlags[" + std::to_string(index / 8) + "] &= static_cast<std::uint8_t>(~UINT8_C(" +
+                    std::to_string(std::uint32_t{1} << (index % 8)) + "));"));
+                const bool observed = !stateFanout_[state].empty() || stateRound_.contains(state);
+                // A write-activated memory is an observable scheduling event even
+                // when this particular state currently has no value fanout.  Keep
+                // the extra fixed-point round so the activation semantics remain
+                // stable as readers are added or optimized away.
+                const bool requiresRound = observed || writeActivation(state);
+                const auto changed = [&] {
+                    std::vector<Code> result{Code::line("GRHSIM_PERF_COUNT(touchedStateShadowCount);")};
+                    if (requiresRound) {
+                        result.push_back(Code::line("pending_ = true;"));
+                        activateState(result, state);
                     }
-                    const auto iterator = temporary("std::map<std::size_t," + cppType(leafType(type)) + ">::const_iterator");
-                    const auto cell = type.shape.empty() ? stateRef(state) : row(stateRef(state), type.shape, iterator + "->first");
-                    body.push_back(Code::block("for (" + iterator + " = " + before + ".begin(); " + iterator + " != " + before + ".end(); ++" + iterator + ")", {
-                        Code::block("if (" + cell + " != " + iterator + "->second)", changed())
-                    }));
-                    body.push_back(Code::line(before + ".clear();"));
+                    return result;
+                };
+                if (large(state)) {
+                    const auto type = grh::stateLogicalType(graph_, state);
+                    const auto before = fieldRef("largeBeforeStore", name(state));
+                    if (writeActivation(state)) {
+                        body.push_back(Code::block("if (" + before + ")", changed()));
+                        body.push_back(Code::line(before + " = false;"));
+                        if (indexedStates_.contains(state))
+                            body.push_back(Code::line(fieldRef("memoryTouchedStore", name(state)) + ".fill(0);"));
+                    } else {
+                        if (wholeArrayStates_.contains(state)) {
+                            const auto wholeBefore = fieldRef("largeWholeBeforeStore", name(state));
+                            const auto wholeDirty = fieldRef("largeWholeDirtyStore", name(state));
+                            body.push_back(Code::block("if (" + wholeDirty + ")", {
+                                Code::block("if (" + stateRef(state) + " != " + wholeBefore + ")", changed()),
+                                Code::line(wholeDirty + " = false;")
+                            }));
+                        }
+                        const auto iterator = temporary("std::map<std::size_t," + cppType(leafType(type)) + ">::const_iterator");
+                        const auto cell = type.shape.empty() ? stateRef(state) : row(stateRef(state), type.shape, iterator + "->first");
+                        body.push_back(Code::block("for (" + iterator + " = " + before + ".begin(); " + iterator + " != " + before + ".end(); ++" + iterator + ")", {
+                            Code::block("if (" + cell + " != " + iterator + "->second)", changed())
+                        }));
+                        body.push_back(Code::line(before + ".clear();"));
+                    }
+                } else {
+                    auto stateChanged = changed();
+                    stateChanged.push_back(Code::line(stateRef(state) + " = " + nextStateRef(state) + ";"));
+                    body.push_back(Code::block("if (" + stateRef(state) + " != " + nextStateRef(state) + ")", std::move(stateChanged)));
                 }
-            } else {
-                auto stateChanged = changed();
-                stateChanged.push_back(Code::line(stateRef(state) + " = " + nextStateRef(state) + ";"));
-                body.push_back(Code::block("if (" + stateRef(state) + " != " + nextStateRef(state) + ")", std::move(stateChanged)));
+                dirtyCases.emplace_back(index, std::move(body));
             }
-            dirtyCases.emplace_back(index, std::move(body));
-        }
-        // State dirty bits use the same flag-only discipline as gsim's
-        // activity bitmap.  Writers set a bit; publish scans packed bytes and
-        // clears each bit before publishing it.  There is no side queue whose
-        // ordering could diverge from the static state ordinal order.
-        const auto dirtyWords = std::max<std::size_t>(1, (states_.size() + 7) / 8);
-        for (std::size_t word = 0; word < dirtyWords; ++word) {
-            std::vector<Code> wordBody;
-            const auto begin = word * 8;
-            const auto end = std::min(states_.size(), begin + 8);
-            for (std::size_t ordinal = begin; ordinal < end; ++ordinal) {
-                auto body = std::move(dirtyCases[ordinal].second);
-                const auto bit = std::uint32_t{1} << (ordinal % 8);
-                wordBody.push_back(Code::block("if (dirtyStateFlags[" + std::to_string(word) + "] & UINT8_C(" +
-                    std::to_string(bit) + "))", std::move(body)));
+            // State dirty bits use the same flag-only discipline as gsim's
+            // activity bitmap.  Writers set a bit; publish scans packed bytes and
+            // clears each bit before publishing it.  There is no side queue whose
+            // ordering could diverge from the static state ordinal order.
+            for (std::size_t word = firstWord; word < lastWord; ++word) {
+                std::vector<Code> wordBody;
+                const auto begin = word * 8;
+                const auto end = std::min(states_.size(), begin + 8);
+                for (std::size_t ordinal = begin; ordinal < end; ++ordinal) {
+                    auto body = std::move(dirtyCases[ordinal - firstWord * 8].second);
+                    const auto bit = std::uint32_t{1} << (ordinal % 8);
+                    wordBody.push_back(Code::block("if (dirtyStateFlags[" + std::to_string(word) + "] & UINT8_C(" +
+                        std::to_string(bit) + "))", std::move(body)));
+                }
+                code.push_back(Code::block("if (dirtyStateFlags[" + std::to_string(word) + "])" , std::move(wordBody)));
             }
-            code.push_back(Code::block("if (dirtyStateFlags[" + std::to_string(word) + "])" , std::move(wordBody)));
+        });
+        const auto batchName = dirtyBatch.name;
+        addFunction(std::move(dirtyBatch));
+        std::string probe;
+        for (std::size_t word = firstWord; word < lastWord; ++word) {
+            if (!probe.empty()) probe += " | ";
+            probe += "dirtyStateFlags[" + std::to_string(word) + "]";
         }
-        // pGeneral consumes all current activity bits.  Move the deferred
-        // bitmap into the next round and leave its source clear.  The byte
-        // scan keeps this transfer proportional to the bitmap words and does
-        // not construct an activation queue.
-        code.push_back(Code::block("for (std::size_t activeWord = 0; activeWord < activeCurrent.size(); ++activeWord)", {
-            Code::line("activeCurrent[activeWord] = activeNext[activeWord];"),
-            Code::line("activeNext[activeWord] = 0;"),
-            Code::line("pending_ |= activeCurrent[activeWord] != 0;")
-        }));
-    }); addFunction(std::move(publishState));
+        publishState.body.push_back(Code::block("if (" + probe + ")", {Code::line(batchName + "();")}));
+    }
+    // pGeneral consumes all current activity bits.  Move the deferred
+    // bitmap into the next round and leave its source clear.  The byte
+    // scan keeps this transfer proportional to the bitmap words and does
+    // not construct an activation queue.
+    publishState.body.push_back(Code::block("for (std::size_t activeWord = 0; activeWord < activeCurrent.size(); ++activeWord)", {
+        Code::line("activeCurrent[activeWord] = activeNext[activeWord];"),
+        Code::line("activeNext[activeWord] = 0;"),
+        Code::line("pending_ |= activeCurrent[activeWord] != 0;")
+    }));
+    addFunction(std::move(publishState));
 
     Function output{"pOutput"};
     inFunction(output, {"output"}, [&](auto& code) {
@@ -1564,6 +2231,9 @@ void CpuStEmitContext::buildInit() {
                 else code.push_back(Code::line("std::memset(&" + target + ", 0, sizeof(" + target + "));"));
             }
         }
+        for (const auto& [op, subscription] : indexedReads_)
+            code.push_back(Code::line(fieldRef("memoryReadIndexStore", "r" + std::to_string(op.index)) + " = " +
+                std::to_string(indexedStates_.at(subscription.state).cells + 1) + ";"));
         for (const auto state : states_) {
             const auto type = grh::stateLogicalType(graph_, state);
             const auto element = leafType(type);
@@ -1663,6 +2333,33 @@ void CpuStEmitContext::buildInit() {
 void CpuStEmitContext::buildRuntime() {
     const auto line = [](std::string text) { return Code::line(std::move(text)); };
     const auto block = [](std::string text, std::vector<Code> body) { return Code::block(std::move(text), std::move(body)); };
+    if (!indexedStates_.empty()) {
+        Function touch{"memory_touch_range", "std::uint64_t *words, std::size_t first, std::size_t count"};
+        touch.locals = {{"std::uint64_t*", "words", "{}", true}, {"std::size_t", "first", "{}", true},
+            {"std::size_t", "count", "{}", true}, {"std::size_t", "word"}, {"std::size_t", "offset"},
+            {"std::size_t", "take"}, {"std::uint64_t", "bits"}};
+        touch.body = {block("while (@count@)", {
+            line("@word@ = @first@ / 64;"), line("@offset@ = @first@ % 64;"),
+            line("@take@ = std::min<std::size_t>(@count@, 64 - @offset@);"),
+            line("@bits@ = ~UINT64_C(0) >> (64 - @take@);"),
+            line("@words@[@word@] |= @bits@ << @offset@;"),
+            line("@first@ += @take@;"), line("@count@ -= @take@;")
+        })};
+        addFunction(std::move(touch));
+        Function intersects{"memory_read_touched", "const std::uint64_t *words, std::size_t first, std::size_t count, std::size_t cells", "bool"};
+        intersects.locals = {{"const std::uint64_t*", "words", "{}", true}, {"std::size_t", "first", "{}", true},
+            {"std::size_t", "count", "{}", true}, {"std::size_t", "cells", "{}", true},
+            {"std::size_t", "word"}, {"std::size_t", "offset"}, {"std::size_t", "take"}, {"std::uint64_t", "bits"}};
+        intersects.body = {block("if (@first@ >= @cells@)", {Code::line("return @first@ > @cells@;", true)}),
+            block("while (@count@)", {
+                line("@word@ = @first@ / 64;"), line("@offset@ = @first@ % 64;"),
+                line("@take@ = std::min<std::size_t>(@count@, 64 - @offset@);"),
+                line("@bits@ = ~UINT64_C(0) >> (64 - @take@);"),
+                block("if (@words@[@word@] & (@bits@ << @offset@))", {Code::line("return true;", true)}),
+                line("@first@ += @take@;"), line("@count@ -= @take@;")
+            }), Code::line("return false;", true)};
+        addFunction(std::move(intersects));
+    }
     Function random{"random_next", "std::uint64_t &rng", "std::uint64_t"};
     random.locals = {{"std::uint64_t", "z"}};
     random.body = {line("@z@ = (rng += UINT64_C(0x9e3779b97f4a7c15));"),
@@ -2005,8 +2702,8 @@ std::string CpuStEmitContext::counterMetadata() const {
     json.endArray();
     json.writeProperty("elided_operations"); json.startArray();
     for (const auto op : graph_.operations())
-        if (graph_.opKind(op) == OperationKind::kAssign && graph_.opResults(op).size() == 1 &&
-            viewOnly_.at(graph_.opResults(op)[0]) && sim::attribute<Key>(graph_, op, sim::kPartition))
+        if ((identityElisions_.contains(op) || leafElisions_.contains(op) || (graph_.opKind(op) == OperationKind::kAssign && graph_.opResults(op).size() == 1 &&
+            viewOnly_.at(graph_.opResults(op)[0]))) && sim::attribute<Key>(graph_, op, sim::kPartition))
             json.writeValue(graph_.getOperation(op).symbolText());
     json.endArray(); json.endObject();
     return std::string(json.view());
@@ -2050,7 +2747,7 @@ std::map<std::string, std::string> CpuStEmitContext::generate() {
     for (std::size_t i = 0; i < functions_.size(); ++i) if (publicFunctions_.contains(functions_[i].name)) header << written[i].functions[0].declaration;
     header << "private:\n";
     header << "    struct TaskArg { char kind; const void *data; std::size_t bytes; std::size_t width; bool isSigned; };\n";
-    static const std::vector<std::string> stores{"smallSinkStore", "largeSinkStore", "inputStore", "nonSinkBoundaryStore", "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore", "largeSinkPayloadBoundaryStore", "prevEventStore", "eventActStore", "timeslotTriggerStore", "sampledStore", "onceStore", "largeBeforeStore", "largeWholeBeforeStore", "largeWholeDirtyStore"};
+    static const std::vector<std::string> stores{"smallSinkStore", "largeSinkStore", "inputStore", "nonSinkBoundaryStore", "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore", "largeSinkPayloadBoundaryStore", "prevEventStore", "eventActStore", "timeslotTriggerStore", "sampledStore", "onceStore", "largeBeforeStore", "largeWholeBeforeStore", "largeWholeDirtyStore", "memoryReadIndexStore", "memoryTouchedStore"};
     for (const auto& store : stores) {
         const auto layout = fieldLayouts_.find(store);
         header << (layout == fieldLayouts_.end() ? writeValueStruct(store + "Type", {}) : layout->second.declaration);

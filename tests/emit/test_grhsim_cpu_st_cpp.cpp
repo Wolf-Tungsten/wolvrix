@@ -158,7 +158,8 @@ void manualCase(Fixture& fixture, std::string label, std::size_t budget,
 // generated program is compiled/executed by the outer project Make target.
 void writeCase(Fixture& fixture, const grh::Design& reference,
                const std::vector<std::map<std::string, uint64_t>>& inputs,
-               const std::string& label, std::size_t budget, std::size_t tuBytes) {
+               const std::string& label, std::size_t budget, std::size_t tuBytes,
+               const std::map<std::string, std::string>& attributes = {}) {
     const auto path = artifact(label);
     std::filesystem::remove_all(path); std::filesystem::create_directories(path);
     emit::EmitDiagnostics diagnostics;
@@ -166,6 +167,7 @@ void writeCase(Fixture& fixture, const grh::Design& reference,
     emit::EmitOptions options;
     options.outputDir = (path / "model").string(); options.session = &fixture.session;
     options.attributes = {{"max-function-lines", std::to_string(budget)}, {"max-tu-bytes", std::to_string(tuBytes)}, {"waveform", "declared-symbols"}};
+    for (const auto& [key, value] : attributes) options.attributes[key] = value;
     const auto checkpoint = json(fixture.design);
     const auto stamp = tx::DesignStamp::capture(fixture.graph);
     const auto result = emitter.emit(fixture.design, options);
@@ -859,6 +861,503 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
     for (const auto budget : {16, 1024}) manualCase(fixture, "dpi-mixed-b" + std::to_string(budget), budget, support, body, false);
 }
 
+void testSmallSinkBoundaries() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clk = fixture.input("clk"), otherClk = fixture.input("other_clk");
+    const auto data = fixture.input("data", 8), raw = fixture.input("raw"), gate = fixture.input("gate");
+    const auto shared = fixture.compute(OperationKind::kAnd, Fixture::type(1), {raw, gate});
+    const auto one = fixture.constant(1, "1'b1"), zero = fixture.constant(1, "1'b0");
+    std::vector<grh::ValueId> enables;
+    std::vector<std::string> payloadNames;
+    const auto outputs = graph.createOperation(OperationKind::kArrayCreate);
+    for (unsigned i = 0; i < 70; ++i) {
+        const auto enable = fixture.input("enable" + std::to_string(i)); enables.push_back(enable);
+        const auto state = fixture.state("dense" + std::to_string(i), 8);
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant, "8'd" + std::to_string(i)}});
+        const auto payload = fixture.compute(OperationKind::kXor, Fixture::type(8),
+            {data, fixture.constant(8, "8'd" + std::to_string(i))});
+        payloadNames.emplace_back(graph.symbolText(graph.operationSymbol(graph.valueDef(payload))));
+        fixture.write(OperationKind::kRegisterWritePort, state, {enable, payload, clk});
+        graph.addOperand(outputs, fixture.read(state));
+    }
+    const auto result = graph.createValue(Fixture::type(560, {70}));
+    graph.addResult(outputs, result); graph.bindOutputPort("dense", result);
+    const auto makeState = [&](const std::string& name, grh::ValueId enable, grh::ValueId payload) {
+        const auto state = fixture.state(name, graph.valueWidth(payload));
+        fixture.write(OperationKind::kRegisterWritePort, state, {enable, payload, clk});
+        graph.bindOutputPort(name, fixture.read(state)); return state;
+    };
+    makeState("shared_enable", shared, data);
+    makeState("shared_payload", one, shared);
+    makeState("always_on", one, data);
+    makeState("always_off", zero, data);
+    const auto localEnable = fixture.compute(OperationKind::kEq, Fixture::type(1),
+        {data, fixture.constant(8, "8'd7")});
+    makeState("local_enable", localEnable, data);
+    const auto priority = makeState("priority", enables[0], data);
+    fixture.write(OperationKind::kRegisterWritePort, priority, {enables[1], fixture.constant(8, "8'd91"), otherClk});
+    fixture.write(OperationKind::kRegisterWritePort, priority, {shared, fixture.constant(8, "8'd173"), clk});
+    // A large consumer keeps shared in nonsink and requires its original
+    // boundary view as well as the small enable and payload views.
+    const auto large = fixture.state("large", 8192, {1024});
+    fixture.write(OperationKind::kRegisterFillPort, large, {shared, data, clk});
+    graph.bindOutputPort("large", fixture.read(large, {fixture.constant(10, "0")}));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    fixture.split();
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session);
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    require(owner(graph, graph.valueDef(shared))[1] == "nonsink" &&
+            owner(graph, graph.valueDef(localEnable))[1] == "small-sink", "Boundary test lost external/local enable cases");
+    std::string support = "#include <vector>\nstatic void setEnables(GrhSIM_top& model, unsigned selected) {\n";
+    for (unsigned i = 0; i < 70; ++i) support += "model.enable" + std::to_string(i) + " = selected == " + std::to_string(i) + ";\n";
+    support += "}\n";
+    const std::string body = R"CPP(
+for (unsigned epoch = 0; epoch < 3; ++epoch) {
+    model.init(); std::array<unsigned,70> expected{}, fires{};
+    for (unsigned i = 0; i < 70; ++i) expected[i] = i;
+    unsigned sharedValue=0, sharedPayload=0, always=0, local=0, priority=0, large=0;
+    for (unsigned step = 0; step < 96; ++step) {
+        // Keep enables/data unchanged on alternate edges. An unrelated bit
+        // in the same word must not make another writer sample its payload.
+        const unsigned selected = step % 8 < 4 ? 99 : (step / 8) % 3 == 0 ? 0 : (step / 8) % 3 == 1 ? 63 : 69;
+        setEnables(model, selected); model.raw = step % 16 >= 8; model.gate = step % 24 >= 8;
+        model.data = step < 16 ? 7 : (step / 4 * 13) & 255;
+        model.clk = step & 1; model.other_clk = step & 1; model.eval();
+        if (model.clk) {
+            if (selected < 70) { expected[selected] = model.data ^ selected; ++fires[selected]; }
+            if (model.raw && model.gate) sharedValue = large = model.data;
+            sharedPayload = model.raw && model.gate; always = model.data;
+            if (model.data == 7) local = model.data;
+            if (selected == 0) priority = model.data;
+            if (selected == 1) priority = 91;
+            if (model.raw && model.gate) priority = 173;
+        }
+        for (unsigned i = 0; i < 70; ++i) assert(model.dense[i] == expected[i]);
+        assert(model.shared_enable == sharedValue && model.shared_payload == sharedPayload);
+        assert(model.always_on == always && model.always_off == 0 && model.local_enable == local);
+        assert(model.priority == priority && model.large == large);
+    }
+    auto* stream = std::fopen("dense-counts.tsv", "w+"); assert(stream);
+    model.dump_execution_counts(stream); std::rewind(stream); char line[256];
+    assert(std::fgets(line,sizeof(line),stream)); assert(std::fgets(line,sizeof(line),stream));
+    std::vector<unsigned long long> counts;
+    while (std::fgets(line,sizeof(line),stream)) {
+        unsigned index; unsigned long long count;
+        if (std::sscanf(line,"%u\t%llu",&index,&count)!=2) break;
+        assert(index==counts.size()); counts.push_back(count);
+    }
+    std::fclose(stream);
+    for (unsigned i=0;i<70;++i) assert(counts.at(payloadSites[i])==fires[i]);
+}
+)CPP";
+    for (const auto budget : {16, 1024}) for (const auto bitmap : {"on", "off"}) {
+        const auto label = "sink-boundaries-" + std::string(bitmap) + "-b" + std::to_string(budget);
+        manualCase(fixture,label,budget,support,body,false,{{"execution-counters","on"},{"mem-enable-bitmap",bitmap}});
+        const auto modelPath = artifact(label) / "model";
+        const auto header = readFile(modelPath / "grhsim_top.hpp");
+        const auto member = "v" + std::to_string(shared.index);
+        std::string source;
+        for (const auto& entry : std::filesystem::directory_iterator(modelPath))
+            if (entry.path().extension() == ".cpp") source += readFile(entry.path());
+        for (const auto store : {"smallSinkEnableBoundaryStore","smallSinkPayloadBoundaryStore","nonSinkBoundaryStore"})
+            require(source.find(std::string(store)+"."+member)!=std::string::npos, "Missing shared boundary role: "+std::string(store));
+        require((source.find("smallSinkEnableBoundaryStore.words[1]")!=std::string::npos)==(std::string(bitmap)=="on"),
+                "Small sink bitmap did not cross its first word or honor off");
+        const std::regex probe(R"REGEX(if \(\(\(smallSinkEnableBoundaryStore\.words\[\d+\] & UINT64_C\(\d+\)\))REGEX");
+        require(std::regex_search(source,probe)==(std::string(bitmap)=="on"),
+                "Small sink boundary bits were published but not used for batch skipping");
+        if (std::string(bitmap)=="on") {
+            const auto bit=1u; // shared has ordinal zero; enable0 follows it.
+            require(source.find("if (((smallSinkEnableBoundaryStore.words[0] & UINT64_C("+
+                        std::to_string(1u<<bit)+"))))")!=std::string::npos,
+                    "Priority run probe included unrelated bits from the same word");
+        }
+        require(header.find("chunkFrame_pGeneral")==std::string::npos,"Small sink boundary introduced a General frame");
+        const auto manifest = readFile(modelPath / "manifest.json");
+        const std::regex sites(R"REGEX(\{"operation":"([^"]+)","category":"([^"]+)","function":"[^"]+"\})REGEX");
+        std::map<std::string,unsigned> ordinals; unsigned ordinal=0;
+        for (std::sregex_iterator it(manifest.begin(),manifest.end(),sites),end;it!=end;++it,++ordinal)
+            if ((*it)[2]=="operation") ordinals.emplace((*it)[1],ordinal);
+        std::string declaration="static const std::array<unsigned,70> payloadSites{";
+        for (const auto& name : payloadNames) declaration+=std::to_string(ordinals.at(name))+",";
+        declaration+="};\n";
+        auto driver=readFile(artifact(label)/"driver.cpp"); driver.insert(driver.find("int main()"),declaration);
+        std::ofstream(artifact(label)/"driver.cpp")<<driver;
+    }
+}
+
+void testSmallSinkPublishedEnables() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clk = fixture.input("clk"), enable = fixture.input("enable"), data = fixture.input("data",8);
+    const auto one = fixture.constant(1,"1'b1");
+    const auto imported = graph.createOperation(OperationKind::kDpicImport,graph.internSymbol("sink_gate"));
+    graph.setAttr(imported,"argsName",std::vector<std::string>{"enable"});
+    graph.setAttr(imported,"argsDirection",std::vector<std::string>{"input"});
+    graph.setAttr(imported,"argsWidth",std::vector<int64_t>{1});
+    graph.setAttr(imported,"argsSigned",std::vector<bool>{false});
+    graph.setAttr(imported,"hasReturn",true); graph.setAttr(imported,"returnWidth",int64_t{1});
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call,"targetImportSymbol",std::string("sink_gate"));
+    graph.addOperand(call,one); graph.addOperand(call,enable);
+    const auto sampledEnable = graph.createValue(Fixture::type(1)); graph.addResult(call,sampledEnable);
+    const auto initial = fixture.state("initial_gate",1);
+    grh::setStateInitSpec(graph,initial,{{grh::InitKind::Constant,"1'b1"}});
+    const auto initializedEnable = fixture.read(initial);
+    const auto negative = fixture.compute(OperationKind::kNot,Fixture::type(1),{enable});
+    for (const auto& [name,guard] : std::vector<std::pair<std::string,grh::ValueId>>{
+             {"sampled",sampledEnable},{"initialized",initializedEnable},{"inverted",negative}}) {
+        for (unsigned i=0;i<2;++i) {
+            const auto suffix=name+std::to_string(i);
+            const auto state=fixture.state(suffix,8);
+            grh::setStateInitSpec(graph,state,{{grh::InitKind::Constant,i?"8'd2":"8'd1"}});
+            fixture.write(OperationKind::kRegisterWritePort,state,{guard,data,clk});
+            graph.bindOutputPort(suffix,fixture.read(state));
+        }
+    }
+    run(fixture.design,"grh-to-grhsim",fixture.session); fixture.split();
+    run(fixture.design,"grhsim-partition-nonsink",fixture.session);
+    run(fixture.design,"grhsim-partition-sink",fixture.session,{"-enable-guard-min-size=2"});
+    const std::string support=R"CPP(
+extern "C" std::uint8_t sink_gate(std::uint8_t enable) { return enable; }
+)CPP";
+    const std::string body=R"CPP(
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); unsigned sampled[2]={1,2},initialized[2]={1,2},inverted[2]={1,2};
+    for(unsigned step=0;step<32;++step) {
+        // The first eval after init already has an edge. Its initialized
+        // and computed-true enables must be published before the probe.
+        model.clk=!(step&1); model.enable=step%8>=4; model.data=step*7; model.eval();
+        if(model.clk) for(unsigned i=0;i<2;++i) {
+            initialized[i]=model.data;
+            if(model.enable) sampled[i]=model.data; else inverted[i]=model.data;
+        }
+        assert(model.sampled0==sampled[0] && model.sampled1==sampled[1]);
+        assert(model.initialized0==initialized[0] && model.initialized1==initialized[1]);
+        assert(model.inverted0==inverted[0] && model.inverted1==inverted[1]);
+    }
+}
+)CPP";
+    for(const auto budget : {16,1024})
+        manualCase(fixture,"sink-published-b"+std::to_string(budget),budget,support,body,false);
+}
+
+void testSparsePhaseDispatch() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clockA = fixture.input("clock_a"), clockB = fixture.input("clock_b");
+    const auto bulk = fixture.input("bulk"), tail = fixture.input("tail");
+    const auto enableA = fixture.input("enable_a"), enableB = fixture.input("enable_b");
+    const auto gateEnable = fixture.input("gate_enable"), gateData = fixture.input("gate_data");
+    const auto data = fixture.input("data", 8), address = fixture.input("address", 4);
+    const auto one = fixture.constant(1, "1'b1"), zero = fixture.constant(1, "1'b0");
+    const auto three = fixture.constant(8, "8'd3"), seven = fixture.constant(8, "8'd7");
+    const auto priorityMask = fixture.constant(8, "8'hf0");
+    const auto dataB = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, three});
+    const auto dataLastA = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, seven});
+    const auto packedStates = graph.createOperation(OperationKind::kArrayCreate);
+    std::vector<grh::OperationId> states;
+    for (unsigned i = 0; i < 145; ++i) {
+        const auto state = fixture.state("sparse" + std::to_string(i), 8);
+        states.push_back(state);
+        // Distinct initial values keep 145 independent current/next fields.
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant, "8'd" + std::to_string(i + 1)}});
+        fixture.write(OperationKind::kRegisterWritePort, state,
+            {i < 128 ? bulk : tail, data, i % 2 ? clockB : clockA});
+        graph.addOperand(packedStates, fixture.read(state));
+    }
+    const auto packed = graph.createValue(Fixture::type(145 * 8, {145}));
+    graph.addResult(packedStates, packed); graph.bindOutputPort("states", packed);
+    const auto constantOn = fixture.state("constant_on", 8);
+    const auto constantOff = fixture.state("constant_off", 8);
+    const auto localState = fixture.state("local_enable", 8);
+    const auto mixedState = fixture.state("mixed_fire", 8);
+    const auto priority = fixture.state("priority", 8);
+    const auto localEnable = fixture.compute(OperationKind::kAnd, Fixture::type(1),
+        {enableA, fixture.compute(OperationKind::kNot, Fixture::type(1), {bulk})});
+    fixture.write(OperationKind::kRegisterWritePort, constantOn, {one, data, clockB});
+    fixture.write(OperationKind::kRegisterWritePort, constantOff, {zero, data, clockB});
+    fixture.write(OperationKind::kRegisterWritePort, localState, {localEnable, dataB, clockA});
+    fixture.write(OperationKind::kRegisterWritePort, mixedState, {enableB, dataLastA, clockA, clockB},
+        {"posedge", "negedge"});
+    // Preserve A/B/A priority when enabled runs are skipped or grouped.
+    fixture.write(OperationKind::kRegisterWritePort, priority, {enableA, data, clockA});
+    fixture.write(OperationKind::kRegisterWritePort, priority, {enableB, dataB, clockA});
+    fixture.write(OperationKind::kRegisterWriteMaskPort, priority, {enableA, dataLastA, priorityMask, clockA});
+    const auto gate = fixture.state("derived_gate", 1);
+    const auto derived = fixture.state("derived_sink", 8);
+    const auto gateRead = fixture.read(gate);
+    fixture.write(OperationKind::kRegisterWritePort, gate, {gateEnable, gateData, clockA});
+    const auto derivedData = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, fixture.read(states.front())});
+    fixture.write(OperationKind::kRegisterWritePort, derived, {one, derivedData, gateRead});
+    for (const auto& [name, state] : std::vector<std::pair<std::string, grh::OperationId>>{
+            {"constant_on", constantOn}, {"constant_off", constantOff}, {"local", localState},
+            {"mixed", mixedState}, {"priority", priority}, {"gate", gate}, {"derived", derived}})
+        graph.bindOutputPort(name, fixture.read(state));
+    const auto memoryA = fixture.state("memory_a", 128, {16});
+    const auto memoryB = fixture.state("memory_b", 128, {16});
+    const auto memoryPriority = fixture.state("memory_priority", 128, {16});
+    grh::setStateInitSpec(graph, memoryA, {{grh::InitKind::Fill, "8'd17"}});
+    grh::setStateInitSpec(graph, memoryB, {{grh::InitKind::Fill, "8'd33"}});
+    // Both payloads must be captured before either large state is committed.
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memoryA,
+        {enableA, address, fixture.read(memoryB, {address}), clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memoryB,
+        {enableB, address, fixture.read(memoryA, {address}), clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memoryPriority, {enableA, address, data, clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memoryPriority, {enableB, address, dataB, clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayMaskPort, memoryPriority,
+        {enableA, address, dataLastA, priorityMask, clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memoryPriority, {tail, address, derivedData, gateRead});
+    graph.bindOutputPort("memory_a", fixture.read(memoryA));
+    graph.bindOutputPort("memory_b", fixture.read(memoryB));
+    graph.bindOutputPort("memory_priority", fixture.read(memoryPriority));
+    fixture.convert(); const auto reference = fixture.design.clone();
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session,
+        {"-max-node-work=2", "-max-supernode-work=4"});
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    const auto localOwner = owner(graph, graph.valueDef(localEnable));
+    require(localOwner.size() > 1 && localOwner[1] == "small-sink",
+        "Sparse dispatch regression lost its sink-local enable cone");
+    std::vector<std::map<std::string, uint64_t>> inputs;
+    const auto step = [&](unsigned a, unsigned b, unsigned bulkValue, unsigned tailValue,
+                          unsigned enableAValue, unsigned enableBValue, unsigned gateEnableValue,
+                          unsigned gateDataValue, unsigned dataValue, unsigned addressValue) {
+        inputs.push_back({{"clock_a", a}, {"clock_b", b}, {"bulk", bulkValue}, {"tail", tailValue},
+            {"enable_a", enableAValue}, {"enable_b", enableBValue}, {"gate_enable", gateEnableValue},
+            {"gate_data", gateDataValue}, {"data", dataValue}, {"address", addressValue}});
+    };
+    step(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    step(1, 0, 0, 1, 0, 0, 0, 0, 201, 0); // Only the final publish batch is dirty.
+    inputs.push_back(inputs.back()); // All clocks and inputs clean.
+    step(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    step(0, 1, 0, 0, 0, 0, 0, 0, 19, 0); // Constant enable on clock B.
+    step(0, 0, 0, 0, 0, 1, 0, 0, 23, 0); // Falling clock B mixed fire.
+    step(1, 1, 1, 1, 1, 1, 1, 1, 43, 2); // Both input edges, followed by NBA derived edge.
+    inputs.push_back(inputs.back());
+    step(0, 0, 0, 0, 0, 0, 0, 1, 53, 2);
+    step(1, 0, 0, 0, 0, 1, 1, 0, 61, 2); // B priority alone, gate falls after publish.
+    step(0, 0, 0, 0, 1, 0, 0, 0, 67, 3);
+    step(1, 0, 0, 1, 1, 0, 1, 1, 71, 3); // A priority and private local enable.
+    step(1, 1, 0, 0, 0, 0, 0, 1, 79, 4); // Clock B rises while A stays high.
+    step(0, 0, 0, 0, 0, 0, 0, 1, 83, 4);
+    step(1, 1, 1, 0, 1, 1, 1, 0, 89, 4);
+    step(0, 0, 0, 0, 0, 0, 0, 0, 97, 15);
+    step(1, 0, 0, 1, 1, 1, 1, 1, 101, 15);
+    inputs.push_back(inputs.back());
+    for (const auto budget : {16u, 1024u}) for (const std::string bitmap : {"on", "off"}) {
+        const auto label = "sparse-dispatch-b" + std::to_string(budget) + "-bitmap-" + bitmap;
+        writeCase(fixture, reference, inputs, label, budget, 4096,
+            {{"mem-enable-bitmap", bitmap}, {"mem-write-activate", "on-write"}});
+        const auto directory = artifact(label) / "model";
+        const auto header = readFile(directory / "grhsim_top.hpp");
+        require(header.find("pPublish_dirty_batch1") != std::string::npos,
+            "Sparse publish fixture did not cross its 128-state batch boundary");
+        std::string sources;
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp") sources += readFile(entry.path());
+        const auto begin = sources.find("void GrhSIM_top::writer_run_batch0()\n{");
+        require(begin != std::string::npos, "Sparse fixture has no writer batch entry");
+        const auto end = sources.find("\n}\n", begin);
+        const auto entry = sources.substr(begin, end - begin);
+        const auto guard = entry.find("if (");
+        require(guard != std::string::npos && entry.find("eventActStore.", guard) != std::string::npos,
+            "Writer batch entry lost its clock fire guard");
+        const auto call = entry.find("writer_run_batch0_chunk");
+        require(call == std::string::npos || guard < call, "Writer helpers run before their fire guard");
+        std::ofstream make(artifact("Makefile"), std::ios::app);
+        make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
+             << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+    }
+}
+
+void testSinkRunCommonEnableFactors() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clockA = fixture.input("clock_a"), clockB = fixture.input("clock_b");
+    const auto gate = fixture.input("gate"), nextClock = fixture.input("next_clock");
+    const auto bits = fixture.input("bits", 32), data = fixture.input("data", 8);
+    const auto indexA = fixture.input("index_a", 5), indexB = fixture.input("index_b", 5);
+    const auto indexC = fixture.input("index_c", 5), observedIndex = fixture.input("observed_index", 5);
+    const auto factorIndexA = fixture.input("factor_index_a", 5);
+    const auto factorIndexB = fixture.input("factor_index_b", 5);
+    const auto factorIndexC = fixture.input("factor_index_c", 5);
+    const auto one = fixture.constant(1, "1'b1"), mask = fixture.constant(8, "8'hf0");
+    const auto three = fixture.constant(8, "8'd3"), seven = fixture.constant(8, "8'd7");
+    const auto dataB = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, three});
+    const auto dataLastA = fixture.compute(OperationKind::kAdd, Fixture::type(8), {data, seven});
+    std::vector<grh::ValueId> localEnables;
+    const auto enable = [&](grh::ValueId index) {
+        const auto selected = fixture.compute(OperationKind::kSliceDynamic, Fixture::type(1), {bits, index});
+        const auto result = fixture.compute(OperationKind::kAnd, Fixture::type(1), {gate, selected});
+        localEnables.push_back(result);
+        return result;
+    };
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto state = fixture.state("factor" + std::to_string(i), 8);
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant, "8'd" + std::to_string(i + 1)}});
+        fixture.write(OperationKind::kRegisterWritePort, state,
+            {enable(i == 0 ? factorIndexA : i == 1 ? factorIndexB : factorIndexC), data, clockA});
+        graph.bindOutputPort("factor" + std::to_string(i), fixture.read(state));
+    }
+    const auto priority = fixture.state("factor_priority", 8);
+    // The final masked A must preserve bits written by the intervening B.
+    const auto enableA = enable(indexA), enableB = enable(indexB);
+    // Shared A belongs in nonsink; only the first three private enables
+    // above are used to prove the common-factor extraction structure.
+    localEnables.resize(3);
+    fixture.write(OperationKind::kRegisterWritePort, priority, {enableA, data, clockB});
+    fixture.write(OperationKind::kRegisterWritePort, priority, {enableB, dataB, clockB});
+    fixture.write(OperationKind::kRegisterWriteMaskPort, priority, {enableA, dataLastA, mask, clockB});
+    graph.bindOutputPort("priority", fixture.read(priority));
+    const auto clockState = fixture.state("factor_clock", 1);
+    const auto derived = fixture.state("factor_derived", 8);
+    fixture.write(OperationKind::kRegisterWritePort, clockState, {one, nextClock, clockA});
+    fixture.write(OperationKind::kRegisterWritePort, derived,
+        {enable(indexC), dataLastA, fixture.read(clockState)});
+    graph.bindOutputPort("derived_clock", fixture.read(clockState));
+    graph.bindOutputPort("derived", fixture.read(derived));
+    const auto observed = fixture.state("factor_observed", 8);
+    const auto observedBit = fixture.compute(OperationKind::kSliceDynamic, Fixture::type(1), {bits, observedIndex});
+    const auto observedEnable = fixture.compute(OperationKind::kLogicAnd, Fixture::type(1), {gate, observedBit});
+    graph.setValueSymbol(observedBit, graph.internSymbol("factor_observed_bit"));
+    graph.addDeclaredSymbol(graph.valueSymbol(observedBit));
+    graph.setValueSymbol(observedEnable, graph.internSymbol("factor_observed_enable"));
+    graph.addDeclaredSymbol(graph.valueSymbol(observedEnable));
+    fixture.write(OperationKind::kRegisterWritePort, observed, {observedEnable, dataB, clockB});
+    graph.bindOutputPort("observed", fixture.read(observed));
+    fixture.convert(); const auto reference = fixture.design.clone();
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session);
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session,
+        {"-max-node-work=2", "-max-supernode-work=4"});
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    for (const auto value : localEnables) {
+        const auto key = owner(graph, graph.valueDef(value));
+        require(key.size() == 3 && key[1] == "small-sink",
+            "Common-factor fixture lost its sink-local enables");
+    }
+    require(owner(graph, graph.valueDef(observedEnable)) == owner(graph, graph.valueDef(observedBit)) &&
+                owner(graph, graph.valueDef(observedEnable))[1] == "small-sink",
+        "Observed common-factor regression did not retain its local enable and dynamic slice");
+    std::vector<std::map<std::string, uint64_t>> inputs;
+    const auto step = [&](unsigned a, unsigned b, unsigned enabled, unsigned next, uint64_t selected,
+                          unsigned value, unsigned ia, unsigned ib, unsigned ic, unsigned io) {
+        inputs.push_back({{"clock_a", a}, {"clock_b", b}, {"gate", enabled}, {"next_clock", next},
+            {"bits", selected}, {"data", value}, {"index_a", ia}, {"index_b", ib},
+            {"index_c", ic}, {"observed_index", io}, {"factor_index_a", ia},
+            {"factor_index_b", ib}, {"factor_index_c", ic}});
+    };
+    step(0, 0, 0, 0, 0, 3, 0, 1, 2, 3);
+    step(1, 1, 1, 1, 15, 17, 0, 1, 2, 3); // Both clocks, then an NBA-derived edge.
+    inputs.push_back(inputs.back());
+    step(0, 0, 0, 1, 0, 29, 1, 2, 3, 4);
+    step(1, 1, 0, 0, 0, 43, 1, 2, 3, 4); // Observed enable must clear with gate false.
+    step(0, 0, 0, 0, 32, 51, 2, 3, 4, 5);
+    step(0, 1, 0, 0, 32, 63, 2, 3, 4, 5); // Observed bit refreshes even when gate remains false.
+    step(1, 1, 1, 1, 14, 79, 0, 1, 2, 5); // B enabled, A disabled; derived edge follows A.
+    inputs.push_back(inputs.back());
+    step(0, 0, 1, 1, 5, 83, 0, 1, 2, 0);
+    step(1, 0, 1, 0, 5, 97, 0, 1, 2, 0); // A enabled, B disabled.
+    step(0, 1, 1, 0, 0x80000003u, 113, 0, 1, 31, 31);
+    step(1, 1, 1, 1, 0x80000003u, 127, 0, 1, 31, 31); // A/B/A, high dynamic bit, derived edge.
+    step(0, 0, 0, 1, 0, 137, 31, 30, 29, 31);
+    step(1, 1, 0, 0, 0, 149, 31, 30, 29, 31);
+    inputs.push_back(inputs.back());
+    step(0, 0, 1, 0, 2, 157, 0, 1, 2, 1);
+    step(0, 1, 1, 0, 2, 157, 0, 1, 2, 1); // B priority alone.
+    step(0, 0, 1, 0, 1, 163, 0, 1, 2, 0);
+    step(0, 1, 1, 0, 1, 163, 0, 1, 2, 0); // A priority alone.
+    step(0, 0, 1, 0, 3, 173, 0, 1, 2, 1);
+    step(0, 1, 1, 0, 3, 173, 0, 1, 2, 1); // Full A/B/A masked priority.
+    const std::string support = R"CPP(
+#include "fstapi.h"
+#include <cassert>
+#include <map>
+struct FactorWave {
+    std::map<fstHandle, std::string> names;
+    std::map<std::string, std::map<std::uint64_t, std::string>> values;
+    static void change(void *user, std::uint64_t time, fstHandle handle, const unsigned char *bits) {
+        auto& wave = *static_cast<FactorWave*>(user);
+        wave.values[wave.names.at(handle)][time] = reinterpret_cast<const char*>(bits);
+    }
+    std::string at(const std::string& name, std::uint64_t time) const {
+        const auto& series = values.at(name); const auto found = series.upper_bound(time);
+        assert(found != series.begin()); return std::prev(found)->second;
+    }
+};
+static void checkFactorWave(const char *path) {
+    auto *reader = fstReaderOpen(path); assert(reader); FactorWave wave;
+    while (auto *hier = fstReaderIterateHier(reader)) if (hier->htyp == FST_HT_VAR)
+        assert(wave.names.emplace(hier->u.var.handle, hier->u.var.name).second);
+    fstReaderSetFacProcessMaskAll(reader);
+    assert(fstReaderIterBlocks2(reader, FactorWave::change, nullptr, &wave, nullptr));
+)CPP";
+    for (const auto budget : {16u, 1024u}) {
+        const auto label = "sink-common-factor-b" + std::to_string(budget);
+        writeCase(fixture, reference, inputs, label, budget, 4096);
+        const auto directory = artifact(label) / "model";
+        std::string sources;
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+            if (entry.path().extension() == ".cpp") sources += readFile(entry.path());
+        const auto gateField = "inputStore.v" + std::to_string(gate.index);
+        bool guarded = false;
+        std::istringstream source(sources); std::string line;
+        while (std::getline(source, line))
+            if (line.find("if (") != std::string::npos && line.find("eventActStore.") != std::string::npos &&
+                line.find(gateField) != std::string::npos) guarded = true;
+        require(guarded, "Common boundary gate was not lifted ahead of local dynamic enables");
+        if (budget == 1024) {
+            const auto indexField = "smallSinkEnableBoundaryStore.v" + std::to_string(factorIndexA.index);
+            bool beforeSelect = false; std::vector<bool> guards;
+            std::istringstream lines(sources);
+            while (std::getline(lines, line)) {
+                if (line.find(" >> ") != std::string::npos && line.find(indexField) != std::string::npos)
+                    beforeSelect |= std::find(guards.begin(), guards.end(), true) != guards.end();
+                for (const auto ch : line) {
+                    if (ch == '{') guards.push_back(line.find("if (") != std::string::npos &&
+                        line.find("eventActStore.") != std::string::npos && line.find(gateField) != std::string::npos);
+                    else if (ch == '}' && !guards.empty()) guards.pop_back();
+                }
+            }
+            require(beforeSelect, "Dynamic bit selection escaped the common boundary gate guard");
+        }
+        std::string checks = support; bool previousClock = false, selected = false, enabled = false;
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto& in = inputs[i];
+            if (in.at("clock_b") && !previousClock) {
+                selected = (in.at("bits") >> in.at("observed_index")) & 1;
+                enabled = selected && in.at("gate");
+            }
+            previousClock = in.at("clock_b");
+            checks += "    assert(wave.at(\"factor_observed_bit\", " + std::to_string(i) + ") == \"" +
+                (selected ? "1" : "0") + "\");\n";
+            checks += "    assert(wave.at(\"factor_observed_enable\", " + std::to_string(i) + ") == \"" +
+                (enabled ? "1" : "0") + "\");\n";
+        }
+        checks += "    fstReaderClose(reader);\n}\n";
+        const auto driverPath = artifact(label) / "driver.cpp";
+        auto driver = readFile(driverPath); driver.insert(driver.find("int main()"), checks);
+        std::size_t offset = 0;
+        for (unsigned epoch = 0; epoch < 3; ++epoch) {
+            offset = driver.find("model.init();", offset);
+            require(offset != std::string::npos, "Common-factor driver lost an initialization epoch");
+            const auto configure = "model.configure_waveform(true, \"factor" + std::to_string(epoch) + ".fst\");\n";
+            driver.insert(offset, configure); offset += configure.size() + std::string("model.init();").size();
+        }
+        driver.insert(driver.find("model.dump_runtime_profile();"),
+            "model.configure_waveform(false);\ncheckFactorWave(\"factor0.fst\");\n"
+            "checkFactorWave(\"factor1.fst\");\ncheckFactorWave(\"factor2.fst\");\n");
+        std::ofstream(driverPath) << driver;
+        std::ofstream make(artifact("Makefile"), std::ios::app);
+        make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
+             << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+    }
+}
+
 void testSinkRunSharedCones() {
     Fixture fixture;
     auto& graph = fixture.graph;
@@ -1075,6 +1574,346 @@ void testContiguousArrayImages() {
             prepare + "model.eval();\n" + verify + "} }", false);
 }
 
+void testPackedArrayConstants() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto choose = fixture.input("choose");
+    struct ConstantCase { std::string name; grh::LogicalType type; std::string text; };
+    auto signed3 = Fixture::type(72, {2, 3, 4}); signed3.isSigned = true;
+    auto signed8 = Fixture::type(8, {2, 4}); signed8.isSigned = true;
+    auto signed16 = Fixture::type(16, {2, 8}); signed16.isSigned = true;
+    const std::array<ConstantCase, 7> cases{{
+        {"zero", Fixture::type(1024, {4, 256}), "'0"},
+        {"ones", Fixture::type(300, {3, 100}), "'1"},
+        {"signed_three", signed3, "72'hd792e4a3b65c1987af"},
+        {"signed_ones", signed3, "'1"},
+        {"signed_eight", signed8, "'1"},
+        {"signed_sixteen", signed16, "'1"},
+        {"bytes", Fixture::type(128, {2, 4}), "128'h0123456789abcdefa569c3f00f965ab4"}
+    }};
+    std::vector<grh::ValueId> constants;
+    for (const auto& item : cases) {
+        const auto value = fixture.compute(OperationKind::kConstant, item.type, {});
+        graph.setAttr(graph.valueDef(value), "constValue", item.text);
+        graph.setValueSymbol(value, graph.internSymbol("packed_constant_" + item.name));
+        graph.addDeclaredSymbol(graph.valueSymbol(value));
+        constants.push_back(value);
+        const auto data = fixture.input("data_" + item.name, item.type.width);
+        const auto source = fixture.compute(OperationKind::kAssign, item.type, {data});
+        graph.bindOutputPort(item.name + "_mux", fixture.compute(OperationKind::kMux, item.type, {choose, source, value}));
+        graph.bindOutputPort(item.name + "_whole", value);
+        graph.bindOutputPort(item.name + "_and", fixture.compute(OperationKind::kReduceAnd, Fixture::type(1), {value}));
+        graph.bindOutputPort(item.name + "_or", fixture.compute(OperationKind::kReduceOr, Fixture::type(1), {value}));
+        graph.bindOutputPort(item.name + "_xor", fixture.compute(OperationKind::kReduceXor, Fixture::type(1), {value}));
+    }
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto reference = fixture.design.clone();
+    fixture.split(); fixture.partition();
+    std::vector<std::map<std::string, uint64_t>> inputs;
+    for (const auto value : {uint64_t{0}, UINT64_MAX, UINT64_C(0x8ac739e12d654b0f), UINT64_C(0x13579bdf2468ace0)})
+        for (const unsigned selected : {0u, 1u, 0u}) {
+            std::map<std::string, uint64_t> values{{"choose", selected}};
+            for (const auto& item : cases)
+                values.emplace("data_" + item.name, item.type.width < 64 ? value & ((uint64_t{1} << item.type.width) - 1) : value);
+            inputs.push_back(std::move(values));
+        }
+    for (const auto budget : {16, 1024}) {
+        const auto label = "packed-array-constants-b" + std::to_string(budget);
+        writeCase(fixture, reference, inputs, label, budget, 4096);
+        std::string generated;
+        for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
+            if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
+        for (const auto value : constants)
+            require(generated.find("packed" + std::to_string(value.index) + "_") == std::string::npos,
+                "A shaped constant was repacked from its initialized array");
+        std::ofstream make(artifact("Makefile"), std::ios::app);
+        make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
+             << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+    }
+}
+
+void testStaticArrayWindows() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clock = fixture.input("clock"), enable = fixture.input("enable");
+    const auto low = fixture.input("low", 64), middle = fixture.input("middle", 64);
+    const auto high = fixture.input("high", 64), top = fixture.input("top", 64);
+    const auto slice = [&](grh::ValueId source, int64_t first, grh::LogicalType type) {
+        const auto value = fixture.compute(OperationKind::kSliceStatic, type, {source});
+        graph.setAttr(graph.valueDef(value), "sliceStart", first);
+        graph.setAttr(graph.valueDef(value), "sliceEnd", first + type.width - 1);
+        return value;
+    };
+    const auto flat192 = fixture.compute(OperationKind::kConcat, Fixture::type(192), {high, middle, low});
+    const auto flat256 = fixture.compute(OperationKind::kConcat, Fixture::type(256), {top, high, middle, low});
+    const auto flat144 = slice(flat192, 0, Fixture::type(144));
+    const auto flat96 = slice(flat192, 0, Fixture::type(96));
+    auto signed3 = Fixture::type(144, {2, 3, 8}); signed3.isSigned = true;
+    auto signed6 = Fixture::type(96, {2, 8}); signed6.isSigned = true;
+    auto signed64 = Fixture::type(256, {2, 2}); signed64.isSigned = true;
+    const auto saved = [&](std::string name, const grh::LogicalType& type, grh::ValueId flat) {
+        const auto value = fixture.compute(OperationKind::kAssign, type, {flat});
+        graph.setValueSymbol(value, graph.internSymbol(name));
+        graph.addDeclaredSymbol(graph.valueSymbol(value));
+        return value;
+    };
+    const auto flags = saved("saved_static_flags", Fixture::type(192, {2, 3, 32}), flat192);
+    const auto flagsFallback = saved("saved_static_flags_fallback", Fixture::type(192, {2, 3, 32}), flat192);
+    const auto three = saved("saved_static_three", signed3, flat144);
+    const auto six = saved("saved_static_six", signed6, flat96);
+    const auto words = saved("saved_static_words", signed64, flat256);
+    const auto output = [&](std::string name, grh::ValueId source, int64_t first, grh::LogicalType type) {
+        graph.bindOutputPort(name, slice(source, first, type));
+    };
+    output("bool_first", flags, 0, Fixture::type(1));
+    output("bool_last", flags, 191, Fixture::type(1));
+    output("bool_cross", flags, 17, Fixture::type(13));
+    output("bool_max_window", flags, 31, Fixture::type(32));
+    output("bool_end", flags, 167, Fixture::type(25));
+    output("bool_wide_fallback", flagsFallback, 57, Fixture::type(80));
+    output("bool_end_fallback", flagsFallback, 117, Fixture::type(75));
+    output("three_cross", three, 2, Fixture::type(8));
+    output("three_middle", three, 14, Fixture::type(33));
+    output("three_wide", three, 5, Fixture::type(79));
+    auto signed9 = Fixture::type(9); signed9.isSigned = true;
+    output("three_signed", three, 1, signed9);
+    output("three_shaped", three, 126, Fixture::type(18, {2, 3}));
+    // The ROB-shaped case reads eight or nine 6-bit leaves, not all sixteen.
+    output("six_aligned", six, 0, Fixture::type(48));
+    output("six_cross", six, 1, Fixture::type(48));
+    output("six_wide", six, 29, Fixture::type(65));
+    output("six_end", six, 79, Fixture::type(17));
+    output("words_aligned", words, 64, Fixture::type(64));
+    output("words_cross", words, 60, Fixture::type(80));
+    output("words_middle", words, 127, Fixture::type(65));
+    output("words_end", words, 193, Fixture::type(63));
+    output("words_wide", words, 63, Fixture::type(193));
+    auto signedResult64 = Fixture::type(64); signedResult64.isSigned = true;
+    output("words_signed", words, 63, signedResult64);
+    const auto localFlags = fixture.compute(OperationKind::kAssign, Fixture::type(192, {2, 3, 32}), {flat192});
+    const auto localSix = fixture.compute(OperationKind::kAssign, signed6, {flat96});
+    output("local_bool_cross", localFlags, 31, Fixture::type(9));
+    output("local_six_cross", localSix, 5, Fixture::type(48));
+    const auto arrayState = fixture.state("static_snapshot_array", 96, {2, 8});
+    grh::setStateLogicalType(graph, arrayState, signed6);
+    const auto capture48 = fixture.state("static_capture48", 48);
+    const auto capture65 = fixture.state("static_capture65", 65);
+    const auto stateSample = fixture.read(arrayState);
+    graph.setValueSymbol(stateSample, graph.internSymbol("saved_static_state"));
+    graph.addDeclaredSymbol(graph.valueSymbol(stateSample));
+    fixture.write(OperationKind::kRegisterWritePort, arrayState, {enable, six, clock});
+    fixture.write(OperationKind::kRegisterWritePort, capture48,
+        {enable, slice(stateSample, 1, Fixture::type(48)), clock});
+    fixture.write(OperationKind::kRegisterWritePort, capture65,
+        {enable, slice(stateSample, 29, Fixture::type(65)), clock});
+    graph.bindOutputPort("captured48", fixture.read(capture48));
+    graph.bindOutputPort("captured65", fixture.read(capture65));
+    output("current48", stateSample, 1, Fixture::type(48));
+    output("current65", stateSample, 29, Fixture::type(65));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto reference = fixture.design.clone();
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=4096"});
+    fixture.partition();
+    std::vector<std::map<std::string, uint64_t>> inputs;
+    uint64_t random = UINT64_C(0x967a3c5921e4bf08);
+    for (unsigned step = 0; step < 36; ++step) {
+        random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+        const auto first = step < 2 ? uint64_t{0} : step < 4 ? UINT64_MAX :
+            step < 12 ? uint64_t{1} << (std::array<unsigned, 8>{0, 1, 2, 5, 31, 32, 62, 63}[step - 4]) : random;
+        inputs.push_back({{"clock", step & 1}, {"enable", step % 7 != 0}, {"low", first},
+            {"middle", step < 4 ? first : (random << 17) ^ (random >> 11)},
+            {"high", step < 4 ? first : ~random}, {"top", step < 4 ? first : random ^ (random >> 23)}});
+    }
+    for (const auto budget : {16, 1024}) {
+        const auto label = "static-array-windows-b" + std::to_string(budget);
+        writeCase(fixture, reference, inputs, label, budget, 4096);
+        std::string generated;
+        for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
+            if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
+        for (const auto value : {flags, three, six, words, localFlags, localSix, stateSample})
+            require(generated.find("packed" + std::to_string(value.index) + "_") == std::string::npos,
+                "Static window extraction packed its entire source array");
+        require(generated.find("nonSinkBoundaryStore.v" + std::to_string(stateSample.index)) != std::string::npos,
+            "Static window regression did not retain its saved state snapshot");
+        require(generated.find("packed" + std::to_string(flagsFallback.index) + "_") != std::string::npos,
+            "Large static window lost its compact packing fallback");
+        std::ofstream make(artifact("Makefile"), std::ios::app);
+        make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
+             << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+    }
+}
+
+void testDynamicArrayBits() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clock = fixture.input("clock"), enable = fixture.input("enable");
+    const auto flags = fixture.input("flags", 64), bits3 = fixture.input("bits3", 36);
+    const auto index = fixture.input("index", 10), signedIndex = fixture.input("signed_index", 10);
+    auto signedIndexType = Fixture::type(10); signedIndexType.isSigned = true;
+    graph.setValueLogicalType(signedIndex, signedIndexType);
+    const auto high = fixture.input("index_high", 64), low = fixture.input("index_low", 64);
+    const auto wideIndex = fixture.compute(OperationKind::kConcat, Fixture::type(128), {high, low});
+    auto signedWideType = Fixture::type(128); signedWideType.isSigned = true;
+    const auto signedWideIndex = fixture.compute(OperationKind::kAssign, signedWideType, {wideIndex});
+    const auto repeated = fixture.compute(OperationKind::kReplicate, Fixture::type(384), {flags});
+    graph.setAttr(graph.valueDef(repeated), "rep", int64_t{6});
+    const auto packed = fixture.compute(OperationKind::kSliceStatic, Fixture::type(352), {repeated});
+    graph.setAttr(graph.valueDef(packed), "sliceStart", int64_t{0});
+    graph.setAttr(graph.valueDef(packed), "sliceEnd", int64_t{351});
+    const auto controls = fixture.compute(OperationKind::kAssign, Fixture::type(352, {2, 176}), {packed});
+    auto signed3 = Fixture::type(36, {2, 2, 3}); signed3.isSigned = true;
+    const auto leaves3 = fixture.compute(OperationKind::kAssign, signed3, {bits3});
+    const auto savedControls = fixture.compute(OperationKind::kAssign, Fixture::type(352, {2, 176}), {controls});
+    const auto savedLeaves3 = fixture.compute(OperationKind::kAssign, signed3, {leaves3});
+    graph.setValueSymbol(savedControls, graph.internSymbol("saved_dynamic_controls"));
+    graph.setValueSymbol(savedLeaves3, graph.internSymbol("saved_dynamic_leaves"));
+    graph.addDeclaredSymbol(graph.valueSymbol(savedControls));
+    graph.addDeclaredSymbol(graph.valueSymbol(savedLeaves3));
+    const auto bit = [&](grh::ValueId source, grh::ValueId offset) {
+        return fixture.compute(OperationKind::kSliceDynamic, Fixture::type(1), {source, offset});
+    };
+    const auto localControls = fixture.compute(OperationKind::kAssign, Fixture::type(352, {2, 176}), {packed});
+    const auto localLeaves3 = fixture.compute(OperationKind::kAssign, signed3, {bits3});
+    graph.bindOutputPort("local_bool", bit(localControls, index));
+    graph.bindOutputPort("saved_bool", bit(savedControls, index));
+    graph.bindOutputPort("signed_index_bool", bit(controls, signedIndex));
+    graph.bindOutputPort("wide_index_bool", bit(controls, wideIndex));
+    graph.bindOutputPort("signed_wide_index_bool", bit(savedControls, signedWideIndex));
+    graph.bindOutputPort("local_three", bit(localLeaves3, index));
+    graph.bindOutputPort("saved_three", bit(savedLeaves3, signedIndex));
+    graph.bindOutputPort("wide_index_three", bit(savedLeaves3, wideIndex));
+    // More than one result bit retains the existing cross-leaf path.
+    const auto fallback = fixture.compute(OperationKind::kAssign, signed3, {bits3});
+    graph.bindOutputPort("cross_leaf", fixture.compute(OperationKind::kSliceDynamic, Fixture::type(4), {fallback, index}));
+    const auto arrayState = fixture.state("snapshot_array", 352, {2, 176});
+    const auto capturedState = fixture.state("snapshot_bit", 1);
+    const auto stateSample = fixture.read(arrayState);
+    graph.setValueSymbol(stateSample, graph.internSymbol("saved_dynamic_state"));
+    graph.addDeclaredSymbol(graph.valueSymbol(stateSample));
+    fixture.write(OperationKind::kRegisterWritePort, arrayState, {enable, controls, clock});
+    fixture.write(OperationKind::kRegisterWritePort, capturedState, {enable, bit(stateSample, index), clock});
+    graph.bindOutputPort("captured", fixture.read(capturedState));
+    graph.bindOutputPort("state_bit", bit(stateSample, index));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto reference = fixture.design.clone();
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=4096"});
+    fixture.partition();
+    std::vector<std::map<std::string, uint64_t>> inputs;
+    const std::array<unsigned, 23> offsets{0, 1, 2, 3, 31, 32, 34, 35, 36, 63, 64, 127, 175, 176, 255, 350, 351, 352, 353, 383, 384, 511, 1023};
+    uint64_t random = UINT64_C(0x98e37bac470156d2);
+    for (unsigned step = 0; step < offsets.size() * 2; ++step) {
+        random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+        const auto offset = offsets[step / 2];
+        inputs.push_back({{"clock", step & 1}, {"enable", step % 7 != 0},
+            {"flags", step < 2 ? UINT64_MAX : random}, {"bits3", random & UINT64_C(0xfffffffff)},
+            {"index", offset}, {"signed_index", step % 5 == 0 ? 1023 : offset},
+            {"index_high", step % 4 == 0 ? 1 : step % 4 == 1 ? UINT64_C(1) << 63 : 0},
+            {"index_low", step % 6 == 0 ? UINT64_MAX : offset}});
+    }
+    for (const auto budget : {16, 1024}) {
+        const auto label = "dynamic-array-bits-b" + std::to_string(budget);
+        writeCase(fixture, reference, inputs, label, budget, 4096);
+        std::string generated;
+        for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
+            if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
+        for (const auto value : {controls, savedControls, leaves3, savedLeaves3, stateSample, localControls, localLeaves3})
+            require(generated.find("packed" + std::to_string(value.index) + "_") == std::string::npos,
+                "Dynamic bit extraction packed its entire source array");
+        for (const auto value : {localControls, localLeaves3})
+            require(generated.find("Store.v" + std::to_string(value.index)) == std::string::npos,
+                "Dynamic bit regression did not retain its private local array");
+        require(generated.find("nonSinkBoundaryStore.v" + std::to_string(stateSample.index)) != std::string::npos,
+            "Dynamic bit regression did not retain its saved state snapshot");
+        require(generated.find("packed" + std::to_string(fallback.index) + "_") != std::string::npos,
+            "Multi-bit dynamic extraction lost its cross-leaf fallback");
+        std::ofstream make(artifact("Makefile"), std::ios::app);
+        make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
+             << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+    }
+}
+
+void testMaskedViewBits() {
+    Fixture fixture;
+    const auto flags = fixture.input("flags", 64), bits3 = fixture.input("bits3", 36);
+    const auto bits5 = fixture.input("bits5", 60), bits56 = fixture.input("bits56", 56);
+    const auto slice = [&](grh::ValueId source, int64_t first, const grh::LogicalType& type) {
+        const auto result = fixture.compute(OperationKind::kSliceStatic, type, {source});
+        fixture.graph.setAttr(fixture.graph.valueDef(result), "sliceStart", first);
+        fixture.graph.setAttr(fixture.graph.valueDef(result), "sliceEnd", first + type.width - 1);
+        return result;
+    };
+    const auto repeatedFlags = fixture.compute(OperationKind::kReplicate, Fixture::type(384), {flags});
+    fixture.graph.setAttr(fixture.graph.valueDef(repeatedFlags), "rep", int64_t{6});
+    const auto scalarControl = slice(repeatedFlags, 0, Fixture::type(352));
+    const auto controls = fixture.compute(OperationKind::kAssign, Fixture::type(352, {2, 176}), {scalarControl});
+    auto signed3 = Fixture::type(36, {2, 2, 3}); signed3.isSigned = true;
+    auto signed56 = Fixture::type(336, {2, 3}); signed56.isSigned = true;
+    const auto data3 = fixture.compute(OperationKind::kAssign, signed3, {bits3});
+    const auto data5 = fixture.compute(OperationKind::kAssign, Fixture::type(60, {3, 4}), {bits5});
+    std::array<grh::ValueId, 6> leaves;
+    for (unsigned i = 0; i < leaves.size(); ++i) {
+        const auto delta = fixture.constant(56, "56'd" + std::to_string(UINT64_C(0x125a53e7951b) * i));
+        leaves[i] = fixture.compute(OperationKind::kXor, Fixture::type(56), {bits56, delta});
+    }
+    const auto flat56 = fixture.compute(OperationKind::kConcat, Fixture::type(336),
+        {leaves[5], leaves[4], leaves[3], leaves[2], leaves[1], leaves[0]});
+    const auto data56 = fixture.compute(OperationKind::kAssign, signed56, {flat56});
+    // Keep the typed array views intact and append dialect operations only
+    // after conversion has checked the base GRH contract.
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    const auto masked = [&](std::string name, const grh::LogicalType& type, std::vector<int64_t> views) {
+        const auto result = fixture.compute(sim::kMaskedOr, type,
+            {controls, scalarControl, data3, data5, data56, bits56});
+        fixture.graph.setAttr(fixture.graph.valueDef(result), "views", std::move(views));
+        fixture.graph.bindOutputPort(name, result);
+    };
+    masked("selectedBits", Fixture::type(1), {
+        0, 0, 2, 2, 0, 63, 2, 3, 0, 64, 3, 4, 0, 175, 3, 59,
+        0, 350, 4, 335, 0, 351, 4, 55, 1, 351, 5, 55});
+    masked("selected3", Fixture::type(3), {
+        0, 63, 2, 3, 0, 64, 2, 33, 0, 128, 3, 6,
+        0, 175, 4, 79, 0, 351, 4, 333, 1, 350, 5, 53});
+    // Include both one-leaf and cross-leaf static windows.
+    masked("selectedArray", Fixture::type(6, {2, 3}), {
+        0, 127, 4, 57, 0, 128, 3, 4, 0, 255, 2, 2, 1, 351, 5, 17});
+    masked("selectedWideArray", Fixture::type(48, {2, 3}), {
+        0, 1, 4, 8, 0, 65, 4, 64, 0, 129, 4, 119, 0, 351, 4, 40});
+    masked("selected56", Fixture::type(56), {
+        0, 63, 4, 56, 0, 175, 4, 280, 1, 351, 5, 0});
+    fixture.graph.bindOutputPort("slice3", slice(data3, 33, Fixture::type(3)));
+    fixture.graph.bindOutputPort("slice5", slice(data5, 55, Fixture::type(5)));
+    fixture.graph.bindOutputPort("sliceArray", slice(data56, 58, Fixture::type(6, {2, 3})));
+    fixture.graph.bindOutputPort("sliceLast", slice(data56, 331, Fixture::type(5)));
+    fixture.graph.bindOutputPort("sliceCross", slice(data3, 2, Fixture::type(4)));
+    const auto reference = fixture.design.clone();
+    fixture.split(); fixture.partition();
+    std::vector<std::map<std::string, uint64_t>> inputs;
+    uint64_t random = UINT64_C(0xa45c3e2970b681df);
+    for (unsigned step = 0; step < 32; ++step) {
+        random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+        const auto control = step == 0 ? uint64_t{0} : step == 1 ? UINT64_MAX :
+            step < 10 ? uint64_t{1} << (std::array<unsigned, 8>{0, 1, 31, 46, 47, 63, 62, 32}[step - 2]) : random;
+        inputs.push_back({{"flags", control}, {"bits3", (random ^ (random >> 21)) & UINT64_C(0xfffffffff)},
+            {"bits5", (random ^ (random << 11)) & UINT64_C(0xfffffffffffffff)},
+            {"bits56", (random ^ (random >> 9)) & UINT64_C(0xffffffffffffff)}});
+    }
+    for (const auto budget : {16, 1024}) {
+        const auto label = "masked-view-bits-b" + std::to_string(budget);
+        writeCase(fixture, reference, inputs, label, budget, 4096);
+        std::string generated;
+        for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
+            if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
+        require(generated.find("packed" + std::to_string(controls.index) + "_") == std::string::npos,
+                "Static masked views packed the entire 352-bit control array");
+        require(generated.find("packed" + std::to_string(data3.index) + "_") == std::string::npos,
+                "Cross-leaf static extraction packed its entire source array");
+        std::ofstream make(artifact("Makefile"), std::ios::app);
+        make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+    }
+}
+
 void testLargeConcatExpressions() {
     Fixture fixture;
     const auto bit = fixture.input("bit");
@@ -1117,6 +1956,13 @@ for (unsigned epoch=0;epoch<3;++epoch) {
 void testArrayViewElision() {
     Fixture fixture;
     std::string prepare, verify;
+    const auto scalarSource = fixture.input("scalar_source", 48);
+    const auto localShape = fixture.compute(OperationKind::kAssign, Fixture::type(48, {2, 4}), {scalarSource});
+    const auto localFlat = fixture.compute(OperationKind::kAssign, Fixture::type(48), {localShape});
+    const auto localView = fixture.compute(OperationKind::kAssign, Fixture::type(48, {4, 2}), {localFlat});
+    fixture.graph.bindOutputPort("local_view", localView);
+    prepare += "model.scalar_source=UINT64_C(0x123456789abc)^step;\n";
+    verify += "for(unsigned i=0;i<8;++i) assert(model.local_view[i/2][i%2]==((model.scalar_source>>(i*6))&63));\n";
     // Value::users() belongs to its snapshot. Force heap-backed use storage
     // so iterating a span from a destroyed temporary cannot pass accidentally.
     const auto shared = fixture.graph.createValue(fixture.graph.internSymbol("shared"), Fixture::type(48, {2, 4}));
@@ -1162,7 +2008,7 @@ void testArrayViewElision() {
             "for (unsigned epoch=0;epoch<3;++epoch) { model.init(); for (unsigned step=0;step<8;++step) {\n" +
             prepare + "model.eval();\n" + verify + "} }", false);
         const auto manifest = readFile(artifact(label) / "model/manifest.json");
-        require(manifest.find("\"array_view_elisions\": 17") != std::string::npos,
+        require(manifest.find("\"array_view_elisions\": 18") != std::string::npos,
                 "Expected private scalar views, including the shared high-fanout view, to avoid materialization");
     }
 }
@@ -1458,8 +2304,825 @@ void generateObservationModels() {
 }
 }
 
+namespace {
+void testSharedPayloadEnableSets() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clockA = fixture.input("sets_clock_a"), clockB = fixture.input("sets_clock_b");
+    const auto controls = fixture.input("sets_controls", 32), observedData = fixture.input("sets_observed_data", 8);
+    const auto next = fixture.input("sets_next", 12), priorityA = fixture.input("sets_priority_a");
+    const auto priorityB = fixture.input("sets_priority_b"), priorityData = fixture.input("sets_priority_data", 12);
+    const auto data = graph.createValue(graph.internSymbol("sets_data"), Fixture::type(16, {2}));
+    graph.bindInputPort("sets_data", data);
+    const auto one = fixture.constant(1, "1'b1"), zeroIndex = fixture.constant(3, "3'd0");
+    const auto seven = fixture.constant(8, "8'd7"), maskA = fixture.constant(12, "12'h135");
+    const auto maskC = fixture.constant(12, "12'h276"), priorityMask = fixture.constant(12, "12'hff0");
+    const auto source = fixture.state("sets_source", 12);
+    fixture.write(OperationKind::kRegisterWritePort, source, {one, next, clockA});
+    graph.bindOutputPort("sets_source_out", fixture.read(source));
+    const auto tag = [&](grh::ValueId value, const std::string& role) {
+        graph.setAttr(graph.valueDef(value), "test.sharedRole", role);
+        return value;
+    };
+    for (const bool large : {false, true}) {
+        const std::string prefix = large ? "large" : "small";
+        for (unsigned writer = 0; writer < 4; ++writer) {
+            const auto width = writer == 3 ? 8 : 12;
+            const auto state = fixture.state("sets_" + prefix + std::to_string(writer), large ? width * 8 : width,
+                                             large ? std::vector<int64_t>{8} : std::vector<int64_t>{});
+            const auto index = fixture.input("sets_" + prefix + "_index" + std::to_string(writer), 5);
+            const auto enable = tag(fixture.compute(OperationKind::kSliceDynamic, Fixture::type(1), {controls, index}),
+                                    prefix + "/enable" + std::to_string(writer));
+            grh::ValueId payload;
+            if (writer < 3) {
+                const auto root = tag(fixture.compute(OperationKind::kXor, Fixture::type(16, {2}),
+                                                      {data, fixture.read(source)}), prefix + "/root");
+                const auto slice = [&](unsigned offset, const std::string& role) {
+                    const auto value = tag(fixture.compute(OperationKind::kSliceStatic, Fixture::type(12), {root}), prefix + '/' + role);
+                    graph.setAttr(graph.valueDef(value), "sliceStart", int64_t{offset});
+                    graph.setAttr(graph.valueDef(value), "sliceEnd", int64_t{offset + 11});
+                    return value;
+                };
+                if (writer == 0) payload = tag(fixture.compute(OperationKind::kXor, Fixture::type(12),
+                                                               {slice(0, "ab"), maskA}), prefix + "/a");
+                else if (writer == 1) payload = tag(fixture.compute(OperationKind::kXor, Fixture::type(12),
+                                                                    {slice(0, "ab"), slice(4, "bc")}), prefix + "/b");
+                else payload = tag(fixture.compute(OperationKind::kXor, Fixture::type(12),
+                                                    {slice(4, "bc"), maskC}), prefix + "/c");
+            } else {
+                payload = tag(fixture.compute(OperationKind::kAdd, Fixture::type(8), {observedData, seven}), prefix + "/observed");
+                graph.setValueSymbol(payload, graph.internSymbol("sets_" + prefix + "_observed"));
+                graph.addDeclaredSymbol(graph.valueSymbol(payload));
+            }
+            fixture.write(large ? OperationKind::kRegisterFillPort : OperationKind::kRegisterWritePort,
+                          state, {enable, payload, clockA});
+            graph.bindOutputPort("sets_" + prefix + std::to_string(writer), fixture.read(state));
+        }
+    }
+    const auto priority = fixture.state("sets_priority", 12);
+    fixture.write(OperationKind::kRegisterWritePort, priority, {priorityA, priorityData, clockB});
+    fixture.write(OperationKind::kRegisterWritePort, priority, {priorityB, next, clockB});
+    fixture.write(OperationKind::kRegisterWriteMaskPort, priority, {priorityA, priorityData, priorityMask, clockB});
+    graph.bindOutputPort("sets_priority_out", fixture.read(priority));
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
+    run(fixture.design, "grhsim-simplify", fixture.session);
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session);
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    std::map<std::string, std::string> siteNames;
+    std::map<std::string, Owner> owners;
+    for (const auto op : graph.operations()) {
+        const auto role = sim::attribute<std::string>(graph, op, "test.sharedRole");
+        if (!role) continue;
+        require(siteNames.emplace(*role, std::string(graph.symbolText(graph.operationSymbol(op)))).second,
+                "Shared payload fixture did not CSE its duplicate sink-private producers");
+        const auto path = owner(graph, op);
+        require(path.size() == 3 && path[0] == "general" && path[1] == (role->starts_with("large") ? "large-sink" : "small-sink"),
+                "Shared payload fixture lost a local enable, shared payload or observed result");
+        const auto category = role->substr(0, role->find('/'));
+        const auto [found, inserted] = owners.emplace(category, path);
+        require(inserted || found->second == path, "Shared payload fixture split a subset across writer groups");
+    }
+    require(siteNames.size() == 22, "Shared payload fixture lost its expected guarded operation sites");
+    const std::string support = R"CPP(
+#include "fstapi.h"
+#include <map>
+struct SetsWave {
+    std::map<fstHandle,std::string> names;
+    std::map<std::string,std::map<std::uint64_t,unsigned>> values;
+    static void change(void *context, std::uint64_t time, fstHandle handle, const unsigned char *bits) {
+        auto& self = *static_cast<SetsWave*>(context);
+        const auto& name = self.names.at(handle);
+        if (name == "sets_small_observed" || name == "sets_large_observed")
+            self.values[name][time] = std::stoul(reinterpret_cast<const char*>(bits), nullptr, 2);
+    }
+    unsigned at(const std::string& name, std::uint64_t time) const {
+        const auto& series = values.at(name); const auto entry = series.upper_bound(time);
+        assert(entry != series.begin()); return std::prev(entry)->second;
+    }
+};
+)CPP";
+    const std::string body = R"CPP(
+const std::array<unsigned,12> masks{0,2,1,4,3,6,5,7,0,8,2,0};
+for (unsigned epoch = 0; epoch < 3; ++epoch) {
+    const auto path = "sets-" + std::to_string(epoch) + ".fst";
+    model.configure_waveform(true, path.c_str()); model.init();
+    std::array<unsigned,4> expected{}; unsigned source = 0, priority = 0, observed = 0;
+    std::array<unsigned,11> expectedCounts{}; std::array<unsigned,36> observations{};
+    for (unsigned step = 0; step < masks.size(); ++step) {
+        const auto mask = masks[step]; const unsigned data = (0xabcd + step * 197 + epoch * 313) & 65535;
+        model.sets_clock_a = false; model.sets_clock_b = false; model.sets_controls = mask;
+        model.sets_data[0] = data & 255; model.sets_data[1] = data >> 8;
+        model.sets_observed_data = 17 * step + epoch; model.sets_next = (step * 53 + epoch * 17 + 11) & 4095;
+        model.sets_priority_a = step % 3 != 0; model.sets_priority_b = step % 4 != 0;
+        model.sets_priority_data = (data >> 3) & 4095;
+        model.sets_small_index0 = model.sets_large_index0 = 0;
+        model.sets_small_index1 = model.sets_large_index1 = 1;
+        model.sets_small_index2 = model.sets_large_index2 = 2;
+        model.sets_small_index3 = model.sets_large_index3 = 3;
+        model.eval(); observations[step * 3] = observed;
+        const bool edge = step % 3 != 2; model.sets_clock_a = edge; model.sets_clock_b = true;
+        if (edge) {
+            const unsigned root = data ^ source, ab = root & 4095, bc = root >> 4;
+            if (mask & 1) expected[0] = ab ^ 0x135;
+            if (mask & 2) expected[1] = ab ^ bc;
+            if (mask & 4) expected[2] = bc ^ 0x276;
+            observed = (model.sets_observed_data + 7) & 255;
+            if (mask & 8) expected[3] = observed;
+            source = model.sets_next;
+            expectedCounts[0] += (mask & 7) != 0; expectedCounts[1] += (mask & 3) != 0;
+            expectedCounts[2] += (mask & 6) != 0;
+            for (unsigned bit = 0; bit < 3; ++bit) expectedCounts[3 + bit] += (mask >> bit) & 1;
+            for (unsigned site = 6; site < 11; ++site) ++expectedCounts[site];
+        }
+        if (model.sets_priority_a) priority = model.sets_priority_data;
+        if (model.sets_priority_b) priority = model.sets_next;
+        if (model.sets_priority_a) priority = (priority & 15) | (model.sets_priority_data & 0xff0);
+        model.eval(); observations[step * 3 + 1] = observed;
+        assert(model.sets_source_out == source && model.sets_priority_out == priority);
+        assert(model.sets_small0 == expected[0] && model.sets_small1 == expected[1]);
+        assert(model.sets_small2 == expected[2] && model.sets_small3 == expected[3]);
+        for (unsigned row = 0; row < 8; ++row) {
+            assert(model.sets_large0[row] == expected[0] && model.sets_large1[row] == expected[1]);
+            assert(model.sets_large2[row] == expected[2] && model.sets_large3[row] == expected[3]);
+        }
+        model.eval(); observations[step * 3 + 2] = observed;
+    }
+    auto *counts = std::fopen("shared-enable-counts.tsv", "w+"); assert(counts);
+    model.dump_execution_counts(counts); std::rewind(counts); char line[256];
+    assert(std::fgets(line, sizeof(line), counts) && std::fgets(line, sizeof(line), counts));
+    std::map<unsigned,unsigned long long> sites;
+    while (std::fgets(line, sizeof(line), counts)) {
+        unsigned site; unsigned long long count;
+        if (std::sscanf(line, "%u\t%llu", &site, &count) == 2) sites[site] = count;
+    }
+    std::fclose(counts);
+    for (unsigned category = 0; category < 2; ++category) for (unsigned site = 0; site < 11; ++site)
+        assert(sites.at(sharedEnableSites[category * 11 + site]) == expectedCounts[site]);
+    model.configure_waveform(false); auto *reader = fstReaderOpen(path.c_str()); assert(reader); SetsWave wave;
+    while (auto *entry = fstReaderIterateHier(reader)) if (entry->htyp == FST_HT_VAR)
+        wave.names.emplace(entry->u.var.handle, entry->u.var.name);
+    fstReaderSetFacProcessMaskAll(reader); assert(fstReaderIterBlocks2(reader, SetsWave::change, nullptr, &wave, nullptr));
+    for (unsigned time = 0; time < observations.size(); ++time) {
+        assert(wave.at("sets_small_observed", time) == observations[time]);
+        assert(wave.at("sets_large_observed", time) == observations[time]);
+    }
+    fstReaderClose(reader);
+}
+)CPP";
+    for (const auto budget : {16, 1024}) for (const std::string bitmap : {"on", "off"}) {
+        const auto label = "shared-payload-enables-" + bitmap + "-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, true,
+                   {{"execution-counters", "on"}, {"mem-enable-bitmap", bitmap}, {"mem-write-activate", "on-change"}});
+        const auto manifest = readFile(artifact(label) / "model/manifest.json");
+        const std::regex allSites(R"REGEX(\{"operation":"([^"]+)","category":"([^"]+)","function":"[^"]+"\})REGEX");
+        std::map<std::string,unsigned> sites; unsigned index = 0;
+        for (std::sregex_iterator it(manifest.begin(), manifest.end(), allSites), end; it != end; ++it, ++index)
+            if ((*it)[2] == "operation") sites.emplace((*it)[1], index);
+        std::string declaration = "static const std::array<unsigned,22> sharedEnableSites{";
+        for (const std::string prefix : {"small", "large"})
+            for (const std::string role : {"root", "ab", "bc", "a", "b", "c", "enable0", "enable1", "enable2", "enable3", "observed"}) {
+                const auto& name = siteNames.at(prefix + '/' + role);
+                require(sites.contains(name), "Shared enable-set operation has no execution counter");
+                declaration += std::to_string(sites.at(name)) + ',';
+            }
+        declaration += "};\n";
+        const auto driverPath = artifact(label) / "driver.cpp";
+        auto driver = readFile(driverPath); driver.insert(driver.find("int main()"), declaration);
+        std::ofstream(driverPath) << driver;
+    }
+}
+
+void testSnapshotIdentityViews() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("identity_clock"), enable = fixture.input("identity_enable"), select = fixture.input("identity_select");
+    const auto next = graph.createValue(graph.internSymbol("identity_next"), Fixture::type(512, {8}));
+    graph.bindInputPort("identity_next", next);
+    const auto source = fixture.state("identity_source", 512, {8});
+    const auto saved = fixture.read(source); graph.bindOutputPort("identity_source_out", saved);
+    fixture.write(OperationKind::kRegisterWritePort, source, {enable, next, clock});
+    const auto assemble = [&](bool reverse, std::string role) {
+        std::vector<grh::ValueId> parts;
+        for (int64_t i = 0; i < 8; ++i) {
+            const auto part = fixture.compute(OperationKind::kSliceStatic, Fixture::type(64), {saved});
+            graph.setAttr(graph.valueDef(part), "sliceStart", i * 64);
+            graph.setAttr(graph.valueDef(part), "sliceEnd", i * 64 + 63); parts.push_back(part);
+        }
+        const auto op = graph.createOperation(OperationKind::kArrayCreate, graph.internSymbol("identity_create_" + role));
+        for (unsigned i = 0; i < 8; ++i) graph.addOperand(op, parts[reverse ? 7 - i : i]);
+        const auto value = graph.createValue(Fixture::type(512, {8})); graph.addResult(op, value); return value;
+    };
+    const auto identity = assemble(false, "identity"), reordered = assemble(true, "reordered");
+    const auto observed = assemble(false, "observed"); graph.bindOutputPort("identity_observed", observed);
+    const auto flat = fixture.compute(OperationKind::kAssign, Fixture::type(512), {identity});
+    const auto shaped = fixture.compute(OperationKind::kAssign, Fixture::type(512, {8}), {flat});
+    const auto payload = fixture.compute(OperationKind::kMux, Fixture::type(512), {select, shaped, fixture.constant(512, "0")});
+    const auto target = fixture.state("identity_target", 512, {8}), reverseTarget = fixture.state("identity_reverse", 512, {8});
+    fixture.write(OperationKind::kRegisterWritePort, target, {enable, payload, clock});
+    fixture.write(OperationKind::kRegisterWritePort, reverseTarget, {enable, reordered, clock});
+    graph.bindOutputPort("identity_target_out", fixture.read(target));
+    graph.bindOutputPort("identity_reverse_out", fixture.read(reverseTarget));
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split(); fixture.partition();
+    for (const auto budget : {16, 1024}) {
+        const auto label = "snapshot-identity-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, "", R"CPP(
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); std::array<std::uint64_t,8> saved{}, target{}, reversed{};
+    for(unsigned step=0;step<12;++step) {
+        model.identity_clock=0; model.identity_enable=step%4!=2; model.identity_select=step%3!=0;
+        for(unsigned i=0;i<8;++i) model.identity_next[i]=UINT64_C(0x123456789abcdef0)^(epoch*101+step*37+i*19);
+        model.eval(); model.identity_clock=1; model.eval();
+        if(model.identity_enable) {
+            for(unsigned i=0;i<8;++i) { target[i]=model.identity_select?saved[i]:0; reversed[i]=saved[7-i]; }
+            saved=model.identity_next;
+        }
+        assert(model.identity_source_out==saved && model.identity_observed==saved);
+        assert(model.identity_target_out==target && model.identity_reverse_out==reversed);
+        model.eval(); assert(model.identity_target_out==target && model.identity_reverse_out==reversed);
+    }
+}
+)CPP", true, {{"execution-counters", "on"}});
+        const auto manifest = readFile(artifact(label) / "model/manifest.json");
+        const auto elided = manifest.substr(manifest.find("\"elided_operations\""));
+        bool hit = false, observedSite = false;
+        for (const auto op : graph.operations()) {
+            const auto name = std::string(graph.getOperation(op).symbolText());
+            if (name.find("identity_create_") == std::string::npos) continue;
+            const bool removed = elided.find("\"" + name + "\"") != std::string::npos;
+            if (name.find("identity_create_identity") != std::string::npos) hit |= removed;
+            if (name.find("identity_create_reordered") != std::string::npos) require(!removed, "Reordered ArrayCreate was identity-elided");
+            if (name.find("identity_create_observed") != std::string::npos && !removed)
+                observedSite |= manifest.find("\"operation\":\"" + name + "\"") != std::string::npos;
+        }
+        require(hit && observedSite, "Snapshot identity did not elide or observed ArrayCreate lost its counter");
+    }
+}
+
+void testLeafAssemblyViews() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("leaf_clock"), enableA = fixture.input("leaf_enable_a");
+    const auto enableB = fixture.input("leaf_enable_b"), index = fixture.input("leaf_index", 8);
+    const auto next = graph.createValue(graph.internSymbol("leaf_next"), Fixture::type(1344, {224, 3}));
+    graph.bindInputPort("leaf_next", next);
+    const auto source = fixture.state("leaf_source", 1344, {224, 3});
+    fixture.write(OperationKind::kRegisterWritePort, source, {enableA, next, clock});
+    graph.bindOutputPort("leaf_source_out", fixture.read(source));
+    std::map<std::string, std::vector<std::string>> sites;
+    const auto tag = [&](grh::ValueId value, const std::string& role) {
+        const auto name = "leaf_" + role;
+        graph.setOpSymbol(graph.valueDef(value), graph.internSymbol(name)); sites[role].push_back(name); return value;
+    };
+    // sn4296: 224 rows of three 2-bit leaves, with one selected row
+    // repeated 32 times above the complete old-state snapshot.
+    const auto assemble = [&](const std::string& role) {
+        const auto row = fixture.read(source, {index});
+        const auto flat = tag(fixture.compute(OperationKind::kAssign, Fixture::type(6), {row}), role + "_row");
+        const auto repeat = tag(fixture.compute(OperationKind::kReplicate, Fixture::type(192), {flat}), role + "_repeat");
+        graph.setAttr(graph.valueDef(repeat), "rep", int64_t{32});
+        const auto whole = tag(fixture.read(source), role + "_snapshot");
+        const auto concat = tag(fixture.compute(OperationKind::kConcat, Fixture::type(1536), {repeat, whole}), role + "_concat");
+        return tag(fixture.compute(OperationKind::kAssign, Fixture::type(1536, {256, 3}), {concat}), role + "_result");
+    };
+    graph.bindOutputPort("leaf_live", assemble("live"));
+    std::vector<grh::OperationId> writers;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto target = fixture.state("leaf_target" + std::to_string(i), 1536, {256, 3});
+        const auto payload = assemble("target" + std::to_string(i));
+        writers.push_back(fixture.write(OperationKind::kRegisterWritePort, target, {i == 1 ? enableB : enableA, payload, clock}));
+        graph.bindOutputPort("leaf_target" + std::to_string(i), fixture.read(target));
+    }
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=4096"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session);
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    const auto writerOwner = owner(graph, writers[0]);
+    require(owner(graph, writers[1]) == writerOwner && owner(graph, writers[2]) == writerOwner,
+            "Leaf assembly A/B/A writers did not share an execution owner");
+    for (const auto& [role, names] : sites) for (const auto& name : names)
+        require(bool(graph.findOperation(name)), "Leaf assembly fixture lost operation: " + role);
+    const std::string body = R"CPP(
+for (unsigned epoch = 0; epoch < 3; ++epoch) {
+    model.init();
+    std::array<std::array<std::uint8_t,3>,224> saved{};
+    std::array<std::array<std::array<std::uint8_t,3>,256>,3> expected{};
+    const auto assemble = [&](const auto& data, unsigned index) {
+        std::array<std::array<std::uint8_t,3>,256> result{};
+        for (unsigned row = 0; row < 224; ++row) result[row] = data[row];
+        if (index < 224) for (unsigned row = 224; row < 256; ++row) result[row] = data[index];
+        return result;
+    };
+    for (unsigned step = 0; step < 16; ++step) {
+        model.leaf_clock = 0; model.leaf_enable_a = step % 4 != 1; model.leaf_enable_b = step % 3 == 1;
+        model.leaf_index = step % 4 == 3 ? 255 : (step * 37 + epoch * 13) % 224;
+        for (unsigned row = 0; row < 224; ++row) for (unsigned col = 0; col < 3; ++col)
+            model.leaf_next[row][col] = (row + col * 3 + step * 2 + epoch) & 3;
+        model.eval(); const auto old = assemble(saved, model.leaf_index);
+        assert(model.leaf_live == old);
+        model.leaf_clock = 1; model.eval();
+        if (model.leaf_enable_a) { expected[0] = old; expected[2] = old; saved = model.leaf_next; }
+        if (model.leaf_enable_b) expected[1] = old;
+        assert(model.leaf_source_out == saved && model.leaf_live == assemble(saved, model.leaf_index));
+        assert(model.leaf_target0 == expected[0] && model.leaf_target1 == expected[1] && model.leaf_target2 == expected[2]);
+        model.eval();
+        assert(model.leaf_target0 == expected[0] && model.leaf_target1 == expected[1] && model.leaf_target2 == expected[2]);
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "leaf-assembly-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, "", body, false, {{"execution-counters", "on"}});
+        const auto manifest = readFile(artifact(label) / "model/manifest.json");
+        const auto elided = manifest.substr(manifest.find("\"elided_operations\""));
+        for (const auto& [role, names] : sites) for (const auto& name : names) {
+            if (role.ends_with("_repeat") || role.ends_with("_concat"))
+                require(elided.find("\"" + name + "\"") != std::string::npos, "Private leaf assembly scalar was materialized: " + role);
+            if (role.ends_with("_snapshot"))
+                require(elided.find("\"" + name + "\"") == std::string::npos &&
+                            manifest.find("\"operation\":\"" + name + "\"") != std::string::npos,
+                        "Leaf assembly removed a RegisterRead snapshot");
+        }
+        std::string generated;
+        for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
+            if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
+        require(generated.find("_BitInt(1344)") == std::string::npos && generated.find("_BitInt(1536)") == std::string::npos,
+                "Leaf assembly retained a whole-array wide scalar pack");
+    }
+}
+
+
+void testLeafAssemblyEdges() {
+    Fixture edges; auto& edgeGraph = edges.graph;
+    std::map<std::string, std::vector<std::string>> edgeSites;
+    const auto edgeInput = [&](std::string_view name, const grh::LogicalType& type) {
+        const auto value = edgeGraph.createValue(edgeGraph.internSymbol(name), type);
+        edgeGraph.bindInputPort(name, value); return value;
+    };
+    const auto edgeTag = [&](grh::ValueId value, const std::string& role) {
+        const auto name = "leaf_edge_" + role;
+        edgeGraph.setOpSymbol(edgeGraph.valueDef(value), edgeGraph.internSymbol(name)); edgeSites[role].push_back(name); return value;
+    };
+    const auto edgeClock = edges.input("edge_clock"), edgeEnable = edges.input("edge_enable");
+    const auto secondClock = edges.input("edge_second_clock");
+    const auto select = edges.input("edge_select"), nibble = edges.input("edge_nibble", 4);
+    auto signedLeaves = Fixture::type(64, {2, 8}); signedLeaves.isSigned = true;
+    const auto signedData = edgeInput("edge_signed", signedLeaves);
+    const auto tiny = edgeInput("edge_tiny", Fixture::type(16, {2, 2}));
+    const auto repeated = edgeTag(edges.compute(OperationKind::kReplicate, Fixture::type(16), {nibble}), "signed_repeat");
+    edgeGraph.setAttr(edgeGraph.valueDef(repeated), "rep", int64_t{4});
+    const auto forward = edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(96), {tiny, repeated, signedData}), "signed_forward");
+    const auto reverse = edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(96), {signedData, repeated, tiny}), "signed_reverse");
+    const auto chosen = edgeTag(edges.compute(OperationKind::kMux, Fixture::type(96), {select, forward, reverse}), "signed_mux");
+    auto signedResult = Fixture::type(96, {2, 3, 4}); signedResult.isSigned = true;
+    edgeGraph.bindOutputPort("edge_signed_result", edges.compute(OperationKind::kAssign, signedResult, {chosen}));
+    edgeGraph.bindOutputPort("edge_shaped_mux", edgeTag(edges.compute(OperationKind::kMux, signedResult,
+        {select, forward, reverse}), "root_shaped_mux"));
+    const auto five = edges.input("edge_five", 5), low70 = edgeInput("edge_low70", Fixture::type(70, {14}));
+    const auto bad = edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(75), {five, low70}), "misaligned");
+    edgeGraph.bindOutputPort("edge_misaligned", edges.compute(OperationKind::kAssign, Fixture::type(75, {25}), {bad}));
+    const auto stopData = edgeInput("edge_stop_data", Fixture::type(64, {8}));
+    const auto wideScalar = [&](const std::string& role) {
+        return edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(128), {stopData, stopData}), role);
+    };
+    const auto stored = wideScalar("stored");
+    edgeGraph.setValueSymbol(stored, edgeGraph.internSymbol("edge_stored_value"));
+    edgeGraph.addDeclaredSymbol(edgeGraph.valueSymbol(stored));
+    const auto observed = wideScalar("observed");
+    edgeGraph.setValueSymbol(observed, edgeGraph.internSymbol("edge_observed_value"));
+    edgeGraph.addDeclaredSymbol(edgeGraph.valueSymbol(observed));
+    edgeGraph.bindOutputPort("edge_stored", edges.compute(OperationKind::kAssign, Fixture::type(128, {16}), {stored}));
+    edgeGraph.bindOutputPort("edge_observed", edges.compute(OperationKind::kAssign, Fixture::type(128, {16}), {observed}));
+    const auto cross = wideScalar("cross_owner");
+    edgeGraph.bindOutputPort("edge_cross_live", edges.compute(OperationKind::kAssign, Fixture::type(128, {16}), {cross}));
+    const auto crossTarget = edges.state("edge_cross_target", 128, {16});
+    const auto crossPayload = edges.compute(OperationKind::kAssign, Fixture::type(128, {16}), {cross});
+    edges.write(OperationKind::kRegisterWritePort, crossTarget,
+                {edgeEnable, crossPayload, edgeClock});
+    edgeGraph.bindOutputPort("edge_cross_saved", edges.read(crossTarget));
+    const auto crossSecond = edges.state("edge_cross_second", 128, {16});
+    const auto secondPayload = edges.compute(OperationKind::kAssign, Fixture::type(128, {16}), {cross});
+    edges.write(OperationKind::kRegisterWritePort, crossSecond,
+                {edgeEnable, secondPayload, secondClock});
+    edgeGraph.bindOutputPort("edge_cross_second", edges.read(crossSecond));
+
+    // One 64-bit intermediate can be a terminal for 32-bit leaves and an
+    // expandable concat for 1-bit leaves. The first plan still needs its value.
+    const auto high3 = edges.input("edge_high3", 3), low61 = edges.input("edge_low61", 61);
+    const auto mixed = edgeTag(edges.compute(OperationKind::kConcat, Fixture::type(64), {high3, low61}), "mixed_terminal");
+    const auto mixedConcat = edges.compute(OperationKind::kConcat, Fixture::type(128), {mixed, mixed});
+    const auto mixedWords = edges.compute(OperationKind::kAssign, Fixture::type(128, {4}), {mixedConcat});
+    const auto mixedBits = edges.compute(OperationKind::kAssign, Fixture::type(128, {128}), {mixedConcat});
+    edgeGraph.bindOutputPort("edge_mixed_words", mixedWords);
+    edgeGraph.bindOutputPort("edge_mixed_bits", mixedBits);
+    const auto control = edgeTag(edges.compute(OperationKind::kAssign, Fixture::type(1), {select}), "mux_control");
+    const auto controlRepeat = edges.compute(OperationKind::kReplicate, Fixture::type(128), {control});
+    edgeGraph.setAttr(edgeGraph.valueDef(controlRepeat), "rep", int64_t{128});
+    const auto controlMux = edges.compute(OperationKind::kMux, Fixture::type(128), {control, controlRepeat, mixedConcat});
+    edgeGraph.bindOutputPort("edge_control_bits", edges.compute(OperationKind::kAssign, Fixture::type(128, {128}), {controlMux}));
+
+    run(edges.design, "grh-to-grhsim", edges.session); edges.split(); edges.partition();
+    require(owner(edgeGraph, edgeGraph.valueDef(mixed)) == owner(edgeGraph, edgeGraph.valueDef(mixedWords)) &&
+                owner(edgeGraph, edgeGraph.valueDef(mixed)) == owner(edgeGraph, edgeGraph.valueDef(mixedBits)),
+            "Mixed-leaf terminal fixture unexpectedly crossed an execution owner");
+    const auto crossOwner = owner(edgeGraph, edgeGraph.valueDef(cross));
+    require(crossOwner.size() == 4 && crossOwner[0] == "general" && crossOwner[1] == "nonsink",
+            "Cross-owner leaf assembly fixture did not retain a nonsink boundary");
+    const auto firstSink = owner(edgeGraph, edgeGraph.valueDef(crossPayload));
+    const auto secondSink = owner(edgeGraph, edgeGraph.valueDef(secondPayload));
+    require(firstSink.size() == 3 && firstSink[1] == "small-sink" &&
+                secondSink.size() == 3 && secondSink[1] == "small-sink" && firstSink != secondSink &&
+                edgeGraph.opOperands(edgeGraph.valueDef(crossPayload))[0] == cross &&
+                edgeGraph.opOperands(edgeGraph.valueDef(secondPayload))[0] == cross,
+            "Cross-owner leaf assembly fixture lost its two distinct sink consumers");
+    for (const auto& [role, names] : edgeSites) for (const auto& name : names)
+        require(bool(edgeGraph.findOperation(name)), "Leaf assembly edge fixture lost operation: " + role);
+    const std::string edgeBody = R"CPP(
+for (unsigned epoch = 0; epoch < 3; ++epoch) {
+    model.init(); std::array<std::uint8_t,16> saved{};
+    for (unsigned step = 0; step < 16; ++step) {
+        model.edge_clock = 0; model.edge_second_clock = 0; model.edge_enable = step % 3 != 0; model.edge_select = step % 2;
+        model.edge_nibble = (step * 3 + epoch) & 15; model.edge_five = (step * 7 + epoch) & 31;
+        model.edge_high3 = (step + epoch) & 7;
+        model.edge_low61 = (UINT64_C(0x123456789abcdef) * (step + 1) + epoch) & ((UINT64_C(1) << 61) - 1);
+        for (unsigned i = 0; i < 16; ++i) model.edge_signed[i / 8][i % 8] = static_cast<std::int8_t>(((i * 7 + step * 5 + epoch) & 15) - 8);
+        for (unsigned i = 0; i < 4; ++i) model.edge_tiny[i / 2][i % 2] = (step * 3 + i * 7 + epoch) & 15;
+        for (unsigned i = 0; i < 14; ++i) model.edge_low70[i] = (step * 11 + i * 7 + epoch) & 31;
+        for (unsigned i = 0; i < 8; ++i) model.edge_stop_data[i] = (step * 13 + i * 29 + epoch) & 255;
+        model.eval();
+        const unsigned repeat = model.edge_nibble * 0x1111;
+        unsigned __int128 source = 0; unsigned tiny = 0;
+        for (unsigned i = 0; i < 16; ++i) source |= static_cast<unsigned __int128>(unsigned(model.edge_signed[i / 8][i % 8]) & 15) << (i * 4);
+        for (unsigned i = 0; i < 4; ++i) tiny |= unsigned(model.edge_tiny[i / 2][i % 2]) << (i * 4);
+        const unsigned __int128 signedExpected = model.edge_select ? source | (static_cast<unsigned __int128>(repeat) << 64) |
+            (static_cast<unsigned __int128>(tiny) << 80) : tiny | (static_cast<unsigned __int128>(repeat) << 16) | (source << 32);
+        for (unsigned i = 0; i < 24; ++i)
+            assert(unsigned(model.edge_signed_result[i / 12][i / 4 % 3][i % 4]) == ((signedExpected >> (i * 4)) & 15));
+        assert(model.edge_shaped_mux == model.edge_signed_result);
+        unsigned __int128 misaligned = static_cast<unsigned __int128>(model.edge_five) << 70;
+        for (unsigned i = 0; i < 14; ++i) misaligned |= static_cast<unsigned __int128>(model.edge_low70[i]) << (i * 5);
+        for (unsigned i = 0; i < 25; ++i) assert(model.edge_misaligned[i] == ((misaligned >> (i * 3)) & 7));
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto value = model.edge_stop_data[i % 8];
+            assert(model.edge_stored[i] == value && model.edge_observed[i] == value && model.edge_cross_live[i] == value);
+        }
+        const std::uint64_t mixed = (std::uint64_t(model.edge_high3) << 61) | model.edge_low61;
+        for (unsigned i = 0; i < 4; ++i) assert(model.edge_mixed_words[i] == std::uint32_t(mixed >> (32 * (i % 2))));
+        for (unsigned i = 0; i < 128; ++i) {
+            const bool bit = (mixed >> (i % 64)) & 1;
+            assert(model.edge_mixed_bits[i] == bit && model.edge_control_bits[i] == (model.edge_select ? true : bit));
+        }
+        model.edge_clock = 1; model.edge_second_clock = 1; model.eval();
+        if (model.edge_enable) for (unsigned i = 0; i < 16; ++i) saved[i] = model.edge_stop_data[i % 8];
+        assert(model.edge_cross_saved == saved && model.edge_cross_second == saved);
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "leaf-assembly-edges-b" + std::to_string(budget);
+        manualCase(edges, label, budget, "", edgeBody, true, {{"execution-counters", "on"}});
+        const auto manifest = readFile(artifact(label) / "model/manifest.json");
+        const auto elided = manifest.substr(manifest.find("\"elided_operations\""));
+        for (const auto& [role, names] : edgeSites) for (const auto& name : names) {
+            const bool removed = elided.find("\"" + name + "\"") != std::string::npos;
+            if (role.starts_with("signed_")) require(removed, "Signed leaf assembly scalar did not elide: " + role);
+            else require(!removed && manifest.find("\"operation\":\"" + name + "\"") != std::string::npos,
+                         "Required leaf assembly terminal lost materialization or counters: " + role);
+        }
+    }
+}
+
+void indexedWakeSites(const std::string& label, const std::vector<std::string>& names) {
+    const auto manifest = readFile(artifact(label) / "model/manifest.json");
+    const std::regex entries(R"REGEX(\{"operation":"([^"]+)","category":"([^"]+)","function":"[^"]+"\})REGEX");
+    std::map<std::string, unsigned> sites; unsigned index = 0;
+    for (std::sregex_iterator it(manifest.begin(), manifest.end(), entries), end; it != end; ++it, ++index)
+        if ((*it)[2] == "operation") sites.emplace((*it)[1], index);
+    std::string declaration = "static const std::array<unsigned," + std::to_string(names.size()) + "> indexedWakeSites{";
+    for (const auto& name : names) {
+        require(sites.contains(name), "Indexed wake read lost its execution site: " + name);
+        declaration += std::to_string(sites.at(name)) + ',';
+    }
+    declaration += "};\n";
+    const auto path = artifact(label) / "driver.cpp";
+    auto driver = readFile(path); driver.insert(driver.find("static std::vector<unsigned long long> indexedWakeCounts"), declaration);
+    std::ofstream(path) << driver;
+}
+
+const std::string indexedWakeSupport = R"CPP(
+#include <cassert>
+#include <vector>
+static std::vector<unsigned long long> indexedWakeCounts(GrhSIM_top& model) {
+    auto* stream = std::tmpfile(); assert(stream); model.dump_execution_counts(stream); std::rewind(stream);
+    char line[256]; assert(std::fgets(line,sizeof(line),stream) && std::fgets(line,sizeof(line),stream));
+    std::vector<unsigned long long> counts;
+    while (std::fgets(line,sizeof(line),stream)) {
+        unsigned site; unsigned long long count;
+        if (std::sscanf(line,"%u\t%llu",&site,&count)!=2) break;
+        assert(site==counts.size()); counts.push_back(count);
+    }
+    std::fclose(stream); std::vector<unsigned long long> result;
+    for (const auto site : indexedWakeSites) result.push_back(counts.at(site));
+    return result;
+}
+)CPP";
+
+void testIndexedMemoryWake() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("iw_clock"), sampleClock=fixture.input("iw_sample_clock");
+    const auto sampleEnable=fixture.input("iw_sample_enable");
+    const auto enable = fixture.input("iw_enable"), middle = fixture.input("iw_middle"), last = fixture.input("iw_last");
+    const auto wholeEnable = fixture.input("iw_whole"), rowEnable = fixture.input("iw_row_write");
+    const auto writeRow = fixture.input("iw_write_row", 4), writeCol = fixture.input("iw_write_col", 4);
+    const auto data = fixture.input("iw_data", 8), middleData = fixture.input("iw_middle_data", 8);
+    const auto lastData = fixture.input("iw_last_data", 8), mask = fixture.input("iw_mask", 8);
+    const auto aRow = fixture.input("iw_a_row", 128), aCol = fixture.input("iw_a_col", 4);
+    const auto bRow = fixture.input("iw_b_row", 8), bCol = fixture.input("iw_b_col", 4);
+    auto signedIndex = Fixture::type(8); signedIndex.isSigned = true; graph.setValueLogicalType(bRow, signedIndex);
+    const auto readRow = fixture.input("iw_read_row", 4), extra = fixture.input("iw_extra", 8);
+    const auto shapedInput = [&](const std::string& name, int width, std::vector<int64_t> shape) {
+        const auto value = graph.createValue(graph.internSymbol(name), Fixture::type(width, std::move(shape)));
+        graph.bindInputPort(name, value); return value;
+    };
+    const auto wholeData = shapedInput("iw_whole_data", 768, {8,12}), rowData = shapedInput("iw_row_data", 96, {12});
+    const auto memory = fixture.state("indexed_memory", 768, {8,12});
+    const auto tag = [&](grh::ValueId value, const std::string& name) {
+        graph.setOpSymbol(graph.valueDef(value), graph.internSymbol(name)); return value;
+    };
+    const auto a = tag(fixture.read(memory, {aRow, aCol}), "indexed_wake_read_a");
+    const auto b = tag(fixture.read(memory, {bRow, bCol}), "indexed_wake_read_b");
+    const auto row = tag(fixture.read(memory, {readRow}), "indexed_wake_read_row");
+    const auto aResult=tag(fixture.compute(OperationKind::kXor, Fixture::type(8), {a, extra}), "indexed_wake_extra_fanout");
+    graph.bindOutputPort("iw_a", aResult);
+    graph.bindOutputPort("iw_b", b); graph.bindOutputPort("iw_row", row);
+    for (const auto& [name,value] : std::vector<std::pair<std::string,grh::ValueId>>{{"a",aResult},{"b",b},{"row",row}}) {
+        const auto type=graph.valueLogicalType(value);
+        const auto first=fixture.state("indexed_capture_"+name+"_a",type.width,type.shape);
+        const auto second=fixture.state("indexed_capture_"+name+"_b",type.width,type.shape);
+        fixture.write(OperationKind::kRegisterWritePort,first,{sampleEnable,value,clock});
+        fixture.write(OperationKind::kRegisterWritePort,second,{sampleEnable,value,sampleClock});
+    }
+    fixture.write(OperationKind::kRegisterWriteArrayMaskPort, memory, {enable, writeRow, writeCol, data, mask, clock});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memory, {middle, writeRow, writeCol, middleData, clock});
+    fixture.write(OperationKind::kRegisterWriteArrayMaskPort, memory, {last, writeRow, writeCol, lastData, mask, clock});
+    fixture.write(OperationKind::kRegisterWriteArrayPort, memory, {rowEnable, writeRow, rowData, clock});
+    fixture.write(OperationKind::kRegisterWritePort, memory, {wholeEnable, wholeData, clock});
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=1"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session,
+        {"-max-node-work=1", "-max-supernode-work=1", "-clone-shared=0"});
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
+    std::set<Owner> readers;
+    for (const auto value : {a,b,row}) {
+        const auto path = owner(graph, graph.valueDef(value));
+        require(path.size()==4 && path[0]=="general" && path[1]=="nonsink",
+                "Indexed wake fixture read is not an executable nonsink");
+        readers.insert(path);
+    }
+    require(readers.size()==3, "Indexed wake fixture merged independent read subscriptions");
+    const std::string body = R"CPP(
+for (unsigned epoch=0; epoch<3; ++epoch) {
+    model.init(); std::array<unsigned,96> expected{};
+    model.iw_clock=0; model.iw_sample_clock=0; model.iw_sample_enable=0;
+    model.iw_a_row=1; model.iw_a_col=1; model.iw_b_row=2; model.iw_b_col=2;
+    model.iw_read_row=5; model.iw_extra=0; model.iw_enable=0; model.iw_middle=0; model.iw_last=0;
+    model.iw_whole=0; model.iw_row_write=0;
+    for (unsigned i=0;i<96;++i) model.iw_whole_data[i/12][i%12]=i+17;
+    for (unsigned i=0;i<12;++i) model.iw_row_data[i]=i+71;
+    const auto check = [&] {
+        const bool av=model.iw_a_row<8 && model.iw_a_col<12;
+        const auto br=static_cast<unsigned>(static_cast<std::uint8_t>(model.iw_b_row));
+        assert(model.iw_a==((av?expected[static_cast<unsigned>(model.iw_a_row)*12+model.iw_a_col]:0)^model.iw_extra));
+        assert(model.iw_b==(br<8 && model.iw_b_col<12?expected[br*12+model.iw_b_col]:0));
+        for(unsigned i=0;i<12;++i) assert(model.iw_row[i]==(model.iw_read_row<8?expected[model.iw_read_row*12+i]:0));
+    };
+    model.eval(); check();
+    const auto pulse = [&](unsigned r,unsigned c,unsigned value,unsigned bits,unsigned flags) {
+        model.iw_clock=0; model.iw_write_row=r; model.iw_write_col=c; model.iw_data=value; model.iw_mask=bits;
+        model.iw_enable=flags&1; model.iw_middle=(flags>>1)&1; model.iw_last=(flags>>2)&1;
+        model.iw_row_write=(flags>>3)&1; model.iw_whole=(flags>>4)&1;
+        model.iw_middle_data=value^0xff; model.iw_last_data=value; model.eval(); check();
+        const auto before=indexedWakeCounts(model); const auto old=expected; std::array<bool,96> touched{};
+        if(r<8 && c<12) {
+            const unsigned i=r*12+c;
+            if(flags&1) { expected[i]=(expected[i]&(~bits&255))|(value&bits); touched[i]=true; }
+            if(flags&2) { expected[i]=value^0xff; touched[i]=true; }
+            if(flags&4) { expected[i]=(expected[i]&(~bits&255))|(value&bits); touched[i]=true; }
+        }
+        if((flags&8) && r<8) for(unsigned i=0;i<12;++i) { expected[r*12+i]=i+71; touched[r*12+i]=true; }
+        if(flags&16) for(unsigned i=0;i<96;++i) { expected[i]=i+17; touched[i]=true; }
+        model.iw_clock=1; model.eval(); check(); const auto after=indexedWakeCounts(model);
+        std::array<bool,3> hit{};
+        if(model.iw_a_row<8 && model.iw_a_col<12) hit[0]=touched[static_cast<unsigned>(model.iw_a_row)*12+model.iw_a_col];
+        const auto br=static_cast<unsigned>(static_cast<std::uint8_t>(model.iw_b_row));
+        if(br<8 && model.iw_b_col<12) hit[1]=touched[br*12+model.iw_b_col];
+        if(model.iw_read_row<8) for(unsigned i=0;i<12;++i) hit[2]=hit[2]||touched[model.iw_read_row*12+i];
+        for(unsigned i=0;i<3;++i) assert(after[i]-before[i]==(indexedWakeOnWrite?hit[i]:(old!=expected)));
+        const auto settled=after; model.eval(); assert(indexedWakeCounts(model)==settled); check();
+    };
+    pulse(6,3,19,255,1); // All three subscriptions are unrelated.
+    pulse(1,1,0,255,1); pulse(1,1,9,0,1); // Same value and zero mask still touch.
+    pulse(1,1,7,255,1); pulse(1,1,7,255,7); // A/B/A cancellation.
+    pulse(2,2,9,255,1); pulse(5,2,13,255,1);
+    pulse(5,3,21,255,1); pulse(5,4,22,255,1); // Row 5 spans touched bits 60..71, including both words.
+    pulse(15,1,99,255,1); pulse(1,15,99,255,1);
+    pulse(5,0,0,255,8); pulse(0,0,0,255,16); // Partial-row and whole writes.
+    model.iw_clock=0; model.iw_a_row=(static_cast<unsigned _BitInt(128)>(1)<<80)|1;
+    model.iw_b_row=-1; model.iw_read_row=8; model.eval(); check();
+    pulse(1,1,201,255,1); // Invalid reads cannot retain a valid subscription.
+    model.iw_clock=0; model.iw_a_row=1; model.iw_b_row=2; model.iw_read_row=5; model.eval(); check();
+    pulse(1,1,202,255,1); pulse(5,3,91,255,1);
+    const auto before=indexedWakeCounts(model); model.iw_extra=33; model.eval(); check();
+    const auto after=indexedWakeCounts(model);
+    for(unsigned i=0;i<3;++i) assert(after[i]==before[i]);
+    assert(after[3]>before[3]); // Independent input fanout must remain active.
+}
+)CPP";
+    for (const auto budget : {16u,1024u}) for (const std::string bitmap : {"on","off"})
+        for (const std::string mode : {"on-write","on-change"}) {
+            const auto label="indexed-wake-"+mode+"-"+bitmap+"-b"+std::to_string(budget);
+            manualCase(fixture,label,budget,"static constexpr bool indexedWakeOnWrite="+std::string(mode=="on-write"?"true;\n":"false;\n")+indexedWakeSupport,
+                       body,false,{{"execution-counters","on"},{"mem-enable-bitmap",bitmap},{"mem-write-activate",mode}});
+            indexedWakeSites(label,{"indexed_wake_read_a","indexed_wake_read_b","indexed_wake_read_row","indexed_wake_extra_fanout"});
+        }
+}
+
+void testIndexedMemoryWakeTemporal() {
+    Fixture fixture; auto& graph=fixture.graph;
+    const auto clockA=fixture.input("it_clock_a"), clockB=fixture.input("it_clock_b");
+    const auto enableA=fixture.input("it_enable_a"), enableB=fixture.input("it_enable_b");
+    const auto gateEnable=fixture.input("it_gate_enable"), gateData=fixture.input("it_gate_data");
+    const auto index=fixture.input("it_index",4), address=fixture.input("it_address",4), data=fixture.input("it_data",8);
+    const auto one=fixture.constant(1,"1'b1");
+    const auto memory=fixture.state("temporal_memory",64,{8}), peer=fixture.state("temporal_peer",64,{8});
+    grh::setStateInitSpec(graph,memory,{{grh::InitKind::Fill,"8'd17"}});
+    grh::setStateInitSpec(graph,peer,{{grh::InitKind::Fill,"8'd33"}});
+    const auto full=fixture.read(memory), selected=fixture.read(memory,{index}), peerRead=fixture.read(peer,{address});
+    graph.setOpSymbol(graph.valueDef(full),graph.internSymbol("indexed_wake_full"));
+    graph.setOpSymbol(graph.valueDef(selected),graph.internSymbol("indexed_wake_mixed"));
+    const auto parity=fixture.compute(OperationKind::kReduceXor,Fixture::type(1),{full});
+    const auto combined=fixture.compute(OperationKind::kAdd,Fixture::type(8),{selected,parity});
+    graph.bindOutputPort("it_combined",combined);
+    // Keep the indexed and full reads in one execution owner. Its full read must
+    // override any narrower subscription inferred from its indexed peer.
+    const auto savedA=fixture.state("temporal_saved_a",8), savedB=fixture.state("temporal_saved_b",8);
+    fixture.write(OperationKind::kRegisterWritePort,savedA,{one,combined,clockA});
+    fixture.write(OperationKind::kRegisterWritePort,savedB,{one,combined,clockB});
+    const auto selective=fixture.read(memory,{index});
+    graph.setOpSymbol(graph.valueDef(selective),graph.internSymbol("indexed_wake_selective"));
+    graph.bindOutputPort("it_selective",selective);
+    for(const auto captureClock : {clockA,clockB}) {
+        const auto capture=fixture.state(captureClock==clockA?"temporal_selective_a":"temporal_selective_b",8);
+        fixture.write(OperationKind::kRegisterWritePort,capture,{one,selective,captureClock});
+    }
+    fixture.write(OperationKind::kRegisterWriteArrayPort,memory,{enableA,address,data,clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayPort,peer,{enableA,address,selected,clockA});
+    fixture.write(OperationKind::kRegisterWriteArrayPort,memory,{enableB,address,peerRead,clockB});
+    const auto gate=fixture.state("temporal_gate",1), derived=fixture.state("temporal_derived",8);
+    const auto gateRead=fixture.read(gate);
+    fixture.write(OperationKind::kRegisterWritePort,gate,{gateEnable,gateData,clockA});
+    fixture.write(OperationKind::kRegisterWritePort,derived,{one,selected,gateRead});
+    const auto fullOnly=fixture.read(peer);
+    graph.setOpSymbol(graph.valueDef(fullOnly),graph.internSymbol("indexed_wake_full_only"));
+    const auto peerParity=fixture.compute(OperationKind::kReduceXor,Fixture::type(1),{fullOnly});
+    graph.bindOutputPort("it_peer_parity",peerParity);
+    for(const auto captureClock : {clockA,clockB}) {
+        const auto capture=fixture.state(captureClock==clockA?"temporal_full_a":"temporal_full_b",1);
+        fixture.write(OperationKind::kRegisterWritePort,capture,{one,peerParity,captureClock});
+    }
+    for(const auto& [name,state] : std::vector<std::pair<std::string,grh::OperationId>>{
+            {"it_saved_a",savedA},{"it_saved_b",savedB},{"it_derived",derived},{"it_gate",gate}})
+        graph.bindOutputPort(name,fixture.read(state));
+    run(fixture.design,"grh-to-grhsim",fixture.session);
+    const auto reference=fixture.design.clone();
+    run(fixture.design,"grhsim-split-event-and-output",fixture.session);
+    run(fixture.design,"grhsim-split-nonsink-and-sink",fixture.session,{"-mem-min-bytes=1"});
+    run(fixture.design,"grhsim-partition-nonsink",fixture.session,{"-max-node-work=1","-max-supernode-work=4","-clone-shared=0"});
+    run(fixture.design,"grhsim-partition-sink",fixture.session);
+    auto mixedOwner=owner(graph,graph.valueDef(selected));
+    auto fullOwner=owner(graph,graph.valueDef(full));
+    require(mixedOwner.size()==4 && mixedOwner[1]=="nonsink" && fullOwner.size()==4 && fullOwner[1]=="nonsink",
+            "Indexed wake fallback fixture lost its nonsink readers");
+    // Leaf nodes constrain rewriting; their enclosing supernode executes once.
+    mixedOwner.resize(3); fullOwner.resize(3);
+    require(mixedOwner==fullOwner,
+            "Indexed wake fallback fixture did not retain a mixed full/indexed nonsink owner");
+    auto selectiveOwner=owner(graph,graph.valueDef(selective));
+    require(selectiveOwner.size()==4 && selectiveOwner[1]=="nonsink",
+            "Indexed wake fallback fixture lost its selective nonsink reader");
+    selectiveOwner.resize(3);
+    require(selectiveOwner!=mixedOwner,
+            "Indexed wake fallback fixture merged its selective and full readers");
+    require(owner(graph,graph.valueDef(fullOnly)).size()==4 && owner(graph,graph.valueDef(fullOnly))[1]=="nonsink",
+            "Indexed wake fallback fixture lost its full-only nonsink reader");
+    std::vector<std::map<std::string,uint64_t>> inputs;
+    const auto step=[&](unsigned a,unsigned b,unsigned ea,unsigned eb,unsigned ge,unsigned gd,unsigned ix,unsigned at,unsigned value) {
+        inputs.push_back({{"it_clock_a",a},{"it_clock_b",b},{"it_enable_a",ea},{"it_enable_b",eb},
+            {"it_gate_enable",ge},{"it_gate_data",gd},{"it_index",ix},{"it_address",at},{"it_data",value}});
+    };
+    step(0,0,0,0,0,0,1,6,0);
+    step(1,0,1,0,0,0,1,6,79); // Unrelated write still wakes the full/mixed owner.
+    inputs.push_back(inputs.back());
+    step(0,0,1,0,0,0,1,1,91); step(1,0,1,0,1,1,1,1,91); // NBA samples old data; derived edge sees committed data.
+    step(0,0,0,0,1,0,1,1,92); step(1,1,1,1,1,0,1,1,93); // Both clocks: both payloads sampled before large commits.
+    step(0,0,0,0,1,0,7,7,0); step(0,1,0,1,0,0,7,7,0);
+    step(0,0,0,0,1,0,15,6,0); step(1,0,1,0,1,1,15,6,37); // Invalid indexed read alongside a valid full read.
+    step(0,0,0,0,1,0,1,15,0); step(1,1,1,1,1,0,1,15,255); // Invalid writes do not touch state.
+    step(0,0,0,0,0,0,1,1,0); step(0,1,0,1,0,0,1,1,0);
+    for(const auto budget : {16u,1024u}) for(const std::string bitmap : {"on","off"})
+        for(const std::string mode : {"on-write","on-change"}) {
+            const auto label="indexed-wake-temporal-"+mode+"-"+bitmap+"-b"+std::to_string(budget);
+            writeCase(fixture,reference,inputs,label,budget,4096,
+                {{"execution-counters","on"},{"mem-enable-bitmap",bitmap},{"mem-write-activate",mode}});
+            require(mode!="on-write" || readFile(artifact(label)/"model/grhsim_top.hpp").find(
+                        " r"+std::to_string(graph.valueDef(selective).index)+";")!=std::string::npos,
+                    "Indexed wake fallback fixture omitted its selective subscription plan");
+            const auto path=artifact(label)/"driver.cpp";
+            auto driver=readFile(path);
+            const std::string marker="const auto iwBefore=indexedWakeCounts(model);\n";
+            // The first unrelated write changes both full-read observations.
+            // The selective memory reader shares its owner with the peer's
+            // full reader, so the peer write wakes all four operation sites.
+            const auto first=driver.find("model.it_clock_a = 1;");
+            require(first!=std::string::npos,"Indexed temporal oracle lost its first edge");
+            driver.insert(first,marker);
+            const auto eval=driver.find("model.eval();",first+marker.size());
+            require(eval!=std::string::npos,"Indexed temporal oracle lost edge evaluation");
+            driver.insert(eval+std::string("model.eval();").size(),
+                "\n{ const auto counts=indexedWakeCounts(model); for(unsigned i=0;i<4;++i) assert(counts[i]>iwBefore[i]); }\n");
+            driver.insert(driver.find("int main()"),indexedWakeSupport);
+            std::ofstream(path)<<driver;
+            indexedWakeSites(label,{"indexed_wake_full","indexed_wake_mixed","indexed_wake_full_only","indexed_wake_selective"});
+            std::ofstream make(artifact("Makefile"),std::ios::app);
+            make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
+        }
+}
+
+void testConditionalPackedScopes() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clock = fixture.input("clock"), enableA = fixture.input("enable_a"), enableB = fixture.input("enable_b");
+    const auto data = graph.createValue(graph.internSymbol("data"), Fixture::type(16, {2}));
+    graph.bindInputPort("data", data);
+    const auto offsetA = fixture.input("offset_a", 4), offsetB = fixture.input("offset_b", 4), offsetLast = fixture.input("offset_last", 4);
+    std::vector<grh::ValueId> payloads;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto state = fixture.state("packed_state" + std::to_string(i), 12);
+        const auto payload = fixture.compute(OperationKind::kSliceDynamic, Fixture::type(12), {data, i == 1 ? offsetB : i == 2 ? offsetLast : offsetA});
+        payloads.push_back(payload);
+        fixture.write(OperationKind::kRegisterWritePort, state, {i == 1 ? enableB : enableA, payload, clock});
+        graph.bindOutputPort("state" + std::to_string(i), fixture.read(state));
+    }
+    fixture.convert(); fixture.split();
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session);
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+    require(schedule.generalRuns.size() == 1 && schedule.generalRuns.front().orderedWriters.size() == 3,
+            "Conditional packing fixture must keep its A/B/A writers in one run");
+    require(schedule.sinkGroups.size() == 1 && schedule.sinkGroups.front().guards.empty(),
+            "Conditional packing fixture unexpectedly hoisted an enable");
+    const auto& runKey = schedule.generalRuns.front().partitionKey;
+    for (const auto payload : payloads)
+        require(owner(graph, graph.valueDef(payload)) == runKey, "Conditional packed payload is not sink-private");
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto writer = schedule.generalRuns.front().orderedWriters[i];
+        require(graph.opOperands(writer)[1] == (i == 1 ? enableB : enableA),
+                "Conditional packing fixture lost A/B/A enable order");
+    }
+    const std::string body = R"CPP(
+const std::array<std::array<unsigned,3>,12> steps{{
+    {0,1,0xabcd}, {1,0,0x1234}, {0,1,0x7654}, {0,0,0xffff},
+    {1,1,0xdead}, {0,1,0xbeef}, {1,0,0x1357}, {0,0,0x2468},
+    {1,1,0xfedc}, {0,1,0x0123}, {1,0,0x89ab}, {1,1,0x4567}
+}};
+for (unsigned epoch = 0; epoch < 3; ++epoch) {
+    model.init(); std::array<unsigned,3> expected{};
+    model.offset_a=0; model.offset_b=4; model.offset_last=2;
+    for (const auto& step : steps) {
+        model.clock = false; model.enable_a = step[0]; model.enable_b = step[1];
+        const unsigned data = step[2] ^ (epoch * 0x1111);
+        model.data[0] = data & 255; model.data[1] = data >> 8; model.eval();
+        assert(model.state0 == expected[0] && model.state1 == expected[1] && model.state2 == expected[2]);
+        model.clock = true; model.eval();
+        if (step[0]) { expected[0] = data & 4095; expected[2] = (data >> 2) & 4095; }
+        if (step[1]) expected[1] = (data >> 4) & 4095;
+        assert(model.state0 == expected[0] && model.state1 == expected[1] && model.state2 == expected[2]);
+        model.eval();
+        assert(model.state0 == expected[0] && model.state1 == expected[1] && model.state2 == expected[2]);
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024})
+        manualCase(fixture, "conditional-packed-scopes-b" + std::to_string(budget), budget, "", body, false);
+}
+}
+
 int main() {
+    // Boundary-role and bitmap cases are appended after the common models.
     // Append after testModels initializes the generated execution Makefile.
     try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
+    catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

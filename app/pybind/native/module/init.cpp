@@ -37,6 +37,8 @@ static PyMethodDef WolvrixMethods[] = {
      "session_run_pass(session, name, design, args=None, dryrun=False, log_level='warn') -> (success, changed, diagnostics)"},
     {"session_store_json", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_store_json), METH_VARARGS | METH_KEYWORDS,
      "session_store_json(session, design, output, mode='pretty-compact', top=None) -> (success, diagnostics)"},
+    {"session_store_text", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_store_text), METH_VARARGS | METH_KEYWORDS,
+     "session_store_text(session, design, output, top=None) -> (success, diagnostics)"},
     {"session_graph_metadata", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_graph_metadata), METH_VARARGS | METH_KEYWORDS,
      "Read graph metadata without exporting graph entities or resolved analysis IDs."},
     {"session_emit_sv", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_sv), METH_VARARGS | METH_KEYWORDS,

@@ -258,6 +258,29 @@ class Session:
             output=output,
         )
 
+    def store_text(
+        self,
+        *,
+        design: str,
+        output: str,
+        top: list[str] | None = None,
+    ) -> list[dict]:
+        """Export readable GRH entities, provenance, partitions and the current GrhSIM schedule."""
+        self._ensure_open()
+        success, diagnostics = _native.session_store_text(
+            self._capsule,
+            design=design,
+            output=output,
+            top=top or [],
+        )
+        return self._complete_action(
+            "store_text",
+            diagnostics,
+            success=bool(success),
+            design=design,
+            output=output,
+        )
+
     def emit_sv(
         self,
         *,
@@ -303,9 +326,16 @@ class Session:
         mem_write_activate: str = "on-write",
         mem_enable_bitmap: bool = True,
         execution_counters: bool = False,
+        readable_names: bool = True,
+        source_comments: bool = True,
+        readable_dump: bool = True,
+        readable_frames: bool = True,
+        max_output_file_bytes: int = 4 * 1024 * 1024 * 1024,
     ) -> list[dict]:
         """Emit the ordinary partitioned design with this session's SinkSchedule."""
         self._ensure_open()
+        if not isinstance(max_output_file_bytes, int) or not 0 < max_output_file_bytes < 2**64:
+            raise ValueError("max_output_file_bytes must be a positive uint64")
         success, diagnostics = _native.session_emit_grhsim_cpu_st_cpp(
             self._capsule, design=design, output=output, top=top or [],
             max_function_lines=max_function_lines, max_tu_bytes=max_tu_bytes,
@@ -313,6 +343,9 @@ class Session:
             trace_underscore_values=bool(trace_underscore_values),
             mem_write_activate=mem_write_activate, mem_enable_bitmap=bool(mem_enable_bitmap),
             execution_counters=bool(execution_counters),
+            readable_names=bool(readable_names), source_comments=bool(source_comments),
+            readable_dump=bool(readable_dump), readable_frames=bool(readable_frames),
+            max_output_file_bytes=max_output_file_bytes,
         )
         return self._complete_action(
             "emit_grhsim_cpu_st_cpp", diagnostics, success=bool(success),

@@ -118,6 +118,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
     lib/core/store.cpp
+    lib/core/store_text.cpp
     lib/core/ingest.cpp
     lib/core/transform.cpp
     lib/transform/activity_schedule.cpp
@@ -441,6 +442,11 @@ target_compile_definitions(store-json-ir
 )
 
 register_test_exe(store-json-ir)
+
+add_executable(store-text tests/store/test_store_text.cpp)
+target_link_libraries(store-text PRIVATE wolvrix-lib)
+target_compile_definitions(store-text PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")
+register_test_exe(store-text)
 
 add_executable(store-load-origin-attrs
     tests/store/test_store_load_origin_attrs.cpp

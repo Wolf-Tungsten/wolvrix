@@ -8,11 +8,15 @@ namespace wolvrix::lib::emit::grhsim_detail {
 
 Code Code::line(std::string text, bool terminal) {
     if (text.find('\n') != std::string::npos) throw std::invalid_argument("C++ statement contains a newline");
-    return {std::move(text), {}, false, terminal};
+    return {std::move(text), {}, false, terminal, {}, {}};
 }
 Code Code::block(std::string header, std::vector<Code> body) {
     if (header.find('\n') != std::string::npos) throw std::invalid_argument("C++ scope contains a newline");
-    return {std::move(header), std::move(body), true, false};
+    return {std::move(header), std::move(body), true, false, {}, {}};
+}
+Code Code::commented(Code code, std::string comment) {
+    code.comment = std::move(comment);
+    return code;
 }
 std::size_t Code::lines() const {
     std::size_t result = scope ? 2 : 1;
@@ -23,6 +27,33 @@ std::size_t Code::lines() const {
 namespace {
 using LocalIndex = std::map<std::string, std::size_t, std::less<>>;
 using Replacements = std::map<std::string, std::string, std::less<>>;
+
+// Comments may contain original HDL identifiers and source locations. Keep
+// them on one physical line and outside placeholder substitution/preprocessing.
+std::string sanitizeComment(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const auto ch = static_cast<unsigned char>(text[i]);
+        if (ch < 32 || ch == 127) result += ' ';
+        else if (ch == '@') result += "(at)";
+        else if (ch == '\\') result += "\\x5c";
+        else if (i + 1 < text.size() &&
+                 ((ch == '*' && text[i + 1] == '/') || (ch == '/' && text[i + 1] == '*'))) {
+            result += static_cast<char>(ch);
+            result += ' ';
+        } else result += static_cast<char>(ch);
+    }
+    const auto first = result.find_first_not_of(' ');
+    if (first == std::string::npos) return {};
+    const auto last = result.find_last_not_of(' ');
+    return result.substr(first, last - first + 1);
+}
+
+std::string inlineComment(std::string_view text) {
+    const auto comment = sanitizeComment(text);
+    return comment.empty() ? std::string{} : " /* " + comment + " */";
+}
 
 template<typename Match>
 void placeholders(std::string_view text, Match&& match) {
@@ -58,48 +89,80 @@ void render(const std::vector<Code>& body, std::string& output, std::size_t inde
         const auto padding = std::string(indent, ' ');
         if (statement.text == "@__chunk_return_check@") {
             output += padding + "if (chunkFrame.chunk_returned) return" +
-                std::string(!helper && returnsValue ? " chunkFrame.chunk_result" : "") + ";\n";
+                std::string(!helper && returnsValue ? " chunkFrame.chunk_result" : "") +
+                ";" + inlineComment(statement.comment) + "\n";
             continue;
         }
         if (helper && returnControl && statement.terminal) {
             if (!statement.text.starts_with("return") || !statement.text.ends_with(';'))
                 throw std::invalid_argument("Only structured return statements can cross a chunk boundary");
             if (returnsValue) output += padding + "chunkFrame.chunk_result = " +
-                replace(statement.text.substr(6), names) + "\n";
-            output += padding + "chunkFrame.chunk_returned = true;\n" + padding + "return;\n";
+                replace(statement.text.substr(6), names) + inlineComment(statement.comment) + "\n";
+            output += padding + "chunkFrame.chunk_returned = true;" +
+                (returnsValue ? std::string{} : inlineComment(statement.comment)) + "\n" + padding + "return;\n";
             continue;
         }
-        output += std::string(indent, ' ') + replace(statement.text, names) + (statement.scope ? " {\n" : "\n");
+        output += padding + replace(statement.text, names) + (statement.scope ? " {" : "") +
+            inlineComment(statement.comment) + "\n";
         if (statement.scope) {
             render(statement.body, output, indent + 4, names, helper, returnsValue, returnControl);
             output += std::string(indent, ' ') + "}\n";
         }
     }
 }
+void references(const Code& statement, const LocalIndex& locals,
+                std::set<std::string>& result) {
+    placeholders(statement.text, [&](std::string_view name, std::size_t, std::size_t) {
+        const auto found = locals.find(name);
+        if (found == locals.end()) return false;
+        result.insert(found->first);
+        return true;
+    });
+    for (const auto& child : statement.body) references(child, locals, result);
+}
 void references(const std::vector<Code>& body, const LocalIndex& locals,
                 std::set<std::string>& result) {
-    for (const auto& statement : body) {
-        placeholders(statement.text, [&](std::string_view name, std::size_t, std::size_t) {
-            const auto found = locals.find(name);
-            if (found == locals.end()) return false;
-            result.insert(found->first);
-            return true;
-        });
-        references(statement.body, locals, result);
-    }
+    for (const auto& statement : body) references(statement, locals, result);
 }
 bool hasTerminal(const Code& code) {
     return code.terminal || std::any_of(code.body.begin(), code.body.end(), hasTerminal);
 }
+void operationReferences(const std::vector<Code>& body, std::set<std::string>& result) {
+    for (const auto& statement : body) {
+        if (!statement.sourceOperation.empty()) result.insert(statement.sourceOperation);
+        operationReferences(statement.body, result);
+    }
+}
+void controlReferences(const std::vector<Code>& body, bool helper, bool returnsValue,
+                       bool returnControl, std::set<std::string>& result) {
+    for (const auto& statement : body) {
+        // These references are emitted directly by render rather than through
+        // the ordinary local-placeholder path. Match only its actual branches.
+        if (statement.text == "@__chunk_return_check@") {
+            result.insert("chunk_returned");
+            if (!helper && returnsValue) result.insert("chunk_result");
+        } else if (helper && returnControl && statement.terminal) {
+            result.insert("chunk_returned");
+            if (returnsValue) result.insert("chunk_result");
+        } else if (statement.scope) {
+            controlReferences(statement.body, helper, returnsValue, returnControl, result);
+        }
+    }
+}
 }
 
-WrittenFunctions writeFunction(const Function& input, std::string_view className, std::size_t maxLines) {
+WrittenFunctions writeFunction(Function source, std::string_view className, std::size_t maxLines) {
     if (maxLines < 8) throw std::invalid_argument("max-function-lines must be at least 8 (function/frame/call scaffolding)");
-    Function source = input;
     const bool returnsValue = source.result != "void" && !source.result.empty();
     bool returnControl = false;
-    struct Part { std::string name; std::vector<Code> body; bool repeated = false; };
-    std::vector<Part> parts{{source.name, source.body}};
+    struct Part {
+        std::string name;
+        std::vector<Code> body;
+        bool repeated = false;
+        std::set<std::string> sourceOperations;
+    };
+    std::vector<Part> parts;
+    parts.push_back({source.name, std::move(source.body)});
     const std::string frameType = "chunkFrame_" + source.name;
     std::vector<std::set<std::string>> refs;
     std::set<std::string> shared, forcedFrame;
@@ -176,7 +239,7 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
             for (auto& scope : body) {
                 if (!scope.scope) continue;
                 std::set<std::string> used;
-                references({scope}, localIndex, used);
+                references(scope, localIndex, used);
                 std::size_t lines = 3 + statementLines(statementLines, scope, index != 0);
                 for (const auto& name : used)
                     if (!shared.contains(name) && !source.locals[localIndex.at(name)].parameter) ++lines;
@@ -193,9 +256,18 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
                 }
                 const bool repeated = parts[index].repeated || scope.text.starts_with("for (") || scope.text.starts_with("while (");
                 std::vector<Code> inner = std::move(scope.body);
+                auto sourceOperations = parts[index].sourceOperations;
+                if (!scope.sourceOperation.empty()) {
+                    sourceOperations.insert(scope.sourceOperation);
+                    // Preserve a tagged scope in both the controlling function
+                    // and its extracted implementation without replacing a
+                    // distinct tag already carried by the first inner statement.
+                    if (!inner.empty() && inner.front().sourceOperation.empty())
+                        inner.front().sourceOperation = scope.sourceOperation;
+                }
                 scope.body = {Code::line(name + "(chunkFrame);")};
                 if (terminal) scope.body.push_back(Code::line("@__chunk_return_check@", true));
-                extracted.push_back({name, std::move(inner), repeated});
+                extracted.push_back({name, std::move(inner), repeated, std::move(sourceOperations)});
             }
             if (!extracted.empty()) {
                 for (auto& part : extracted) parts.push_back(std::move(part));
@@ -217,7 +289,7 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
                 const std::string name = source.name + "_chunk" + std::to_string(parts.size() + additions.size());
                 std::vector<Code> inner;
                 for (; begin < end; ++begin) inner.push_back(std::move(body[begin]));
-                additions.push_back({name, std::move(inner), parts[index].repeated});
+                additions.push_back({name, std::move(inner), parts[index].repeated, parts[index].sourceOperations});
                 replacement.push_back(Code::line(name + "(chunkFrame);"));
             }
             std::size_t previousLines = 0, replacementLines = 0;
@@ -248,8 +320,10 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
         std::vector<Local> fields;
         for (const auto& local : source.locals) if (shared.contains(local.name))
             fields.push_back(local);
-        layout = writeValueLayout(frameType, fields);
+        layout = source.readableFrame ? writeDirectValueLayout(frameType, fields) : writeValueLayout(frameType, fields);
         result.frameDeclaration = std::move(layout.declaration);
+        // Only physical references are needed after the declaration is written.
+        std::vector<Local>().swap(layout.physicalFields);
     }
     if (!hasFrame) {
         // Split points are discovered before the final liveness fixpoint, so
@@ -272,11 +346,14 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
         for (auto& part : parts) stripFrameArgument(stripFrameArgument, part.body);
     }
     for (std::size_t i = 0; i < parts.size(); ++i) {
-        const auto& part = parts[i];
+        auto& part = parts[i];
         const std::string parameters = i == 0 ? source.parameters : (hasFrame ? frameType + " &chunkFrame" : "");
         const std::string signature = (i == 0 ? source.result : "void") + " " + part.name + "(" + parameters + ")" + (source.isConst ? " const" : "");
         WrittenFunction function;
         function.name = part.name;
+        auto operations = std::move(part.sourceOperations);
+        operationReferences(part.body, operations);
+        function.operations.assign(operations.begin(), operations.end());
         function.declaration = "    " + signature + ";\n";
         function.definition = (i == 0 ? source.result : "void") + " " + std::string(className) + "::" +
             part.name + "(" + parameters + ")" + (source.isConst ? " const" : "") + "\n{\n";
@@ -285,7 +362,11 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
         Replacements names;
         for (const auto index : sharedParameters) if (i == 0) {
             const auto& local = source.locals[index];
-            function.definition += "    chunkFrame." + layout.references.at(local.name) + " = " + local.name + ";\n";
+            const auto reference = "chunkFrame." + layout.references.at(local.name);
+            // A helper-only parameter still occurs in this root's frame setup.
+            // Include that emitted reference even without a root body use.
+            names[local.name] = reference;
+            function.definition += "    " + reference + " = " + local.name + ";\n";
         }
         std::vector<std::size_t> usedLocals;
         for (const auto& name : refs[i]) usedLocals.push_back(localIndex.at(name));
@@ -295,12 +376,32 @@ WrittenFunctions writeFunction(const Function& input, std::string_view className
             names[local.name] = shared.contains(local.name) ? "chunkFrame." + layout.references.at(local.name) : local.name;
             if (!shared.contains(local.name) && !local.parameter)
                 function.definition += "    " + local.type + " " + local.name +
-                    (!source.zeroInitializeLocals && local.initializer == "{}" ? "" : local.initializer) + ";\n";
+                    (!source.zeroInitializeLocals && local.initializer == "{}" ? "" : local.initializer) +
+                    ";" + inlineComment(local.comment) + "\n";
         }
+        std::set<std::string> controls;
+        controlReferences(part.body, i != 0, returnsValue, returnControl, controls);
+        for (const auto& name : controls) names[name] = "chunkFrame." + layout.references.at(name);
+        for (const auto& [name, reference] : names)
+            function.localTypes.emplace(name, source.locals[localIndex.at(name)].type);
         render(part.body, function.definition, 4, names, i != 0, returnsValue, returnControl);
+        function.localReferences = std::move(names);
+        // Rendering has consumed this part's structured text. Release it before
+        // retaining the rendered definition and proceeding to the next chunk.
+        std::vector<Code>().swap(part.body);
+        part.sourceOperations.clear();
+        refs[i].clear();
         function.definition += "}\n";
         function.lines = std::count(function.definition.begin(), function.definition.end(), '\n');
         if (function.lines > maxLines) throw std::logic_error("Generated function line accounting failed: " + part.name);
+        if (!source.comment.empty()) {
+            const auto comment = sanitizeComment((i == 0 ? std::string{} : "Extracted chunk of " + source.name + ". ") +
+                                                 source.comment);
+            if (!comment.empty()) {
+                function.declaration.insert(0, "    // " + comment + "\n");
+                function.definition.insert(0, "// " + comment + "\n");
+            }
+        }
         result.functions.push_back(std::move(function));
     }
     return result;
@@ -313,7 +414,8 @@ std::string writeValueStruct(std::string_view name, const std::vector<Local>& fi
     result += "        " + std::string(name) + "() = default;\n";
     for (const auto& field : fields)
         result += "        " + field.type + " " + field.name +
-            (field.initializer == "{}" ? "" : field.initializer) + ";\n";
+            (field.initializer == "{}" ? "" : field.initializer) +
+            ";" + inlineComment(field.comment) + "\n";
     return result + "    };\n";
 }
 

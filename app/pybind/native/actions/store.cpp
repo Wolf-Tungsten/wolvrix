@@ -125,4 +125,37 @@ namespace wolvrix::app::pybind
                                 sessionDesignSourceManager(*session, designKey));
     }
 
+    PyObject *py_session_store_text(PyObject *, PyObject *args, PyObject *kwargs)
+    {
+        PyObject *sessionObj = nullptr;
+        const char *designKey = nullptr;
+        const char *output = nullptr;
+        PyObject *topListObj = Py_None;
+        static const char *kwlist[] = {"session", "design", "output", "top", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|O", const_cast<char **>(kwlist),
+                                        &sessionObj, &designKey, &output, &topListObj)) return nullptr;
+        SessionHandle *session = getSessionHandle(sessionObj);
+        if (!session) return nullptr;
+        auto *design = sessionDesign(*session, designKey);
+        if (!design) { PyErr_Format(PyExc_KeyError, "design key not found: %s", designKey); return nullptr; }
+        std::vector<std::string> tops;
+        std::string error;
+        if (!parseStringList(topListObj, tops, error)) {
+            PyErr_SetString(PyExc_ValueError, error.c_str()); return nullptr;
+        }
+        const std::filesystem::path path(output);
+        if (path.filename().empty()) {
+            PyErr_SetString(PyExc_ValueError, "store_text(...) expects an output file path"); return nullptr;
+        }
+        wolvrix::lib::store::StoreDiagnostics diagnostics;
+        wolvrix::lib::store::StoreText store(&diagnostics, &session->nativeValues);
+        wolvrix::lib::store::StoreOptions options;
+        options.outputFilename = path.filename().string();
+        if (!path.parent_path().empty()) options.outputDir = path.parent_path().string();
+        options.topOverrides = std::move(tops);
+        const auto result = store.store(*design, options);
+        return makeActionResult(result.success && !diagnostics.hasError(), diagnostics.messages(),
+                                sessionDesignSourceManager(*session, designKey));
+    }
+
 } // namespace wolvrix::app::pybind

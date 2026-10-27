@@ -27,11 +27,16 @@ namespace wolvrix::app::pybind
         const char *memWriteActivate = "on-write";
         int memEnableBitmap = 1;
         int executionCounters = 0;
+        int readableNames = 1, sourceComments = 1, readableDump = 1, readableFrames = 1;
+        unsigned long long maxOutputFileBytes = 4ULL * 1024 * 1024 * 1024;
         static const char *kwlist[] = {"session", "design", "output", "top", "max_function_lines", "max_tu_bytes",
-                                      "max_round", "waveform", "trace_underscore_values", "mem_write_activate", "mem_enable_bitmap", "execution_counters", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OKKKppspp", const_cast<char **>(kwlist),
+                                      "max_round", "waveform", "trace_underscore_values", "mem_write_activate", "mem_enable_bitmap", "execution_counters",
+                                      "readable_names", "source_comments", "readable_dump", "readable_frames", "max_output_file_bytes", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OKKKppsppppppK", const_cast<char **>(kwlist),
                 &sessionObj, &designKey, &output, &topObj, &maxFunctionLines, &maxTuBytes, &maxRound,
-                &waveform, &traceUnderscore, &memWriteActivate, &memEnableBitmap, &executionCounters)) return nullptr;
+                &waveform, &traceUnderscore, &memWriteActivate, &memEnableBitmap, &executionCounters,
+                &readableNames, &sourceComments, &readableDump, &readableFrames, &maxOutputFileBytes)) return nullptr;
+        if (!maxOutputFileBytes) { PyErr_SetString(PyExc_ValueError, "max_output_file_bytes must be positive"); return nullptr; }
         SessionHandle *session = getSessionHandle(sessionObj);
         if (!session) return nullptr;
         auto *design = sessionDesign(*session, designKey);
@@ -42,12 +47,15 @@ namespace wolvrix::app::pybind
             PyErr_SetString(PyExc_ValueError, error.c_str()); return nullptr;
         }
         options.outputDir = output;
+        options.maxOutputFileBytes = maxOutputFileBytes;
         options.session = &session->nativeValues;
         options.traceUnderscoreValues = traceUnderscore != 0;
         options.attributes = {{"max-function-lines", std::to_string(maxFunctionLines)},
                               {"max-tu-bytes", std::to_string(maxTuBytes)}, {"max-round", std::to_string(maxRound)},
                               {"waveform", waveform ? "declared-symbols" : "none"},
-                              {"mem-write-activate", memWriteActivate}, {"mem-enable-bitmap", memEnableBitmap ? "on" : "off"}};
+                              {"mem-write-activate", memWriteActivate}, {"mem-enable-bitmap", memEnableBitmap ? "on" : "off"},
+                              {"readable-names", readableNames ? "on" : "off"}, {"source-comments", sourceComments ? "on" : "off"},
+                              {"readable-dump", readableDump ? "on" : "off"}, {"readable-frames", readableFrames ? "on" : "off"}};
         if (executionCounters) options.attributes["execution-counters"] = "on";
         wolvrix::lib::emit::EmitDiagnostics diagnostics;
         wolvrix::lib::emit::GrhSimCpuStCpp emitter(&diagnostics);

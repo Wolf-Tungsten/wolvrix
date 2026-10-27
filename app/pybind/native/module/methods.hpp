@@ -25,6 +25,7 @@ namespace wolvrix::app::pybind
     PyObject *py_session_run_pass(PyObject *self, PyObject *args, PyObject *kwargs);
 
     PyObject *py_session_store_json(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_store_text(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_graph_metadata(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_emit_sv(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_emit_grhsim_cpu_st_cpp(PyObject *self, PyObject *args, PyObject *kwargs);

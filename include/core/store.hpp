@@ -3,6 +3,7 @@
 
 #include "core/diagnostics.hpp"
 #include "core/grh.hpp"
+#include "core/transform.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -93,6 +94,25 @@ namespace wolvrix::lib::store
         StoreResult storeImpl(const wolvrix::lib::grh::Design &design,
                               std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
                               const StoreOptions &options) override;
+    };
+
+    // Human-readable inspection format; JSON remains the round-trip format.
+    // A session supplies the validated grhsim writer schedule when available.
+    class StoreText : public Store
+    {
+    public:
+        explicit StoreText(StoreDiagnostics *diagnostics = nullptr,
+                           const wolvrix::lib::transform::SessionStore *session = nullptr);
+
+        std::optional<std::string> storeToString(const wolvrix::lib::grh::Design &design,
+                                                const StoreOptions &options = StoreOptions());
+
+    private:
+        StoreResult storeImpl(const wolvrix::lib::grh::Design &design,
+                              std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
+                              const StoreOptions &options) override;
+
+        const wolvrix::lib::transform::SessionStore *session_ = nullptr;
     };
 
 } // namespace wolvrix::lib::store

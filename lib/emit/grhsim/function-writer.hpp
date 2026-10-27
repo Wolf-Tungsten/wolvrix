@@ -18,8 +18,13 @@ struct Code {
     std::vector<Code> body;
     bool scope = false;
     bool terminal = false;
+    std::string comment;
+    std::string sourceOperation;
     static Code line(std::string text, bool terminal = false);
     static Code block(std::string header, std::vector<Code> body);
+    // Documentation stays attached to the statement and does not affect its
+    // line cost, local references, or extraction boundaries.
+    static Code commented(Code code, std::string comment);
     std::size_t lines() const;
 };
 
@@ -28,6 +33,7 @@ struct Local {
     std::string name;
     std::string initializer = "{}";
     bool parameter = false;
+    std::string comment;
 };
 
 // Value-initialize with {} when fields require zero defaults. The explicitly
@@ -60,13 +66,19 @@ struct Function {
     // Only opt out when the producer assigns every local before its use,
     // including across guarded chunks. Explicit initializers still apply.
     bool zeroInitializeLocals = true;
+    std::string comment;
+    bool readableFrame = false;
 };
 
 struct WrittenFunction {
     std::string name;
     std::string declaration;
     std::string definition;
+    // Counts the function itself, excluding documentation before its signature.
     std::size_t lines = 0;
+    std::map<std::string, std::string, std::less<>> localReferences;
+    std::vector<std::string> operations;
+    std::map<std::string, std::string> localTypes;
 };
 
 struct WrittenFunctions {
@@ -76,7 +88,8 @@ struct WrittenFunctions {
 
 // Local references in Code use @name@. They resolve either to a local or to a
 // chunkFrame field after splitting and liveness analysis have reached a fixpoint.
-WrittenFunctions writeFunction(const Function& function, std::string_view className,
+// Pass an owned function with std::move to consume its potentially large body.
+WrittenFunctions writeFunction(Function function, std::string_view className,
                                std::size_t maxLines);
 
 }

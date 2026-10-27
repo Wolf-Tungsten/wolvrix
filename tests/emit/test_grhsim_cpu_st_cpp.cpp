@@ -1,7 +1,11 @@
 #include "emit/grhsim/cpu-st-cpp.hpp"
 #include "function-writer.hpp"
 #include "grhsim_partition_fixture.hpp"
+#include "json-writer.hpp"
 
+#include "slang/text/Json.h"
+
+#include <limits>
 #include <sstream>
 #include <regex>
 
@@ -20,7 +24,224 @@ std::string readFile(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(stream), {}};
 }
 
-void inspectFunctions(const std::filesystem::path& directory, std::size_t budget) {
+void testStreamingJsonWriter() {
+    using wolvrix::lib::emit::grhsim_detail::StreamingJsonWriter;
+    std::string text;
+    for (unsigned byte = 0; byte < 32; ++byte) text.push_back(static_cast<char>(byte));
+    text += "\"/\\ UTF-8: \xc3\xa9 \xe4\xb8\xad \xf0\x9f\x98\x80";
+    const auto payload = [&](auto& json) {
+        json.startObject();
+        json.writeProperty(text); json.writeValue(std::string_view(text));
+        json.writeProperty("empty"); json.writeValue(std::string_view{});
+        json.writeProperty("nested"); json.startArray();
+        json.startObject(); json.endObject();
+        json.startArray(); json.endArray();
+        json.startObject();
+        json.writeProperty("array"); json.startArray(); json.endArray();
+        json.writeProperty("object"); json.startObject(); json.endObject();
+        json.endObject();
+        json.endArray();
+        json.writeProperty("numbers"); json.startArray();
+        json.writeValue(std::numeric_limits<uint64_t>::max());
+        json.writeValue(uint64_t(0));
+        json.writeValue(std::numeric_limits<int64_t>::min());
+        json.writeValue(std::numeric_limits<int64_t>::max());
+        json.writeValue(int64_t(0));
+        json.writeValue(true); json.writeValue(false);
+        json.endArray();
+        json.endObject();
+    };
+    slang::JsonWriter reference;
+    payload(reference);
+    std::ostringstream output;
+    StreamingJsonWriter streaming(output);
+    payload(streaming);
+    require(output.str() == reference.view(), "Streaming JSON differs from buffered JSON");
+
+    // Spliced values consume an object property and participate in array
+    // comma insertion exactly like values emitted through the regular API.
+    std::istringstream objectSpool(output.str()), arraySpool(output.str());
+    std::ostringstream rawOutput;
+    StreamingJsonWriter raw(rawOutput);
+    raw.startObject();
+    raw.writeProperty("payload"); raw.writeRawValue(objectSpool);
+    raw.writeProperty("array"); raw.startArray();
+    raw.writeValue(true); raw.writeRawValue(arraySpool); raw.writeValue(false);
+    raw.endArray();
+    raw.writeProperty("after"); raw.startObject(); raw.endObject();
+    raw.endObject();
+    slang::JsonWriter rawReference;
+    rawReference.startObject();
+    rawReference.writeProperty("payload"); payload(rawReference);
+    rawReference.writeProperty("array"); rawReference.startArray();
+    rawReference.writeValue(true); payload(rawReference); rawReference.writeValue(false);
+    rawReference.endArray();
+    rawReference.writeProperty("after"); rawReference.startObject(); rawReference.endObject();
+    rawReference.endObject();
+    require(rawOutput.str() == rawReference.view(), "Raw JSON spool changed nesting or comma handling");
+}
+
+// Resolve names from the emitted map rather than duplicating the naming policy.
+std::string mappedName(const std::filesystem::path& directory, std::string_view category, uint32_t index) {
+    const auto map = readFile(directory / "code-map.json");
+    const auto key = category == "value" ? "value_id" : "operation_id";
+    const auto id = std::string(category == "value" ? "v" : "o") + std::to_string(index);
+    const std::regex record("\"" + std::string(key) + "\":\"" + id +
+        "\",\"cpp_name\":\"([A-Za-z_][A-Za-z0-9_]*)\"");
+    std::smatch found;
+    require(std::regex_search(map, found, record), "Missing code-map name for " + id);
+    return found[1].str();
+}
+
+std::string mappedValue(const std::filesystem::path& directory, grh::ValueId value) {
+    return mappedName(directory, "value", value.index);
+}
+
+std::string mappedOperation(const std::filesystem::path& directory, grh::OperationId op) {
+    return mappedName(directory, "operation", op.index);
+}
+
+std::string mappedPackedPrefix(const std::filesystem::path& directory, grh::ValueId value) {
+    const auto map = readFile(directory / "code-map.json");
+    const std::regex record("\"value_id\":\"v" + std::to_string(value.index) +
+        "\",\"cpp_name\":\"[A-Za-z_][A-Za-z0-9_]*\",\"packed_prefix\":\"([A-Za-z_][A-Za-z0-9_]*)\"");
+    std::smatch found;
+    require(std::regex_search(map, found, record), "Missing packed prefix in code-map");
+    return found[1].str();
+}
+
+std::string generatedCpp(const std::filesystem::path& directory) {
+    std::string result;
+    for (const auto& entry : std::filesystem::directory_iterator(directory))
+        if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") result += readFile(entry.path());
+    return result;
+}
+
+// Only split top-level records; braces and escaped quotes in source metadata
+// are data, and must never truncate an operation's nested storage records.
+std::vector<std::string> mappedRecords(const std::string& map, std::string_view array) {
+    const auto marker = "\"" + std::string(array) + "\":[";
+    const auto begin = map.find(marker);
+    require(begin != std::string::npos, "Code map lacks array " + std::string(array));
+    std::vector<std::string> result;
+    bool quoted = false, escaped = false; unsigned depth = 0; std::size_t start = 0;
+    for (std::size_t i = begin + marker.size(); i < map.size(); ++i) {
+        const auto ch = map[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == '"') quoted = false;
+            continue;
+        }
+        if (ch == '"') { quoted = true; continue; }
+        if (ch == '{') { if (depth++ == 0) start = i; }
+        else if (ch == '}') {
+            require(depth != 0, "Unbalanced code-map object");
+            if (--depth == 0) result.push_back(map.substr(start, i - start + 1));
+        } else if (ch == ']' && depth == 0) return result;
+    }
+    throw std::runtime_error("Unterminated code-map array");
+}
+
+void inspectOperationStorage(const std::filesystem::path& directory, const grh::Graph& graph) {
+    const auto map = readFile(directory / "code-map.json");
+    const auto header = readFile(directory / "grhsim_top.hpp");
+    const auto records = mappedRecords(map, "operations");
+    const auto functions = mappedRecords(map, "functions");
+    std::map<std::string, std::set<std::string>> phaseOperations;
+    const std::regex root(R"REGEX("root_function":"(~?[A-Za-z_][A-Za-z0-9_]*)")REGEX");
+    const std::regex operation(R"REGEX("(o[0-9]+)")REGEX");
+    for (const auto& function : functions) {
+        std::smatch match; require(std::regex_search(function, match, root), "Function map omitted its root");
+        const auto start = function.find("\"operations\":[");
+        const auto end = start == std::string::npos ? start : function.find(']', start);
+        require(start != std::string::npos && end != std::string::npos, "Function map omitted its operation list");
+        const auto body = function.substr(start, end - start);
+        for (std::sregex_iterator it(body.begin(), body.end(), operation), last; it != last; ++it)
+            phaseOperations[match[1].str()].insert((*it)[1].str());
+    }
+    const std::regex identity(R"REGEX(^[{]"operation_id":"(o[0-9]+)","cpp_name":"([A-Za-z_][A-Za-z0-9_]*)")REGEX");
+    std::map<std::string, std::pair<const std::string*, std::string>> byId;
+    for (const auto& record : records) {
+        std::smatch match; require(std::regex_search(record, match, identity), "Invalid code-map operation identity");
+        byId.emplace(match[1].str(), std::pair{&record, match[2].str()});
+    }
+    std::map<std::string, std::vector<std::string>> actualStorage;
+    const auto declaredFields = [](const std::string& body) {
+        std::vector<std::string> result;
+        const std::regex field(R"REGEX(^[ \t]+.+[ \t]+([A-Za-z_][A-Za-z0-9_]*)(?:[{][^;]*[}])?;[ \t]*$)REGEX");
+        std::istringstream lines(body);
+        std::string line;
+        while (std::getline(lines, line)) {
+            const auto comment = std::min(line.find("/*"), line.find("//"));
+            if (comment != std::string::npos) line.resize(comment);
+            // Fields use brace initializers. The defaulted constructor has an
+            // equals sign and must not become a fictional field named default.
+            // Do not reject all parentheses: unsigned _BitInt(N) is a type.
+            if (line.find('=') != std::string::npos) continue;
+            std::smatch match;
+            if (std::regex_match(line, match, field)) result.push_back(match[1].str());
+        }
+        return result;
+    };
+    for (const auto& store : mappedRecords(map, "stores")) {
+        const std::regex name(R"REGEX(^[{]"name":"([A-Za-z_][A-Za-z0-9_]*)")REGEX");
+        std::smatch match; require(std::regex_search(store, match, name), "Invalid exported store name");
+        const auto storeName = match[1].str();
+        const std::regex type(R"REGEX("type":"([A-Za-z_][A-Za-z0-9_]*)")REGEX");
+        require(std::regex_search(store, match, type), "Exported store omitted its declared type");
+        const auto begin = header.find("struct " + match[1].str() + " {");
+        const auto end = begin == std::string::npos ? begin : header.find("    };", begin);
+        require(begin != std::string::npos && end != std::string::npos, "Mapped store has no generated declaration");
+        const auto body = header.substr(begin, end - begin);
+        const auto fields = mappedRecords(store, "fields");
+        for (const auto& member : declaredFields(body)) {
+            require(std::any_of(fields.begin(), fields.end(), [&](const auto& record) {
+                return record.starts_with("{\"name\":\"" + member + "\",") &&
+                    record.find("\"reference\":\"" + storeName + "." + member + "\"") != std::string::npos;
+            }), "Exported store omits an actual field: " + storeName + "." + member);
+        }
+    }
+    for (const auto store : {"smallSinkStore", "largeSinkStore", "prevEventStore", "timeslotTriggerStore",
+                             "sampledStore", "onceStore", "largeBeforeStore", "largeWholeBeforeStore",
+                             "largeWholeDirtyStore", "memoryTouchedStore", "largeSinkEnableBoundaryStore"}) {
+        const auto begin = header.find(std::string("struct ") + store + "Type {");
+        const auto end = begin == std::string::npos ? begin : header.find("    };", begin);
+        if (begin == std::string::npos || end == std::string::npos) continue;
+        const auto body = header.substr(begin, end - begin);
+        for (const auto& member : declaredFields(body))
+            actualStorage[member].push_back(std::string(store) + "." + member);
+    }
+    for (const auto op : graph.operations()) {
+        const auto id = "o" + std::to_string(op.index);
+        const auto entry = byId.find(id); require(entry != byId.end(), "Code map omitted an operation");
+        const auto& member = entry->second.second;
+        const auto storage = mappedRecords(*entry->second.first, "storage");
+        auto expected = actualStorage[member];
+        const auto capture = actualStorage.find(member + "_captured_enable");
+        if (capture != actualStorage.end()) expected.insert(expected.end(), capture->second.begin(), capture->second.end());
+        for (const auto& reference : expected) {
+            require(std::any_of(storage.begin(), storage.end(), [&](const auto& record) {
+                return record.find("\"reference\":\"" + reference + "\"") != std::string::npos;
+            }), "Code map omitted actual operation storage: " + reference);
+        }
+        if (graph.opKind(op) == sim::kHistoryWrite) {
+            require(phaseOperations["pOutput"].contains(id),
+                    "Output history write is absent from output function provenance: " + id);
+        }
+        if (graph.opKind(op) == OperationKind::kRegister || graph.opKind(op) == OperationKind::kLatch) {
+            require(phaseOperations["init"].contains(id), "State initializer is absent from function provenance: " + id);
+            if (sim::attribute<std::string>(graph, op, "grhsim.history").value_or("") != "output-end")
+                require(std::any_of(phaseOperations.begin(), phaseOperations.end(), [&](const auto& phase) {
+                    return phase.first.starts_with("pPublish") && phase.second.contains(id);
+                }), "State publisher is absent from function provenance: " + id);
+        }
+        if (graph.opKind(op) == sim::kEdgeDetect || entry->second.first->find("\"subscription\":") != std::string::npos)
+            require(phaseOperations["init"].contains(id), "Detector/subscription initialization lost provenance: " + id);
+    }
+}
+
+void inspectFunctions(const std::filesystem::path& directory, std::size_t budget, bool readableDump = true) {
     std::size_t functions = 0;
     std::ofstream report(directory.parent_path() / "function-lines.tsv");
     report << "source\tfunction\tactual_lines\n";
@@ -45,6 +266,9 @@ void inspectFunctions(const std::filesystem::path& directory, std::size_t budget
     require(functions > 10, "Independent line scan found too few generated functions");
     const auto manifest = readFile(directory / "manifest.json");
     const auto header = readFile(directory / "grhsim_top.hpp");
+    require(!readFile(directory / "code-map.json").empty(), "Default emitter omitted the code map");
+    if (readableDump) require(!readFile(directory / "grhsim.txt").empty(), "Default emitter omitted the readable graph");
+    else require(!std::filesystem::exists(directory / "grhsim.txt"), "Readable dump opt-out was ignored");
     require(header.find("pGeneral_chunk") == std::string::npos &&
                 header.find("chunkFrame_pGeneral") == std::string::npos,
             "General phase driver contains computation chunks or a spill frame");
@@ -146,7 +370,8 @@ void manualCase(Fixture& fixture, std::string label, std::size_t budget,
         for (const auto& entry : diagnostics.messages()) message += entry.message + '\n';
         throw std::runtime_error(label + ": " + message);
     }
-    inspectFunctions(path / "model", budget);
+    inspectFunctions(path / "model", budget, !attributes.contains("readable-dump") || attributes.at("readable-dump") != "off");
+    inspectOperationStorage(path / "model", fixture.graph);
     std::ofstream driver(path / "driver.cpp");
     driver << "#include \"model/grhsim_top.hpp\"\n#include <cassert>\n" << support << "\nint main() {\nGrhSIM_top model;\n" << body << "\nreturn 0;\n}\n";
     runMakefile(path);
@@ -178,7 +403,8 @@ void writeCase(Fixture& fixture, const grh::Design& reference,
     }
     require(stamp.matches(fixture.graph) && checkpoint == json(fixture.design), "Emit changed graph or partitions");
     require(sim::requireSinkSchedule(&fixture.session, fixture.graph).complete, "Emit invalidated schedule");
-    inspectFunctions(path / "model", budget);
+    inspectFunctions(path / "model", budget, !attributes.contains("readable-dump") || attributes.at("readable-dump") != "off");
+    inspectOperationStorage(path / "model", fixture.graph);
     std::ofstream driver(path / "driver.cpp");
     driver << "#include \"model/grhsim_top.hpp\"\n#include <cstdio>\nint main() {\nGrhSIM_top model;\nmodel.configure_waveform(true, \"trace.fst\");\nmodel.set_runtime_profile_enabled(true);\n";
     grhsim_test::Oracle oracle(*reference.findGraph("top"));
@@ -322,6 +548,20 @@ void testModels() {
     require(!emitter.emit(fixture.design, options).success && !std::filesystem::exists(*options.outputDir), "Missing schedule wrote files");
     options.session = &fixture.session; options.attributes["max-function-lines"] = "4";
     require(!emitter.emit(fixture.design, options).success && !std::filesystem::exists(*options.outputDir), "Impossible budget wrote files");
+    const auto failureParent = artifact("streaming-failure");
+    std::filesystem::remove_all(failureParent);
+    std::filesystem::create_directories(failureParent);
+    options.outputDir = (failureParent / "model").string();
+    options.attributes.clear(); options.maxOutputFileBytes = 1;
+    require(!emitter.emit(fixture.design, options).success, "Artifact byte budget was ignored");
+    require(std::filesystem::is_empty(failureParent), "Failed streaming emission left output or staging");
+    options.maxOutputFileBytes = emit::EmitOptions{}.maxOutputFileBytes;
+    require(emitter.emit(fixture.design, options).success, "Emission did not recover after staging cleanup");
+    require(std::distance(std::filesystem::directory_iterator(failureParent), std::filesystem::directory_iterator{}) == 1,
+            "Successful streaming emission left staging");
+    require(!std::filesystem::exists(std::filesystem::path(*options.outputDir) / ".function-bodies"),
+            "Private function spool was published");
+    options.outputDir = artifact("invalid").string();
     options.attributes.clear(); fixture.graph.setMetadata("test.invalidates", true);
     require(!emitter.emit(fixture.design, options).success && !std::filesystem::exists(*options.outputDir), "Stale schedule wrote files");
 }
@@ -473,6 +713,231 @@ for (unsigned parity = 0; parity < 2; ++parity) for (unsigned stop = 0; stop <= 
     }
 }
 
+void testReadableFunctionWriter() {
+    const std::string unsafe = "original @ghost@ */ INJECTED /* \n\r\t\\";
+    Function plain{"readable_chunks"};
+    plain.locals = {{"unsigned", "sum"}};
+    for (unsigned i = 0; i < 80; ++i)
+        plain.body.push_back(Code::line("@sum@ += " + std::to_string(i) + ";"));
+    plain.body.push_back(Code::line("result = @sum@;"));
+    Function annotated = plain;
+    annotated.comment = unsafe; annotated.locals[0].comment = unsafe;
+    for (std::size_t i = 0; i < annotated.body.size(); ++i) {
+        annotated.body[i] = Code::commented(std::move(annotated.body[i]), unsafe);
+        annotated.body[i].sourceOperation = "o" + std::to_string(i + 1);
+    }
+    for (const auto budget : {16u, 1024u}) {
+        const auto before = writeFunction(plain, "ChunkTest", budget);
+        const auto after = writeFunction(annotated, "ChunkTest", budget);
+        require(before.functions.size() == after.functions.size(), "Comments changed function splitting");
+        std::set<std::string> operations;
+        for (std::size_t i = 0; i < after.functions.size(); ++i) {
+            const auto& part = after.functions[i];
+            require(part.name == before.functions[i].name && part.lines == before.functions[i].lines &&
+                    part.localReferences == before.functions[i].localReferences,
+                    "Comments changed the budget, local liveness or physical references");
+            require(part.lines <= budget && part.definition.find("@ghost@") == std::string::npos &&
+                    part.definition.find("*/ INJECTED /*") == std::string::npos &&
+                    part.definition.find("\\\n") == std::string::npos &&
+                    part.definition.find('\r') == std::string::npos,
+                    "Source documentation escaped a comment or affected preprocessing");
+            operations.insert(part.operations.begin(), part.operations.end());
+        }
+        for (std::size_t i = 0; i < annotated.body.size(); ++i)
+            require(operations.contains("o" + std::to_string(i + 1)), "Chunk mapping lost a source operation");
+    }
+    Function frame{"readable_frame"};
+    std::string expression = "result = ";
+    for (unsigned i = 0; i < 1100; ++i) {
+        const auto name = "module_payload_" + std::to_string(i);
+        frame.locals.push_back({"unsigned", name});
+        expression += (i ? " + @" : "@") + name + "@";
+    }
+    frame.body = {Code::line(expression + ";")};
+    for (const auto budget : {16u, 1024u}) {
+        const auto compact = writeFunction(frame, "ChunkTest", budget);
+        frame.readableFrame = true;
+        const auto direct = writeFunction(frame, "ChunkTest", budget);
+        frame.readableFrame = false;
+        require(compact.frameDeclaration.find("cells_") != std::string::npos &&
+                direct.frameDeclaration.find("cells_") == std::string::npos &&
+                direct.frameDeclaration.find("unsigned module_payload_1099;") != std::string::npos,
+                "Readable frame option did not retain logical field names");
+        require(compact.functions.front().localReferences.at("module_payload_1099").find("chunkFrame.cells_") == 0 &&
+                direct.functions.front().localReferences.at("module_payload_1099") == "chunkFrame.module_payload_1099",
+                "Frame map does not describe the emitted physical reference");
+    }
+    Function parameter{"shared_parameter"};
+    parameter.parameters = "unsigned input";
+    parameter.locals = {{"unsigned", "input", "{}", true}};
+    std::vector<Code> repeated;
+    for (unsigned i = 0; i < 40; ++i) repeated.push_back(Code::line("result += @input@;"));
+    parameter.body = {Code::block("if (true)", std::move(repeated))};
+    const auto shared = writeFunction(parameter, "ChunkTest", 16);
+    require(shared.functions.size() > 1 &&
+            shared.functions.front().localReferences.at("input") == "chunkFrame.input",
+            "Root parameter-to-frame assignment is absent from the local reference map");
+    require(std::any_of(shared.functions.begin() + 1, shared.functions.end(), [&](const auto& part) {
+        const auto found = part.localReferences.find("input");
+        return found != part.localReferences.end() && found->second == "chunkFrame.input";
+    }), "Extracted helper lost its shared parameter reference");
+    // Return control is synthesized after the caller's locals are collected.
+    // Its map must follow the actual root/helper rendering, including helpers
+    // which use only a return check and helpers with no return control at all.
+    for (const bool returnsValue : {false, true}) {
+        Function control{"mapped_return_control", "bool stop", returnsValue ? "std::uint64_t" : "void"};
+        control.locals = {{"bool", "stop", "{}", true}, {"std::uint64_t", "sum", "{5}"}};
+        std::vector<Code> early, ordinary;
+        for (unsigned i = 0; i < 40; ++i) {
+            early.push_back(Code::line("++@sum@;"));
+            ordinary.push_back(Code::line("@sum@ += 2;"));
+        }
+        const auto terminal = returnsValue ? "return @sum@;" : "return;";
+        early.push_back(Code::block("if (@sum@ > 10)", {Code::line(terminal, true)}));
+        control.body = {Code::block("if (@stop@)", std::move(early)),
+                        Code::block("if (true)", std::move(ordinary)), Code::line(terminal, true)};
+        const auto written = writeFunction(control, "ChunkTest", 16);
+        require(written.functions.size() > 2 &&
+                written.functions.front().localReferences.contains("chunk_returned") &&
+                written.functions.front().localReferences.contains("chunk_result") == returnsValue,
+                "Root return check omitted its physical control references");
+        bool terminalHelper = false, ordinaryHelper = false;
+        for (std::size_t i = 0; i < written.functions.size(); ++i) {
+            const auto& part = written.functions[i];
+            require(part.localReferences.size() == part.localTypes.size(),
+                    "A mapped writer local omitted its type");
+            for (const auto& [name, reference] : part.localReferences) {
+                require(part.localTypes.contains(name) && !part.localTypes.at(name).empty(),
+                        "A physical local reference omitted its type");
+            }
+            for (const auto name : {"chunk_returned", "chunk_result"}) {
+                const auto reference = std::string("chunkFrame.") + name;
+                const bool emitted = part.definition.find(reference) != std::string::npos;
+                require(part.localReferences.contains(name) == emitted,
+                        "Return control map disagrees with an actual emitted reference");
+                if (emitted) {
+                    require(part.localReferences.at(name) == reference &&
+                            part.localTypes.at(name) == (std::string_view(name) == "chunk_returned" ? "bool" : "std::uint64_t"),
+                            "Return control map has an incorrect physical reference or type");
+                }
+            }
+            if (i && part.definition.find("chunkFrame.chunk_returned = true;") != std::string::npos) {
+                terminalHelper = true;
+                require(part.localReferences.contains("chunk_returned") &&
+                        part.localReferences.contains("chunk_result") == returnsValue,
+                        "Extracted terminal helper omitted its return control");
+            }
+            if (i && !part.localReferences.contains("chunk_returned")) ordinaryHelper = true;
+            if (!returnsValue) require(!part.localReferences.contains("chunk_result"),
+                                       "Void function exported nonexistent result storage");
+        }
+        require(terminalHelper && ordinaryHelper, "Control mapping fixture did not exercise both helper paths");
+    }
+}
+
+void testReadableEmission() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("clock"), enable = fixture.input("enable");
+    const auto data = fixture.input("data", 8);
+    const auto first = fixture.state("tile$pipe-a", 8), second = fixture.state("tile$pipe$a", 8);
+    const auto keyword = fixture.state("class", 8);
+    const auto unicode = fixture.state("top$\xc3\xa9tage$payload", 8);
+    const std::string longPath = "top$" + std::string(300, 'a') + "$decode$" + std::string(180, 'b');
+    const auto distant = fixture.state("distant_state", 8);
+    graph.setAttr(distant, "originModules", std::vector<std::string>{longPath});
+    for (const auto state : {first, second, distant, keyword, unicode})
+        fixture.write(OperationKind::kRegisterWritePort, state, {enable, data, clock});
+    const auto sum = fixture.compute(OperationKind::kAdd, Fixture::type(8), {fixture.read(first), data});
+    const auto sumOp = graph.valueDef(sum);
+    graph.setAttr(sumOp, "originModules", std::vector<std::string>{"top$core0$alu", "top$core1$alu"});
+    grh::SrcLoc location; location.file = "rtl/original @ghost@ */ INJECTED /* \n\r\t\\";
+    location.line = 37; location.column = 9; location.origin = "rtl";
+    graph.setOpSrcLoc(sumOp, location);
+    graph.setValueSymbol(sum, graph.internSymbol("top$execute$sum"));
+    graph.addDeclaredSymbol(graph.valueSymbol(sum));
+    const auto missing = fixture.compute(OperationKind::kXor, Fixture::type(8), {fixture.read(second), data});
+    const auto missingOp = graph.valueDef(missing);
+    graph.bindOutputPort("sum", sum); graph.bindOutputPort("missing", missing);
+    graph.bindOutputPort("distant", fixture.read(distant));
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split(); fixture.partition();
+    const auto checkpoint = json(fixture.design);
+    const auto stamp = tx::DesignStamp::capture(graph);
+    const std::string body = R"CPP(
+for (unsigned epoch = 0; epoch < 2; ++epoch) {
+    model.init(); model.clock = 0; model.enable = 1; model.data = 7; model.eval();
+    assert(model.sum == 7 && model.missing == 7 && model.distant == 0);
+    model.clock = 1; model.eval();
+    assert(model.sum == 14 && model.missing == 0 && model.distant == 7);
+    model.clock = 0; model.enable = 0; model.data = 11; model.eval();
+    assert(model.sum == 18 && model.missing == 12 && model.distant == 7);
+    model.clock = 1; model.eval();
+    assert(model.sum == 18 && model.missing == 12 && model.distant == 7);
+}
+)CPP";
+    for (const auto budget : {16u, 1024u}) {
+        const auto label = "readable-emission-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, "", body, false);
+        const auto directory = artifact(label) / "model";
+        const auto source = generatedCpp(directory);
+        const auto map = readFile(directory / "code-map.json");
+        const auto dump = readFile(directory / "grhsim.txt");
+        std::set<std::string> allNames;
+        for (const auto value : graph.values()) {
+            const auto name = mappedValue(directory, value);
+            require(name.starts_with("val_") && name.size() <= 180 && allNames.insert(name).second,
+                    "Readable value names are invalid, unbounded or ambiguous");
+        }
+        for (const auto op : graph.operations()) {
+            const auto name = mappedOperation(directory, op);
+            require(name.starts_with("op_") && name.size() <= 180 && allNames.insert(name).second,
+                    "Readable operation names are invalid, unbounded or ambiguous");
+        }
+        require(mappedOperation(directory, first) != mappedOperation(directory, second),
+                "Sanitized hierarchical declaration names collided");
+        require(mappedOperation(directory, keyword).find("class") != std::string::npos &&
+                mappedOperation(directory, unicode) != mappedOperation(directory, keyword),
+                "Keyword or non-ASCII source identifiers lost their unique safe spelling");
+        require(mappedOperation(directory, distant).find("distant_state") != std::string::npos &&
+                dump.find(longPath) != std::string::npos, "Long source paths were lost from readable exports");
+        require(mappedOperation(directory, sumOp).find("shared2") != std::string::npos &&
+                dump.find("top$core0$alu") != std::string::npos && dump.find("top$core1$alu") != std::string::npos,
+                "Merged logic lost its multiple defining origins");
+        require(mappedOperation(directory, missingOp).find("generated") != std::string::npos &&
+                source.find("origin unavailable/generated") != std::string::npos,
+                "Missing provenance was replaced with an invented RTL origin");
+        require(source.find("Phase 1 Input") != std::string::npos &&
+                source.find("Phase 6 Output") != std::string::npos &&
+                source.find("source=rtl/original") != std::string::npos,
+                "Default generated source lacks phase and operation documentation");
+        require(source.find("@ghost@") == std::string::npos &&
+                source.find("*/ INJECTED /*") == std::string::npos && source.find("\\\n") == std::string::npos &&
+                source.find('\r') == std::string::npos, "RTL provenance escaped generated C++ comments");
+        require(map.find("\"operations\":[\"o") != std::string::npos &&
+                map.find("\"source\":\"grhsim_top_tu") != std::string::npos &&
+                map.find("\"reference\":") != std::string::npos,
+                "Code map omitted function provenance or emitted references");
+        const auto repeat = label + "-explicit";
+        manualCase(fixture, repeat, budget, "", body, false,
+                   {{"readable-names", "on"}, {"source-comments", "on"}, {"readable-dump", "on"}});
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+            if (entry.is_regular_file()) require(readFile(entry.path()) == readFile(artifact(repeat) / "model" / entry.path().filename()),
+                                                "Repeated readable emission was not deterministic");
+        const auto off = label + "-off";
+        manualCase(fixture, off, budget, "", body, false,
+                   {{"readable-names", "off"}, {"source-comments", "off"}, {"readable-dump", "off"}});
+        const auto offDirectory = artifact(off) / "model";
+        require(mappedValue(offDirectory, data) == "v" + std::to_string(data.index) &&
+                mappedOperation(offDirectory, first) == "s" + std::to_string(first.index) &&
+                generatedCpp(offDirectory).find("Phase 1 Input") == std::string::npos &&
+                generatedCpp(offDirectory).find("origin unavailable/generated") == std::string::npos,
+                "Readable naming/comment opt-outs were ignored");
+        manualCase(fixture, label + "-frames", budget, "", body, false, {{"readable-frames", "on"}});
+        manualCase(fixture, label + "-compact", budget, "", body, false, {{"readable-frames", "off"}});
+        require(stamp.matches(graph) && checkpoint == json(fixture.design) &&
+                sim::requireSinkSchedule(&fixture.session, graph).complete, "Readable emission modified its graph or schedule");
+    }
+}
+
 void testLargeStoreConstruction() {
     const auto path = artifact("large-store-construction");
     std::filesystem::create_directories(path);
@@ -518,6 +983,7 @@ void testLargeStoreConstruction() {
 }
 
 void testNamedModelStores() {
+    testReadableFunctionWriter(); testReadableEmission();
     Fixture fixture;
     const auto clk = fixture.input("clk"), en = fixture.input("en"), data = fixture.input("data", 8);
     const auto address = fixture.constant(1, "0");
@@ -561,7 +1027,9 @@ for (unsigned epoch = 0; epoch < 2; ++epoch) {
         require(end != std::string::npos && header.substr(begin, end - begin).find("cells_") == std::string::npos,
                 std::string("Named store was emitted through cells_: ") + store);
     }
-    require(header.find("std::uint8_t s4;") != std::string::npos,
+    const auto scalarField = mappedOperation(artifact("named-model-stores") / "model",
+                                            fixture.graph.findOperation("scalar0"));
+    require(header.find("std::uint8_t " + scalarField + ";") != std::string::npos,
             "Model state store did not retain direct semantic fields");
     require(header.find("pGeneral_chunk") == std::string::npos &&
                 header.find("chunkFrame_pGeneral") == std::string::npos,
@@ -956,7 +1424,7 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
         manualCase(fixture,label,budget,support,body,false,{{"execution-counters","on"},{"mem-enable-bitmap",bitmap}});
         const auto modelPath = artifact(label) / "model";
         const auto header = readFile(modelPath / "grhsim_top.hpp");
-        const auto member = "v" + std::to_string(shared.index);
+        const auto member = mappedValue(modelPath, shared);
         std::string source;
         for (const auto& entry : std::filesystem::directory_iterator(modelPath))
             if (entry.path().extension() == ".cpp") source += readFile(entry.path());
@@ -1303,7 +1771,7 @@ static void checkFactorWave(const char *path) {
         std::string sources;
         for (const auto& entry : std::filesystem::directory_iterator(directory))
             if (entry.path().extension() == ".cpp") sources += readFile(entry.path());
-        const auto gateField = "inputStore.v" + std::to_string(gate.index);
+        const auto gateField = "inputStore." + mappedValue(directory, gate);
         bool guarded = false;
         std::istringstream source(sources); std::string line;
         while (std::getline(source, line))
@@ -1311,7 +1779,7 @@ static void checkFactorWave(const char *path) {
                 line.find(gateField) != std::string::npos) guarded = true;
         require(guarded, "Common boundary gate was not lifted ahead of local dynamic enables");
         if (budget == 1024) {
-            const auto indexField = "smallSinkEnableBoundaryStore.v" + std::to_string(factorIndexA.index);
+            const auto indexField = "smallSinkEnableBoundaryStore." + mappedValue(directory, factorIndexA);
             bool beforeSelect = false; std::vector<bool> guards;
             std::istringstream lines(sources);
             while (std::getline(lines, line)) {
@@ -1624,7 +2092,7 @@ void testPackedArrayConstants() {
         for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
             if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
         for (const auto value : constants)
-            require(generated.find("packed" + std::to_string(value.index) + "_") == std::string::npos,
+            require(generated.find(mappedPackedPrefix(artifact(label) / "model", value)) == std::string::npos,
                 "A shaped constant was repacked from its initialized array");
         std::ofstream make(artifact("Makefile"), std::ios::app);
         make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
@@ -1732,11 +2200,11 @@ void testStaticArrayWindows() {
         for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
             if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
         for (const auto value : {flags, three, six, words, localFlags, localSix, stateSample})
-            require(generated.find("packed" + std::to_string(value.index) + "_") == std::string::npos,
+            require(generated.find(mappedPackedPrefix(artifact(label) / "model", value)) == std::string::npos,
                 "Static window extraction packed its entire source array");
-        require(generated.find("nonSinkBoundaryStore.v" + std::to_string(stateSample.index)) != std::string::npos,
+        require(generated.find("nonSinkBoundaryStore." + mappedValue(artifact(label) / "model", stateSample)) != std::string::npos,
             "Static window regression did not retain its saved state snapshot");
-        require(generated.find("packed" + std::to_string(flagsFallback.index) + "_") != std::string::npos,
+        require(generated.find(mappedPackedPrefix(artifact(label) / "model", flagsFallback)) != std::string::npos,
             "Large static window lost its compact packing fallback");
         std::ofstream make(artifact("Makefile"), std::ios::app);
         make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
@@ -1819,14 +2287,14 @@ void testDynamicArrayBits() {
         for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
             if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
         for (const auto value : {controls, savedControls, leaves3, savedLeaves3, stateSample, localControls, localLeaves3})
-            require(generated.find("packed" + std::to_string(value.index) + "_") == std::string::npos,
+            require(generated.find(mappedPackedPrefix(artifact(label) / "model", value)) == std::string::npos,
                 "Dynamic bit extraction packed its entire source array");
         for (const auto value : {localControls, localLeaves3})
-            require(generated.find("Store.v" + std::to_string(value.index)) == std::string::npos,
+            require(generated.find("Store." + mappedValue(artifact(label) / "model", value)) == std::string::npos,
                 "Dynamic bit regression did not retain its private local array");
-        require(generated.find("nonSinkBoundaryStore.v" + std::to_string(stateSample.index)) != std::string::npos,
+        require(generated.find("nonSinkBoundaryStore." + mappedValue(artifact(label) / "model", stateSample)) != std::string::npos,
             "Dynamic bit regression did not retain its saved state snapshot");
-        require(generated.find("packed" + std::to_string(fallback.index) + "_") != std::string::npos,
+        require(generated.find(mappedPackedPrefix(artifact(label) / "model", fallback)) != std::string::npos,
             "Multi-bit dynamic extraction lost its cross-leaf fallback");
         std::ofstream make(artifact("Makefile"), std::ios::app);
         make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label
@@ -1905,9 +2373,9 @@ void testMaskedViewBits() {
         std::string generated;
         for (const auto& entry : std::filesystem::directory_iterator(artifact(label) / "model"))
             if (entry.path().extension() == ".cpp" || entry.path().extension() == ".hpp") generated += readFile(entry.path());
-        require(generated.find("packed" + std::to_string(controls.index) + "_") == std::string::npos,
+        require(generated.find(mappedPackedPrefix(artifact(label) / "model", controls)) == std::string::npos,
                 "Static masked views packed the entire 352-bit control array");
-        require(generated.find("packed" + std::to_string(data3.index) + "_") == std::string::npos,
+        require(generated.find(mappedPackedPrefix(artifact(label) / "model", data3)) == std::string::npos,
                 "Cross-leaf static extraction packed its entire source array");
         std::ofstream make(artifact("Makefile"), std::ios::app);
         make << "\n.PHONY: " << label << "\nrun: " << label << '\n' << label << ":\n\t$(MAKE) -C " << label << " -f run.mk run\n";
@@ -3036,7 +3504,7 @@ void testIndexedMemoryWakeTemporal() {
             writeCase(fixture,reference,inputs,label,budget,4096,
                 {{"execution-counters","on"},{"mem-enable-bitmap",bitmap},{"mem-write-activate",mode}});
             require(mode!="on-write" || readFile(artifact(label)/"model/grhsim_top.hpp").find(
-                        " r"+std::to_string(graph.valueDef(selective).index)+";")!=std::string::npos,
+                        " "+mappedOperation(artifact(label)/"model",graph.valueDef(selective))+"_last_read_leaf;")!=std::string::npos,
                     "Indexed wake fallback fixture omitted its selective subscription plan");
             const auto path=artifact(label)/"driver.cpp";
             auto driver=readFile(path);
@@ -3119,6 +3587,8 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
 }
 
 int main() {
+    try { testStreamingJsonWriter(); }
+    catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     // Boundary-role and bitmap cases are appended after the common models.
     // Append after testModels initializes the generated execution Makefile.
     try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }

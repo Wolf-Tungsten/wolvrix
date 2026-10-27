@@ -1,6 +1,7 @@
 #include "emit/grhsim/cpu-st-cpp.hpp"
 
 #include "function-writer.hpp"
+#include "json-writer.hpp"
 #include "emit/readmem.hpp"
 #include "core/op_descriptor.hpp"
 #include "core/state.hpp"
@@ -36,6 +37,13 @@ using grh::OperationKind;
 using grh::ValueId;
 using grh::LogicalType;
 using Key = sim::PartitionKey;
+const std::vector<std::string> namedStores{
+    "smallSinkStore", "largeSinkStore", "inputStore", "nonSinkBoundaryStore",
+    "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore",
+    "largeSinkEnableBoundaryStore", "largeSinkPayloadBoundaryStore",
+    "prevEventStore", "eventActStore", "timeslotTriggerStore", "sampledStore",
+    "onceStore", "largeBeforeStore", "largeWholeBeforeStore",
+    "largeWholeDirtyStore", "memoryReadIndexStore", "memoryTouchedStore"};
 
 std::string identifier(std::string_view text) {
     std::string result;
@@ -64,6 +72,51 @@ std::size_t option(const EmitOptions& options, std::string_view name, std::size_
         throw std::invalid_argument("Invalid emit option " + std::string(name) + ": " + found->second);
     return result;
 }
+bool enabledOption(const EmitOptions& options, std::string_view name, bool fallback = true) {
+    const auto found = options.attributes.find(name);
+    if (found == options.attributes.end()) return fallback;
+    if (found->second != "on" && found->second != "off")
+        throw std::invalid_argument(std::string(name) + " must be on or off");
+    return found->second == "on";
+}
+std::string readableIdentifier(std::string_view text) {
+    std::string result;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char ch : text) {
+        hash = (hash ^ ch) * UINT64_C(1099511628211);
+        const bool ascii = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+        if (ascii) result += static_cast<char>(ch);
+        else if (!result.empty() && result.back() != '_') result += '_';
+    }
+    if (!result.empty() && result.back() == '_') result.pop_back();
+    if (result.empty()) result = "anonymous";
+    if (result.size() > 88) {
+        std::ostringstream suffix; suffix << std::hex << hash;
+        result = result.substr(0, 38) + "_" + result.substr(result.size() - 28) + "_h" + suffix.str();
+    }
+    return result;
+}
+struct OperationScope {
+    OperationId& current;
+    OperationId previous;
+    OperationScope(OperationId& current, OperationId op) : current(current), previous(current) { current = op; }
+    ~OperationScope() { current = previous; }
+};
+struct CodeOrigin {
+    std::vector<Code>& code;
+    std::size_t first;
+    std::string operation, comment;
+    ~CodeOrigin() {
+        if (code.size() > first) {
+            const auto tag = [&](auto&& self, Code& statement) -> void {
+                if (statement.sourceOperation.empty()) statement.sourceOperation = operation;
+                for (auto& child : statement.body) self(self, child);
+            };
+            for (std::size_t i = first; i < code.size(); ++i) tag(tag, code[i]);
+            code[first].comment = std::move(comment);
+        }
+    }
+};
 std::string unsignedType(int64_t width) {
     if (width > 64) return "unsigned _BitInt(" + std::to_string((width + 63) / 64 * 64) + ")";
     return "std::uint" + std::to_string(width <= 8 ? 8 : width <= 16 ? 16 : width <= 32 ? 32 : 64) + "_t";
@@ -153,7 +206,7 @@ public:
           prefix_("grhsim_" + identifier(graph.symbol())),
           class_("GrhSIM_" + identifier(graph.symbol())), counterSnapshot_(std::move(counterSnapshot)) {}
 
-    std::map<std::string, std::string> generate();
+    std::vector<std::string> generate(const std::filesystem::path& staging);
 private:
     const grh::Graph& graph_;
     const sim::SinkSchedule& schedule_;
@@ -200,7 +253,8 @@ private:
     std::map<std::string, std::vector<Local>> fields_;
     std::map<std::string, std::set<std::string>> fieldDeclarations_;
     std::map<std::string, ValueStructLayout> fieldLayouts_;
-    std::vector<Function> functions_;
+    std::vector<std::string> functionNames_;
+    std::function<void(Function)> writeFunction_;
     std::set<std::string> publicFunctions_;
     std::string dpiDeclarations_;
     std::map<std::string, std::string> initFiles_;
@@ -209,6 +263,12 @@ private:
     std::set<ValueId, bool(*)(ValueId, ValueId)> packed_{[](ValueId a, ValueId b) { return a.index < b.index; }};
     std::set<std::string> localNames_;
     std::size_t temporary_ = 0;
+    bool readableNames_ = true;
+    bool sourceComments_ = true;
+    bool readableFrames_ = true;
+    OperationId currentOperation_;
+    mutable std::unordered_map<OperationId, std::string, grh::OperationIdHash> operationNames_;
+    mutable std::unordered_map<ValueId, std::string, grh::ValueIdHash> valueNames_;
     bool waveform_ = false;
     bool hasTasks_ = false;
     bool activateOnWrite_ = false;
@@ -219,8 +279,10 @@ private:
     std::vector<std::string> counterBindingFiles_;
     std::vector<CounterSite> counterSites_;
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> packedNames_;
-    std::string counterBinding(const std::map<std::string, std::string>& files) const;
+    std::string counterBinding(const std::filesystem::path& staging) const;
     std::string counterMetadata() const;
+    void codeMap(std::ostream& output, const std::vector<WrittenFunctions>& written,
+                 const std::map<std::string, std::string>& sources) const;
     void countOperation(std::vector<Code>& code, OperationId op, std::string category = "operation") {
         if (counterSnapshot_.empty()) return;
         code.push_back(Code::line("++opExecCounts_[" + std::to_string(counterSites_.size()) + "];"));
@@ -230,8 +292,20 @@ private:
     const Key& executionOwner(OperationId op) const {
         return *executionOwners_.at(op.index);
     }
-    std::string name(OperationId op) const { return "s" + std::to_string(op.index); }
-    std::string valueName(ValueId id) const { return "v" + std::to_string(id.index); }
+    const std::string& name(OperationId op) const;
+    const std::string& valueName(ValueId id) const;
+    void analyzeNames();
+    std::string qualifiedName(OperationId op, std::string semantic) const;
+    std::string operationDescription(OperationId op) const;
+    std::string valueDescription(ValueId value) const;
+    std::string functionDescription(const Function& function, const Key& key) const;
+    std::string captureName(OperationId op, std::optional<std::size_t> operand = {}) const;
+    std::string subscriptionName(OperationId op) const {
+        return readableNames_ ? name(op) + "_last_read_leaf" : "r" + std::to_string(op.index);
+    }
+    std::string packedPrefix(ValueId id) const {
+        return readableNames_ ? valueName(id) + "_packed_" : "packed" + std::to_string(id.index) + "_";
+    }
     std::string attr(OperationId op, std::string_view key, std::string fallback = {}) const {
         return sim::attribute<std::string>(graph_, op, key).value_or(std::move(fallback));
     }
@@ -253,16 +327,34 @@ private:
                     const LeafPlan& plan, const std::string& offset = "0");
     ValueId arrayView(ValueId value) const;
     bool viewOnly(ValueId value);
-    void field(std::string store, const std::string& type, const std::string& name) {
+    void field(std::string store, const std::string& type, const std::string& name, std::string comment = {}) {
         const auto declaration = type + " " + name;
-        if (fieldDeclarations_[store].insert(declaration).second) fields_[store].push_back({type, name});
+        if (fieldDeclarations_[store].insert(declaration).second) {
+            if (sourceComments_ && comment.empty()) comment = store + " bookkeeping field";
+            fields_[store].push_back({type, name, "{}", false, sourceComments_ ? std::move(comment) : std::string{}});
+        }
     }
-    std::string local(const std::string& type, const std::string& name, std::string initializer = "{}") {
+    void field(std::string store, const std::string& type, OperationId op) {
+        field(std::move(store), type, name(op), sourceComments_ ? operationDescription(op) : std::string{});
+    }
+    void field(std::string store, const std::string& type, ValueId value) {
+        field(std::move(store), type, valueName(value), sourceComments_ ? valueDescription(value) : std::string{});
+    }
+    std::string local(const std::string& type, const std::string& name, std::string initializer = "{}", std::string comment = {}) {
         if (localNames_.insert(name).second)
-            function_->locals.push_back({type, name, std::move(initializer)});
+            function_->locals.push_back({type, name, std::move(initializer), false, sourceComments_ ? std::move(comment) : std::string{}});
         return "@" + name + "@";
     }
-    std::string temporary(const std::string& type) { return local(type, "tmp" + std::to_string(temporary_++)); }
+    std::string temporary(const std::string& type, std::string_view role = "scratch", ValueId value = {}) {
+        const auto ordinal = temporary_++;
+        const auto stem = value ? valueName(value) : currentOperation_ ? name(currentOperation_) :
+            "runtime_" + readableIdentifier(function_->name);
+        const auto member = readableNames_ ? stem + "_" + std::string(role) + "_t" + std::to_string(ordinal) :
+            "tmp" + std::to_string(ordinal);
+        auto comment = sourceComments_ ? std::string(role) + "; " +
+            (currentOperation_ ? operationDescription(currentOperation_) : "generated runtime helper in " + function_->name) : std::string{};
+        return local(type, member, "{}", std::move(comment));
+    }
     std::string read(ValueId id, bool payload = false) {
         if (owner_.size() == 3 && owner_[1] == "small-sink") {
             if (payload)
@@ -272,7 +364,10 @@ private:
         }
         if (const auto found = storage_.find(id); found != storage_.end()) return found->second;
         if (const auto found = snapshotViews_.find(id); found != snapshotViews_.end()) return read(found->second, payload);
-        return local(cppType(graph_.valueLogicalType(id)), valueName(id));
+        const auto& member = valueName(id);
+        if (localNames_.contains(member)) return "@" + member + "@";
+        return local(cppType(graph_.valueLogicalType(id)), member, "{}",
+                     sourceComments_ ? valueDescription(id) : std::string{});
     }
     std::string packed(ValueId id, std::vector<Code>& code);
     void copy(std::vector<Code>& code, const std::string& destination, const LogicalType& target,
@@ -295,15 +390,127 @@ private:
     void buildObservers();
     void buildRuntime();
     void addFunction(Function function, bool publicFunction = false) {
+        function.readableFrame = readableFrames_;
+        if (sourceComments_ && function.comment.empty()) function.comment = functionDescription(function, {});
         if (publicFunction) publicFunctions_.insert(function.name);
-        functions_.push_back(std::move(function));
+        functionNames_.push_back(function.name);
+        writeFunction_(std::move(function));
     }
     void inFunction(Function& function, const Key& key, const std::function<void(std::vector<Code>&)>& action) {
         function_ = &function; owner_ = key; packed_.clear(); packedNames_.clear(); localNames_.clear();
+        currentOperation_ = {};
+        if (sourceComments_) function.comment = functionDescription(function, key);
         for (const auto& local : function.locals) localNames_.insert(local.name);
         action(function.body); function_ = nullptr;
     }
 };
+
+void CpuStEmitContext::analyzeNames() {
+    readableNames_ = enabledOption(options_, "readable-names");
+    sourceComments_ = enabledOption(options_, "source-comments");
+    readableFrames_ = enabledOption(options_, "readable-frames");
+    // The graph can contain millions of elided operations and values. Cache a
+    // name only when the generated source or map references it, and attach
+    // comments directly to declarations instead of retaining a second global
+    // copy indexed by each long C++ name.
+}
+
+std::string CpuStEmitContext::qualifiedName(OperationId op, std::string semantic) const {
+    const auto origins = sim::attribute<std::vector<std::string>>(graph_, op, "originModules");
+    std::string provenance = origins && !origins->empty() ? origins->front() : "generated";
+    if (origins && !origins->empty() && semantic.starts_with(origins->front() + "$"))
+        semantic.erase(0, origins->front().size() + 1);
+    if (origins && origins->size() > 1) provenance += "_shared" + std::to_string(origins->size());
+    return provenance + "_" + semantic;
+}
+
+const std::string& CpuStEmitContext::name(OperationId op) const {
+    if (const auto found = operationNames_.find(op); found != operationNames_.end()) return found->second;
+    std::string result = "s" + std::to_string(op.index);
+    if (readableNames_) {
+        const auto symbol = graph_.symbolText(graph_.operationSymbol(op));
+        const auto kind = std::string(grh::toString(graph_.opKind(op)));
+        const auto semantic = graph_.isDeclaredSymbol(graph_.operationSymbol(op)) || (!symbol.empty() && symbol.front() != '_') ?
+            std::string(symbol) : attr(op, "regSymbol", attr(op, "latchSymbol", kind));
+        result = "op_" + readableIdentifier(qualifiedName(op, semantic)) +
+            "_" + readableIdentifier(kind) + "_o" + std::to_string(op.index);
+    }
+    return operationNames_.emplace(op, std::move(result)).first->second;
+}
+
+const std::string& CpuStEmitContext::valueName(ValueId value) const {
+    if (const auto found = valueNames_.find(value); found != valueNames_.end()) return found->second;
+    std::string result = "v" + std::to_string(value.index);
+    if (readableNames_) {
+        const auto symbol = graph_.symbolText(graph_.valueSymbol(value));
+        const auto producer = graph_.valueDef(value);
+        std::string provenance;
+        if (graph_.valueIsInput(value)) provenance = std::string(graph_.symbol()) + "_input_" + std::string(symbol);
+        else if (graph_.isDeclaredSymbol(graph_.valueSymbol(value)))
+            provenance = producer ? qualifiedName(producer, std::string(symbol)) : "generated_unbound_" + std::string(symbol);
+        else if (producer) provenance = name(producer);
+        else provenance = "generated_unbound_" + std::string(symbol);
+        result = "val_" + readableIdentifier(provenance) + "_v" + std::to_string(value.index);
+    }
+    return valueNames_.emplace(value, std::move(result)).first->second;
+}
+
+std::string CpuStEmitContext::valueDescription(ValueId value) const {
+    const auto producer = graph_.valueDef(value);
+    return "value v" + std::to_string(value.index) + " symbol=" + std::string(graph_.symbolText(graph_.valueSymbol(value))) +
+        (producer ? "; " + operationDescription(producer) : "; input/external value");
+}
+
+std::string CpuStEmitContext::operationDescription(OperationId op) const {
+    std::string text = "op o" + std::to_string(op.index) + " " + std::string(grh::toString(graph_.opKind(op))) +
+        " symbol=" + std::string(graph_.symbolText(graph_.operationSymbol(op)));
+    if (const auto origins = sim::attribute<std::vector<std::string>>(graph_, op, "originModules"); origins && !origins->empty()) {
+        text += "; origin=" + origins->front();
+        if (origins->size() > 1) text += " (+" + std::to_string(origins->size() - 1) + " origins; see grhsim.txt)";
+    } else text += "; origin unavailable/generated";
+    if (const auto location = graph_.opSrcLoc(op)) {
+        if (!location->file.empty()) text += "; source=" + location->file + ":" + std::to_string(location->line);
+        if (!location->pass.empty()) text += "; pass=" + location->pass;
+    }
+    if (sim::isWriter(graph_.opKind(op))) text += "; target=" + attr(op, "regSymbol", attr(op, "latchSymbol"));
+    if (const auto order = sim::attribute<int64_t>(graph_, op, "writerOrder")) text += "; writerOrder=" + std::to_string(*order);
+    if (text.size() > 420) text = text.substr(0, 390) + "... (full origin in grhsim.txt)";
+    return text;
+}
+
+std::string CpuStEmitContext::functionDescription(const Function& function, const Key& key) const {
+    static const std::map<std::string, std::string> phases{
+        {"pInput", "Phase 1 Input: snapshot inputs and activate changed consumers."},
+        {"pEvent", "Phase 2 Event: detect edges from current state; update detector history."},
+        {"pGeneral", "Phase 3 General: execute active nonsinks, then ordered writer sampling runs."},
+        {"pLargeSink", "Phase 4 LargeSink: commit captured payloads in writer order."},
+        {"pPublish", "Phase 5 Publish: publish committed small/large state and schedule another round."},
+        {"pOutput", "Phase 6 Output: refresh observable ports after fixed-point convergence."},
+        {"eval", "Evaluate one timeslot through the six phases until convergence, then Output."},
+        {"init", "Initialize model state, named stores and initial activity."}};
+    if (const auto found = phases.find(function.name); found != phases.end()) return found->second;
+    std::string text = function.name;
+    if (!key.empty()) {
+        text += "; execution owner=";
+        for (std::size_t i = 0; i < key.size(); ++i) text += (i ? "/" : "") + key[i];
+    }
+    if (function.name.starts_with("writer_run")) text += "; sample writer inputs before large-state commit; preserve schedule order";
+    else if (function.name.starts_with("commit_run")) text += "; commit captured large-state writes in schedule order";
+    else if (function.name.starts_with("sn_")) text += "; active nonsink computation; see code-map.json for original operations";
+    else text += "; generated scheduling/runtime helper";
+    return text;
+}
+
+std::string CpuStEmitContext::captureName(OperationId op, std::optional<std::size_t> operand) const {
+    if (!readableNames_) return "w" + std::to_string(op.index) + (operand ? "_" + std::to_string(*operand) : "");
+    if (!operand) return name(op) + "_captured_enable";
+    const auto args = graph_.opOperands(op);
+    const auto kind = graph_.opKind(op);
+    const bool masked = kind == sim::kLatchWrite || kind == sim::kWriteMask || kind == sim::kWriteArrayMask;
+    const auto data = args.size() - (masked ? 2 : 1);
+    const auto role = *operand == data ? "data" : masked && *operand == args.size() - 1 ? "mask" : "index";
+    return name(op) + "_captured_" + role + "_arg" + std::to_string(*operand);
+}
 
 std::vector<OperationId> CpuStEmitContext::topological(const std::vector<OperationId>& ops) const {
     std::unordered_map<OperationId, std::size_t, grh::OperationIdHash> degree;
@@ -333,6 +540,7 @@ std::vector<OperationId> CpuStEmitContext::topological(const std::vector<Operati
 }
 
 void CpuStEmitContext::analyze() {
+    analyzeNames();
     // requireSinkSchedule already verified this immutable graph and schedule.
     if (graph_.metadata(sim::kStage) != std::optional<grh::AttributeValue>(std::string("sink-partitioned")))
         throw std::invalid_argument("grhsim-cpu-st-cpp requires the sink-partitioned stage");
@@ -365,7 +573,7 @@ void CpuStEmitContext::analyze() {
         const auto sanitized = identifier(port.name);
         if (!ports.insert(sanitized).second) throw std::invalid_argument("CPU port names collide after C++ sanitization: " + port.name);
         if (input) {
-            field("inputStore", cppType(graph_.valueLogicalType(port.value)), valueName(port.value));
+            field("inputStore", cppType(graph_.valueLogicalType(port.value)), port.value);
             storage_[port.value] = "inputStore." + valueName(port.value);
         }
     };
@@ -382,10 +590,10 @@ void CpuStEmitContext::analyze() {
             if (grh::stateInitSpec(graph_, op).empty()) throw std::invalid_argument("CPU state initializer is missing");
             stateOrdinal_.emplace(op, states_.size());
             states_.push_back(op);
-            field(large(op) ? "largeSinkStore" : "smallSinkStore", cppType(type), name(op));
+            field(large(op) ? "largeSinkStore" : "smallSinkStore", cppType(type), op);
             if (large(op)) {
-                if (writeActivation(op)) field("largeBeforeStore", "bool", name(op));
-                else field("largeBeforeStore", "std::map<std::size_t," + cppType(leafType(type)) + ">", name(op));
+                if (writeActivation(op)) field("largeBeforeStore", "bool", op);
+                else field("largeBeforeStore", "std::map<std::size_t," + cppType(leafType(type)) + ">", op);
             }
             continue;
         }
@@ -394,15 +602,15 @@ void CpuStEmitContext::analyze() {
         if (key.empty()) throw std::invalid_argument("CPU executable op is missing its virtual partition");
         members_[key].push_back(op);
         if (kind == sim::kEdgeDetect) {
-            edges_.push_back(op); field("prevEventStore", "bool", name(op));
+            edges_.push_back(op); field("prevEventStore", "bool", op);
         }
         if (kind == sim::kHistoryWrite) histories_.push_back(op);
         if (kind == sim::kSystemTask) {
             hasTasks_ = true;
-            if (attr(op, "grhsim.timeslot") == "event") field("timeslotTriggerStore", "bool", name(op));
-            if (attr(op, "procKind") == "initial") field("onceStore", "bool", name(op));
+            if (attr(op, "grhsim.timeslot") == "event") field("timeslotTriggerStore", "bool", op);
+            if (attr(op, "procKind") == "initial") field("onceStore", "bool", op);
         }
-        if (kind == sim::kSystemFunction && sim::systemFunctionEffect(graph_, op) != "pure") field("sampledStore", "bool", name(op));
+        if (kind == sim::kSystemFunction && sim::systemFunctionEffect(graph_, op) != "pure") field("sampledStore", "bool", op);
     }
     // Whole-array writes can use the native std::array assignment route.  A
     // large on-change state needs one aggregate before-image so the publish
@@ -424,8 +632,8 @@ void CpuStEmitContext::analyze() {
     }
     for (const auto state : states_) if (wholeArrayStates_.contains(state) && large(state) && !writeActivation(state)) {
         const auto type = grh::stateLogicalType(graph_, state);
-        field("largeWholeBeforeStore", cppType(type), name(state));
-        field("largeWholeDirtyStore", "bool", name(state));
+        field("largeWholeBeforeStore", cppType(type), state);
+        field("largeWholeDirtyStore", "bool", state);
     }
     std::map<Key, std::set<Key>> dependencies;
     for (const auto& [key, ops] : members_) if (key.size() > 1 && key[0] == "general" && key[1] == "nonsink") {
@@ -495,11 +703,11 @@ void CpuStEmitContext::analyze() {
         if (role != smallRoles.end()) {
             const auto member = valueName(value), type = cppType(graph_.valueLogicalType(value));
             if (role->second & 1) {
-                field("smallSinkEnableBoundaryStore", type, member);
+                field("smallSinkEnableBoundaryStore", type, value);
                 smallEnableBoundary_[value] = "smallSinkEnableBoundaryStore." + member;
             }
             if (role->second & 2) {
-                field("smallSinkPayloadBoundaryStore", type, member);
+                field("smallSinkPayloadBoundaryStore", type, value);
                 smallPayloadBoundary_[value] = "smallSinkPayloadBoundaryStore." + member;
             }
             // Only direct, externally published writer enables are safe to
@@ -540,7 +748,7 @@ void CpuStEmitContext::analyze() {
         if (boundary) {
             const std::string store = graph_.opKind(producer) == sim::kEdgeDetect ? "eventActStore" : "nonSinkBoundaryStore";
             storage_[value] = store + "." + valueName(value);
-            field(store, cppType(graph_.valueLogicalType(value)), valueName(value));
+            field(store, cppType(graph_.valueLogicalType(value)), value);
         } else if (smallEnableBoundary_.contains(value)) storage_[value] = smallEnableBoundary_.at(value);
         else if (smallPayloadBoundary_.contains(value)) storage_[value] = smallPayloadBoundary_.at(value);
     }
@@ -584,11 +792,14 @@ void CpuStEmitContext::analyze() {
     // Register capture fields before rendering accesses. Every function must
     // use the same layout regardless of the order in which writers are emitted.
     for (const auto op : graph_.operations()) if (sim::isWriter(graph_.opKind(op)) && large(sim::writerTarget(graph_, op))) {
-        if (!enableBitmap_) field("largeSinkEnableBoundaryStore", "bool", "w" + std::to_string(op.index));
+        if (!enableBitmap_) field("largeSinkEnableBoundaryStore", "bool", captureName(op),
+                                 sourceComments_ ? "captured writer enable; " + operationDescription(op) : std::string{});
         const auto args = graph_.opOperands(op);
-        for (std::size_t i = graph_.opKind(op) == sim::kLatchWrite ? 1 : 2; i < args.size(); ++i)
+        for (std::size_t i = graph_.opKind(op) == sim::kLatchWrite ? 1 : 2; i < args.size(); ++i) {
             field("largeSinkPayloadBoundaryStore", cppType(graph_.valueLogicalType(args[i])),
-                  "w" + std::to_string(op.index) + "_" + std::to_string(i));
+                  captureName(op, i), sourceComments_ ? "captured argument " + std::to_string(i) + " from " + valueName(args[i]) +
+                  "; " + operationDescription(op) : std::string{});
+        }
     }
     // Named stores expose semantic state and boundary fields directly.  The
     // indexed layout is reserved for emitter-private chunk frames; sharing it
@@ -642,9 +853,10 @@ void CpuStEmitContext::analyzeIndexedReads() {
             const auto type = grh::stateLogicalType(graph_, state);
             for (std::size_t i = 0; i < args.size(); ++i) count /= type.shape[i];
             indexedReads_.emplace(read, IndexedRead{state, count});
-            field("memoryReadIndexStore", indexType, "r" + std::to_string(read.index));
+            field("memoryReadIndexStore", indexType, subscriptionName(read), sourceComments_ ?
+                  "last sampled leaf; N=invalid, N+1=not sampled; " + operationDescription(read) : std::string{});
         }
-        field("memoryTouchedStore", "std::array<std::uint64_t," + std::to_string((plan.cells + 63) / 64) + ">", name(state));
+        field("memoryTouchedStore", "std::array<std::uint64_t," + std::to_string((plan.cells + 63) / 64) + ">", state);
         indexedStates_.emplace(state, std::move(plan));
     }
 }
@@ -822,7 +1034,7 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
     if (plan.kind == LeafPlan::Kind::Source) {
         const auto type = graph_.valueLogicalType(plan.source);
         const auto source = read(plan.source);
-        const auto i = temporary("std::size_t");
+        const auto i = temporary("std::size_t", "leaf_index");
         const auto value = type.shape.empty() ?
             "(static_cast<std::uint64_t>(" + clean(source, type) + ") >> (" + i + " * " + std::to_string(leaf.width) + "))" :
             clean(row(source, type.shape, i), leafType(type));
@@ -836,12 +1048,12 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
             first += input.width / leaf.width;
         }
     } else if (plan.kind == LeafPlan::Kind::Repeat) {
-        const auto i = temporary("std::size_t");
+        const auto i = temporary("std::size_t", "leaf_index");
         std::vector<Code> body;
         emitLeaves(body, destination, target, plan.inputs[0], "(" + offset + "+" + i + "*" + std::to_string(plan.inputs[0].width / leaf.width) + ")");
         code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(plan.width / plan.inputs[0].width) + "; ++" + i + ")", std::move(body)));
     } else {
-        const auto condition = temporary("bool");
+        const auto condition = temporary("bool", "condition");
         code.push_back(Code::line(condition + " = static_cast<bool>(" + read(plan.source) + ");"));
         std::vector<Code> yes, no;
         emitLeaves(yes, destination, target, plan.inputs[0], offset);
@@ -923,7 +1135,7 @@ void CpuStEmitContext::activateState(std::vector<Code>& code, OperationId state)
         std::string condition;
         for (const auto read : reads) {
             if (!condition.empty()) condition += " || ";
-            const auto start = fieldRef("memoryReadIndexStore", "r" + std::to_string(read.index));
+            const auto start = fieldRef("memoryReadIndexStore", subscriptionName(read));
             const auto cells = std::to_string(plan.cells);
             if (indexedReads_.at(read).count == 1)
                 condition += "(" + start + " > " + cells + " || (" + start + " < " + cells + " && (" + touched +
@@ -996,7 +1208,7 @@ std::string CpuStEmitContext::pack(std::vector<Code>& code, const std::string& s
         code.push_back(Code::line("std::memcpy(&(" + destination + "), &(" + source + "), " + std::to_string(type.width / 8) + ");"));
         return destination;
     }
-    const auto i = temporary("std::size_t");
+    const auto i = temporary("std::size_t", "leaf_index");
     code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(type.width / type.leafWidth()) + "; ++" + i + ")", {
         Code::line(destination + " |= static_cast<" + unsignedType(type.width) + ">(" + clean(row(source, type.shape, i), leafType(type)) + ") << (" + i + " * " + std::to_string(type.leafWidth()) + ");")
     }));
@@ -1016,8 +1228,9 @@ std::string CpuStEmitContext::packed(ValueId id, std::vector<Code>& code) {
     // A value can be packed independently in several static sink runs.  The
     // runs may later be grouped into one writer batch, so value-id-only names
     // would collide when their locals are merged into that batch Function.
-    const auto destination = local(unsignedType(type.width),
-        "packed" + std::to_string(id.index) + "_" + std::to_string(temporary_++));
+    const auto packedName = packedPrefix(id) + std::to_string(temporary_++);
+    const auto destination = local(unsignedType(type.width), packedName, "{}",
+                                   sourceComments_ ? "packed bit image of " + valueName(id) : std::string{});
     packedNames_.emplace(id, destination);
     packed_.insert(id);
     pack(code, read(id), type, destination);
@@ -1031,7 +1244,7 @@ void CpuStEmitContext::unpack(std::vector<Code>& code, const std::string& destin
         code.push_back(Code::line("std::memcpy(&(" + destination + "), &(" + scalar + "), " + std::to_string(type.width / 8) + ");"));
         return;
     }
-    const auto i = temporary("std::size_t");
+    const auto i = temporary("std::size_t", "leaf_index");
     code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(type.width / type.leafWidth()) + "; ++" + i + ")", {
         Code::line(row(destination, type.shape, i) + " = " + clean("(" + scalar + ") >> (" + i + " * " + std::to_string(type.leafWidth()) + ")", leafType(type)) + ";")
     }));
@@ -1043,12 +1256,12 @@ void CpuStEmitContext::copy(std::vector<Code>& code, const std::string& destinat
         code.push_back(Code::line(destination + " = " + convert(source, sourceType, target) + ";")); return;
     }
     if (target.width == sourceType.width && target.leafWidth() == sourceType.leafWidth()) {
-        const auto i = temporary("std::size_t");
+        const auto i = temporary("std::size_t", "leaf_index");
         code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(target.width / target.leafWidth()) + "; ++" + i + ")", {
             Code::line(row(destination, target.shape, i) + " = " + convert(row(source, sourceType.shape, i), leafType(sourceType), leafType(target)) + ";")
         })); return;
     }
-    const auto scalar = sourceType.shape.empty() ? source : pack(code, source, sourceType, temporary(unsignedType(sourceType.width)));
+    const auto scalar = sourceType.shape.empty() ? source : pack(code, source, sourceType, temporary(unsignedType(sourceType.width), "packed_source"));
     unpack(code, destination, target, scalar, sourceType.width);
 }
 
@@ -1230,7 +1443,7 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
         return "((" + offset + ") >= " + std::to_string(container) + " ? 0 : " + shifted + ")";
     }
     if (kind == sim::kMaskedOr) {
-        const auto accumulator = temporary(unsignedType(type.width));
+        const auto accumulator = temporary(unsignedType(type.width), "packed_bits");
         code.push_back(Code::line(accumulator + " = 0;"));
         if (const auto views = sim::attribute<std::vector<int64_t>>(graph_, op, "views")) {
             for (std::size_t i = 0; i < views->size(); i += 4) {
@@ -1244,7 +1457,7 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
             }
         } else {
             const auto control = a(0), source = read(args[1]); const auto dataType = graph_.valueLogicalType(args[1]);
-            const auto i = temporary("std::size_t");
+            const auto i = temporary("std::size_t", "leaf_index");
             code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(t(0).width) + "; ++" + i + ")", {
                 Code::block("if ((" + control + " >> " + i + ") & 1)", {
                     Code::line(accumulator + " |= " + row(source, dataType.shape, i) + ";")
@@ -1257,6 +1470,8 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
 }
 
 void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
+    OperationScope origin(currentOperation_, op);
+    CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ? operationDescription(op) : std::string{}};
     const auto kind = graph_.opKind(op);
     const auto args = graph_.opOperands(op), results = graph_.opResults(op);
     if (sim::isWriter(kind) || kind == sim::kHistoryWrite) return;
@@ -1267,7 +1482,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     if (kind == sim::kDpiCall) { dpi(code, op); return; }
     if (results.size() != 1) throw std::invalid_argument("CPU expects one result for compute/read operation");
     const auto id = results[0]; const auto type = graph_.valueLogicalType(id);
-    const auto destination = storage_.contains(id) ? temporary(cppType(type)) : read(id);
+    const auto destination = storage_.contains(id) ? temporary(cppType(type), "computed", id) : read(id);
     if (const auto plan = leafPlans_.find(op); plan != leafPlans_.end()) {
         emitLeaves(code, destination, type, plan->second);
     } else if (kind == OperationKind::kConstant) {
@@ -1295,7 +1510,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         for (const auto arg : args) {
             const auto sourceType = graph_.valueLogicalType(arg);
             const auto rows = sourceType.width / sourceType.leafWidth();
-            const auto i = temporary("std::size_t");
+            const auto i = temporary("std::size_t", "leaf_index");
             const auto source = read(arg);
             code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(rows) + "; ++" + i + ")", {
                 Code::line(row(destination, type.shape, "(" + i + "+" + std::to_string(first) + ")") + " = " +
@@ -1323,7 +1538,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
             code.push_back(Code::line(destination + " = {};"));
             std::vector<Code> valid; copy(valid, destination, type, source, sourceType);
             if (subscription != indexedReads_.end()) {
-                const auto slot = fieldRef("memoryReadIndexStore", "r" + std::to_string(op.index));
+                const auto slot = fieldRef("memoryReadIndexStore", subscriptionName(op));
                 code.push_back(Code::line(slot + " = " + std::to_string(indexedStates_.at(state).cells) + ";"));
                 valid.push_back(Code::line(slot + " = " + flatStart + ";"));
             }
@@ -1333,7 +1548,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         const auto sourceType = graph_.valueLogicalType(args[0]);
         int64_t blocks = 1;
         for (std::size_t i = 1; i < args.size(); ++i) blocks *= sourceType.shape[i - 1];
-        const auto index = temporary("std::size_t");
+        const auto index = temporary("std::size_t", "leaf_index");
         code.push_back(Code::line(index + " = 0;"));
         for (std::size_t i = 1; i < args.size(); ++i) {
             const auto raw = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + read(args[i]) + ")";
@@ -1345,7 +1560,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         std::vector<Code> valid;
         if (type.shape.empty()) valid.push_back(Code::line(destination + " = " + clean(row(source, sourceType.shape, index), type) + ";"));
         else {
-            const auto i = temporary("std::size_t"); const auto count = type.width / type.leafWidth();
+            const auto i = temporary("std::size_t", "leaf_index"); const auto count = type.width / type.leafWidth();
             valid.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(count) + "; ++" + i + ")", {
                 Code::line(row(destination, type.shape, i) + " = " + row(source, sourceType.shape, "(" + index + "*" + std::to_string(count) + "+" + i + ")") + ";")
             }));
@@ -1373,7 +1588,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         const auto text = expression(op, id, code);
         if (type.shape.empty()) code.push_back(Code::line(destination + " = " + clean(text, type) + ";"));
         else {
-            const auto scalar = temporary(unsignedType(type.width));
+            const auto scalar = temporary(unsignedType(type.width), "packed_bits");
             code.push_back(Code::line(scalar + " = " + clean(text, scalarType(type)) + ";"));
             unpack(code, destination, type, scalar, type.width);
         }
@@ -1382,6 +1597,9 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
 }
 
 void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool commit) {
+    OperationScope origin(currentOperation_, op);
+    CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ?
+        std::string(commit ? "commit captured writer; " : "sample writer; ") + operationDescription(op) : std::string{}};
     countOperation(code, op, commit ? "writer-commit" : "writer-sample");
     const auto kind = graph_.opKind(op);
     const auto args = graph_.opOperands(op);
@@ -1400,13 +1618,13 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     const std::string enableWord = "largeSinkEnableBoundaryStore.words[" + std::to_string(bit / 64) + "]";
     const std::string enableMask = "(UINT64_C(1)<<" + std::to_string(bit % 64) + ")";
     const std::string enableSlot = inPlace ? (enableBitmap_ ? "(" + enableWord + " & " + enableMask + ")" :
-        fieldRef("largeSinkEnableBoundaryStore", "w" + std::to_string(op.index))) : std::string{};
+        fieldRef("largeSinkEnableBoundaryStore", captureName(op))) : std::string{};
     if (inPlace && !commit) {
         // pGeneral resets all enables before its clock-guarded sink runs.
         std::vector<Code> capture;
         for (std::size_t i = latch ? 1 : 2; i < args.size(); ++i) {
             const auto argType = graph_.valueLogicalType(args[i]);
-            const std::string member = "w" + std::to_string(op.index) + "_" + std::to_string(i);
+            const std::string member = captureName(op, i);
             copy(capture, fieldRef("largeSinkPayloadBoundaryStore", member), argType, read(args[i]), argType);
         }
         capture.push_back(Code::line(enableBitmap_ ? enableWord + " |= " + enableMask + ";" : enableSlot + " = true;"));
@@ -1414,7 +1632,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         return;
     }
     const auto value = [&](std::size_t i) {
-        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", "w" + std::to_string(op.index) + "_" + std::to_string(i)) : read(args[i], true);
+        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)) : read(args[i], true);
     };
     std::string condition = inPlace ? enableSlot : latch ? read(args[0]) : "(" + read(args[0]) + " && " + read(args[1]) + ")";
     std::string start = "0";
@@ -1430,15 +1648,15 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     const auto element = leafType(type);
     const auto data = value(dataIndex);
     const auto dataPacked = dataType.shape.empty() ? data :
-        dataType.leafWidth() == type.leafWidth() ? std::string{} : pack(body, data, dataType, temporary(unsignedType(dataType.width)));
+        dataType.leafWidth() == type.leafWidth() ? std::string{} : pack(body, data, dataType, temporary(unsignedType(dataType.width), "packed_data"));
     std::string maskData, packedMask;
     LogicalType maskType;
     if (masked) {
         maskType = graph_.valueLogicalType(args.back()); maskData = value(args.size() - 1);
         if (!maskType.shape.empty() && maskType.leafWidth() != element.width)
-            packedMask = pack(body, maskData, maskType, temporary(unsignedType(maskType.width)));
+            packedMask = pack(body, maskData, maskType, temporary(unsignedType(maskType.width), "packed_mask"));
     }
-    const auto i = temporary("std::size_t");
+    const auto i = temporary("std::size_t", "leaf_index");
     const auto addressedRow = "(" + start + " + " + i + ")";
     const auto destination = type.shape.empty() ? (inPlace ? stateRef(state) : nextStateRef(state)) :
         row(inPlace ? stateRef(state) : nextStateRef(state), type.shape, addressedRow);
@@ -1477,7 +1695,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     };
     const bool broadcast = kind == sim::kFill && dataType.width == type.leafWidth();
     const auto payload = elementFrom(data, dataType, dataPacked, broadcast);
-    const auto changed = temporary(cppType(element));
+    const auto changed = temporary(cppType(element), "previous_leaf");
     const auto replacement = masked ? clean("(" + destination + " & ~" + elementFrom(maskData, maskType, packedMask, false) + ") | (" + payload + " & " + elementFrom(maskData, maskType, packedMask, false) + ")", element) : payload;
     std::vector<Code> write{Code::line(changed + " = " + replacement + ";"), Code::line("GRHSIM_PERF_COUNT(touchedWriteCount);")};
     if (inPlace) {
@@ -1528,13 +1746,13 @@ void CpuStEmitContext::dpi(std::vector<Code>& code, OperationId op) {
             const auto source = args[input++];
             if (target.kind == grh::ValueType::String) call += "(" + read(source) + ").c_str()";
             else {
-                const auto argument = temporary(base);
+                const auto argument = temporary(base, "dpi_argument");
                 body.push_back(Code::line(argument + " = " + convert(read(source), graph_.valueLogicalType(source), target) + ";"));
                 call += argument;
             }
         } else {
             declaration += base + "*";
-            const auto argument = temporary(base);
+            const auto argument = temporary(base, "dpi_argument");
             const auto initial = directions[i] == "inout" ? convert(read(args[inoutInput]), graph_.valueLogicalType(args[inoutInput]), target) :
                 target.kind == grh::ValueType::String ? "std::string{}" : "0";
             body.push_back(Code::line(argument + " = " + initial + ";"));
@@ -1546,11 +1764,11 @@ void CpuStEmitContext::dpi(std::vector<Code>& code, OperationId op) {
     declaration += ");\n"; call += ")";
     if (dpiDeclarations_.find(declaration) == std::string::npos) dpiDeclarations_ += declaration;
     if (returned) {
-        const auto result = temporary(dpiType(graph_.valueLogicalType(results[0])));
+        const auto result = temporary(dpiType(graph_.valueLogicalType(results[0])), "dpi_return", results[0]);
         body.push_back(Code::line(result + " = " + call + ";")); produced.insert(produced.begin(), {results[0], result});
     } else body.push_back(Code::line(call + ";"));
     for (const auto& [result, source] : produced) {
-        const auto normalized = temporary(cppType(graph_.valueLogicalType(result)));
+        const auto normalized = temporary(cppType(graph_.valueLogicalType(result)), "normalized_return", result);
         body.push_back(Code::line(normalized + " = " + clean(source, graph_.valueLogicalType(result)) + ";"));
         publish(body, result, normalized);
     }
@@ -1586,10 +1804,10 @@ void CpuStEmitContext::buildPhases() {
     inFunction(input, {}, [&](auto& code) {
         for (const auto& port : graph_.inputPorts()) {
             const auto type = graph_.valueLogicalType(port.value);
-            const auto incoming = temporary(cppType(type));
+            const auto incoming = temporary(cppType(type), "input_snapshot", port.value);
             if (type.shape.empty()) code.push_back(Code::line(incoming + " = " + clean("this->" + identifier(port.name), type) + ";"));
             else {
-                const auto i = temporary("std::size_t");
+                const auto i = temporary("std::size_t", "leaf_index");
                 code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(type.width / type.leafWidth()) + "; ++" + i + ")", {
                     Code::line(row(incoming, type.shape, i) + " = " + clean(row("this->" + identifier(port.name), type.shape, i), leafType(type)) + ";")
                 }));
@@ -2048,6 +2266,7 @@ void CpuStEmitContext::buildPhases() {
             std::vector<std::pair<std::size_t, std::vector<Code>>> dirtyCases;
             for (std::size_t ordinal = firstWord * 8; ordinal < std::min(states_.size(), lastWord * 8); ++ordinal) {
                 const auto state = states_[ordinal];
+                OperationScope origin(currentOperation_, state);
                 const auto index = stateOrdinal_.at(state);
                 if (attr(state, "grhsim.history") == "output-end") {
                     // Keep the ordinal table dense.  Output-end history states do
@@ -2092,7 +2311,7 @@ void CpuStEmitContext::buildPhases() {
                                 Code::line(wholeDirty + " = false;")
                             }));
                         }
-                        const auto iterator = temporary("std::map<std::size_t," + cppType(leafType(type)) + ">::const_iterator");
+                        const auto iterator = temporary("std::map<std::size_t," + cppType(leafType(type)) + ">::const_iterator", "before_image_iterator");
                         const auto cell = type.shape.empty() ? stateRef(state) : row(stateRef(state), type.shape, iterator + "->first");
                         body.push_back(Code::block("for (" + iterator + " = " + before + ".begin(); " + iterator + " != " + before + ".end(); ++" + iterator + ")", {
                             Code::block("if (" + cell + " != " + iterator + "->second)", changed())
@@ -2104,6 +2323,8 @@ void CpuStEmitContext::buildPhases() {
                     stateChanged.push_back(Code::line(stateRef(state) + " = " + nextStateRef(state) + ";"));
                     body.push_back(Code::block("if (" + stateRef(state) + " != " + nextStateRef(state) + ")", std::move(stateChanged)));
                 }
+                CodeOrigin{body, 0, "o" + std::to_string(state.index), sourceComments_ ?
+                    "publish dirty state; " + operationDescription(state) : std::string{}};
                 dirtyCases.emplace_back(index, std::move(body));
             }
             // State dirty bits use the same flag-only discipline as gsim's
@@ -2149,14 +2370,20 @@ void CpuStEmitContext::buildPhases() {
         for (const auto& port : graph_.outputPorts()) copy(code, "this->" + identifier(port.name), graph_.valueLogicalType(port.value), read(port.value), graph_.valueLogicalType(port.value));
         std::vector<std::pair<OperationId, std::string>> staged;
         for (const auto op : histories_) {
+            OperationScope origin(currentOperation_, op);
+            CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ?
+                "snapshot history after all output observations; " + operationDescription(op) : std::string{}};
             countOperation(code, op, "history-write");
             const auto state = sim::writerTarget(graph_, op);
             const auto type = grh::stateLogicalType(graph_, state);
-            const auto snapshot = temporary(cppType(type));
+            const auto snapshot = temporary(cppType(type), "history_snapshot");
             copy(code, snapshot, type, read(graph_.opOperands(op)[0]), type);
-            staged.emplace_back(state, snapshot);
+            staged.emplace_back(op, snapshot);
         }
-        for (const auto& [state, snapshot] : staged) {
+        for (const auto& [op, snapshot] : staged) {
+            const auto state = sim::writerTarget(graph_, op);
+            CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ?
+                "commit staged history; " + operationDescription(op) : std::string{}};
             code.push_back(Code::line(stateRef(state) + " = " + snapshot + ";"));
             if (!large(state)) code.push_back(Code::line(nextStateRef(state) + " = " + snapshot + ";"));
         }
@@ -2231,10 +2458,16 @@ void CpuStEmitContext::buildInit() {
                 else code.push_back(Code::line("std::memset(&" + target + ", 0, sizeof(" + target + "));"));
             }
         }
-        for (const auto& [op, subscription] : indexedReads_)
-            code.push_back(Code::line(fieldRef("memoryReadIndexStore", "r" + std::to_string(op.index)) + " = " +
+        for (const auto& [op, subscription] : indexedReads_) {
+            CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ?
+                "initialize indexed-read subscription; " + operationDescription(op) : std::string{}};
+            code.push_back(Code::line(fieldRef("memoryReadIndexStore", subscriptionName(op)) + " = " +
                 std::to_string(indexedStates_.at(subscription.state).cells + 1) + ";"));
+        }
         for (const auto state : states_) {
+            OperationScope origin(currentOperation_, state);
+            CodeOrigin annotation{code, code.size(), "o" + std::to_string(state.index), sourceComments_ ?
+                "initialize state; " + operationDescription(state) : std::string{}};
             const auto type = grh::stateLogicalType(graph_, state);
             const auto element = leafType(type);
             const auto slot = stateRef(state);
@@ -2265,11 +2498,11 @@ void CpuStEmitContext::buildInit() {
                     const bool random = step.kind == grh::InitKind::Random || step.random;
                     const auto value = random ? slang::SVInt(element.width, 0, element.isSigned) : bits(step.value, element.width, element.isSigned);
                     if (!random && value == 0 && !dirty) continue;
-                    const auto index = temporary("std::size_t");
+                    const auto index = temporary("std::size_t", "leaf_index");
                     const auto cell = type.shape.empty() ? slot : row(slot, type.shape, index);
                     std::string rng = "cpu_rng";
                     if (step.seed) {
-                        rng = temporary("std::uint64_t");
+                        rng = temporary("std::uint64_t", "initial_rng");
                         code.push_back(Code::line(rng + " = UINT64_C(" + std::to_string(uint64_t(*step.seed)) + ");"));
                     }
                     std::vector<Code> fill;
@@ -2324,8 +2557,12 @@ void CpuStEmitContext::buildInit() {
             if (end != rows) throw std::invalid_argument("CPU initializer leaves uncovered rows: " + std::string(graph_.getOperation(state).symbolText()));
         }
         code.push_back(Code::line("smallSinkStoreNext = smallSinkStore;"));
-        for (const auto edge : edges_) code.push_back(Code::line(fieldRef("prevEventStore", name(edge)) + " = " +
-            (bits(attr(edge, "prevInit"), 1, false).getRawPtr()[0] ? "true" : "false") + ";"));
+        for (const auto edge : edges_) {
+            CodeOrigin annotation{code, code.size(), "o" + std::to_string(edge.index), sourceComments_ ?
+                "initialize edge detector history; " + operationDescription(edge) : std::string{}};
+            code.push_back(Code::line(fieldRef("prevEventStore", name(edge)) + " = " +
+                (bits(attr(edge, "prevInit"), 1, false).getRawPtr()[0] ? "true" : "false") + ";"));
+        }
         if (waveform_) code.push_back(Code::line("waveform_time_ = 0;"));
     }); addFunction(std::move(init), true);
 }
@@ -2534,19 +2771,19 @@ void CpuStEmitContext::buildObservers() {
             body.push_back(Code::line("std::fputs(" + quote(label + "=") + ", @stream@);"));
             if (type.kind == grh::ValueType::String) body.push_back(Code::line("std::fputs(" + value + ".c_str(), @stream@);"));
             else if (type.kind == grh::ValueType::Real) {
-                const auto raw = temporary("std::uint64_t");
+                const auto raw = temporary("std::uint64_t", "real_bit_image");
                 body.push_back(Code::line("std::memcpy(&" + raw + ", &" + value + ", sizeof(" + raw + "));"));
                 body.push_back(Code::line("std::fprintf(@stream@, \"%016llx\", static_cast<unsigned long long>(" + raw + "));"));
             } else {
                 const auto element = leafType(type);
                 const auto rows = type.width / element.width;
-                const auto i = temporary("std::size_t");
+                const auto i = temporary("std::size_t", "leaf_index");
                 const auto cell = type.shape.empty() ? value : row(value, type.shape, "(" + i + " - 1)");
                 std::vector<Code> print;
                 if (element.width == 1 && !element.isSigned) print.push_back(Code::line("std::fprintf(@stream@, \"%u\", " + cell + " ? 1u : 0u);"));
                 else if (element.width <= 64) print.push_back(Code::line("std::fprintf(@stream@, \"%0*llx\", int(sizeof(" + cell + ") * 2), static_cast<unsigned long long>(static_cast<" + unsignedType(element.width) + ">(" + cell + ")));"));
                 else {
-                    const auto word = temporary("std::size_t");
+                    const auto word = temporary("std::size_t", "leaf_index");
                     print.push_back(Code::block("for (" + word + " = " + std::to_string((element.width + 63) / 64) + "; " + word + " > 0; --" + word + ")", {
                         Code::line("std::fprintf(@stream@, \"%016llx\", static_cast<unsigned long long>(" + cell + " >> ((" + word + " - 1) * 64)));")
                     }));
@@ -2665,7 +2902,7 @@ void CpuStEmitContext::buildObservers() {
     }; addFunction(std::move(trace));
 }
 
-std::string CpuStEmitContext::counterBinding(const std::map<std::string, std::string>& files) const {
+std::string CpuStEmitContext::counterBinding(const std::filesystem::path& staging) const {
     uint64_t hash = 14695981039346656037ull;
     const auto append = [&](std::string_view text) {
         for (const unsigned char ch : text) { hash ^= ch; hash *= 1099511628211ull; }
@@ -2675,10 +2912,16 @@ std::string CpuStEmitContext::counterBinding(const std::map<std::string, std::st
         for (const auto& text : {std::string(graph_.getOperation(site.operation).symbolText()), site.category, site.function}) {
             append(std::to_string(text.size())); append(":"); append(text);
         }
-    for (const auto& [name, contents] : files)
-        for (const auto& text : {std::string_view(name), std::string_view(contents)}) {
-            append(std::to_string(text.size())); append(":"); append(text);
-        }
+    for (const auto& name : counterBindingFiles_) {
+        append(std::to_string(name.size())); append(":"); append(name);
+        append(std::to_string(std::filesystem::file_size(staging / name))); append(":");
+        std::ifstream input(staging / name, std::ios::binary);
+        input.exceptions(std::ios::badbit);
+        if (!input) throw std::runtime_error("Cannot read execution binding source: " + name);
+        char buffer[65536];
+        while (input.read(buffer, sizeof(buffer)) || input.gcount())
+            append(std::string_view(buffer, static_cast<std::size_t>(input.gcount())));
+    }
     return std::to_string(hash);
 }
 
@@ -2709,15 +2952,199 @@ std::string CpuStEmitContext::counterMetadata() const {
     return std::string(json.view());
 }
 
-std::map<std::string, std::string> CpuStEmitContext::generate() {
+void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFunctions>& written,
+                               const std::map<std::string, std::string>& sources) const {
+    StreamingJsonWriter json(output);
+    const auto text = [&](std::string_view key, std::string_view value) { json.writeProperty(key); json.writeValue(value); };
+    const auto strings = [&](std::string_view key, const auto& values) {
+        json.writeProperty(key); json.startArray();
+        for (const auto& value : values) json.writeValue(std::string_view(value));
+        json.endArray();
+    };
+    const auto location = [&](const std::optional<grh::SrcLoc>& loc) {
+        json.writeProperty("source_location"); json.startObject();
+        if (loc) {
+            text("file", loc->file);
+            json.writeProperty("line"); json.writeValue(uint64_t(loc->line));
+            json.writeProperty("column"); json.writeValue(uint64_t(loc->column));
+            json.writeProperty("end_line"); json.writeValue(uint64_t(loc->endLine));
+            json.writeProperty("end_column"); json.writeValue(uint64_t(loc->endColumn));
+            text("origin", loc->origin); text("pass", loc->pass); text("note", loc->note);
+        }
+        json.endObject();
+    };
+    const auto owner = [&](OperationId op) {
+        strings("logical_partition", sim::attribute<Key>(graph_, op, sim::kPartition).value_or(Key{}));
+        strings("execution_owner", executionOwner(op));
+    };
+    const auto reference = [&](std::string_view role, const std::string& ref) {
+        json.startObject(); text("role", role); text("reference", ref); json.endObject();
+    };
+    json.startObject();
+    text("schema", "grhsim-code-map.v1"); text("top", graph_.symbol());
+    text("identity_scope", "op/value IDs identify this frozen graph only; full symbols and origin sets are in grhsim.txt");
+    json.writeProperty("readable_names"); json.writeValue(readableNames_);
+    std::map<std::vector<std::string>, std::size_t> originSets;
+    for (const auto op : graph_.operations()) {
+        const auto origins = sim::attribute<std::vector<std::string>>(graph_, op, "originModules").value_or(std::vector<std::string>{});
+        if (!originSets.contains(origins)) originSets.emplace(origins, originSets.size());
+    }
+    json.writeProperty("origin_sets"); json.startArray();
+    for (const auto& [origins, id] : originSets) {
+        json.startObject(); json.writeProperty("id"); json.writeValue(uint64_t(id)); strings("modules", origins); json.endObject();
+    }
+    json.endArray();
+    json.writeProperty("values"); json.startArray();
+    for (const auto value : graph_.values()) {
+        json.startObject(); text("value_id", "v" + std::to_string(value.index)); text("cpp_name", valueName(value));
+        text("packed_prefix", packedPrefix(value));
+        text("symbol", graph_.symbolText(graph_.valueSymbol(value)));
+        text("cpp_type", cppType(graph_.valueLogicalType(value)));
+        json.writeProperty("generation"); json.writeValue(uint64_t(value.generation));
+        const auto producer = graph_.valueDef(value);
+        if (producer) text("producer", "o" + std::to_string(producer.index));
+        location(graph_.valueSrcLoc(value));
+        json.writeProperty("storage"); json.startArray();
+        if (const auto found = storage_.find(value); found != storage_.end()) reference("primary", found->second);
+        if (const auto found = smallEnableBoundary_.find(value); found != smallEnableBoundary_.end()) reference("small-sink-enable", found->second);
+        if (const auto found = smallPayloadBoundary_.find(value); found != smallPayloadBoundary_.end()) reference("small-sink-payload", found->second);
+        if (const auto found = snapshotViews_.find(value); found != snapshotViews_.end()) {
+            auto source = found->second;
+            while (snapshotViews_.contains(source)) source = snapshotViews_.at(source);
+            reference("snapshot-view", storage_.at(source));
+        }
+        json.endArray();
+        if (const auto found = snapshotViews_.find(value); found != snapshotViews_.end())
+            text("snapshot_source", "v" + std::to_string(found->second.index));
+        if (const auto found = smallEnableOrdinal_.find(value); found != smallEnableOrdinal_.end()) {
+            json.writeProperty("enable_bit"); json.writeValue(uint64_t(found->second));
+        }
+        json.endObject();
+    }
+    json.endArray();
+    json.writeProperty("operations"); json.startArray();
+    for (const auto op : graph_.operations()) {
+        json.startObject(); text("operation_id", "o" + std::to_string(op.index)); text("cpp_name", name(op));
+        text("symbol", graph_.symbolText(graph_.operationSymbol(op))); text("kind", grh::toString(graph_.opKind(op)));
+        json.writeProperty("generation"); json.writeValue(uint64_t(op.generation));
+        json.writeProperty("origin_set"); json.writeValue(uint64_t(originSets.at(
+            sim::attribute<std::vector<std::string>>(graph_, op, "originModules").value_or(std::vector<std::string>{}))));
+        json.writeProperty("operands"); json.startArray();
+        for (const auto arg : graph_.opOperands(op)) json.writeValue("v" + std::to_string(arg.index));
+        json.endArray();
+        json.writeProperty("results"); json.startArray();
+        for (const auto result : graph_.opResults(op)) json.writeValue("v" + std::to_string(result.index));
+        json.endArray();
+        location(graph_.opSrcLoc(op)); owner(op);
+        const bool elided = identityElisions_.contains(op) || leafElisions_.contains(op) ||
+            (graph_.opKind(op) == OperationKind::kAssign && graph_.opResults(op).size() == 1 && viewOnly_.at(graph_.opResults(op)[0]));
+        json.writeProperty("elided"); json.writeValue(elided);
+        if (const auto ordinal = stateOrdinal_.find(op); ordinal != stateOrdinal_.end()) {
+            text("state_reference", stateRef(op));
+            if (!large(op)) text("next_reference", nextStateRef(op));
+        }
+        if (indexedReads_.contains(op)) text("subscription", fieldRef("memoryReadIndexStore", subscriptionName(op)));
+        if (const auto bit = largeWriteOrdinal_.find(op); bit != largeWriteOrdinal_.end()) {
+            json.writeProperty("enable_bit"); json.writeValue(uint64_t(bit->second));
+            json.writeProperty("captures"); json.startArray();
+            for (std::size_t i = graph_.opKind(op) == sim::kLatchWrite ? 1 : 2; i < graph_.opOperands(op).size(); ++i)
+                reference("argument-" + std::to_string(i), fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)));
+            json.endArray();
+        }
+        json.writeProperty("storage"); json.startArray();
+        for (const auto& [store, layout] : fieldLayouts_) {
+            if (layout.references.contains(name(op))) reference(store, fieldRef(store, name(op)));
+            if (store == "smallSinkStore" && layout.references.contains(name(op)))
+                reference("smallSinkStoreNext", nextStateRef(op));
+        }
+        if (indexedReads_.contains(op)) reference("memoryReadIndexStore", fieldRef("memoryReadIndexStore", subscriptionName(op)));
+        if (largeWriteOrdinal_.contains(op)) {
+            if (enableBitmap_) {
+                const auto bit = largeWriteOrdinal_.at(op);
+                reference("captured-enable", "(largeSinkEnableBoundaryStore.words[" + std::to_string(bit / 64) +
+                    "] & (UINT64_C(1)<<" + std::to_string(bit % 64) + "))");
+            } else reference("captured-enable", fieldRef("largeSinkEnableBoundaryStore", captureName(op)));
+            for (std::size_t i = graph_.opKind(op) == sim::kLatchWrite ? 1 : 2; i < graph_.opOperands(op).size(); ++i)
+                reference("captured-argument-" + std::to_string(i), fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)));
+        }
+        json.endArray();
+        json.endObject();
+    }
+    json.endArray();
+    json.writeProperty("stores"); json.startArray();
+    auto storeInstances = namedStores;
+    storeInstances.push_back("smallSinkStoreNext");
+    for (const auto& instance : storeInstances) {
+        const auto store = instance == "smallSinkStoreNext" ? "smallSinkStore" : instance;
+        json.startObject(); text("name", instance); text("type", store + "Type");
+        if (instance != store) text("layout", store);
+        json.writeProperty("fields"); json.startArray();
+        if (const auto found = fields_.find(store); found != fields_.end()) for (const auto& field : found->second) {
+            json.startObject(); text("name", field.name); text("type", field.type);
+            text("reference", fieldRef(store, field.name, instance)); json.endObject();
+        }
+        json.endArray(); json.endObject();
+    }
+    json.endArray();
+    json.writeProperty("functions"); json.startArray();
+    for (std::size_t i = 0; i < written.size(); ++i) for (const auto& function : written[i].functions) {
+        json.startObject(); text("name", function.name); text("source", sources.at(function.name));
+        text("root_function", functionNames_[i]); strings("operations", function.operations);
+        json.writeProperty("locals"); json.startArray();
+        for (const auto& [name, reference] : function.localReferences) {
+            json.startObject(); text("name", name); text("reference", reference);
+            text("type", function.localTypes.at(name)); json.endObject();
+        }
+        json.endArray(); json.endObject();
+    }
+    json.endArray();
+    json.writeProperty("nonsink_functions"); json.startArray();
+    for (std::size_t i = 0; i < nonsink_.size(); ++i) {
+        json.startObject(); text("name", "sn_" + std::to_string(i)); strings("execution_owner", nonsink_[i]); json.endObject();
+    }
+    json.endArray(); json.endObject();
+    output.put('\n');
+}
+
+std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path& staging) {
+    // Consume each source function as it is built. The large structured bodies
+    // and rendered definitions never accumulate alongside the whole model.
+    struct Definition { std::uint64_t bytes; };
+    std::vector<Definition> definitions;
+    std::vector<WrittenFunctions> written;
+    const auto bodyPath = staging / ".function-bodies";
+    std::ofstream bodies(bodyPath, std::ios::binary);
+    bodies.exceptions(std::ios::badbit | std::ios::failbit);
+    writeFunction_ = [&](Function function) {
+        auto group = writeFunction(std::move(function), class_, maxLines_);
+        for (auto& emitted : group.functions) {
+            definitions.push_back({emitted.definition.size()});
+            bodies << emitted.definition;
+            std::string().swap(emitted.definition);
+        }
+        written.push_back(std::move(group));
+    };
     analyze();
     buildPhases();
     buildInit();
+    for (auto& [store, layout] : fieldLayouts_) std::vector<Local>().swap(layout.physicalFields);
     buildRuntime();
     buildObservers();
-    std::vector<WrittenFunctions> written;
-    for (const auto& function : functions_) written.push_back(writeFunction(function, class_, maxLines_));
-    std::ostringstream header;
+    writeFunction_ = {};
+    bodies.close();
+    std::vector<std::string> files;
+    const auto finished = [&](const std::string& path) {
+        if (std::filesystem::file_size(staging / path) > options_.maxOutputFileBytes)
+            throw std::invalid_argument("Generated artifact exceeds maxOutputFileBytes: " + path);
+        files.push_back(path);
+    };
+    const auto save = [&](const std::string& path, std::string_view contents) {
+        std::ofstream output(staging / path, std::ios::binary);
+        output.exceptions(std::ios::badbit | std::ios::failbit);
+        output << contents; output.close(); finished(path);
+    };
+    std::ofstream header(staging / (prefix_ + ".hpp"), std::ios::binary);
+    header.exceptions(std::ios::badbit | std::ios::failbit);
     header << "#pragma once\n#include <algorithm>\n#include <array>\n#include <chrono>\n#include <cctype>\n#include <cstdint>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <functional>\n#include <initializer_list>\n#include <iostream>\n#include <map>\n#include <span>\n#include <sstream>\n#include <stdexcept>\n#include <string>\n#include <string_view>\n#include <vector>\n";
     if (waveform_) header << "#include \"fstapi.h\"\n";
     header << "#if !defined(__clang__) || !defined(__BITINT_MAXWIDTH__)\n#error \"grhsim CPU requires clang with unsigned _BitInt support\"\n#endif\n"
@@ -2732,7 +3159,7 @@ std::map<std::string, std::string> CpuStEmitContext::generate() {
     std::set<std::string> memberNames{class_, "PerfCounters", "TaskArg", "activeCurrent", "activeNext", "dirtyStateFlags", "pending_", "cpu_rng", "perf_", "profileEnabled_", "snTimeTicks_", "snTimeFires_"};
     if (!counterSnapshot_.empty()) { memberNames.insert("opExecCounts_"); memberNames.insert("opExecEvals_"); }
     for (const auto& [store, fields] : fields_) memberNames.insert(store);
-    for (const auto& function : functions_) memberNames.insert(function.name);
+    for (const auto& name : functionNames_) memberNames.insert(name);
     const auto port = [&](const grh::Port& port) {
         const auto name = identifier(port.name);
         if (!memberNames.insert(name).second) throw std::invalid_argument("CPU port collides with a generated member: " + name);
@@ -2744,13 +3171,13 @@ std::map<std::string, std::string> CpuStEmitContext::generate() {
         << "    " << class_ << "(const " << class_ << "&) = delete;\n"
         << "    " << class_ << "& operator=(const " << class_ << "&) = delete;\n"
         << "    struct PerfCounters {\n        std::uint64_t evalCount=0, round1Count=0, round2Count=0, totalRoundCount=0, computeBatchExecCount=0, commitBatchExecCount=0, touchedStateShadowCount=0, touchedWriteCount=0;\n    };\n";
-    for (std::size_t i = 0; i < functions_.size(); ++i) if (publicFunctions_.contains(functions_[i].name)) header << written[i].functions[0].declaration;
+    for (std::size_t i = 0; i < functionNames_.size(); ++i) if (publicFunctions_.contains(functionNames_[i])) header << written[i].functions[0].declaration;
     header << "private:\n";
     header << "    struct TaskArg { char kind; const void *data; std::size_t bytes; std::size_t width; bool isSigned; };\n";
-    static const std::vector<std::string> stores{"smallSinkStore", "largeSinkStore", "inputStore", "nonSinkBoundaryStore", "smallSinkEnableBoundaryStore", "smallSinkPayloadBoundaryStore", "largeSinkEnableBoundaryStore", "largeSinkPayloadBoundaryStore", "prevEventStore", "eventActStore", "timeslotTriggerStore", "sampledStore", "onceStore", "largeBeforeStore", "largeWholeBeforeStore", "largeWholeDirtyStore", "memoryReadIndexStore", "memoryTouchedStore"};
-    for (const auto& store : stores) {
+    for (const auto& store : namedStores) {
         const auto layout = fieldLayouts_.find(store);
-        header << (layout == fieldLayouts_.end() ? writeValueStruct(store + "Type", {}) : layout->second.declaration);
+        if (layout == fieldLayouts_.end()) header << writeValueStruct(store + "Type", {});
+        else { header << layout->second.declaration; std::string().swap(layout->second.declaration); }
         header << "    " << store << "Type " << store << "{};\n";
     }
     const auto activeWords = std::max<std::size_t>(1, (nonsink_.size() + 7) / 8);
@@ -2765,44 +3192,87 @@ std::map<std::string, std::string> CpuStEmitContext::generate() {
     if (waveform_) header << "    struct WaveEntry { const void *data; std::size_t bytes; std::uint32_t width; bool real; fstHandle handle; std::vector<unsigned char> previous; bool valid; };\n"
         << "    fstWriterContext *waveform_ctx_ = nullptr;\n    std::vector<WaveEntry> waveform_entries_;\n"
         << "    bool waveform_enabled_ = false;\n    std::string waveform_path_ = \"grhsim.fst\";\n    std::uint64_t waveform_time_ = 0;\n";
-    for (std::size_t i = 0; i < functions_.size(); ++i) {
+    for (std::size_t i = 0; i < functionNames_.size(); ++i) {
         header << written[i].frameDeclaration;
         for (std::size_t j = 0; j < written[i].functions.size(); ++j)
-            if (j || !publicFunctions_.contains(functions_[i].name)) header << written[i].functions[j].declaration;
+            if (j || !publicFunctions_.contains(functionNames_[i])) header << written[i].functions[j].declaration;
     }
     header << "};\n";
-    std::map<std::string, std::string> files;
-    files[prefix_ + ".hpp"] = header.str();
+    header.close(); finished(prefix_ + ".hpp");
+    // Declarations have been written. Keep only metadata needed by code-map.
+    for (auto& group : written) {
+        std::string().swap(group.frameDeclaration);
+        for (auto& function : group.functions) std::string().swap(function.declaration);
+    }
     const auto preamble = "#include \"" + prefix_ + ".hpp\"\n" + dpiDeclarations_;
     std::vector<std::string> sources;
-    std::string unit = preamble;
+    std::map<std::string, std::string> functionSources;
+    std::ifstream bodyInput(bodyPath, std::ios::binary);
+    bodyInput.exceptions(std::ios::badbit);
+    if (!bodyInput) throw std::runtime_error("Cannot read generated function bodies");
+    std::ofstream unit;
+    unit.exceptions(std::ios::badbit | std::ios::failbit);
+    std::uint64_t unitBytes = preamble.size();
+    std::string unitPath;
     std::ostringstream manifest;
     manifest << "{\n  \"emitter\": \"grhsim-cpu-st-cpp\",\n  \"top\": " << quote(graph_.symbol())
+        << ",\n  \"code_map\": \"code-map.json\",\n  \"readable_names\": " << (readableNames_ ? "true" : "false")
+        << ",\n  \"source_comments\": " << (sourceComments_ ? "true" : "false")
+        << ",\n  \"readable_frames\": " << (readableFrames_ ? "true" : "false")
         << ",\n  \"max_function_lines\": " << maxLines_ << ",\n  \"max_tu_bytes\": " << tuBytes_
         << ",\n  \"array_view_elisions\": " << std::count_if(viewOnly_.begin(), viewOnly_.end(), [](const auto& entry) { return entry.second; })
         << ",\n  \"functions\": [\n";
     bool first = true;
     const auto flush = [&] {
-        if (unit.size() == preamble.size()) return;
-        const auto path = prefix_ + "_tu" + std::to_string(sources.size()) + ".cpp";
-        sources.push_back(path); files[path] = std::move(unit); unit = preamble;
+        if (!unit.is_open()) return;
+        unit.close(); finished(unitPath); sources.push_back(unitPath); unitBytes = preamble.size();
     };
+    std::size_t definitionIndex = 0;
     for (const auto& group : written) for (const auto& function : group.functions) {
-        if (unit.size() + function.definition.size() > tuBytes_) flush();
-        unit += function.definition + '\n';
+        const auto bytes = definitions.at(definitionIndex++).bytes;
+        if (unitBytes + bytes > tuBytes_) flush();
+        if (!unit.is_open()) {
+            unitPath = prefix_ + "_tu" + std::to_string(sources.size()) + ".cpp";
+            unit.open(staging / unitPath, std::ios::binary); unit << preamble;
+        }
+        functionSources.emplace(function.name, prefix_ + "_tu" + std::to_string(sources.size()) + ".cpp");
+        auto remaining = bytes;
+        char buffer[65536];
+        while (remaining) {
+            const auto count = static_cast<std::streamsize>(std::min<std::uint64_t>(remaining, sizeof(buffer)));
+            bodyInput.read(buffer, count);
+            if (bodyInput.gcount() != count) throw std::runtime_error("Truncated generated function bodies");
+            unit.write(buffer, count); remaining -= count;
+        }
+        unit.put('\n'); unitBytes += bytes + 1;
         if (!first) manifest << ",\n"; first = false;
         manifest << "    {\"name\":" << quote(function.name) << ",\"lines\":" << function.lines << "}";
     }
     flush();
+    bodyInput.close(); std::filesystem::remove(bodyPath);
+    {
+        std::ofstream output(staging / "code-map.json", std::ios::binary);
+        output.exceptions(std::ios::badbit | std::ios::failbit);
+        codeMap(output, written, functionSources); output.close(); finished("code-map.json");
+    }
+    std::vector<WrittenFunctions>().swap(written);
     if (!counterSnapshot_.empty()) {
-        counterBinding_ = counterBinding(files);
+        // Bind executable sources only; inspection artifacts are not part of
+        // the counter ABI and may be exported independently.
+        counterBindingFiles_ = sources; counterBindingFiles_.push_back(prefix_ + ".hpp");
+        std::sort(counterBindingFiles_.begin(), counterBindingFiles_.end());
+        counterBinding_ = counterBinding(staging);
         std::size_t replacements = 0;
-        for (auto& [file, contents] : files) {
-            counterBindingFiles_.push_back(file);
+        for (const auto& file : counterBindingFiles_) {
+            std::ifstream input(staging / file, std::ios::binary);
+            input.exceptions(std::ios::badbit);
+            std::string contents{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
             constexpr std::string_view placeholder = "__GRHSIM_EXECUTION_BINDING__";
             if (const auto offset = contents.find(placeholder); offset != std::string::npos) {
                 contents.replace(offset, placeholder.size(), counterBinding_); ++replacements;
                 if (contents.find(placeholder) != std::string::npos) ++replacements;
+                std::ofstream output(staging / file, std::ios::binary);
+                output.exceptions(std::ios::badbit | std::ios::failbit); output << contents; output.close();
             }
         }
         if (replacements != 1) throw std::invalid_argument("Execution counter source binding placeholder must be unique");
@@ -2831,10 +3301,10 @@ std::map<std::string, std::string> CpuStEmitContext::generate() {
     manifest << "],\n  \"virtual_partition_count\": " << leafOwners.size();
     if (!counterSnapshot_.empty()) {
         manifest << ",\n  \"execution_counters\": " << counterMetadata();
-        files["execution-counter-graph.json"] = counterSnapshot_;
+        save("execution-counter-graph.json", counterSnapshot_);
     }
     manifest << "\n}\n";
-    files["manifest.json"] = manifest.str();
+    save("manifest.json", manifest.str());
     std::ostringstream make;
     make << ".DEFAULT_GOAL := all\nifeq ($(origin CXX),default)\nCXX := clang++\nendif\n"
         << "CXXFLAGS ?= -std=c++20 -O3 -fno-strict-aliasing\nAR ?= ar\nSOURCES :=";
@@ -2852,9 +3322,7 @@ std::map<std::string, std::string> CpuStEmitContext::generate() {
         << "$(PCH): " << prefix_ << ".hpp\n\t$(CXX) $(CPPFLAGS) $(CXXFLAGS) -x c++-header $< -o $@\n"
         << "%.o: %.cpp $(PCH)\n\t$(CXX) $(CPPFLAGS) $(CXXFLAGS) -include-pch $(PCH) -c $< -o $@\n";
     if (waveform_) for (const auto source : {"fstapi", "fastlz", "lz4"}) make << source << ".o: $(LIBFST_SRC_DIR)/" << source << ".c\n\t$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@\n";
-    make << ".PHONY: all\n"; files["Makefile"] = make.str();
-    for (const auto& [path, contents] : files) if (contents.size() > options_.maxOutputFileBytes)
-        throw std::invalid_argument("Generated artifact exceeds maxOutputFileBytes: " + path);
+    make << ".PHONY: all\n"; save("Makefile", make.str());
     return files;
 }
 
@@ -2870,7 +3338,8 @@ EmitResult GrhSimCpuStCpp::emitImpl(const grh::Design& design, std::span<const g
         const auto destination = resolveOutputDir(options);
         if (std::filesystem::exists(destination) && !std::filesystem::is_empty(destination))
             throw std::invalid_argument("grhsim-cpu-st-cpp output directory must be empty: " + destination.string());
-        // Every semantic/codegen/budget check finishes before filesystem writes.
+        // Publish only a complete, validated model. Large artifacts are streamed
+        // into private staging and removed together if any check fails.
         std::string counterSnapshot;
         if (const auto found = options.attributes.find("execution-counters"); found != options.attributes.end()) {
             if (found->second != "on" && found->second != "off") throw std::invalid_argument("execution-counters must be on or off");
@@ -2883,16 +3352,30 @@ EmitResult GrhSimCpuStCpp::emitImpl(const grh::Design& design, std::span<const g
                 counterSnapshot = std::move(*snapshot);
             }
         }
-        CpuStEmitContext context(graph, schedule, options, std::move(counterSnapshot));
-        const auto files = context.generate();
         static std::atomic<uint64_t> nonce{0};
-        staging = destination.parent_path() / (destination.filename().string() + ".staging-" + std::to_string(++nonce));
-        if (!std::filesystem::create_directories(staging)) throw std::runtime_error("Cannot create exclusive emitter staging directory");
+        do {
+            staging = destination.parent_path() / (destination.filename().string() + ".staging-" + std::to_string(++nonce));
+        } while (!std::filesystem::create_directories(staging));
         ownsStaging = true;
+        std::vector<std::string> files;
+        {
+            CpuStEmitContext context(graph, schedule, options, std::move(counterSnapshot));
+            files = context.generate(staging);
+        }
+        if (enabledOption(options, "readable-dump")) {
+            store::StoreText serializer(nullptr, options.session);
+            store::StoreOptions snapshotOptions;
+            snapshotOptions.topOverrides = {std::string(graph.symbol())};
+            snapshotOptions.outputDir = staging.string();
+            snapshotOptions.outputFilename = "grhsim.txt";
+            if (!serializer.store(design, snapshotOptions).success)
+                throw std::invalid_argument("Cannot export readable GRH snapshot");
+            if (std::filesystem::file_size(staging / "grhsim.txt") > options.maxOutputFileBytes)
+                throw std::invalid_argument("grhsim.txt exceeds maxOutputFileBytes");
+            files.push_back("grhsim.txt");
+        }
         EmitResult result;
-        for (const auto& [path, contents] : files) {
-            std::ofstream out(staging / path, std::ios::binary);
-            out.exceptions(std::ios::badbit | std::ios::failbit); out << contents; out.close();
+        for (const auto& path : files) {
             result.artifacts.push_back((destination / path).string());
         }
         if (std::filesystem::exists(destination)) std::filesystem::remove(destination);

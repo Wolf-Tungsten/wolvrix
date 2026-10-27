@@ -260,6 +260,13 @@ private:
     std::map<std::string, std::string> initFiles_;
     Function* function_ = nullptr;
     Key owner_;
+    struct PublicationGroup {
+        std::size_t expected = 0;
+        std::size_t emitted = 0;
+        std::string dirty;
+    };
+    bool groupPublications_ = false;
+    std::map<std::set<std::size_t>, PublicationGroup> publicationGroups_;
     std::set<ValueId, bool(*)(ValueId, ValueId)> packed_{[](ValueId a, ValueId b) { return a.index < b.index; }};
     std::set<std::string> localNames_;
     std::size_t temporary_ = 0;
@@ -377,6 +384,10 @@ private:
     std::string pack(std::vector<Code>& code, const std::string& source, const LogicalType& type, const std::string& destination);
     void activate(std::vector<Code>& code, const std::set<std::size_t>& fanout, std::optional<std::size_t> current = {});
     void markState(std::vector<Code>& code, OperationId state);
+    bool operationIsElided(OperationId op) const;
+    bool scalarPublication(ValueId value) const;
+    void beginPublications(std::vector<Code>& code, const std::vector<OperationId>& ops);
+    void finishPublications(std::vector<Code>& code);
     void publish(std::vector<Code>& code, ValueId value, const std::string& source);
     void syncSmallBoundary(std::vector<Code>& code, ValueId value, const std::string& source);
     std::string fireExpression(ValueId value);
@@ -398,10 +409,12 @@ private:
     }
     void inFunction(Function& function, const Key& key, const std::function<void(std::vector<Code>&)>& action) {
         function_ = &function; owner_ = key; packed_.clear(); packedNames_.clear(); localNames_.clear();
+        groupPublications_ = false; publicationGroups_.clear();
         currentOperation_ = {};
         if (sourceComments_) function.comment = functionDescription(function, key);
         for (const auto& local : function.locals) localNames_.insert(local.name);
         action(function.body); function_ = nullptr;
+        groupPublications_ = false; publicationGroups_.clear();
     }
 };
 
@@ -1163,6 +1176,55 @@ void CpuStEmitContext::syncSmallBoundary(std::vector<Code>& code, ValueId id, co
         code.push_back(Code::line(word + " = (" + word + " & ~" + mask + ") | (static_cast<std::uint64_t>(" + source + ") << " + std::to_string(bit % 64) + ");"));
     }
 }
+bool CpuStEmitContext::operationIsElided(OperationId op) const {
+    const auto kind = graph_.opKind(op);
+    if (sim::isWriter(kind) || kind == sim::kHistoryWrite || identityElisions_.contains(op) || leafElisions_.contains(op)) return true;
+    const auto results = graph_.opResults(op);
+    return kind == OperationKind::kAssign && results.size() == 1 && viewOnly_.at(results[0]);
+}
+bool CpuStEmitContext::scalarPublication(ValueId id) const {
+    if (!storage_.contains(id) || smallEnableOrdinal_.contains(id)) return false;
+    const auto type = graph_.valueLogicalType(id);
+    return type.kind == grh::ValueType::Logic && type.domain == grh::LogicDomain::TwoState &&
+        type.shape.empty() && type.width > 0 && type.width <= 64;
+}
+void CpuStEmitContext::beginPublications(std::vector<Code>& code, const std::vector<OperationId>& ops) {
+    // An external call or string allocation can leave an owner before its
+    // activation flush. Keep every publication in such owners immediate.
+    for (const auto op : ops) {
+        if (grh::operationEffect(graph_, op) == grh::OpEffect::External) return;
+        for (const auto value : graph_.opOperands(op))
+            if (graph_.valueLogicalType(value).kind == grh::ValueType::String) return;
+        for (const auto value : graph_.opResults(op))
+            if (graph_.valueLogicalType(value).kind == grh::ValueType::String) return;
+    }
+    groupPublications_ = true;
+    // Count actual publication sites, using the same elisions as operation().
+    // The complete fanout preserves both current- and next-round routing.
+    for (const auto op : ops) {
+        if (operationIsElided(op)) continue;
+        const auto results = graph_.opResults(op);
+        if (results.size() == 1 && scalarPublication(results[0]))
+            ++publicationGroups_[fanout_[results[0]]].expected;
+    }
+    for (auto& [destinations, group] : publicationGroups_) {
+        if (destinations.empty() || group.expected < 2) continue;
+        group.dirty = temporary("bool", "publication_changed");
+        // This ordered assignment also initializes flags shared by chunks.
+        code.push_back(Code::line(group.dirty + " = false;"));
+    }
+}
+void CpuStEmitContext::finishPublications(std::vector<Code>& code) {
+    if (!groupPublications_) return;
+    for (const auto& [destinations, group] : publicationGroups_) {
+        if (group.emitted != group.expected)
+            throw std::logic_error("CPU publication group site count mismatch in " + function_->name);
+        if (group.dirty.empty()) continue;
+        std::vector<Code> changed;
+        activate(changed, destinations, ordinal_.at(owner_));
+        code.push_back(Code::block("if (" + group.dirty + ")", std::move(changed)));
+    }
+}
 void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::string& source) {
     const auto destination = storage_.contains(id) ? storage_.at(id) : read(id);
     if (!storage_.contains(id)) { copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id)); return; }
@@ -1175,6 +1237,21 @@ void CpuStEmitContext::publish(std::vector<Code>& code, ValueId id, const std::s
         activate(triggered, fanout_[id]);
         if (!triggered.empty()) code.push_back(Code::block("if (" + source + ")", std::move(triggered)));
         return;
+    }
+    if (groupPublications_ && scalarPublication(id)) {
+        const auto& destinations = fanout_[id];
+        const auto found = publicationGroups_.find(destinations);
+        if (found == publicationGroups_.end())
+            throw std::logic_error("CPU publication group has an unexpected site in " + function_->name);
+        auto& group = found->second;
+        ++group.emitted;
+        if (destinations.empty() || !group.dirty.empty()) {
+            if (!group.dirty.empty())
+                code.push_back(Code::line(group.dirty + " |= " + destination + " != " + source + ";"));
+            copy(code, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
+            syncSmallBoundary(code, id, destination);
+            return;
+        }
     }
     std::vector<Code> changed;
     copy(changed, destination, graph_.valueLogicalType(id), source, graph_.valueLogicalType(id));
@@ -1474,9 +1551,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     CodeOrigin annotation{code, code.size(), "o" + std::to_string(op.index), sourceComments_ ? operationDescription(op) : std::string{}};
     const auto kind = graph_.opKind(op);
     const auto args = graph_.opOperands(op), results = graph_.opResults(op);
-    if (sim::isWriter(kind) || kind == sim::kHistoryWrite) return;
-    if (identityElisions_.contains(op) || leafElisions_.contains(op)) return;
-    if (kind == OperationKind::kAssign && results.size() == 1 && viewOnly_.at(results[0])) return;
+    if (operationIsElided(op)) return;
     countOperation(code, op);
     if (kind == sim::kSystemTask) { task(code, op); return; }
     if (kind == sim::kDpiCall) { dpi(code, op); return; }
@@ -1844,7 +1919,10 @@ void CpuStEmitContext::buildPhases() {
             code.push_back(Code::block("if constexpr (WOLVRIX_GRHSIM_SN_TIMING)", {
                 Code::line(time + " = profileEnabled_ ? profile_clock() : 0;")
             }));
-            for (const auto op : topological(members_.at(key))) operation(code, op);
+            const auto ops = topological(members_.at(key));
+            beginPublications(code, ops);
+            for (const auto op : ops) operation(code, op);
+            finishPublications(code);
             code.push_back(Code::block("if constexpr (WOLVRIX_GRHSIM_SN_TIMING)", {
                 Code::block("if (profileEnabled_)", {
                     Code::line("snTimeTicks_[" + std::to_string(ordinal) + "] += profile_clock() - " + time + ";"),

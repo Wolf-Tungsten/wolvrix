@@ -34,8 +34,35 @@ with no shared locals or return control has no frame or frame argument.
 General always dispatches separate nonsink functions, followed by ordered
 writer batches. Activity batches scan consecutive groups of 24 bitmap bytes,
 reading each live bit immediately before its call. Later activations remain
-visible within the same round, including across batch boundaries. Writer and
-commit batches contain at most 128 contiguous SinkSchedule runs. Only these
+visible within the same round, including across batch boundaries.
+
+Nonsink owners with no External operations or String operands/results can
+group boundary publications of scalar TwoState Logic values up to 64 bits.
+Values represented in the small-sink enable bitmap retain immediate publication.
+For each complete nonempty nonsink fanout shared by at least two emitted
+publication sites, a local dirty flag accumulates each old-snapshot comparison;
+the snapshot copy and small-sink boundary synchronization stay at that site's
+original position. For example, `oldA` and `oldB` are stored snapshots and
+`newA` and `newB` are the newly computed values:
+
+```cpp
+changed = false;                 // owner entry
+changed |= oldA != newA;
+oldA = newA;                     // synchronize A's small-sink copies here
+changed |= oldB != newB;
+oldB = newB;                     // synchronize B's small-sink copies here
+if (changed) activate(fanout);   // owner exit, preserving current/next routing
+```
+
+The flag uses ordinary locals/chunkFrame storage and is explicitly reset before
+the owner's operations. Empty fanout needs only the original-position copy and
+synchronization, without a comparison. Nonempty fanout with one publication
+site, other types, Event/fire publications and excluded owners retain their
+original path. Group counts use the operation emitter's elisions and are checked
+against actual publication calls. Each site's comparison/copy/synchronization
+retains its operation origin; the combined flush is owner bookkeeping.
+
+Writer and commit batches contain at most 128 contiguous SinkSchedule runs. Only these
 bounded helpers own computation locals and split when their line budget
 requires it; `pGeneral` and `pLargeSink` keep constant-size ordered call loops.
 The splitter processes all oversized parts and scopes in each analysis pass.
@@ -64,6 +91,17 @@ physical fields; strings retain their constructors and string-aware reset.
 The Python entry is `Session.emit_grhsim_cpu_st_cpp(...)`; the ordinary GRH
 JSON checkpoint stores graph semantics and ownership. Reloading requires
 rebuilding SinkSchedule through `grhsim-partition-sink`.
+
+The XiangShan SV flow exposes `--[no-]readable-names`,
+`--[no-]source-comments`, `--[no-]readable-dump` and
+`--[no-]readable-frames`, all enabled by default. Its Makefile variables are
+`XS_GRHSIM_READABLE_NAMES`, `XS_GRHSIM_SOURCE_COMMENTS`,
+`XS_GRHSIM_READABLE_DUMP` and `XS_GRHSIM_READABLE_FRAMES` (default 1).
+Disabling names, comments and the text dump reduces generated artifact size;
+code map generation remains enabled. Frame layout is controlled independently.
+`XS_GRHSIM_MAX_OUTPUT_FILE_BYTES` passes `--max-output-file-bytes`, a positive
+uint64 with the existing 4 GiB default. Large code maps can use a larger explicit
+budget; this only changes the artifact size check, not generated C++ contents.
 
 ## Types, arrays and external ABI
 

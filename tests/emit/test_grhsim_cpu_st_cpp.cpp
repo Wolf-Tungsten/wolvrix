@@ -3584,6 +3584,243 @@ for (unsigned epoch = 0; epoch < 3; ++epoch) {
     for (const auto budget : {16, 1024})
         manualCase(fixture, "conditional-packed-scopes-b" + std::to_string(budget), budget, "", body, false);
 }
+
+void testGroupedNonsinkPublications() {
+    Fixture fixture;
+    auto& graph = fixture.graph;
+    const auto clock = fixture.input("group_clock");
+    const auto head = fixture.input("group_head", 16), middle = fixture.input("group_middle", 16);
+    const auto tail = fixture.input("group_tail", 16), other = fixture.input("group_other", 16);
+    std::vector<std::pair<grh::OperationId, std::string>> placements;
+    const auto place = [&](grh::ValueId value, std::string key) {
+        placements.emplace_back(graph.valueDef(value), std::move(key)); return value;
+    };
+    const auto constant = [&](unsigned width, unsigned value, const std::string& key) {
+        return place(fixture.constant(width, std::to_string(width) + "'d" + std::to_string(value)), key);
+    };
+    const auto binary = [&](OperationKind kind, unsigned width, grh::ValueId a, grh::ValueId b,
+                            const std::string& key) {
+        return place(fixture.compute(kind, Fixture::type(width), {a, b}), key);
+    };
+    const auto slice = [&](grh::ValueId value, unsigned width) {
+        const auto result = place(fixture.compute(OperationKind::kSliceStatic, Fixture::type(width), {value}), "source");
+        graph.setAttr(graph.valueDef(result), "sliceStart", int64_t{0});
+        graph.setAttr(graph.valueDef(result), "sliceEnd", int64_t{width - 1}); return result;
+    };
+    const auto headLow = slice(head, 8), middleLow = slice(middle, 8), tailLow = slice(tail, 8), otherLow = slice(other, 8);
+    const auto enabled = slice(other, 1), one = constant(1, 1, "source");
+    std::vector<grh::ValueId> firstGroup, secondGroup;
+    auto sumA = constant(16, 0, "consumer_a");
+    // More than 1024 emitted lines even at the production budget. The first
+    // and final snapshots change independently, while the same dirty flag
+    // must survive all intervening helpers.
+    for (unsigned i = 0; i < 400; ++i) {
+        const auto input = i == 0 ? headLow : i == 399 ? tailLow : middleLow;
+        const auto value = binary(OperationKind::kXor, 8, input, constant(8, (i * 17 + 3) & 255, "source"), "source");
+        firstGroup.push_back(value);
+        sumA = binary(OperationKind::kAdd, 16, sumA, value, "consumer_a");
+    }
+    auto sumB = constant(16, 0, "consumer_b");
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto value = binary(OperationKind::kAdd, 8, otherLow, constant(8, i * 29 + 7, "source"), "source");
+        secondGroup.push_back(value);
+        sumB = binary(OperationKind::kAdd, 16, sumB, value, "consumer_b");
+    }
+    const auto singleton = binary(OperationKind::kXor, 8, headLow, constant(8, 90, "source"), "source");
+    const auto payload = binary(OperationKind::kAdd, 8, headLow, constant(8, 7, "source"), "source");
+
+    // These owners each have two matching scalar publications, but one also
+    // handles String and the other External. They must retain ordinary
+    // publication paths even beside an eligible grouped owner.
+    const grh::LogicalType stringType{grh::ValueType::String, 0, false, grh::LogicDomain::TwoState, {}};
+    const auto text = place(fixture.compute(OperationKind::kConstant, stringType, {}), "string");
+    graph.setAttr(graph.valueDef(text), "constValue", std::string("publication"));
+    const auto stringA = binary(OperationKind::kXor, 8, otherLow, constant(8, 51, "string"), "string");
+    const auto stringB = binary(OperationKind::kXor, 8, otherLow, constant(8, 119, "string"), "string");
+    const auto imported = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("group_publication_effect"));
+    graph.setAttr(imported, "argsName", std::vector<std::string>{"input", "text"});
+    graph.setAttr(imported, "argsDirection", std::vector<std::string>{"input", "input"});
+    graph.setAttr(imported, "argsType", std::vector<std::string>{"logic", "string"});
+    graph.setAttr(imported, "argsWidth", std::vector<int64_t>{8, 0});
+    graph.setAttr(imported, "argsSigned", std::vector<bool>{false, false});
+    graph.setAttr(imported, "hasReturn", true); graph.setAttr(imported, "returnWidth", int64_t{8});
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call, "targetImportSymbol", std::string("group_publication_effect"));
+    for (const auto value : {one, headLow, text}) graph.addOperand(call, value);
+    const auto sampled = graph.createValue(Fixture::type(8)); graph.addResult(call, sampled); place(sampled, "effect");
+    const auto effectA = binary(OperationKind::kXor, 8, sampled, constant(8, 3, "effect"), "effect");
+    const auto effectB = binary(OperationKind::kAdd, 8, sampled, constant(8, 5, "effect"), "effect");
+    auto sumC = binary(OperationKind::kAdd, 16, singleton, effectA, "consumer_c");
+    for (const auto value : {effectB, stringA, stringB})
+        sumC = binary(OperationKind::kAdd, 16, sumC, value, "consumer_c");
+    graph.setOpSymbol(graph.valueDef(sumA), graph.internSymbol("group_consumer_a"));
+    graph.setOpSymbol(graph.valueDef(sumB), graph.internSymbol("group_consumer_b"));
+    for (const auto& [name, value] : std::vector<std::pair<std::string, grh::ValueId>>{
+            {"group_sum_a", sumA}, {"group_sum_b", sumB}, {"group_sum_c", sumC}}) {
+        graph.bindOutputPort(name, value);
+        for (unsigned copy = 0; copy < 2; ++copy) {
+            const auto state = fixture.state(name + std::to_string(copy), 16);
+            fixture.write(OperationKind::kRegisterWritePort, state, {one, value, clock});
+            graph.bindOutputPort(name + std::to_string(copy), fixture.read(state));
+        }
+    }
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const auto state = fixture.state("group_small" + std::to_string(copy), 8);
+        fixture.write(OperationKind::kRegisterWritePort, state, {enabled, payload, clock});
+        graph.bindOutputPort("group_small" + std::to_string(copy), fixture.read(state));
+    }
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split();
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    // Fix only the activity partition, after the ordinary extraction has
+    // proved these operations belong to nonsink. This makes exact fanout
+    // groups independent of the partitioner's cost-model choices.
+    for (const auto& [op, key] : placements) {
+        const auto path = owner(graph, op);
+        require(path.size() == 4 && path[0] == "general" && path[1] == "nonsink",
+                "Grouped-publication fixture lost a nonsink operation");
+        graph.setAttr(op, sim::kPartition, Owner{"general", "nonsink", "group_" + key, "node_" + key});
+    }
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
+    const auto fanout = [&](grh::ValueId value) {
+        std::set<Owner> result;
+        auto source = owner(graph, graph.valueDef(value)); source.resize(3);
+        for (const auto& use : graph.valueUsers(value)) {
+            auto target = owner(graph, use.operation);
+            if (target.size() != 4 || target[1] != "nonsink") continue;
+            target.resize(3); if (target != source) result.insert(std::move(target));
+        }
+        return result;
+    };
+    const auto fanoutA = fanout(firstGroup.front()), fanoutB = fanout(secondGroup.front());
+    require(fanoutA.size() == 1 && fanoutB.size() == 1 && fanoutA != fanoutB,
+            "Grouped-publication fixture lost its distinct complete fanouts");
+    for (const auto& values : {firstGroup, secondGroup}) for (const auto value : values)
+        require(fanout(value) == (values.size() == firstGroup.size() ? fanoutA : fanoutB),
+                "Grouped-publication fixture split a complete fanout group");
+    require(fanout(payload).empty() && fanout(singleton).size() == 1,
+            "Grouped-publication fixture lost empty or singleton fanout");
+    const std::string support = R"CPP(
+extern "C" std::uint8_t group_publication_effect(std::uint8_t input, const char* text) {
+    assert(std::string(text) == "publication"); return input + 11;
+}
+static std::array<unsigned long long,2> groupPublicationCounts(GrhSIM_top& model) {
+    auto *stream = std::fopen("group-publication-counts.tsv", "w+"); assert(stream);
+    model.dump_execution_counts(stream); std::rewind(stream); char line[256];
+    assert(std::fgets(line,sizeof(line),stream) && std::fgets(line,sizeof(line),stream));
+    std::array<unsigned long long,2> result{}; std::array<bool,2> found{};
+    while (std::fgets(line,sizeof(line),stream)) {
+        unsigned site; unsigned long long count;
+        if (std::sscanf(line,"%u\t%llu",&site,&count)!=2) continue;
+        for (unsigned i=0;i<2;++i) if (site==groupPublicationSites[i]) { result[i]=count; found[i]=true; }
+    }
+    std::fclose(stream); assert(found[0] && found[1]); return result;
+}
+)CPP";
+    const std::string body = R"CPP(
+const std::array<std::array<unsigned,4>,14> steps{{
+    {0,0,0,0}, {256,256,256,256}, {257,256,256,256}, {513,512,512,512},
+    {513,512,519,512}, {769,768,775,768}, {769,781,775,768}, {1025,1037,1031,1024},
+    {1025,1037,1031,1025}, {1281,1293,1287,1281}, {1287,1293,1281,1281},
+    {1543,1549,1537,1537}, {1543,1549,1537,1538}, {1799,1805,1793,1794}
+}};
+for (unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); bool initialized=false; std::array<unsigned,4> previous{}; unsigned small=0;
+    for (const auto& step : steps) {
+        model.group_clock=false; model.group_head=step[0]; model.group_middle=step[1];
+        model.group_tail=step[2]; model.group_other=step[3];
+        std::array<unsigned,4> low{}; for (unsigned i=0;i<4;++i) low[i]=step[i]&255;
+        unsigned a=0,b=0;
+        for (unsigned i=0;i<400;++i) a=(a+((i==0?low[0]:i==399?low[2]:low[1])^((i*17+3)&255)))&65535;
+        for (unsigned i=0;i<4;++i) b+=((low[3]+i*29+7)&255);
+        const unsigned effect=(low[0]+11)&255;
+        const unsigned c=(low[0]^90)+(effect^3)+((effect+5)&255)+(low[3]^51)+(low[3]^119);
+        const auto before=groupPublicationCounts(model); model.eval(); const auto after=groupPublicationCounts(model);
+        const bool changedA=!initialized || low[0]!=previous[0] || low[1]!=previous[1] || low[2]!=previous[2];
+        const bool changedB=!initialized || low[3]!=previous[3];
+        assert(after[0]==before[0]+changedA && after[1]==before[1]+changedB);
+        assert(model.group_sum_a==a && model.group_sum_b==b && model.group_sum_c==c);
+        assert(model.group_small0==small && model.group_small1==small);
+        // A clean call following a dirty call must not reuse the old flag.
+        model.eval(); assert(groupPublicationCounts(model)==after);
+        model.group_clock=true; model.eval();
+        if (low[3]&1) small=(low[0]+7)&255;
+        assert(model.group_small0==small && model.group_small1==small);
+        assert(model.group_sum_a0==a && model.group_sum_a1==a);
+        assert(model.group_sum_b0==b && model.group_sum_b1==b);
+        assert(model.group_sum_c0==c && model.group_sum_c1==c);
+        model.eval(); assert(groupPublicationCounts(model)==after);
+        initialized=true; previous=low;
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "grouped-publications-b" + std::to_string(budget);
+        // The site declaration precedes the helper that reads it.
+        manualCase(fixture, label, budget, "static const std::array<unsigned,2> groupPublicationSites{};\n" + support,
+                   body, false, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        const auto functions = mappedRecords(readFile(directory / "code-map.json"), "functions");
+        const auto location = [&](grh::OperationId op) {
+            const auto id = "\"o" + std::to_string(op.index) + "\"";
+            std::pair<std::string,std::string> result;
+            for (const auto& function : functions) if (function.find(id)!=std::string::npos) {
+                std::smatch match;
+                require(std::regex_search(function,match,std::regex(R"REGEX("name":"([^"]+)")REGEX")), "Function lacks name");
+                result.first=match[1];
+                require(std::regex_search(function,match,std::regex(R"REGEX("root_function":"([^"]+)")REGEX")), "Function lacks root");
+                result.second=match[1]; return result;
+            }
+            throw std::runtime_error("Grouped-publication operation has no generated function");
+        };
+        const auto first = location(graph.valueDef(firstGroup.front()));
+        const auto last = location(graph.valueDef(firstGroup.back()));
+        require(first.second==last.second && first.first!=last.first && first.second.starts_with("sn_"),
+                "Grouped publications did not cross helpers at the requested budget");
+        const auto consumerA = location(graph.valueDef(sumA)).second, consumerB = location(graph.valueDef(sumB)).second;
+        const auto ordinalA = std::stoul(consumerA.substr(3)), ordinalB = std::stoul(consumerB.substr(3));
+        require(ordinalA!=ordinalB && ordinalA/8==ordinalB/8, "Grouped fanouts did not occupy distinct masks of one activity byte");
+        const auto header = readFile(directory / "grhsim_top.hpp");
+        const auto frame = header.find("struct chunkFrame_" + first.second);
+        const auto end = frame==std::string::npos ? frame : header.find("    };",frame);
+        require(frame!=std::string::npos && end!=std::string::npos &&
+                    header.substr(frame,end-frame).find("publication_changed")!=std::string::npos,
+                "Grouped-publication fixture did not retain a dirty flag across helper frames");
+        const auto source = generatedCpp(directory);
+        for (const auto& [value, store] : std::vector<std::pair<grh::ValueId,std::string>>{
+                 {enabled,"smallSinkEnableBoundaryStore"}, {singleton,"nonSinkBoundaryStore"}})
+            require(source.find("if ("+store+"."+mappedValue(directory,value)+" != ")!=std::string::npos,
+                    "Packed enable or singleton publication lost its ordinary change guard");
+        require(source.find("if (smallSinkPayloadBoundaryStore."+mappedValue(directory,payload)+" != ")==std::string::npos,
+                "Empty-fanout publication retained a redundant comparison");
+        for (const auto op : {call, graph.valueDef(text)}) {
+            const auto root = location(op).second;
+            for (const auto& function : functions) {
+                if (function.find("\"root_function\":\""+root+"\"")==std::string::npos) continue;
+                std::smatch match;
+                require(std::regex_search(function,match,std::regex(R"REGEX("name":"([^"]+)")REGEX")), "Fallback function lacks name");
+                const auto name=match[1].str();
+                require(std::regex_search(function,match,std::regex(R"REGEX("source":"([^"]+)")REGEX")), "Fallback function lacks source");
+                const auto cpp=readFile(directory/match[1].str());
+                const auto begin=cpp.find("void GrhSIM_top::"+name+"(");
+                const auto end=begin==std::string::npos ? begin : cpp.find("\n}\n",begin);
+                require(begin!=std::string::npos && end!=std::string::npos, "Fallback function body was not found");
+                require(cpp.substr(begin,end-begin).find("publication_changed")==std::string::npos,
+                        "External/String owner entered grouped publication");
+            }
+        }
+        const auto manifest = readFile(directory / "manifest.json");
+        const std::regex sites(R"REGEX(\{"operation":"([^"]+)","category":"([^"]+)","function":"[^"]+"\})REGEX");
+        std::map<std::string,unsigned> ordinals; unsigned ordinal=0;
+        for (std::sregex_iterator it(manifest.begin(),manifest.end(),sites),stop;it!=stop;++it,++ordinal)
+            if ((*it)[2]=="operation") ordinals.emplace((*it)[1],ordinal);
+        const auto path = artifact(label)/"driver.cpp"; auto driver=readFile(path);
+        const std::string placeholder="static const std::array<unsigned,2> groupPublicationSites{};";
+        const auto begin=driver.find(placeholder); require(begin!=std::string::npos,"Missing grouped counter site declaration");
+        driver.replace(begin,placeholder.size(),"static const std::array<unsigned,2> groupPublicationSites{"+
+            std::to_string(ordinals.at("group_consumer_a"))+","+std::to_string(ordinals.at("group_consumer_b"))+"};");
+        std::ofstream(path)<<driver;
+    }
+}
 }
 
 int main() {
@@ -3593,6 +3830,6 @@ int main() {
     // Append after testModels initializes the generated execution Makefile.
     try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
-    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
+    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -4246,6 +4246,163 @@ for(unsigned epoch=0;epoch<3;++epoch) {
     }
 }
 
+void testNumericSelects() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto choose0 = fixture.input("select_c0"), choose1 = fixture.input("select_c1"), choose2 = fixture.input("select_c2");
+    const auto input = [&](const std::string& name, const grh::LogicalType& type) {
+        const auto value = graph.createValue(graph.internSymbol(name), type);
+        graph.bindInputPort(name, value); return value;
+    };
+    struct SelectCase {
+        unsigned width; bool sign; std::string name;
+        grh::LogicalType type;
+        std::array<grh::ValueId,4> data;
+        grh::ValueId mux{}, priority{};
+    };
+    std::vector<SelectCase> cases;
+    std::string prepare, verify;
+    for (const unsigned width : {1u,3u,7u,8u,16u,31u,32u,63u,64u,65u,128u}) {
+        for (const bool sign : {false,true}) {
+            if (width > 64 && sign) continue;
+            auto type = Fixture::type(width); type.isSigned = sign;
+            SelectCase item{width,sign,(sign ? "s" : "u") + std::to_string(width),type,{}};
+            for (unsigned arm=0; arm<4; ++arm) {
+                const auto name = "select_" + item.name + "_" + std::to_string(arm);
+                item.data[arm] = input(name,type);
+                const auto port = "model." + name;
+                prepare += port + "=static_cast<decltype(" + port + ")>(patterns[(pattern+" +
+                    std::to_string(arm) + ")%patterns.size()]);\n";
+            }
+            item.mux = fixture.compute(OperationKind::kMux,type,{choose0,item.data[0],item.data[1]});
+            graph.bindOutputPort("select_mux_" + item.name,item.mux);
+            const auto source = "model.select_" + item.name + "_";
+            const auto normalized = [&](unsigned arm) {
+                return "selectBits(SelectWide(" + source + std::to_string(arm) + ")," +
+                    std::to_string(width) + ",false," + std::to_string(width) + ")";
+            };
+            const auto expected = "selectExpected_" + item.name;
+            verify += "const auto " + expected + "=model.select_c0 ? " + normalized(0) + " : " + normalized(1) + ";\n";
+            verify += "assert(selectBits(SelectWide(model.select_mux_" + item.name + ")," + std::to_string(width) +
+                ",false," + std::to_string(width) + ")==" + expected + ");\n";
+            if (width <= 64)
+                verify += "assert(selectBits(SelectWide(model.select_priority_" + item.name + ")," + std::to_string(width) +
+                    ",false," + std::to_string(width) + ")== (model.select_c0 ? " + normalized(0) +
+                    " : model.select_c1 ? " + normalized(1) + " : model.select_c2 ? " + normalized(2) + " : " + normalized(3) + "));\n";
+            cases.push_back(std::move(item));
+        }
+    }
+    // Extend from the semantic sign bit, then truncate to the result width.
+    auto signed7 = Fixture::type(7); signed7.isSigned = true;
+    const auto narrow = input("select_signed7",signed7), wide = fixture.input("select_unsigned64",64);
+    prepare += "model.select_signed7=static_cast<std::int8_t>(patterns[pattern]); model.select_unsigned64=static_cast<std::uint64_t>(patterns[(pattern+1)%patterns.size()]);\n";
+    for (const unsigned width : {3u,16u,32u,64u}) {
+        auto type = Fixture::type(width); type.isSigned = width != 3;
+        const auto result = fixture.compute(OperationKind::kMux,type,{choose0,narrow,wide});
+        const auto name = "select_convert_" + std::to_string(width);
+        graph.bindOutputPort(name,result);
+        verify += "assert(selectBits(SelectWide(model." + name + ")," + std::to_string(width) + ",false," +
+            std::to_string(width) + ")== (model.select_c0 ? selectBits(SelectWide(model.select_signed7),7,true," +
+            std::to_string(width) + ") : selectBits(SelectWide(model.select_unsigned64),64,false," + std::to_string(width) + ")));\n";
+    }
+    const grh::LogicalType realType{grh::ValueType::Real,64,false,grh::LogicDomain::TwoState,{}};
+    const grh::LogicalType stringType{grh::ValueType::String,0,false,grh::LogicDomain::TwoState,{}};
+    const auto realA = input("select_real_a",realType), realB = input("select_real_b",realType);
+    const auto textA = input("select_text_a",stringType), textB = input("select_text_b",stringType);
+    graph.bindOutputPort("select_real",fixture.compute(OperationKind::kMux,realType,{choose0,realA,realB}));
+    graph.bindOutputPort("select_text",fixture.compute(OperationKind::kMux,stringType,{choose0,textA,textB}));
+    const auto shapedType = Fixture::type(24,{3});
+    const auto shapedA = input("select_shape_a",shapedType), shapedB = input("select_shape_b",shapedType);
+    graph.bindOutputPort("select_shape",fixture.compute(OperationKind::kMux,shapedType,{choose0,shapedA,shapedB}));
+
+    const auto clock = fixture.input("select_clock"), enableA = fixture.input("select_enable_a"), enableB = fixture.input("select_enable_b");
+    const auto guardA = fixture.input("select_guard_a",16), guardB = fixture.input("select_guard_b",16);
+    const auto shared = fixture.compute(OperationKind::kAdd,Fixture::type(16),{guardA,guardB});
+    const auto flipped = fixture.compute(OperationKind::kXor,Fixture::type(16),{shared,fixture.constant(16,"16'ha55a")});
+    const std::array<grh::ValueId,3> payloads{
+        fixture.compute(OperationKind::kMux,Fixture::type(16),{choose0,shared,guardB}),
+        fixture.compute(OperationKind::kMux,Fixture::type(16),{choose1,guardA,shared}),
+        fixture.compute(OperationKind::kMux,Fixture::type(16),{choose2,flipped,guardA})
+    };
+    for (unsigned i=0; i<3; ++i) {
+        const auto state = fixture.state("select_saved_" + std::to_string(i),16);
+        fixture.write(OperationKind::kRegisterWritePort,state,{i == 1 ? enableB : enableA,payloads[i],clock});
+        graph.bindOutputPort("select_saved_" + std::to_string(i),fixture.read(state));
+    }
+
+    // Keep actual kMux nodes, including bool and shaped results, while testing
+    // the normalized priority operation directly with all three conditions.
+    run(fixture.design,"grh-to-grhsim",fixture.session);
+    for (auto& item : cases) {
+        if (item.width > 64) continue;
+        item.priority = fixture.compute(sim::kPrioritySelect,item.type,
+            {choose0,choose1,choose2,item.data[0],item.data[1],item.data[2],item.data[3]});
+        graph.bindOutputPort("select_priority_" + item.name,item.priority);
+    }
+    fixture.split();
+    run(fixture.design,"grhsim-partition-nonsink",fixture.session);
+    run(fixture.design,"grhsim-partition-sink",fixture.session,{"-enable-guard-min-size=0"});
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session,graph);
+    require(schedule.generalRuns.size() == 1 && schedule.generalRuns.front().orderedWriters.size() == 3,
+            "Numeric select fixture lost its A/B/A writer run");
+    for (const auto payload : payloads)
+        require(owner(graph,graph.valueDef(payload)) == schedule.generalRuns.front().partitionKey,
+                "Numeric select payload is no longer sink-private");
+    for (const auto& item : cases)
+        require(graph.opKind(graph.valueDef(item.mux)) == OperationKind::kMux &&
+                    (item.width > 64 || graph.opKind(graph.valueDef(item.priority)) == sim::kPrioritySelect),
+                "Numeric select fixture lost a requested selection operation");
+
+    const std::string support = R"CPP(
+#include <bit>
+using SelectWide = unsigned _BitInt(128);
+static SelectWide selectBits(SelectWide value,unsigned sourceWidth,bool sign,unsigned resultWidth) {
+    const SelectWide sourceMask=sourceWidth == 128 ? ~SelectWide(0) : (SelectWide(1)<<sourceWidth)-1;
+    value &= sourceMask;
+    if (sign && sourceWidth<resultWidth && ((value>>(sourceWidth-1))&1)) value |= ~sourceMask;
+    return resultWidth == 128 ? value : value&((SelectWide(1)<<resultWidth)-1);
+}
+)CPP";
+    const std::string body = R"CPP(
+const std::array<SelectWide,8> patterns{
+    0,~SelectWide(0),1,SelectWide(1)<<63,SelectWide(1)<<64,SelectWide(1)<<127,
+    (SelectWide(UINT64_C(0xaaaaaaaaaaaaaaaa))<<64)|UINT64_C(0x5555555555555555),
+    (SelectWide(UINT64_C(0xfedcba9876543210))<<64)|UINT64_C(0x0123456789abcdef)
+};
+for (unsigned epoch=0; epoch<2; ++epoch) {
+    model.init(); std::array<unsigned,3> saved{};
+    for (unsigned selectors=0; selectors<8; ++selectors) for (unsigned pattern=0; pattern<patterns.size(); ++pattern) {
+        model.select_clock=false;
+        model.select_c0=selectors&1; model.select_c1=selectors&2; model.select_c2=selectors&4;
+        model.select_enable_a=(selectors+pattern+epoch)&1;
+        model.select_enable_b=(selectors+pattern+epoch)&2;
+        model.select_guard_a=static_cast<std::uint16_t>(patterns[pattern]);
+        model.select_guard_b=static_cast<std::uint16_t>(patterns[(pattern+3)%patterns.size()]);
+        model.select_real_a=std::bit_cast<double>(pattern&1 ? UINT64_C(0x8000000000000000) : UINT64_C(0x7ff8000000001234));
+        model.select_real_b=std::bit_cast<double>(pattern&1 ? UINT64_C(0x7ff0000000000000) : UINT64_C(0x4004000000000000));
+        model.select_text_a=std::string(160,'A')+std::to_string(pattern);
+        model.select_text_b=std::string("B\0tail",6)+std::to_string(epoch);
+        for(unsigned i=0;i<3;++i) { model.select_shape_a[i]=pattern*17+i; model.select_shape_b[i]=selectors*29+i; }
+)CPP" + prepare + R"CPP(
+        model.eval();
+)CPP" + verify + R"CPP(
+        assert(std::bit_cast<std::uint64_t>(model.select_real)==std::bit_cast<std::uint64_t>(model.select_c0 ? model.select_real_a : model.select_real_b));
+        assert(model.select_text==(model.select_c0 ? model.select_text_a : model.select_text_b));
+        assert(model.select_shape==(model.select_c0 ? model.select_shape_a : model.select_shape_b));
+        assert(model.select_saved_0==saved[0] && model.select_saved_1==saved[1] && model.select_saved_2==saved[2]);
+        const unsigned sum=(unsigned(model.select_guard_a)+model.select_guard_b)&65535;
+        if(model.select_enable_a) { saved[0]=model.select_c0 ? sum : model.select_guard_b; saved[2]=model.select_c2 ? (sum^0xa55a) : model.select_guard_a; }
+        if(model.select_enable_b) saved[1]=model.select_c1 ? model.select_guard_a : sum;
+        model.select_clock=true; model.eval();
+        assert(model.select_saved_0==saved[0] && model.select_saved_1==saved[1] && model.select_saved_2==saved[2]);
+        model.eval();
+        assert(model.select_saved_0==saved[0] && model.select_saved_1==saved[1] && model.select_saved_2==saved[2]);
+    }
+}
+)CPP";
+    for (const auto budget : {16,1024})
+        manualCase(fixture,"numeric-selects-b" + std::to_string(budget),budget,support,body,false);
+}
+
 void testNarrowConstantLogicalShifts() {
     Fixture fixture; auto& graph = fixture.graph;
     const auto data = fixture.input("shift_data", 128);
@@ -4494,6 +4651,6 @@ int main() {
     // Append after testModels initializes the generated execution Makefile.
     try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
-    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
+    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

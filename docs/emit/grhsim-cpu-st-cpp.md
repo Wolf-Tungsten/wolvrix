@@ -140,6 +140,17 @@ budget; this only changes the artifact size check, not generated C++ contents.
 
 ## Types, arrays and external ABI
 
+Scalar TwoState Logic `kMux` and `kPrioritySelect` results up to 64 bits use
+`numeric_select(condition, yes, no)`. Both data arguments are passed by value
+after the existing sign extension, truncation and width cleanup. The helper
+returns `__builtin_unpredictable(condition) ? yes : no`, allowing a conditional
+move without making the operand loads conditional. For a priority selection,
+the first true condition wins; all false conditions select the default value.
+Producers keep their original guards and evaluation order. This changes no
+effect calls, writer sampling, publication or clock behavior. Real, String,
+wide and shaped results retain their existing paths, as do bounds, division
+and shift guards.
+
 CPU execution requires explicit TwoState Logic. FourState types remain valid
 in GRH and JSON, but are rejected by this emitter; use the explicit conversion
 policy rather than expecting an implicit X/Z projection. Scalar Real/String

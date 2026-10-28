@@ -1443,12 +1443,17 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
     }
     if (kind == OperationKind::kNot || kind == OperationKind::kLogicNot) return "(" + std::string(kind == OperationKind::kNot ? "~" : "!") + a(0) + ")";
     if (kind == OperationKind::kXnor) return "~(" + c(0) + "^" + c(1) + ")";
-    if (kind == OperationKind::kMux) return "(" + a(0) + " ? " + c(1) + " : " + c(2) + ")";
+    const auto select = [&](const std::string& condition, const std::string& yes, const std::string& no) {
+        if (type.kind == grh::ValueType::Logic && type.width <= 64 && graph_.valueShape(result).empty())
+            return "numeric_select(" + condition + ", " + yes + ", " + no + ")";
+        return "(" + condition + " ? " + yes + " : " + no + ")";
+    };
+    if (kind == OperationKind::kMux) return select(a(0), c(1), c(2));
     if (kind == sim::kBitSelect) return "((" + c(0) + "&" + c(1) + ")|(~" + c(0) + "&" + c(2) + "))";
     if (kind == sim::kPrioritySelect) {
         const auto count = (args.size() - 1) / 2;
         std::string text = c(args.size() - 1);
-        for (std::size_t i = count; i-- > 0;) text = "(" + a(i) + " ? " + c(count + i) + " : " + text + ")";
+        for (std::size_t i = count; i-- > 0;) text = select(a(i), c(count + i), text);
         return text;
     }
     static const std::map<OperationKind, std::string> compare{
@@ -3316,7 +3321,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         << "#else\n#define GRHSIM_PROFILE_CLOCK(aux) static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())\n#define GRHSIM_PROFILE_UNIT \"nanoseconds\"\n#endif\n"
         << "static_assert(sizeof(unsigned _BitInt(65)) == 16 && alignof(unsigned _BitInt(65)) == 8);\n"
         << "class " << class_ << " {\npublic:\n";
-    std::set<std::string> memberNames{class_, "PerfCounters", "TaskArg", "activeCurrent", "activeNext", "dirtyStateFlags", "pending_", "cpu_rng", "perf_", "profileEnabled_", "snTimeTicks_", "snTimeFires_"};
+    std::set<std::string> memberNames{class_, "PerfCounters", "TaskArg", "activeCurrent", "activeNext", "dirtyStateFlags", "pending_", "cpu_rng", "perf_", "profileEnabled_", "snTimeTicks_", "snTimeFires_", "numeric_select"};
     if (!counterSnapshot_.empty()) { memberNames.insert("opExecCounts_"); memberNames.insert("opExecEvals_"); }
     for (const auto& [store, fields] : fields_) memberNames.insert(store);
     for (const auto& name : functionNames_) memberNames.insert(name);
@@ -3333,6 +3338,10 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         << "    struct PerfCounters {\n        std::uint64_t evalCount=0, round1Count=0, round2Count=0, totalRoundCount=0, computeBatchExecCount=0, commitBatchExecCount=0, touchedStateShadowCount=0, touchedWriteCount=0;\n    };\n";
     for (std::size_t i = 0; i < functionNames_.size(); ++i) if (publicFunctions_.contains(functionNames_[i])) header << written[i].functions[0].declaration;
     header << "private:\n";
+    // Both scalar operands are already available under the consumer's guard.
+    // Passing them by value avoids conditional loads in numeric mux chains.
+    header << "    template<class T> static T numeric_select(bool condition, T yes, T no) noexcept {\n"
+        << "        return __builtin_unpredictable(condition) ? yes : no;\n    }\n";
     header << "    struct TaskArg { char kind; const void *data; std::size_t bytes; std::size_t width; bool isSigned; };\n";
     for (const auto& store : namedStores) {
         const auto layout = fieldLayouts_.find(store);

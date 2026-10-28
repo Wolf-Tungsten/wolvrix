@@ -3801,7 +3801,7 @@ for (unsigned epoch=0;epoch<3;++epoch) {
                 const auto name=match[1].str();
                 require(std::regex_search(function,match,std::regex(R"REGEX("source":"([^"]+)")REGEX")), "Fallback function lacks source");
                 const auto cpp=readFile(directory/match[1].str());
-                const auto begin=cpp.find("void GrhSIM_top::"+name+"(");
+                const auto begin=cpp.find("GrhSIM_top::"+name+"(");
                 const auto end=begin==std::string::npos ? begin : cpp.find("\n}\n",begin);
                 require(begin!=std::string::npos && end!=std::string::npos, "Fallback function body was not found");
                 require(cpp.substr(begin,end-begin).find("publication_changed")==std::string::npos,
@@ -3821,6 +3821,670 @@ for (unsigned epoch=0;epoch<3;++epoch) {
         std::ofstream(path)<<driver;
     }
 }
+
+void testImmutableConstantSources() {
+    const auto valueRecord = [](const std::filesystem::path& directory, grh::ValueId value) {
+        const auto prefix = "{\"value_id\":\"v" + std::to_string(value.index) + "\",";
+        for (const auto& record : mappedRecords(readFile(directory / "code-map.json"), "values"))
+            if (record.starts_with(prefix)) return record;
+        throw std::runtime_error("Immutable-source value is absent from code map");
+    };
+    const auto primary = [&](const std::filesystem::path& directory, grh::ValueId value) {
+        for (const auto& record : mappedRecords(valueRecord(directory, value), "storage")) {
+            std::smatch match;
+            if (record.find("\"role\":\"primary\"") != std::string::npos &&
+                std::regex_search(record, match, std::regex(R"REGEX("reference":"([^"]+)")REGEX")))
+                return match[1].str();
+        }
+        return std::string{};
+    };
+    const auto operationBlock = [](const std::string& cpp, grh::OperationId op) {
+        const auto marker = "/* op o" + std::to_string(op.index) + ' ';
+        std::istringstream input(cpp); std::string line, result; bool collecting = false;
+        while (std::getline(input, line)) {
+            if (line.find("++opExecCounts_[") != std::string::npos && line.find("/* op o") != std::string::npos) {
+                if (collecting) break;
+                collecting = line.find(marker) != std::string::npos;
+            }
+            if (collecting) { result += line + '\n'; if (line == "}") break; }
+        }
+        require(!result.empty(), "Immutable-source operation lost its counter/provenance site");
+        return result;
+    };
+    const auto rootFunction = [](const std::filesystem::path& directory, grh::OperationId op) {
+        const auto id = "\"o" + std::to_string(op.index) + "\"";
+        for (const auto& record : mappedRecords(readFile(directory / "code-map.json"), "functions")) {
+            if (record.find(id) == std::string::npos) continue;
+            std::smatch match;
+            require(std::regex_search(record, match, std::regex(R"REGEX("root_function":"([^"]+)")REGEX")),
+                    "Immutable-source function omitted its root");
+            return match[1].str();
+        }
+        throw std::runtime_error("Immutable-source operation lost function provenance");
+    };
+
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("immutable_clock"), enable = fixture.input("immutable_enable");
+    const auto marker = fixture.input("immutable_marker", 8);
+    std::vector<std::pair<grh::OperationId, std::string>> placements;
+    const auto place = [&](grh::ValueId value, const std::string& key) {
+        placements.emplace_back(graph.valueDef(value), key); return value;
+    };
+    const auto one = place(fixture.constant(1, "1'b1"), "root");
+    struct NumericCase {
+        unsigned width; bool sign; std::string text, bits;
+        grh::ValueId constant{}, same{}, cross{};
+    };
+    std::vector<NumericCase> cases{
+        {1, false, "1'b1", "1"},
+        {7, true, "7'sh7d", "125"},
+        {9, false, "9'h1a5", "421"},
+        {31, true, "31'sh7ffffffd", "UINT64_C(0x7ffffffd)"},
+        {64, false, "64'h8000000000000005", "UINT64_C(0x8000000000000005)"},
+        {64, true, "64'shfffffffffffffffd", "UINT64_C(0xfffffffffffffffd)"},
+        {65, false, "65'h10000000000000003", "((ImmutableWide(1)<<64)|3)"},
+        {130, true, "130'sh3fffffffffffffffffffffffffffffffd", "((ImmutableWide(1)<<130)-3)"}
+    };
+    std::string support = "using ImmutableWide = unsigned _BitInt(192);\n";
+    std::string prepare, verify;
+    for (auto& item : cases) {
+        const auto suffix = std::string(item.sign ? "s" : "u") + std::to_string(item.width);
+        auto type = Fixture::type(item.width); type.isSigned = item.sign;
+        const auto input = graph.createValue(graph.internSymbol("immutable_input_" + suffix), type);
+        graph.bindInputPort("immutable_input_" + suffix, input);
+        item.constant = place(fixture.compute(OperationKind::kConstant, type, {}), "source_" + suffix);
+        graph.setAttr(graph.valueDef(item.constant), "constValue", item.text);
+        graph.setOpSymbol(graph.valueDef(item.constant), graph.internSymbol("immutable_constant_" + suffix));
+        item.same = place(fixture.compute(OperationKind::kAdd, type, {input, item.constant}), "source_" + suffix);
+        item.cross = place(fixture.compute(OperationKind::kXor, type, {input, item.constant}), "consumer_" + suffix);
+        const auto target = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("immutable_numeric_" + suffix));
+        graph.setAttr(target, "argsName", std::vector<std::string>{"input", "sum", "cross"});
+        graph.setAttr(target, "argsDirection", std::vector<std::string>(3, "input"));
+        graph.setAttr(target, "argsWidth", std::vector<int64_t>(3, item.width));
+        graph.setAttr(target, "argsSigned", std::vector<bool>(3, item.sign));
+        graph.setAttr(target, "hasReturn", true); graph.setAttr(target, "returnWidth", int64_t{8});
+        const auto call = graph.createOperation(OperationKind::kDpicCall);
+        graph.setAttr(call, "targetImportSymbol", "immutable_numeric_" + suffix);
+        for (const auto value : {one, input, item.same, item.cross}) graph.addOperand(call, value);
+        const auto result = graph.createValue(Fixture::type(8)); graph.addResult(call, result); place(result, "audit_" + suffix);
+        graph.bindOutputPort("immutable_result_" + suffix, result);
+        const auto scalar = item.width == 1 ? std::string("std::uint8_t") : item.width > 64 ?
+            "const unsigned _BitInt(" + std::to_string((item.width + 63) / 64 * 64) + ")&" :
+            std::string(item.sign ? "std::int" : "std::uint") +
+                std::to_string(item.width <= 8 ? 8 : item.width <= 16 ? 16 : item.width <= 32 ? 32 : 64) + "_t";
+        support += "extern \"C\" std::uint8_t immutable_numeric_" + suffix + "(" + scalar + " x," + scalar +
+            " sum," + scalar + " cross) { const ImmutableWide mask=(ImmutableWide(1)<<" + std::to_string(item.width) +
+            ")-1, c=" + item.bits + "; assert((ImmutableWide(sum)&mask)==((ImmutableWide(x)+c)&mask)); "
+            "assert((ImmutableWide(cross)&mask)==((ImmutableWide(x)^c)&mask)); return static_cast<std::uint8_t>(sum); }\n";
+        const auto port = "m.immutable_input_" + suffix;
+        prepare += port + "=static_cast<decltype(" + port + ")>((ImmutableWide(step*17+3)<<" +
+            std::to_string(item.width > 64 ? 60 : 0) + ")|step);\n";
+        verify += "assert(m.immutable_result_" + suffix + "==static_cast<std::uint8_t>((ImmutableWide(" + port + ")+" + item.bits + ")&((ImmutableWide(1)<<" + std::to_string(item.width) + ")-1)));\n";
+    }
+    // Byte-contiguous array assignment copies from the physical scalar by
+    // address; its immutable RHS shortcut must not feed memcpy an rvalue.
+    const auto copiedArray = place(fixture.compute(OperationKind::kAssign, Fixture::type(64, {8}),
+        {cases[4].constant}), "array_copy");
+    const auto copiedScalar = place(fixture.compute(OperationKind::kAssign, Fixture::type(64),
+        {copiedArray}), "array_copy");
+    const grh::LogicalType stringType{grh::ValueType::String, 0, false, grh::LogicDomain::TwoState, {}};
+    const auto textConstant = [&](const std::string& text) {
+        const auto value = place(fixture.compute(OperationKind::kConstant, stringType, {}), "strings");
+        graph.setAttr(graph.valueDef(value), "constValue", text); return value;
+    };
+    const auto localText = textConstant(std::string(160, 'L') + "/\"\\\n\t@\xc3\xa9");
+    const auto storedText = textConstant(std::string(180, 'S') + "/stored");
+    const auto nulText = textConstant(std::string("A\0B", 3));
+    const auto format = textConstant("immutable %s %s %s %d %h %h packed=%h");
+    auto packedType = Fixture::type(72, {2, 3, 4}); packedType.isSigned = true;
+    const auto packedConstant = place(fixture.compute(OperationKind::kConstant, packedType, {}), "strings");
+    graph.setAttr(graph.valueDef(packedConstant), "constValue", std::string("72'hd792e4a3b65c1987af"));
+    graph.setValueSymbol(storedText, graph.internSymbol("immutable_stored_text"));
+    graph.addDeclaredSymbol(graph.valueSymbol(storedText));
+    const auto imported = [&](const std::string& name, const std::vector<std::string>& kinds,
+                              const std::vector<int64_t>& widths) {
+        const auto target = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol(name));
+        std::vector<std::string> names;
+        for (std::size_t i = 0; i < widths.size(); ++i) names.push_back("arg" + std::to_string(i));
+        graph.setAttr(target, "argsName", names); graph.setAttr(target, "argsType", kinds);
+        graph.setAttr(target, "argsDirection", std::vector<std::string>(widths.size(), "input"));
+        graph.setAttr(target, "argsWidth", widths); graph.setAttr(target, "argsSigned", std::vector<bool>(widths.size(), false));
+        graph.setAttr(target, "hasReturn", true); graph.setAttr(target, "returnWidth", int64_t{8});
+        return target;
+    };
+    const auto stringsTarget = imported("immutable_strings", {"string", "string", "string", "logic"}, {0, 0, 0, 8});
+    const auto stringsCall = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(stringsCall, "targetImportSymbol", std::string(graph.getOperation(stringsTarget).symbolText()));
+    for (const auto value : {one, localText, storedText, nulText, marker}) graph.addOperand(stringsCall, value);
+    const auto stringsResult = graph.createValue(Fixture::type(8)); graph.addResult(stringsCall, stringsResult); place(stringsResult, "strings");
+    graph.bindOutputPort("immutable_strings_result", stringsResult);
+    // Keep effects assigned to this owner contiguous in effect order. The
+    // crossing stored-string call must follow both same-owner consumers.
+    const auto task = fixture.task("display", {enable, format, localText, storedText, nulText,
+        cases[1].constant, cases[4].constant, cases[7].constant, packedConstant, clock}, {"posedge"});
+    placements.emplace_back(task, "strings");
+    const auto storedTarget = imported("immutable_stored", {"string"}, {0});
+    const auto storedCall = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(storedCall, "targetImportSymbol", std::string(graph.getOperation(storedTarget).symbolText()));
+    for (const auto value : {one, storedText}) graph.addOperand(storedCall, value);
+    const auto storedResult = graph.createValue(Fixture::type(8)); graph.addResult(storedCall, storedResult); place(storedResult, "strings_consumer");
+    graph.bindOutputPort("immutable_stored_result", storedResult);
+    const auto copiedTarget = imported("immutable_copied_constant", {"logic"}, {64});
+    const auto copiedCall = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(copiedCall, "targetImportSymbol", std::string(graph.getOperation(copiedTarget).symbolText()));
+    for (const auto value : {one, copiedScalar}) graph.addOperand(copiedCall, value);
+    const auto copiedResult = graph.createValue(Fixture::type(8)); graph.addResult(copiedCall, copiedResult); place(copiedResult, "array_copy_audit");
+    graph.bindOutputPort("immutable_copied_result", copiedResult);
+    support += R"CPP(
+extern "C" std::uint8_t immutable_strings(const char* local, const char* stored, const char* nul, std::uint8_t marker) {
+    assert(std::string(local)==std::string(160,'L')+"/\"\\\n\t@\xc3\xa9");
+    assert(std::string(stored)==std::string(180,'S')+"/stored");
+    assert(std::string(nul)=="A"); return marker+3;
+}
+extern "C" std::uint8_t immutable_stored(const char* text) {
+    assert(std::string(text)==std::string(180,'S')+"/stored"); return std::string(text).size();
+}
+extern "C" std::uint8_t immutable_copied_constant(std::uint64_t value) {
+    assert(value==UINT64_C(0x8000000000000005)); return 167;
+}
+static std::array<unsigned long long,2> immutableCounts(GrhSIM_top& model) {
+    auto* stream=std::fopen("immutable-counts.tsv","w+"); assert(stream);
+    model.dump_execution_counts(stream); std::rewind(stream); char line[256];
+    std::array<unsigned long long,2> result{}; std::array<bool,2> found{};
+    while(std::fgets(line,sizeof(line),stream)) {
+        unsigned site; unsigned long long count;
+        if(std::sscanf(line,"%u\t%llu",&site,&count)!=2) continue;
+        for(unsigned i=0;i<2;++i) if(site==immutableSites[i]) { result[i]=count; found[i]=true; }
+    }
+    std::fclose(stream); assert(found[0] && found[1]); return result;
+}
+)CPP";
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split();
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    for (const auto& [op, key] : placements) {
+        const auto path = owner(graph, op);
+        require(path.size() == 4 && path[0] == "general" && path[1] == "nonsink",
+                "Immutable-source fixture lost an original General nonsink operation");
+        graph.setAttr(op, sim::kPartition, Owner{"general", "nonsink", "immutable_" + key, "node_" + key});
+    }
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
+    const std::string body = "GrhSIM_top peer;\nauto exercise=[&](GrhSIM_top& m,unsigned step) {\n" + prepare +
+        "m.immutable_marker=step*13; m.immutable_enable=true; m.immutable_clock=false; m.eval();\n" + verify +
+        "assert(m.immutable_strings_result==static_cast<std::uint8_t>(m.immutable_marker+3)); "
+        "assert(m.immutable_stored_result==187 && m.immutable_copied_result==167); "
+        "auto counts=immutableCounts(m); assert(counts[0]>0 && counts[0]==counts[1]);\n"
+        "std::ostringstream captured; auto* previous=std::cout.rdbuf(captured.rdbuf()); "
+        "m.immutable_clock=true; m.eval(); std::cout.rdbuf(previous); "
+        "assert(captured.str().ends_with(\" packed=d792e4a3b65c1987af\\n\")); std::cout<<captured.str(); "
+        "assert(immutableCounts(m)[0]==immutableCounts(m)[1]);\n};\n"
+        "for(unsigned epoch=0;epoch<3;++epoch) { model.init(); peer.init(); "
+        "assert((immutableCounts(model)==std::array<unsigned long long,2>{})); "
+        "assert((immutableCounts(peer)==std::array<unsigned long long,2>{})); "
+        "for(unsigned step=0;step<8;++step) { exercise(model,step+epoch*11); exercise(peer,step+epoch*11+29); } }\n";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "immutable-sources-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, "#include <iostream>\n#include <sstream>\nstatic const std::array<unsigned,2> immutableSites{};\n" + support,
+                   body, true, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        const auto cpp = generatedCpp(directory);
+        for (const auto& item : cases) {
+            const auto original = graph.valueDef(item.constant);
+            const auto store = primary(directory, item.constant);
+            require(!store.empty(), "Immutable scalar lost its original physical store");
+            const auto publication = operationBlock(cpp, original);
+            const auto same = operationBlock(cpp, graph.valueDef(item.same));
+            const auto cross = operationBlock(cpp, graph.valueDef(item.cross));
+            const auto sourceRoot = rootFunction(directory, original);
+            require(sourceRoot.starts_with("sn_") && sourceRoot == rootFunction(directory, graph.valueDef(item.same)) &&
+                        sourceRoot != rootFunction(directory, graph.valueDef(item.cross)),
+                    "Immutable scalar did not cover same-owner and crossing General RHS uses");
+            // Small budgets can split one operation after its counter. The
+            // runtime cases cover those frames; inspect RHS spelling in the
+            // unsplit owner so a neighbouring publication cannot mask it.
+            if (budget == 1024) {
+                require(publication.find(store) != std::string::npos, "Immutable scalar lost its original publication");
+                if (item.width <= 64) require(same.find(store) == std::string::npos && cross.find(store) == std::string::npos,
+                        "Immutable scalar RHS still loads its resettable boundary store");
+                else require(cross.find(store) != std::string::npos, "Wide scalar unexpectedly used the narrow immutable-source path");
+            }
+        }
+        require(primary(directory, localText).empty() && !primary(directory, storedText).empty(),
+                "Immutable string fixture lost its no-store/stored cases");
+        for (const auto value : {localText, storedText, nulText, format}) {
+            const auto helper = "constant_" + mappedValue(directory, value);
+            const auto block = operationBlock(cpp, graph.valueDef(value));
+            require(budget != 1024 || block.find(helper + "()") != std::string::npos,
+                    "Immutable string helper lost its original operation/counter site");
+            require(cpp.find("const std::string& GrhSIM_top::" + helper + "()") != std::string::npos,
+                    "Immutable string helper does not return an addressable const reference");
+        }
+        const auto taskBody = operationBlock(cpp, task);
+        require(budget != 1024 || taskBody.find("TaskArg{'s', &constant_" + mappedValue(directory, localText) + "()") != std::string::npos,
+                "Task string argument lost its addressable immutable source");
+        require(budget != 1024 || taskBody.find(primary(directory, cases[1].constant)) != std::string::npos,
+                "Task numeric argument was replaced with an unaddressable literal");
+        if (budget == 1024) {
+            const auto source = primary(directory, cases[4].constant);
+            const auto copyBody = operationBlock(cpp, graph.valueDef(copiedArray));
+            require(!source.empty() && copyBody.find("std::memcpy(") != std::string::npos &&
+                        copyBody.find(", &(" + source + "), 8);") != std::string::npos,
+                    "Scalar-to-array assignment lost the physical memcpy source");
+            std::smatch packedArgument;
+            require(std::regex_search(taskBody, packedArgument,
+                        std::regex(R"REGEX(TaskArg\{'l', &([^,]+), sizeof\(\1\), 72, true\})REGEX")) &&
+                        packedArgument[1].str().find(mappedPackedPrefix(directory, packedConstant)) != std::string::npos,
+                    "Task shaped constant lost its addressable packed bit image");
+        }
+        const auto manifest = readFile(directory / "manifest.json");
+        const std::regex sites(R"REGEX(\{"operation":"([^"]+)","category":"([^"]+)","function":"[^"]+"\})REGEX");
+        std::map<std::string,unsigned> ordinals; unsigned ordinal = 0;
+        for (std::sregex_iterator it(manifest.begin(), manifest.end(), sites), last; it != last; ++it, ++ordinal)
+            if ((*it)[2] == "operation") ordinals.emplace((*it)[1], ordinal);
+        const auto path = artifact(label) / "driver.cpp"; auto driver = readFile(path);
+        const std::string placeholder = "static const std::array<unsigned,2> immutableSites{};";
+        const auto begin = driver.find(placeholder); require(begin != std::string::npos, "Missing immutable counter declaration");
+        driver.replace(begin, placeholder.size(), "static const std::array<unsigned,2> immutableSites{" +
+            std::to_string(ordinals.at(std::string(graph.getOperation(graph.valueDef(cases[1].constant)).symbolText()))) + ',' +
+            std::to_string(ordinals.at(std::string(graph.getOperation(graph.valueDef(cases[1].same)).symbolText()))) + "};");
+        std::ofstream(path) << driver;
+    }
+
+    Fixture events; auto& eventGraph = events.graph;
+    const auto requested = events.input("immutable_request"), data = events.input("immutable_event_data", 8);
+    const auto eventOne = events.constant(1, "1'b1"), numericConstant = events.constant(7, "7'h5d");
+    const auto eventText = events.compute(OperationKind::kConstant, stringType, {});
+    eventGraph.setAttr(eventGraph.valueDef(eventText), "constValue", std::string("ready"));
+    const auto sampledCall = [&](const std::string& name, bool text) {
+        const auto target = eventGraph.createOperation(OperationKind::kDpicImport, eventGraph.internSymbol(name));
+        eventGraph.setAttr(target, "argsName", std::vector<std::string>{"requested", "constant"});
+        eventGraph.setAttr(target, "argsDirection", std::vector<std::string>(2, "input"));
+        eventGraph.setAttr(target, "argsType", std::vector<std::string>{"logic", text ? "string" : "logic"});
+        eventGraph.setAttr(target, "argsWidth", std::vector<int64_t>{1, text ? 0 : 7});
+        eventGraph.setAttr(target, "argsSigned", std::vector<bool>(2, false));
+        eventGraph.setAttr(target, "hasReturn", true);
+        eventGraph.setAttr(target, "returnType", std::string(text ? "string" : "logic"));
+        eventGraph.setAttr(target, "returnWidth", int64_t{text ? 0 : 1});
+        const auto call = eventGraph.createOperation(OperationKind::kDpicCall);
+        eventGraph.setAttr(call, "targetImportSymbol", name);
+        for (const auto value : {eventOne, requested, text ? eventText : numericConstant}) eventGraph.addOperand(call, value);
+        const auto result = eventGraph.createValue(text ? stringType : Fixture::type(1));
+        eventGraph.addResult(call, result); return result;
+    };
+    const auto numericSample = sampledCall("immutable_sample_numeric", false);
+    const auto textSample = sampledCall("immutable_sample_text", true);
+    const auto textClock = events.compute(OperationKind::kEq, Fixture::type(1), {textSample, eventText});
+    const auto numericState = events.state("immutable_numeric_seen", 8), textState = events.state("immutable_text_seen", 8);
+    events.write(OperationKind::kRegisterWritePort, numericState, {eventOne, data, numericSample});
+    events.write(OperationKind::kRegisterWritePort, textState, {eventOne, data, textClock});
+    eventGraph.bindOutputPort("immutable_numeric_seen", events.read(numericState));
+    eventGraph.bindOutputPort("immutable_text_seen", events.read(textState));
+    run(events.design, "grh-to-grhsim", events.session); events.split(); events.partition();
+    for (const auto value : {numericSample, textSample}) {
+        const auto producer = eventGraph.valueDef(value);
+        require(eventGraph.opKind(producer) == sim::kDpiCall &&
+                    sim::attribute<bool>(eventGraph, producer, "grhsim.sampleBoundary").value_or(false),
+                "Immutable Event fixture lost its legal effectful sample boundary");
+        require(std::any_of(eventGraph.valueUsers(value).begin(), eventGraph.valueUsers(value).end(), [&](const auto& use) {
+                    return owner(eventGraph, use.operation) == Owner{"event"};
+                }), "Immutable Event fixture no longer observes the sampled store from Event");
+    }
+    const std::string eventSupport = R"CPP(
+extern "C" std::uint8_t immutable_sample_numeric(std::uint8_t requested,std::uint8_t constant) {
+    assert(constant==93); return requested;
+}
+extern "C" std::string immutable_sample_text(std::uint8_t requested,const char* constant) {
+    assert(std::string(constant)=="ready"); return requested ? constant : "";
+}
+)CPP";
+    const std::string eventBody = R"CPP(
+GrhSIM_top peer;
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); peer.init();
+    for(auto* instance : {&model,&peer}) {
+        auto& m=*instance; m.immutable_request=true; m.immutable_event_data=37+epoch;
+        // Event runs before the first General sample: resettable values are
+        // still zero/empty even when the effect's argument is immutable.
+        m.eval(); assert(m.immutable_numeric_seen==0 && m.immutable_text_seen==0);
+        m.eval(); assert(m.immutable_numeric_seen==37+epoch && m.immutable_text_seen==37+epoch);
+        m.immutable_request=false; m.eval(); m.eval();
+        m.immutable_request=true; m.immutable_event_data=91+epoch;
+        m.eval(); assert(m.immutable_numeric_seen==37+epoch && m.immutable_text_seen==37+epoch);
+        m.eval(); assert(m.immutable_numeric_seen==91+epoch && m.immutable_text_seen==91+epoch);
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "immutable-event-samples-b" + std::to_string(budget);
+        manualCase(events, label, budget, eventSupport, eventBody, false, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        const auto cpp = generatedCpp(directory);
+        for (const auto value : {numericSample, textSample}) {
+            const auto store = primary(directory, value);
+            require(!store.empty() && (budget != 1024 || operationBlock(cpp, eventGraph.valueDef(value)).find(store) != std::string::npos),
+                    "Immutable Event sample lost physical publication or provenance");
+            bool eventRead = false;
+            for (const auto& use : eventGraph.valueUsers(value)) if (owner(eventGraph, use.operation) == Owner{"event"}) {
+                require(rootFunction(directory, use.operation) == "pEvent", "Sample observer left Event");
+                eventRead |= budget != 1024 || operationBlock(cpp, use.operation).find(store) != std::string::npos;
+            }
+            require(eventRead, "Event bypassed the previous resettable DPI sample");
+        }
+    }
+
+    // An interrupted nonsink has already cleared its activity bit. A later
+    // eval must not invent a constant whose original publication was skipped.
+    Fixture interrupted; auto& interruptedGraph = interrupted.graph;
+    const auto interruptedOne = interrupted.constant(1, "1'b1");
+    const auto beforeThrow = interrupted.constant(8, "8'd29");
+    const auto throwingTarget = interruptedGraph.createOperation(OperationKind::kDpicImport,
+        interruptedGraph.internSymbol("immutable_throw_once"));
+    interruptedGraph.setAttr(throwingTarget, "argsName", std::vector<std::string>{"before"});
+    interruptedGraph.setAttr(throwingTarget, "argsDirection", std::vector<std::string>{"input"});
+    interruptedGraph.setAttr(throwingTarget, "argsWidth", std::vector<int64_t>{8});
+    interruptedGraph.setAttr(throwingTarget, "argsSigned", std::vector<bool>{false});
+    interruptedGraph.setAttr(throwingTarget, "hasReturn", false);
+    const auto throwingCall = interruptedGraph.createOperation(OperationKind::kDpicCall);
+    interruptedGraph.setAttr(throwingCall, "targetImportSymbol", std::string("immutable_throw_once"));
+    interruptedGraph.addOperand(throwingCall, interruptedOne); interruptedGraph.addOperand(throwingCall, beforeThrow);
+    const auto afterThrow = interrupted.constant(8, "8'd101");
+    const auto afterTarget = interruptedGraph.createOperation(OperationKind::kDpicImport,
+        interruptedGraph.internSymbol("immutable_after_throw"));
+    interruptedGraph.setAttr(afterTarget, "argsName", std::vector<std::string>{"before", "after"});
+    interruptedGraph.setAttr(afterTarget, "argsDirection", std::vector<std::string>(2, "input"));
+    interruptedGraph.setAttr(afterTarget, "argsWidth", std::vector<int64_t>(2, 8));
+    interruptedGraph.setAttr(afterTarget, "argsSigned", std::vector<bool>(2, false));
+    interruptedGraph.setAttr(afterTarget, "hasReturn", true); interruptedGraph.setAttr(afterTarget, "returnWidth", int64_t{8});
+    const auto afterCall = interruptedGraph.createOperation(OperationKind::kDpicCall);
+    interruptedGraph.setAttr(afterCall, "targetImportSymbol", std::string("immutable_after_throw"));
+    for (const auto value : {interruptedOne, beforeThrow, afterThrow}) interruptedGraph.addOperand(afterCall, value);
+    const auto afterResult = interruptedGraph.createValue(Fixture::type(8)); interruptedGraph.addResult(afterCall, afterResult);
+    interruptedGraph.bindOutputPort("immutable_after_throw", afterResult);
+    run(interrupted.design, "grh-to-grhsim", interrupted.session);
+    // Keep the fire constant before the throwing call too. The converter's
+    // appended equivalent constant must not accidentally reorder this fixture.
+    interruptedGraph.replaceOperand(throwingCall, 0, interruptedOne);
+    interruptedGraph.replaceOperand(afterCall, 0, interruptedOne);
+    interrupted.split();
+    run(interrupted.design, "grhsim-partition-nonsink", interrupted.session, {"-clone-shared=0"});
+    for (const auto op : {interruptedGraph.valueDef(interruptedOne), interruptedGraph.valueDef(beforeThrow),
+                          throwingCall, interruptedGraph.valueDef(afterThrow)}) {
+        require(owner(interruptedGraph, op).size() == 4 && owner(interruptedGraph, op)[1] == "nonsink",
+                "Interrupted-source fixture lost a nonsink operation");
+        interruptedGraph.setAttr(op, sim::kPartition, Owner{"general", "nonsink", "immutable_throw_source", "source"});
+    }
+    interruptedGraph.setAttr(afterCall, sim::kPartition, Owner{"general", "nonsink", "immutable_throw_consumer", "consumer"});
+    run(interrupted.design, "grhsim-partition-sink", interrupted.session);
+    const std::string interruptedSupport = R"CPP(
+static bool immutableThrowNext;
+extern "C" void immutable_throw_once(std::uint8_t before) {
+    assert(before==29); if(immutableThrowNext) { immutableThrowNext=false; throw std::runtime_error("expected immutable-source interruption"); }
+}
+extern "C" std::uint8_t immutable_after_throw(std::uint8_t before,std::uint8_t after) {
+    assert(before==29 && after==0); return before+after;
+}
+)CPP";
+    const std::string interruptedBody = R"CPP(
+for(unsigned epoch=0;epoch<3;++epoch) {
+    model.init(); immutableThrowNext=true; bool caught=false;
+    try { model.eval(); } catch(const std::runtime_error&) { caught=true; }
+    assert(caught && model.immutable_after_throw==0);
+    model.eval(); assert(model.immutable_after_throw==29);
+}
+)CPP";
+    for (const auto budget : {16, 1024}) {
+        const auto label = "immutable-interrupted-source-b" + std::to_string(budget);
+        manualCase(interrupted, label, budget, interruptedSupport, interruptedBody, false, {{"execution-counters", "on"}});
+        const auto directory = artifact(label) / "model";
+        const auto cpp = generatedCpp(directory), beforeStore = primary(directory, beforeThrow), afterStore = primary(directory, afterThrow);
+        const auto consumer = operationBlock(cpp, afterCall);
+        require(!beforeStore.empty() && !afterStore.empty() && (budget != 1024 ||
+                    (consumer.find(beforeStore) == std::string::npos && consumer.find(afterStore) != std::string::npos)),
+                "Interrupted owner did not distinguish published-prefix and skipped constants");
+        require(rootFunction(directory, interruptedGraph.valueDef(beforeThrow)) == rootFunction(directory, throwingCall) &&
+                    rootFunction(directory, interruptedGraph.valueDef(afterThrow)) == rootFunction(directory, throwingCall),
+                "Interrupted constants no longer bracket a call in the same owner");
+    }
+}
+
+void testNarrowConstantLogicalShifts() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto data = fixture.input("shift_data", 128);
+    std::vector<grh::OperationId> placements;
+    const auto place = [&](grh::ValueId value) {
+        placements.push_back(graph.valueDef(value)); return value;
+    };
+    const auto one = place(fixture.constant(1, "1'b1"));
+    struct AmountCase { std::string name; unsigned width; bool sign; grh::ValueId value{}; };
+    std::vector<AmountCase> amounts{
+        {"u32",32,false}, {"u8",8,false}, {"s8",8,true},
+        {"u16",16,false}, {"s16",16,true}, {"u31",31,false}, {"s31",31,true},
+        {"s32",32,true}, {"u64",64,false}, {"s64",64,true},
+        {"u128",128,false}, {"s128",128,true}
+    };
+    for (auto& amount : amounts) {
+        auto type = Fixture::type(amount.width); type.isSigned = amount.sign;
+        amount.value = graph.createValue(graph.internSymbol("shift_amount_" + amount.name), type);
+        graph.bindInputPort("shift_amount_" + amount.name, amount.value);
+    }
+    struct ShiftCase {
+        unsigned width; bool sign; uint64_t bits; std::size_t amount;
+        grh::ValueId source{}, shifted{}, selected{};
+        std::string inputName;
+    };
+    std::vector<ShiftCase> cases;
+    // Keep the original 5/6/7/8 sources in one owner with the shared dynamic
+    // amount. Width-two/three literals deliberately exercise normalization.
+    for (const auto width : {2u,3u,4u})
+        for (const auto bits : {UINT64_C(5),UINT64_C(6),UINT64_C(7),UINT64_C(8)})
+            cases.push_back({width,false,bits,0});
+    for (const auto width : {2u,3u,4u}) {
+        ShiftCase item{width,false,0,0};
+        item.inputName = "shift_runtime_u" + std::to_string(width); cases.push_back(std::move(item));
+    }
+    for (std::size_t amount = 1; amount < amounts.size(); ++amount) {
+        for (const auto bits : {UINT64_C(5),UINT64_C(6),UINT64_C(7)})
+            cases.push_back({3,false,bits,amount});
+        cases.push_back({4,false,8,amount});
+    }
+    for (const auto width : {8u,16u,31u,32u,64u}) {
+        const auto high = uint64_t{1} << (width - 1);
+        const auto mask = width == 64 ? UINT64_MAX : (uint64_t{1} << width) - 1;
+        for (const auto sign : {false,true})
+            for (const auto bits : {high,mask,UINT64_C(127),UINT64_C(128)})
+                cases.push_back({width,sign,bits,0});
+    }
+    std::vector<grh::ValueId> selectedBits;
+    for (std::size_t index = 0; index < cases.size(); ++index) {
+        auto& item = cases[index];
+        auto sourceType = Fixture::type(item.width); sourceType.isSigned = item.sign;
+        if (item.inputName.empty()) {
+            item.source = place(fixture.compute(OperationKind::kConstant, sourceType, {}));
+            graph.setAttr(graph.valueDef(item.source), "constValue", std::to_string(item.width) +
+                (item.sign ? "'sd" : "'d") + std::to_string(item.bits));
+            graph.setOpSymbol(graph.valueDef(item.source), graph.internSymbol("narrow_shift_constant_" + std::to_string(index)));
+        } else item.source = fixture.input(item.inputName, item.width);
+        // Explicit unsigned result types define the logical bit image even
+        // for signed source constants; signed-result shift policy is separate.
+        item.shifted = place(fixture.compute(OperationKind::kLShr, Fixture::type(item.width),
+            {item.source, amounts[item.amount].value}));
+        const auto shiftedData = place(fixture.compute(OperationKind::kLShr, Fixture::type(128), {data, item.shifted}));
+        item.selected = place(fixture.compute(OperationKind::kSliceStatic, Fixture::type(1), {shiftedData}));
+        graph.setAttr(graph.valueDef(item.selected), "sliceStart", int64_t{0});
+        graph.setAttr(graph.valueDef(item.selected), "sliceEnd", int64_t{0});
+        graph.bindOutputPort("shift_bit_" + std::to_string(index), item.selected);
+        selectedBits.push_back(item.selected);
+    }
+    struct SignedResultCase {
+        unsigned width; int64_t value; std::string inputName;
+        grh::ValueId source{}, shifted{};
+    };
+    std::vector<SignedResultCase> signedResults;
+    for (const auto width : {8u,16u,32u}) {
+        for (const auto value : {int64_t{-1},int64_t{-3},-(int64_t{1} << (width-1))})
+            signedResults.push_back({width,value,{}});
+        signedResults.push_back({width,0,"shift_signed_runtime_s" + std::to_string(width)});
+    }
+    for (std::size_t index=0; index<signedResults.size(); ++index) {
+        auto& item=signedResults[index];
+        auto type=Fixture::type(item.width); type.isSigned=true;
+        if (item.inputName.empty()) {
+            item.source=place(fixture.compute(OperationKind::kConstant,type,{}));
+            const auto bits=static_cast<uint64_t>(item.value)&((uint64_t{1}<<item.width)-1);
+            graph.setAttr(graph.valueDef(item.source),"constValue",std::to_string(item.width)+"'sd"+std::to_string(bits));
+            graph.setOpSymbol(graph.valueDef(item.source),graph.internSymbol("signed_result_lshr_constant_"+std::to_string(index)));
+        } else {
+            item.source=graph.createValue(graph.internSymbol(item.inputName),type);
+            graph.bindInputPort(item.inputName,item.source);
+        }
+        item.shifted=place(fixture.compute(OperationKind::kLShr,type,{item.source,amounts[0].value}));
+        graph.bindOutputPort("shift_signed_result_"+std::to_string(index),item.shifted);
+        const auto low=place(fixture.compute(OperationKind::kSliceStatic,Fixture::type(1),{item.shifted}));
+        graph.setAttr(graph.valueDef(low),"sliceStart",int64_t{0});
+        graph.setAttr(graph.valueDef(low),"sliceEnd",int64_t{0});
+        selectedBits.push_back(low);
+    }
+    const auto imported = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("audit_narrow_constant_shifts"));
+    std::vector<std::string> argumentNames;
+    std::string signature, audit;
+    for (std::size_t index = 0; index < selectedBits.size(); ++index) {
+        const auto argument = "bit" + std::to_string(index); argumentNames.push_back(argument);
+        if (index) signature += ',';
+        signature += "std::uint8_t " + argument;
+        audit += "checksum=(checksum*33+" + argument + ")&255;\n";
+    }
+    graph.setAttr(imported, "argsName", argumentNames);
+    graph.setAttr(imported, "argsDirection", std::vector<std::string>(selectedBits.size(), "input"));
+    graph.setAttr(imported, "argsWidth", std::vector<int64_t>(selectedBits.size(), 1));
+    graph.setAttr(imported, "argsSigned", std::vector<bool>(selectedBits.size(), false));
+    graph.setAttr(imported, "hasReturn", true); graph.setAttr(imported, "returnWidth", int64_t{8});
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call, "targetImportSymbol", std::string("audit_narrow_constant_shifts"));
+    graph.addOperand(call, one);
+    for (const auto value : selectedBits) graph.addOperand(call, value);
+    const auto checksum = graph.createValue(Fixture::type(8)); graph.addResult(call, checksum); place(checksum);
+    graph.bindOutputPort("shift_checksum", checksum);
+    run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split();
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    for (const auto op : placements) {
+        const auto path = owner(graph, op);
+        require(path.size() == 4 && path[0] == "general" && path[1] == "nonsink",
+                "Narrow-shift fixture lost an original General nonsink operation");
+        graph.setAttr(op, sim::kPartition, Owner{"general", "nonsink", "narrow_constant_shifts", "shared"});
+    }
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
+    const std::string support = R"CPP(
+using ShiftWide = unsigned _BitInt(128);
+// Divide the normalized source pattern, then query the selected source-data
+// bit. This oracle never performs the generated dynamic 128-bit right shift.
+static bool expectedShiftBit(std::uint64_t low, std::uint64_t high, std::uint64_t constant,
+                             unsigned width, ShiftWide amount) {
+    if (width < 64) constant %= std::uint64_t{1} << width;
+    if (amount >= width) constant = 0;
+    else for (unsigned remaining=static_cast<unsigned>(amount); remaining; --remaining) constant /= 2;
+    if (constant >= 128) return false;
+    auto word = constant < 64 ? low : high;
+    for (unsigned remaining=static_cast<unsigned>(constant%64); remaining; --remaining) word /= 2;
+    return word%2 != 0;
+}
+// Preserve the existing signed-result LShr behavior: a negative host scalar
+// supplies sign-filled low bits below W, while counts at/above W return zero.
+static std::int64_t expectedSignedLshr(std::int64_t value,unsigned width,ShiftWide amount) {
+    if (amount>=width) return 0;
+    for (unsigned remaining=static_cast<unsigned>(amount); remaining; --remaining)
+        value=value/2-(value<0 && value%2!=0);
+    return value;
+}
+)CPP" + std::string("extern \"C\" std::uint8_t audit_narrow_constant_shifts(") + signature +
+        ") { unsigned checksum=0;\n" + audit + "return static_cast<std::uint8_t>(checksum); }\n";
+    std::string prepare, verify;
+    for (const auto& amount : amounts) {
+        const auto port = "model.shift_amount_" + amount.name;
+        prepare += port + "=static_cast<decltype(" + port + ")>(rawAmount);\n";
+    }
+    for (std::size_t index = 0; index < cases.size(); ++index) {
+        const auto& item = cases[index]; const auto& amount = amounts[item.amount];
+        if (!item.inputName.empty()) {
+            const auto input = "model." + item.inputName;
+            prepare += input + "=static_cast<decltype(" + input + ")>((pattern[0]^pattern[1]^"
+                "static_cast<std::uint64_t>(rawAmount))+epoch*5);\n";
+        }
+        const auto port = "model.shift_amount_" + amount.name;
+        const auto rawAmount = amount.width == 128 ? "ShiftWide(" + port + ")" :
+            "(ShiftWide(" + port + ")&ShiftWide(UINT64_C(" +
+                std::to_string(amount.width == 64 ? UINT64_MAX : (uint64_t{1} << amount.width) - 1) + ")))";
+        const auto expected = "expected" + std::to_string(index);
+        const auto source = item.inputName.empty() ? "UINT64_C(" + std::to_string(item.bits) + ')' :
+            "static_cast<std::uint64_t>(model." + item.inputName + ')';
+        verify += "const bool " + expected + "=expectedShiftBit(pattern[0],pattern[1]," +
+            source + ',' + std::to_string(item.width) + ',' + rawAmount + ");\n";
+        verify += "assert(model.shift_bit_" + std::to_string(index) + "==" + expected + "); "
+            "checksum=(checksum*33+" + expected + ")&255;\n";
+    }
+    for (std::size_t index=0; index<signedResults.size(); ++index) {
+        const auto& item=signedResults[index];
+        std::string source=std::to_string(item.value);
+        if (!item.inputName.empty()) {
+            source="model."+item.inputName;
+            prepare+=source+"=static_cast<decltype("+source+")>(epoch==0 ? -3 : epoch==1 ? -1 : "+
+                std::to_string(-(int64_t{1}<<(item.width-1)))+");\n";
+        }
+        const auto expected="signedExpected"+std::to_string(index);
+        verify+="const auto "+expected+"=expectedSignedLshr("+source+','+std::to_string(item.width)+
+            ",ShiftWide(model.shift_amount_u32));\n";
+        verify+="assert(static_cast<std::int64_t>(model.shift_signed_result_"+std::to_string(index)+")=="+expected+"); "
+            "checksum=(checksum*33+(static_cast<std::uint64_t>("+expected+")&1))&255;\n";
+    }
+    const std::string body = R"CPP(
+const std::array<ShiftWide,37> rawAmounts{
+    0,1,2,3,4,5,6,7,8,9,15,16,17,30,31,32,33,63,64,65,127,128,255,256,65535,65536,
+    ShiftWide(1)<<30, ShiftWide(1)<<31, (ShiftWide(1)<<31)|1,
+    ShiftWide(1)<<32, (ShiftWide(1)<<32)|2, ShiftWide(1)<<63, (ShiftWide(1)<<63)|3,
+    ShiftWide(1)<<64, (ShiftWide(1)<<64)|4, ShiftWide(1)<<100, ~ShiftWide(0)
+};
+const std::array<std::array<std::uint64_t,2>,6> patterns{{
+    {0,0}, {UINT64_MAX,UINT64_MAX},
+    {UINT64_C(0x0123456789abcdef),UINT64_C(0xfedcba9876543210)},
+    {UINT64_C(0xaaaaaaaaaaaaaaaa),UINT64_C(0x5555555555555555)},
+    {1,UINT64_C(0x8000000000000000)}, {UINT64_C(0x8000000000000000),1}
+}};
+for (unsigned epoch=0; epoch<3; ++epoch) {
+    model.init();
+    for (const auto rawAmount : rawAmounts) for (const auto& pattern : patterns) {
+        model.shift_data=(ShiftWide(pattern[1])<<64)|pattern[0];
+)CPP" + prepare + "model.eval(); unsigned checksum=0;\n" + verify + R"CPP(
+        assert(model.shift_checksum==checksum);
+    }
+}
+)CPP";
+    for (const auto budget : {16,1024}) {
+        const auto label = "narrow-constant-lshr-b" + std::to_string(budget);
+        manualCase(fixture, label, budget, support, body, false);
+        const auto directory = artifact(label) / "model";
+        const auto functions = mappedRecords(readFile(directory / "code-map.json"), "functions");
+        std::string sharedRoot;
+        for (const auto op : placements) {
+            const auto id = "\"o" + std::to_string(op.index) + "\""; std::string root;
+            for (const auto& function : functions) if (function.find(id) != std::string::npos) {
+                std::smatch match;
+                require(std::regex_search(function, match, std::regex(R"REGEX("root_function":"([^"]+)")REGEX")),
+                        "Narrow-shift function omitted its original owner");
+                root = match[1].str(); break;
+            }
+            require(root.starts_with("sn_"), "Narrow-shift operation left its General owner or lost provenance");
+            if (sharedRoot.empty()) sharedRoot = root;
+            require(root == sharedRoot, "Narrow-shift sources and dependent shifts no longer share one General owner");
+        }
+        for (const auto& item : cases) if (item.inputName.empty())
+            require(graph.opKind(graph.valueDef(item.source)) == OperationKind::kConstant,
+                    "Narrow-shift regression no longer uses a true constant producer");
+        for (const auto& item : signedResults) {
+            require(graph.valueLogicalType(item.shifted).isSigned,
+                    "Signed-result LShr regression lost its signed result type");
+            if (item.inputName.empty()) require(graph.opKind(graph.valueDef(item.source))==OperationKind::kConstant,
+                    "Signed-result LShr regression no longer uses a true constant producer");
+        }
+    }
+}
 }
 
 int main() {
@@ -3830,6 +4494,6 @@ int main() {
     // Append after testModels initializes the generated execution Makefile.
     try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
-    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
+    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

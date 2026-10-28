@@ -62,6 +62,41 @@ original path. Group counts use the operation emitter's elisions and are checked
 against actual publication calls. Each site's comparison/copy/synchronization
 retains its operation origin; the combined flush is owner bookkeeping.
 
+General right-hand sides can use a typed literal for a direct scalar Logic
+`kConstant` up to 64 bits. This does not look through assigns or held samples.
+The defining operation, its counter, boundary copy, role synchronization and
+activity publication remain at the original site. Cross-owner substitution
+requires an earlier nonsink whose constant precedes every potentially throwing
+operation in that owner's topological order. The safe prefix contains only
+Logic Pure/ReadState operations and excludes system functions. An external call
+or string operation ends the prefix, preserving zero boundaries when a caller
+catches an exception before publication and invokes `eval()` again. Event,
+Output and address-taking paths keep their stored views.
+
+For an unsigned logical-right-shift result narrower than 64 bits whose source
+was replaced by such a literal, the zero guard uses the existing `uint64_t`
+shift container's width, 64. The normalized source is already zero above its
+logical width, so intermediate counts naturally produce zero. The complete
+count is compared before conversion to `size_t`, including counts wider than
+64 bits. This equivalent expression avoids a Clang 22 vector instruction
+selection failure; signed results and other shift paths keep their guards.
+
+String constants use an immutable source helper returning a reference to a
+function-local `static const std::string`. The original operation calls it first; definitions
+alone allocate nothing. Stored strings still publish into the resettable
+boundary, and no-store strings retain an explicit original-site call. Helpers
+share immutable contents across instances and repeated `init()`, while instance
+stores still reset. Construction preserves the existing C-string behavior for
+embedded NUL bytes; it does not promise identical allocation-failure frequency.
+Task arguments always have addressable storage, including packed shaped
+constants, instead of taking the address of a literal.
+The retained implementation was validated on XiangShan CoreMark 100k with
+NEMU difftest: six fresh alternating runs on one CPU, without PGO, waveform
+or extra counters, improved throughput by 51.210858% over the retained NO2
+baseline. The full original-SV build took 2182.178070 seconds with 32 jobs.
+This measures the combined scalar/string mechanism and does not assign the
+gain to either component separately.
+
 Writer and commit batches contain at most 128 contiguous SinkSchedule runs. Only these
 bounded helpers own computation locals and split when their line budget
 requires it; `pGeneral` and `pLargeSink` keep constant-size ordered call loops.

@@ -239,6 +239,9 @@ private:
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> fireExpressions_;
     std::unordered_map<ValueId, bool, grh::ValueIdHash> viewOnly_;
     std::unordered_map<ValueId, ValueId, grh::ValueIdHash> snapshotViews_;
+    std::unordered_map<ValueId, std::string, grh::ValueIdHash> constantSources_;
+    std::unordered_map<ValueId, std::string, grh::ValueIdHash> constantStrings_;
+    std::unordered_set<ValueId, grh::ValueIdHash> publishedConstants_;
     std::unordered_set<OperationId, grh::OperationIdHash> identityElisions_;
     struct LeafPlan {
         enum class Kind { Source, Concat, Repeat, Mux };
@@ -371,12 +374,29 @@ private:
         }
         if (const auto found = storage_.find(id); found != storage_.end()) return found->second;
         if (const auto found = snapshotViews_.find(id); found != snapshotViews_.end()) return read(found->second, payload);
+        if (const auto found = constantStrings_.find(id); found != constantStrings_.end()) return found->second + "()";
         const auto& member = valueName(id);
         if (localNames_.contains(member)) return "@" + member + "@";
         return local(cppType(graph_.valueLogicalType(id)), member, "{}",
                      sourceComments_ ? valueDescription(id) : std::string{});
     }
-    std::string packed(ValueId id, std::vector<Code>& code);
+    std::string readSource(ValueId id, bool payload = false) {
+        const auto found = constantSources_.find(id);
+        if (found != constantSources_.end() && owner_.size() == 3 && owner_[0] == "general") {
+            const auto& producer = executionOwner(graph_.valueDef(id));
+            // Only the original defining op is immutable. Do not look through
+            // held samples, role views or assigns. General is topological, and
+            // every nonsink runs before the ordered sink batches after init.
+            // Cross-owner sources must publish before any throwing operation
+            // in that producer: an interrupted owner has consumed its activity
+            // bit, so a later eval may otherwise observe its initial boundary.
+            if (producer == owner_ || (publishedConstants_.contains(id) && ordinal_.contains(producer) &&
+                (!ordinal_.contains(owner_) || ordinal_.at(producer) < ordinal_.at(owner_))))
+                return found->second;
+        }
+        return read(id, payload);
+    }
+    std::string packed(ValueId id, std::vector<Code>& code, bool addressable = false);
     void copy(std::vector<Code>& code, const std::string& destination, const LogicalType& target,
               const std::string& source, const LogicalType& sourceType);
     void unpack(std::vector<Code>& code, const std::string& destination, const LogicalType& type,
@@ -398,6 +418,7 @@ private:
     void task(std::vector<Code>& code, OperationId op);
     void buildPhases();
     void buildInit();
+    void buildConstantSources();
     void buildObservers();
     void buildRuntime();
     void addFunction(Function function, bool publicFunction = false) {
@@ -802,6 +823,15 @@ void CpuStEmitContext::analyze() {
         }
     }
     analyzeLeafPlans();
+    for (const auto op : graph_.operations()) {
+        if (graph_.opKind(op) != OperationKind::kConstant) continue;
+        const auto id = graph_.opResults(op)[0];
+        const auto type = graph_.valueLogicalType(id);
+        if (type.kind == grh::ValueType::String)
+            constantStrings_.emplace(id, "constant_" + valueName(id));
+        else if (type.kind == grh::ValueType::Logic && type.shape.empty() && type.width <= 64)
+            constantSources_.emplace(id, literal(bits(attr(op, "constValue"), type.width, type.isSigned), type));
+    }
     // Register capture fields before rendering accesses. Every function must
     // use the same layout regardless of the order in which writers are emitted.
     for (const auto op : graph_.operations()) if (sim::isWriter(graph_.opKind(op)) && large(sim::writerTarget(graph_, op))) {
@@ -1046,7 +1076,7 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
     const auto count = plan.width / leaf.width;
     if (plan.kind == LeafPlan::Kind::Source) {
         const auto type = graph_.valueLogicalType(plan.source);
-        const auto source = read(plan.source);
+        const auto source = readSource(plan.source);
         const auto i = temporary("std::size_t", "leaf_index");
         const auto value = type.shape.empty() ?
             "(static_cast<std::uint64_t>(" + clean(source, type) + ") >> (" + i + " * " + std::to_string(leaf.width) + "))" :
@@ -1067,7 +1097,7 @@ void CpuStEmitContext::emitLeaves(std::vector<Code>& code, const std::string& de
         code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(plan.width / plan.inputs[0].width) + "; ++" + i + ")", std::move(body)));
     } else {
         const auto condition = temporary("bool", "condition");
-        code.push_back(Code::line(condition + " = static_cast<bool>(" + read(plan.source) + ");"));
+        code.push_back(Code::line(condition + " = static_cast<bool>(" + readSource(plan.source) + ");"));
         std::vector<Code> yes, no;
         emitLeaves(yes, destination, target, plan.inputs[0], offset);
         emitLeaves(no, destination, target, plan.inputs[1], offset);
@@ -1291,11 +1321,11 @@ std::string CpuStEmitContext::pack(std::vector<Code>& code, const std::string& s
     }));
     return destination;
 }
-std::string CpuStEmitContext::packed(ValueId id, std::vector<Code>& code) {
+std::string CpuStEmitContext::packed(ValueId id, std::vector<Code>& code, bool addressable) {
     const auto type = graph_.valueLogicalType(id);
-    if (type.shape.empty()) return read(id);
+    if (type.shape.empty()) return addressable ? read(id) : readSource(id);
     const auto producer = graph_.valueDef(id);
-    if (type.kind == grh::ValueType::Logic && producer && graph_.opKind(producer) == OperationKind::kConstant) {
+    if (!addressable && type.kind == grh::ValueType::Logic && producer && graph_.opKind(producer) == OperationKind::kConstant) {
         auto packedType = scalarType(type); packedType.isSigned = false;
         // Constants are immutable; concatenating their cleaned leaf patterns
         // is their original normalized bit pattern, with no signed host cast.
@@ -1362,7 +1392,7 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
         if (!sourceType.shape.empty() &&
             (offset + width - 1) / leaf.width - offset / leaf.width >= maxWindowLeaves) return std::nullopt;
         auto target = scalarType(sourceType); target.width = width; target.isSigned = false;
-        const auto saved = read(value);
+        const auto saved = readSource(value);
         const auto fragment = [&](int64_t index, int64_t shift) {
             const auto source = sourceType.shape.empty() ? saved :
                 row(saved, sourceType.shape, std::to_string(index));
@@ -1452,10 +1482,20 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
     }
     if (kind == OperationKind::kShl || kind == OperationKind::kLShr || kind == OperationKind::kAShr) {
         const auto amount = "static_cast<" + unsignedType(t(1).width) + ">(" + a(1) + ")";
-        const auto shifted = kind == OperationKind::kAShr ? signedValue(c(0), type.width) :
-            "static_cast<" + unsignedType(std::max(type.width, 64)) + ">(" + c(0) + ")";
+        const auto source = a(0);
+        const auto converted = convert(source, t(0), type);
+        const auto shifted = kind == OperationKind::kAShr ? signedValue(converted, type.width) :
+            "static_cast<" + unsignedType(std::max(type.width, 64)) + ">(" + converted + ")";
         const auto overflow = kind == OperationKind::kAShr ? "(" + shifted + "<0 ? " + mask(type.width) + " : 0)" : "0";
-        return "(" + amount + ">=" + std::to_string(type.width) + " ? " + overflow + " : (" + shifted +
+        auto guardWidth = type.width;
+        if (kind == OperationKind::kLShr && !type.isSigned && type.width < 64) {
+            const auto literal = constantSources_.find(args[0]);
+            // A zero-extended constant naturally shifts to zero at its logical
+            // width. Guard the uint64 container instead: Clang 22 can fail
+            // instruction selection for vectorized narrow constant selects.
+            if (literal != constantSources_.end() && source == literal->second) guardWidth = 64;
+        }
+        return "(" + amount + ">=" + std::to_string(guardWidth) + " ? " + overflow + " : (" + shifted +
             (kind == OperationKind::kShl ? " << " : " >> ") + "static_cast<std::size_t>(" + amount + ")))";
     }
     if (kind >= OperationKind::kReduceAnd && kind <= OperationKind::kReduceXnor) {
@@ -1503,7 +1543,7 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
         if (kind == OperationKind::kSliceDynamic && !sourceType.shape.empty() && type.width == 1) {
             const auto leaf = leafType(sourceType);
             const auto index = "static_cast<std::size_t>(" + offset + ")";
-            const auto source = row(read(args[0]), sourceType.shape, "(" + index + " / " + std::to_string(leaf.width) + ")");
+            const auto source = row(readSource(args[0]), sourceType.shape, "(" + index + " / " + std::to_string(leaf.width) + ")");
             // Preserve the saved array view. Check the full-width unsigned
             // offset before narrowing it, including the packed padding bits.
             const auto selected = "(static_cast<" + unsignedType(leaf.width) + ">(" + clean(source, leaf) +
@@ -1533,7 +1573,7 @@ std::string CpuStEmitContext::expression(OperationId op, ValueId result, std::ve
                 }));
             }
         } else {
-            const auto control = a(0), source = read(args[1]); const auto dataType = graph_.valueLogicalType(args[1]);
+            const auto control = a(0), source = readSource(args[1]); const auto dataType = graph_.valueLogicalType(args[1]);
             const auto i = temporary("std::size_t", "leaf_index");
             code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(t(0).width) + "; ++" + i + ")", {
                 Code::block("if ((" + control + " >> " + i + ") & 1)", {
@@ -1557,6 +1597,13 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     if (kind == sim::kDpiCall) { dpi(code, op); return; }
     if (results.size() != 1) throw std::invalid_argument("CPU expects one result for compute/read operation");
     const auto id = results[0]; const auto type = graph_.valueLogicalType(id);
+    if (const auto source = constantStrings_.find(id); source != constantStrings_.end()) {
+        // Call at the original operation, not in hoisted local/frame initializers.
+        // Each instance still publishes into its resettable boundary fields.
+        if (storage_.contains(id)) publish(code, id, source->second + "()");
+        else code.push_back(Code::line("(void)" + source->second + "();"));
+        return;
+    }
     const auto destination = storage_.contains(id) ? temporary(cppType(type), "computed", id) : read(id);
     if (const auto plan = leafPlans_.find(op); plan != leafPlans_.end()) {
         emitLeaves(code, destination, type, plan->second);
@@ -1578,7 +1625,9 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
     } else if (kind == OperationKind::kAssign) {
         const auto view = type.shape.empty() ? ValueId{} : arrayView(args[0]);
         const auto source = view && graph_.valueLogicalType(view).leafWidth() == type.leafWidth() ? view : args[0];
-        copy(code, destination, type, read(source), graph_.valueLogicalType(source));
+        // Packed array copies may take the source address for memcpy.
+        // Keep their physical scalar source instead of an rvalue literal.
+        copy(code, destination, type, type.shape.empty() ? readSource(source) : read(source), graph_.valueLogicalType(source));
     }
     else if (kind == OperationKind::kArrayCreate) {
         int64_t first = 0;
@@ -1586,7 +1635,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
             const auto sourceType = graph_.valueLogicalType(arg);
             const auto rows = sourceType.width / sourceType.leafWidth();
             const auto i = temporary("std::size_t", "leaf_index");
-            const auto source = read(arg);
+            const auto source = readSource(arg);
             code.push_back(Code::block("for (" + i + " = 0; " + i + " < " + std::to_string(rows) + "; ++" + i + ")", {
                 Code::line(row(destination, type.shape, "(" + i + "+" + std::to_string(first) + ")") + " = " +
                     convert(sourceType.shape.empty() ? source : row(source, sourceType.shape, i), leafType(sourceType), leafType(type)) + ";")
@@ -1600,7 +1649,7 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         std::string flatStart = "0";
         int64_t stride = sourceType.width / sourceType.leafWidth();
         for (std::size_t i = 0; i < args.size(); ++i) {
-            const auto index = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + read(args[i]) + ")";
+            const auto index = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + readSource(args[i]) + ")";
             condition += " && " + index + " < " + std::to_string(sourceType.shape[i]);
             source += "[static_cast<std::size_t>(" + index + ")]";
             stride /= sourceType.shape[i];
@@ -1626,12 +1675,12 @@ void CpuStEmitContext::operation(std::vector<Code>& code, OperationId op) {
         const auto index = temporary("std::size_t", "leaf_index");
         code.push_back(Code::line(index + " = 0;"));
         for (std::size_t i = 1; i < args.size(); ++i) {
-            const auto raw = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + read(args[i]) + ")";
+            const auto raw = "static_cast<" + unsignedType(graph_.valueWidth(args[i])) + ">(" + readSource(args[i]) + ")";
             code.push_back(Code::line(index + " = (" + index + " >= " + std::to_string(blocks) + " || " + raw + " >= " + std::to_string(blocks) +
                 ") ? " + std::to_string(blocks) + " : " + index + " * " + std::to_string(sourceType.shape[i - 1]) + " + static_cast<std::size_t>(" + raw + ");"));
         }
         code.push_back(Code::line(destination + " = {};"));
-        const auto source = read(args[0]);
+        const auto source = readSource(args[0]);
         std::vector<Code> valid;
         if (type.shape.empty()) valid.push_back(Code::line(destination + " = " + clean(row(source, sourceType.shape, index), type) + ";"));
         else {
@@ -1700,16 +1749,16 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         for (std::size_t i = latch ? 1 : 2; i < args.size(); ++i) {
             const auto argType = graph_.valueLogicalType(args[i]);
             const std::string member = captureName(op, i);
-            copy(capture, fieldRef("largeSinkPayloadBoundaryStore", member), argType, read(args[i]), argType);
+            copy(capture, fieldRef("largeSinkPayloadBoundaryStore", member), argType, readSource(args[i]), argType);
         }
         capture.push_back(Code::line(enableBitmap_ ? enableWord + " |= " + enableMask + ";" : enableSlot + " = true;"));
-        code.push_back(Code::block("if (" + (latch ? read(args[0]) : read(args[0]) + " && " + read(args[1])) + ")", std::move(capture)));
+        code.push_back(Code::block("if (" + (latch ? readSource(args[0]) : readSource(args[0]) + " && " + readSource(args[1])) + ")", std::move(capture)));
         return;
     }
     const auto value = [&](std::size_t i) {
-        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)) : read(args[i], true);
+        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)) : readSource(args[i], true);
     };
-    std::string condition = inPlace ? enableSlot : latch ? read(args[0]) : "(" + read(args[0]) + " && " + read(args[1]) + ")";
+    std::string condition = inPlace ? enableSlot : latch ? readSource(args[0]) : "(" + readSource(args[0]) + " && " + readSource(args[1]) + ")";
     std::string start = "0";
     int64_t count = type.width / type.leafWidth();
     for (std::size_t i = 0; i < indexCount; ++i) {
@@ -1819,16 +1868,16 @@ void CpuStEmitContext::dpi(std::vector<Code>& code, OperationId op) {
         if (directions[i] == "input") {
             declaration += target.kind == grh::ValueType::String ? "const char*" : target.width > 64 && target.kind == grh::ValueType::Logic ? "const " + base + "&" : base;
             const auto source = args[input++];
-            if (target.kind == grh::ValueType::String) call += "(" + read(source) + ").c_str()";
+            if (target.kind == grh::ValueType::String) call += "(" + readSource(source) + ").c_str()";
             else {
                 const auto argument = temporary(base, "dpi_argument");
-                body.push_back(Code::line(argument + " = " + convert(read(source), graph_.valueLogicalType(source), target) + ";"));
+                body.push_back(Code::line(argument + " = " + convert(readSource(source), graph_.valueLogicalType(source), target) + ";"));
                 call += argument;
             }
         } else {
             declaration += base + "*";
             const auto argument = temporary(base, "dpi_argument");
-            const auto initial = directions[i] == "inout" ? convert(read(args[inoutInput]), graph_.valueLogicalType(args[inoutInput]), target) :
+            const auto initial = directions[i] == "inout" ? convert(readSource(args[inoutInput]), graph_.valueLogicalType(args[inoutInput]), target) :
                 target.kind == grh::ValueType::String ? "std::string{}" : "0";
             body.push_back(Code::line(argument + " = " + initial + ";"));
             if (directions[i] == "inout") ++inoutInput;
@@ -1847,7 +1896,7 @@ void CpuStEmitContext::dpi(std::vector<Code>& code, OperationId op) {
         body.push_back(Code::line(normalized + " = " + clean(source, graph_.valueLogicalType(result)) + ";"));
         publish(body, result, normalized);
     }
-    code.push_back(Code::block("if (" + fireExpression(args[0]) + " && " + read(args[1]) + ")", std::move(body)));
+    code.push_back(Code::block("if (" + fireExpression(args[0]) + " && " + readSource(args[1]) + ")", std::move(body)));
 }
 
 void CpuStEmitContext::task(std::vector<Code>& code, OperationId op) {
@@ -1856,7 +1905,7 @@ void CpuStEmitContext::task(std::vector<Code>& code, OperationId op) {
     if (!supported.contains(name) || attr(op, "procKind") == "final") throw std::invalid_argument("CPU system task is not implemented: " + name);
     const auto args = graph_.opOperands(op);
     const bool timeslot = attr(op, "grhsim.timeslot") == "event";
-    std::string condition = (timeslot ? fieldRef("timeslotTriggerStore", this->name(op)) : fireExpression(args[0])) + " && " + read(args[1]);
+    std::string condition = (timeslot ? fieldRef("timeslotTriggerStore", this->name(op)) : fireExpression(args[0])) + " && " + readSource(args[1]);
     const bool once = attr(op, "procKind") == "initial";
     if (once) condition += " && !" + fieldRef("onceStore", this->name(op));
     std::vector<Code> body;
@@ -1865,7 +1914,7 @@ void CpuStEmitContext::task(std::vector<Code>& code, OperationId op) {
     for (std::size_t i = 2; i < args.size(); ++i) {
         if (i != 2) call += ",";
         const auto type = scalarType(graph_.valueLogicalType(args[i]));
-        const auto source = packed(args[i], body);
+        const auto source = packed(args[i], body, true);
         call += "TaskArg{'" + std::string(type.kind == grh::ValueType::Logic ? "l" : type.kind == grh::ValueType::Real ? "r" : "s") +
             "', &" + source + ", sizeof(" + source + "), " + std::to_string(type.width) + ", " + (type.isSigned ? "true" : "false") + "}";
     }
@@ -1920,6 +1969,19 @@ void CpuStEmitContext::buildPhases() {
                 Code::line(time + " = profileEnabled_ ? profile_clock() : 0;")
             }));
             const auto ops = topological(members_.at(key));
+            bool nonthrowingPrefix = true;
+            for (const auto op : ops) {
+                if (nonthrowingPrefix) for (const auto value : graph_.opResults(op))
+                    if (constantSources_.contains(value)) publishedConstants_.insert(value);
+                const auto effect = grh::operationEffect(graph_, op);
+                if ((effect != grh::OpEffect::Pure && effect != grh::OpEffect::ReadState) ||
+                    graph_.opKind(op) == sim::kSystemFunction)
+                    nonthrowingPrefix = false;
+                for (const auto value : graph_.opOperands(op))
+                    if (graph_.valueLogicalType(value).kind != grh::ValueType::Logic) nonthrowingPrefix = false;
+                for (const auto value : graph_.opResults(op))
+                    if (graph_.valueLogicalType(value).kind != grh::ValueType::Logic) nonthrowingPrefix = false;
+            }
             beginPublications(code, ops);
             for (const auto op : ops) operation(code, op);
             finishPublications(code);
@@ -2085,7 +2147,7 @@ void CpuStEmitContext::buildPhases() {
                 if (sharedPayload.empty()) return;
                 std::string condition;
                 for (const auto& [index, enable] : payloadEnables)
-                    condition += (condition.empty() ? "" : " || ") + read(enable);
+                    condition += (condition.empty() ? "" : " || ") + readSource(enable);
                 enabled.push_back(Code::block("if (" + condition + ")", std::move(sharedPayload)));
                 sharedPayload.clear();
             };
@@ -2127,7 +2189,7 @@ void CpuStEmitContext::buildPhases() {
                     target.insert(target.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
                     continue;
                 }
-                const auto condition = "if (" + read(enable) + ")";
+                const auto condition = "if (" + readSource(enable) + ")";
                 if (!target.empty() && target.back().scope && target.back().text == condition)
                     target.back().body.insert(target.back().body.end(), std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end()));
                 else target.push_back(Code::block(condition, std::move(payload)));
@@ -2136,7 +2198,7 @@ void CpuStEmitContext::buildPhases() {
             if (group.guards.empty()) code.insert(code.end(), std::make_move_iterator(enabled.begin()), std::make_move_iterator(enabled.end()));
             else {
                 std::string condition;
-                for (const auto guard : group.guards) condition += (condition.empty() ? "" : " && ") + read(guard);
+                for (const auto guard : group.guards) condition += (condition.empty() ? "" : " && ") + readSource(guard);
                 code.push_back(Code::block("if (" + condition + ")", std::move(enabled)));
             }
         });
@@ -2494,6 +2556,25 @@ void CpuStEmitContext::buildPhases() {
         code.push_back(Code::line("pOutput();"));
         if (waveform_) code.push_back(Code::line("dump_waveform();"));
     }); addFunction(std::move(eval), true);
+}
+
+void CpuStEmitContext::buildConstantSources() {
+    // Definitions alone do not construct the local static. The original
+    // constant operation remains the first call in each execution path.
+    for (const auto op : graph_.operations()) {
+        if (graph_.opKind(op) != OperationKind::kConstant) continue;
+        const auto id = graph_.opResults(op)[0];
+        const auto found = constantStrings_.find(id);
+        if (found == constantStrings_.end()) continue;
+        Function function{found->second, "", "const std::string&"};
+        function.body = {
+            Code::line("static const std::string value(" + quote(attr(op, "constValue")) + ");"),
+            Code::line("return value;", true)
+        };
+        CodeOrigin{function.body, 0, "o" + std::to_string(op.index),
+            sourceComments_ ? operationDescription(op) : std::string{}};
+        addFunction(std::move(function));
+    }
 }
 
 void CpuStEmitContext::buildInit() {
@@ -3203,6 +3284,7 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
         written.push_back(std::move(group));
     };
     analyze();
+    buildConstantSources();
     buildPhases();
     buildInit();
     for (auto& [store, layout] : fieldLayouts_) std::vector<Local>().swap(layout.physicalFields);

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -196,7 +197,13 @@ namespace wolvrix::lib::emit::detail
             modelOptions.session = &session;
             modelOptions.sessionPathPrefix = modelName;
             modelOptions.attributes["waveform"] = "off";
-            modelOptions.attributes["perf"] = "off";
+            // Package emission keeps per-model counters disabled by default,
+            // but a private diagnostic run may opt into the same eval trace
+            // used by the direct GrhSIM emitter.  The environment escape hatch
+            // is deliberately narrow so normal package behavior is unchanged.
+            const char *diagnosticPerf = std::getenv("WOLVRIX_GRHSIM_REPCUT_PERF");
+            modelOptions.attributes["perf"] =
+                diagnosticPerf != nullptr && std::string_view(diagnosticPerf) == "eval" ? "eval" : "off";
             if (inputDirtyTracking)
             {
                 std::string canonical;

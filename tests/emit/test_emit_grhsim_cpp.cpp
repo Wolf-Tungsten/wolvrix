@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 #include "emit/grhsim_cpp.hpp"
+#include "emit/grhsim_execution_plan.hpp"
 #include "transform/activity_schedule.hpp"
 #include "transform/reg_to_mem.hpp"
 
@@ -8507,6 +8508,24 @@ int main(){
             const auto emitted = emitter.emit(fixture.design, options);
             ::unsetenv(environmentKey);
             if (!emitted.success || diagnostics.hasError()) return fail("same-reader commit emit failed: " + mode);
+            if (mode == "on")
+            {
+                GrhSimExecutionPlan plan;
+                if (!emitter.analyzeExecutionPlan(fixture.design, options, plan).success)
+                    return fail("same-reader work plan failed");
+                std::size_t groups = 0;
+                for (const auto &run : plan.commitWriteRuns) for (const auto &body : run.bodies)
+                    if (body.kind == GrhSimExecutionPlan::CommitWriteBody::Kind::SameReader)
+                    {
+                        ++groups;
+                        if (!body.unmodeledWork.empty() ||
+                            body.enabledWork.at("scalar_comparisons") != body.operations.size() ||
+                            body.changedWork.at("scalar_store_slots_upper") != body.operations.size() ||
+                            body.changedWork.at("reader_activation_calls_upper") != 1)
+                            return fail("same-reader group incorrectly shared a comparison/store");
+                    }
+                if (groups != 3) return fail("same-reader work plan missed groups");
+            }
             const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
             if (mode == "default") defaultFiles = files;
             if ((mode == "off" || mode == "precedence") && files != defaultFiles)
@@ -9056,6 +9075,20 @@ int main(){
             if (mode == "bitmap-environment" || mode == "bitmap-precedence")
                 ::unsetenv("WOLVRIX_GRHSIM_PRIORITY_MUX_CONSTANT_BITMAPS");
             if (!emitted.success || diag.hasError()) return fail("priority mux emit failed: " + mode);
+            if (mode == "on" || mode == "bitmap" || mode == "combined")
+            {
+                GrhSimExecutionPlan plan;
+                if (!emitter.analyzeExecutionPlan(fixture.design, options, plan).success)
+                    return fail("priority mux work plan failed");
+                std::map<std::string, uint64_t> features;
+                for (const auto &group : plan.computeLowering)
+                    for (const auto &[key, value] : group.features) features[key] += value;
+                if (features["priority_branch_roots"] != expectedChains ||
+                    features["priority_bitmap_roots"] != expectedBitmaps ||
+                    features["priority_absorbed_operations"] + features["priority_roots"] !=
+                        features["priority_condition_terms_upper"])
+                    return fail("priority mux lowering feature mismatch");
+            }
             const auto files = collectGeneratedSourceFiles(outDir, "grhsim_top");
             if (mode == "default") defaultFiles = files;
             if ((mode == "off" || mode == "bitmap-master-off") && files != defaultFiles)
@@ -11163,6 +11196,20 @@ int main() {
             EmitDiagnostics diagnostics; EmitGrhSimCpp emitter(&diagnostics);
             const auto result = emitter.emit(fixture.design, options); ::unsetenv(key);
             if (!result.success || diagnostics.hasError()) return fail("bool producer reduce emit failed: " + mode);
+            if (mode == "on")
+            {
+                GrhSimExecutionPlan plan;
+                if (!emitter.analyzeExecutionPlan(fixture.design, options, plan).success)
+                    return fail("bool reduce work plan failed");
+                std::map<std::string, uint64_t> features;
+                for (const auto &group : plan.computeLowering)
+                    for (const auto &[key, value] : group.features) features[key] += value;
+                if (features["bool_reduce_regions"] != 4 || !features["bool_reduce_iterations"] ||
+                    features["bool_reduce_iterations"] != features["bool_reduce_scalar_comparisons"] ||
+                    features["bool_reduce_iterations"] != features["bool_reduce_unconditional_stores"] ||
+                    features["bool_reduce_or_ops"] != 2 * features["bool_reduce_iterations"])
+                    return fail("bool reduce feature plan incorrectly elided stores/comparisons");
+            }
             const auto files = collectGeneratedSourceFiles(dir, "grhsim_top");
             if (mode == "default") defaults = files;
             if ((mode == "off" || mode == "precedence") && files != defaults)

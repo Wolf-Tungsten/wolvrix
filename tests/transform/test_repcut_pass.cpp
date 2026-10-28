@@ -425,7 +425,8 @@ int main()
         std::string legacyHgr;
         for (const auto costModel : {RepcutCostModel::kLegacy,
                                     RepcutCostModel::kVerilatorV1,
-                                    RepcutCostModel::kVerilatorLoweredV1})
+                                    RepcutCostModel::kVerilatorLoweredV1,
+                                    RepcutCostModel::kGrhsimV1})
         {
             wolvrix::lib::grh::Design costDesign;
             populateBasicRepcutDesign(costDesign, "top_wide", 256);
@@ -514,6 +515,94 @@ int main()
     {
         return fail("closure-aware repcut missing effective partition file");
     }
+
+    // A wide stored value feeding a cheap terminal slice must be accounted at
+    // its final destination. Replay supplies an independent statistics oracle.
+    const auto populateInitialDesign = [](wolvrix::lib::grh::Design &target) {
+        populateBasicRepcutDesign(target, "top_initial", 8192);
+        auto &graph = *target.findGraph("top_initial");
+        for (int i = 0; i < 6; ++i)
+        {
+            const auto suffix = std::to_string(i);
+            const auto read = graph.createOperation(wolvrix::lib::grh::OperationKind::kLatchReadPort,
+                                                     graph.internSymbol("read_" + suffix));
+            graph.setAttr(read, "latchSymbol", "lat_" + suffix);
+            const auto stored = makeValue(graph, "stored_" + suffix, 8192);
+            graph.addResult(read, stored);
+            const auto slice = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceStatic,
+                                                      graph.internSymbol("slice_" + suffix));
+            graph.addOperand(slice, stored);
+            graph.setAttr(slice, "sliceStart", static_cast<int64_t>(0));
+            graph.setAttr(slice, "sliceEnd", static_cast<int64_t>(7));
+            const auto output = makeValue(graph, "out_" + suffix, 8);
+            graph.addResult(slice, output);
+            graph.bindOutputPort("out_" + suffix, output);
+        }
+    };
+    wolvrix::lib::grh::Design initialDesign;
+    populateInitialDesign(initialDesign);
+    RepcutOptions initialOptions = closureAwareOptions;
+    initialOptions.path = "top_initial";
+    initialOptions.workDir = (outDir / "initial").string();
+    initialOptions.imbalanceFactor = 0.05;
+    initialOptions.costModel = RepcutCostModel::kGrhsimV1;
+    initialOptions.initialAssignment = "grhsim-terminal-v1";
+    PassManager initialManager;
+    initialManager.options().verbosity = PassVerbosity::Info;
+    initialManager.addPass(std::make_unique<RepcutPass>(initialOptions));
+    PassDiagnostics initialDiags;
+    if (!initialManager.run(initialDesign, initialDiags).success ||
+        !diagnosticsContain(initialDiags, "\"strategy\":\"grhsim-terminal-v1\",\"applied\":true") ||
+        !diagnosticsContain(initialDiags, "\"deferred_atoms\":6"))
+    {
+        for (const auto &diag : initialDiags.messages()) std::cerr << diag.message << '\n';
+        return fail("initial assignment production integration did not place terminal readers");
+    }
+    const auto *initialStats = findRepcutStatsDiagnostic(initialDiags);
+    if (!initialStats || initialStats->find("\"assignment_scope\":\"solver_reference\"") == std::string::npos)
+        return fail("initial assignment must distinguish reference refinement from final statistics");
+
+    const auto replayDir = outDir / "initial_replay";
+    std::filesystem::create_directories(replayDir);
+    std::ifstream labels(std::filesystem::path(initialOptions.workDir) /
+                         "top_initial_repcut_k2.hgr.closure-aware.part2");
+    RepcutReplayAssignment replay;
+    uint32_t label;
+    while (labels >> label) replay.atomPartitions.push_back(label);
+    SessionStore replaySession;
+    replaySession.emplace("top_initial.repcut.replay_assignment",
+        std::make_unique<SessionSlotValue<RepcutReplayAssignment>>(std::move(replay)));
+    wolvrix::lib::grh::Design replayDesign;
+    populateInitialDesign(replayDesign);
+    auto replayOptions = initialOptions;
+    replayOptions.initialAssignment = "solver";
+    replayOptions.partitioner = "assignment-replay";
+    replayOptions.workDir = replayDir.string();
+    PassManager replayManager;
+    replayManager.options().verbosity = PassVerbosity::Info;
+    replayManager.options().session = &replaySession;
+    replayManager.addPass(std::make_unique<RepcutPass>(replayOptions));
+    PassDiagnostics replayDiags;
+    if (!replayManager.run(replayDesign, replayDiags).success)
+        return fail("initial assignment statistics replay failed");
+    const auto *replayStats = findRepcutStatsDiagnostic(replayDiags);
+    const auto unsignedFields = [](const std::string &json, std::string_view field) {
+        std::vector<uint64_t> values;
+        const std::string key = "\"" + std::string(field) + "\":";
+        std::size_t offset = 0;
+        while ((offset = json.find(key, offset)) != std::string::npos)
+        {
+            offset += key.size();
+            values.push_back(std::stoull(json.substr(offset)));
+        }
+        return values;
+    };
+    if (!replayStats) return fail("initial assignment statistics replay has no report");
+    for (const auto field : {"exact_partition_load_sum", "exact_partition_load_max",
+                             "exact_referenced_closure_weight"})
+        if (unsignedFields(*initialStats, field).empty() ||
+            unsignedFields(*initialStats, field) != unsignedFields(*replayStats, field))
+            return fail("initial assignment final closure statistics disagree with independent replay");
 
     PassDiagnostics diags;
     PassManagerResult result{};

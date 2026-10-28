@@ -718,9 +718,10 @@ def _compile_repcut_kwargs(named: dict[str, Any]) -> list[str]:
             "legacy",
             "verilator-v1",
             "verilator-lowered-v1",
+            "grhsim-v1",
         }:
             raise ValueError(
-                "cost_model must be one of: legacy, verilator-v1, verilator-lowered-v1"
+                "cost_model must be one of: legacy, verilator-v1, verilator-lowered-v1, grhsim-v1"
             )
         out.extend(["-cost-model", cost_model])
     weight_mode = _pop_named(local, "weight_mode", None)
@@ -733,6 +734,40 @@ def _compile_repcut_kwargs(named: dict[str, Any]) -> list[str]:
                 "weight_mode must be one of: baseline, closure-aware"
             )
         out.extend(["-weight-mode", weight_mode])
+    initial_assignment = _pop_named(local, "initial_assignment", None)
+    if initial_assignment is not None:
+        if initial_assignment not in ("solver", "grhsim-terminal-v1", "grhsim-terminal-state-v1"):
+            raise ValueError(
+                "initial_assignment must be one of: solver, grhsim-terminal-v1, grhsim-terminal-state-v1"
+            )
+        out.extend(["-initial-assignment", initial_assignment])
+    initial_core_imbalance = _pop_named(local, "initial_core_imbalance_factor", None)
+    if initial_core_imbalance is not None:
+        try:
+            valid = not isinstance(initial_core_imbalance, bool) and 0 <= float(initial_core_imbalance) < float("inf")
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise ValueError("initial_core_imbalance_factor must be finite and non-negative")
+        out.extend(["-initial-core-imbalance-factor", str(initial_core_imbalance)])
+    communication_weight_scale = _pop_named(local, "communication_weight_scale", None)
+    if communication_weight_scale is not None:
+        if (isinstance(communication_weight_scale, bool) or
+                not isinstance(communication_weight_scale, int) or communication_weight_scale < 1):
+            raise ValueError("communication_weight_scale must be a positive integer")
+        out.extend(["-communication-weight-scale", str(communication_weight_scale)])
+    communication_receiver_weight_scale = _pop_named(local, "communication_receiver_weight_scale", None)
+    if communication_receiver_weight_scale is not None:
+        if (isinstance(communication_receiver_weight_scale, bool) or
+                not isinstance(communication_receiver_weight_scale, int) or communication_receiver_weight_scale < 0):
+            raise ValueError("communication_receiver_weight_scale must be a non-negative integer")
+        out.extend(["-communication-receiver-weight-scale", str(communication_receiver_weight_scale)])
+    communication_value_edge_weight_scale = _pop_named(local, "communication_value_edge_weight_scale", None)
+    if communication_value_edge_weight_scale is not None:
+        if (isinstance(communication_value_edge_weight_scale, bool) or
+                not isinstance(communication_value_edge_weight_scale, int) or communication_value_edge_weight_scale < 0):
+            raise ValueError("communication_value_edge_weight_scale must be a non-negative integer")
+        out.extend(["-communication-value-edge-weight-scale", str(communication_value_edge_weight_scale)])
     keep_intermediate_files = _pop_named(local, "keep_intermediate_files", None)
     if keep_intermediate_files:
         out.append("-keep-intermediate-files")

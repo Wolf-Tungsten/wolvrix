@@ -23,7 +23,7 @@ int main() {
         std::ofstream out(makefile);
         out << "CXX ?= c++\nCXXFLAGS ?= -std=c++20 -O3\n";
         wolvrix::lib::emit::emitGrhSimCompilerCompatibilityMakefile(out);
-        out << "SOURCE := " << WOLF_CLANG_REDUCTION_FIXTURE << "\n"
+        out << "SOURCE ?= " << WOLF_CLANG_REDUCTION_FIXTURE << "\n"
             << ".PHONY: all\nall:\n"
             << "\t$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GRHSIM_COMPILER_FLAGS) -c $(SOURCE) -o model.o\n"
             << "\t$(CXX) -std=c++20 -O0 -DGRHSIM_REDUCTION_MAIN $(SOURCE) model.o -o probe\n"
@@ -40,6 +40,13 @@ int main() {
                 std::cerr << "GrhSIM compiler compatibility regression failed: " << compiler << '\n';
                 return 1;
             }
+        }
+        const std::string nativeCommand = "make -C " + quote(root.string()) +
+            " CXX=" + quote(compiler) + " CXXFLAGS='-std=c++20 -O3 -march=native' SOURCE=" +
+            quote(WOLF_CLANG_CHANGE_REDUCTION_FIXTURE);
+        if (std::system(nativeCommand.c_str()) != 0) {
+            std::cerr << "GrhSIM native change-reduction regression failed: " << compiler << '\n';
+            return 1;
         }
     }
     return 0;

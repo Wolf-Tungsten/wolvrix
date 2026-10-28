@@ -23,6 +23,8 @@
 
 #include <chrono>
 #include <exception>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -2718,7 +2720,12 @@ namespace wolvrix::lib::transform
                     options.costModel = RepcutCostModel::kVerilatorLoweredV1;
                     return true;
                 }
-                error = "invalid -cost-model value; expected legacy, verilator-v1, or verilator-lowered-v1";
+                if (value == "grhsim-v1")
+                {
+                    options.costModel = RepcutCostModel::kGrhsimV1;
+                    return true;
+                }
+                error = "invalid -cost-model value; expected legacy, verilator-v1, verilator-lowered-v1, or grhsim-v1";
                 return false;
             };
             auto parseWeightMode = [&](std::string_view value) -> bool {
@@ -2921,6 +2928,102 @@ namespace wolvrix::lib::transform
                 {
                     if (!parseWeightMode(arg.substr(std::string_view("-weight-mode=").size())))
                     {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-initial-assignment")
+                {
+                    if (!parseStringArg("-initial-assignment", options.initialAssignment)) return nullptr;
+                }
+                else if (arg.starts_with("-initial-assignment="))
+                {
+                    options.initialAssignment = std::string(arg.substr(std::string_view("-initial-assignment=").size()));
+                }
+                else if (arg == "-initial-core-imbalance-factor" || arg.starts_with("-initial-core-imbalance-factor="))
+                {
+                    std::string value;
+                    if (arg == "-initial-core-imbalance-factor")
+                    {
+                        if (!parseStringArg("-initial-core-imbalance-factor", value)) return nullptr;
+                    }
+                    else value = std::string(arg.substr(std::string_view("-initial-core-imbalance-factor=").size()));
+                    try
+                    {
+                        std::size_t consumed = 0;
+                        options.initialCoreImbalanceFactor = std::stod(value, &consumed);
+                        if (consumed != value.size() || !(options.initialCoreImbalanceFactor >= 0.0) ||
+                            options.initialCoreImbalanceFactor == std::numeric_limits<double>::infinity())
+                            throw std::invalid_argument("invalid initial core imbalance");
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -initial-core-imbalance-factor value; expected finite and >= 0";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-communication-weight-scale")
+                {
+                    std::size_t scale = 0;
+                    if (!parseSizeArg("-communication-weight-scale", scale))
+                    {
+                        return nullptr;
+                    }
+                    options.communicationWeightScale = static_cast<uint32_t>(scale);
+                }
+                else if (arg.starts_with("-communication-weight-scale="))
+                {
+                    try
+                    {
+                        options.communicationWeightScale = static_cast<std::size_t>(std::stoull(
+                            std::string(arg.substr(std::string_view("-communication-weight-scale=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -communication-weight-scale value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-communication-receiver-weight-scale")
+                {
+                    std::size_t scale = 0;
+                    if (!parseSizeArg("-communication-receiver-weight-scale", scale))
+                    {
+                        return nullptr;
+                    }
+                    options.communicationReceiverWeightScale = static_cast<uint32_t>(scale);
+                }
+                else if (arg.starts_with("-communication-receiver-weight-scale="))
+                {
+                    try
+                    {
+                        options.communicationReceiverWeightScale = static_cast<uint32_t>(std::stoull(
+                            std::string(arg.substr(std::string_view("-communication-receiver-weight-scale=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -communication-receiver-weight-scale value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-communication-value-edge-weight-scale")
+                {
+                    std::size_t scale = 0;
+                    if (!parseSizeArg("-communication-value-edge-weight-scale", scale))
+                    {
+                        return nullptr;
+                    }
+                    options.communicationValueEdgeWeightScale = static_cast<uint32_t>(scale);
+                }
+                else if (arg.starts_with("-communication-value-edge-weight-scale="))
+                {
+                    try
+                    {
+                        options.communicationValueEdgeWeightScale = static_cast<uint32_t>(std::stoull(
+                            std::string(arg.substr(std::string_view("-communication-value-edge-weight-scale=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -communication-value-edge-weight-scale value";
                         return nullptr;
                     }
                 }

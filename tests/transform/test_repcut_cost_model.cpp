@@ -69,6 +69,7 @@ int main()
         check(repcutCostModelName(RepcutCostModel::kVerilatorV1) == "verilator-v1", "versioned name");
         check(repcutCostModelName(RepcutCostModel::kVerilatorLoweredV1) == "verilator-lowered-v1",
               "lowered versioned name");
+        check(repcutCostModelName(RepcutCostModel::kGrhsimV1) == "grhsim-v1", "GrhSIM versioned name");
         for (const auto width : {32, 64, 65, 128, 256, 1024})
         {
             const auto words = width <= 64 ? 1u : (width + 31u) / 32u;
@@ -118,13 +119,72 @@ int main()
         }
         check(f.cost(K::kMemoryWritePort, {1, 8, std::numeric_limits<int32_t>::max(), 1}, 0).weight ==
               std::numeric_limits<uint32_t>::max() - 1u, "saturation must not alias cache sentinel");
+        const auto grhsim = RepcutCostModel::kGrhsimV1;
+        for (const auto width : {1, 32, 64, 65, 128, 256, 1024})
+        {
+            const auto words = (width + 63u) / 64u;
+            check(f.cost(K::kAnd, {width, width}, width, grhsim).weight == words,
+                  "GrhSIM uses 64-bit words");
+            check(f.cost(K::kReduceOr, {width}, 1, grhsim).weight == words,
+                  "GrhSIM reduction uses input width");
+            check(f.cost(K::kAdd, {width, width}, width, grhsim).weight == (words == 1 ? 1 : 3 * words),
+                  "GrhSIM scalar add and wide carry chain");
+            check(f.cost(K::kSliceDynamic, {65536, 32}, width, grhsim).weight == 2 + 2 * words,
+                  "GrhSIM narrow slice must not scan wide source");
+            check(f.cost(K::kMemoryWritePort, {1, 8, width, width}, 0, grhsim).weight == 2 + 5 * words,
+                  "GrhSIM dynamic write stages and merges words, not individual bits");
+            check(f.cost(K::kRegisterWritePort, {1, width, width, 1}, 0, grhsim).weight == 2 + 5 * words,
+                  "GrhSIM register write uses data operand 1");
+        }
+        check(f.cost(K::kLogicAnd, {1, 1}, 1, grhsim).weight == 1, "GrhSIM bool inputs need no truth conversion");
+        check(f.cost(K::kLogicAnd, {128, 1}, 1, grhsim).weight == 3, "GrhSIM wide truth conversion");
+        check(f.memoryMaskCost("256'h0", grhsim) == 1, "GrhSIM zero mask");
+        check(f.memoryMaskCost("256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", grhsim) == 14,
+              "GrhSIM full mask has no merge pass");
+        check(f.memoryMaskCost("256'h5", grhsim) == 22 && f.memoryMaskCost("256'hx", grhsim) == 22,
+              "GrhSIM partial and unknown masks remain word-wise");
+        check(f.cost(K::kDpicCall, {64}, 0, grhsim).usedLegacyFallback,
+              "external effect work must remain an explicit fallback");
+        check(f.cost(K::kMul, {std::numeric_limits<int32_t>::max()},
+                     std::numeric_limits<int32_t>::max(), grhsim).weight ==
+              std::numeric_limits<uint32_t>::max() - 1u, "GrhSIM saturation excludes cache sentinel");
+        for (const auto width : {1, 128})
+        {
+            const auto producer = f.operation(K::kXor, {width, width}, width);
+            const auto value = f.graph.getOperation(producer).results()[0];
+            const auto consumer = f.operation(K::kAnd, {}, width);
+            f.graph.addOperand(consumer, value);
+            f.graph.addOperand(consumer, value);
+            const auto words = (width + 63u) / 64u;
+            check(estimateRepcutOperationCost(f.graph, f.graph.getOperation(producer), grhsim).weight == words,
+                  "two operand uses in one consumer do not imply boundary storage");
+            const auto secondConsumer = f.operation(K::kNot, {}, width);
+            f.graph.addOperand(secondConsumer, value);
+            check(estimateRepcutOperationCost(f.graph, f.graph.getOperation(producer), grhsim).weight == 3 * words + 1,
+                  "distinct consumers add word-scaled comparison, store and dirty work");
+            check(estimateRepcutOperationCost(f.graph, f.graph.getOperation(producer), RepcutCostModel::kVerilatorV1).weight ==
+                  (width <= 64 ? 1u : (width + 31u) / 32u), "boundary proxy must not affect Verilator");
+            for (unsigned index = 0; index < 12; ++index)
+                f.graph.addOperand(f.operation(K::kNot, {}, width), value);
+            check(estimateRepcutOperationCost(f.graph, f.graph.getOperation(producer), grhsim).weight == 3 * words + 1,
+                  "heap-backed user lists retain their owner during cost estimation");
+        }
+        const auto stagedProducer = f.operation(K::kXor, {128, 128}, 128);
+        const auto stagedValue = f.graph.getOperation(stagedProducer).results()[0];
+        const auto write = f.operation(K::kLatchWritePort, {1}, 0);
+        f.graph.addOperand(write, stagedValue);
+        const auto mask = f.operation(K::kConstant, {}, 128);
+        f.graph.setAttr(mask, "constValue", std::string("128'hffffffffffffffffffffffffffffffff"));
+        f.graph.addOperand(write, f.graph.getOperation(mask).results()[0]);
+        check(estimateRepcutOperationCost(f.graph, f.graph.getOperation(stagedProducer), grhsim).weight == 4,
+              "compute-to-commit result includes a persistent word store");
         const auto invalid = static_cast<RepcutCostModel>(999);
         check(repcutCostModelName(invalid) == "unknown", "unknown model name");
         bool rejected = false;
         try { (void)f.cost(K::kAdd, {8, 8}, 8, invalid); }
         catch (const std::invalid_argument &) { rejected = true; }
         check(rejected, "unknown model must not silently fall back");
-        for (const auto token : {"legacy", "verilator-v1", "verilator-lowered-v1"})
+        for (const auto token : {"legacy", "verilator-v1", "verilator-lowered-v1", "grhsim-v1"})
         {
             std::string error;
             const std::string option = std::string("-cost-model=") + token;

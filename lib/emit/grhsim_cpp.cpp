@@ -2603,13 +2603,22 @@ namespace wolvrix::lib::emit
         std::size_t parseScheduleBatchMaxOps(const EmitOptions &options)
         {
             auto it = options.attributes.find("sched_batch_max_ops");
-            if (it == options.attributes.end())
+            std::string value;
+            if (it != options.attributes.end())
+            {
+                value = it->second;
+            }
+            else if (const char *env = std::getenv("WOLVRIX_GRHSIM_SCHED_BATCH_MAX_OPS"))
+            {
+                value = env;
+            }
+            else
             {
                 return 512;
             }
             try
             {
-                return static_cast<std::size_t>(std::stoull(it->second));
+                return static_cast<std::size_t>(std::stoull(value));
             }
             catch (const std::exception &)
             {
@@ -2620,13 +2629,22 @@ namespace wolvrix::lib::emit
         std::size_t parseScheduleBatchMaxEstimatedLines(const EmitOptions &options)
         {
             auto it = options.attributes.find("sched_batch_max_estimated_lines");
-            if (it == options.attributes.end())
+            std::string value;
+            if (it != options.attributes.end())
+            {
+                value = it->second;
+            }
+            else if (const char *env = std::getenv("WOLVRIX_GRHSIM_SCHED_BATCH_MAX_ESTIMATED_LINES"))
+            {
+                value = env;
+            }
+            else
             {
                 return 4096;
             }
             try
             {
-                return static_cast<std::size_t>(std::stoull(it->second));
+                return static_cast<std::size_t>(std::stoull(value));
             }
             catch (const std::exception &)
             {
@@ -2637,13 +2655,22 @@ namespace wolvrix::lib::emit
         std::size_t parseScheduleBatchTargetCount(const EmitOptions &options)
         {
             auto it = options.attributes.find("sched_batch_target_count");
-            if (it == options.attributes.end())
+            std::string value;
+            if (it != options.attributes.end())
+            {
+                value = it->second;
+            }
+            else if (const char *env = std::getenv("WOLVRIX_GRHSIM_SCHED_BATCH_TARGET_COUNT"))
+            {
+                value = env;
+            }
+            else
             {
                 return 0;
             }
             try
             {
-                return static_cast<std::size_t>(std::stoull(it->second));
+                return static_cast<std::size_t>(std::stoull(value));
             }
             catch (const std::exception &)
             {
@@ -7585,6 +7612,20 @@ namespace wolvrix::lib::emit
             return aliases;
         }
 
+        void bindSupernodeStorageRefAlias(const SupernodeStorageRefAliasDecl &alias,
+                                          SupernodeLocalExprContext &context,
+                                          bool collectBoolRefs)
+        {
+            if (alias.value.has_value())
+            {
+                context.storedValueRefByValue.emplace(*alias.value, alias.aliasName);
+                if (collectBoolRefs && alias.pureBoolStorageRef)
+                    context.boolStorageRefs.emplace(alias.aliasName);
+            }
+            if (!alias.stateSymbol.empty())
+                context.stateRefBySymbol.emplace(alias.stateSymbol, alias.aliasName);
+        }
+
         void emitSupernodeStorageRefAliases(std::ostream &stream,
                                             const std::vector<SupernodeStorageRefAliasDecl> &aliases,
                                             std::string_view indent,
@@ -7598,18 +7639,7 @@ namespace wolvrix::lib::emit
             for (const auto &alias : aliases)
             {
                 stream << indent << "auto &" << alias.aliasName << " = " << alias.initExpr << ";\n";
-                if (alias.value.has_value())
-                {
-                    context.storedValueRefByValue.emplace(*alias.value, alias.aliasName);
-                    if (collectBoolRefs && alias.pureBoolStorageRef)
-                    {
-                        context.boolStorageRefs.emplace(alias.aliasName);
-                    }
-                }
-                if (!alias.stateSymbol.empty())
-                {
-                    context.stateRefBySymbol.emplace(alias.stateSymbol, alias.aliasName);
-                }
+                bindSupernodeStorageRefAlias(alias, context, collectBoolRefs);
             }
         }
 
@@ -22060,6 +22090,41 @@ template<class Index>
             return groups;
         }
 
+        struct CommitWriteRunPlan
+        {
+            std::size_t end = 0;
+            std::vector<CommitWriteGuardGroup> guards;
+        };
+
+        std::optional<CommitWriteRunPlan> buildCommitWriteRunPlan(
+            const Graph &graph, const EmitModel &model, std::span<const OperationId> ops,
+            std::size_t begin, std::size_t limit, const std::string &eventExpr,
+            const SupernodeLocalExprContext &context, OperationId &errorOp)
+        {
+            CommitWriteRunPlan result;
+            result.end = begin + 1;
+            while (result.end < limit)
+            {
+                const auto next = graph.getOperation(ops[result.end]);
+                if (!isWritePortKind(next.kind())) break;
+                const auto event = exactEventExpr(graph, model, next.id(), next);
+                if (!event) { errorOp = next.id(); return std::nullopt; }
+                if (*event != eventExpr) break;
+                ++result.end;
+            }
+            std::vector<WritePortGuardKey> keys;
+            keys.reserve(result.end - begin);
+            for (std::size_t i = begin; i < result.end; ++i)
+            {
+                const auto op = graph.getOperation(ops[i]);
+                const auto key = writePortGuardKey(graph, model, op.id(), op, &context);
+                if (!key) { errorOp = op.id(); return std::nullopt; }
+                keys.push_back(*key);
+            }
+            result.guards = buildCommitWriteGuardGroups(keys);
+            return result;
+        }
+
         std::vector<OrderedMemoryWriteAffineRange> buildOrderedMemoryWriteAffineRanges(
             std::span<const OrderedMemoryWriteSlotIndices> entries)
         {
@@ -22373,6 +22438,34 @@ template<class Index>
                 }
             }
             return info;
+        }
+
+        struct CommitEventWordCluster
+        {
+            std::string eventExpr;
+            std::uint8_t mask = UINT8_C(0);
+        };
+
+        std::optional<std::vector<CommitEventWordCluster>> buildCommitEventWordClusters(
+            const Graph &graph, const EmitModel &model, const ScheduleRefs &schedule,
+            const ScheduleBatch &batch, const ScheduleBatch::Word &word)
+        {
+            std::vector<CommitEventWordCluster> clusters;
+            if (batch.phase != ScheduleBatch::Phase::kCommit) return clusters;
+            for (uint32_t supernodeId : word.supernodeIds)
+            {
+                const std::size_t activeId = supernodeId < model.activeIdBySupernode.size()
+                    ? model.activeIdBySupernode[supernodeId] : kInvalidIndex;
+                if (activeId == kInvalidIndex) continue;
+                const auto event = analyzeCommitSupernodeEvent(graph, model, schedule.supernodeToOps, supernodeId);
+                if (!event) return std::nullopt;
+                const auto bit = static_cast<std::uint8_t>(UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
+                auto it = std::find_if(clusters.begin(), clusters.end(),
+                    [&](const auto &entry) { return entry.eventExpr == event->dispatchExpr; });
+                if (it == clusters.end()) clusters.push_back({event->dispatchExpr, bit});
+                else it->mask = static_cast<std::uint8_t>(it->mask | bit);
+            }
+            return clusters;
         }
 
         bool isPureEventComputeProducerKind(OperationKind kind) noexcept
@@ -22899,6 +22992,22 @@ template<class Index>
             };
             return allComputeActiveIds(model.inputHeadSupernodesByValue) &&
                    allComputeActiveIds(model.stateHeadSupernodesBySymbol);
+        }
+
+        std::string_view commitContinuationFallback(const Graph &graph, const EmitModel &model,
+                                                     const ScheduleRefs &schedule,
+                                                     CommitExactEventPolicy policy, bool profileConflict)
+        {
+            if (policy == CommitExactEventPolicy::kOff) return "policy_off";
+            if (model.emitPerf) return "perf";
+            if (model.emitWaveform) return "waveform";
+            if (profileConflict) return "runtime_profile";
+            if (model.inputFullpassSpecialization) return "input_fullpass";
+            if (model.posedgeFullpassSpecialization) return "posedge_fullpass";
+            if (!model.stateShadows.empty()) return "state_shadows";
+            if (model.eventEdgeSlotCount == 0u) return "no_event_edges";
+            if (!canUseEventQualifiedBitmapContinuation(graph, model, schedule)) return "proof";
+            return "none";
         }
 
         bool buildTargetedPureEventWordPack(
@@ -24964,6 +25073,23 @@ template<class Index>
             }
         }
 
+        BoolProducerReducePlan buildSupernodeBoolReducePlan(const Graph &graph, const EmitModel &model,
+                                                             const ScheduleRefs &schedule, uint32_t id)
+        {
+            if (!model.boolProducerReduce) return {};
+            const auto &fanout = model.deferredActivationCofireStrict
+                ? model.deferredActivationCofireStrictFanoutByValue
+                : (model.sameBatchActivationCohortStrict
+                    ? model.sameBatchActivationCohortStrictFanoutByValue : model.boundaryFanoutByValue);
+            const auto &original = schedule.supernodeToOps[id];
+            const auto reordered = model.localComputeUseOrder
+                ? orderLocalComputeByUse(graph, model, original) : std::vector<OperationId>{};
+            const auto groups = buildDeferredActivationGroupsForFanout(
+                graph, model, schedule.supernodeToOps, id, fanout);
+            return collectBoolProducerReducePlan(
+                graph, model, reordered.empty() ? original : reordered, id, groups, fanout);
+        }
+
         std::optional<std::string> emitSchedBatchFile(const std::filesystem::path &schedPath,
                                                       const std::filesystem::path &headerPath,
                                                       const std::string &className,
@@ -25011,22 +25137,12 @@ template<class Index>
             std::unordered_map<uint32_t, BoolProducerReducePlan> boolReducePlans;
             if (model.boolProducerReduce)
             {
-                const auto &fanout = model.deferredActivationCofireStrict
-                    ? model.deferredActivationCofireStrictFanoutByValue
-                    : (model.sameBatchActivationCohortStrict
-                        ? model.sameBatchActivationCohortStrictFanoutByValue : model.boundaryFanoutByValue);
                 for (const auto &batch : batches)
                 {
                     if (batch.phase != ScheduleBatch::Phase::kCompute) continue;
                     for (auto id : batch.supernodeIds)
                     {
-                        const auto &original = schedule.supernodeToOps[id];
-                        const auto reordered = model.localComputeUseOrder
-                            ? orderLocalComputeByUse(graph, model, original) : std::vector<OperationId>{};
-                        const auto groups = buildDeferredActivationGroupsForFanout(
-                            graph, model, schedule.supernodeToOps, id, fanout);
-                        auto plan = collectBoolProducerReducePlan(
-                            graph, model, reordered.empty() ? original : reordered, id, groups, fanout);
+                        auto plan = buildSupernodeBoolReducePlan(graph, model, schedule, id);
                         if (!plan.loops.empty()) boolReducePlans.emplace(id, std::move(plan));
                     }
                 }
@@ -25065,7 +25181,8 @@ template<class Index>
             const auto emitWordBody = [&](const ScheduleBatch::Word &word,
                                           bool fullpassVariant,
                                           bool allowPureEventBypass,
-                                          bool profileWord = true) -> std::optional<std::string>
+                                          bool profileWord = true)
+                -> std::optional<std::string>
             {
                 const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
                 const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
@@ -25104,54 +25221,6 @@ template<class Index>
                     pureEventWordExpr = eligiblePureEventComputeWordExpr(
                         graph, model, schedule, batch, word, allowPureEventBypass);
                 }
-                struct CommitEventWordCluster
-                {
-                    std::string eventExpr;
-                    std::uint8_t mask = UINT8_C(0);
-                };
-                auto buildCommitEventWordClusters = [&]() -> std::optional<std::vector<CommitEventWordCluster>>
-                {
-                    std::vector<CommitEventWordCluster> clusters;
-                    if (batch.phase != ScheduleBatch::Phase::kCommit)
-                    {
-                        return clusters;
-                    }
-                    for (uint32_t supernodeId : word.supernodeIds)
-                    {
-                        const std::size_t activeId =
-                            supernodeId < model.activeIdBySupernode.size() ? model.activeIdBySupernode[supernodeId]
-                                                                           : kInvalidIndex;
-                        if (activeId == kInvalidIndex)
-                        {
-                            continue;
-                        }
-                        const auto commitEventInfo =
-                            analyzeCommitSupernodeEvent(graph, model, schedule.supernodeToOps, supernodeId);
-                        if (!commitEventInfo)
-                        {
-                            return std::nullopt;
-                        }
-                        const std::string &eventExpr = commitEventInfo->dispatchExpr;
-                        const std::uint8_t bit = static_cast<std::uint8_t>(
-                            UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
-                        auto clusterIt =
-                            std::find_if(clusters.begin(),
-                                         clusters.end(),
-                                         [&](const CommitEventWordCluster &cluster)
-                                         {
-                                             return cluster.eventExpr == eventExpr;
-                                         });
-                        if (clusterIt == clusters.end())
-                        {
-                            clusters.push_back(CommitEventWordCluster{.eventExpr = eventExpr, .mask = bit});
-                        }
-                        else
-                        {
-                            clusterIt->mask = static_cast<std::uint8_t>(clusterIt->mask | bit);
-                        }
-                    }
-                    return clusters;
-                };
                 stream << "    \n";
                 stream << "        {\n";
                 stream << "            constexpr std::uint8_t dispatchMask = UINT8_C("
@@ -25165,7 +25234,7 @@ template<class Index>
                 }
                 else if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
-                    const auto commitEventClusters = buildCommitEventWordClusters();
+                    const auto commitEventClusters = buildCommitEventWordClusters(graph, model, schedule, batch, word);
                     if (!commitEventClusters)
                     {
                         return emitError("unsupported exact event expression emit for commit word",
@@ -25539,7 +25608,7 @@ template<class Index>
                 emitSupernodeStorageRefAliases(stream,
                                                collectSupernodeStorageRefAliases(graph,
                                                                                  model,
-                                                                                 schedule.supernodeToOps[supernodeId],
+                                                                                 supernodeOps,
                                                                                  batch.phase),
                                                "            ",
                                                localExprContext,
@@ -25729,8 +25798,9 @@ template<class Index>
                                          true);
                     stream << "        }();\n";
                 };
-                for (OperationId useOpId : supernodeOps)
+                for (std::size_t useIndex = 0; useIndex < supernodeOps.size(); ++useIndex)
                 {
+                    const OperationId useOpId = supernodeOps[useIndex];
                     const Operation useOp = graph.getOperation(useOpId);
                     const bool useOpCommitPhase = isCommitPhaseOp(useOp);
                     if ((batch.phase == ScheduleBatch::Phase::kCompute && useOpCommitPhase) ||
@@ -25958,50 +26028,16 @@ template<class Index>
                         }
                         if (batch.phase == ScheduleBatch::Phase::kCommit)
                         {
-                            std::size_t runEnd = opIndex + 1;
-                            while (runEnd < supernodeOps.size())
-                            {
-                                if (nextConcatPrefixDecl < concatPrefixCacheDecls.size() &&
-                                    concatPrefixCacheDecls[nextConcatPrefixDecl].firstUseIndex == runEnd)
-                                {
-                                    break;
-                                }
-                                const Operation nextOp = graph.getOperation(supernodeOps[runEnd]);
-                                if (!isWritePortKind(nextOp.kind()))
-                                {
-                                    break;
-                                }
-                                const auto nextEventExpr =
-                                    exactEventExpr(graph, model, supernodeOps[runEnd], nextOp);
-                                if (!nextEventExpr)
-                                {
-                                    return emitError("unsupported exact event expression emit",
-                                                     std::string(nextOp.symbolText()));
-                                }
-                                if (*nextEventExpr != *eventExpr)
-                                {
-                                    break;
-                                }
-                                ++runEnd;
-                            }
-                            std::vector<WritePortGuardKey> guardKeys;
-                            guardKeys.reserve(runEnd - opIndex);
-                            for (std::size_t runIndex = opIndex; runIndex < runEnd; ++runIndex)
-                            {
-                                const auto runOpId = supernodeOps[runIndex];
-                                const Operation runOp = graph.getOperation(runOpId);
-                                const auto guardKey =
-                                    writePortGuardKey(graph, model, runOpId, runOp, &localExprContext);
-                                if (!guardKey)
-                                {
-                                    return emitError("unsupported exact event expression emit",
-                                                     std::string(runOp.symbolText()));
-                                }
-                                guardKeys.push_back(*guardKey);
-                            }
-                            const std::vector<CommitWriteGuardGroup> guardGroups =
-                                buildCommitWriteGuardGroups(
-                                    std::span<const WritePortGuardKey>(guardKeys.data(), guardKeys.size()));
+                            const std::size_t runLimit = nextConcatPrefixDecl < concatPrefixCacheDecls.size()
+                                ? concatPrefixCacheDecls[nextConcatPrefixDecl].firstUseIndex : supernodeOps.size();
+                            OperationId errorOp;
+                            const auto runPlan = buildCommitWriteRunPlan(graph, model, supernodeOps, opIndex,
+                                runLimit, *eventExpr, localExprContext, errorOp);
+                            if (!runPlan)
+                                return emitError("unsupported exact event expression emit",
+                                                 std::string(graph.getOperation(errorOp).symbolText()));
+                            const std::size_t runEnd = runPlan->end;
+                            const auto &guardGroups = runPlan->guards;
                             const std::vector<OrderedMemoryWriteAffineGroup> orderedAffineGroups =
                                 buildOrderedMemoryWriteAffineGroups(
                                     graph,
@@ -27503,7 +27539,18 @@ template<class Index>
             {
                 if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
-                    return emitWordBody(word, false, false);
+                    // Commit words use event expressions rather than the
+                    // compute active-mask continuation protocol.  Keep the
+                    // original schedule word and emit each contiguous chunk
+                    // as a separate helper; each helper recomputes the same
+                    // event predicate and preserves supernode order.
+                    for (std::size_t chunkIndex = 0; chunkIndex < word.helperChunks.size(); ++chunkIndex)
+                    {
+                        stream << "        "
+                               << scheduleBatchWordChunkHelperName(batch, wordChunkIndex, chunkIndex)
+                               << "();\n";
+                    }
+                    return std::nullopt;
                 }
                 std::uint8_t dispatchMask = UINT8_C(0);
                 std::uint8_t clearMask = UINT8_C(0);
@@ -27610,12 +27657,15 @@ template<class Index>
                     chunkWord.supernodeIds.assign(
                         word.supernodeIds.begin() + static_cast<std::ptrdiff_t>(chunk.beginSupernodeIndex),
                         word.supernodeIds.begin() + static_cast<std::ptrdiff_t>(chunk.endSupernodeIndex));
-                          stream << "void " << className << "::"
+                    stream << "void " << className << "::"
                               << scheduleBatchWordChunkHelperName(batch, wordChunkIndex, chunkIndex)
                               << "()\n{\n";
                     // The split-word wrapper records this dispatch once; its
                     // helper chunks must not count the same word again.
-                    if (auto error = emitWordBody(chunkWord, false, false, false))
+                    if (auto error = emitWordBody(chunkWord,
+                                                  false,
+                                                  false,
+                                                  false))
                     {
                         return error;
                     }
@@ -27823,11 +27873,852 @@ template<class Index>
             return std::nullopt;
         }
 
+        void snapshotCommitBodyWork(const Graph &graph, const EmitModel &model,
+                                    GrhSimExecutionPlan::CommitWriteBody &body)
+        {
+            using Kind = GrhSimExecutionPlan::CommitWriteBody::Kind;
+            auto &enabled = body.enabledWork;
+            auto &changed = body.changedWork;
+            const bool lockstep = body.kind == Kind::Lockstep;
+            const bool sameReader = body.kind == Kind::SameReader;
+            const bool ordered = body.kind == Kind::OrderedMemoryAffine;
+            std::set<std::size_t> sharedDirtyBanks;
+            for (std::size_t index = 0; index < body.operations.size(); ++index)
+            {
+                const auto op = graph.getOperation(body.operations[index]);
+                const auto &write = model.writeByOp.at(op.id());
+                const auto &state = model.stateBySymbol.at(write.symbol);
+                const auto operands = op.operands();
+                const bool memory = write.kind == StateDecl::Kind::Memory;
+                const bool wide = isWideLogicWidth(state.width);
+                const uint64_t words = logicWordCount(state.width);
+                const uint64_t rows = write.isMemoryFill ? static_cast<uint64_t>(state.rowCount) : 1;
+                if (memory && !write.isMemoryFill && write.memoryMaskMode == WriteDecl::MemoryMaskMode::kConstZero)
+                {
+                    ++enabled["elided_zero_mask_memory_bodies"];
+                    continue;
+                }
+                if (!memory && !wide && !lockstep && !sameReader && model.commitScalarEagerMaxActivationWrites != 0)
+                    body.unmodeledWork = "scalar eager activation requires the late activation context";
+                const bool fullMask = write.isMemoryFill || (memory
+                    ? write.memoryMaskMode == WriteDecl::MemoryMaskMode::kConstAllOnes
+                    : isConstLogicAllOnes(graph, operands[2], state.width));
+                if (memory && !write.isMemoryFill)
+                {
+                    ++enabled["memory_row_addresses"];
+                    if (!ordered)
+                    {
+                        const auto row = memoryRowAccessExpr(graph, operands[1], "address", state.rowCount);
+                        enabled["row_bounds_checks"] += !row.alwaysInRange;
+                    }
+                }
+                if (write.isMemoryFill)
+                {
+                    enabled["fill_row_iterations"] += rows;
+                    const auto dataWidth = graph.valueWidth(operands[1]);
+                    if (dataWidth != state.width && dataWidth == static_cast<int64_t>(state.width) * state.rowCount)
+                        enabled["packed_fill_slice_words"] += rows * words;
+                }
+                if (!lockstep || index == 0)
+                {
+                    enabled[wide ? "word_next_values" : "scalar_next_values"] += rows * (wide ? words : 1);
+                    // Generic wide helpers can short-circuit later comparisons.
+                    enabled[wide ? "word_comparisons_upper" : "scalar_comparisons"] += rows * (wide ? words : 1);
+                    if (!fullMask) enabled["mask_merge_words"] += rows * words;
+                }
+                // assign_words and apply_masked_words write every live word,
+                // even if unchanged. Scalar stores are inside the change guard.
+                if (wide) enabled["unconditional_word_stores"] += rows * words;
+                else changed["scalar_store_slots_upper"] += rows;
+
+                const auto readers = model.stateHeadSupernodesBySymbol.find(write.symbol);
+                if (readers != model.stateHeadSupernodesBySymbol.end() && !readers->second.empty() &&
+                    (!sameReader || index == 0) && (!ordered || index == 0))
+                {
+                    // This is semantic notification work, not packed bitmap
+                    // stores. Row-selective readers are conservatively bounded.
+                    const uint64_t calls = ordered
+                        ? std::min<uint64_t>(state.rowCount, body.operations.size()) : 1;
+                    changed["reader_activation_calls_upper"] += calls;
+                    changed["reader_targets_upper"] += calls * readers->second.size();
+                    changed["row_selective_activation_calls_upper"] +=
+                        memory && !write.isMemoryFill && model.memoryRowReaderActivationBySymbol.contains(write.symbol)
+                            ? calls : 0;
+                    if (ordered) changed["changed_row_scan_iterations"] += state.rowCount;
+                }
+                // Ordered-memory lowering has its own changed-row accumulator.
+                // Other shared bodies OR each bank once, with per-state change
+                // terms for same-reader groups and one condition for lockstep.
+                if (!ordered)
+                    if (const auto dirty = model.producerDirtyBitsByState.find(write.symbol);
+                        dirty != model.producerDirtyBitsByState.end())
+                        for (const auto bit : dirty->second) sharedDirtyBanks.insert(bit.bank);
+            }
+            changed["producer_dirty_bank_or_sites"] += sharedDirtyBanks.size();
+            if (sameReader) enabled["change_or_terms"] += body.operations.size();
+            if (ordered) enabled["ordered_writer_iterations_upper"] += body.operations.size();
+            // Zero entries are omitted to keep the read-only snapshot compact.
+            std::erase_if(enabled, [](const auto &entry) { return entry.second == 0; });
+            std::erase_if(changed, [](const auto &entry) { return entry.second == 0; });
+        }
+
+        void snapshotComputeLowering(const Graph &graph, const EmitModel &model, const ScheduleRefs &schedule,
+                                     GrhSimExecutionPlan &plan)
+        {
+            for (auto id : schedule.topoOrder)
+            {
+                if (isCommitSupernode(model, id)) continue;
+                GrhSimExecutionPlan::ComputeLowering entry;
+                entry.supernode = id;
+                if (plan.activationOverlays || plan.inputFullpass || plan.posedgeFullpass)
+                {
+                    entry.unmodeledWork = "nonordinary dispatch/activation variant";
+                    for (auto op : schedule.supernodeToOps.at(id))
+                        if (!isCommitPhaseOp(graph.getOperation(op))) entry.genericOperations.push_back(op);
+                    plan.computeLowering.push_back(std::move(entry));
+                    continue;
+                }
+                const auto &original = schedule.supernodeToOps.at(id);
+                const auto reordered = model.localComputeUseOrder
+                    ? orderLocalComputeByUse(graph, model, original) : std::vector<OperationId>{};
+                const auto &ops = reordered.empty() ? original : reordered;
+                const auto priority = model.priorityMuxChains
+                    ? collectPriorityMuxChains(graph, model, ops) : PriorityMuxPlan{};
+                const auto reduce = buildSupernodeBoolReducePlan(graph, model, schedule, id);
+                std::map<std::string, uint64_t> features;
+                // Reconstruct the same local expression context used by the
+                // emitter. This is deliberately a planner-only pass: no C++
+                // is written, but alias bindings, use counts, demanded-bit
+                // positions and concat-prefix cache keys are identical to the
+                // normal lowering context.
+                SupernodeLocalExprContext localContext;
+                if (emitStorageRefAliasesEnabled())
+                {
+                    for (const auto &alias : collectSupernodeStorageRefAliases(
+                             graph, model, original, ScheduleBatch::Phase::kCompute))
+                    {
+                        bindSupernodeStorageRefAlias(alias, localContext, model.boolEagerLogic);
+                    }
+                }
+                const auto prefixDecls = collectScalarConcatPrefixCaches(graph, ops);
+                std::unordered_map<ScalarConcatPrefixCacheKey, std::string, ScalarConcatPrefixCacheKeyHash> prefixTemps;
+                for (const auto &decl : prefixDecls) prefixTemps.emplace(decl.key, decl.tempName);
+                if (model.packedArrayLateIndex)
+                    collectStablePackedArrayIndices(graph, model, ops, localContext);
+                localContext.stableWideStateReadRefs = model.wideStateReadRefs &&
+                    canReferenceWideStateInSupernode(graph, model, ops);
+                for (auto opId : ops)
+                {
+                    const auto op = graph.getOperation(opId);
+                    if (!isCommitPhaseOp(op) && !isRegToMemIntentBypassOp(model, opId))
+                        for (auto value : op.operands()) ++localContext.useCountByValue[value];
+                }
+                if (model.localShiftDemandedBit || model.scalarConcatReduction)
+                {
+                    for (std::size_t i = 0; i < ops.size(); ++i)
+                    {
+                        if (!isCommitPhaseOp(graph.getOperation(ops[i])) &&
+                            !isRegToMemIntentBypassOp(model, ops[i]) && !priority.absorbed.contains(ops[i]))
+                            localContext.demandedBitComputePositions.emplace(ops[i], i);
+                    }
+                    collectDemandedBitSourceCacheCandidates(graph, model, ops, localContext);
+                }
+                const std::size_t activeId = model.activeIdBySupernode.at(id);
+                const ActivationEmitContext staticActivationContext{
+                    .currentWordIndex = activeId / kActiveFlagBitsPerWord,
+                    .currentActiveId = activeId,
+                    .localActiveExpr = "activeWordFlags"};
+                const auto addShape = [&](std::string_view name, uint64_t count = 1) {
+                    features[std::string(name)] += count;
+                };
+                const auto operandWidthBits = [&](std::span<const ValueId> values) {
+                    uint64_t bits = 0;
+                    for (const auto value : values)
+                    {
+                        const auto width = graph.valueWidth(value);
+                        if (width > 0) bits += static_cast<uint64_t>(width);
+                    }
+                    return bits;
+                };
+                const auto operandWordCount = [&](std::span<const ValueId> values) {
+                    uint64_t words = 0;
+                    for (const auto value : values)
+                    {
+                        const auto width = graph.valueWidth(value);
+                        if (width > 0) words += logicWordCount(width);
+                    }
+                    return words;
+                };
+                const auto helperCallCount = [](std::string_view expression) {
+                    uint64_t count = 0;
+                    for (std::size_t pos = 0; (pos = expression.find("grhsim_", pos)) != std::string_view::npos;)
+                    {
+                        std::size_t end = pos + 7;
+                        while (end < expression.size() &&
+                               (std::isalnum(static_cast<unsigned char>(expression[end])) || expression[end] == '_'))
+                            ++end;
+                        while (end < expression.size() && std::isspace(static_cast<unsigned char>(expression[end]))) ++end;
+                        count += end < expression.size() && expression[end] == '(';
+                        pos = end;
+                    }
+                    return count;
+                };
+                const auto classifyStoredResult = [&](ValueId result, std::string_view prefix) {
+                    if (isMaterializedValue(model, result))
+                    {
+                        addShape(std::string(prefix) + ".materialized");
+                        if (valueNeedsTrackedChange(model, result, &staticActivationContext))
+                            addShape(std::string(prefix) + ".change_detect");
+                        else
+                            addShape(std::string(prefix) + ".untracked_store");
+                    }
+                    else
+                    {
+                        addShape(std::string(prefix) + ".temporary");
+                    }
+                };
+                const auto canWordwiseWideConcat = [&](const Operation &op) {
+                    if (!model.wordwiseWideConcat || op.kind() != OperationKind::kConcat || op.results().empty()) return false;
+                    const ValueId result = op.results().front();
+                    const ValueId storage = canonicalMaterializedStorageValue(model, result);
+                    std::vector<ValueId> pending(op.operands().begin(), op.operands().end());
+                    std::unordered_set<ValueId, ValueIdHash> visited;
+                    std::size_t totalWidth = 0;
+                    while (!pending.empty())
+                    {
+                        const ValueId value = pending.back(); pending.pop_back();
+                        if (!visited.insert(value).second) continue;
+                        if (canonicalMaterializedStorageValue(model, value) == storage || isEventValue(model, value)) return false;
+                        if (isMaterializedValue(model, value) || model.inputFieldByValue.contains(value) ||
+                            model.directStateReadSymbolByValue.contains(value)) continue;
+                        const OperationId def = graph.valueDef(value);
+                        if (!def.valid()) continue;
+                        const Operation producer = graph.getOperation(def);
+                        if (producer.kind() != OperationKind::kMemoryReadPort &&
+                            producer.kind() != OperationKind::kRegisterReadPort &&
+                            producer.kind() != OperationKind::kLatchReadPort &&
+                            !isDeferredActivationForwardPureKind(producer.kind())) return false;
+                        pending.insert(pending.end(), producer.operands().begin(), producer.operands().end());
+                    }
+                    for (auto value : op.operands())
+                    {
+                        if (graph.valueWidth(value) <= 0) return false;
+                        totalWidth += static_cast<std::size_t>(graph.valueWidth(value));
+                    }
+                    return totalWidth == static_cast<std::size_t>(graph.valueWidth(result));
+                };
+                std::size_t siteBegin = 0;
+                const auto finishSite = [&](std::size_t end) {
+                    if (features.empty()) return;
+                    GrhSimExecutionPlan::ComputeLowering::Site site;
+                    for (std::size_t at = siteBegin; at < end; ++at)
+                        if (!isCommitPhaseOp(graph.getOperation(ops[at])))
+                            site.operations.push_back(ops[at]);
+                    for (const auto &[name, count] : features) entry.features[name] += count;
+                    site.features.swap(features);
+                    entry.sites.push_back(std::move(site));
+                };
+                for (std::size_t i = 0; i < ops.size();)
+                {
+                    finishSite(i);
+                    siteBegin = i;
+                    const auto op = graph.getOperation(ops[i]);
+                    if (isCommitPhaseOp(op)) { ++i; continue; }
+                    const auto lowered = [&](const char *feature) {
+                        ++features[feature]; entry.loweredOperations.push_back(op.id()); ++i;
+                    };
+                    if (isRegToMemIntentBypassOp(model, op.id())) { lowered("bypassed_operations"); continue; }
+                    if (priority.absorbed.contains(op.id())) { lowered("priority_absorbed_operations"); continue; }
+                    if (op.results().size() == 1 && model.directInvertedBoolStateValues.contains(op.results()[0]))
+                    { lowered("inverted_state_view_operations"); continue; }
+                    if (const auto loop = reduce.loops.find(i); loop != reduce.loops.end())
+                    {
+                        ++features["bool_reduce_regions"];
+                        const auto count = loop->second.indices.size();
+                        features["bool_reduce_iterations"] += count;
+                        features["bool_reduce_scalar_comparisons"] += count;
+                        features["bool_reduce_unconditional_stores"] += count;
+                        features["bool_reduce_and_ops"] += count;
+                        features["bool_reduce_or_ops"] += 2 * count;
+                        for (; i < loop->second.end; ++i) entry.loweredOperations.push_back(ops[i]);
+                        continue;
+                    }
+                    if (reduce.absorbed.contains(op.id())) { lowered("bool_reduce_absorbed_operations"); continue; }
+                    if (const auto root = reduce.roots.find(op.id()); root != reduce.roots.end())
+                    {
+                        features["bool_reduce_root_terms"] += root->second.reductions.size() + root->second.residuals.size();
+                        lowered("bool_reduce_roots"); continue;
+                    }
+                    if (const auto chain = priority.roots.find(op.id()); chain != priority.roots.end())
+                    {
+                        if (model.priorityMuxCommitDemand)
+                            entry.unmodeledWork = "commit-demand mux transfer not priced";
+                        features["priority_condition_terms_upper"] += chain->second.arms.size();
+                        if (!chain->second.constantValues.empty())
+                        {
+                            ++features["priority_bitmap_roots"];
+                            features["priority_bitmap_groups_upper"] += (chain->second.arms.size() + 63) / 64;
+                            features["priority_table_entries"] += chain->second.constantValues.size();
+                        }
+                        else ++features["priority_branch_roots"];
+                        lowered("priority_roots"); continue;
+                    }
+                    // The following cases mirror the order in emitWordLogic
+                    // and the scalar assignment path. They record the chosen
+                    // backend shape while leaving generic operation membership
+                    // unchanged for coverage accounting.
+                    const auto result = op.results().empty() ? ValueId::invalid() : op.results().front();
+                    bool classified = false;
+                    // Side-effecting operations are schedule boundaries rather
+                    // than scalar expressions.  The normal emitter handles
+                    // their event guard/call ABI in dedicated cases below;
+                    // classify that same boundary explicitly so a DPIC or
+                    // system-task node is not reported as an unmodeled
+                    // "empty scalar expression".  A system-function result
+                    // is likewise lowered by its special file/error path,
+                    // not by scalarAssignmentExpr.
+                    if (op.kind() == OperationKind::kDpicCall || op.kind() == OperationKind::kSystemTask)
+                    {
+                        addShape(op.kind() == OperationKind::kDpicCall
+                            ? "side_effect.dpic_call" : "side_effect.system_task");
+                        for (auto value : op.results())
+                            if (graph.valueType(value) == ValueType::Logic)
+                                classifyStoredResult(value, "side_effect.result");
+                        classified = true;
+                    }
+                    else if (op.kind() == OperationKind::kSystemFunction)
+                    {
+                        addShape("side_effect.system_function");
+                        for (auto value : op.results())
+                            if (graph.valueType(value) == ValueType::Logic)
+                                classifyStoredResult(value, "side_effect.result");
+                        classified = true;
+                    }
+                    const auto operands = op.operands();
+                    const uint64_t operandBits = operandWidthBits(operands);
+                    const uint64_t operandWords = operandWordCount(operands);
+                    features["generic_operand_bits"] += operandBits;
+                    features["generic_operand_words"] += operandWords;
+                    if (result.valid() && op.kind() == OperationKind::kConstant)
+                    {
+                        if (isMaterializedValue(model, result)) addShape("constant.init_only");
+                        else if (isWideLogicValue(graph, result)) addShape("constant.wide_temporary");
+                        else
+                        {
+                            const auto expr = constantExpr(graph, op, result);
+                            const bool inlineable = expr && canInlineSingleUserLocalValue(
+                                graph, model, result, *expr, SupernodeLocalExprKind::kScalarInline, &localContext);
+                            addShape(inlineable ? "constant.scalar_inline" : "constant.scalar_temporary");
+                        }
+                        classifyStoredResult(result, "constant.result");
+                        classified = true;
+                    }
+                    if (result.valid() && (op.kind() == OperationKind::kRegisterReadPort ||
+                                           op.kind() == OperationKind::kLatchReadPort))
+                    {
+                        if (model.directStateReadSymbolByValue.contains(result))
+                            addShape("state_read.direct_visible");
+                        else if (!isMaterializedValue(model, result) && isWideLogicValue(graph, result) &&
+                                 localContext.stableWideStateReadRefs)
+                            addShape("state_read.wide_alias");
+                        else
+                        {
+                            const auto symbol = getAttribute<std::string>(op,
+                                op.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol");
+                            const bool tracked = valueNeedsTrackedChange(model, result, &staticActivationContext);
+                            const bool reused = tracked && symbol &&
+                                localContext.scalarStateReadChangedBySymbol.contains(*symbol) &&
+                                !isEventValue(model, result);
+                            addShape(reused ? "state_read.scalar_change_reuse" :
+                                (tracked ? "state_read.scalar_change_new" : "state_read.scalar_untracked"));
+                            if (tracked && symbol && !reused && !isEventValue(model, result))
+                                localContext.scalarStateReadChangedBySymbol.emplace(*symbol,
+                                    "grhsim_changed_" + std::to_string(result.index));
+                        }
+                        classifyStoredResult(result, "state_read.result");
+                        classified = true;
+                    }
+                    if (result.valid() && op.kind() == OperationKind::kMemoryReadPort && !op.operands().empty())
+                    {
+                        auto mem = getAttribute<std::string>(op, "memSymbol");
+                        auto state = mem ? model.stateBySymbol.find(*mem) : model.stateBySymbol.end();
+                        if (state != model.stateBySymbol.end())
+                        {
+                            const auto row = memoryRowAccessExpr(graph, op.operands()[0], "address", state->second.rowCount);
+                            addShape(isWideLogicValue(graph, result) ? "memory_read.wide" : "memory_read.scalar");
+                            addShape(row.alwaysInRange ? "memory_read.no_bounds_check" : "memory_read.bounds_check");
+                        }
+                        classifyStoredResult(result, "memory_read.result");
+                        classified = true;
+                    }
+                    if (!classified && result.valid() && graph.valueType(result) == ValueType::Logic)
+                    {
+                        std::vector<std::string> operandExprs;
+                        operandExprs.reserve(operands.size());
+                        for (auto value : operands) operandExprs.push_back(resolvedScheduleValueExpr(model, value, &localContext));
+                        if (isWideLogicValue(graph, result) || opNeedsWordLogicEmit(graph, op))
+                        {
+                            addShape("wide.operand_words", operandWords);
+                            if (const auto bit = localShiftDemandedBit(graph, model, op, localContext))
+                            {
+                                addShape("wide.demanded_bit"); localContext.demandedBitByWideValue.emplace(result, *bit);
+                            }
+                            else if (op.kind() == OperationKind::kSliceStatic && operands.size() == 1 &&
+                                     localContext.demandedBitByWideValue.contains(operands.front()))
+                            {
+                                addShape("wide.demanded_bit_slice");
+                            }
+                            else if (op.kind() == OperationKind::kConcat &&
+                                     packedArrayLaneViewForSourceValue(model, result) != nullptr)
+                            {
+                                addShape("wide.packed_lane_concat");
+                            }
+                            else if (op.kind() == OperationKind::kAssign &&
+                                     packedArrayLaneViewForValue(model, result) != nullptr)
+                            {
+                                addShape("wide.packed_lane_assign");
+                            }
+                            else if (op.kind() == OperationKind::kSliceArray && operands.size() == 2 &&
+                                     packedArrayLaneViewForValue(model, operands.front()) != nullptr)
+                            {
+                                addShape("wide.packed_lane_slice");
+                            }
+                            else if (shouldEmitDirectWideConcatFastPath(graph, model, op, result))
+                            {
+                                addShape("wide.concat_source_words", operandWords);
+                                const bool producerDirty = model.producerDirtyWords &&
+                                    isMaterializedValue(model, result) &&
+                                    model.producerDirtyWordBitsByValue.contains(result);
+                                const bool wordwise = canWordwiseWideConcat(op);
+                                addShape(producerDirty ? "wide.concat_producer_dirty" :
+                                    (wordwise ? "wide.concat_wordwise" : "wide.concat_insert"));
+                                if (wordwise || producerDirty) addShape("wide.concat_destination_words",
+                                    logicWordCount(graph.valueWidth(result)));
+                            }
+                            else
+                            {
+                                addShape(std::string("wide.helper.") + std::string(toString(op.kind())));
+                                addShape("wide.helper_operand_words", operandWords);
+                                const uint64_t resultWords = graph.valueWidth(result) > 0
+                                    ? logicWordCount(graph.valueWidth(result)) : 0;
+                                addShape("wide.helper_output_words", isWideLogicValue(graph, result)
+                                    ? resultWords : 1);
+                                // grhsim_slice_words iterates over destination
+                                // words, including scalar results. A narrow
+                                // slice does not scan the entire source bus.
+                                // Keep input shape and cross-word/index work
+                                // separate from this helper's loop bound.
+                                const bool outputWordLoop = isWideLogicValue(graph, result) ||
+                                    op.kind() == OperationKind::kSliceStatic ||
+                                    op.kind() == OperationKind::kSliceDynamic ||
+                                    op.kind() == OperationKind::kSliceArray;
+                                addShape("wide.helper_word_iterations",
+                                    outputWordLoop ? resultWords : operandWords);
+                                switch (op.kind())
+                                {
+                                case OperationKind::kSliceStatic:
+                                {
+                                    const auto start = getAttribute<int64_t>(op, "sliceStart").value_or(0);
+                                    if (resultWords != 0 && (start & 63) != 0)
+                                        addShape("wide.helper_cross_word_merges", resultWords);
+                                    break;
+                                }
+                                case OperationKind::kSliceDynamic:
+                                case OperationKind::kSliceArray:
+                                {
+                                    bool constantIndex = false;
+                                    if (operands.size() == 2)
+                                    {
+                                        constantIndex = constLogicIndexValue(
+                                            graph, operands[1], static_cast<std::size_t>(graph.valueWidth(operands[0]))).has_value();
+                                    }
+                                    if (!constantIndex)
+                                    {
+                                        addShape("wide.helper.index_normalizations");
+                                        if (resultWords != 0) addShape("wide.helper.cross_word_merges", resultWords);
+                                    }
+                                    else if (resultWords != 0)
+                                    {
+                                        const auto start = constLogicIndexValue(
+                                            graph, operands[1], static_cast<std::size_t>(graph.valueWidth(operands[0])));
+                                        if (start && (*start & 63u) != 0u)
+                                            addShape("wide.helper.cross_word_merges", resultWords);
+                                    }
+                                    break;
+                                }
+                                case OperationKind::kReduceAnd:
+                                case OperationKind::kReduceNand:
+                                case OperationKind::kReduceOr:
+                                case OperationKind::kReduceNor:
+                                case OperationKind::kReduceXor:
+                                case OperationKind::kReduceXnor:
+                                    addShape("wide.helper.reduce_word_iterations", operandWords);
+                                    break;
+                                case OperationKind::kReplicate:
+                                {
+                                    const auto rep = getAttribute<int64_t>(op, "rep").value_or(1);
+                                    const auto width = graph.valueWidth(operands.empty() ? result : operands.front());
+                                    const uint64_t lanes = rep > 0 && width > 0
+                                        ? std::min<uint64_t>(static_cast<uint64_t>(rep),
+                                            (static_cast<uint64_t>(graph.valueWidth(result)) + static_cast<uint64_t>(width) - 1u) /
+                                                static_cast<uint64_t>(width)) : 0;
+                                    addShape("wide.helper.replication_lanes", lanes);
+                                    break;
+                                }
+                                default:
+                                    break;
+                                }
+                                addShape(isWideLogicValue(graph, result) ? "wide.result_words" : "wide.to_scalar_result");
+                                if (op.kind() == OperationKind::kConcat && graph.valueWidth(result) > 64 &&
+                                    preferLoopedScalarConcatEmit(graph, op))
+                                    addShape("wide.concat_scalar_loop");
+                            }
+                            classifyStoredResult(result, "wide.result");
+                        }
+                        else
+                        {
+                            addShape("scalar.operand_bits", operandBits);
+                            if (op.kind() == OperationKind::kConcat && model.scalarConcatReduction)
+                            {
+                                const auto reduction = scalarConcatReductionExpr(
+                                    graph, model, op, operandExprs, localContext, model.scalarConcatReductionMinFields);
+                                if (reduction)
+                                {
+                                    addShape("scalar.concat_reduction");
+                                    localContext.reducedScalarConcatValues.insert(result);
+                                }
+                            }
+                            const bool staged = model.stagedScalarConcat && op.kind() == OperationKind::kConcat &&
+                                op.operands().size() >= 16 && graph.valueWidth(result) > 0 && graph.valueWidth(result) <= 64 &&
+                                !isEventValue(model, result) && std::all_of(operands.begin(), operands.end(), [&](ValueId value) {
+                                    return isScalarLogicValue(graph, value) && !isEventValue(model, value);
+                                });
+                            if (staged && !localContext.reducedScalarConcatValues.contains(result))
+                                addShape("scalar.concat_staged");
+                            else if (localContext.reducedScalarConcatValues.contains(result))
+                                addShape("scalar.concat_reduced_value");
+                            else
+                            {
+                                const auto rhs = scalarAssignmentExpr(
+                                    op.kind(), operandExprs, op, graph, &prefixTemps, model.oneBitBitwiseBytes,
+                                    model.boolEagerLogic, nullptr,
+                                    model.scalarLeafMuxUnpredictable && isScalarLeafOrMux(graph, model, op, localContext));
+                                if (rhs.expr.empty())
+                                {
+                                    entry.unmodeledWork = "scalar expression shape could not be reconstructed";
+                                }
+                                else
+                                {
+                                    const auto helperCalls = helperCallCount(rhs.expr);
+                                    addShape("scalar.helper_call_sites", helperCalls);
+                                    addShape("scalar.expression_ternary_terms",
+                                        static_cast<uint64_t>(std::count(rhs.expr.begin(), rhs.expr.end(), '?')));
+                                    const bool inlineable = !isMaterializedValue(model, result) &&
+                                        canInlineSingleUserLocalValue(graph, model, result, rhs.expr,
+                                            SupernodeLocalExprKind::kScalarInline, &localContext);
+                                    addShape(inlineable ? "scalar.inline" :
+                                        (isMaterializedValue(model, result) ? "scalar.materialized" : "scalar.temporary"));
+                                    // Storage aliases and local variables also
+                                    // use grhsim_ names. Only calls identify a
+                                    // helper expression; names alone must not
+                                    // make ordinary operators disappear.
+                                    addShape(rhs.byteBitResult ? "scalar.byte_bool" :
+                                        (helperCalls != 0 ? "scalar.helper_expr" : "scalar.native_expr"));
+                                }
+                            }
+                            classifyStoredResult(result, "scalar.result");
+                        }
+                        addShape(std::string("op.") + std::string(toString(op.kind())));
+                    }
+                    entry.genericOperations.push_back(op.id());
+                    ++features["generic_operations"];
+                    for (auto value : op.results())
+                    {
+                        if (graph.valueType(value) != ValueType::Logic) continue;
+                        const auto width = graph.valueWidth(value);
+                        features["generic_result_words"] += logicWordCount(width);
+                        if (model.directStateReadSymbolByValue.contains(value)) ++features["generic_direct_state_views"];
+                        else if (isMaterializedValue(model, value)) ++features["generic_materialized_results"];
+                        else ++features["generic_local_results"];
+                    }
+                    ++i;
+                }
+                finishSite(ops.size());
+                plan.computeLowering.push_back(std::move(entry));
+            }
+        }
+
+        void snapshotCommitGuards(const Graph &graph, const EmitModel &model, const ScheduleRefs &schedule,
+                                  const std::vector<ScheduleBatch> &batches, GrhSimExecutionPlan &plan)
+        {
+            using Body = GrhSimExecutionPlan::CommitWriteBody;
+            for (const auto &batch : batches)
+            {
+                if (batch.phase != ScheduleBatch::Phase::kCommit) continue;
+                for (const auto &word : batch.words)
+                {
+                    const auto clusters = buildCommitEventWordClusters(graph, model, schedule, batch, word);
+                    if (!clusters) continue;
+                    for (const auto &cluster : *clusters)
+                    {
+                        GrhSimExecutionPlan::CommitEventCheck check;
+                        check.batch = batch.index; check.activeWord = word.activeFlagWordIndex;
+                        check.expression = cluster.eventExpr; check.activeMask = cluster.mask;
+                        for (auto id : word.supernodeIds)
+                            if (cluster.mask & (UINT8_C(1) << (model.activeIdBySupernode.at(id) % kActiveFlagBitsPerWord)))
+                                check.groups.push_back(id);
+                        plan.commitEventChecks.push_back(std::move(check));
+                    }
+                }
+            }
+            for (auto id : schedule.topoOrder)
+            {
+                if (!isCommitSupernode(model, id)) continue;
+                const auto &ops = schedule.supernodeToOps.at(id);
+                const auto eventInfo = analyzeCommitSupernodeEvent(graph, model, schedule.supernodeToOps, id);
+                // A result-producing effect can alter local expression bindings.
+                // Do not silently approximate such mixed groups in this snapshot.
+                const bool mixedResults = std::any_of(ops.begin(), ops.end(), [&](auto opId) {
+                    const auto op = graph.getOperation(opId);
+                    return isCommitPhaseOp(op) && !isWritePortKind(op.kind()) && !op.results().empty();
+                });
+                SupernodeLocalExprContext context;
+                if (emitStorageRefAliasesEnabled())
+                    for (const auto &alias : collectSupernodeStorageRefAliases(
+                             graph, model, ops, ScheduleBatch::Phase::kCommit))
+                        bindSupernodeStorageRefAlias(alias, context, model.boolEagerLogic);
+                for (auto opId : ops)
+                {
+                    const auto op = graph.getOperation(opId);
+                    if (isCommitPhaseOp(op) && !isRegToMemIntentBypassOp(model, opId))
+                        for (auto v : op.operands()) ++context.useCountByValue[v];
+                }
+                const auto prefixes = collectScalarConcatPrefixCaches(graph, ops);
+                std::size_t prefix = 0;
+                for (std::size_t i = 0; i < ops.size();)
+                {
+                    while (prefix < prefixes.size() && prefixes[prefix].firstUseIndex <= i) ++prefix;
+                    const auto op = graph.getOperation(ops[i]);
+                    if (!isCommitPhaseOp(op) || !isWritePortKind(op.kind()) || isRegToMemIntentBypassOp(model, op.id()))
+                    { ++i; continue; }
+                    const auto event = exactEventExpr(graph, model, op.id(), op);
+                    if (!eventInfo || !event || mixedResults || plan.activationOverlays ||
+                        isCompressibleScalarStateWrite(model, op.id()))
+                    { plan.unmodeledCommitWrites.push_back(op.id()); ++i; continue; }
+                    OperationId errorOp;
+                    const auto run = buildCommitWriteRunPlan(graph, model, ops, i,
+                        prefix < prefixes.size() ? prefixes[prefix].firstUseIndex : ops.size(), *event, context, errorOp);
+                    if (!run) { plan.unmodeledCommitWrites.push_back(op.id()); ++i; continue; }
+                    GrhSimExecutionPlan::CommitWriteRun entry;
+                    entry.supernode = id; entry.begin = i; entry.end = run->end;
+                    entry.eventExpression = *event; entry.eventHandledByDispatch = eventInfo->homogeneous;
+                    const std::span<const OperationId> runOps(ops.data() + i, run->end - i);
+                    for (const auto &guard : run->guards)
+                    {
+                        GrhSimExecutionPlan::CommitEnableGroup group;
+                        group.expression = guard.condExpr;
+                        group.representativeEnable = graph.getOperation(runOps[guard.runIndices.front()]).operands()[0];
+                        for (auto index : guard.runIndices) group.operations.push_back(runOps[index]);
+                        entry.enables.push_back(std::move(group));
+                    }
+                    const auto ordered = buildOrderedMemoryWriteAffineGroups(graph, model, runOps, run->guards);
+                    for (std::size_t g = 0; g < run->guards.size();)
+                    {
+                        const auto affine = std::find_if(ordered.begin(), ordered.end(),
+                            [&](const auto &group) { return group.firstGuardGroupIndex == g; });
+                        if (affine != ordered.end())
+                        {
+                            entry.bodies.push_back({Body::Kind::OrderedMemoryAffine, affine->opIds});
+                            g += affine->opIds.size(); continue;
+                        }
+                        const auto &guard = run->guards[g];
+                        const auto lockstep = plan.eventQualifiedContinuation
+                            ? buildLockstepCommitScalarStateWriteGroups(graph, model, runOps, guard, &context)
+                            : std::vector<LockstepCommitScalarStateWriteGroup>{};
+                        std::vector<std::size_t> lockstepByIndex(runOps.size(), kInvalidIndex);
+                        for (std::size_t n = 0; n < lockstep.size(); ++n)
+                            for (auto index : lockstep[n].runIndices) lockstepByIndex[index] = n;
+                        const auto sameReader = buildSameReaderCommitScalarWriteGroups(
+                            graph, model, runOps, guard, lockstepByIndex);
+                        std::unordered_map<std::size_t, std::size_t> sameByIndex;
+                        for (std::size_t n = 0; n < sameReader.size(); ++n)
+                            for (auto index : sameReader[n].runIndices) sameByIndex.emplace(index, n);
+                        const auto appendBody = [&](Body::Kind kind, const auto &indices) {
+                            Body body; body.kind = kind;
+                            for (auto index : indices) body.operations.push_back(runOps[index]);
+                            entry.bodies.push_back(std::move(body));
+                        };
+                        for (auto index : guard.runIndices)
+                        {
+                            if (lockstepByIndex[index] != kInvalidIndex)
+                            {
+                                const auto &indices = lockstep[lockstepByIndex[index]].runIndices;
+                                if (index == indices.front()) appendBody(Body::Kind::Lockstep, indices);
+                            }
+                            else if (const auto it = sameByIndex.find(index); it != sameByIndex.end())
+                            {
+                                const auto &indices = sameReader[it->second].runIndices;
+                                if (index == indices.front()) appendBody(Body::Kind::SameReader, indices);
+                            }
+                            else entry.bodies.push_back({Body::Kind::Single, {runOps[index]}});
+                        }
+                        ++g;
+                    }
+                    for (auto &body : entry.bodies) snapshotCommitBodyWork(graph, model, body);
+                    plan.commitWriteRuns.push_back(std::move(entry));
+                    i = run->end;
+                }
+            }
+        }
+
+        GrhSimExecutionPlan snapshotExecutionPlan(const Graph &graph,
+                                                  const EmitModel &model,
+                                                  const ScheduleRefs &schedule,
+                                                  const std::vector<ScheduleBatch> &batches)
+        {
+            GrhSimExecutionPlan plan;
+            plan.graph = graph.id();
+            plan.graphName = graph.symbol();
+            plan.activeFlagBits = kActiveFlagBitsPerWord;
+            plan.inputFullpass = model.inputFullpassSpecialization;
+            plan.posedgeFullpass = model.posedgeFullpassSpecialization;
+            plan.fullActiveWordConsume = model.fullActiveWordConsume;
+            plan.pureEventWordBypass = model.pureEventComputeWordBypass;
+            plan.inputBitActivation = model.inputBitActivation;
+            plan.producerDirtyWords = model.producerDirtyWords;
+            plan.sharedDeferredActivation = model.sharedDeferredActivation;
+            const auto inputBitMasks = model.inputBitActivation
+                ? buildInputBitActivationMasks(graph, model, schedule.supernodeToOps) : InputBitActivationMasks{};
+            for (uint32_t id : schedule.topoOrder)
+            {
+                plan.groups.push_back({id, model.activeIdBySupernode.at(id),
+                    isCommitSupernode(model, id) ? GrhSimExecutionPlan::Phase::Commit
+                                                : GrhSimExecutionPlan::Phase::Compute,
+                    estimateSupernodeEmitLines(graph, model, schedule.valueFanout, schedule.supernodeToOps, id),
+                    schedule.supernodeToOps.at(id)});
+            }
+            for (const auto &batch : batches)
+            {
+                GrhSimExecutionPlan::Batch copy;
+                copy.index = batch.index;
+                copy.phase = batch.phase == ScheduleBatch::Phase::kCommit
+                                 ? GrhSimExecutionPlan::Phase::Commit : GrhSimExecutionPlan::Phase::Compute;
+                copy.estimatedLines = batch.estimatedLines;
+                for (const auto &word : batch.words)
+                {
+                    GrhSimExecutionPlan::Word entry;
+                    entry.activeWord = word.activeFlagWordIndex;
+                    entry.groups = word.supernodeIds;
+                    for (const auto &chunk : word.helperChunks)
+                    {
+                        entry.helperChunks.emplace_back(chunk.beginSupernodeIndex, chunk.endSupernodeIndex);
+                    }
+                    copy.words.push_back(std::move(entry));
+                }
+                plan.batches.push_back(std::move(copy));
+            }
+            // Graph order makes the snapshot deterministic despite planner hash maps.
+            for (ValueId value : graph.values())
+            {
+                if (model.inputFieldByValue.contains(value))
+                {
+                    const auto it = model.inputHeadSupernodesByValue.find(value);
+                    plan.inputs.push_back({value, it == model.inputHeadSupernodesByValue.end()
+                        ? std::vector<uint32_t>{} : it->second, model.inputChangeIndexByValue.contains(value)});
+                    if (const auto masks = inputBitMasks.find(value); masks != inputBitMasks.end())
+                    {
+                        for (const auto &[target, words] : masks->second)
+                            for (const auto &[word, mask] : words)
+                                plan.inputs.back().bitMasks.push_back({target, word, mask});
+                    }
+                }
+                if (const auto it = model.boundaryFanoutByValue.find(value); it != model.boundaryFanoutByValue.end())
+                {
+                    plan.boundaries.push_back({value, it->second, false});
+                }
+            }
+            for (const auto &symbol : model.stateOrder)
+            {
+                const auto it = model.stateHeadSupernodesBySymbol.find(symbol);
+                plan.states.push_back({symbol, it == model.stateHeadSupernodesBySymbol.end()
+                    ? std::vector<uint32_t>{} : it->second,
+                    model.memoryRowReaderActivationBySymbol.contains(symbol)});
+            }
+            for (OperationId id : graph.operations())
+            {
+                if (const auto it = model.eventSamplesByOp.find(id); it != model.eventSamplesByOp.end())
+                {
+                    plan.events.push_back({id, it->second.values, it->second.edges});
+                }
+                if (const auto it = model.writeByOp.find(id); it != model.writeByOp.end())
+                {
+                    const auto &write = it->second;
+                    plan.writes.push_back({id, write.symbol, write.shadowIndex != kInvalidIndex,
+                                           write.kind == StateDecl::Kind::Memory});
+                    const auto op = graph.getOperation(id);
+                    auto &entry = plan.writes.back();
+                    const auto nonzero = [&](ValueId value) {
+                        const auto bits = constLogicValue(graph, value, graph.valueWidth(value));
+                        if (!bits) return GrhSimExecutionPlan::Predicate::Unknown;
+                        for (std::size_t i = 0; i < logicWordCount(graph.valueWidth(value)); ++i)
+                            if (bits->getRawPtr()[i] != 0) return GrhSimExecutionPlan::Predicate::True;
+                        return GrhSimExecutionPlan::Predicate::False;
+                    };
+                    entry.enable = op.operands()[0];
+                    entry.enableProof = nonzero(entry.enable);
+                    entry.dataWidth = static_cast<uint32_t>(model.stateBySymbol.at(write.symbol).width);
+                    if (write.isMemoryFill)
+                    {
+                        entry.maskNonzeroProof = GrhSimExecutionPlan::Predicate::True;
+                    }
+                    else
+                    {
+                        entry.mask = op.operands()[write.kind == StateDecl::Kind::Memory ? 3 : 2];
+                        entry.maskNonzeroProof = nonzero(entry.mask);
+                    }
+                }
+            }
+            plan.storageFeatures = {
+                {"materialized_values", model.materializedValues.size()},
+                {"direct_state_read_values", model.directStateReadSymbolByValue.size()},
+                {"event_edge_bytes", model.eventEdgeSlotCount},
+                {"state_logic_bytes", model.stateLogicStorageBytes},
+                {"state_shadow_bytes", model.stateShadowStorageBytes},
+                {"memory_write_staging_bytes", model.memoryWriteStorageBytes},
+                {"producer_dirty_banks", model.producerDirtyWordBankCount},
+                {"producer_dirty_target_words", model.producerDirtyTargetWordCount},
+                {"proved_zero_values", model.provedZeroValueCount},
+            };
+            return plan;
+        }
+
     } // namespace
 
-    EmitResult EmitGrhSimCpp::emitImpl(const wolvrix::lib::grh::Design & /*design*/,
+    EmitResult EmitGrhSimCpp::analyzeExecutionPlan(const wolvrix::lib::grh::Design &design,
+                                                  const EmitOptions &options,
+                                                  GrhSimExecutionPlan &plan)
+    {
+        plan = {};
+        const auto topGraphs = resolveTopGraphs(design, options);
+        if (!validateTopGraphs(topGraphs)) return EmitResult{.success = false};
+        GrhSimExecutionPlan candidate;
+        auto result = prepareAndEmit(design, topGraphs, options, &candidate);
+        if (diagnostics() != nullptr && diagnostics()->hasError()) result.success = false;
+        if (result.success) plan = std::move(candidate);
+        return result;
+    }
+
+    EmitResult EmitGrhSimCpp::emitImpl(const wolvrix::lib::grh::Design &design,
                                        std::span<const Graph *const> topGraphs,
                                        const EmitOptions &options)
+    {
+        return prepareAndEmit(design, topGraphs, options, nullptr);
+    }
+
+    EmitResult EmitGrhSimCpp::prepareAndEmit(const wolvrix::lib::grh::Design & /*design*/,
+                                       std::span<const Graph *const> topGraphs,
+                                       const EmitOptions &options,
+                                       GrhSimExecutionPlan *plan)
     {
         EmitResult result;
         if (topGraphs.size() != 1)
@@ -27836,7 +28727,7 @@ template<class Index>
             result.success = false;
             return result;
         }
-        if (!options.outputDir || options.outputDir->empty())
+        if (plan == nullptr && (!options.outputDir || options.outputDir->empty()))
         {
             reportError("emit grhsim-cpp requires outputDir");
             result.success = false;
@@ -28862,6 +29753,19 @@ template<class Index>
             }
         }
 
+        if (plan != nullptr)
+        {
+            *plan = snapshotExecutionPlan(graph, model, schedule, scheduleBatches);
+            plan->activationOverlays =
+                *deferredActivationForwardPolicy != DeferredActivationForwardPolicy::kOff ||
+                *sameBatchActivationCohortPolicy != SameBatchActivationCohortPolicy::kOff;
+            plan->eventQualifiedContinuation = commitContinuationFallback(
+                graph, model, schedule, *commitExactEventPolicy, commitExactEventProfileConflict) == "none";
+            snapshotCommitGuards(graph, model, schedule, scheduleBatches, *plan);
+            snapshotComputeLowering(graph, model, schedule, *plan);
+            return result;
+        }
+
         const std::filesystem::path outDir = resolveOutputDir(options);
         const std::string normalizedTop = sanitizeIdentifier(graph.symbol());
         const std::string className = "GrhSIM_" + normalizedTop;
@@ -29004,48 +29908,9 @@ template<class Index>
                          deferredActivationCofirePairs.size(),
                          strictValues.size());
         }
-        bool eventQualifiedBitmapContinuation = false;
-        std::string_view commitExactEventFallback = "none";
-        if (*commitExactEventPolicy == CommitExactEventPolicy::kOff)
-        {
-            commitExactEventFallback = "policy_off";
-        }
-        else if (model.emitPerf)
-        {
-            commitExactEventFallback = "perf";
-        }
-        else if (model.emitWaveform)
-        {
-            commitExactEventFallback = "waveform";
-        }
-        else if (commitExactEventProfileConflict)
-        {
-            commitExactEventFallback = "runtime_profile";
-        }
-        else if (model.inputFullpassSpecialization)
-        {
-            commitExactEventFallback = "input_fullpass";
-        }
-        else if (model.posedgeFullpassSpecialization)
-        {
-            commitExactEventFallback = "posedge_fullpass";
-        }
-        else if (!model.stateShadows.empty())
-        {
-            commitExactEventFallback = "state_shadows";
-        }
-        else if (model.eventEdgeSlotCount == 0u)
-        {
-            commitExactEventFallback = "no_event_edges";
-        }
-        else if (!canUseEventQualifiedBitmapContinuation(graph, model, schedule))
-        {
-            commitExactEventFallback = "proof";
-        }
-        else
-        {
-            eventQualifiedBitmapContinuation = true;
-        }
+        const std::string_view commitExactEventFallback = commitContinuationFallback(
+            graph, model, schedule, *commitExactEventPolicy, commitExactEventProfileConflict);
+        const bool eventQualifiedBitmapContinuation = commitExactEventFallback == "none";
         CommitExactEventStats commitExactEventStats;
         const std::string_view pendingEvalRoundExpr =
             eventQualifiedBitmapContinuation

@@ -69,7 +69,9 @@
 | `-mtkahypar-preset` | `deterministic-quality` | mt-kahypar 预设；`repcut` 会强制使用确定性 preset |
 | `-mtkahypar-threads` | `0` | 线程数，`0` 表示后端默认 |
 | `-weight-mode` | `baseline` | 求解器 vertex weight 模式；严格支持 `baseline` 或 `closure-aware` |
-| `-cost-model` | `legacy` | 操作计算成本模型；支持 `legacy`、实验性 `verilator-v1` 和非默认 `verilator-lowered-v1` |
+| `-cost-model` | `legacy` | 操作计算成本模型；支持 `legacy`、`verilator-v1`、`verilator-lowered-v1` 和实验性 `grhsim-v1` |
+| `-initial-assignment` | `solver` | `solver` 保留原流程；`grhsim-terminal-v1` 从原图重新求解核心 ASC，再放置终端消费者 |
+| `-initial-core-imbalance-factor` | `0.05` | 两阶段初解中核心求解的不平衡因子，须有限且非负；不改变参考求解的 `-imbalance-factor` |
 | `-keep-intermediate-files` | false | 是否保留中间文件 |
 
 `baseline` 保留原有 RepCut vertex weight 口径。`closure-aware` 包含三步：
@@ -96,10 +98,71 @@ piece closure；Phase E 另行归属的 storage/source 和重建 adapter 继续�
 重建的分区另存为 `.hgr.closure-aware.partK`。最终 info stats 会记录 `closure_weight_stats`、
 `partition_refine_stats`，以及每个 part 的 `exact_referenced_closure_weight`。
 
+## GrhSIM 两阶段初始分配
+
+实验选项 `initial-assignment=grhsim-terminal-state-v1` 在下述终端 reader 规则上，
+允许延后放置无反馈的寄存器 ASC。分类使用原始存储读写和 effect 返回值形成的 ASC
+有向依赖图，先计算 SCC（强连通分量），再标记能到达环、memory、latch 或不支持的
+sink 的节点。自保持的自环保守地归入核心；缺少状态元数据时不新增状态候选。
+一个候选 ASC 必须全部由寄存器写入 sink 构成，且不能参与无写口 storage 的归属投票。
+共享组合 piece、写入工作和状态通信仍按原成本完整计入。状态依赖现在从每个完整
+ASC 的 sink 沿 value definition 反向回溯到实际的 register/latch/memory read，再
+建立 source-state 到 sink-ASC 的边；普通 `values` 的直接 ASC reader 边仍只用于
+通信和 evaluator 记账。
+
+新增的状态链从下游端点往上游安排，每次只放置一个完整 ASC；就绪节点之间沿用原有
+输入规模排序。它不合并寄存器链、不拆分 ASC，也不放宽下述结构预算。中间文件开启时，
+`.hgr.state-regions.csv` 记录每个 ASC 的 SCC、sink 类型和分类结果。该回溯仍以完整
+ASC 为分配单位，因而同一 ASC 内的多个结果可能继续形成保守耦合；结构账本必须结合
+原始 sink 路径解释，不能仅按信号名字判断反馈。该选项保持实验性，默认仍为 `solver`；
+仅结构预算通过不代表功能或性能验收通过。
+
+`initial-assignment=grhsim-terminal-v1` 要求 `cost-model=grhsim-v1`、
+`weight-mode=closure-aware` 和实际求解器后端，不能与 `assignment-replay` 同时使用。
+它保持 ASC 的语义边界、storage 共置和原有重建规则，不按模块名、信号名或分区编号匹配。
+
+普通 solver/refine 先产生参考方案，只提供结构预算和失败回退。新核心的标签从原始超图
+独立求解，不继承参考标签：所有写者、有状态写入的 ASC、参与无写口 storage 归属投票的
+ASC 都留在核心。只有输入合计至少 128 个 64-bit word、且输入 word 数超过独立 recurring
+工作量的终端 reader 才延后放置；recurring 是排除常量、声明和直接别名/状态读取后的
+结构成本，不是实测运行次数。
+
+核心求解完成后，按精确共享 piece 并集、writer/reader 集合与通信拼包成本，为每个终端
+reader 初次选择分区，不移动已经分配的核心 ASC。最多尝试 6 个接收容量上限；通信拼包
+可随后续 reader 的放置重组，所以局部只剪枝单调增加的计算量，完整结果再核验全部约束。
+预算由当前输入的参考方案推导：最大 recurring 不增加，总 recurring、通信调用及字节量
+最多增加 0.5%，总 operation 数及最大单端发送/接收调用、字节量最多增加 1%。这些量是
+结构约束，不能当作 walltime 预测。
+
+当前构造器支持最多 64 个分区。无合适 reader、核心 ASC 不足、模型不支持、核心求解失败
+或预算不满足时，保留原 solver/refine 方案并报告原因；不输出部分分配。启用中间文件时，
+参考标签另存为 `.hgr.reference.partK`，核心图及其标签保存在 `.hgr.initial-core.hgr*`，
+最终采用的完整标签仍是 `.hgr.closure-aware.partK`。
+
+stats 的 `initial_assignment` 记录实际是否采用、原因、reader 数、尝试数和通信容量。
+`final_assignment_metrics`、`closure_weight_stats` 及各分区的
+`exact_referenced_closure_weight` 对应最终标签；`partition_refine_stats` 的 before/after
+仍记录参考方案的局部调整，并以 `assignment_scope=solver_reference` 标明。
+未采用新构造器时，`assignment_scope=final`，统计语义沿用原流程。
+
+Python 对应 `initial_assignment="grhsim-terminal-v1"` 和
+`initial_core_imbalance_factor=0.05`。通用 API、香山脚本及 Make 的默认仍为 `solver`。
+香山 GrhSIM 流程可显式启用：
+
+```bash
+make build_xs_repcut_grhsim XS_REPCUT_INITIAL_ASSIGNMENT=grhsim-terminal-v1
+```
+
+该选项同时将未显式指定的成本模型选为 `grhsim-v1`；不会更改生成后的优化 pass 或
+GrhSIM emitter 参数。已验证性能线使用
+`XS_REPCUT_REG_TO_MEM_PROFITABILITY_FILTER=verilator-v1`，而普通 GrhSIM 入口该选项默认
+仍为 `none`，因此分配器的性能结论不能直接视为全部默认生成配置的验证。Verilator
+脚本拒绝该初始分配选项，保留原默认分区及生成路径。
+
 ## 后端计算成本模型
 
 `cost-model` 与 `weight-mode` 正交：前者给单个 GRH 操作计价，后者决定这些成本如何分配到
-ASC（不可拆分的原子逻辑锥）、共享 piece（逻辑片段）和分区。两者的四种组合均支持。
+ASC（不可拆分的原子逻辑锥）、共享 piece（逻辑片段）和分区。各模型均支持两种 weight mode。
 操作成本贯穿 HGR 顶点权重、共享 piece 复制惩罚、exact closure refinement 和分区静态统计。
 通信 proxy 公式和 ASC/storage 共置规则不变；closure-aware 边权含共享计算成本，因此其数值会随模型改变。
 
@@ -147,7 +210,50 @@ mul/div/mod、memory read、storage、常量和 effects 等未覆盖类型保留
 
 扩展其他仿真器时，在 `repcut_cost_model.hpp/.cpp` 添加独立、有版本的模型及对应选项校验，
 复用 `estimateRepcutOperationCost` 接口与现有汇总流程；不要把新后端映射成 Verilator 别名。
-新增模型需独立算子 fixture、默认兼容性和跨设计验证。当前不接受 `gsim`/`grhsim`，避免误称已支持。
+新增模型需独立算子 fixture、默认兼容性和跨设计验证。不接受无版本的 `gsim`/`grhsim` 别名。
+
+### GrhSIM 静态模型 `grhsim-v1`
+
+这是独立的、显式启用的模型，不复用或修改 Verilator 的计价公式。ASC 构造、
+storage 共置、共享 closure 分摊及 solver/refinement 算法保持原样；只替换传入这些
+步骤的操作成本。默认值不变，性能收益需要在目标设计上单独验证。
+
+记 `G(W)=ceil(W/64)`。GrhSIM 使用原生标量及 `uint64_t` 数组；主要规则是：
+
+| 操作 | 相对成本 |
+| --- | --- |
+| bitwise、assign、state read、静态切片 | `G(O)` |
+| add/sub | 标量 `1`，宽值 carry chain `3*G(O)` |
+| 比较 / XOR reduction | 标量比较 `1`；宽比较或 XOR reduction `2*G(I)` |
+| AND/OR reduction、逻辑非 | `G(I)` |
+| 逻辑与/或 | `1 + sum(G(width) for non-bool operands)` |
+| mux / concat | `1+G(O)` / `G(O)+sum(G(operand width))` |
+| replicate / 动态 shift | `2*G(O)`；常量 shift 为 `G(O)` |
+| 动态切片 / memory read | `2+2*G(O)` / `2+G(O)` |
+| state/memory write，全零 / 全一 mask | `1` / `2+3*G(data width)` |
+| state/memory write，部分或动态 mask | `2+5*G(data width)` |
+| mul / div/mod | 标量 `3` / `8`；宽值 `3*G(O)^2` / `64*G(O)^2` |
+
+write 项近似覆盖暂存、变更比较、提交拷贝及激活记账，部分 mask 再增加逐字合并，
+不使用 SV 的逐 bit 写入估算。storage 声明和常量保留最小正权重 `1`；DPI、system
+effects 等外部成本仍显式回退 legacy。
+
+上述基础算子成本另加中间值存储项：组合结果若被两个不同的操作使用，按可能的
+supernode 边界增加 `2*G(result width)+1`，近似旧值比较、持久存储与变化标记；
+若只有一个 consumer、但该 consumer 是 state/memory write，则增加 `G(result width)`，
+表示跨 compute/commit 阶段保存数据。常量、assign 别名和直接 state read 不加此项。
+同一操作在两个 operand 位置重复使用一个值，不会被误算成两个 consumer。
+该项只依赖 GRH def-use，不运行 emitter/编译器，也不读取 profile。
+多个 consumer 可能最终合并到同一 supernode，所以这是结构代理，不是对最终
+materialized 值的精确计数；单 consumer 也可能因 batch 大小限制形成边界。
+
+系数是机制启发式，不是机器周期标定；
+它不预测运行时活跃频率、编译器融合、batch 分组、分支误预测或两沿负载差异，
+也不根据模块名、信号名、分区编号或测得的耗时拟合。
+
+Python 使用 `cost_model="grhsim-v1"`；香山 GrhSIM 流程显式设置
+`XS_REPCUT_BACKEND=grhsim XS_REPCUT_COST_MODEL=grhsim-v1`。
+Verilator 的默认配置与所有已有 cost model 的数值规则不变。
 
 ## 示例
 
@@ -305,6 +411,27 @@ Playground 的 `XS_REPCUT_BACKEND` 默认为 `verilator`；
 `build/xs/repcut-grhsim/{package,work,partitioned-emu}`，不覆盖原 Verilator 产物。
 GrhSIM 管线暂默认使用 `legacy` cost model 和 `none` reg-to-mem 收益筛选，避免把
 Verilator 专用成本估计当作 GrhSIM 成本；现有 Verilator 默认值保持不变。
+
+## GrhSIM 划分前事件场景分析
+
+`analyzeRepcutGrhsimScenarios()`（`transform/repcut_grhsim_scenarios.hpp`）是只读的原始
+GRH 分析接口，不需要先分区、生成 activity schedule 或发射 C++。调用方声明输入变化场景、
+已知事件根的上升沿/下降沿场景，以及各写入场景经过 commit 后在哪些场景对后续计算可见。
+场景是可重叠的 bit 集合，不是执行次数或实测概率。
+
+例如，外部驱动每次 `eval()` 翻转一次时钟时，可以声明上升沿为 bit 0、下降沿为 bit 1，
+并声明上升沿 commit 的状态在下一下降沿计算中可见。这样寄存器写入的事件 mask 与
+寄存器读取所激活的组合计算 mask 不会被混为一谈。该可见性关系由调用方提供，接口
+本身不假定单时钟、交替两沿或固定的时钟相位关系。
+
+接口只穿透一位 `assign`/`not`/`logic-not` 时钟别名，并正确反转极性；其他派生事件、
+未声明的输入和未声明的 commit 可见性保留为 `kRepcutUnknownScenario`。此最高位表示
+不确定性，不是额外一个实际执行场景；只有未知位的操作也不能据此判定在已知场景中
+不活跃。当前传播使用整个 value 的 may 集合，尚未建模位级条件、后端内联、分组共同
+激活或动态数据门控，不能把其计数解释成精确的半周期执行量。
+
+该分析目前供独立 GrhSIM 初解实验提取结构特征；尚未接入生产默认分配入口，也不改变
+Verilator 权重、划分结果或生成流程。
 
 ## 前置条件
 

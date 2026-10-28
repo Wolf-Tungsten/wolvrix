@@ -452,6 +452,165 @@ namespace wolvrix::lib::transform
             }
         }
 
+        uint64_t grhsimWords(int32_t width)
+        {
+            return (static_cast<uint64_t>(width) + 63u) / 64u;
+        }
+
+        uint64_t grhsimBoundaryStorageWeight(const grh::Graph &graph, const grh::Operation &op)
+        {
+            // Scheduling is not available before partitioning. Distinct
+            // consumers are a structural proxy for a supernode boundary;
+            // a staged-write operand definitely survives the compute phase.
+            // Constants, aliases and direct state views do not create stores.
+            if (!legacyIsCombOp(op) || op.kind() == OperationKind::kConstant ||
+                op.kind() == OperationKind::kAssign)
+                return 0u;
+            uint64_t weight = 0u;
+            for (const auto result : op.results())
+            {
+                if (graph.valueType(result) != grh::ValueType::Logic)
+                    continue;
+                grh::OperationId firstUser;
+                bool distinctConsumers = false;
+                bool staged = false;
+                const auto valueInfo = graph.getValue(result);
+                for (const auto &user : valueInfo.users())
+                {
+                    if (!user.operation.valid())
+                        continue;
+                    if (!firstUser.valid())
+                        firstUser = user.operation;
+                    else if (firstUser != user.operation)
+                        distinctConsumers = true;
+                    const auto kind = graph.opKind(user.operation);
+                    staged |= kind == OperationKind::kRegisterWritePort ||
+                              kind == OperationKind::kLatchWritePort ||
+                              kind == OperationKind::kMemoryWritePort;
+                    if (distinctConsumers)
+                        break;
+                }
+                const auto words = grhsimWords(safeValueWidth(graph, result));
+                // Old-value comparison, persistent store and dirty marking.
+                // A local value used twice by ONE operation is not a boundary.
+                if (distinctConsumers)
+                    weight += 2u * words + 1u;
+                else if (staged)
+                    weight += words;
+            }
+            return weight;
+        }
+
+        std::optional<uint64_t> grhsimWeight(const grh::Graph &graph, const grh::Operation &op)
+        {
+            // Static work per activation, not a prediction of toggle frequency.
+            // Do not charge per-bit SV staging or Verilator's 32-bit WData here.
+            const uint64_t outWords = grhsimWords(getResultWidth(graph, op));
+            const uint64_t inWords = grhsimWords(getMaxOperandWidth(graph, op));
+            switch (op.kind())
+            {
+            case OperationKind::kConstant:
+            case OperationKind::kRegister:
+            case OperationKind::kLatch:
+            case OperationKind::kMemory:
+                // Solver weights must remain positive; storage declarations and
+                // folded constants have no recurring word-copy work.
+                return 1u;
+            case OperationKind::kAssign:
+            case OperationKind::kRegisterReadPort:
+            case OperationKind::kLatchReadPort:
+            case OperationKind::kAnd:
+            case OperationKind::kOr:
+            case OperationKind::kXor:
+            case OperationKind::kXnor:
+            case OperationKind::kNot:
+            case OperationKind::kSliceStatic:
+                return outWords;
+            case OperationKind::kAdd:
+            case OperationKind::kSub:
+                // Native integer through 64 bits, carry propagation above it.
+                return outWords == 1u ? 1u : 3u * outWords;
+            case OperationKind::kMul:
+                return outWords == 1u ? 3u : 3u * outWords * outWords;
+            case OperationKind::kDiv:
+            case OperationKind::kMod:
+                return outWords == 1u ? 8u : 64u * outWords * outWords;
+            case OperationKind::kReduceAnd:
+            case OperationKind::kReduceOr:
+            case OperationKind::kReduceNor:
+            case OperationKind::kReduceNand:
+            case OperationKind::kLogicNot:
+                return inWords;
+            case OperationKind::kReduceXor:
+            case OperationKind::kReduceXnor:
+                return 2u * inWords;
+            case OperationKind::kLogicAnd:
+            case OperationKind::kLogicOr:
+            {
+                uint64_t words = 1u;
+                for (const auto value : op.operands())
+                {
+                    // Boolean inputs need no extra truth-value conversion.
+                    if (safeValueWidth(graph, value) > 1)
+                        words += grhsimWords(safeValueWidth(graph, value));
+                }
+                return words;
+            }
+            case OperationKind::kEq:
+            case OperationKind::kNe:
+            case OperationKind::kCaseEq:
+            case OperationKind::kCaseNe:
+            case OperationKind::kWildcardEq:
+            case OperationKind::kWildcardNe:
+            case OperationKind::kLt:
+            case OperationKind::kLe:
+            case OperationKind::kGt:
+            case OperationKind::kGe:
+                return inWords == 1u ? 1u : 2u * inWords;
+            case OperationKind::kMux:
+                return 1u + outWords;
+            case OperationKind::kConcat:
+            {
+                uint64_t words = 0;
+                for (const auto value : op.operands())
+                    words += grhsimWords(safeValueWidth(graph, value));
+                // Word-wise insertion, not one iteration per result bit.
+                return outWords + words;
+            }
+            case OperationKind::kReplicate:
+                return 2u * outWords;
+            case OperationKind::kShl:
+            case OperationKind::kLShr:
+            case OperationKind::kAShr:
+                return constantUnsignedValue(graph, op, 1) ? outWords : 2u * outWords;
+            case OperationKind::kSliceDynamic:
+            case OperationKind::kSliceArray:
+                return 2u + 2u * outWords;
+            case OperationKind::kMemoryReadPort:
+                return 2u + outWords;
+            case OperationKind::kRegisterWritePort:
+            case OperationKind::kLatchWritePort:
+            case OperationKind::kMemoryWritePort:
+            {
+                const bool memory = op.kind() == OperationKind::kMemoryWritePort;
+                const int32_t width = getOperandWidth(graph, op, memory ? 2u : 1u);
+                const uint64_t words = grhsimWords(width);
+                const auto ones = constantMaskOnes(graph, op, memory ? 3u : 2u, width);
+                if (ones && *ones == 0u)
+                    return 1u;
+                // Staging, state comparison and commit copy, plus the shared
+                // enable/dirty-activation bookkeeping. Partial masks add a
+                // word-wise merge; they never imply a per-bit write loop.
+                const uint64_t wordPasses = ones && *ones == static_cast<uint64_t>(width) ? 3u : 5u;
+                return 2u + wordPasses * words;
+            }
+            default:
+                // DPI/system effects and unfamiliar kinds retain an explicit
+                // fallback; their external work cannot be inferred from GRH.
+                return std::nullopt;
+            }
+        }
+
         std::optional<uint64_t> verilatorLoweredWeight(const grh::Graph &graph, const grh::Operation &op)
         {
             const auto resultWidth = getResultWidth(graph, op);
@@ -508,6 +667,7 @@ namespace wolvrix::lib::transform
         case RepcutCostModel::kLegacy: return "legacy";
         case RepcutCostModel::kVerilatorV1: return "verilator-v1";
         case RepcutCostModel::kVerilatorLoweredV1: return "verilator-lowered-v1";
+        case RepcutCostModel::kGrhsimV1: return "grhsim-v1";
         }
         return "unknown";
     }
@@ -517,6 +677,16 @@ namespace wolvrix::lib::transform
     {
         if (model == RepcutCostModel::kLegacy)
             return {legacyWeight(graph, op), false};
+        if (model == RepcutCostModel::kGrhsimV1)
+        {
+            if (const auto weight = grhsimWeight(graph, op))
+            {
+                return {static_cast<uint32_t>(std::clamp<uint64_t>(
+                            *weight + grhsimBoundaryStorageWeight(graph, op), 1u,
+                            std::numeric_limits<uint32_t>::max() - 1u)), false};
+            }
+            return {legacyWeight(graph, op), true};
+        }
         if (model != RepcutCostModel::kVerilatorV1)
         {
             if (model != RepcutCostModel::kVerilatorLoweredV1)

@@ -111,6 +111,8 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/emit.cpp
     lib/core/toposort.cpp
     lib/emit/grhsim_cpp.cpp
+    lib/emit/grhsim_activity_model.cpp
+    lib/emit/grhsim_partition_work.cpp
     lib/emit/grhsim_repcut_unit.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
@@ -140,6 +142,10 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/strip_debug.cpp
     lib/transform/repcut.cpp
     lib/transform/repcut_cost_model.cpp
+    lib/transform/repcut_assignment_model.cpp
+    lib/transform/repcut_initial_assignment.cpp
+    lib/transform/repcut_grhsim_scenarios.cpp
+    lib/transform/grhsim_assignment_proposal.cpp
 )
 
 add_library(wolvrix-lib SHARED ${WOLVRIX_LIB_SOURCES})
@@ -454,6 +460,17 @@ target_compile_definitions(emit-grhsim-cpp
 )
 
 register_test_exe(emit-grhsim-cpp)
+add_executable(emit-grhsim-execution-plan tests/emit/test_grhsim_execution_plan.cpp)
+target_link_libraries(emit-grhsim-execution-plan PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-execution-plan PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")
+register_test_exe(emit-grhsim-execution-plan)
+add_executable(emit-grhsim-guard-activity tests/emit/test_grhsim_guard_activity.cpp)
+target_link_libraries(emit-grhsim-guard-activity PRIVATE wolvrix-lib)
+register_test_exe(emit-grhsim-guard-activity)
+add_executable(emit-grhsim-partition-work tests/emit/test_grhsim_partition_work.cpp)
+target_link_libraries(emit-grhsim-partition-work PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-partition-work PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")
+register_test_exe(emit-grhsim-partition-work)
 add_executable(emit-grhsim-cpp-input-bit-activation
     tests/emit/test_emit_grhsim_input_bit_activation.cpp
 )
@@ -533,6 +550,7 @@ target_compile_definitions(grhsim-compiler-compat PRIVATE
     WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
     WOLF_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}"
     WOLF_CLANG_REDUCTION_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/emit/data/grhsim_clang_sse2_reduction.cpp"
+    WOLF_CLANG_CHANGE_REDUCTION_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/emit/data/grhsim_clang_change_reduction.cpp"
 )
 register_test_exe(grhsim-compiler-compat)
 add_test(NAME emit-grhsim-cpp-direct-hot-input-event
@@ -823,6 +841,22 @@ register_test_exe(transform-repcut)
 add_executable(transform-repcut-cost-model tests/transform/test_repcut_cost_model.cpp)
 target_link_libraries(transform-repcut-cost-model PRIVATE wolvrix-lib)
 register_test_exe(transform-repcut-cost-model)
+
+add_executable(transform-repcut-assignment-model tests/transform/test_repcut_assignment_model.cpp)
+target_link_libraries(transform-repcut-assignment-model PRIVATE wolvrix-lib)
+register_test_exe(transform-repcut-assignment-model)
+
+add_executable(transform-repcut-initial-assignment tests/transform/test_repcut_initial_assignment.cpp)
+target_link_libraries(transform-repcut-initial-assignment PRIVATE wolvrix-lib)
+register_test_exe(transform-repcut-initial-assignment)
+
+add_executable(transform-repcut-grhsim-scenarios tests/transform/test_repcut_grhsim_scenarios.cpp)
+target_link_libraries(transform-repcut-grhsim-scenarios PRIVATE wolvrix-lib)
+register_test_exe(transform-repcut-grhsim-scenarios)
+
+add_executable(transform-grhsim-assignment-proposal tests/transform/test_grhsim_assignment_proposal.cpp)
+target_link_libraries(transform-grhsim-assignment-proposal PRIVATE wolvrix-lib)
+register_test_exe(transform-grhsim-assignment-proposal)
 
 add_executable(transform-repcut-partition-set
     tests/transform/test_repcut_partition_set.cpp

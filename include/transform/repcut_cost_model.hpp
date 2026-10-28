@@ -16,6 +16,9 @@ namespace wolvrix::lib::transform
         // Static estimate after known SystemVerilog emitter lowering rules.
         // Experimental and intentionally not the default.
         kVerilatorLoweredV1,
+        // GrhSIM's native scalar / uint64_t-word and staged-state representation.
+        // Opt-in: does not change any Verilator model or ASC construction rule.
+        kGrhsimV1,
     };
 
     struct RepcutOperationCost

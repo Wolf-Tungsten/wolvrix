@@ -73,8 +73,44 @@ or string operation ends the prefix, preserving zero boundaries when a caller
 catches an exception before publication and invokes `eval()` again. Event,
 Output and address-taking paths keep their stored views.
 
+Large-writer captures can also use direct scalar TwoState Logic constants,
+including wide `_BitInt` values. Eligibility is decided at the original General
+capture: the defining constant belongs to the same writer owner, or it is in an
+earlier nonsink's safe prefix described above. The emitter omits that argument's
+capture copy and uses its exact typed literal in LargeSink. The defining
+operation, publication and counters remain. Assigns, held samples and shaped
+constants keep their capture path. Declared capture fields and model layout are
+retained; an omitted copy leaves its unused field without semantic significance.
+This capture-specific rule does not extend general wide-operand substitution.
+
+In bitmap mode, LargeSink may read one original capture bit for writers proven
+to have the same stable effective capture condition. Controls must be physically
+stored scalar Logic Input, Event, or nonsink General values. Groups match latch
+kind and the ValueId identities of the fresh run fire, saved fire/enable and
+ordered guards, and use the smallest original writer bit. General still clears
+the full bitmap and sets every writer's own bit after its original capture;
+it does not precompute or compact enables. The proof includes the expanded run fire
+gate as well as the saved fire/enable reads: a saved OR/Assign fire can remain
+true after an Event pulse clears. Original coarse word guards, batch boundaries,
+counter sites, payload snapshots and writer order remain. Thus, for example,
+two equivalent writers still capture separate data and mark bits 3 and 70,
+while their final commit tests can both read bit 3. General must finish before
+LargeSink runs; an exception aborts that transition, and the next General clears
+the bitmap again. Index validity, masks, on-write touches and before-images keep
+their existing behavior, including valid zero-mask and same-value writes.
+
+The code map distinguishes these cases from physical capture storage. Both the
+writer's `captures` argument reference and `captured-argument-i` storage role
+describe the actual literal when its copy is omitted. In bitmap mode, the original
+`enable_bit` and `captured-enable` still identify that writer's own completion bit;
+`commit_enable_bit` and `captured-commit-enable` identify the final commit read.
+With `mem-enable-bitmap=off`, `captured-enable` names the writer's bool field,
+the own and commit ordinals are equal, and no `captured-commit-enable` role is emitted.
+Retained field declarations
+do not imply that a constant argument is read from that unused field.
+
 For an unsigned logical-right-shift result narrower than 64 bits whose source
-was replaced by such a literal, the zero guard uses the existing `uint64_t`
+was replaced by a General scalar literal, the zero guard uses the existing `uint64_t`
 shift container's width, 64. The normalized source is already zero above its
 logical width, so intermediate counts naturally produce zero. The complete
 count is compared before conversion to `size_t`, including counts wider than
@@ -90,7 +126,7 @@ stores still reset. Construction preserves the existing C-string behavior for
 embedded NUL bytes; it does not promise identical allocation-failure frequency.
 Task arguments always have addressable storage, including packed shaped
 constants, instead of taking the address of a literal.
-The retained implementation was validated on XiangShan CoreMark 100k with
+The General scalar/string source mechanism was validated on XiangShan CoreMark 100k with
 NEMU difftest: six fresh alternating runs on one CPU, without PGO, waveform
 or extra counters, improved throughput by 51.210858% over the retained NO2
 baseline. The full original-SV build took 2182.178070 seconds with 32 jobs.
@@ -113,6 +149,11 @@ disabled writer cannot suppress a sink-local observable boundary refresh.
 Large-state options are `mem-write-activate=on-change|on-write` and
 `mem-enable-bitmap=on|off`; the emitter defaults to on-change/on, while the
 production flow explicitly selects on-write/on.
+`large-capture-specialization=on|off` defaults to on and controls constant
+capture-copy elimination and commit-enable aliases together. Setting it off
+retains the original capture/commit path for comparison. With bitmap mode off,
+constant specialization still applies while enables remain per-writer bools.
+The manifest records the option as `large_capture_specialization`.
 
 Cross-chunk frames with more than 1024 logical fields group their
 default-initialized fields by complete C++ type into indexed arrays. Named

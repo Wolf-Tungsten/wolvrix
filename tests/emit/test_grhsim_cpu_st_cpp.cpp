@@ -4246,6 +4246,417 @@ for(unsigned epoch=0;epoch<3;++epoch) {
     }
 }
 
+void testLargeCaptureMetadata() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clockA = fixture.input("capture_clock_a"), clockB = fixture.input("capture_clock_b");
+    const auto enableA = fixture.input("capture_a"), enableB = fixture.input("capture_b");
+    const auto raw = fixture.input("capture_raw"), gate = fixture.input("capture_gate");
+    const auto data = fixture.input("capture_data", 8), index = fixture.input("capture_index", 4);
+    auto wideType = Fixture::type(130); wideType.isSigned = true;
+    const auto wideData = graph.createValue(graph.internSymbol("capture_wide_data"), wideType);
+    graph.bindInputPort("capture_wide_data", wideData);
+    const auto zero = fixture.constant(4, "4'd0"), one = fixture.constant(4, "4'd1");
+    const auto two = fixture.constant(4, "4'd2"), invalid = fixture.constant(4, "4'd15");
+    const auto high = fixture.constant(8, "8'ha6"), last = fixture.constant(8, "8'hd5");
+    const auto mask = fixture.constant(8, "8'hf0"), zeroMask = fixture.constant(8, "8'h00");
+    const auto memory = [&](const std::string& name, unsigned cells, const std::string& initial) {
+        const auto state = fixture.state(name, cells * 8, {cells});
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Fill, initial}});
+        graph.bindOutputPort(name, fixture.read(state)); return state;
+    };
+    const auto priority = memory("capture_priority", 8, "8'h39");
+    const auto dynamic = memory("capture_dynamic", 8, "8'h7e");
+    const auto mixed = memory("capture_mixed", 2, "8'h18");
+    const auto stableMixed = memory("capture_stable_mixed", 2, "8'h27");
+    const auto local = memory("capture_local", 2, "8'h4d");
+    const auto bulk = memory("capture_bulk", 65, "8'h5a");
+    std::vector<grh::OperationId> writers;
+    const auto write = [&](OperationKind kind, grh::OperationId state,
+                           std::initializer_list<grh::ValueId> args,
+                           std::vector<std::string> edges = {"posedge"}) {
+        const auto op = fixture.write(kind, state, args, std::move(edges)); writers.push_back(op); return op;
+    };
+    const auto firstA = write(OperationKind::kRegisterWriteArrayPort, priority, {enableA, zero, high, clockA});
+    write(OperationKind::kRegisterWriteArrayPort, priority, {enableB, zero, data, clockA});
+    const auto lastA = write(OperationKind::kRegisterWriteArrayMaskPort, priority, {enableA, zero, last, mask, clockA});
+    write(OperationKind::kRegisterWriteArrayPort, priority, {enableA, one, high, clockA});
+    const auto invalidWrite = write(OperationKind::kRegisterWriteArrayPort, priority, {enableA, invalid, high, clockA});
+    write(OperationKind::kRegisterWriteArrayMaskPort, priority, {enableA, two, high, zeroMask, clockA});
+    write(OperationKind::kRegisterWriteArrayPort, dynamic, {enableA, index, data, clockA});
+    const auto mixedFirst = write(OperationKind::kRegisterWriteArrayPort, mixed,
+        {enableA, zero, data, clockA, clockB}, {"posedge", "negedge"});
+    const auto mixedLast = write(OperationKind::kRegisterWriteArrayPort, mixed,
+        {enableA, one, high, clockA, clockB}, {"posedge", "negedge"});
+    const auto stableMixedFirst = write(OperationKind::kRegisterWriteArrayPort, stableMixed,
+        {enableA, zero, data, clockA, clockB}, {"posedge", "posedge"});
+    const auto stableMixedLast = write(OperationKind::kRegisterWriteArrayPort, stableMixed,
+        {enableA, one, high, clockA, clockB}, {"posedge", "posedge"});
+    const auto localEnableA = fixture.compute(OperationKind::kAnd, Fixture::type(1), {raw, gate});
+    const auto localEnableB = fixture.compute(OperationKind::kAnd, Fixture::type(1), {raw, gate});
+    const auto localFirst = write(OperationKind::kRegisterWriteArrayPort, local, {localEnableA, zero, data, clockA});
+    const auto localLast = write(OperationKind::kRegisterWriteArrayPort, local, {localEnableB, one, high, clockA});
+    std::vector<grh::OperationId> bulkWriters;
+    for (unsigned i = 0; i < 65; ++i)
+        bulkWriters.push_back(write(OperationKind::kRegisterWriteArrayPort, bulk,
+            {enableA, fixture.constant(7, "7'd" + std::to_string(i)),
+             fixture.constant(8, "8'd" + std::to_string((i * 3 + 7) & 255)), clockA}));
+    const auto wide = fixture.state("capture_wide", 260, {2});
+    auto wideStateType = Fixture::type(260, {2}); wideStateType.isSigned = true;
+    grh::setStateLogicalType(graph, wide, wideStateType);
+    grh::setStateInitSpec(graph, wide, {{grh::InitKind::Fill, "130'h20000000000000000000000000000000b"}});
+    graph.bindOutputPort("capture_wide", fixture.read(wide));
+    const auto negative = fixture.compute(OperationKind::kConstant, wideType, {});
+    graph.setAttr(graph.valueDef(negative), "constValue", std::string("130'sh3fffffffffffffffffffffffffffffffd"));
+    const auto wideMask = fixture.constant(130, "130'h1000000000000000100000000000000ff");
+    write(OperationKind::kRegisterWriteArrayPort, wide, {enableB, zero, wideData, clockA});
+    const auto wideWrite = write(OperationKind::kRegisterWriteArrayMaskPort, wide,
+        {enableA, zero, negative, wideMask, clockA});
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    // Conversion creates a distinct detector per writer. Share the same
+    // stable Event boundary explicitly so the positive alias cases exercise
+    // identical control identities, not merely equivalent clock expressions.
+    const auto sharedFire = graph.opOperands(firstA)[0];
+    require(graph.opKind(graph.valueDef(sharedFire)) == sim::kEdgeDetect,
+            "Capture metadata fixture lost its stable Event fire");
+    for (const auto op : writers) if (op != mixedFirst && op != mixedLast &&
+            op != stableMixedFirst && op != stableMixedLast)
+        graph.replaceOperand(op, 0, sharedFire);
+    // Two users keep this OR in a nonsink owner. The writer-local ORs above
+    // remain separate negative cases. Use a distinct second edge so their
+    // sink groups cannot pick a local OR as this shared run's fresh fire.
+    const auto stableMixedFire = graph.opOperands(stableMixedFirst)[0];
+    graph.replaceOperand(stableMixedLast, 0, stableMixedFire);
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=1"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
+    const auto& captureSchedule = sim::requireSinkSchedule(&fixture.session, graph);
+    require(std::any_of(captureSchedule.sinkGroups.begin(), captureSchedule.sinkGroups.end(),
+                [](const auto& group) { return !group.guards.empty(); }),
+            "Capture metadata fixture did not exercise hoisted boundary guards");
+    require(owner(graph, graph.valueDef(stableMixedFire)).size() == 4 &&
+                owner(graph, graph.valueDef(stableMixedFire))[1] == "nonsink" &&
+                graph.opOperands(stableMixedLast)[0] == stableMixedFire,
+            "Capture metadata fixture lost its shared nonsink multi-clock fire");
+    for (const auto value : {localEnableA, localEnableB})
+        require(owner(graph, graph.valueDef(value)).size() == 3 &&
+                    owner(graph, graph.valueDef(value))[1] == "large-sink",
+                "Capture metadata fixture lost its unstable writer-local enable");
+    for (const auto op : {mixedFirst, mixedLast}) {
+        const auto fire = graph.opOperands(op)[0];
+        require(graph.opKind(graph.valueDef(fire)) == OperationKind::kOr &&
+                    owner(graph, graph.valueDef(fire)) == owner(graph, op),
+                "Capture metadata fixture lost its writer-local multi-clock fire");
+    }
+    const std::string support = "using CaptureWide = unsigned _BitInt(130);\n";
+    const std::string body = R"CPP(
+for (unsigned epoch=0; epoch<3; ++epoch) {
+    model.capture_clock_a=false; model.capture_clock_b=false; model.init();
+    std::array<unsigned,8> priority{}, dynamic{}; priority.fill(0x39); dynamic.fill(0x7e);
+    std::array<unsigned,2> mixed{0x18,0x18}, stableMixed{0x27,0x27}, local{0x4d,0x4d};
+    std::array<unsigned,65> bulk{}; bulk.fill(0x5a);
+    const CaptureWide initial=(CaptureWide(1)<<129)|11;
+    const CaptureWide partial=(CaptureWide(1)<<128)|(CaptureWide(1)<<64)|255;
+    std::array<CaptureWide,2> wide{initial,initial}; bool previousA=false, previousB=false;
+    for (unsigned step=0; step<48; ++step) {
+        model.capture_clock_a=step%2; model.capture_clock_b=(step/3)%2;
+        model.capture_a=step%5!=0; model.capture_b=step%3!=0;
+        model.capture_raw=step%4!=0; model.capture_gate=step%7!=0;
+        model.capture_data=step*17+epoch*23+9; model.capture_index=(step/2)%12;
+        model.capture_wide_data=(CaptureWide(step+3)<<120)|(CaptureWide(epoch+step+7)<<64)|(step*31+19);
+        const bool fireA=model.capture_clock_a&&!previousA;
+        const bool fireMixed=fireA||(!model.capture_clock_b&&previousB);
+        const bool fireStableMixed=fireA||(model.capture_clock_b&&!previousB);
+        const bool a=fireA&&model.capture_a, b=fireA&&model.capture_b;
+        const bool l=fireA&&model.capture_raw&&model.capture_gate, m=fireMixed&&model.capture_a;
+        unsigned writes=0, states=0;
+        if(a) { priority[0]=0xa6; ++writes; }
+        if(b) { priority[0]=model.capture_data; ++writes; }
+        if(a) { priority[0]=(priority[0]&15)|0xd0; priority[1]=0xa6; writes+=3; }
+        if(a||b) ++states; // The valid zero-mask write to cell 2 still touches.
+        if(a&&model.capture_index<8) { dynamic[model.capture_index]=model.capture_data; ++writes; ++states; }
+        if(m) { mixed[0]=model.capture_data; mixed[1]=0xa6; writes+=2; ++states; }
+        if(fireStableMixed&&model.capture_a) { stableMixed[0]=model.capture_data; stableMixed[1]=0xa6; writes+=2; ++states; }
+        if(l) { local[0]=model.capture_data; local[1]=0xa6; writes+=2; ++states; }
+        if(a) { for(unsigned i=0;i<65;++i) bulk[i]=(i*3+7)&255; writes+=65; ++states; }
+        if(b) { wide[0]=model.capture_wide_data; ++writes; }
+        if(a) { wide[0]=(wide[0]&~partial)|((~CaptureWide(0)-2)&partial); ++writes; }
+        if(a||b) ++states;
+        const auto before=model.perf_counters(); model.eval(); const auto after=model.perf_counters();
+        for(unsigned i=0;i<8;++i) assert(model.capture_priority[i]==priority[i]&&model.capture_dynamic[i]==dynamic[i]);
+        for(unsigned i=0;i<2;++i) {
+            assert(model.capture_mixed[i]==mixed[i]&&model.capture_local[i]==local[i]);
+            assert(model.capture_stable_mixed[i]==stableMixed[i]);
+            assert(CaptureWide(model.capture_wide[i])==wide[i]);
+        }
+        for(unsigned i=0;i<65;++i) assert(model.capture_bulk[i]==bulk[i]);
+        assert(after.commitBatchExecCount-before.commitBatchExecCount==writes);
+        assert(after.touchedWriteCount-before.touchedWriteCount==writes);
+        assert(after.touchedStateShadowCount-before.touchedStateShadowCount==states);
+        assert(after.totalRoundCount-before.totalRoundCount==(writes?2:1));
+        model.eval(); const auto settled=model.perf_counters();
+        assert(settled.touchedWriteCount==after.touchedWriteCount&&settled.commitBatchExecCount==after.commitBatchExecCount);
+        previousA=model.capture_clock_a; previousB=model.capture_clock_b;
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) for (const std::string bitmap : {"on", "off"})
+        for (const std::string specialization : {"on", "off"}) {
+            const auto label = "large-capture-metadata-b" + std::to_string(budget) + "-bitmap-" + bitmap + "-specialize-" + specialization;
+            manualCase(fixture, label, budget, support, body, false,
+                {{"mem-enable-bitmap", bitmap}, {"mem-write-activate", "on-write"}, {"large-capture-specialization", specialization}});
+            const auto directory = artifact(label) / "model";
+            const auto operations = mappedRecords(readFile(directory / "code-map.json"), "operations");
+            const auto record = [&](grh::OperationId op) -> const std::string& {
+                const auto prefix = "{\"operation_id\":\"o" + std::to_string(op.index) + "\",";
+                for (const auto& item : operations) if (item.starts_with(prefix)) return item;
+                throw std::runtime_error("Large capture writer missing from code map");
+            };
+            const auto bit = [&](grh::OperationId op, const std::string& name) {
+                std::smatch found;
+                require(std::regex_search(record(op), found, std::regex("\"" + name + "\":([0-9]+)")), "Missing capture bit metadata");
+                return std::stoul(found[1]);
+            };
+            const auto captured = [&](grh::OperationId op, unsigned arg) {
+                for (const auto& item : mappedRecords(record(op), "captures")) {
+                    if (item.find("\"role\":\"argument-" + std::to_string(arg) + "\"") == std::string::npos) continue;
+                    std::smatch found; require(std::regex_search(item, found, std::regex(R"REGEX("reference":"([^"]+)")REGEX")), "Capture omitted actual source");
+                    return found[1].str();
+                }
+                throw std::runtime_error("Capture argument missing from code map");
+            };
+            std::set<unsigned long> ownBits;
+            for (const auto op : writers) {
+                const auto own = bit(op, "enable_bit"), commit = bit(op, "commit_enable_bit");
+                require(ownBits.insert(own).second, "General capture bitmap lost a writer's own bit");
+                if (specialization == "off" || bitmap == "off") require(own == commit, "Disabled specialization changed commit enable identity");
+                if (bitmap == "on") require(record(op).find("\"role\":\"captured-commit-enable\"") != std::string::npos,
+                    "Canonical commit enable missing from operation storage map");
+            }
+            require(*ownBits.rbegin() >= 64, "Capture metadata fixture did not cross bitmap words");
+            if (specialization == "on" && bitmap == "on") {
+                require(bit(firstA, "commit_enable_bit") == bit(lastA, "commit_enable_bit"), "A/B/A stable guards did not share commit enable");
+                require(bit(bulkWriters.front(), "commit_enable_bit") == bit(bulkWriters.back(), "commit_enable_bit"), "Cross-word stable writers did not share commit enable");
+                require(bit(stableMixedFirst, "commit_enable_bit") == bit(stableMixedLast, "commit_enable_bit") &&
+                            bit(stableMixedFirst, "commit_enable_bit") != bit(firstA, "commit_enable_bit"),
+                        "Stable nonsink OR fire lost its complete shared capture identity");
+                for (const auto op : {mixedFirst, mixedLast})
+                    require(bit(op, "commit_enable_bit") == bit(op, "enable_bit") &&
+                                bit(op, "commit_enable_bit") != bit(firstA, "commit_enable_bit"),
+                            "Writer-local multi-clock OR fire was aliased without a stable boundary");
+                for (const auto op : {localFirst, localLast}) require(bit(op, "commit_enable_bit") == bit(op, "enable_bit"),
+                    "Writer-local enable was aliased without a stable boundary");
+            }
+            for (const auto& [op, arg] : std::vector<std::pair<grh::OperationId, unsigned>>{{firstA, 2}, {firstA, 3}, {invalidWrite, 2}, {wideWrite, 3}, {wideWrite, 4}}) {
+                const auto source = captured(op, arg);
+                require((source.find("largeSinkPayloadBoundaryStore.") == std::string::npos) == (specialization == "on"),
+                    "True scalar/wide captured constant did not expose its actual specialized source");
+                require(record(op).find("\"role\":\"captured-argument-" + std::to_string(arg) + "\",\"reference\":\"" + source + "\"") != std::string::npos,
+                    "Capture and storage records disagree on actual argument source");
+            }
+        }
+}
+
+void testLargeLatchCaptures() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto enable = fixture.input("capture_latch_enable"), data = fixture.input("capture_latch_data", 8);
+    const auto dynamicMask = fixture.input("capture_latch_mask", 8);
+    const auto partial = fixture.constant(8, "8'hf0"), zero = fixture.constant(8, "8'h00");
+    const auto constantData = fixture.constant(8, "8'ha5");
+    const auto latch = [&](const std::string& name, const std::string& initial) {
+        const auto state = fixture.state(name, 8); graph.setOpKind(state, OperationKind::kLatch);
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Constant, initial}});
+        graph.bindOutputPort(name, fixture.read(state)); return state;
+    };
+    const auto firstState = latch("capture_latch_first", "8'h39");
+    const auto lastState = latch("capture_latch_last", "8'h7e");
+    // The zero-mask writer observes both states without changing either.
+    // This keeps real General feedback, so state changes require a settling
+    // round and an unchanged or disabled latch converges immediately.
+    const auto feedback = fixture.compute(OperationKind::kOr, Fixture::type(8),
+        {fixture.read(firstState), fixture.read(lastState)});
+    const auto first = fixture.write(OperationKind::kLatchWritePort, firstState, {enable, data, partial});
+    const auto last = fixture.write(OperationKind::kLatchWritePort, lastState, {enable, constantData, dynamicMask});
+    const auto zeroWrite = fixture.write(OperationKind::kLatchWritePort, lastState, {enable, feedback, zero});
+    fixture.convert();
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=1"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
+    for (const auto op : {first, last, zeroWrite})
+        require(graph.opKind(op) == sim::kLatchWrite && graph.opOperands(op).size() == 3 &&
+                    owner(graph, op).size() == 3 && owner(graph, op)[1] == "large-sink",
+                "Latch capture fixture did not exercise the large controls=1 path");
+    for (const auto value : graph.opOperands(graph.valueDef(feedback)))
+        require(owner(graph, graph.valueDef(value)).size() == 3 &&
+                    owner(graph, graph.valueDef(value))[0] == "general",
+                "Latch capture fixture lost its General state observations");
+    const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
+    for (const auto& group : schedule.sinkGroups)
+        require(!group.fire && group.guards == std::vector<grh::ValueId>{enable},
+                "Latch capture fixture lost its null fire or hoisted enable");
+    const std::string body = R"CPP(
+for(unsigned epoch=0; epoch<3; ++epoch) {
+    model.capture_latch_enable=false; model.init(); unsigned first=0x39, last=0x7e;
+    model.eval(); assert(model.capture_latch_first==first && model.capture_latch_last==last);
+    for(unsigned step=0; step<32; ++step) {
+        model.capture_latch_enable=step%5!=0;
+        // Repeat payloads on alternate evals, with zero, partial and full masks.
+        model.capture_latch_data=(step/2*29+epoch*17)&255;
+        model.capture_latch_mask=step%4==0 ? 0 : step%4==1 ? 15 : step%4==2 ? 240 : 255;
+        const auto previousFirst=first, previousLast=last;
+        if(model.capture_latch_enable) {
+            first=(first&15)|(model.capture_latch_data&240);
+            last=(last&~unsigned(model.capture_latch_mask))|(0xa5&model.capture_latch_mask);
+        }
+        const auto before=model.perf_counters(); model.eval(); const auto after=model.perf_counters();
+        assert(model.capture_latch_first==first && model.capture_latch_last==last);
+        assert(after.totalRoundCount-before.totalRoundCount==
+            (first!=previousFirst || last!=previousLast ? 2 : 1));
+        model.eval(); const auto settled=model.perf_counters();
+        assert(model.capture_latch_first==first && model.capture_latch_last==last);
+        assert(settled.touchedStateShadowCount==after.touchedStateShadowCount);
+        assert(settled.totalRoundCount-after.totalRoundCount==1);
+    }
+}
+)CPP";
+    for (const auto budget : {16, 1024}) for (const std::string bitmap : {"on", "off"})
+        for (const std::string specialization : {"on", "off"}) for (const std::string mode : {"on-write", "on-change"}) {
+            const auto label = "large-latch-capture-b" + std::to_string(budget) + "-bitmap-" + bitmap +
+                "-specialize-" + specialization + "-" + mode;
+            manualCase(fixture, label, budget, {}, body, false,
+                {{"mem-enable-bitmap", bitmap}, {"large-capture-specialization", specialization}, {"mem-write-activate", mode}});
+            const auto operations = mappedRecords(readFile(artifact(label) / "model/code-map.json"), "operations");
+            const auto record = [&](grh::OperationId op) -> const std::string& {
+                const auto prefix = "{\"operation_id\":\"o" + std::to_string(op.index) + "\",";
+                for (const auto& item : operations) if (item.starts_with(prefix)) return item;
+                throw std::runtime_error("Large latch writer missing from code map");
+            };
+            const auto bit = [&](grh::OperationId op, const std::string& name) {
+                std::smatch found;
+                require(std::regex_search(record(op), found, std::regex("\"" + name + "\":([0-9]+)")),
+                        "Missing latch capture bit metadata");
+                return std::stoul(found[1]);
+            };
+            std::set<unsigned long> own;
+            for (const auto op : {first, last, zeroWrite}) {
+                require(own.insert(bit(op, "enable_bit")).second, "Latch writers lost separate capture bits");
+                require(bit(op, "commit_enable_bit") == bit(
+                            specialization == "on" && bitmap == "on" ? first : op, "enable_bit"),
+                        "Latch capture canonical enable ignored specialization or null fire");
+                const auto captures = mappedRecords(record(op), "captures");
+                require(captures.size() == 2, "Latch controls=1 capture offset omitted data or mask");
+                for (unsigned argument=1; argument<=2; ++argument) {
+                    const auto& capture = captures[argument-1];
+                    require(capture.find("\"role\":\"argument-" + std::to_string(argument) + "\"") != std::string::npos,
+                            "Latch capture metadata used register argument offsets");
+                    const bool constant = op == last ? argument == 1 : argument == 2;
+                    const bool physical = capture.find("largeSinkPayloadBoundaryStore.") != std::string::npos;
+                    require(physical == (!constant || specialization == "off"),
+                            "Latch data/mask capture did not honor actual specialized source");
+                }
+            }
+        }
+}
+
+void testLargeCaptureInterruptedConstants() {
+    Fixture fixture; auto& graph = fixture.graph;
+    const auto clock = fixture.input("capture_throw_clock"), enable = fixture.input("capture_throw_enable");
+    const auto one = fixture.constant(1, "1'b1"), index = fixture.constant(1, "1'b0");
+    auto type = Fixture::type(130); type.isSigned = true;
+    const auto before = fixture.compute(OperationKind::kConstant, type, {});
+    graph.setAttr(graph.valueDef(before), "constValue", std::string("130'sh3fffffffffffffffffffffffffffffffd"));
+    const auto imported = [&](const std::string& name, unsigned arguments, bool result) {
+        const auto target = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol(name));
+        std::vector<std::string> names; for (unsigned i=0; i<arguments; ++i) names.push_back("arg"+std::to_string(i));
+        graph.setAttr(target, "argsName", names); graph.setAttr(target, "argsDirection", std::vector<std::string>(arguments, "input"));
+        graph.setAttr(target, "argsWidth", std::vector<int64_t>(arguments, 130)); graph.setAttr(target, "argsSigned", std::vector<bool>(arguments, true));
+        graph.setAttr(target, "hasReturn", result); if (result) graph.setAttr(target, "returnWidth", int64_t{8});
+    };
+    imported("capture_throw_once", 1, false);
+    const auto call = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(call, "targetImportSymbol", std::string("capture_throw_once"));
+    graph.addOperand(call, one); graph.addOperand(call, before);
+    const auto after = fixture.compute(OperationKind::kConstant, type, {});
+    graph.setAttr(graph.valueDef(after), "constValue", std::string("130'sh3fffffffffffffffffffffffffffffff9"));
+    imported("capture_after_throw", 2, true);
+    const auto audit = graph.createOperation(OperationKind::kDpicCall);
+    graph.setAttr(audit, "targetImportSymbol", std::string("capture_after_throw"));
+    for (const auto value : {one, before, after}) graph.addOperand(audit, value);
+    const auto result = graph.createValue(Fixture::type(8)); graph.addResult(audit, result); graph.bindOutputPort("capture_throw_audit", result);
+    std::vector<grh::OperationId> writes;
+    for (const auto& [name, value] : std::vector<std::pair<std::string, grh::ValueId>>{{"capture_prefix", before}, {"capture_suffix", after}}) {
+        const auto state = fixture.state(name, 260, {2}); auto stateType = Fixture::type(260, {2}); stateType.isSigned = true;
+        grh::setStateLogicalType(graph, state, stateType);
+        grh::setStateInitSpec(graph, state, {{grh::InitKind::Fill, "130'h20000000000000000000000000000000b"}});
+        writes.push_back(fixture.write(OperationKind::kRegisterWriteArrayPort, state, {enable, index, value, clock}));
+        graph.bindOutputPort(name, fixture.read(state));
+    }
+    run(fixture.design, "grh-to-grhsim", fixture.session);
+    graph.replaceOperand(call, 0, one); graph.replaceOperand(audit, 0, one);
+    run(fixture.design, "grhsim-split-event-and-output", fixture.session);
+    run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=1"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-clone-shared=0"});
+    for (const auto op : {graph.valueDef(one), graph.valueDef(before), call, graph.valueDef(after)}) {
+        require(owner(graph, op).size() == 4 && owner(graph, op)[1] == "nonsink", "Interrupted capture fixture lost a nonsink constant source");
+        graph.setAttr(op, sim::kPartition, Owner{"general", "nonsink", "capture_throw_source", "source"});
+    }
+    graph.setAttr(audit, sim::kPartition, Owner{"general", "nonsink", "capture_throw_audit", "audit"});
+    run(fixture.design, "grhsim-partition-sink", fixture.session);
+    const std::string support = R"CPP(
+using CaptureWide = unsigned _BitInt(130);
+static bool captureThrowNext;
+extern "C" void capture_throw_once(const unsigned _BitInt(192)& before) {
+    assert(CaptureWide(before)==~CaptureWide(0)-2);
+    if(captureThrowNext) { captureThrowNext=false; throw std::runtime_error("expected capture interruption"); }
+}
+extern "C" std::uint8_t capture_after_throw(const unsigned _BitInt(192)& before,const unsigned _BitInt(192)& after) {
+    assert(CaptureWide(before)==~CaptureWide(0)-2 && after==0); return 29;
+}
+)CPP";
+    const std::string body = R"CPP(
+for(unsigned epoch=0; epoch<3; ++epoch) {
+    model.init(); model.capture_throw_clock=false; model.capture_throw_enable=true;
+    captureThrowNext=true; bool caught=false;
+    try { model.eval(); } catch(const std::runtime_error&) { caught=true; }
+    assert(caught);
+    model.capture_throw_clock=true; const auto before=model.perf_counters(); model.eval(); const auto after=model.perf_counters();
+    assert(model.capture_throw_audit==29);
+    if(CaptureWide(model.capture_prefix[0])!=~CaptureWide(0)-2 || model.capture_suffix[0]!=0) {
+        std::fprintf(stderr,"Interrupted capture epoch=%u commits=%llu writes=%llu\n",epoch,
+            static_cast<unsigned long long>(after.commitBatchExecCount-before.commitBatchExecCount),
+            static_cast<unsigned long long>(after.touchedWriteCount-before.touchedWriteCount));
+        model.dumpState(stderr);
+    }
+    assert(CaptureWide(model.capture_prefix[0])==~CaptureWide(0)-2 && model.capture_suffix[0]==0);
+    const CaptureWide untouched=(CaptureWide(1)<<129)|11;
+    assert(CaptureWide(model.capture_prefix[1])==untouched && CaptureWide(model.capture_suffix[1])==untouched);
+    assert(after.commitBatchExecCount-before.commitBatchExecCount==2);
+    assert(after.touchedWriteCount-before.touchedWriteCount==2 && after.touchedStateShadowCount-before.touchedStateShadowCount==2);
+    model.eval(); assert(model.perf_counters().touchedWriteCount==after.touchedWriteCount);
+}
+)CPP";
+    for (const auto budget : {16,1024}) for (const std::string specialization : {"on","off"}) {
+        const auto label = "large-capture-interrupted-b" + std::to_string(budget) + "-specialize-" + specialization;
+        manualCase(fixture, label, budget, support, body, false,
+            {{"large-capture-specialization", specialization}, {"mem-write-activate", "on-write"}});
+        const auto records = mappedRecords(readFile(artifact(label)/"model/code-map.json"), "operations");
+        for (unsigned i=0; i<writes.size(); ++i) {
+            const auto prefix = "{\"operation_id\":\"o" + std::to_string(writes[i].index) + "\",";
+            bool found = false;
+            for (const auto& record : records) if (record.starts_with(prefix))
+                for (const auto& capture : mappedRecords(record, "captures"))
+                    if (capture.find("\"role\":\"argument-3\"") != std::string::npos) {
+                        const bool physical = capture.find("largeSinkPayloadBoundaryStore.") != std::string::npos;
+                        require(physical == (i == 1 || specialization == "off"),
+                            "Interrupted prefix/suffix constant capture ignored its original publication point");
+                        found = true;
+                    }
+            require(found, "Interrupted capture lost its data argument metadata");
+        }
+    }
+}
+
 void testNumericSelects() {
     Fixture fixture; auto& graph = fixture.graph;
     const auto choose0 = fixture.input("select_c0"), choose1 = fixture.input("select_c1"), choose2 = fixture.input("select_c2");
@@ -4651,6 +5062,6 @@ int main() {
     // Append after testModels initializes the generated execution Makefile.
     try { testChunkWriter(); testModels(); testNamedModelStores(); testActivityBatchOrder(); testMultipleNonsinkActivation(); testLargeStoreConstruction(); testChunkExecution(); testEffectsAndCalls(); testDpiTriggerActivation(); testDpiIntegralAliases(); testDpiMixedTypes(); testSinkRunSharedCones(); testSinkPrivatePayloads(); testArrayViewsAndWide(); testContiguousArrayImages(); testLargeConcatExpressions(); testArrayViewElision(); testReadmemAndRandomInit(); testNonconvergence(); testMemoryActivationAndCancellation(); testWholeArrayBeforeImage(); testWaveformContents(); testExecutionCounters(); generateObservationModels(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
-    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
+    try { testSmallSinkBoundaries(); testSmallSinkPublishedEnables(); testSparsePhaseDispatch(); testMaskedViewBits(); testStaticArrayWindows(); testDynamicArrayBits(); testPackedArrayConstants(); testSinkRunCommonEnableFactors(); testSnapshotIdentityViews(); testLeafAssemblyViews(); testLeafAssemblyEdges(); testConditionalPackedScopes(); testGroupedNonsinkPublications(); testImmutableConstantSources(); testLargeCaptureMetadata(); testLargeLatchCaptures(); testLargeCaptureInterruptedConstants(); testNumericSelects(); testNarrowConstantLogicalShifts(); testSharedPayloadEnableSets(); testIndexedMemoryWake(); testIndexedMemoryWakeTemporal(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

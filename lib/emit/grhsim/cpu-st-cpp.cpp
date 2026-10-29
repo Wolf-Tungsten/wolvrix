@@ -236,12 +236,16 @@ private:
     std::unordered_set<OperationId, grh::OperationIdHash> wholeArrayStates_;
     std::unordered_map<OperationId, std::string, grh::OperationIdHash> stateNames_;
     std::unordered_map<OperationId, std::size_t, grh::OperationIdHash> largeWriteOrdinal_;
+    std::unordered_map<OperationId, std::size_t, grh::OperationIdHash> largeCommitEnableOrdinal_;
+    std::unordered_map<OperationId, std::vector<std::string>, grh::OperationIdHash> largeCaptureLiterals_;
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> fireExpressions_;
     std::unordered_map<ValueId, bool, grh::ValueIdHash> viewOnly_;
     std::unordered_map<ValueId, ValueId, grh::ValueIdHash> snapshotViews_;
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> constantSources_;
+    std::unordered_map<ValueId, std::string, grh::ValueIdHash> captureConstantSources_;
     std::unordered_map<ValueId, std::string, grh::ValueIdHash> constantStrings_;
     std::unordered_set<ValueId, grh::ValueIdHash> publishedConstants_;
+    std::unordered_set<ValueId, grh::ValueIdHash> publishedCaptureConstants_;
     std::unordered_set<OperationId, grh::OperationIdHash> identityElisions_;
     struct LeafPlan {
         enum class Kind { Source, Concat, Repeat, Mux };
@@ -283,6 +287,7 @@ private:
     bool hasTasks_ = false;
     bool activateOnWrite_ = false;
     bool enableBitmap_ = true;
+    bool specializeLargeCaptures_ = true;
     struct CounterSite { OperationId operation; std::string category, function; };
     std::string counterSnapshot_;
     std::string counterBinding_;
@@ -328,6 +333,12 @@ private:
     std::string nextStateRef(OperationId state) const { return fieldRef("smallSinkStore", name(state), "smallSinkStoreNext"); }
     std::vector<OperationId> topological(const std::vector<OperationId>& ops) const;
     void analyze();
+    void analyzeLargeCommitEnables();
+    std::string largeCaptureSource(OperationId op, std::size_t argument) const {
+        if (const auto found = largeCaptureLiterals_.find(op); found != largeCaptureLiterals_.end())
+            if (!found->second.at(argument).empty()) return found->second[argument];
+        return fieldRef("largeSinkPayloadBoundaryStore", captureName(op, argument));
+    }
     void analyzeIndexedReads();
     void activateState(std::vector<Code>& code, OperationId state);
     void touchState(std::vector<Code>& code, OperationId state, const std::string& start, int64_t count);
@@ -596,6 +607,11 @@ void CpuStEmitContext::analyze() {
         if (found->second != "on" && found->second != "off") throw std::invalid_argument("mem-enable-bitmap must be on or off");
         enableBitmap_ = found->second == "on";
     }
+    if (const auto found = options_.attributes.find("large-capture-specialization"); found != options_.attributes.end()) {
+        if (found->second != "on" && found->second != "off")
+            throw std::invalid_argument("large-capture-specialization must be on or off");
+        specializeLargeCaptures_ = found->second == "on";
+    }
     for (const auto& run : schedule_.largeCommitRuns) for (const auto writer : run.orderedWriters)
         if (!largeWriteOrdinal_.contains(writer)) largeWriteOrdinal_.emplace(writer, largeWriteOrdinal_.size());
     if (enableBitmap_ && !largeWriteOrdinal_.empty())
@@ -829,8 +845,11 @@ void CpuStEmitContext::analyze() {
         const auto type = graph_.valueLogicalType(id);
         if (type.kind == grh::ValueType::String)
             constantStrings_.emplace(id, "constant_" + valueName(id));
-        else if (type.kind == grh::ValueType::Logic && type.shape.empty() && type.width <= 64)
-            constantSources_.emplace(id, literal(bits(attr(op, "constValue"), type.width, type.isSigned), type));
+        else if (type.kind == grh::ValueType::Logic && type.shape.empty()) {
+            auto text = literal(bits(attr(op, "constValue"), type.width, type.isSigned), type);
+            if (type.width <= 64) constantSources_.emplace(id, text);
+            if (specializeLargeCaptures_) captureConstantSources_.emplace(id, std::move(text));
+        }
     }
     // Register capture fields before rendering accesses. Every function must
     // use the same layout regardless of the order in which writers are emitted.
@@ -853,6 +872,51 @@ void CpuStEmitContext::analyze() {
         const auto separator = reference.find('.');
         reference = fieldRef(reference.substr(0, separator), reference.substr(separator + 1));
     }
+    analyzeLargeCommitEnables();
+}
+
+void CpuStEmitContext::analyzeLargeCommitEnables() {
+    largeCommitEnableOrdinal_ = largeWriteOrdinal_;
+    if (!enableBitmap_ || !specializeLargeCaptures_) return;
+    const auto stable = [&](ValueId value) {
+        if (!value || !storage_.contains(value)) return false;
+        const auto type = graph_.valueLogicalType(value);
+        if (type.kind != grh::ValueType::Logic || !type.shape.empty()) return false;
+        const auto producer = graph_.valueDef(value);
+        if (!producer) return graph_.valueIsInput(value);
+        const auto& key = executionOwner(producer);
+        return key == Key{"event"} || (key.size() == 3 && key[0] == "general" && key[1] == "nonsink");
+    };
+    std::map<Key, const sim::SinkGroup*> groups;
+    for (const auto& group : schedule_.sinkGroups) groups.emplace(group.partitionKey, &group);
+    std::map<std::vector<uint32_t>, std::vector<OperationId>> equivalent;
+    for (const auto& run : schedule_.generalRuns) {
+        if (run.partitionKey[1] != "large-sink") continue;
+        const auto& group = *groups.at(run.partitionKey);
+        if ((group.fire && !stable(group.fire)) ||
+            !std::all_of(group.guards.begin(), group.guards.end(), stable)) continue;
+        for (const auto op : run.orderedWriters) {
+            const auto args = graph_.opOperands(op);
+            const bool latch = graph_.opKind(op) == sim::kLatchWrite;
+            const auto controls = latch ? 1u : 2u;
+            if (!std::all_of(args.begin(), args.begin() + controls, stable)) continue;
+            // Include the fresh run fire as well as the held capture operands.
+            // Equal values alone do not prove equal edge-triggered captures.
+            std::vector<uint32_t> signature{uint32_t(latch), group.fire.index};
+            for (std::size_t i = 0; i < controls; ++i) signature.push_back(args[i].index);
+            signature.push_back(uint32_t(group.guards.size()));
+            for (const auto guard : group.guards) signature.push_back(guard.index);
+            equivalent[signature].push_back(op);
+        }
+    }
+    for (const auto& [signature, writers] : equivalent) {
+        if (writers.size() < 2) continue;
+        auto bit = largeWriteOrdinal_.at(writers.front());
+        for (const auto op : writers) bit = std::min(bit, largeWriteOrdinal_.at(op));
+        for (const auto op : writers) largeCommitEnableOrdinal_[op] = bit;
+    }
+    // Keep every original capture bit and coarse word probe. General must
+    // return before LargeSink runs; a retry clears all bits before recapture.
 }
 
 void CpuStEmitContext::analyzeIndexedReads() {
@@ -1743,7 +1807,8 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     const bool wholeArray = !type.shape.empty() && !indexed && !masked &&
         (kind == sim::kWrite || kind == sim::kFill) && dataType == type;
     const bool inPlace = large(state);
-    const auto bit = inPlace && enableBitmap_ ? largeWriteOrdinal_.at(op) : 0;
+    const auto bit = inPlace && enableBitmap_ ?
+        (commit ? largeCommitEnableOrdinal_.at(op) : largeWriteOrdinal_.at(op)) : 0;
     const std::string enableWord = "largeSinkEnableBoundaryStore.words[" + std::to_string(bit / 64) + "]";
     const std::string enableMask = "(UINT64_C(1)<<" + std::to_string(bit % 64) + ")";
     const std::string enableSlot = inPlace ? (enableBitmap_ ? "(" + enableWord + " & " + enableMask + ")" :
@@ -1751,8 +1816,19 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
     if (inPlace && !commit) {
         // pGeneral resets all enables before its clock-guarded sink runs.
         std::vector<Code> capture;
+        auto& literals = largeCaptureLiterals_[op];
+        literals.resize(args.size());
         for (std::size_t i = latch ? 1 : 2; i < args.size(); ++i) {
             const auto argType = graph_.valueLogicalType(args[i]);
+            if (const auto found = captureConstantSources_.find(args[i]); found != captureConstantSources_.end()) {
+                const auto& producer = executionOwner(graph_.valueDef(args[i]));
+                if (producer == owner_ || (publishedCaptureConstants_.contains(args[i]) && ordinal_.contains(producer))) {
+                    // Record only the literal legal at this original capture.
+                    // Never substitute a held Assign or an interrupted suffix.
+                    literals[i] = found->second;
+                    continue;
+                }
+            }
             const std::string member = captureName(op, i);
             copy(capture, fieldRef("largeSinkPayloadBoundaryStore", member), argType, readSource(args[i]), argType);
         }
@@ -1761,7 +1837,7 @@ void CpuStEmitContext::writer(std::vector<Code>& code, OperationId op, bool comm
         return;
     }
     const auto value = [&](std::size_t i) {
-        return inPlace ? fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)) : readSource(args[i], true);
+        return inPlace ? largeCaptureSource(op, i) : readSource(args[i], true);
     };
     std::string condition = inPlace ? enableSlot : latch ? readSource(args[0]) : "(" + readSource(args[0]) + " && " + readSource(args[1]) + ")";
     std::string start = "0";
@@ -1976,8 +2052,10 @@ void CpuStEmitContext::buildPhases() {
             const auto ops = topological(members_.at(key));
             bool nonthrowingPrefix = true;
             for (const auto op : ops) {
-                if (nonthrowingPrefix) for (const auto value : graph_.opResults(op))
+                if (nonthrowingPrefix) for (const auto value : graph_.opResults(op)) {
                     if (constantSources_.contains(value)) publishedConstants_.insert(value);
+                    if (captureConstantSources_.contains(value)) publishedCaptureConstants_.insert(value);
+                }
                 const auto effect = grh::operationEffect(graph_, op);
                 if ((effect != grh::OpEffect::Pure && effect != grh::OpEffect::ReadState) ||
                     graph_.opKind(op) == sim::kSystemFunction)
@@ -3210,9 +3288,10 @@ void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFu
         if (indexedReads_.contains(op)) text("subscription", fieldRef("memoryReadIndexStore", subscriptionName(op)));
         if (const auto bit = largeWriteOrdinal_.find(op); bit != largeWriteOrdinal_.end()) {
             json.writeProperty("enable_bit"); json.writeValue(uint64_t(bit->second));
+            json.writeProperty("commit_enable_bit"); json.writeValue(uint64_t(largeCommitEnableOrdinal_.at(op)));
             json.writeProperty("captures"); json.startArray();
             for (std::size_t i = graph_.opKind(op) == sim::kLatchWrite ? 1 : 2; i < graph_.opOperands(op).size(); ++i)
-                reference("argument-" + std::to_string(i), fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)));
+                reference("argument-" + std::to_string(i), largeCaptureSource(op, i));
             json.endArray();
         }
         json.writeProperty("storage"); json.startArray();
@@ -3227,9 +3306,12 @@ void CpuStEmitContext::codeMap(std::ostream& output, const std::vector<WrittenFu
                 const auto bit = largeWriteOrdinal_.at(op);
                 reference("captured-enable", "(largeSinkEnableBoundaryStore.words[" + std::to_string(bit / 64) +
                     "] & (UINT64_C(1)<<" + std::to_string(bit % 64) + "))");
+                const auto commitBit = largeCommitEnableOrdinal_.at(op);
+                reference("captured-commit-enable", "(largeSinkEnableBoundaryStore.words[" + std::to_string(commitBit / 64) +
+                    "] & (UINT64_C(1)<<" + std::to_string(commitBit % 64) + "))");
             } else reference("captured-enable", fieldRef("largeSinkEnableBoundaryStore", captureName(op)));
             for (std::size_t i = graph_.opKind(op) == sim::kLatchWrite ? 1 : 2; i < graph_.opOperands(op).size(); ++i)
-                reference("captured-argument-" + std::to_string(i), fieldRef("largeSinkPayloadBoundaryStore", captureName(op, i)));
+                reference("captured-argument-" + std::to_string(i), largeCaptureSource(op, i));
         }
         json.endArray();
         json.endObject();
@@ -3452,7 +3534,9 @@ std::vector<std::string> CpuStEmitContext::generate(const std::filesystem::path&
     first = true;
     for (const auto& [file, hash] : initFiles_) { manifest << (first ? "" : ",") << quote(file) << ':' << quote(hash); first = false; }
     manifest << "},\n  \"profile_time_unit\": \"cycles-on-x86_64-nanoseconds-elsewhere\",\n  \"mem_write_activate\": " << quote(activateOnWrite_ ? "on-write" : "on-change")
-        << ",\n  \"mem_enable_bitmap\": " << (enableBitmap_ ? "true" : "false") << ",\n  \"nonsink_functions\": [";
+        << ",\n  \"mem_enable_bitmap\": " << (enableBitmap_ ? "true" : "false")
+        << ",\n  \"large_capture_specialization\": " << (specializeLargeCaptures_ ? "true" : "false")
+        << ",\n  \"nonsink_functions\": [";
     for (std::size_t ordinal = 0; ordinal < nonsink_.size(); ++ordinal) {
         const auto& key = nonsink_[ordinal];
         manifest << (ordinal ? "," : "") << "{\"ordinal\":" << ordinal << ",\"partition\":[";

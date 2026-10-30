@@ -5,12 +5,13 @@ The SystemVerilog frontend lives in `lib/ingest/sv.cpp`. Include
 `core/ingest.hpp` header has been removed.
 
 `ingest/ingest.hpp` defines the language-independent request and result types.
-It exposes no slang AST or SourceManager types. `readSources` currently supports
-SV requests. FIRRTL interface scanning now validates syntax and returns typed
-source owners and shared leaf signatures; see [FIRRTL parsing](firrtl-parser.md).
-FIRRTL lowering, explicit specialization, external binding and cross-language
-linking return an error diagnostic. Those entry points do not return an empty
-successful design. Mixed elaboration is a later implementation stage.
+It exposes no slang AST or SourceManager types. `readSources` supports SV requests
+and pure FIRRTL combinational requests. FIRRTL interface scanning validates syntax
+and returns typed source owners and shared leaf signatures; see
+[FIRRTL parsing](firrtl-parser.md) and [combinational lowering](firrtl-combinational.md).
+Registers, memories, effects, instances, explicit specialization, external binding
+and cross-language linking return an error diagnostic at this stage. A failed read
+does not return a partial design. Mixed elaboration is a later implementation stage.
 
 Node attribute utilities and primitive CSE isolation are implemented separately;
 see [node-attributes.md](node-attributes.md) for the current scope and schema.
@@ -74,5 +75,7 @@ make run_hdlbits_test DUT=001 SKIP_PY_INSTALL=1
 ```
 
 The CTest `ingest-driver` case exercises SV dispatch, ownership after releasing
-the original result, owned error locations, FIRRTL scanning and unsupported lowering. The session
+the original result, owned error locations, FIRRTL scanning and staged rejection
+of unsupported constructs. The FIRRTL suites also exercise actual combinational
+lowering and generated GrhSIM execution. The session
 tests cover failed replacement, diagnostics, clone/copy and argument-only reads.

@@ -109,9 +109,12 @@ struct ExternalBinding {
     std::vector<PortBinding> ports;
 };
 
+enum class FirrtlInvalidPolicy { Unknown, Zero };
+
 struct FirrtlOptions {
     std::optional<std::string> expectedVersion;
     bool nodeAnnotations = true;
+    FirrtlInvalidPolicy invalidPolicy = FirrtlInvalidPolicy::Unknown;
 };
 
 struct IngestRequest {

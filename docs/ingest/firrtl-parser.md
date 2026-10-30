@@ -27,9 +27,10 @@ are rejected instead of being silently rewritten.
 An index success is explicitly an interface result. An unknown statement in a
 body can pass indexing and must fail body validation. `scanFirrtlInterfaces`
 and the shared `scanInterfaces` entry point perform both operations before
-reporting success. `readFirrtl` performs the same checks, then returns a located
-"lowering is not supported yet" error and no design. Parsing does not publish a
-partial executable design or create GRH node attributes; lowering starts in F04.
+reporting success. `readFirrtl` performs the same checks, then lowers selected
+combinational modules as described in [firrtl-combinational.md](firrtl-combinational.md).
+Unsupported behavioral constructs return located errors and no design. Parsing
+alone does not publish an executable design or create GRH node attributes.
 
 ```cpp
 #include "ingest/firrtl.hpp"

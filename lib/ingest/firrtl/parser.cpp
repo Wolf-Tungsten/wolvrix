@@ -343,7 +343,7 @@ ExprId Parser::expression(bool property) {
                  word == "andr" || word == "orr" || word == "xorr") count = 1;
         else if (word == "pad" || word == "shl" || word == "shr" || word == "head" || word == "tail") { count = 1; integers = 1; }
         else if (word == "bits") { count = 1; integers = 2; }
-        else if (word == "cat") count = -2; // Chisel's variadic textual form is retained.
+        else if (word == "cat") count = -1;
         else if (property && (word == "integer_add" || word == "integer_mul" || word == "integer_shr" ||
                  word == "integer_shl" || word == "prop_eq" || word == "bool_and" || word == "bool_or" || word == "bool_xor")) {
             count = 2; result.kind = ExprKind::PropertyOperation;
@@ -360,7 +360,6 @@ ExprId Parser::expression(bool property) {
         }
         if (count < 0) {
             if (!at(")")) do { result.operands.push_back(expression(property)); } while (accept(","));
-            if (count == -2 && result.operands.size() < 2) fail("cat requires at least two operands");
         } else {
             for (int i = 0; i < count; ++i) { if (i) expect(","); result.operands.push_back(expression(property)); }
             for (int i = 0; i < integers; ++i) { expect(","); result.operands.push_back(integerExpression()); }

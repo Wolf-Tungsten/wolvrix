@@ -126,6 +126,8 @@ set(WOLVRIX_LIB_SOURCES
     lib/ingest/firrtl/source.cpp
     lib/ingest/firrtl/lexer.cpp
     lib/ingest/firrtl/parser.cpp
+    lib/ingest/firrtl/semantic.cpp
+    lib/ingest/firrtl/lower.cpp
     lib/core/transform.cpp
     lib/transform/activity_schedule.cpp
     lib/transform/grhsim/ops.cpp
@@ -802,13 +804,15 @@ target_compile_definitions(transform-repcut-partition-count
 
 register_test_exe(transform-repcut-partition-count)
 
-# ingest: FIRRTL node metadata and primitive CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser)
+# ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
+foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)
     target_compile_definitions(${test_name} PRIVATE
         WOLVRIX_FIRRTL_TEST_DATA_DIR="${WOLF_SV_INGEST_TEST_DATA_DIR}/firrtl"
+        WOLVRIX_FIRRTL_TEST_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts"
+        WOLVRIX_FIRRTL_FST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/external/libfst/src"
     )
     register_test_exe(${test_name})
 endforeach()

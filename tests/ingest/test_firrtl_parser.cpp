@@ -115,6 +115,8 @@ void errors() {
     require(!parsed.success() && parsed.diagnostics.size() >= 2, "parser did not recover across independent invalid statements");
     require(parsed.diagnostics[0].context == "T" && parsed.diagnostics[0].location->sourceInfo == "@[original.scala 4:5]",
             "original source info/current module not included in error");
+    require(parsed.diagnostics[0].location->line == 6 && parsed.diagnostics[0].location->column == 20,
+            "body diagnostic line/column did not identify the invalid operand");
     auto owned = parsed.diagnostics; parsed = {}; recover = {};
     require(owned[0].location->sourceLine.find("add(a,)") != std::string::npos, "diagnostics did not own source snippets");
 }
@@ -196,9 +198,43 @@ void signaturesAndRequests() {
     require(fi::decodeString("\"x\\\";]\\t\\n\\\\\"") == "x\";]\t\n\\", "string decoding changed escaped content");
     require(fi::decodeString("\"\\{{SimulationTime}}\"") == "{{SimulationTime}}", "escaped format substitution rejected");
 }
+
+void resourceAndLineBoundaries() {
+    const std::string literal = "0h" + std::string(256, 'f');
+    auto text = design("    node wide = UInt<1024>(" + literal + ") @[wide.scala 7:9]\n");
+    text.pop_back(); // EOF may terminate the final statement without a physical newline.
+    std::string crlf;
+    for (const char c : text) {
+        if (c == '\n') crlf += '\r';
+        crlf += c;
+    }
+    auto indexed = fi::indexText(std::move(crlf), "wide.fir", "wide");
+    require(indexed.success(), "CRLF input without a final newline failed indexing");
+    auto parsed = fi::parseModule(indexed.source, 0);
+    require(parsed.success(), "CRLF input without a final newline failed body validation");
+    const auto& statement = parsed.body->arena.statements.at(parsed.body->statements.at(0));
+    const auto& expression = parsed.body->arena.expressions.at(statement.operands.at(0));
+    require(expression.literal == literal && parsed.body->arena.types.at(expression.type).width == 1024,
+            "wide literal spelling or explicit type width was truncated");
+    require(statement.range.info == "@[wide.scala 7:9]", "EOF statement lost its original source info");
+
+    std::string invalid;
+    for (int i = 0; i < 100; ++i) invalid += "    mystery bad\n";
+    indexed = fi::indexText(design(invalid), "many-errors.fir", "many-errors");
+    require(indexed.success(), "interface index unexpectedly retained body errors");
+    parsed = fi::parseModule(indexed.source, 0);
+    require(!parsed.success() && parsed.diagnostics.size() == 32,
+            "independent body errors must recover and stop at the documented diagnostic limit");
+
+    std::string nested;
+    for (int i = 0; i < 300; ++i) nested += "not(";
+    nested += "a";
+    nested.append(300, ')');
+    bad(design("    node n = " + nested + "\n"), "nesting limit exceeded");
+}
 }
 int main() {
-    try { validFixture(); errors(); propertiesAndInterning(); memoryPortScope(); signaturesAndRequests(); }
+    try { validFixture(); errors(); propertiesAndInterning(); memoryPortScope(); signaturesAndRequests(); resourceAndLineBoundaries(); }
     catch (const std::exception& error) { std::cerr << "[firrtl-parser] " << error.what() << '\n'; return 1; }
     return 0;
 }

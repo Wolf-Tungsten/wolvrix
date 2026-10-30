@@ -105,6 +105,8 @@ source info and current module. Recovery continues at statement/block boundaries
 diagnostics are capped at 32. Syntax and alias nesting have explicit limits.
 No failed index exposes a usable source, and callers must check a module result's
 success before consuming its possibly partial body.
+Regression cases also check CRLF, EOF without a final newline, unchanged 1024-bit
+literal text, recovery up to the diagnostic limit, and excessive nesting.
 
 ## Shared-driver signatures
 
@@ -158,6 +160,8 @@ make test_firrtl_parser
 make inspect_firrtl_inputs FIRRTL_INPUT=/path/to/SimTop.fir
 make inspect_firrtl_inputs FIRRTL_INPUT=/path/to/SimTop.fir FIRRTL_INSPECT_FLAGS='--module SimTop'
 make inspect_firrtl_inputs FIRRTL_INPUT=/path/to/SimTop.fir FIRRTL_INSPECT_FLAGS='--index-only'
+make test_firrtl_parser_inputs
+make verify_firrtl_inputs
 make test_wolvrix
 ```
 
@@ -168,3 +172,18 @@ It returns nonzero for parse/signature errors. Logs and workflow temporary files
 belong under `ptmp/firrtl-ingest/F03/`; checked-in fixtures are under
 `tests/ingest/data/firrtl/`. Performance numbers and the exact local large-input
 identities are recorded in the playground's F03 implementation record.
+
+The playground's `pdocs/firrtl-ingest/inputs.json` freezes the acceptance input.
+`verify_firrtl_inputs` checks the FIRRTL, parser fixtures, generated SV inventory,
+generation log and cached specification before running the inspector. It requires
+successful validation of every module body, compares all persistent syntax and
+interface counters, then hashes the inputs again to detect changes during the
+run. The full SV file inventory and inspection log are written under
+`ptmp/firrtl-ingest/F03/input-verify/`. This gate checks syntax and input identity;
+SV binding and behavioral equivalence remain later stages.
+
+`freeze_firrtl_inputs` captures a new manifest after the same validation and
+refuses to overwrite an existing one. To evaluate a different input, supply a new
+`FIRRTL_INPUT_MANIFEST` path together with `FIRRTL_INPUT`,
+`FIRRTL_INPUT_SV_FILELIST`, `FIRRTL_INPUT_GENERATION_LOG` and `FIRRTL_INPUT_SPEC`.
+The specification cache must contain the pinned revision referenced above.

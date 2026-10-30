@@ -1,4 +1,5 @@
 #include "transform/const_fold.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include "core/grh.hpp"
 #include "core/transform.hpp"
@@ -945,7 +946,8 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueId aliased = newValue;
             try
             {
-                aliased = graph.replaceAllUsesWithView(oldValue, newValue);
+                const auto replacement = ingest::node::redirectRoots(graph, oldValue, newValue);
+                aliased = graph.replaceAllUsesWithView(oldValue, replacement);
             }
             catch (const std::exception &ex)
             {
@@ -1283,7 +1285,8 @@ namespace wolvrix::lib::transform
             {
                 continue;
             }
-            if (ctx.graph.opKind(baseDefId) != wolvrix::lib::grh::OperationKind::kConcat)
+            if (!ingest::node::mayInline(ctx.graph, opId, baseDefId) ||
+                ctx.graph.opKind(baseDefId) != wolvrix::lib::grh::OperationKind::kConcat)
             {
                 continue;
             }
@@ -1745,6 +1748,7 @@ namespace wolvrix::lib::transform
             for (const auto &graphEntry : design().graphs())
             {
                 wolvrix::lib::grh::Graph &graph = *graphEntry.second;
+                ingest::node::requireValid(graph);
 
                 // Create per-graph context with fresh state
                 GraphFoldContext ctx{

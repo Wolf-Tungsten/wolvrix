@@ -3,6 +3,7 @@
 #include "core/grh.hpp"
 #include "core/op_descriptor.hpp"
 #include "core/state.hpp"
+#include "ingest/node_attributes.hpp"
 #include "transform/grhsim/ops.hpp"
 
 #include <cstdint>
@@ -240,6 +241,8 @@ namespace wolvrix::lib::transform
 
             try
             {
+                for (const auto& problem : ingest::node::inspect(*graph).errors)
+                    error(*graph, "grh.verify: " + problem);
                 if (const std::string problem = grhsim::verifyGraph(*graph); !problem.empty())
                     error(*graph, "grh.verify: " + problem);
             }
@@ -929,7 +932,7 @@ namespace wolvrix::lib::transform
                         // Region ownership and sampling are common execution
                         // annotations checked by grhsim::verifyGraph above;
                         // they do not change arrayCreate's operand geometry.
-                        valid = valid && (attr.key == "originModules" ||
+                        valid = valid && (ingest::node::isAttribute(attr.key) || attr.key == "originModules" ||
                             attr.key == grhsim::kPartition || attr.key == "grhsim.sampleBoundary" ||
                             attr.key == "grhsim.activity");
                     if (!valid)

@@ -57,6 +57,12 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `attrs`: 可选属性对象，键为属性名，值为属性负载。
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 
+FIRRTL node 信息也使用现有 metadata/attrs 负载：Graph 的
+`firrtl.nodeSchema` 为整数 1；op 的 `firrtl.node.members`、`roots`、`origins`
+为字符串数组，`firrtl.node.rootResults` 为与 roots 等长的整数数组，记录当前
+op 的 result 序号。身份 key 和根映射不保存裸实体 ID。具体字段和 verifier
+约束见 [node 属性](../ingest/node-attributes.md)，不增加独立 JSON 方言。
+
 ## 存储单元 Port 操作
 - 存储声明类操作使用 `sym` 作为声明名，`attrs` 仅承载类型信息。
 - `kRegister`

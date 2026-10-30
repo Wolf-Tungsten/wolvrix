@@ -97,6 +97,15 @@ pass 调用内合并。同一操作最多在队列中出现一次，已擦除操
 签名未过期；类型与 shape 检查继续
 限制可合并的值。该队列与签名表只在一次图处理内存在，不跨 simplify 迭代缓存。
 
+带 `firrtl.node.*` attrs 的图从第一次 simplify 起执行 node 作用域约束：
+功能签名排除这些来源属性，但 primitive CSE 还必须匹配 members 作用域。
+不同源 node 的内部公共计算保持独立；无标注 SV 不与受保护区域合并。
+完整执行 leaf 确定后，CSE 可在同一 leaf 内共享，不能跨执行归属。
+常量仍可去重，纯别名可以简化；结果根转到输入或另一个 node 时用透明
+`kAssign` 保存映射。数组归一化与局部融合也遵守该边界，细节见
+[node 属性合约](../ingest/node-attributes.md)。完整 node 判等与共享门槛属于
+后续独立 pass，不由本 pass 的 primitive CSE 实现。
+
 ## CSE 候选条件
 
 要成为 CSE 候选，运算必须：

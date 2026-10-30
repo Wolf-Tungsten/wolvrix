@@ -142,13 +142,13 @@ bool canonicalize(Scope& scope, OperationId op)
         const auto hi = attribute<int64_t>(graph, op, "sliceEnd").value();
         if (lo == 0 && hi + 1 == graph.valueWidth(args[0])) return alias(args[0]);
         const auto source = graph.valueDef(args[0]);
-        if (scope.contains(source) && graph.opKind(source) == OperationKind::kSliceStatic) {
+        if (scope.mayInline(op, source) && graph.opKind(source) == OperationKind::kSliceStatic) {
             const auto start = attribute<int64_t>(graph, source, "sliceStart").value();
             detail::replaceOperands(graph, op, graph.opOperands(source));
             graph.setAttr(op, "sliceStart", start + lo); graph.setAttr(op, "sliceEnd", start + hi);
             detail::mergeOrigins(graph, op, {source}); return true;
         }
-        if (scope.contains(source) && (graph.opKind(source) == OperationKind::kConcat || graph.opKind(source) == OperationKind::kArrayCreate)) {
+        if (scope.mayInline(op, source) && (graph.opKind(source) == OperationKind::kConcat || graph.opKind(source) == OperationKind::kArrayCreate)) {
             const auto parts = graph.opOperands(source);
             int64_t offset = 0;
             for (std::size_t i = 0; i < parts.size(); ++i) {
@@ -167,7 +167,7 @@ bool canonicalize(Scope& scope, OperationId op)
     if (kind == OperationKind::kSliceArray && args.size() >= 2) {
         const auto source = graph.valueDef(args[0]);
         const auto index = constant(args[1]);
-        if (scope.contains(source) && graph.opKind(source) == OperationKind::kArrayCreate && index &&
+        if (scope.mayInline(op, source) && graph.opKind(source) == OperationKind::kArrayCreate && index &&
             !index->hasUnknown() && !index->isNegative()) {
             const auto row = index->as<uint64_t>();
             const auto elements = graph.opOperands(source);
@@ -195,7 +195,7 @@ bool canonicalize(Scope& scope, OperationId op)
     }
     if (kind == OperationKind::kAssign && args.size() == 1 && !type.shape.empty()) {
         const auto source = graph.valueDef(args[0]);
-        if (scope.contains(source) && graph.opKind(source) == OperationKind::kConcat) {
+        if (scope.mayInline(op, source) && graph.opKind(source) == OperationKind::kConcat) {
             const auto parts = graph.opOperands(source);
             if (!parts.empty()) {
                 auto elementType = graph.valueLogicalType(parts[0]);
@@ -227,7 +227,7 @@ bool canonicalize(Scope& scope, OperationId op)
     }
     if ((kind == OperationKind::kNot || kind == OperationKind::kLogicNot) && args.size() == 1) {
         const auto source = graph.valueDef(args[0]);
-        if (scope.contains(source) && graph.opKind(source) == kind &&
+        if (scope.mayInline(op, source) && graph.opKind(source) == kind &&
             (kind == OperationKind::kNot || (type.width == 1 && graph.valueWidth(graph.opOperands(source)[0]) == 1)))
             return alias(graph.opOperands(source)[0]);
     }
@@ -280,7 +280,7 @@ bool muxChains(Scope& scope)
         while (chain.size() < 64) {
             const auto tail = graph.opOperands(chain.back())[2];
             const auto next = graph.valueDef(tail);
-            if (!eligible(next) || scope.exported(tail) || scope.anchored(next) ||
+            if (!eligible(next) || !scope.mayInline(op, next) || scope.exported(tail) || scope.anchored(next) ||
                 graph.valueUsers(tail).size() != 1) break;
             chain.push_back(next);
         }
@@ -334,11 +334,12 @@ public:
     std::string bytes;
 };
 
-std::string cseKey(const Graph& graph, OperationId op) {
+std::string cseKey(const Graph& graph, OperationId op, bool nodeScopes) {
     CseKey key;
     key.bytes.reserve(96);
     const bool history = graph.opKind(op) == kEdgeDetect;
     key.scalar(static_cast<uint32_t>(graph.opKind(op)));
+    if (nodeScopes) key.text(ingest::node::cseScope(graph, op));
     const auto operands = graph.opOperands(op), results = graph.opResults(op);
     key.scalar(static_cast<uint64_t>(operands.size()));
     for (const auto value : operands) {
@@ -348,7 +349,7 @@ std::string cseKey(const Graph& graph, OperationId op) {
     for (const auto value : results) key.type(graph, value);
     std::vector<const AttrKV*> attributes;
     for (const auto& entry : graph.opAttrs(op))
-        if (entry.key != kPartition && entry.key != kOriginModulesKey &&
+        if (entry.key != kPartition && entry.key != kOriginModulesKey && !ingest::node::isAttribute(entry.key) &&
             !(history && entry.key == "prevInitFallback")) attributes.push_back(&entry);
     std::sort(attributes.begin(), attributes.end(), [](const auto* left, const auto* right) { return left->key < right->key; });
     for (const auto* entry : attributes) {
@@ -364,6 +365,7 @@ bool foldAndShare(Scope& scope, std::span<const OperationId> ordered)
 {
     auto& graph = scope.graph;
     bool changed = false;
+    const bool nodeScopes = graph.metadata(ingest::node::kSchema).has_value();
     std::unordered_map<std::string, ValueId> expressions;
     for (const auto op : ordered) {
         if (!scope.contains(op)) continue;
@@ -401,9 +403,10 @@ bool foldAndShare(Scope& scope, std::span<const OperationId> ordered)
             graph.sameValueType(result, graph.opOperands(op)[0])) continue;
         if (!canCseOperation(graph, op) && graph.opKind(op) != kEdgeDetect) continue;
         if (ordered.size() == 1) continue; // No second expression in this leaf can share it.
-        const auto key = cseKey(graph, op);
+        const auto key = cseKey(graph, op, nodeScopes);
         const auto [it, inserted] = expressions.emplace(key, result);
         if (!inserted && it->second != result) {
+            ingest::node::mergeCseOperations(graph, graph.valueDef(it->second), op);
             detail::mergeOrigins(graph, graph.valueDef(it->second), {op});
             changed = scope.alias(op, it->second) || changed;
         }

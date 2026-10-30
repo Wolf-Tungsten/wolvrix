@@ -16,6 +16,9 @@ struct Matcher {
     detail::Scope& scope;
     Graph& graph;
     int32_t width;
+    OperationId root;
+
+    bool contains(OperationId op) const { return scope.mayInline(root, op); }
 
     bool twoState(ValueId value) const { return detail::twoState(graph.valueLogicalType(value)); }
     std::optional<slang::SVInt> constant(ValueId value) const {
@@ -23,7 +26,7 @@ struct Matcher {
     }
     bool zero(ValueId value) const { const auto bits = constant(value); return bits && detail::isZero(*bits); }
     bool isOr(OperationId op) const {
-        if (!scope.contains(op) || graph.opKind(op) != OperationKind::kOr || graph.opOperands(op).size() != 2 ||
+        if (!contains(op) || graph.opKind(op) != OperationKind::kOr || graph.opOperands(op).size() != 2 ||
             graph.opResults(op).size() != 1) return false;
         if (!twoState(graph.opResults(op)[0]) || graph.valueWidth(graph.opResults(op)[0]) != width) return false;
         for (const auto value : graph.opOperands(op)) if (!twoState(value) || graph.valueWidth(value) != width) return false;
@@ -32,7 +35,7 @@ struct Matcher {
     ValueId strip(ValueId value) const {
         for (unsigned depth = 0; depth < 128; ++depth) {
             const auto op = graph.valueDef(value);
-            if (!scope.contains(op)) break;
+            if (!contains(op)) break;
             const auto args = graph.opOperands(op);
             if (args.size() != 1 || !twoState(args[0]) || graph.valueWidth(args[0]) != graph.valueWidth(value)) break;
             const auto kind = graph.opKind(op);
@@ -45,7 +48,7 @@ struct Matcher {
     View view(ValueId value, int64_t offset, int32_t bits) const {
         for (unsigned depth = 0; depth < 128; ++depth) {
             const auto op = graph.valueDef(value);
-            if (!scope.contains(op)) break;
+            if (!contains(op)) break;
             const auto args = graph.opOperands(op);
             const auto kind = graph.opKind(op);
             const auto alias = strip(value);
@@ -94,14 +97,14 @@ struct Matcher {
         value = strip(value);
         if (width == 1 && graph.valueWidth(value) == 1) return value;
         const auto op = graph.valueDef(value);
-        if (!scope.contains(op) || graph.opKind(op) != OperationKind::kReplicate || graph.opOperands(op).size() != 1) return {};
+        if (!contains(op) || graph.opKind(op) != OperationKind::kReplicate || graph.opOperands(op).size() != 1) return {};
         const auto bit = graph.opOperands(op)[0];
         return graph.valueWidth(bit) == 1 && graph.valueWidth(value) >= width && twoState(bit) ? std::optional(bit) : std::nullopt;
     }
     std::optional<Term> term(ValueId value) const {
         value = strip(value);
         const auto op = graph.valueDef(value);
-        if (!scope.contains(op)) return {};
+        if (!contains(op)) return {};
         const auto args = graph.opOperands(op);
         const auto kind = graph.opKind(op);
         if ((kind == OperationKind::kMux || (kind == kBitSelect && width == 1)) && args.size() == 3 &&
@@ -128,7 +131,7 @@ struct Matcher {
                 }
             }
             const auto node = graph.valueDef(current);
-            if (!scope.contains(node) || graph.opKind(node) != OperationKind::kAnd || graph.opOperands(node).size() != 2) continue;
+            if (!contains(node) || graph.opKind(node) != OperationKind::kAnd || graph.opOperands(node).size() != 2) continue;
             const auto inputs = graph.opOperands(node);
             if (!twoState(inputs[0]) || !twoState(inputs[1]) || graph.valueWidth(inputs[0]) < width || graph.valueWidth(inputs[1]) < width) continue;
             factors.push_back({inputs[0], inputs[1], i}); factors.push_back({inputs[1], inputs[0], i});
@@ -145,7 +148,7 @@ bool recover(detail::Scope& scope, uint32_t minimum, std::ostream* report, std::
     for (const auto op : operations) {
         if (!scope.contains(op) || graph.opResults(op).size() != 1) continue;
         const auto result = graph.opResults(op)[0];
-        Matcher matcher{scope, graph, graph.valueWidth(result)};
+        Matcher matcher{scope, graph, graph.valueWidth(result), op};
         if (!matcher.isOr(op)) continue;
         const auto resultView = graph.getValue(result);
         const auto uses = resultView.users();

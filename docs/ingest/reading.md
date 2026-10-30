@@ -11,6 +11,9 @@ external binding and cross-language linking return an error diagnostic. Those
 entry points do not return an empty successful design. FIRRTL parsing and mixed
 elaboration are separate implementation stages.
 
+Node attribute utilities and primitive CSE isolation are implemented separately;
+see [node-attributes.md](node-attributes.md) for the current scope and schema.
+
 ```cpp
 #include "ingest/ingest.hpp"
 

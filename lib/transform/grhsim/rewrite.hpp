@@ -3,6 +3,7 @@
 
 #include "transform/grhsim/ops.hpp"
 #include "core/transform.hpp"
+#include "ingest/node_attributes.hpp"
 #include "slang/numeric/SVInt.h"
 
 #include <algorithm>
@@ -84,7 +85,8 @@ inline void replaceOperands(Graph& graph, OperationId op, std::span<const ValueI
 inline void rewrite(Graph& graph, OperationId op, OperationKind kind, std::span<const ValueId> operands) {
     std::vector<std::string> erase;
     for (const auto& attr : graph.opAttrs(op))
-        if (attr.key != kPartition && attr.key != kOriginModulesKey) erase.emplace_back(attr.key);
+        if (attr.key != kPartition && attr.key != kOriginModulesKey && !ingest::node::isAttribute(attr.key))
+            erase.emplace_back(attr.key);
     for (const auto& key : erase) graph.eraseAttr(op, key);
     replaceOperands(graph, op, operands);
     graph.setOpKind(op, kind);
@@ -104,6 +106,7 @@ inline ValueId makeOperation(Graph& graph, OperationId source, OperationKind kin
     graph.addResult(op, result);
     if (const auto partition = attribute<Owner>(graph, source, kPartition)) graph.setAttr(op, kPartition, *partition);
     inheritOrigin(graph, op, {source});
+    ingest::node::copyMembers(graph, source, op);
     graph.setOpSrcLoc(op, makeTransformSrcLoc("grhsim-simplify"));
     return result;
 }
@@ -151,7 +154,8 @@ inline std::string expressionKey(const Graph& graph, OperationId op, bool histor
     for (const auto value : graph.opResults(op)) encode(out, graph.valueLogicalType(value));
     std::vector<std::pair<std::string, AttributeValue>> attrs;
     for (const auto& entry : graph.opAttrs(op)) {
-        if (entry.key == kPartition || entry.key == kOriginModulesKey || (history && entry.key == "prevInitFallback")) continue;
+        if (entry.key == kPartition || entry.key == kOriginModulesKey || ingest::node::isAttribute(entry.key) ||
+            (history && entry.key == "prevInitFallback")) continue;
         auto value = entry.value;
         if (history && entry.key == "prevInit") value = slang::SVInt::fromString(std::get<std::string>(value)).toString();
         attrs.emplace_back(entry.key, std::move(value));
@@ -201,6 +205,9 @@ struct Scope {
         return partition.empty();
     }
     bool local(ValueId value) const { return contains(graph.valueDef(value)); }
+    bool mayInline(OperationId consumer, OperationId producer) const {
+        return contains(producer) && ingest::node::mayInline(graph, consumer, producer);
+    }
     bool anchored(ValueId value) const { return (sharedAnchors ? *sharedAnchors : anchors).contains(graph.valueSymbol(value).value); }
     bool anchored(OperationId op) const { return (sharedAnchors ? *sharedAnchors : anchors).contains(graph.operationSymbol(op).value); }
     bool exported(ValueId value) const {
@@ -218,13 +225,16 @@ struct Scope {
             if (type.width != from.width || type.kind != from.kind || type.domain != from.domain) return false;
         }
         const auto args = graph.opOperands(op);
+        const bool keepRoot = ingest::node::annotated(graph, op) && !ingest::node::read(graph, op).roots.empty() &&
+            (!graph.valueDef(input) || !ingest::node::sameScope(graph, op, graph.valueDef(input)));
         if (graph.opKind(op) == OperationKind::kAssign && args.size() == 1 && args[0] == input &&
-            (exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input))) return false;
-        if (exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input)) {
+            (keepRoot || exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input))) return false;
+        if (keepRoot || exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input)) {
             rewrite(graph, op, OperationKind::kAssign, std::array{input});
         } else {
             mergeOrigins(graph, graph.valueDef(input), {op});
-            graph.replaceAllUses(result, input);
+            const auto replacement = ingest::node::redirectRoots(graph, result, input);
+            graph.replaceAllUses(result, replacement);
             graph.eraseOp(op);
             erased.insert(op);
             graph.eraseValue(result);

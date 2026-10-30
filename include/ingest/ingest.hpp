@@ -50,7 +50,12 @@ struct IntegerParameter {
     bool operator==(const IntegerParameter&) const = default;
 };
 
-using ParameterValue = std::variant<IntegerParameter, std::string, double>;
+struct RawStringParameter {
+    std::string text;
+    bool operator==(const RawStringParameter&) const = default;
+};
+
+using ParameterValue = std::variant<IntegerParameter, std::string, double, RawStringParameter>;
 
 struct ModuleParameter {
     std::string name;
@@ -68,6 +73,10 @@ struct PortLeafSignature {
     int32_t elementWidth = 0;
     bool isSigned = false;
     std::vector<int64_t> shape;
+    // Scanning retains source semantics before width/reset/ABI resolution.
+    std::string sourceType;
+    bool requiresTypeResolution = false;
+    bool isConst = false;
 };
 
 struct ModuleSignature {

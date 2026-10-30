@@ -6,10 +6,11 @@ The SystemVerilog frontend lives in `lib/ingest/sv.cpp`. Include
 
 `ingest/ingest.hpp` defines the language-independent request and result types.
 It exposes no slang AST or SourceManager types. `readSources` currently supports
-SV requests; FIRRTL interface scanning, FIRRTL lowering, explicit specialization,
-external binding and cross-language linking return an error diagnostic. Those
-entry points do not return an empty successful design. FIRRTL parsing and mixed
-elaboration are separate implementation stages.
+SV requests. FIRRTL interface scanning now validates syntax and returns typed
+source owners and shared leaf signatures; see [FIRRTL parsing](firrtl-parser.md).
+FIRRTL lowering, explicit specialization, external binding and cross-language
+linking return an error diagnostic. Those entry points do not return an empty
+successful design. Mixed elaboration is a later implementation stage.
 
 Node attribute utilities and primitive CSE isolation are implemented separately;
 see [node-attributes.md](node-attributes.md) for the current scope and schema.
@@ -73,5 +74,5 @@ make run_hdlbits_test DUT=001 SKIP_PY_INSTALL=1
 ```
 
 The CTest `ingest-driver` case exercises SV dispatch, ownership after releasing
-the original result, owned error locations and unsupported frontends. The session
+the original result, owned error locations, FIRRTL scanning and unsupported lowering. The session
 tests cover failed replacement, diagnostics, clone/copy and argument-only reads.

@@ -82,11 +82,11 @@ int main() {
     }
 
     IngestRequest firrtl;
-    firrtl.sources.push_back({SourceLanguage::Firrtl, "not-read-until-F03.fir", "firrtl"});
-    if (scanFirrtlInterfaces(firrtl).success || scanFirrtlInterfaces(firrtl).diagnostics.empty() ||
-        scanInterfaces(firrtl).diagnostics.empty() || scanSvInterfaces(request).success ||
+    firrtl.inputRoot = WOLVRIX_INGEST_TEST_DATA_DIR;
+    firrtl.sources.push_back({SourceLanguage::Firrtl, "firrtl/parser.fir", "firrtl"});
+    if (!scanFirrtlInterfaces(firrtl).success || !scanInterfaces(firrtl).success || scanSvInterfaces(request).success ||
         !unsupported(readFirrtl(firrtl)) || !unsupported(readSources(firrtl))) {
-        return fail("FIRRTL and interface scan placeholders must explicitly reject unsupported work");
+        return fail("FIRRTL scans must validate syntax while lowering remains explicitly unsupported");
     }
     firrtl.sources.push_back(request.sources.front());
     if (!unsupported(readSources(firrtl)) ||

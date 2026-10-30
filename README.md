@@ -164,6 +164,7 @@ If you are new to Wolvrix, read these in order:
 3. [docs/python/python-binding-architecture.md](docs/python/python-binding-architecture.md)
 4. [docs/grhsim.md](docs/grhsim.md)
 5. [Ingest requests and source ownership](docs/ingest/reading.md)
+6. [FIRRTL parser and interface index](docs/ingest/firrtl-parser.md)
 
 ## Tests
 

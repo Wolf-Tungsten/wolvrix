@@ -1,6 +1,6 @@
 #include "native/session/storage.hpp"
 
-#include "slang/ast/Compilation.h"
+#include "ingest/sv.hpp"
 
 #include <cctype>
 #include <fstream>
@@ -117,11 +117,11 @@ namespace wolvrix::app::pybind
     {
         const std::string ownedKey(key);
         auto it = session.designs.find(ownedKey);
-        if (it == session.designs.end() || !it->second.compilation)
+        if (it == session.designs.end())
         {
             return nullptr;
         }
-        return it->second.compilation->getSourceManager();
+        return wolvrix::lib::ingest::svSourceManager(it->second.sourceOwners);
     }
 
     wolvrix::lib::grh::Design *sessionDesign(SessionHandle &session, std::string_view key)

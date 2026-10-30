@@ -306,6 +306,10 @@ namespace wolvrix::app::pybind
             PyErr_SetString(PyExc_KeyError, error.c_str());
             return nullptr;
         }
+        if (std::string_view(src) == dst)
+        {
+            Py_RETURN_NONE;
+        }
         if (replace)
         {
             sessionEraseKey(*session, dst);
@@ -317,7 +321,7 @@ namespace wolvrix::app::pybind
         {
             session->designs.insert_or_assign(
                 dstKey,
-                DesignHandle{it->second.design.clone(), it->second.compilation});
+                DesignHandle{it->second.design.clone(), it->second.sourceOwners});
         }
         else if (auto it = session->nativeValues.find(srcKey); it != session->nativeValues.end())
         {

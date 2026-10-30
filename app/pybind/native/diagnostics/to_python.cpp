@@ -113,44 +113,36 @@ namespace wolvrix::app::pybind
         }
 
         std::string formatSourceLineSnippet(const slang::SourceManager *sourceManager,
-                                            const DiagnosticLocationInfo &info)
+                                            const DiagnosticLocationInfo &info,
+                                            const wolvrix::lib::ingest::SourcePosition *position = nullptr)
         {
-            if (!sourceManager || !info.location.valid())
+            std::string line;
+            if (position)
             {
-                return {};
-            }
-            const auto bufferId = info.location.buffer();
-            const auto sourceText = sourceManager->getSourceText(bufferId);
-            if (sourceText.empty())
-            {
-                return {};
-            }
-            const std::size_t offset = info.location.offset();
-            if (offset >= sourceText.size())
-            {
-                return {};
-            }
-
-            std::size_t lineStart = sourceText.rfind('\n', offset);
-            if (lineStart == std::string_view::npos)
-            {
-                lineStart = 0;
+                line = position->sourceLine;
             }
             else
             {
-                ++lineStart;
+                if (!sourceManager || !info.location.valid())
+                {
+                    return {};
+                }
+                const auto sourceText = sourceManager->getSourceText(info.location.buffer());
+                const std::size_t offset = info.location.offset();
+                if (offset >= sourceText.size())
+                {
+                    return {};
+                }
+                const auto previous = sourceText.rfind('\n', offset);
+                const auto lineStart = previous == std::string_view::npos ? 0 : previous + 1;
+                const auto next = sourceText.find('\n', offset);
+                const auto lineEnd = next == std::string_view::npos ? sourceText.size() : next;
+                line.assign(sourceText.substr(lineStart, lineEnd - lineStart));
             }
-            std::size_t lineEnd = sourceText.find('\n', offset);
-            if (lineEnd == std::string_view::npos)
-            {
-                lineEnd = sourceText.size();
-            }
-            if (lineEnd <= lineStart)
+            if (line.empty())
             {
                 return {};
             }
-
-            std::string line(sourceText.substr(lineStart, lineEnd - lineStart));
             if (!line.empty() && line.back() == '\r')
             {
                 line.pop_back();
@@ -214,14 +206,25 @@ namespace wolvrix::app::pybind
         }
 
         std::string formatDiagnostic(const wolvrix::lib::diag::Diagnostic &message,
-                                     const slang::SourceManager *sourceManager)
+                                     const slang::SourceManager *sourceManager,
+                                     const wolvrix::lib::ingest::SourcePosition *position = nullptr)
         {
             std::string out;
             out.append(diagnosticKindText(message.kind));
             DiagnosticLocationInfo info;
-            const bool hasLocation =
-                message.location && message.location->valid() &&
-                getDiagnosticLocationInfo(sourceManager, *message.location, info);
+            bool hasLocation = false;
+            if (position && !position->file.empty())
+            {
+                info.filename = position->file.string();
+                info.line = position->line;
+                info.column = position->column;
+                hasLocation = true;
+            }
+            else
+            {
+                hasLocation = message.location && message.location->valid() &&
+                              getDiagnosticLocationInfo(sourceManager, *message.location, info);
+            }
             if (hasLocation)
             {
                 out.append(" ");
@@ -253,13 +256,14 @@ namespace wolvrix::app::pybind
             }
             if (hasLocation)
             {
-                out.append(formatSourceLineSnippet(sourceManager, info));
+                out.append(formatSourceLineSnippet(sourceManager, info, position));
             }
             return out;
         }
 
         PyObject *diagnosticsToPyList(const std::vector<wolvrix::lib::diag::Diagnostic> &messages,
-                                      const slang::SourceManager *sourceManager)
+                                      const slang::SourceManager *sourceManager,
+                                      const std::vector<wolvrix::lib::ingest::IngestDiagnostic> *ingest = nullptr)
         {
             PyObject *list = PyList_New(static_cast<Py_ssize_t>(messages.size()));
             if (!list)
@@ -269,6 +273,8 @@ namespace wolvrix::app::pybind
             for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(messages.size()); ++i)
             {
                 const auto &message = messages[static_cast<std::size_t>(i)];
+                const auto *position = ingest && (*ingest)[i].location
+                                           ? &*(*ingest)[i].location : nullptr;
                 PyObject *dict = PyDict_New();
                 if (!dict)
                 {
@@ -307,10 +313,22 @@ namespace wolvrix::app::pybind
                 Py_DECREF(ctx);
                 Py_DECREF(origin);
 
-                if (message.location && sourceManager)
+                if (position || (message.location && sourceManager))
                 {
                     DiagnosticLocationInfo info;
-                    if (getDiagnosticLocationInfo(sourceManager, *message.location, info))
+                    bool hasLocation = false;
+                    if (position && !position->file.empty())
+                    {
+                        info.filename = position->file.string();
+                        info.line = position->line;
+                        info.column = position->column;
+                        hasLocation = true;
+                    }
+                    else if (message.location)
+                    {
+                        hasLocation = getDiagnosticLocationInfo(sourceManager, *message.location, info);
+                    }
+                    if (hasLocation)
                     {
                         PyObject *file = PyUnicode_FromString(info.filename.c_str());
                         PyObject *line = PyLong_FromUnsignedLongLong(info.line);
@@ -327,7 +345,7 @@ namespace wolvrix::app::pybind
                     }
                 }
 
-                const std::string text = formatDiagnostic(message, sourceManager);
+                const std::string text = formatDiagnostic(message, sourceManager, position);
                 PyObject *textObj = PyUnicode_FromStringAndSize(text.data(),
                                                                 static_cast<Py_ssize_t>(text.size()));
                 if (!textObj)
@@ -345,6 +363,46 @@ namespace wolvrix::app::pybind
         }
 
     } // namespace
+
+    PyObject *makeIngestActionResult(const wolvrix::lib::ingest::IngestResult &result)
+    {
+        std::vector<wolvrix::lib::diag::Diagnostic> messages;
+        messages.reserve(result.diagnostics.size());
+        for (const auto &diagnostic : result.diagnostics)
+        {
+            wolvrix::lib::diag::Diagnostic message;
+            switch (diagnostic.kind)
+            {
+            case wolvrix::lib::ingest::IngestSeverity::Error:
+                message.kind = wolvrix::lib::diag::DiagnosticKind::Error; break;
+            case wolvrix::lib::ingest::IngestSeverity::Warning:
+                message.kind = wolvrix::lib::diag::DiagnosticKind::Warning; break;
+            case wolvrix::lib::ingest::IngestSeverity::Info:
+                message.kind = wolvrix::lib::diag::DiagnosticKind::Info; break;
+            case wolvrix::lib::ingest::IngestSeverity::Debug:
+                message.kind = wolvrix::lib::diag::DiagnosticKind::Debug; break;
+            }
+            message.message = diagnostic.message;
+            message.context = diagnostic.context;
+            message.passName = diagnostic.passName;
+            message.originSymbol = diagnostic.originSymbol;
+            messages.push_back(std::move(message));
+        }
+        PyObject *diagnostics = diagnosticsToPyList(messages, nullptr, &result.diagnostics);
+        if (!diagnostics)
+        {
+            return nullptr;
+        }
+        PyObject *action = PyTuple_New(2);
+        if (!action)
+        {
+            Py_DECREF(diagnostics);
+            return nullptr;
+        }
+        PyTuple_SET_ITEM(action, 0, PyBool_FromLong(result.success()));
+        PyTuple_SET_ITEM(action, 1, diagnostics);
+        return action;
+    }
 
     PyObject *makeActionResult(bool success,
                                const std::vector<wolvrix::lib::diag::Diagnostic> &messages,

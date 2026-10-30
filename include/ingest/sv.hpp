@@ -1,9 +1,10 @@
-#ifndef WOLVRIX_INGEST_HPP
-#define WOLVRIX_INGEST_HPP
+#ifndef WOLVRIX_INGEST_SV_HPP
+#define WOLVRIX_INGEST_SV_HPP
 
 #include "core/grh.hpp"
 #include "core/logging.hpp"
 #include "core/diagnostics.hpp"
+#include "ingest/ingest.hpp"
 #include "slang/text/SourceLocation.h"
 
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -22,9 +24,17 @@
 #include <utility>
 #include <vector>
 
+namespace slang {
+class SourceManager;
+} // namespace slang
+
 namespace slang::ast {
 class Compilation;
 } // namespace slang::ast
+
+namespace slang::driver {
+class Driver;
+} // namespace slang::driver
 
 namespace slang::ast {
 class RootSymbol;
@@ -36,6 +46,16 @@ class Type;
 } // namespace slang::ast
 
 namespace wolvrix::lib::ingest {
+
+// The driver owns the SourceManager used by the compilation and its syntax trees.
+struct SvSourceOwner final : SourceOwner {
+    std::shared_ptr<slang::driver::Driver> driver;
+    std::shared_ptr<slang::ast::Compilation> compilation;
+};
+
+const slang::SourceManager* svSourceManager(const SourceOwners& owners);
+InterfaceScanResult scanSvInterfaces(const IngestRequest& request);
+IngestResult readSystemVerilog(const IngestRequest& request);
 
 using ValueId = wolvrix::lib::grh::ValueId;
 using OperationId = wolvrix::lib::grh::OperationId;
@@ -691,4 +711,4 @@ private:
 
 } // namespace wolvrix::lib::ingest
 
-#endif // WOLVRIX_INGEST_HPP
+#endif // WOLVRIX_INGEST_SV_HPP

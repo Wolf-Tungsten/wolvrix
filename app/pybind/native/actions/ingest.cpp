@@ -1,16 +1,12 @@
 #include "native/module/methods.hpp"
 
-#include "core/ingest.hpp"
+#include "ingest/ingest.hpp"
 #include "native/diagnostics/to_python.hpp"
 #include "native/session/storage.hpp"
 
-#include "slang/analysis/AnalysisManager.h"
-#include "slang/ast/Compilation.h"
-#include "slang/driver/Driver.h"
-
 #include <iostream>
-#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wolvrix::app::pybind
@@ -84,142 +80,38 @@ namespace wolvrix::app::pybind
             return nullptr;
         }
 
-        std::vector<std::string> argvStorage;
-        argvStorage.reserve(2 + slangArgs.size());
-        argvStorage.emplace_back("read_sv");
+        wolvrix::lib::ingest::IngestRequest request;
         if (path)
         {
-            argvStorage.emplace_back(path);
+            request.sources.push_back({wolvrix::lib::ingest::SourceLanguage::SystemVerilog, path, {}});
         }
-        for (const auto &arg : slangArgs)
-        {
-            argvStorage.push_back(arg);
-        }
-        std::vector<const char *> argv;
-        argv.reserve(argvStorage.size());
-        for (const auto &arg : argvStorage)
-        {
-            argv.push_back(arg.c_str());
-        }
-
-        slang::driver::Driver driver;
-        driver.addStandardArgs();
-        driver.options.singleUnit = true;
-        driver.options.compilationFlags.at(slang::ast::CompilationFlags::AllowTopLevelIfacePorts) = true;
-
-        auto reportSlangDiagnostics = [&]() {
-            if (driver.diagEngine.getNumErrors() == 0 && driver.diagEngine.getNumWarnings() == 0)
+        request.slangArgs = std::move(slangArgs);
+        request.logLevel = logLevel;
+        request.logSink = [](const wolvrix::lib::LogEvent &event) {
+            std::string message;
+            if (!event.tag.empty())
             {
-                return;
+                message.append(event.tag);
+                message.append(": ");
             }
-            (void)driver.reportDiagnostics(/* quiet */ true);
+            message.append(event.message);
+            std::cerr << message << '\n';
         };
-
-        if (!driver.parseCommandLine(static_cast<int>(argv.size()), argv.data()))
+        auto result = wolvrix::lib::ingest::readSources(request);
+        PyObject *action = makeIngestActionResult(result);
+        if (!action)
         {
-            reportSlangDiagnostics();
-            return makeActionResult(false,
-                                    singleDiagnostic(wolvrix::lib::diag::DiagnosticKind::Error,
-                                                     "failed to parse slang options", "read_sv"),
-                                    nullptr);
+            return nullptr;
         }
-        if (!driver.processOptions())
+        if (result.success())
         {
-            reportSlangDiagnostics();
-            return makeActionResult(false,
-                                    singleDiagnostic(wolvrix::lib::diag::DiagnosticKind::Error,
-                                                     "failed to apply slang options", "read_sv"),
-                                    nullptr);
-        }
-        if (!driver.parseAllSources())
-        {
-            reportSlangDiagnostics();
-            return makeActionResult(false,
-                                    singleDiagnostic(wolvrix::lib::diag::DiagnosticKind::Error,
-                                                     "failed to parse sources", "read_sv"),
-                                    nullptr);
-        }
-
-        auto compilation = std::shared_ptr<slang::ast::Compilation>(driver.createCompilation());
-        driver.runAnalysis(*compilation);
-        const auto &allDiagnostics = compilation->getAllDiagnostics();
-        bool hasSlangIssues = false;
-        bool hasSlangErrors = false;
-        for (const auto &diag : allDiagnostics)
-        {
-            const auto severity = slang::getDefaultSeverity(diag.code);
-            if (severity >= slang::DiagnosticSeverity::Warning)
-            {
-                hasSlangIssues = true;
-            }
-            if (severity >= slang::DiagnosticSeverity::Error || diag.isError())
-            {
-                hasSlangErrors = true;
-            }
-        }
-        if (hasSlangIssues)
-        {
-            driver.reportCompilation(*compilation, /* quiet */ true);
-            reportSlangDiagnostics();
-        }
-        if (hasSlangErrors)
-        {
-            return makeActionResult(false,
-                                    singleDiagnostic(wolvrix::lib::diag::DiagnosticKind::Error,
-                                                     "slang reported errors; see stderr diagnostics",
-                                                     "read_sv"),
-                                    compilation->getSourceManager());
-        }
-
-        wolvrix::lib::ingest::ConvertOptions convertOptions;
-        convertOptions.abortOnError = true;
-        convertOptions.enableLogging = logLevel != wolvrix::lib::LogLevel::Off;
-        convertOptions.logLevel = logLevel;
-
-        wolvrix::lib::ingest::ConvertDriver converter(convertOptions);
-        if (convertOptions.enableLogging)
-        {
-            converter.logger().setSink([](const wolvrix::lib::LogEvent &event) {
-                std::string message;
-                if (!event.tag.empty())
-                {
-                    message.append(event.tag);
-                    message.append(": ");
-                }
-                message.append(event.message);
-                std::cerr << message << '\n';
-            });
-        }
-
-        wolvrix::lib::grh::Design design;
-        try
-        {
-            design = converter.convert(compilation->getRoot());
-        }
-        catch (const wolvrix::lib::ingest::ConvertAbort &)
-        {
-            converter.diagnostics().flushThreadLocal();
-            return makeActionResult(false,
-                                    converter.diagnostics().messages(),
-                                    compilation->getSourceManager());
-        }
-
-        converter.diagnostics().flushThreadLocal();
-        const bool success = !converter.diagnostics().hasError();
-        if (success)
-        {
-            if (replace)
-            {
-                sessionEraseKey(*session, outDesign);
-            }
             session->designs.insert_or_assign(
                 std::string(outDesign),
-                DesignHandle{std::move(design), std::move(compilation)});
+                DesignHandle{std::move(*result.design), std::move(result.sourceOwners)});
+            session->nativeValues.erase(outDesign);
+            session->pythonValues.erase(outDesign);
         }
-        return makeActionResult(success,
-                                converter.diagnostics().messages(),
-                                success ? sessionDesignSourceManager(*session, outDesign)
-                                        : compilation->getSourceManager());
+        return action;
     }
 
     PyObject *py_session_clone_design(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
@@ -251,13 +143,11 @@ namespace wolvrix::app::pybind
             PyErr_SetString(PyExc_KeyError, insertError.c_str());
             return nullptr;
         }
-        if (replace)
-        {
-            sessionEraseKey(*session, outDesign);
-        }
+        DesignHandle clone{srcIt->second.design.clone(), srcIt->second.sourceOwners};
         session->designs.insert_or_assign(std::string(outDesign),
-                                          DesignHandle{srcIt->second.design.clone(),
-                                                       srcIt->second.compilation});
+                                          std::move(clone));
+        session->nativeValues.erase(outDesign);
+        session->pythonValues.erase(outDesign);
         return makeActionResult(true, {}, sessionDesignSourceManager(*session, outDesign));
     }
 

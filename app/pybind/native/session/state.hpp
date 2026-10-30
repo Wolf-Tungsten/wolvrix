@@ -5,16 +5,12 @@
 
 #include "core/grh.hpp"
 #include "core/transform.hpp"
+#include "ingest/ingest.hpp"
 
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
-
-namespace slang::ast
-{
-    class Compilation;
-}
 
 namespace wolvrix::app::pybind
 {
@@ -23,8 +19,14 @@ namespace wolvrix::app::pybind
 
     struct DesignHandle
     {
+        wolvrix::lib::ingest::SourceOwners sourceOwners;
         wolvrix::lib::grh::Design design;
-        std::shared_ptr<slang::ast::Compilation> compilation;
+
+        DesignHandle(wolvrix::lib::grh::Design value,
+                     wolvrix::lib::ingest::SourceOwners owners)
+            : sourceOwners(std::move(owners)), design(std::move(value))
+        {
+        }
     };
 
     struct PythonSessionValue

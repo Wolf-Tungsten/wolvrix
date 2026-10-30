@@ -1,7 +1,9 @@
-#include "core/ingest.hpp"
+#include "ingest/sv.hpp"
 
+#include "slang/analysis/AnalysisManager.h"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
+#include "slang/driver/Driver.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/Scope.h"
 #include "slang/ast/Statement.h"
@@ -55,6 +57,170 @@
 #include <variant>
 
 namespace wolvrix::lib::ingest {
+
+const slang::SourceManager* svSourceManager(const SourceOwners& owners) {
+    for (const auto& source : owners) {
+        const auto* sv = dynamic_cast<const SvSourceOwner*>(source.get());
+        if (sv && sv->compilation) {
+            return sv->compilation->getSourceManager();
+        }
+    }
+    return nullptr;
+}
+
+InterfaceScanResult scanSvInterfaces(const IngestRequest& /*request*/) {
+    InterfaceScanResult result;
+    result.diagnostics.push_back({IngestSeverity::Error,
+                                  "pre-elaboration SystemVerilog interface scanning is not supported yet",
+                                  {}, "ingest-sv"});
+    return result;
+}
+
+namespace {
+
+IngestDiagnostic ownSvDiagnostic(const ConvertDiagnostic& diagnostic,
+                                const slang::SourceManager* sourceManager) {
+    IngestDiagnostic result;
+    switch (diagnostic.kind) {
+    case ConvertDiagnosticKind::Error: result.kind = IngestSeverity::Error; break;
+    case ConvertDiagnosticKind::Warning: result.kind = IngestSeverity::Warning; break;
+    case ConvertDiagnosticKind::Info: result.kind = IngestSeverity::Info; break;
+    case ConvertDiagnosticKind::Debug: result.kind = IngestSeverity::Debug; break;
+    }
+    result.message = diagnostic.message;
+    result.context = diagnostic.context;
+    result.passName = diagnostic.passName;
+    result.originSymbol = diagnostic.originSymbol;
+    if (!sourceManager || !diagnostic.location || !diagnostic.location->valid()) {
+        return result;
+    }
+    auto location = sourceManager->getFullyOriginalLoc(*diagnostic.location);
+    if (!location.valid()) {
+        location = *diagnostic.location;
+    }
+    if (!sourceManager->isFileLoc(location)) {
+        location = sourceManager->getFullyExpandedLoc(*diagnostic.location);
+    }
+    if (!location.valid() || !sourceManager->isFileLoc(location)) {
+        return result;
+    }
+    SourcePosition position;
+    position.file = std::string(sourceManager->getFileName(location));
+    if (position.file.empty()) {
+        position.file = sourceManager->getFullPath(location.buffer());
+    }
+    if (position.file.empty()) {
+        position.file = std::string(sourceManager->getRawFileName(location.buffer()));
+    }
+    position.line = sourceManager->getLineNumber(location);
+    position.column = sourceManager->getColumnNumber(location);
+    const std::string_view text = sourceManager->getSourceText(location.buffer());
+    if (location.offset() < text.size()) {
+        const auto previous = text.rfind('\n', location.offset());
+        const auto begin = previous == std::string_view::npos ? 0 : previous + 1;
+        const auto end = text.find('\n', location.offset());
+        position.sourceLine = text.substr(begin, end == std::string_view::npos ? text.size() - begin : end - begin);
+    }
+    result.location = std::move(position);
+    return result;
+}
+
+} // namespace
+
+IngestResult readSystemVerilog(const IngestRequest& request) {
+    IngestResult result;
+    auto owner = std::make_shared<SvSourceOwner>();
+    owner->driver = std::make_shared<slang::driver::Driver>();
+    result.sourceOwners.push_back(owner);
+    auto& driver = *owner->driver;
+    driver.addStandardArgs();
+    driver.options.singleUnit = true;
+    driver.options.compilationFlags.at(slang::ast::CompilationFlags::AllowTopLevelIfacePorts) = true;
+
+    std::vector<std::string> argvStorage{"read_sv"};
+    for (const IngestSource& source : request.sources) {
+        if (source.language != SourceLanguage::SystemVerilog) {
+            result.diagnostics.push_back({IngestSeverity::Error,
+                                          "readSystemVerilog requires SystemVerilog sources",
+                                          source.path.string(), "read_sv"});
+            return result;
+        }
+        const auto path = source.path.is_relative() && !request.inputRoot.empty()
+                              ? request.inputRoot / source.path : source.path;
+        argvStorage.push_back(path.string());
+    }
+    argvStorage.insert(argvStorage.end(), request.slangArgs.begin(), request.slangArgs.end());
+    for (const auto& top : request.tops) {
+        argvStorage.emplace_back("--top");
+        argvStorage.push_back(top);
+    }
+    std::vector<const char*> argv;
+    argv.reserve(argvStorage.size());
+    for (const auto& arg : argvStorage) {
+        argv.push_back(arg.c_str());
+    }
+    auto reportSlangDiagnostics = [&]() {
+        if (driver.diagEngine.getNumErrors() || driver.diagEngine.getNumWarnings()) {
+            (void)driver.reportDiagnostics(/* quiet */ true);
+        }
+    };
+    auto fail = [&](std::string message) {
+        reportSlangDiagnostics();
+        result.diagnostics.push_back({IngestSeverity::Error, std::move(message), {}, "read_sv"});
+    };
+    if (!driver.parseCommandLine(static_cast<int>(argv.size()), argv.data())) {
+        fail("failed to parse slang options");
+        return result;
+    }
+    if (!driver.processOptions()) {
+        fail("failed to apply slang options");
+        return result;
+    }
+    if (!driver.parseAllSources()) {
+        fail("failed to parse sources");
+        return result;
+    }
+    owner->compilation = driver.createCompilation();
+    auto& compilation = *owner->compilation;
+    driver.runAnalysis(compilation);
+    bool hasSlangIssues = false;
+    bool hasSlangErrors = false;
+    for (const auto& diagnostic : compilation.getAllDiagnostics()) {
+        const auto severity = slang::getDefaultSeverity(diagnostic.code);
+        hasSlangIssues |= severity >= slang::DiagnosticSeverity::Warning;
+        hasSlangErrors |= severity >= slang::DiagnosticSeverity::Error || diagnostic.isError();
+    }
+    if (hasSlangIssues) {
+        driver.reportCompilation(compilation, /* quiet */ true);
+        reportSlangDiagnostics();
+    }
+    if (hasSlangErrors) {
+        result.diagnostics.push_back({IngestSeverity::Error,
+                                      "slang reported errors; see stderr diagnostics", {}, "read_sv"});
+        return result;
+    }
+
+    ConvertOptions options;
+    options.abortOnError = true;
+    options.enableLogging = request.logLevel != LogLevel::Off;
+    options.logLevel = request.logLevel;
+    ConvertDriver converter(options);
+    converter.logger().setSink(request.logSink);
+    try {
+        result.design = converter.convert(compilation.getRoot());
+    }
+    catch (const ConvertAbort&) {
+        // Diagnostics are collected below; failed transactions never publish a design.
+    }
+    converter.diagnostics().flushThreadLocal();
+    for (const auto& diagnostic : converter.diagnostics().messages()) {
+        result.diagnostics.push_back(ownSvDiagnostic(diagnostic, compilation.getSourceManager()));
+    }
+    if (!result.success()) {
+        result.design.reset();
+    }
+    return result;
+}
 
 static std::string procKindText(ProcKind kind);
 

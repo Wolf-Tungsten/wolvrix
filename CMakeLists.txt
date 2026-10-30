@@ -119,7 +119,9 @@ set(WOLVRIX_LIB_SOURCES
     lib/emit/verilator_repcut_package.cpp
     lib/core/store.cpp
     lib/core/store_text.cpp
-    lib/core/ingest.cpp
+    lib/ingest/sv.cpp
+    lib/ingest/driver.cpp
+    lib/ingest/firrtl.cpp
     lib/core/transform.cpp
     lib/transform/activity_schedule.cpp
     lib/transform/grhsim/ops.cpp
@@ -795,6 +797,16 @@ target_compile_definitions(transform-repcut-partition-count
 )
 
 register_test_exe(transform-repcut-partition-count)
+
+# ingest: public driver
+add_executable(ingest-driver
+    tests/ingest/test_ingest_driver.cpp
+)
+target_link_libraries(ingest-driver PRIVATE wolvrix-lib)
+target_compile_definitions(ingest-driver PRIVATE
+    WOLVRIX_INGEST_TEST_DATA_DIR="${WOLF_SV_INGEST_TEST_DATA_DIR}"
+)
+register_test_exe(ingest-driver)
 
 # ingest: symbol collector
 add_executable(ingest-symbol-collector

@@ -164,6 +164,12 @@ sess.clone_design(design="design.main", out_design="design.copy")
 sess.run_pass("stats", design="design.main", out_stats="stats.main")
 ```
 
+The native `read_sv` action delegates to the shared ingest driver. A design key
+retains all frontend source owners, and cloning/copying shares those owners.
+Reading with `replace=True` publishes only a successful result, so an ingest
+error preserves the old session value. See [ingest ownership](../ingest/reading.md)
+for the C++ request boundary and current frontend support.
+
 This keeps calls readable:
 
 - first identify the design

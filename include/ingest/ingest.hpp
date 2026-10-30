@@ -1,0 +1,152 @@
+#ifndef WOLVRIX_INGEST_INGEST_HPP
+#define WOLVRIX_INGEST_INGEST_HPP
+
+#include "core/grh.hpp"
+#include "core/logging.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace wolvrix::lib::ingest {
+
+enum class SourceLanguage { SystemVerilog, Firrtl };
+
+struct IngestSource {
+    SourceLanguage language = SourceLanguage::SystemVerilog;
+    std::filesystem::path path;
+    std::string unit;
+};
+
+struct SourcePosition {
+    std::string unit;
+    std::filesystem::path file;
+    uint64_t line = 0;
+    uint64_t column = 0;
+    std::string sourceLine;
+    std::string sourceInfo;
+};
+
+enum class IngestSeverity { Error, Warning, Info, Debug };
+
+struct IngestDiagnostic {
+    IngestSeverity kind = IngestSeverity::Error;
+    std::string message;
+    std::string context;
+    std::string passName;
+    std::string originSymbol;
+    std::optional<SourcePosition> location;
+};
+
+// Integer bits are canonical, MSB first; width and signedness are part of the type.
+struct IntegerParameter {
+    uint32_t width = 0;
+    bool isSigned = false;
+    std::string bits;
+    bool operator==(const IntegerParameter&) const = default;
+};
+
+using ParameterValue = std::variant<IntegerParameter, std::string, double>;
+
+struct ModuleParameter {
+    std::string name;
+    ParameterValue value;
+    bool operator==(const ModuleParameter&) const = default;
+};
+
+enum class LeafDirection { Input, Output, Inout };
+
+struct PortLeafSignature {
+    std::string name;
+    std::vector<std::string> fieldPath;
+    LeafDirection direction = LeafDirection::Input;
+    grh::ValueType valueType = grh::ValueType::Logic;
+    int32_t elementWidth = 0;
+    bool isSigned = false;
+    std::vector<int64_t> shape;
+};
+
+struct ModuleSignature {
+    SourceLanguage language = SourceLanguage::SystemVerilog;
+    std::string sourceUnit;
+    std::string name;
+    std::string implementationName;
+    bool external = false;
+    std::vector<ModuleParameter> parameters;
+    std::vector<PortLeafSignature> ports;
+    std::optional<SourcePosition> location;
+};
+
+struct ModuleSpecialization {
+    SourceLanguage language = SourceLanguage::SystemVerilog;
+    std::string sourceUnit;
+    std::string implementationName;
+    std::vector<ModuleParameter> parameters;
+};
+
+struct PortBinding {
+    std::string sourcePort;
+    std::string implementationPort;
+};
+
+struct ExternalBinding {
+    std::string sourceUnit;
+    std::string moduleName;
+    ModuleSpecialization implementation;
+    std::vector<PortBinding> ports;
+};
+
+struct FirrtlOptions {
+    std::optional<std::string> expectedVersion;
+    bool nodeAnnotations = true;
+};
+
+struct IngestRequest {
+    std::vector<IngestSource> sources;
+    // Empty uses the caller's working directory. Relative source paths use this root.
+    std::filesystem::path inputRoot;
+    std::vector<std::string> tops;
+    std::vector<std::string> slangArgs;
+    FirrtlOptions firrtl;
+    std::vector<ExternalBinding> externalBindings;
+    LogLevel logLevel = LogLevel::Info;
+    Logger::Sink logSink;
+};
+
+class SourceOwner {
+public:
+    virtual ~SourceOwner() = default;
+};
+
+using SourceOwners = std::vector<std::shared_ptr<const SourceOwner>>;
+
+struct InterfaceScanResult {
+    SourceOwners sourceOwners;
+    std::vector<ModuleSignature> modules;
+    std::vector<IngestDiagnostic> diagnostics;
+    bool success = false;
+};
+
+struct IngestResult {
+    // Declared first so the design and diagnostics are destroyed before their sources.
+    SourceOwners sourceOwners;
+    std::optional<grh::Design> design;
+    std::vector<ModuleSignature> modules;
+    std::vector<IngestDiagnostic> diagnostics;
+
+    bool success() const noexcept;
+};
+
+IngestResult readSources(const IngestRequest& request);
+InterfaceScanResult scanInterfaces(const IngestRequest& request);
+IngestResult specializeModule(const IngestRequest& request,
+                             const ModuleSpecialization& specialization);
+IngestResult linkModules(const IngestRequest& request, std::vector<IngestResult> modules);
+
+} // namespace wolvrix::lib::ingest
+
+#endif // WOLVRIX_INGEST_INGEST_HPP

@@ -1,4 +1,5 @@
 #include "transform/memory_read_retime.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include "core/grh.hpp"
 
@@ -857,8 +858,9 @@ namespace wolvrix::lib::transform
                                                            candidate.dataType,
                                                            "rom_data_read");
 
-            graph.replaceAllUsesWithView(candidate.readResult, dataOut);
-            rebindOutputPorts(graph, candidate.readResult, dataOut);
+            const auto replacement = ingest::node::redirectRoots(graph, candidate.readResult, dataOut);
+            const auto view = graph.replaceAllUsesWithView(candidate.readResult, replacement);
+            rebindOutputPorts(graph, candidate.readResult, view);
 
             if (!graph.eraseOp(candidate.memoryReadOp))
             {
@@ -951,8 +953,9 @@ namespace wolvrix::lib::transform
                                                            candidate.dataType,
                                                            "ram_data_read");
 
-            graph.replaceAllUsesWithView(candidate.readResult, dataOut);
-            rebindOutputPorts(graph, candidate.readResult, dataOut);
+            const auto replacement = ingest::node::redirectRoots(graph, candidate.readResult, dataOut);
+            const auto view = graph.replaceAllUsesWithView(candidate.readResult, replacement);
+            rebindOutputPorts(graph, candidate.readResult, view);
             if (!graph.eraseOp(candidate.memoryReadOp))
             {
                 return false;

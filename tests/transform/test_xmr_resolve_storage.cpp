@@ -1,4 +1,5 @@
 #include "core/grh.hpp"
+#include "ingest/node_attributes.hpp"
 #include "transform/xmr_resolve.hpp"
 #include "core/transform.hpp"
 
@@ -169,6 +170,11 @@ int main()
                             top.internSymbol("_op_test_xmr_read"));
     top.addResult(xmrRead, readValue);
     top.setAttr(xmrRead, "xmrPath", std::string("u_leaf.reg_a"));
+    namespace node = wolvrix::lib::ingest::node;
+    const auto nodeKey = node::key({"fixture", "Circuit", "top", {}, "xmr", {}});
+    node::write(top, xmrRead, {{nodeKey}, {{nodeKey, 0}}, {nodeKey}});
+    node::establishPolicy(top);
+    top.bindOutputPort("observed", readValue);
 
     const auto xmrWriteReg =
         top.createOperation(wolvrix::lib::grh::OperationKind::kXMRWrite,
@@ -196,6 +202,10 @@ int main()
     {
         return fail("XMR resolve pass failed");
     }
+    const auto nodes = node::inspect(top);
+    if (!nodes.errors.empty() || nodes.nodes.size() != 1 || nodes.nodes[0].roots.size() != 1 ||
+        nodes.nodes[0].roots[0].value != top.outputPortValue("observed"))
+        return fail("XMR resolution lost the source node output root");
 
     if (!hasNoXmrOps(top))
     {

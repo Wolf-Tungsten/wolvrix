@@ -3,8 +3,9 @@
 `ingest/node_attributes.hpp` defines schema v1 for source node ownership and
 result boundaries on ordinary GRH operations. It also provides inspection and
 the sharing rules used by `simplify` and `grhsim-simplify`. The FIRRTL frontend
-emits these attributes on real parsed node expressions. Complete node expression
-CSE and node-based nonsink grouping remain later stages.
+emits these attributes on real parsed node expressions. The
+[whole-node CSE pass](node-cse.md) consumes complete expression boundaries
+before partitioning. Node-based nonsink grouping remains a later stage.
 
 Graphs containing the attributes carry integer metadata `firrtl.nodeSchema=1`.
 All fields use the existing GRH JSON attribute representation:
@@ -73,14 +74,46 @@ folding or dead code removal.
 Clone/freeze/JSON preserve the existing representation. F05 exercises actual
 General/Output clones of state-dependent nodes through partitioning and compiled
 execution. State declarations, state read ports and writers do not become node
-members. Hierarchical inlining, bit packing, whole-node CSE and node-aware nonsink
-consumption still require their planned integration and validation.
+members. Hierarchical inlining qualifies the inventory and operation keys with
+the same instance path. Bit packing rewrites existing reads into slices in place,
+preserving their result identities and attrs. Whole-node CSE merges all source
+roots and matching members; unmerged nodes retain their primitive sharing
+scopes. Node-aware nonsink consumption remains a later stage.
+
+## Source policy and checkpoint census
+
+The FIRRTL lowerer establishes `firrtl.nodeScopePolicy=source-node-v1` and a
+`firrtl.nodeInventory` string array at source construction. Flattening imports
+qualified child inventories. `firrtl.nodeEliminated` contains roots whose
+deletion was proved by a DCE worklist. Rewriting or clearing attrs alone does
+not authorize an elimination record. A legacy graph without this policy cannot
+be upgraded into a node-aware checkpoint merely by running the CSE pass.
+
+`firrtl.nodeRetention` stores a compact versioned census after successful
+mutating passes. It reports source identities, available roots, proved dead
+identities, constant/alias/shared roots, rootless fragments and isolated origins.
+Every inventory key must have a current root or an explicit elimination record;
+an unexplained missing identity fails the pass. Phase/leaf copies increase root
+counts without inventing new source keys. Categories can overlap. The census
+checks source-result availability; it is not an immutable checksum of original
+primitives, which legal rewrites can remove or replace. Scope checks and
+transformation regressions protect internal ownership.
+
+Key references, total key bytes and unique key bytes are counted across
+members/roots/origins. No upstream provenance closure or AST is stored. Repeated
+strings remain ordinary GRH attribute values in memory and JSON; there is no
+graph-wide interning claim. `inspect-firrtl-nodes` measures this representation
+and JSON overhead on a self-contained selected FIRRTL hierarchy. Its stripped
+serialization is only a size measurement, never a resumable checkpoint.
 
 Validation uses the playground Makefile:
 
 ```sh
 make test_firrtl_node_attributes
 make test_firrtl_cse_scope
+make test_grhsim_node_cse
+make test_firrtl_node_pipeline
+make inspect_firrtl_node_retention
 make test_wolvrix
 ```
 

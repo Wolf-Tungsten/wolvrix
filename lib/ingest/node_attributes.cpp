@@ -425,6 +425,108 @@ void requireValid(const grh::Graph& graph) {
     if (!result.errors.empty()) throw std::invalid_argument("FIRRTL node attributes: " + result.errors.front());
 }
 
+namespace {
+std::vector<std::string> metadataKeys(const grh::Graph& graph, std::string_view name) {
+    const auto value = graph.metadata(name);
+    if (!value) return {};
+    const auto* keys = std::get_if<std::vector<std::string>>(&*value);
+    if (!keys) throw std::invalid_argument("wrong FIRRTL inventory metadata type");
+    return *keys;
+}
+}
+
+void establishPolicy(grh::Graph& graph) {
+    std::vector<std::string> keys;
+    for (const auto& record : inspect(graph).nodes) keys.push_back(record.key);
+    graph.setMetadata(kScopePolicy, std::string(kScopeRevision));
+    graph.setMetadata(kInventory, std::move(keys));
+}
+
+void requirePolicy(const grh::Graph& graph) {
+    if (!graph.metadata(kSchema) && !graph.metadata(kScopePolicy)) return;
+    if (graph.metadata(kScopePolicy) != std::optional<grh::AttributeValue>(std::string(kScopeRevision)) ||
+        !graph.metadata(kInventory))
+        throw std::invalid_argument("FIRRTL source-node policy is missing/incompatible; re-ingest the source");
+}
+
+void recordDead(grh::Graph& graph, grh::OperationId op) {
+    if (!graph.metadata(kScopePolicy) || !annotated(graph, op)) return;
+    const auto attributes = read(graph, op);
+    if (attributes.roots.empty()) return;
+    auto dead = metadataKeys(graph, kEliminated);
+    for (const auto& root : attributes.roots) dead.push_back(root.key);
+    unique(dead); graph.setMetadata(kEliminated, std::move(dead));
+}
+
+void importInventory(const grh::Graph& source, grh::Graph& target,
+                     std::span<const std::string> instancePath) {
+    if (!source.metadata(kScopePolicy)) return;
+    requirePolicy(source);
+    if (target.metadata(kScopePolicy)) requirePolicy(target);
+    for (const auto name : {kInventory, kEliminated}) {
+        auto keys = metadataKeys(target, name);
+        for (const auto& encoded : metadataKeys(source, name)) {
+            auto identity = parseKey(encoded);
+            identity.instancePath.insert(identity.instancePath.begin(), instancePath.begin(), instancePath.end());
+            keys.push_back(key(identity));
+        }
+        unique(keys);
+        if (!keys.empty() || name == kInventory) target.setMetadata(name, std::move(keys));
+    }
+    target.setMetadata(kScopePolicy, std::string(kScopeRevision));
+}
+
+void recordRetention(grh::Graph& graph) {
+    if (!graph.metadata(kScopePolicy)) return;
+    requirePolicy(graph);
+    const auto inspection = inspect(graph);
+    if (!inspection.errors.empty()) throw std::invalid_argument(inspection.errors.front());
+    std::set<std::string> keys, available, constants, aliases, shared, fragments;
+    std::size_t references = 0, bytes = 0, roots = 0;
+    for (const auto& record : inspection.nodes) {
+        if (!record.roots.empty()) available.insert(record.key);
+        else fragments.insert(record.key);
+        roots += record.roots.size();
+        for (const auto& root : record.roots) {
+            auto operation = root.operation;
+            const auto args = graph.opOperands(operation);
+            if (graph.opKind(operation) == grh::OperationKind::kAssign && args.size() == 1) {
+                aliases.insert(record.key);
+                operation = graph.valueDef(args[0]);
+            }
+            if (operation && literal(graph, operation)) constants.insert(record.key);
+            if (read(graph, root.operation).roots.size() > 1) shared.insert(record.key);
+        }
+    }
+    for (const auto op : graph.operations()) {
+        const auto attributes = read(graph, op);
+        const auto add = [&](const std::string& key) { keys.insert(key); ++references; bytes += key.size(); };
+        for (const auto& key : attributes.members) add(key);
+        for (const auto& key : attributes.origins) add(key);
+        for (const auto& root : attributes.roots) add(root.key);
+    }
+    const auto eliminated = metadataKeys(graph, kEliminated);
+    const std::set<std::string> dead(eliminated.begin(), eliminated.end());
+    const auto inventory = metadataKeys(graph, kInventory);
+    std::size_t missing = 0, removed = 0, uniqueBytes = 0;
+    for (const auto& key : keys) uniqueBytes += key.size();
+    for (const auto& key : inventory) if (!available.contains(key)) {
+        if (dead.contains(key)) ++removed;
+        else ++missing;
+    }
+    grh::AttributeValue census = std::vector<std::string>{"v1",
+        "source-nodes=" + std::to_string(inventory.size()), "available=" + std::to_string(available.size()),
+        "roots=" + std::to_string(roots), "dead=" + std::to_string(removed),
+        "constant=" + std::to_string(constants.size()), "alias=" + std::to_string(aliases.size()),
+        "shared=" + std::to_string(shared.size()), "fragments=" + std::to_string(fragments.size()),
+        "isolated=" + std::to_string(inspection.isolatedFragments.size()), "missing=" + std::to_string(missing),
+        "key-references=" + std::to_string(references), "key-bytes=" + std::to_string(bytes),
+        "unique-key-bytes=" + std::to_string(uniqueBytes)};
+    if (graph.metadata("firrtl.nodeRetention") != std::optional<grh::AttributeValue>(census))
+        graph.setMetadata("firrtl.nodeRetention", std::move(census));
+    if (missing) throw std::invalid_argument("FIRRTL source node information was lost: " + std::to_string(missing));
+}
+
 std::string Inspection::report(const grh::Graph& graph) const {
     std::ostringstream out;
     out << "nodes=" << nodes.size() << " isolated_fragments=" << isolatedFragments.size()

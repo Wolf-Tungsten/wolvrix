@@ -868,7 +868,9 @@ ModuleSignature Lowerer::run() {
                 throw Error(driver.range, "FIRRTL component '" + key.first + "' is not fully initialized on every path");
         drive(driver.value, driver.current ? driver.current : invalid(graph_.valueLogicalType(driver.value), driver.range), driver.range);
     }
-    checkCycles(); node::requireValid(graph_); return signature;
+    checkCycles(); node::requireValid(graph_);
+    if (options_.nodeAnnotations) { node::establishPolicy(graph_); node::recordRetention(graph_); }
+    return signature;
 }
 } // namespace
 

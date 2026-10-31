@@ -9,6 +9,8 @@
 #include "transform/hier_flatten.hpp"
 #include "transform/grhsim/grh-to-grhsim.hpp"
 #include "transform/grhsim/simplify.hpp"
+#include "transform/grhsim/node-cse.hpp"
+#include "ingest/node_attributes.hpp"
 #include "transform/grhsim/pack-bit-registers.hpp"
 #include "transform/grhsim/recover-masked-or.hpp"
 #include "transform/grhsim/split-event-and-output.hpp"
@@ -399,6 +401,16 @@ namespace wolvrix::lib::transform
             pass->setContext(&context);
             auto startTime = std::chrono::steady_clock::now();
             PassResult passResult = pass->run();
+            // partition-sink records before capturing its revision-local schedule.
+            if (!passResult.failed && passResult.changed && pass->id() != "grhsim-partition-sink") {
+                for (const auto& [name, graph] : design.graphs()) {
+                    try { ingest::node::recordRetention(*graph); }
+                    catch (const std::exception& error) {
+                        diags.error(pass->id(), error.what(), "firrtl-node-retention");
+                        passResult.failed = true;
+                    }
+                }
+            }
             auto endTime = std::chrono::steady_clock::now();
             pass->clearContext();
             result.changed = result.changed || passResult.changed;
@@ -463,6 +475,7 @@ namespace wolvrix::lib::transform
             "grh.verify",
             "grh-to-grhsim",
             "grhsim-simplify",
+            "grhsim-node-cse",
             "grhsim-pack-bit-registers",
             "grhsim-recover-masked-or",
             "grhsim-split-event-and-output",
@@ -537,6 +550,16 @@ namespace wolvrix::lib::transform
             if (normalized == "grhsim-split-nonsink-and-sink") return std::make_unique<grhsim::SplitNonsinkAndSinkPass>(splitOptions);
             if (normalized == "grhsim-partition-nonsink") return std::make_unique<grhsim::PartitionNonsinkPass>(nonsinkOptions);
             return std::make_unique<grhsim::PartitionSinkPass>(sinkOptions);
+        }
+        if (normalized == "grhsim-node-cse") {
+            grhsim::NodeCseOptions options;
+            for (const auto argument : args) {
+                if (argument.starts_with("-top=")) options.top = argument.substr(5);
+                else if (argument.starts_with("-firrtl-node-cse=")) options.mode = argument.substr(std::string_view("-firrtl-node-cse=").size());
+                else if (argument.starts_with("-report=")) options.report = argument.substr(8);
+                else { error = "Unknown grhsim-node-cse option: " + std::string(argument); return nullptr; }
+            }
+            return std::make_unique<grhsim::NodeCsePass>(std::move(options));
         }
         if (normalized == "grhsim-simplify" || normalized == "grhsim-pack-bit-registers" ||
             normalized == "grhsim-recover-masked-or")

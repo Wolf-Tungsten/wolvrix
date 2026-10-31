@@ -2,6 +2,7 @@
 #define WOLVRIX_REGISTER_WRITE_INTERNAL_HPP
 
 #include "core/grh.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -25,6 +26,7 @@ namespace wolvrix::lib::transform::write_detail
         {
             const auto def = graph.valueDef(value);
             if (!def.valid()) break;
+            if (ingest::node::annotated(graph, def)) break;
             const auto operands = graph.opOperands(def);
             if ((graph.opKind(def) != OperationKind::kAssign &&
                  graph.opKind(def) != OperationKind::kConcat) || operands.size() != 1 ||

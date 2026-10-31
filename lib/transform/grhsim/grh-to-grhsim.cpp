@@ -2,6 +2,7 @@
 
 #include "transform/grhsim/ops.hpp"
 #include "transform/verify.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include "slang/numeric/SVInt.h"
 
@@ -243,6 +244,9 @@ PassResult GrhToGrhsimPass::run()
         }
         graph = design().findGraph(top);
         if (!graph) throw std::invalid_argument("Top graph does not exist: " + top);
+        // Pre-F08 checkpoints can still be inspected, but cannot be upgraded
+        // into a node-aware simulation merely by attaching a new policy.
+        if (graph->metadata(ingest::node::kScopePolicy)) ingest::node::requirePolicy(*graph);
         if (const auto stage = graph->metadata(kStage))
         {
             if (*stage != AttributeValue(std::string("converted")) ||

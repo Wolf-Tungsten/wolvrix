@@ -18,6 +18,7 @@ The simulation stages then operate on that same design:
 | --- | --- |
 | `grh-to-grhsim` | Explicit logic domain, edge detectors and simulation writers/calls; no partitions |
 | `grhsim-simplify`, bit-register packing, masked-OR recovery | Global optimization with state, effect and declaration identities preserved |
+| `grhsim-node-cse` for annotated FIRRTL | Whole-node equivalence with thresholded sharing, before extraction |
 | `grhsim-split-event-and-output` | Event, General and Output owners |
 | `grhsim-split-nonsink-and-sink` | General becomes NonSink, SmallSink and LargeSink |
 | `grhsim-partition-nonsink`, leaf simplify | Activity partitions and complete leaf owners |
@@ -28,6 +29,10 @@ The production helper enables bit-register packing, masked-OR recovery and
 leaf simplify by default. Pass options and their contracts are specified in
 [GrhSIM transforms](transform/grhsim-transforms.md). Work limits control
 activity partitions; function line limits control emitted C++ functions.
+For annotated FIRRTL it runs whole-node CSE in `gsim` mode; `off` disables
+whole-node merging while retaining source-node primitive scopes. Policy and
+configuration are checkpoint metadata and enter generation identity; see
+[FIRRTL node CSE](ingest/node-cse.md).
 
 ## Python and checkpoints
 

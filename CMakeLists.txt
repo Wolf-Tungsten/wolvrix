@@ -136,6 +136,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/grhsim/ops.cpp
     lib/transform/grhsim/grh-to-grhsim.cpp
     lib/transform/grhsim/simplify.cpp
+    lib/transform/grhsim/node-cse.cpp
     lib/transform/grhsim/used-bits.cpp
     lib/transform/grhsim/pack-bit-registers.cpp
     lib/transform/grhsim/recover-masked-or.cpp
@@ -808,7 +809,7 @@ target_compile_definitions(transform-repcut-partition-count
 register_test_exe(transform-repcut-partition-count)
 
 # ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects ingest-mixed)
+foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects ingest-mixed grhsim-node-cse firrtl-node-pipeline)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)
@@ -822,6 +823,8 @@ endforeach()
 
 add_executable(inspect-firrtl app/inspect_firrtl.cpp)
 target_link_libraries(inspect-firrtl PRIVATE wolvrix-lib)
+add_executable(inspect-firrtl-nodes app/inspect_firrtl_nodes.cpp)
+target_link_libraries(inspect-firrtl-nodes PRIVATE wolvrix-lib)
 
 # The frozen multi-gigabyte input is optional, outside the default CTest suite.
 add_executable(firrtl-target tests/ingest/test_firrtl_target.cpp)

@@ -367,6 +367,7 @@ PassResult PartitionSinkPass::run() {
             graph->setMetadata(kStage, std::string("sink-partitioned"));
             verifyPartitionResult(*graph);
         }
+        ingest::node::recordRetention(*graph);
         auto schedule = buildSchedule(*graph);
         session()->insert_or_assign(sinkScheduleKey(*graph),
             std::make_unique<SessionSlotValue<SinkSchedule>>(std::move(schedule)));

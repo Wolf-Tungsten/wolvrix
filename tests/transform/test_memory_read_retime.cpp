@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 #include "transform/memory_read_retime.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include <iostream>
 #include <string>
@@ -166,6 +167,25 @@ namespace
 
 int main()
 {
+    // A tagged read replaced by retiming must keep its root on the new
+    // output view, for both ROM and RAM paths.
+    for (const bool ram : {false, true})
+    {
+        Design design;
+        Graph &graph = buildBaseReadPath(design, ram, false);
+        namespace node = wolvrix::lib::ingest::node;
+        const auto identity = node::key({"fixture", "Circuit", graph.symbol(), {}, "read", {}});
+        const auto oldResult = graph.outputPortValue("data");
+        node::write(graph, graph.valueDef(oldResult), {{identity}, {{identity, 0}}, {identity}});
+        node::establishPolicy(graph);
+        PassManager manager; manager.addPass(std::make_unique<MemoryReadRetimePass>());
+        PassDiagnostics diagnostics;
+        const auto result = manager.run(design, diagnostics);
+        const auto inspection = node::inspect(graph);
+        if (!result.success || !result.changed || !inspection.errors.empty() || inspection.nodes.size() != 1 ||
+            inspection.nodes[0].roots.size() != 1 || inspection.nodes[0].roots[0].value != graph.outputPortValue("data"))
+            return fail("retiming lost the source node result mapping");
+    }
     {
         Design design;
         Graph &graph = buildBaseReadPath(design, false, false);

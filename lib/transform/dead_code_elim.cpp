@@ -1,6 +1,7 @@
 #include "transform/dead_code_elim.hpp"
 
 #include "core/grh.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include <algorithm>
 #include <array>
@@ -873,6 +874,7 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
+                ingest::node::recordDead(graph, info.id);
                 if (graph.eraseOpUnchecked(info.id))
                 {
                     graphChanged = true;

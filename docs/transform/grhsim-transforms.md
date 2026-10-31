@@ -14,6 +14,7 @@ Run the existing GRH frontend and ordinary `simplify` first, then:
 ```text
 grh-to-grhsim
   → optional grhsim-simplify / grhsim-pack-bit-registers / grhsim-recover-masked-or
+  → grhsim-node-cse                     (annotated FIRRTL only)
   → grhsim-split-event-and-output        (first virtual partitions)
   → grhsim-split-nonsink-and-sink
   → grhsim-partition-nonsink
@@ -27,6 +28,7 @@ grh-to-grhsim
 | `grhsim-simplify` | `-top`, `-max-rounds` | the unique top, 8 |
 | `grhsim-pack-bit-registers` | `-top`, `-report` | the unique top, no TSV |
 | `grhsim-recover-masked-or` | `-top`, `-min-terms`, `-report` | the unique top, 16, no TSV |
+| `grhsim-node-cse` | `-top`, `-firrtl-node-cse=off|gsim`, `-report` | the unique top, gsim, no report |
 | `grhsim-split-event-and-output` | `-top` | the unique top |
 | `grhsim-split-nonsink-and-sink` | `-top`, `-mem-min-bytes` | the unique top, 64 |
 | `grhsim-partition-nonsink` | `-top`, `-max-node-work`, `-max-supernode-work`, `-segment-penalty`, `-semantic-nodes` | the unique top, 128, 128, 1, 0 |
@@ -68,6 +70,10 @@ result/history; effectful calls and random samples do not undergo this CSE.
 On a fully attributed graph it works separately inside each complete leaf
 owner. It preserves exported values/types and cannot merge clones across
 owners. Shared-state narrowing/merging only runs before partitioning.
+Annotated FIRRTL additionally restricts primitive CSE and structural inlining
+to one source-node scope before complete execution leaves exist.
+`grhsim-node-cse` compares complete pure scalar expressions and applies the
+GSIM count/width/fanout thresholds; see [its contract](../ingest/node-cse.md).
 
 Full LogicalType, including shape/domain, participates in aliases and CSE.
 ArrayCreate and sliceArray keep the established bit order and flattened

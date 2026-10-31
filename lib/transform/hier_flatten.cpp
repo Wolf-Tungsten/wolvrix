@@ -789,6 +789,7 @@ namespace wolvrix::lib::transform
                 return false;
             }
             state.stack.insert(&source);
+            wolvrix::lib::ingest::node::importInventory(source, target, state.nodeInstancePath);
 
             std::unordered_set<uint32_t> declaredSet;
             declaredSet.reserve(source.declaredSymbols().size());

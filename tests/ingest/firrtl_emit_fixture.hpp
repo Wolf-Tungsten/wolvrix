@@ -18,7 +18,7 @@ inline void pass(grh::Design& design, tx::SessionStore& session, std::string_vie
 }
 inline void generate(grh::Design& design, const std::filesystem::path& path, std::string_view driverText) {
     tx::SessionStore session;
-    for (const auto name : {"grh-to-grhsim", "grhsim-simplify", "grhsim-split-event-and-output", "grhsim-simplify", "grhsim-split-nonsink-and-sink", "grhsim-partition-nonsink", "grhsim-simplify", "grhsim-partition-sink"}) pass(design, session, name);
+    for (const auto name : {"grh-to-grhsim", "grhsim-simplify", "grhsim-node-cse", "grhsim-split-event-and-output", "grhsim-simplify", "grhsim-split-nonsink-and-sink", "grhsim-partition-nonsink", "grhsim-simplify", "grhsim-partition-sink"}) pass(design, session, name);
     valid(design);
     std::filesystem::remove_all(path); std::filesystem::create_directories(path);
     namespace emit = wolvrix::lib::emit;

@@ -15,6 +15,10 @@ inline constexpr std::string_view kMembers = "firrtl.node.members";
 inline constexpr std::string_view kRoots = "firrtl.node.roots";
 inline constexpr std::string_view kRootResults = "firrtl.node.rootResults";
 inline constexpr std::string_view kOrigins = "firrtl.node.origins";
+inline constexpr std::string_view kScopePolicy = "firrtl.nodeScopePolicy";
+inline constexpr std::string_view kScopeRevision = "source-node-v1";
+inline constexpr std::string_view kInventory = "firrtl.nodeInventory";
+inline constexpr std::string_view kEliminated = "firrtl.nodeEliminated";
 
 struct Identity {
     std::string sourceUnit;
@@ -91,6 +95,17 @@ struct Inspection {
 
 Inspection inspect(const grh::Graph& graph);
 void requireValid(const grh::Graph& graph);
+
+// Establish only at source construction, never to upgrade a loaded checkpoint.
+void establishPolicy(grh::Graph& graph);
+void requirePolicy(const grh::Graph& graph);
+// Call only after the caller has proved that the result is dead.
+void recordDead(grh::Graph& graph, grh::OperationId op);
+// Copy the source inventory/tombstones with the same qualification as the ops.
+void importInventory(const grh::Graph& source, grh::Graph& target,
+                     std::span<const std::string> instancePath);
+// Compact, auditable census. Missing inventory entries are errors, not DCE.
+void recordRetention(grh::Graph& graph);
 
 } // namespace wolvrix::lib::ingest::node
 

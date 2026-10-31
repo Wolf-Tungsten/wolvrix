@@ -487,6 +487,7 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
 _GRHSIM_PASS_OPTIONS = {
     "grh-to-grhsim": ("top", "logic_domain"),
     "grhsim-simplify": ("top", "max_rounds"),
+    "grhsim-node-cse": ("top", "firrtl_node_cse", "report"),
     "grhsim-pack-bit-registers": ("top", "report"),
     "grhsim-recover-masked-or": ("top", "min_terms", "report"),
     "grhsim-split-event-and-output": ("top",),

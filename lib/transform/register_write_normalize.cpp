@@ -87,6 +87,10 @@ namespace wolvrix::lib::transform
             --budget;
             data = strip(graph, data);
             const auto def = graph.valueDef(data);
+            if (def.valid() && ingest::node::annotated(graph, def)) {
+                arms.push_back({data, path, false});
+                return arms.size() <= 64;
+            }
             if (def.valid() && graph.opKind(def) == OperationKind::kMux)
             {
                 const auto operands = graph.opOperands(def);
@@ -117,6 +121,7 @@ namespace wolvrix::lib::transform
             if (holdsIdentity(graph, data, attrName, symbol, row, width))
                 return {{}, booleans.literal(false)};
             const auto def = graph.valueDef(data);
+            if (def.valid() && ingest::node::annotated(graph, def)) return {data, booleans.literal(true)};
             if (!def.valid() || graph.opKind(def) != OperationKind::kMux) return {data, booleans.literal(true)};
             const auto source = graph.getOperation(def);
             const auto cond = source.operands()[0];

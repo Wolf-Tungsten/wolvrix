@@ -1,4 +1,5 @@
 #include "transform/xmr_resolve.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include "core/grh.hpp"
 
@@ -1084,6 +1085,7 @@ namespace wolvrix::lib::transform
                         result.changed = true;
                         continue;
                     }
+                    const auto oldResult = results.front();
                     log(LogLevel::Trace, "xmr read resolve begin graph=" + graph.symbol());
                     auto replacement = resolveRead(graph, opId, *path);
                     log(LogLevel::Trace, "xmr read resolve end graph=" + graph.symbol());
@@ -1091,7 +1093,10 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    graph.replaceAllUsesWithView(results.front(), *replacement);
+                    const auto root = ingest::node::redirectRoots(graph, oldResult, *replacement);
+                    const auto view = graph.replaceAllUsesWithView(oldResult, root);
+                    const std::vector<wolvrix::lib::grh::Port> ports(graph.outputPorts().begin(), graph.outputPorts().end());
+                    for (const auto& port : ports) if (port.value == oldResult) graph.bindOutputPort(port.name, view);
                     graph.eraseOp(opId);
                     result.changed = true;
                     continue;

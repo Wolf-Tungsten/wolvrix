@@ -255,6 +255,7 @@ struct Scope {
             })) continue;
             const std::vector<ValueId> results(outputs.begin(), outputs.end());
             const std::vector<ValueId> args(graph.opOperands(op).begin(), graph.opOperands(op).end());
+            ingest::node::recordDead(graph, op);
             if (!graph.eraseOp(op)) continue;
             erased.insert(op);
             for (const auto value : results) graph.eraseValue(value);

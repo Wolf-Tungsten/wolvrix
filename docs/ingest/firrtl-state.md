@@ -108,5 +108,6 @@ and all writes remain arrays; tests reject undriven reference outputs.
 
 Fixtures: `tests/ingest/data/firrtl/state/`. Generated models and checkpoints:
 `build/artifacts/firrtl-state/`. Playground logs: `ptmp/firrtl-ingest/F05/`.
-Memory/effects are F06; mixed-language linking and Python FIRRTL options are F07;
+Memory/effects are documented in [firrtl-memory.md](firrtl-memory.md) and
+[firrtl-effects.md](firrtl-effects.md); mixed-language linking and Python options are F07;
 whole-node CSE and node-aware nonsink grouping remain F08/F09.

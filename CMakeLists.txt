@@ -127,6 +127,8 @@ set(WOLVRIX_LIB_SOURCES
     lib/ingest/firrtl/lexer.cpp
     lib/ingest/firrtl/parser.cpp
     lib/ingest/firrtl/semantic.cpp
+    lib/ingest/firrtl/memory.cpp
+    lib/ingest/firrtl/annotations.cpp
     lib/ingest/firrtl/lower.cpp
     lib/core/transform.cpp
     lib/transform/activity_schedule.cpp
@@ -805,7 +807,7 @@ target_compile_definitions(transform-repcut-partition-count
 register_test_exe(transform-repcut-partition-count)
 
 # ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state)
+foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)
@@ -819,6 +821,12 @@ endforeach()
 
 add_executable(inspect-firrtl app/inspect_firrtl.cpp)
 target_link_libraries(inspect-firrtl PRIVATE wolvrix-lib)
+
+# The frozen multi-gigabyte input is optional, outside the default CTest suite.
+add_executable(firrtl-target tests/ingest/test_firrtl_target.cpp)
+target_link_libraries(firrtl-target PRIVATE wolvrix-lib)
+get_target_property(FIRRTL_TARGET_DEFINITIONS firrtl-memory COMPILE_DEFINITIONS)
+target_compile_definitions(firrtl-target PRIVATE ${FIRRTL_TARGET_DEFINITIONS})
 
 # ingest: public driver
 add_executable(ingest-driver

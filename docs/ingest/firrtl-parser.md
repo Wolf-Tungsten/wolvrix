@@ -28,7 +28,9 @@ An index success is explicitly an interface result. An unknown statement in a
 body can pass indexing and must fail body validation. `scanFirrtlInterfaces`
 and the shared `scanInterfaces` entry point perform both operations before
 reporting success. `readFirrtl` performs the same checks, then lowers selected
-combinational modules as described in [firrtl-combinational.md](firrtl-combinational.md).
+modules as described in [firrtl-combinational.md](firrtl-combinational.md),
+[firrtl-state.md](firrtl-state.md), [firrtl-memory.md](firrtl-memory.md), and
+[firrtl-effects.md](firrtl-effects.md).
 Unsupported behavioral constructs return located errors and no design. Parsing
 alone does not publish an executable design or create GRH node attributes.
 
@@ -88,8 +90,8 @@ connect out, p
 
 The AST keeps the `MPort` statement inside `When.body`. Its operands are the
 indexed memory reference `m[addr]` and `clock`, and its `target` is `read`.
-The following connect can reference p. F06 must use the original nesting when
-deriving enables. A node or wire declared in the same when cannot escape.
+The following connect can reference p. Memory lowering uses the original nesting
+when deriving enables. A node or wire declared in the same when cannot escape.
 See the [CHIRRTL port design discussion](https://github.com/llvm/circt/issues/1561)
 for this input convention; it is a semantic reference, not an implementation
 dependency.

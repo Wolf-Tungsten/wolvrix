@@ -83,7 +83,7 @@ circuit main :
     connect y,UInt<4>(3)
   module state :
     input clk : Clock
-    cmem r : UInt<4>[4]
+    inst r of helper
   public module main :
     output y : UInt<4>
     node n = UInt<4>(7)
@@ -97,7 +97,7 @@ circuit main :
     request.tops={"helper","main"}; auto both=ingest::readSources(request);
     require(both.success() && both.design->graphs().size()==2,"explicit FIRRTL top selection did not lower both modules");
     request.tops={"main","state"}; auto failed=ingest::readSources(request);
-    require(!failed.success() && !failed.design && diagnostics(failed).find("F06")!=std::string::npos,"failed multi-top read published a partial design");
+    require(!failed.success() && !failed.design && diagnostics(failed).find("F07")!=std::string::npos,"failed multi-top read published a partial design");
     request.tops={"missing"}; auto missing=ingest::readSources(request);
     require(!missing.success() && !missing.design && diagnostics(missing).find("missing")!=std::string::npos,"missing top silently succeeded");
     request.tops={"main"}; request.sources.push_back({ingest::SourceLanguage::Firrtl,path,"other"});

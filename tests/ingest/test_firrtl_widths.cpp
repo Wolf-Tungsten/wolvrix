@@ -160,7 +160,7 @@ void errors() {
     error("const-source", "    input a : UInt<1>\n    output y : const UInt<1>\n    connect y,a\n", "non-constant source", 6);
     error("const-condition", "    input sel : UInt<1>\n    output y : const UInt<1>\n    connect y,UInt(0)\n    when sel : connect y,UInt(1)\n", "non-constant when", 7);
     error("cycle", "    output y : UInt<4>\n    wire w : UInt<4>\n    connect w,add(w,UInt<1>(1))\n    connect y,w\n", "combinational cycle", 5);
-    error("memory-stage", "    input clk : Clock\n    cmem r : UInt<4>[4]\n", "not supported yet", 5);
+    error("unsupported-effect", "    input clk : Clock\n    fflush(clk, UInt<1>(1))\n", "not supported yet", 5);
     auto bounded=text("bounded-width-cycle",R"FIR(    output y : UInt<16>
     wire w : UInt
     node t = rem(add(w,UInt<1>(1)),UInt<16>(1))

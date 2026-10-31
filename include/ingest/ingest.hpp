@@ -117,6 +117,8 @@ struct FirrtlOptions {
     bool nodeAnnotations = true;
     FirrtlInvalidPolicy invalidPolicy = FirrtlInvalidPolicy::Unknown;
     FirrtlInitPolicy initPolicy = FirrtlInitPolicy::Unknown;
+    // Full layer paths. Selecting a child also enables its ancestors.
+    std::vector<std::string> enabledLayers;
 };
 
 struct IngestRequest {

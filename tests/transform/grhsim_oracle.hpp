@@ -39,8 +39,9 @@ struct Observation {
 
 class Oracle {
 public:
-    explicit Oracle(const grh::Graph& graph, std::vector<std::string> probes = {}, const sim::SinkSchedule* schedule = nullptr)
-        : graph_(graph), probes_(std::move(probes)), schedule_(schedule) { init(); }
+    explicit Oracle(const grh::Graph& graph, std::vector<std::string> probes = {}, const sim::SinkSchedule* schedule = nullptr,
+                    bool preserveUnknowns = false)
+        : graph_(graph), probes_(std::move(probes)), schedule_(schedule), preserveUnknowns_(preserveUnknowns) { init(); }
 
     void init() {
         state_.clear(); history_.clear(); pendingHistory_.clear(); held_.clear(); samples_.clear();
@@ -61,7 +62,8 @@ public:
                         bits.set(row * type.leafWidth() + type.leafWidth() - 1, row * type.leafWidth(), literal(step.value, type.leafWidth(), type.isSigned));
                 } else throw std::runtime_error("Oracle fixture initializer is not const/fill");
             }
-            bits.flattenUnknowns(); state_.emplace(op, bits);
+            if (!preserveUnknowns_) bits.flattenUnknowns();
+            state_.emplace(op, bits);
         }
         // All fixture event cones use the legacy statically evaluable subset.
         for (const auto op : graph_.operations()) {
@@ -110,7 +112,9 @@ public:
                 if (graph_.opKind(op) == sim::kEdgeDetect) value(graph_.opResults(op)[0]);
             for (const auto& [key, current] : pendingHistory_) { history_[key] = current; ++historyUpdates_; }
             samplingEvents_ = false;
-            const bool changed = next != state_;
+            const bool changed = std::any_of(next.begin(), next.end(), [&](const auto& entry) {
+                return !exactlyEqual(entry.second, state_.at(entry.first));
+            });
             state_ = std::move(next); cache_.clear();
             observation.rounds.push_back(project());
             if (!changed) break;
@@ -247,8 +251,10 @@ private:
     }
     SVInt normalize(grh::ValueId id, SVInt bits) const {
         bits.setSigned(graph_.valueSigned(id)); bits = bits.resize(graph_.valueWidth(id)); bits.setSigned(graph_.valueSigned(id));
-        // The reference executes the explicitly selected production TwoState policy.
-        bits.flattenUnknowns(); return bits;
+        // Default fixtures execute the explicitly selected production TwoState
+        // policy; frontend tests may observe FourState GRH before conversion.
+        if (!preserveUnknowns_) bits.flattenUnknowns();
+        return bits;
     }
     std::string rawKey(grh::ValueId value) const { return "raw/" + std::to_string(value.index); }
     static bool edge(std::string_view mode, bool previous, bool current) {
@@ -451,6 +457,7 @@ private:
     std::map<std::string, SVInt> samples_;
     std::map<std::string, SVInt> heldSamples_;
     const sim::SinkSchedule* schedule_ = nullptr;
+    bool preserveUnknowns_ = false;
     std::string phase_;
     bool samplingEvents_ = false;
     std::set<grh::OperationId, bool(*)(grh::OperationId, grh::OperationId)> deferred_{[](auto a, auto b) { return a.index < b.index; }};

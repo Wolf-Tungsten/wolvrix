@@ -1,5 +1,6 @@
 #include "ingest/firrtl.hpp"
 #include "firrtl/semantic.hpp"
+#include "firrtl/annotations.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -166,6 +167,7 @@ IngestResult readFirrtl(const IngestRequest& request) {
         if (request.tops.empty()) tops.emplace_back(source->circuit());
     }
     grh::Design design;
+    std::map<const firrtl::Source*, firrtl::detail::AnnotationIndex> annotationIndexes;
     std::unordered_set<std::string> selected;
     for (const auto& top : tops) {
         const auto found = modules.find(top);
@@ -176,14 +178,19 @@ IngestResult readFirrtl(const IngestRequest& request) {
         const auto& [source, index] = found->second.front();
         const auto& module = source->modules()[index];
         try {
-            if (!source->annotations().empty())
-                throw firrtl::detail::Error(module.range, "FIRRTL annotation lowering is not supported yet (F06)");
+            if (!annotationIndexes.contains(source.get())) annotationIndexes.emplace(source.get(), firrtl::detail::readAnnotations(*source));
             if (!request.externalBindings.empty())
                 throw firrtl::detail::Error(module.range, "FIRRTL external binding lowering is not supported yet (F07)");
             auto parsed = firrtl::parseModule(source, index);
             result.diagnostics.insert(result.diagnostics.end(), parsed.diagnostics.begin(), parsed.diagnostics.end());
             if (!parsed.success()) continue;
+            for (const auto& statement : parsed.body->arena.statements)
+                if (statement.kind == firrtl::StmtKind::Cover)
+                    result.diagnostics.push_back({IngestSeverity::Warning,
+                        "FIRRTL cover uses a simulation hit trace; no formal coverage model is generated",
+                        top, "ingest-firrtl", top, source->position(statement.range)});
             auto signature = firrtl::detail::lowerModule(*source, *parsed.body, design, request.firrtl);
+            firrtl::detail::applyAnnotations(*source, module, annotationIndexes.at(source.get()), *design.findGraph(top));
             for (auto& entry : result.modules)
                 if (entry.sourceUnit == signature.sourceUnit && entry.name == signature.name) entry = signature;
             design.markAsTop(top);

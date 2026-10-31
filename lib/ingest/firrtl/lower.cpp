@@ -26,6 +26,7 @@ struct Driver {
     // Disjoint half-open bit intervals, with a sentinel at total width.
     std::map<int64_t, int> coverage;
     std::string regSymbol;
+    ValueId memoryMask;
 };
 
 class Lowerer {
@@ -40,6 +41,7 @@ private:
     const FirrtlOptions& options_;
     std::map<LeafKey, Driver> drivers_;
     std::map<int, ValueId> guards_;
+    std::unordered_map<ValueId, ValueId, grh::ValueIdHash> clockPulses_;
     std::string nodeKey_;
     grh::SrcLoc location(Range range) const;
     LogicalType logical(const Leaf& leaf) const;
@@ -68,6 +70,11 @@ private:
     void cover(Driver& driver, int64_t begin, int64_t end, int guard);
     void drive(ValueId target, ValueId source, Range range, bool root = false);
     void checkCycles() const;
+    void memories();
+    bool memorySource(const LeafKey& key) const;
+    ValueId pipeline(ValueId data, ValueId clock, int64_t stages, Range range);
+    ValueId clockPulse(ValueId clock, Range range);
+    void effects();
 };
 
 grh::SrcLoc Lowerer::location(Range range) const {
@@ -108,9 +115,11 @@ ValueId Lowerer::constant(const LogicalType& type, std::string bits, Range range
     return value;
 }
 ValueId Lowerer::number(int64_t value, int32_t width, Range range) {
+    auto unsignedValue = static_cast<uint64_t>(value);
     std::string bits;
-    do { bits += char('0' + (value & 1)); value >>= 1; } while (value);
+    do { bits += char('0' + (unsignedValue & 1)); unsignedValue >>= 1; } while (unsignedValue);
     std::reverse(bits.begin(), bits.end());
+    if (bits.size() > static_cast<std::size_t>(width)) bits.erase(0, bits.size() - width);
     return constant({grh::ValueType::Logic, width, false}, std::move(bits), range);
 }
 ValueId Lowerer::invalid(const LogicalType& type, Range range) {
@@ -224,6 +233,7 @@ ValueId Lowerer::expression(ExprId id, const std::vector<std::string>& fields) {
         return op(OperationKind::kMux, type, {select, a, b}, expr.range);
     }
     if (expr.kind == ExprKind::Primitive) return primitive(id);
+    if (expr.kind == ExprKind::Probe || expr.kind == ExprKind::RWProbe || expr.kind == ExprKind::Read) return expression(expr.operands[0], fields);
     throw Error(expr.range, "FIRRTL expression lowering is not supported yet (F06)");
 }
 
@@ -371,10 +381,17 @@ void Lowerer::connect(const Connection& connection) {
         if (!fixed || *fixed >= fullType.shape[i]) staticWrite = false;
         else offset += *fixed * stride;
     }
+    if (connection.define) {
+        if (!staticWrite) throw Error(connection.range, "probe definition requires a static component destination");
+        for (auto at = driver.coverage.begin(); std::next(at) != driver.coverage.end(); ++at)
+            if (at->first < offset + dataType.width && std::next(at)->first > offset && at->second)
+                throw Error(connection.range, "probe has multiple definitions");
+    }
     if (staticWrite) cover(driver, offset, offset + dataType.width, connection.guard);
     auto current = driver.current;
     if (!current) current = invalid(fullType, connection.range);
     auto enable = guard(connection.guard, connection.range);
+    auto writeMask = constant(fullType, std::string(dataType.width, '1'), connection.range);
     if (!path.indices.empty()) {
         const LogicalType offsetType{grh::ValueType::Logic, 32, false};
         const LogicalType bit{grh::ValueType::Logic, 1, false};
@@ -395,18 +412,323 @@ void Lowerer::connect(const Connection& connection) {
         const auto mask = constant(flatType, std::string(dataType.width, '1'), connection.range);
         payload = op(OperationKind::kShl, flatType, {payload, bitOffset}, connection.range);
         const auto shifted = op(OperationKind::kShl, flatType, {mask, bitOffset}, connection.range);
+        writeMask = view(shifted, fullType, connection.range);
         const auto clear = op(OperationKind::kNot, flatType, {shifted}, connection.range);
         const auto kept = op(OperationKind::kAnd, flatType, {view(current, flatType, connection.range), clear}, connection.range);
         data = view(op(OperationKind::kOr, flatType, {kept, payload}, connection.range), fullType, connection.range);
     }
     driver.current = connection.guard == 1 && path.indices.empty() ? data :
         op(OperationKind::kMux, fullType, {enable, data, current}, connection.range);
+    if (semantics_.memoryPorts.contains(path.name)) {
+        auto mask = driver.memoryMask ? driver.memoryMask : number(0, fullType.width, connection.range);
+        mask = view(mask, fullType, connection.range);
+        const auto merged = op(OperationKind::kOr, fullType, {mask, writeMask}, connection.range);
+        driver.memoryMask = op(OperationKind::kMux, fullType, {enable, merged, mask}, connection.range);
+    }
 }
 void Lowerer::drive(ValueId target, ValueId source, Range range, bool root) {
     if (!target) return;
     const auto operation = graph_.createOperation(OperationKind::kAssign);
     graph_.addOperand(operation, source); graph_.addResult(operation, target); graph_.setOpSrcLoc(operation, location(range));
     if (root && !nodeKey_.empty()) node::write(graph_, operation, {{nodeKey_}, {{nodeKey_, 0}}, {nodeKey_}});
+}
+
+bool Lowerer::memorySource(const LeafKey& key) const {
+    const auto found = semantics_.memories.find(key.first);
+    if (found == semantics_.memories.end() || !found->second.standard || key.second.size() < 2) return false;
+    for (const auto& port : found->second.ports)
+        if (port.name == key.second[0] && port.read && key.second[1] == (port.write ? "rdata" : "data")) return true;
+    return false;
+}
+ValueId Lowerer::pipeline(ValueId data, ValueId clock, int64_t stages, Range range) {
+    const auto type = graph_.valueLogicalType(data);
+    for (int64_t i = 0; i < stages; ++i) {
+        const auto state = graph_.createOperation(OperationKind::kRegister);
+        const std::string symbol(graph_.getOperation(state).symbolText());
+        grh::setStateLogicalType(graph_, state, type);
+        grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
+        grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLoc(state, location(range));
+        graph_.setAttr(state, "firrtl.memoryPipeline", true);
+        const auto write = graph_.createOperation(OperationKind::kRegisterWritePort);
+        for (const auto value : {number(1, 1, range), data, clock}) graph_.addOperand(write, value);
+        graph_.setAttr(write, "regSymbol", symbol); graph_.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        graph_.setOpSrcLoc(write, location(range));
+        data = op(OperationKind::kRegisterReadPort, type, {}, range); graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
+    }
+    return data;
+}
+ValueId Lowerer::clockPulse(ValueId clock, Range range) {
+    if (const auto found = clockPulses_.find(clock); found != clockPulses_.end()) return found->second;
+    const LogicalType bit{grh::ValueType::Logic, 1, false};
+    const auto state = graph_.createOperation(OperationKind::kRegister);
+    const std::string symbol(graph_.getOperation(state).symbolText());
+    grh::setStateLogicalType(graph_, state, bit);
+    grh::InitStep init; init.value = "1'b0"; grh::setStateInitSpec(graph_, state, {init});
+    graph_.setAttr(state, "firrtl.memoryClockHistory", true);
+    const auto previous = op(OperationKind::kRegisterReadPort, bit, {}, range);
+    graph_.setAttr(graph_.valueDef(previous), "regSymbol", symbol);
+    const auto writer = graph_.createOperation(OperationKind::kRegisterWritePort);
+    for (const auto value : {number(1, 1, range), clock, clock}) graph_.addOperand(writer, value);
+    graph_.setAttr(writer, "regSymbol", symbol);
+    graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"both"});
+    graph_.setOpSrcLoc(writer, location(range));
+    const auto pulse = op(OperationKind::kAnd, bit, {clock, op(OperationKind::kNot, bit, {previous}, range)}, range);
+    clockPulses_.emplace(clock, pulse); return pulse;
+}
+void Lowerer::memories() {
+    const LogicalType bit{grh::ValueType::Logic, 1, false};
+    const auto both = [&](ValueId a, ValueId b, Range r) { return op(OperationKind::kAnd, bit, {a, b}, r); };
+    std::unordered_map<ValueId, ValueId, grh::ValueIdHash> aliases;
+    for (const auto& [key, driver] : drivers_)
+        if (driver.value && driver.current) aliases.emplace(driver.value, driver.current);
+    const auto clockSource = [&](ValueId clock) {
+        std::unordered_set<ValueId, grh::ValueIdHash> visited;
+        while (visited.insert(clock).second) {
+            if (const auto found = aliases.find(clock); found != aliases.end()) { clock = found->second; continue; }
+            const auto definition = graph_.valueDef(clock);
+            if (!definition || graph_.opKind(definition) != OperationKind::kAssign) break;
+            const auto operands = graph_.opOperands(definition);
+            if (operands.size() != 1 || graph_.valueWidth(operands[0]) != 1) break;
+            clock = operands[0];
+        }
+        return clock;
+    };
+    for (const auto& [name, memory] : semantics_.memories) {
+        std::map<std::string, ValueId> writeModes;
+        if (!memory.standard) for (const auto& port : memory.ports) if (port.read && port.write) {
+            auto mode = number(0, 1, port.range);
+            for (const auto& leaf : semantics_.leaves(memory.data)) {
+                const auto mask = drivers_.at({port.name, leaf.fields}).memoryMask;
+                if (mask) mode = op(OperationKind::kOr, bit, {mode, op(OperationKind::kReduceOr, bit, {mask}, port.range)}, port.range);
+            }
+            writeModes.emplace(port.name, mode);
+        }
+        struct Port {
+            const MemoryPort* source; ValueId address, clock, readEnable, writeEnable;
+            ValueId writeAddress, writeData, writeMask;
+            ValueId initiatingEnable;
+            std::vector<std::pair<ValueId, ValueId>> pendingWrites;
+        };
+        for (const auto& leaf : semantics_.leaves(memory.data)) {
+            const auto type = logical(leaf); if (!type.width) continue;
+            auto storage = type; storage.shape.insert(storage.shape.begin(), memory.depth);
+            auto storedLeaf = leaf; storedLeaf.shape.insert(storedLeaf.shape.begin(), memory.depth);
+            storage.width = static_cast<int32_t>(semantics_.total(storedLeaf));
+            const auto state = graph_.createOperation(OperationKind::kRegister);
+            const std::string symbol(graph_.getOperation(state).symbolText());
+            grh::setStateLogicalType(graph_, state, storage);
+            grh::InitStep init; init.value = std::to_string(storage.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
+            grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLoc(state, location(memory.range));
+            graph_.setAttr(state, "firrtl.memory", name); graph_.setAttr(state, "firrtl.readUnderWrite", memory.readUnderWrite);
+            std::vector<Port> ports;
+            for (const auto& port : memory.ports) {
+                const auto field = [&](std::string_view member, bool data = false) -> Driver& {
+                    std::vector<std::string> path{port.name, std::string(member)};
+                    if (data) path.insert(path.end(), leaf.fields.begin(), leaf.fields.end());
+                    return drivers_.at({name, path});
+                };
+                Port lowered{&port};
+                if (memory.standard) {
+                    auto address = field("addr").value;
+                    lowered.address = address ? address : number(0, 1, port.range);
+                    lowered.clock = clockSource(field("clk").current ? field("clk").current : field("clk").value);
+                    lowered.readEnable = lowered.writeEnable = field("en").value;
+                    if (port.read && port.write) {
+                        const auto mode = field("wmode").value;
+                        lowered.readEnable = both(lowered.readEnable, op(OperationKind::kNot, bit, {mode}, port.range), port.range);
+                        lowered.writeEnable = both(lowered.writeEnable, mode, port.range);
+                    }
+                    if (port.write) {
+                        lowered.writeData = field(port.read ? "wdata" : "data", true).value;
+                        const auto mask = field(port.read ? "wmask" : "mask", true).value;
+                        const auto& maskType = graph_.valueLogicalType(mask);
+                        if (type.shape.empty()) {
+                            lowered.writeMask = type.width == 1 ? view(mask, type, port.range) : op(OperationKind::kReplicate, type, {mask}, port.range);
+                            if (type.width != 1) graph_.setAttr(graph_.valueDef(lowered.writeMask), "rep", int64_t(type.width));
+                        } else {
+                            // Repeat each mask leaf's bit across its corresponding data element.
+                            std::vector<ValueId> elements; const auto count = maskType.width;
+                            for (int64_t i = 0; i < count; ++i) {
+                                const auto selected = slice(mask, i, 1, false, port.range);
+                                const auto width = type.width / count;
+                                auto expanded = selected;
+                                if (width > 1) { expanded = op(OperationKind::kReplicate, {grh::ValueType::Logic, width, false}, {selected}, port.range); graph_.setAttr(graph_.valueDef(expanded), "rep", width); }
+                                elements.insert(elements.begin(), expanded);
+                            }
+                            auto flat = type; flat.shape.clear(); flat.isSigned = false;
+                            lowered.writeMask = view(elements.size() == 1 ? elements[0] : op(OperationKind::kConcat, flat, elements, port.range), type, port.range);
+                        }
+                    }
+                } else {
+                    lowered.address = index(*port.address); lowered.clock = clockSource(expression(*port.clock));
+                    lowered.readEnable = guard(port.guard, port.range);
+                    auto& driver = drivers_.at({port.name, leaf.fields});
+                    lowered.writeData = driver.current ? driver.current : invalid(type, port.range);
+                    lowered.writeMask = driver.memoryMask ? driver.memoryMask : view(number(0, type.width, port.range), type, port.range);
+                    lowered.writeEnable = both(guard(port.guard, port.range), op(OperationKind::kReduceOr, bit, {lowered.writeMask}, port.range), port.range);
+                    if (port.read && port.write) lowered.readEnable = both(lowered.readEnable, op(OperationKind::kNot, bit, {writeModes.at(port.name)}, port.range), port.range);
+                }
+                const auto bounds = inBounds(lowered.address, memory.depth, port.range);
+                lowered.readEnable = both(lowered.readEnable, bounds, port.range);
+                lowered.writeEnable = both(lowered.writeEnable, bounds, port.range);
+                if (port.write) {
+                    lowered.writeEnable = both(lowered.writeEnable, op(OperationKind::kReduceOr, bit, {lowered.writeMask}, port.range), port.range);
+                    lowered.initiatingEnable = lowered.writeEnable;
+                    lowered.writeAddress = lowered.address;
+                    for (int64_t i = 1; i < memory.writeLatency; ++i) {
+                        lowered.writeAddress = pipeline(lowered.writeAddress, lowered.clock, 1, port.range);
+                        lowered.writeEnable = pipeline(lowered.writeEnable, lowered.clock, 1, port.range);
+                        lowered.pendingWrites.emplace_back(lowered.writeAddress, lowered.writeEnable);
+                    }
+                    lowered.writeData = pipeline(lowered.writeData, lowered.clock, memory.writeLatency - 1, port.range);
+                    lowered.writeMask = pipeline(lowered.writeMask, lowered.clock, memory.writeLatency - 1, port.range);
+                }
+                ports.push_back(lowered);
+            }
+            for (const auto& port : ports) if (port.source->write) {
+                auto data = port.writeData;
+                for (const auto& other : ports) if (&other != &port && other.source->write) {
+                    const auto same = op(OperationKind::kEq, bit, {port.writeAddress, other.writeAddress}, port.source->range);
+                    const auto active = both(other.writeEnable, clockPulse(other.clock, port.source->range), port.source->range);
+                    const auto conflict = both(active, same, port.source->range);
+                    // FIRRTL independent writers have undefined collisions, never last-connect priority.
+                    data = op(OperationKind::kMux, type, {conflict, invalid(type, port.source->range), data}, port.source->range);
+                }
+                const auto writer = graph_.createOperation(OperationKind::kRegisterWriteArrayMaskPort);
+                for (const auto value : {port.writeEnable, port.writeAddress, data, port.writeMask, port.clock}) graph_.addOperand(writer, value);
+                graph_.setAttr(writer, "regSymbol", symbol); graph_.setAttr(writer, "eventEdge", std::vector<std::string>{"posedge"});
+                graph_.setOpSrcLoc(writer, location(port.source->range));
+            }
+            for (const auto& port : ports) {
+                ValueId data;
+                if (port.source->read) {
+                    ValueId poison;
+                    if (memory.readLatency) {
+                        // Pending read tokens retain collision history even when a
+                        // different clock writes between two read clock edges.
+                        const auto readPulse = clockPulse(port.clock, port.source->range);
+                        auto tokenAddress = port.address, tokenEnable = port.readEnable;
+                        auto priorPoison = number(0, 1, port.source->range);
+                        std::vector<ValueId> clocks{port.clock};
+                        for (const auto& writer : ports) if (writer.source->write && std::find(clocks.begin(), clocks.end(), writer.clock) == clocks.end()) clocks.push_back(writer.clock);
+                        for (int64_t stage = 0; stage < memory.readLatency; ++stage) {
+                            const auto range = port.source->range;
+                            const auto savedAddress = pipeline(tokenAddress, port.clock, 1, range);
+                            const auto savedEnable = pipeline(tokenEnable, port.clock, 1, range);
+                            const auto state = graph_.createOperation(OperationKind::kRegister);
+                            const std::string poisonSymbol(graph_.getOperation(state).symbolText());
+                            grh::setStateLogicalType(graph_, state, bit);
+                            grh::InitStep init; init.value = "1'b0"; grh::setStateInitSpec(graph_, state, {init});
+                            graph_.setAttr(state, "firrtl.memoryCollision", true);
+                            poison = op(OperationKind::kRegisterReadPort, bit, {}, range);
+                            graph_.setAttr(graph_.valueDef(poison), "regSymbol", poisonSymbol);
+                            const auto selectedAddress = op(OperationKind::kMux, graph_.valueLogicalType(tokenAddress), {readPulse, tokenAddress, savedAddress}, range);
+                            const auto selectedEnable = op(OperationKind::kMux, bit, {readPulse, tokenEnable, savedEnable}, range);
+                            auto next = op(OperationKind::kMux, bit, {readPulse, priorPoison, poison}, range);
+                            for (const auto& writer : ports) if (writer.source->write && (memory.readUnderWrite == "undefined" || writer.clock != port.clock)) {
+                                const auto collide = [&](ValueId address, ValueId enable) {
+                                    const auto same = op(OperationKind::kEq, bit, {selectedAddress, address}, range);
+                                    const auto collision = both(selectedEnable, both(enable, same, range), range);
+                                    next = op(OperationKind::kOr, bit, {next, collision}, range);
+                                };
+                                // A write with latency one commits on its initiating
+                                // edge; longer writes also occupy pending stages.
+                                collide(writer.address, both(writer.initiatingEnable, clockPulse(writer.clock, range), range));
+                                for (const auto& pending : writer.pendingWrites) collide(pending.first, pending.second);
+                            }
+                            const auto update = graph_.createOperation(OperationKind::kRegisterWritePort);
+                            // Completed tokens remain stable until the next result.
+                            graph_.addOperand(update, stage + 1 == memory.readLatency ? readPulse : number(1, 1, range));
+                            graph_.addOperand(update, next);
+                            for (const auto clock : clocks) graph_.addOperand(update, clock);
+                            graph_.setAttr(update, "regSymbol", poisonSymbol);
+                            graph_.setAttr(update, "eventEdge", std::vector<std::string>(clocks.size(), "posedge"));
+                            priorPoison = poison; tokenAddress = savedAddress; tokenEnable = savedEnable;
+                        }
+                    }
+                    auto address = port.address, enable = port.readEnable;
+                    if (memory.readUnderWrite == "new") {
+                        address = pipeline(address, port.clock, memory.readLatency, port.source->range);
+                        enable = pipeline(enable, port.clock, memory.readLatency, port.source->range);
+                    }
+                    data = op(OperationKind::kRegisterReadArrayPort, type, {address}, port.source->range);
+                    graph_.setAttr(graph_.valueDef(data), "regSymbol", symbol);
+                    data = op(OperationKind::kMux, type, {enable, data, invalid(type, port.source->range)}, port.source->range);
+                    if (memory.readUnderWrite != "new") data = pipeline(data, port.clock, memory.readLatency, port.source->range);
+                    if (poison) data = op(OperationKind::kMux, type, {poison, invalid(type, port.source->range), data}, port.source->range);
+                } else data = invalid(type, port.source->range);
+                std::vector<std::string> fields;
+                std::string target = port.source->name;
+                if (memory.standard) {
+                    if (!port.source->read) continue;
+                    target = name; fields = {port.source->name, port.source->write ? "rdata" : "data"};
+                }
+                fields.insert(fields.end(), leaf.fields.begin(), leaf.fields.end());
+                // Write-only mports have no expression value. Their data is
+                // consumed directly from the ordered connection driver.
+                if (memory.standard || port.source->read) drive(drivers_.at({target, fields}).value, data, port.source->range);
+            }
+        }
+    }
+}
+void Lowerer::effects() {
+    const LogicalType bit{grh::ValueType::Logic, 1, false};
+    for (const auto& effect : semantics_.effects) {
+        const auto& statement = semantics_.body.arena.statements[effect.statement];
+        auto operands = statement.operands;
+        std::string text, name; std::vector<ValueId> arguments;
+        const bool verification = statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume || statement.kind == StmtKind::Cover || statement.kind == StmtKind::Intrinsic;
+        if (statement.kind == StmtKind::Intrinsic) {
+            const auto& call = semantics_.body.arena.expressions[operands[0]]; operands = call.operands;
+            for (const auto& parameter : call.parameters) if (parameter.name == "format") text = decodeString(parameter.value);
+        } else if (statement.kind != StmtKind::Stop) {
+            const auto format = verification ? 3u : 2u;
+            text = decodeString(semantics_.body.arena.expressions[operands[format]].literal);
+            for (std::size_t i = format + 1; i < operands.size(); ++i) arguments.push_back(expression(operands[i]));
+        }
+        const auto clock = expression(operands[0]);
+        auto enable = expression(operands[verification ? 2 : 1]);
+        enable = op(OperationKind::kAnd, bit, {enable, guard(effect.guard, statement.range)}, statement.range);
+        if (verification) {
+            auto predicate = expression(operands[1]);
+            if (statement.kind != StmtKind::Cover) predicate = op(OperationKind::kNot, bit, {predicate}, statement.range);
+            enable = op(OperationKind::kAnd, bit, {enable, predicate}, statement.range);
+        }
+        if (statement.kind == StmtKind::Stop) {
+            name = "finish";
+            const auto& code = semantics_.body.arena.expressions[operands[2]];
+            arguments.push_back(number(integer64({TokenKind::Number, code.literal, code.range}), 32, code.range));
+        } else {
+            // FIRRTL %x is the same base as the existing SV formatter's %h.
+            // Cover carries a literal comment, not a printf format string.
+            if (statement.kind == StmtKind::Cover) {
+                std::string escaped;
+                for (const char c : text) { escaped += c; if (c == '%') escaped += '%'; }
+                text = std::move(escaped);
+            }
+            std::size_t placeholders = 0;
+            for (std::size_t i = 0; i < text.size(); ++i) if (text[i] == '%') {
+                if (++i == text.size()) throw Error(statement.range, "truncated FIRRTL format placeholder");
+                if (text[i] == '%') continue;
+                if (std::string_view("bcdx").find(text[i]) == std::string_view::npos) throw Error(statement.range, "unsupported FIRRTL format placeholder");
+                ++placeholders; if (text[i] == 'x') text[i] = 'h';
+            }
+            if (statement.kind != StmtKind::Cover && text.find("{{") != std::string::npos) throw Error(statement.range, "FIRRTL special format substitution is not supported yet");
+            if (statement.kind != StmtKind::Cover && placeholders != arguments.size()) throw Error(statement.range, "FIRRTL format argument count mismatch");
+            const auto constant = graph_.createOperation(OperationKind::kConstant);
+            const auto value = graph_.createValue({grh::ValueType::String, 0, false});
+            graph_.addResult(constant, value); graph_.setAttr(constant, "constValue", text); graph_.setOpSrcLoc(constant, location(statement.range));
+            arguments.insert(arguments.begin(), value);
+            name = verification && statement.kind != StmtKind::Cover ? "fatal" : "write";
+            if (name == "fatal") arguments.insert(arguments.begin(), number(1, 32, statement.range));
+        }
+        const auto task = graph_.createOperation(OperationKind::kSystemTask);
+        graph_.addOperand(task, enable); for (const auto value : arguments) graph_.addOperand(task, value); graph_.addOperand(task, clock);
+        graph_.setAttr(task, "name", name); graph_.setAttr(task, "eventEdge", std::vector<std::string>{"posedge"});
+        graph_.setAttr(task, "procKind", std::string("always")); graph_.setAttr(task, "hasTiming", true);
+        graph_.setAttr(task, "firrtl.effectKind", std::string(statement.kind == StmtKind::Cover ? "cover-hit" : verification ? "assert" : statement.kind == StmtKind::Stop ? "stop" : "printf"));
+        graph_.setAttr(task, "firrtl.effectLabel", std::string(statement.name)); graph_.setOpSrcLoc(task, location(statement.range));
+    }
 }
 void Lowerer::checkCycles() const {
     std::unordered_map<ValueId, unsigned, grh::ValueIdHash> colors;
@@ -443,6 +765,7 @@ ModuleSignature Lowerer::run() {
     graph_.setMetadata("firrtl.sourceUnit", std::string(semantics_.source.unit()));
     graph_.setMetadata("firrtl.invalidPolicy", std::string(options_.invalidPolicy == FirrtlInvalidPolicy::Unknown ? "unknown" : "zero"));
     graph_.setMetadata("firrtl.initPolicy", std::string(options_.initPolicy == FirrtlInitPolicy::Unknown ? "unknown" : "zero"));
+    graph_.setMetadata("firrtl.enabledLayers", options_.enabledLayers);
     std::set<std::string> names; std::vector<std::string> elided;
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declarations.at(name);
@@ -477,6 +800,10 @@ ModuleSignature Lowerer::run() {
                 port.isSigned = type.isSigned; port.isConst = leaf.type->constant; port.requiresTypeResolution = !type.width;
                 const auto kind = semantics_.resolvedKind(leaf.type);
                 port.sourceType = kind == TypeKind::SInt ? "SInt" : kind == TypeKind::Clock ? "Clock" : kind == TypeKind::AsyncReset ? "AsyncReset" : "UInt";
+                if (leaf.probe != TypeKind::Unknown) {
+                    port.sourceType = std::string(leaf.probe == TypeKind::Probe ? "Probe<" : "RWProbe<") + port.sourceType + ">";
+                    port.requiresTypeResolution = true;
+                }
                 signature.ports.push_back(std::move(port));
             }
         }
@@ -506,8 +833,11 @@ ModuleSignature Lowerer::run() {
             stateWrite(driver, *declaration.state, expression(*declaration.state->reset), {}, data, declaration.range);
         }
     }
+    memories();
+    effects();
     for (auto& [key, driver] : drivers_) {
         if (!driver.value || !driver.regSymbol.empty() || !(driver.leaf.flow & 2)) continue;
+        if (memorySource(key) || semantics_.memoryPorts.contains(key.first)) continue;
         const auto required = semantics_.declarations.at(key.first).guard;
         for (auto at = driver.coverage.begin(); std::next(at) != driver.coverage.end(); ++at)
             if (semantics_.guards.conjunction(required, semantics_.guards.negate(at->second)))
@@ -522,9 +852,7 @@ ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
                             grh::Design& design, const FirrtlOptions& options) {
     if (body.interface.kind != ModuleKind::Module)
         throw Error(body.interface.range, "FIRRTL external/class lowering is not supported yet (F06/F07)");
-    if (!body.interface.enabledLayers.empty() || !body.interface.knownLayers.empty())
-        throw Error(body.interface.range, "FIRRTL layer lowering is not supported yet (F06)");
-    Semantics semantics(source, body); semantics.analyze();
+    Semantics semantics(source, body, options); semantics.analyze();
     auto& graph = design.createGraph(std::string(body.interface.name));
     return Lowerer(semantics, graph, options).run();
 }

@@ -67,8 +67,8 @@ void validFixture() {
     require(probe != ports.end() && probe->requiresTypeResolution && probe->sourceType == "Probe<UInt>",
             "Probe interface was silently treated as ordinary Logic");
     const auto read = in::readFirrtl(request);
-    require(!read.success() && !read.design && read.diagnostics.back().message.find("lowering is not supported") != std::string::npos,
-            "syntax scan returned a publishable design without lowering");
+    require(!read.success() && !read.design && read.diagnostics.back().message.find("annotation") != std::string::npos,
+            "syntax-only annotation fixture became executable without an annotation policy");
 }
 
 void bad(std::string text, std::string_view expected) {

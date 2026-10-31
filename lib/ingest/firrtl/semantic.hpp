@@ -31,6 +31,7 @@ struct SemanticType {
     int64_t extent = 0;
     TypePtr element;
     std::vector<SemanticField> fields;
+    std::string layer;
 };
 
 struct Width {
@@ -74,6 +75,7 @@ struct Connection {
     int guard = 1;
     bool invalid = false;
     Range range;
+    bool define = false;
 };
 struct Declaration {
     struct Register {
@@ -90,17 +92,46 @@ struct Declaration {
     int guard = 1;
     std::optional<Register> state;
     std::size_t conditionDepth = 0;
+    std::string layer;
 };
 struct Leaf {
     TypePtr type;
     std::vector<int64_t> shape;
     std::vector<std::string> fields;
     int flow = 3;
+    TypeKind probe = TypeKind::Unknown;
+};
+
+// Both standard memory ports and CHIRRTL accesses use this frontend-only model.
+struct MemoryPort {
+    std::string name;
+    bool read = false;
+    bool write = false;
+    bool inferred = false;
+    std::optional<ExprId> address;
+    std::optional<ExprId> clock;
+    int guard = 1;
+    Range range;
+};
+struct Memory {
+    std::string name;
+    TypePtr data;
+    int64_t depth = 0;
+    int64_t readLatency = 0;
+    int64_t writeLatency = 1;
+    std::string readUnderWrite = "undefined";
+    bool standard = false;
+    std::vector<MemoryPort> ports;
+    Range range;
+};
+struct Effect {
+    StmtId statement = 0;
+    int guard = 1;
 };
 
 class Semantics {
 public:
-    Semantics(const Source& source, const ModuleBody& body);
+    Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options);
     void analyze();
     TypePtr expression(ExprId id);
     std::vector<Leaf> leaves(TypePtr type, int flow = 1) const;
@@ -118,6 +149,11 @@ public:
     std::vector<Connection> connections;
     std::vector<TypePtr> expressions;
     Guards guards;
+    std::map<std::string, Memory> memories;
+    std::map<std::string, std::pair<std::string, std::size_t>> memoryPorts;
+    std::vector<Effect> effects;
+    std::unordered_set<StmtId> activeStatements;
+    bool layerEnabled(std::string_view path) const;
 
 private:
     std::vector<Width> widths_;
@@ -128,7 +164,12 @@ private:
     std::vector<TypePtr> conditions_;
     std::vector<int> conditionGuards_;
     std::unordered_map<std::string, StmtId> nodeDeclarations_;
+    std::unordered_map<std::string, std::string> nodeLayers_;
     std::unordered_set<std::string> activeNodes_;
+    std::unordered_set<std::string> knownLayers_;
+    std::vector<std::string> enabledLayers_;
+    std::string activeLayer_;
+    std::string layerPath(const Statement& statement) const;
     uint32_t newWidth(int64_t value, Range range);
     uint32_t newReset(unsigned flags);
     uint32_t resetRoot(uint32_t id);
@@ -148,6 +189,9 @@ private:
     int flow(ExprId id) const;
     void solve();
     void normalizeGuards();
+    void collectMemory(const Statement& statement);
+    void collectMemoryPort(const Statement& statement);
+    void inferMemoryPorts(std::span<const StmtId> statements);
 };
 
 ModuleSignature lowerModule(const Source& source, const ModuleBody& body,

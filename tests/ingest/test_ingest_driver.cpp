@@ -84,9 +84,13 @@ int main() {
     IngestRequest firrtl;
     firrtl.inputRoot = WOLVRIX_INGEST_TEST_DATA_DIR;
     firrtl.sources.push_back({SourceLanguage::Firrtl, "firrtl/parser.fir", "firrtl"});
+    const auto rejected = [](const IngestResult& result) {
+        return !result.success() && !result.design && !result.diagnostics.empty() &&
+            result.diagnostics.front().message.find("annotation") != std::string::npos;
+    };
     if (!scanFirrtlInterfaces(firrtl).success || !scanInterfaces(firrtl).success || scanSvInterfaces(request).success ||
-        !unsupported(readFirrtl(firrtl)) || !unsupported(readSources(firrtl))) {
-        return fail("FIRRTL scans must validate syntax while lowering remains explicitly unsupported");
+        !rejected(readFirrtl(firrtl)) || !rejected(readSources(firrtl))) {
+        return fail("FIRRTL syntax scanning must not grant execution to unknown annotations");
     }
     firrtl.sources.push_back(request.sources.front());
     if (!unsupported(readSources(firrtl)) ||

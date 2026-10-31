@@ -89,8 +89,31 @@ int Guards::negate(int value) {
     const auto branch = branches[value]; return make(branch.variable, negate(branch.low), negate(branch.high));
 }
 
-Semantics::Semantics(const Source& source, const ModuleBody& body)
-    : source(source), body(body), expressions(body.arena.expressions.size()) {}
+Semantics::Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options)
+    : source(source), body(body), expressions(body.arena.expressions.size()), enabledLayers_(options.enabledLayers) {
+    const auto visit = [&](auto&& self, std::span<const Layer> layers, const std::string& parent) -> void {
+        for (const auto& layer : layers) {
+            const auto path = parent.empty() ? std::string(layer.name) : parent + "." + std::string(layer.name);
+            knownLayers_.insert(path); self(self, layer.children, path);
+        }
+    };
+    visit(visit, source.layers(), {});
+    for (const auto& path : enabledLayers_) if (!knownLayers_.contains(path))
+        throw Error(body.interface.range, "unknown enabled FIRRTL layer '" + path + "'");
+    for (const auto path : body.interface.enabledLayers) {
+        if (!knownLayers_.contains(std::string(path))) throw Error(body.interface.range, "unknown module enabled layer");
+        if (!layerEnabled(path)) throw Error(body.interface.range, "module requires explicitly enabled layer '" + std::string(path) + "'");
+    }
+}
+bool Semantics::layerEnabled(std::string_view path) const {
+    if (path.empty()) return true;
+    return std::any_of(enabledLayers_.begin(), enabledLayers_.end(), [&](const auto& enabled) { return enabled == path || enabled.starts_with(std::string(path) + "."); });
+}
+std::string Semantics::layerPath(const Statement& statement) const {
+    const auto path = activeLayer_.empty() ? std::string(statement.target) : activeLayer_ + "." + std::string(statement.target);
+    if (!knownLayers_.contains(path)) throw Error(statement.range, "unknown or incorrectly nested layerblock '" + path + "'");
+    return path;
+}
 uint32_t Semantics::newWidth(int64_t value, Range range) {
     const auto id = static_cast<uint32_t>(widths_.size());
     widths_.push_back({value, value >= 0, range, {}}); return id;
@@ -139,7 +162,10 @@ TypePtr Semantics::declaredType(const Arena& arena, TypeId id, Range range, bool
     if (type.kind == TypeKind::Clock || type.kind == TypeKind::Reset || type.kind == TypeKind::AsyncReset)
         return ground(type.kind, 1, range, constant);
     auto result = std::make_shared<SemanticType>(); result->kind = type.kind; result->constant = constant;
-    if (type.kind == TypeKind::Vector) { result->extent = type.extent; result->element = declaredType(arena, type.element, range, constant); }
+    if (type.kind == TypeKind::Probe || type.kind == TypeKind::RWProbe) {
+        result->element = declaredType(arena, type.element, range, constant); result->layer = type.layer;
+        if (!result->layer.empty() && !knownLayers_.contains(result->layer)) throw Error(range, "unknown probe layer color");
+    } else if (type.kind == TypeKind::Vector) { result->extent = type.extent; result->element = declaredType(arena, type.element, range, constant); }
     else if (type.kind == TypeKind::Bundle) {
         for (const auto& field : type.fields) result->fields.push_back({std::string(field.name), field.flip, declaredType(arena, field.type, range, constant)});
     } else throw Error(range, "FIRRTL type lowering is not supported yet for this construct (F06/F07)");
@@ -184,8 +210,15 @@ TypePtr Semantics::merge(TypePtr left, TypePtr right, Range range) {
 void Semantics::collect(std::span<const StmtId> statements) {
     for (const auto id : statements) {
         const auto& statement = body.arena.statements[id];
+        activeStatements.insert(id);
+        if (statement.kind == StmtKind::LayerBlock) {
+            const auto path = layerPath(statement);
+            if (layerEnabled(path)) { auto previous = activeLayer_; activeLayer_ = path; collect(statement.body); activeLayer_ = std::move(previous); }
+            continue;
+        }
         if (statement.kind == StmtKind::Wire || statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset) {
             Declaration declaration{std::string(statement.name), declaredType(body.arena, statement.type, statement.range), statement.range};
+            declaration.layer = activeLayer_;
             if (statement.kind != StmtKind::Wire) {
                 if (!storable(declaration.type)) throw Error(statement.range, "register data must have a passive, non-const storable type");
                 declaration.state = Declaration::Register{statement.operands[0]};
@@ -195,11 +228,23 @@ void Semantics::collect(std::span<const StmtId> statements) {
                 }
             }
             declarations.emplace(declaration.name, declaration); declarationOrder.push_back(declaration.name);
+        } else if (statement.kind == StmtKind::Memory || statement.kind == StmtKind::CMem || statement.kind == StmtKind::SMem) {
+            collectMemory(statement);
+        } else if (statement.kind == StmtKind::MPort) {
+            collectMemoryPort(statement);
         } else if (statement.kind == StmtKind::Node) {
             nodeDeclarations_.emplace(statement.name, id); declarationOrder.emplace_back(statement.name);
-        } else if (statement.kind != StmtKind::Connect && statement.kind != StmtKind::Invalidate && statement.kind != StmtKind::When && statement.kind != StmtKind::Skip) {
-            const auto stage = statement.kind == StmtKind::Instance ? "F07" : "F06";
-            throw Error(statement.range, "FIRRTL statement lowering is not supported yet for this construct (" + std::string(stage) + ")");
+            nodeLayers_.emplace(statement.name, activeLayer_);
+        } else if (statement.kind == StmtKind::Instance) {
+            const auto target = source.findModule(statement.target);
+            const auto& signature = source.modules()[*target];
+            throw Error(statement.range, "FIRRTL instance '" + std::string(statement.name) + "' requires " +
+                (signature.kind == ModuleKind::External ? "an external implementation binding for '" : "module linking for '") +
+                std::string(statement.target) + "' (not supported yet; F07)");
+        } else if (statement.kind != StmtKind::Connect && statement.kind != StmtKind::Define && statement.kind != StmtKind::Invalidate && statement.kind != StmtKind::When && statement.kind != StmtKind::Skip &&
+                   statement.kind != StmtKind::Printf && statement.kind != StmtKind::Stop && statement.kind != StmtKind::Assert && statement.kind != StmtKind::Assume &&
+                   statement.kind != StmtKind::Cover && statement.kind != StmtKind::Intrinsic) {
+            throw Error(statement.range, "FIRRTL statement lowering is not supported yet for this construct (F06)");
         }
         collect(statement.body); collect(statement.otherwise);
     }
@@ -216,9 +261,12 @@ TypePtr Semantics::expression(ExprId id) {
             if (node == nodeDeclarations_.end()) throw Error(expr.range, "unknown FIRRTL component");
             if (!activeNodes_.insert(name).second) throw Error(expr.range, "cyclic node definition");
             const auto& definition = body.arena.statements[node->second];
+            auto previous = activeLayer_; activeLayer_ = nodeLayers_.at(name);
             auto type = expression(definition.operands[0]);
+            activeLayer_ = std::move(previous);
             if (!passive(type)) throw Error(definition.range, "a node expression must have a passive type");
             declarations.emplace(name, Declaration{name, type, definition.range, 1, definition.operands[0]});
+            declarations.at(name).layer = nodeLayers_.at(name);
             activeNodes_.erase(name);
         }
         result = declarations.at(name).type;
@@ -262,6 +310,24 @@ TypePtr Semantics::expression(ExprId id) {
             };
             clear(clear, result);
         }
+    } else if (expr.kind == ExprKind::Probe || expr.kind == ExprKind::RWProbe) {
+        auto element = expression(expr.operands[0]);
+        const auto unflip = [&](auto&& self, TypePtr type) -> TypePtr {
+            auto copy = std::make_shared<SemanticType>(*type);
+            if (type->element) copy->element = self(self, type->element);
+            for (auto& field : copy->fields) { field.flip = false; field.type = self(self, field.type); }
+            return copy;
+        };
+        result = std::make_shared<SemanticType>();
+        result->kind = expr.kind == ExprKind::Probe ? TypeKind::Probe : TypeKind::RWProbe; result->element = unflip(unflip, element);
+    } else if (expr.kind == ExprKind::Read) {
+        auto probe = expression(expr.operands[0]);
+        if (probe->kind != TypeKind::Probe && probe->kind != TypeKind::RWProbe) throw Error(expr.range, "read requires a probe");
+        if (!layerEnabled(probe->layer)) throw Error(expr.range, "probe color is not enabled");
+        if (!probe->layer.empty() && activeLayer_ != probe->layer && !activeLayer_.starts_with(probe->layer + ".") &&
+            std::find(body.interface.enabledLayers.begin(), body.interface.enabledLayers.end(), probe->layer) == body.interface.enabledLayers.end())
+            throw Error(expr.range, "probe read is outside its layer color");
+        result = probe->element;
     } else if (expr.kind == ExprKind::Primitive) {
         const auto word = expr.name;
         std::vector<TypePtr> args;
@@ -342,6 +408,10 @@ int Semantics::flow(ExprId id) const {
 }
 void Semantics::connect(Projection left, TypePtr leftType, Projection right, TypePtr rightType,
                         int guard, Range range, bool invalid) {
+    if (leftType->kind == TypeKind::Probe || leftType->kind == TypeKind::RWProbe) {
+        if (invalid) return;
+        throw Error(range, "probes require define, not connect");
+    }
     if (!invalid) equivalent(leftType, rightType, range);
     if (leftType->kind == TypeKind::Vector) {
         connect(std::move(left), leftType->element, std::move(right), invalid ? nullptr : rightType->element, guard, range, invalid); return;
@@ -371,7 +441,10 @@ void Semantics::connect(Projection left, TypePtr leftType, Projection right, Typ
         root = body.arena.expressions[root].operands[0];
     const auto& base = body.arena.expressions[root];
     if (base.kind != ExprKind::Reference) throw Error(range, "connect requires a component destination");
-    const auto depth = declarations.at(std::string(base.name)).conditionDepth;
+    if (!activeLayer_.empty() && declarations.at(std::string(base.name)).layer != activeLayer_)
+        throw Error(range, "layerblock cannot drive a component declared outside its layer");
+    const auto port = memoryPorts.find(std::string(base.name));
+    const auto depth = port == memoryPorts.end() ? declarations.at(std::string(base.name)).conditionDepth : 0;
     // Hardware declarations are unconditional; only interleaving conditions
     // (blocks not containing the destination declaration) control a connect.
     guard = 1;
@@ -396,6 +469,12 @@ std::string Semantics::expressionKey(ExprId id) const {
 void Semantics::statements(std::span<const StmtId> statements, int guard) {
     for (const auto id : statements) {
         const auto& statement = body.arena.statements[id];
+        if (!activeStatements.contains(id)) continue;
+        if (statement.kind == StmtKind::LayerBlock) {
+            const auto path = layerPath(statement);
+            if (layerEnabled(path)) { auto previous = activeLayer_; activeLayer_ = path; this->statements(statement.body, guard); activeLayer_ = std::move(previous); }
+            continue;
+        }
         if (statement.kind == StmtKind::Wire || statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset) {
             auto& declaration = declarations.at(std::string(statement.name));
             declaration.conditionDepth = conditions_.size();
@@ -424,8 +503,46 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             auto type = expression(statement.operands[0]);
             if (!passive(type)) throw Error(statement.range, "a node expression must have a passive type");
             declarations.try_emplace(std::string(statement.name), Declaration{std::string(statement.name), type, statement.range, 1, statement.operands[0]});
+            declarations.at(std::string(statement.name)).layer = activeLayer_;
+        } else if (statement.kind == StmtKind::MPort) {
+            const auto& entry = memoryPorts.at(std::string(statement.name));
+            auto& port = memories.at(entry.first).ports[entry.second]; port.guard = guard;
+            const auto& addressExpr = body.arena.expressions[*port.address];
+            auto address = addressExpr.kind == ExprKind::Integer ? ground(TypeKind::UInt, 64, addressExpr.range, true) : expression(*port.address);
+            expressions[*port.address] = address;
+            auto clock = expression(*port.clock);
+            if (clock->kind != TypeKind::Clock) throw Error(statement.range, "mport clock must have Clock type");
+            if (address->kind != TypeKind::UInt && body.arena.expressions[*port.address].kind != ExprKind::Integer)
+                throw Error(statement.range, "mport address must have UInt type");
+        } else if (statement.kind == StmtKind::Define) {
+            auto a = expression(statement.operands[0]), b = expression(statement.operands[1]);
+            if ((a->kind != TypeKind::Probe && a->kind != TypeKind::RWProbe) || (b->kind != TypeKind::Probe && b->kind != TypeKind::RWProbe))
+                throw Error(statement.range, "define requires probe operands");
+            if (a->kind == TypeKind::RWProbe && b->kind != TypeKind::RWProbe) throw Error(statement.range, "read-only probe cannot define RWProbe");
+            if (!layerEnabled(a->layer)) throw Error(statement.range, "probe definition color is not enabled");
+            if (!(flow(statement.operands[0]) & 2)) throw Error(statement.range, "probe definition requires a sink or duplex destination");
+            auto root = statement.operands[0];
+            while (body.arena.expressions[root].kind == ExprKind::Index || body.arena.expressions[root].kind == ExprKind::Field)
+                root = body.arena.expressions[root].operands[0];
+            const auto& destination = body.arena.expressions[root];
+            const bool local = destination.kind == ExprKind::Reference && declarations.at(std::string(destination.name)).layer == activeLayer_;
+            if (!activeLayer_.empty() && !local && a->layer != activeLayer_)
+                throw Error(statement.range, "probe definition in a layerblock requires the same layer color");
+            if (!b->layer.empty() && a->layer != b->layer && !a->layer.starts_with(b->layer + "."))
+                throw Error(statement.range, "probe definition would expose a disabled source color");
+            equivalent(a->element, b->element, statement.range);
+            const auto left = leaves(a->element), right = leaves(b->element);
+            for (std::size_t i = 0; i < left.size(); ++i) {
+                constrain(left[i].type->width, {right[i].type->width}, [](const auto& args) { return args[0]; }, statement.range);
+                checks_.push_back([this, a = left[i].type, b = right[i].type, range = statement.range] {
+                    if (width(a) != width(b)) throw Error(range, "probe definition requires matching element widths");
+                });
+                connections.push_back({{statement.operands[0], left[i].fields}, {statement.operands[1], right[i].fields}, 1, false, statement.range, true});
+            }
         } else if (statement.kind == StmtKind::Connect) {
             auto a = expression(statement.operands[0]), b = expression(statement.operands[1]);
+            if (a->kind == TypeKind::Probe || a->kind == TypeKind::RWProbe || b->kind == TypeKind::Probe || b->kind == TypeKind::RWProbe)
+                throw Error(statement.range, "probes require define, not connect");
             connect({statement.operands[0], {}}, a, {statement.operands[1], {}}, b, guard, statement.range);
         } else if (statement.kind == StmtKind::Invalidate) {
             auto type = expression(statement.operands[0]);
@@ -443,6 +560,39 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             this->statements(statement.otherwise, guards.conjunction(guard, guards.negate(condition)));
             conditionGuards_.pop_back();
             conditions_.pop_back();
+        } else if (statement.kind == StmtKind::Printf || statement.kind == StmtKind::Stop || statement.kind == StmtKind::Assert ||
+                   statement.kind == StmtKind::Assume || statement.kind == StmtKind::Cover || statement.kind == StmtKind::Intrinsic) {
+            auto operands = statement.operands;
+            if (statement.kind == StmtKind::Intrinsic) {
+                const auto& call = body.arena.expressions[operands.at(0)];
+                if (call.name != "circt_chisel_ifelsefatal" || call.type || call.operands.size() != 3)
+                    throw Error(statement.range, "unsupported effect intrinsic '" + std::string(call.name) + "'");
+                bool format = false;
+                for (const auto& parameter : call.parameters) {
+                    if ((parameter.name != "format" && parameter.name != "label") || parameter.kind != LiteralKind::String)
+                        throw Error(parameter.range, "unsupported ifelsefatal parameter");
+                    format |= parameter.name == "format";
+                }
+                if (!format) throw Error(statement.range, "ifelsefatal requires a format parameter");
+                operands = call.operands;
+            }
+            if (expression(operands[0])->kind != TypeKind::Clock) throw Error(statement.range, "effect clock must have Clock type");
+            const auto booleans = statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume || statement.kind == StmtKind::Cover || statement.kind == StmtKind::Intrinsic ? 3u : 2u;
+            for (std::size_t i = 1; i < booleans; ++i) {
+                auto type = expression(operands[i]);
+                if (type->kind != TypeKind::UInt) throw Error(statement.range, "effect predicate and enable must have UInt<1> type");
+                constrain(type->width, {}, [](const auto&) { return 1; }, statement.range);
+                checks_.push_back([this, type, range = statement.range] { if (width(type) != 1) throw Error(range, "effect predicate and enable must have UInt<1> type"); });
+            }
+            if (statement.kind == StmtKind::Printf || statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume) {
+                const auto start = statement.kind == StmtKind::Printf ? 3u : 4u;
+                for (std::size_t i = start; i < operands.size(); ++i) {
+                    auto type = expression(operands[i]);
+                    if (!integerKind(type->kind) && type->kind != TypeKind::Clock && type->kind != TypeKind::Reset && type->kind != TypeKind::AsyncReset)
+                        throw Error(statement.range, "print argument must have a ground hardware type");
+                }
+            }
+            effects.push_back({id, guard});
         }
     }
 }
@@ -498,7 +648,9 @@ void Semantics::normalizeGuards() {
         converted.emplace(id, result); return result;
     };
     for (auto& connection : connections) connection.guard = convert(connection.guard);
+    for (auto& effect : effects) effect.guard = convert(effect.guard);
     for (auto& [name, declaration] : declarations) declaration.guard = convert(declaration.guard);
+    for (auto& [name, memory] : memories) for (auto& port : memory.ports) port.guard = convert(port.guard);
     guards = std::move(normalized);
 }
 void Semantics::analyze() {
@@ -507,7 +659,12 @@ void Semantics::analyze() {
         declarations.emplace(std::string(port.name), Declaration{std::string(port.name), type, port.range, port.direction == LeafDirection::Input ? 1 : 2, {}, true});
         declarationOrder.emplace_back(port.name);
     }
-    collect(body.statements); statements(body.statements, 1); solve(); normalizeGuards();
+    collect(body.statements); inferMemoryPorts(body.statements);
+    for (const auto& [name, entry] : memoryPorts) {
+        const auto& port = memories.at(entry.first).ports[entry.second];
+        declarations.at(name).flow = (port.read ? 1 : 0) | (port.write ? 2 : 0);
+    }
+    statements(body.statements, 1); solve(); normalizeGuards();
     for (const auto& [name, declaration] : declarations) for (const auto& leaf : leaves(declaration.type, declaration.flow)) total(leaf);
 }
 int64_t Semantics::width(TypePtr type) const { return widths_.at(type->width).value; }
@@ -517,7 +674,11 @@ TypeKind Semantics::resolvedKind(TypePtr type) const {
 std::vector<Leaf> Semantics::leaves(TypePtr type, int flow) const {
     std::vector<Leaf> result;
     std::function<void(TypePtr, Leaf)> visit = [&](TypePtr current, Leaf leaf) {
-        if (current->kind == TypeKind::Vector) { leaf.shape.push_back(current->extent); visit(current->element, std::move(leaf)); }
+        if (current->kind == TypeKind::Probe || current->kind == TypeKind::RWProbe) {
+            leaf.probe = current->kind;
+            if (layerEnabled(current->layer)) visit(current->element, std::move(leaf));
+        }
+        else if (current->kind == TypeKind::Vector) { leaf.shape.push_back(current->extent); visit(current->element, std::move(leaf)); }
         else if (current->kind == TypeKind::Bundle) {
             for (const auto& field : current->fields) { auto child = leaf; child.fields.push_back(field.name); if (field.flip) child.flow = reversed(child.flow); visit(field.type, std::move(child)); }
         } else { leaf.type = current; result.push_back(std::move(leaf)); }
@@ -535,12 +696,12 @@ int64_t Semantics::total(const Leaf& leaf) const {
 }
 TypePtr Semantics::projected(TypePtr type, const std::vector<std::string>& fields) const {
     for (const auto& name : fields) {
-        while (type->kind == TypeKind::Vector) type = type->element;
+        while (type->kind == TypeKind::Vector || type->kind == TypeKind::Probe || type->kind == TypeKind::RWProbe) type = type->element;
         const auto found = std::find_if(type->fields.begin(), type->fields.end(), [&](const auto& field) { return field.name == name; });
         if (found == type->fields.end()) throw std::logic_error("invalid FIRRTL leaf projection");
         type = found->type;
     }
-    while (type->kind == TypeKind::Vector) type = type->element;
+    while (type->kind == TypeKind::Vector || type->kind == TypeKind::Probe || type->kind == TypeKind::RWProbe) type = type->element;
     return type;
 }
 std::optional<int64_t> Semantics::staticIndex(ExprId id) const {

@@ -1,127 +1,71 @@
 # FIRRTL node attributes
 
-`ingest/node_attributes.hpp` defines schema v1 for source node ownership and
-result boundaries on ordinary GRH operations. It also provides inspection and
-the sharing rules used by `simplify` and `grhsim-simplify`. The FIRRTL frontend
-emits these attributes on real parsed node expressions. The
-[whole-node CSE pass](node-cse.md) consumes complete expression boundaries
-before partitioning. Node-based nonsink grouping remains a later stage.
-
-Graphs containing the attributes carry integer metadata `firrtl.nodeSchema=1`.
-All fields use the existing GRH JSON attribute representation:
+`ingest/node_attributes.hpp` defines optional source associations on ordinary
+GRH ops. Schema 2 and `firrtl.nodeScopePolicy=soft-node-v2` replace F02/F08
+source-node isolation. Associations are partition hints, never optimization
+scopes, execution owners, mandatory roots or DontTouch constraints.
 
 | Attribute | Type | Meaning |
 | --- | --- | --- |
-| `firrtl.node.members` | string[] | Source node leaf expressions owning this computation |
-| `firrtl.node.roots` | string[] | Source node leaf results supplied by this operation |
-| `firrtl.node.rootResults` | int[] | Corresponding zero-based operation result indices |
-| `firrtl.node.origins` | string[] | Diagnostic history, without sharing permission |
+| `firrtl.node.members` | string[] | Direct source-node associations for this op |
+| `firrtl.node.roots` | string[] | Optional source-result associations still mapped accurately |
+| `firrtl.node.rootResults` | int[] | Corresponding zero-based result indices |
+| `firrtl.node.origins` | string[] | Diagnostic history, excluded from partition affinity |
 
-A key is compact canonical JSON
-`[sourceUnit,circuit,module,instancePath,nodeName,fieldPath]`, with both paths
-encoded as string arrays. `key`/`parseKey` preserve escaped names and distinguish
-path components containing separators. `qualify` prepends an actual instance
-path to all identities on a cloned operation. Bundle leaves have distinct field
-paths; a Vector remains one shaped value. Entity IDs are absent from persisted
-keys and roots: result indices resolve against the current operation's results.
+Graphs carry integer `firrtl.nodeSchema=2`. A key is canonical JSON
+`[sourceUnit,circuit,module,instancePath,nodeName,fieldPath]`; paths are arrays.
+Flattening qualifies keys and inventories with actual instance path components.
+Bundle leaves have distinct fields; Vectors retain LogicalType shape. No raw
+entity IDs are persisted in the associations.
 
-For `node n = and(eq(a,b),or(c,d))`, the inputs of `eq` are `[a,b]`, the inputs
-of `or` are `[c,d]`, and `and` takes their two results. All three operations have
-`members=[N]`, where N is n's key. Only `and` has `roots=[N], rootResults=[0]`.
-A later `node y = mux(n,x,z)` has its own member key Y; referencing n does not
-add Y to n's computation.
+For `node n = and(eq(a,b),or(c,d))`, eq takes `[a,b]`, or takes `[c,d]`, and and
+takes their results. All three start with member N; only and has root `(N,0)`.
+Referencing n does not recursively label its upstream ops. After ordinary CSE
+of `xor(and(a,b),c)` and `or(and(a,b),d)`, the shared and can have `{N1,N2}`;
+xor/or each retain their own member. These overlapping sets are not must-link
+components and are never transitively unioned by the partitioner.
 
-`write` sorts and deduplicates member/origin keys and `(root,result)` pairs.
-`inspect` checks the schema, known attribute names, types, canonical keys,
-paired root arrays, result bounds, duplicate roots and escaping members without
-a root. Phase and leaf cloning mark copies with boolean `grhsim.nodeClone=true`.
-One source identity can then have multiple roots only in distinct nonempty
-execution owners, with at most one unmarked original. Unmarked duplicates and
-duplicates within one owner remain errors. The marker is provenance, excluded
-from functional CSE keys; root carriers preserve it. Source identities and
-result indices remain unchanged, including through JSON reload.
-`GrhVerifyPass` reports these errors as diagnostics. `Inspection::report`
-prints each key, member count and actual root operation/result/value symbol.
-Origins-only fragments appear separately in `isolatedFragments` and retain
-individual sharing barriers before execution leaves are assigned.
+## Optimization transparency
 
-Functional CSE signatures exclude node attributes. A separate node scope key
-restricts primitive sharing to the same member set. Unannotated SV operations
-share as before, within their existing execution owner. Immutable constants can
-be pooled. Once General operations have a complete nonsink leaf
-`[general,nonsink,supernode,node]` or sink leaf
-`[general,small-sink|large-sink,group]`, primitive sharing is allowed inside that
-leaf. `sameScope` also compares execution owners, so equal node scopes do not
-permit sharing across leaves. `cseScope` must be combined with the caller's
-existing execution owner scope.
+Functional CSE signatures exclude node attrs and `grhsim.nodeClone`. Ordinary
+CSE shares across source nodes and SV, independently of the whole-node option.
+Inlining/reassociation, constant/alias propagation, mux recovery, packing,
+write normalization and DCE use ordinary functional constraints. Actual complete
+execution owners, types, state/effects and declarations retain their constraints.
 
-Structural inlining, NOT/XOR fusion, mux chain recovery and masked-OR recovery
-respect these boundaries. Rewrites retain node attributes; new internal
-operations inherit members/history, without copying their parent's roots.
-`copyMembers` is intended for new operations. `unite` requires an explicit
-reason for merging different member sets. `mergeCseOperations` checks primitive
-scope; `mergeEquivalentOperations` accepts a result permutation after the caller
-has proven whole-node equivalence. Neither helper proves functional equivalence.
+Equivalent ops union direct associations. New/replaced ops inherit bounded
+associations from ops involved in the rewrite. Roots move only with an exact
+result mapping; otherwise they are dropped. `redirectRoots` never creates an
+op/value. Folding a node to an input does not require an assign carrier; a real
+declaration/port view can still require one under unannotated rules.
 
-When a simplification replaces a root with a same-scope result or a constant,
-`redirectRoots` moves its result mapping. An input or another node's result uses
-a transparent `kAssign` carrier carrying the original identity and result type.
-For example, slicing bits 15:8 from `concat(a8,b8)` inside N leaves
-`assign(a8)` as N's result carrier, and removes the concat/slice. It does not
-attach N to a8's unrelated producer. Source labels do not prevent constant
-folding or dead code removal.
+`write` sorts/deduplicates sets and caps each op at 64 members, 64 roots and
+64 origins. Exceeding any cap clears optional attrs and increments
+`firrtl.nodeHintDegraded`, without rejecting the functional rewrite. No upstream
+provenance closure is built. `inspect` checks schema, known names/types,
+canonical/sorted/unique keys, paired root arrays and result bounds. Missing
+roots, duplicate source roots, partial/nonconvex regions and phase copies are
+valid. `grhsim.nodeClone=true` is diagnostic only. Representation corruption is
+a verifier error; incomplete source regions are not.
 
-Clone/freeze/JSON preserve the existing representation. F05 exercises actual
-General/Output clones of state-dependent nodes through partitioning and compiled
-execution. State declarations, state read ports and writers do not become node
-members. Hierarchical inlining qualifies the inventory and operation keys with
-the same instance path. Bit packing rewrites existing reads into slices in place,
-preserving their result identities and attrs. Whole-node CSE merges all source
-roots and matching members; unmerged nodes retain their primitive sharing
-scopes. Node-aware nonsink consumption remains a later stage.
+## Policy and checkpoints
 
-## Source policy and checkpoint census
+The lowerer establishes policy and `firrtl.nodeInventory` at source creation.
+Flattening imports qualified inventories. `firrtl.nodeEliminated` records
+source roots deleted by DCE. `firrtl.nodeRetention` v2 reports roots,
+dead/constant/alias/shared/fragment identities, missing roots and key bytes.
+Missing identities are diagnostic and never keep computation alive or fail a
+legal optimization. Categories overlap.
 
-The FIRRTL lowerer establishes `firrtl.nodeScopePolicy=source-node-v1` and a
-`firrtl.nodeInventory` string array at source construction. Flattening imports
-qualified child inventories. `firrtl.nodeEliminated` contains roots whose
-deletion was proved by a DCE worklist. Rewriting or clearing attrs alone does
-not authorize an elimination record. A legacy graph without this policy cannot
-be upgraded into a node-aware checkpoint merely by running the CSE pass.
+Schema 1 / `source-node-v1` checkpoints require re-ingest; clearing attrs cannot
+undo optimization history. The [whole-expression pass](node-cse.md) has a
+separate v2 identity. [Nonsink partitioning](../transform/grhsim-transforms.md#firrtl-soft-hints)
+uses current members after simplify.
 
-`firrtl.nodeRetention` stores a compact versioned census after successful
-mutating passes. It reports source identities, available roots, proved dead
-identities, constant/alias/shared roots, rootless fragments and isolated origins.
-Every inventory key must have a current root or an explicit elimination record;
-an unexplained missing identity fails the pass. Phase/leaf copies increase root
-counts without inventing new source keys. Categories can overlap. The census
-checks source-result availability; it is not an immutable checksum of original
-primitives, which legal rewrites can remove or replace. Scope checks and
-transformation regressions protect internal ownership.
-
-Key references, total key bytes and unique key bytes are counted across
-members/roots/origins. No upstream provenance closure or AST is stored. Repeated
-strings remain ordinary GRH attribute values in memory and JSON; there is no
-graph-wide interning claim. `inspect-firrtl-nodes` measures this representation
-and JSON overhead on a self-contained selected FIRRTL hierarchy. Its stripped
-serialization is only a size measurement, never a resumable checkpoint.
-
-Validation uses the playground Makefile:
-
-```sh
-make test_firrtl_node_attributes
-make test_firrtl_cse_scope
-make test_grhsim_node_cse
-make test_firrtl_node_pipeline
-make inspect_firrtl_node_retention
-make test_wolvrix
-```
-
-The scope suite checks independent two-state observations across normal and
-GrhSIM simplification, array shapes, root-to-input rewrites, isolated fragments,
-masked-OR boundaries and sharing within/across execution leaves. The metadata
-suite covers escaped keys, instance qualification, result permutations, corrupt
-attributes and clone/freeze/JSON persistence. It forces actual operation/value
-ID compaction, renames their symbols, and checks that source identities and
-resolved root mappings survive. Multi-result tests match each node leaf's root
-value to its actual output port after result permutation and JSON reload.
+Playground validation targets: `test_firrtl_node_attributes`,
+`test_firrtl_cse_scope`, `test_firrtl_node_pipeline`, `test_grhsim_firrtl_nodes`,
+`test_wolvrix`. Transparency tests optimize annotated and stripped copies of
+one graph and compare normalized functional structure/sharing plus independent
+behavior. `inspect_firrtl_node_retention` / `inspect_firrtl_partitions` measure a
+real hierarchy, metadata/JSON bytes and wall/RSS. Their stripped copy is only a
+size census, never a resumable checkpoint.

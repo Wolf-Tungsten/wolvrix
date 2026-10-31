@@ -33,7 +33,11 @@ void ordinary(grh::Design& design, tx::SessionStore& session) {
 }
 void partition(grh::Design& design, tx::SessionStore& session) {
     for (const auto name : {"grhsim-split-event-and-output", "grhsim-split-nonsink-and-sink",
-         "grhsim-partition-nonsink", "grhsim-simplify", "grhsim-partition-sink"}) execute(design, session, name);
+         "grhsim-partition-nonsink", "grhsim-simplify", "grhsim-partition-sink"})
+        if (std::string_view(name) == "grhsim-partition-nonsink")
+            execute(design, session, name, {"-firrtl-nodes=prefer", "-cost-model=bytes", "-fuse-leaves=1",
+                "-max-node-work=2", "-max-supernode-work=4"});
+        else execute(design, session, name);
 }
 std::string fixture() {
     std::string body = "    input clk : Clock\n    input en : UInt<1>\n    input a : UInt<8>\n    input b : UInt<8>\n    input c : UInt<8>\n";
@@ -49,11 +53,27 @@ void realPipeline(std::string mode) {
     require(input.success(), diagnostics(input));
     auto& design = *input.design;
     const auto reference = design.clone();
+    auto stripped = design.clone();
+    const auto strip = [](grh::Design& current) {
+        for (const auto& [name, graph] : current.graphs()) {
+            for (const auto op : graph->operations()) {
+                node::write(*graph, op, {}); graph->eraseAttr(op, "grhsim.nodeClone");
+            }
+            std::vector<std::string> keys;
+            for (const auto& entry : graph->metadata()) if (entry.key.starts_with("firrtl.node")) keys.push_back(entry.key);
+            for (const auto& key : keys) graph->eraseMetadata(key);
+        }
+    };
+    strip(stripped); tx::SessionStore strippedSession; ordinary(stripped, strippedSession);
     tx::SessionStore session; ordinary(design, session);
+    auto normalized = design.clone(); strip(normalized);
+    require(wolvrix::lib::store::StoreJson{}.storeToString(normalized) ==
+            wolvrix::lib::store::StoreJson{}.storeToString(stripped),
+            "node hints changed the normal production simplify/packing structure");
     const auto before = count(*design.findGraph("top"), OperationKind::kXor);
-    require(before == 5, "primitive CSE crossed source node scopes");
+    require(before == 1, "ordinary primitive CSE was blocked by source node hints");
     execute(design, session, "grhsim-node-cse", {mode == "off" ? "-firrtl-node-cse=off" : "-firrtl-node-cse=gsim"});
-    require(count(*design.findGraph("top"), OperationKind::kXor) == (mode == "off" ? 5 : 1), "real FIRRTL threshold was not applied");
+    require(count(*design.findGraph("top"), OperationKind::kXor) == 1, "optional whole-node pass changed an already shared expression");
     auto checkpoint = roundTrip(design);
     partition(checkpoint, session);
     const auto& graph = *checkpoint.findGraph("top");
@@ -67,7 +87,7 @@ void realPipeline(std::string mode) {
     }
     node::recordRetention(*checkpoint.findGraph("top"));
     const auto metrics = std::get<std::vector<std::string>>(*graph.metadata("firrtl.nodeRetention"));
-    require(std::find(metrics.begin(), metrics.end(), "missing=0") != metrics.end(), "checkpoint lost source nodes");
+    require(metrics.front() == "v2", "checkpoint did not use soft hint retention");
     wolvrix::lib::store::StoreJson store;
     std::ofstream(artifact("firrtl-node-pipeline") / (mode + ".json")) << *store.storeToString(checkpoint);
 }
@@ -76,7 +96,9 @@ void retentionFailures() {
     require(input.success(), diagnostics(input));
     auto& graph = *input.design->findGraph("top");
     for (const auto op : graph.operations()) if (node::annotated(graph, op)) node::write(graph, op, {});
-    rejects([&] { node::recordRetention(graph); }, "lost tags were mislabeled as dead nodes");
+    node::recordRetention(graph);
+    const auto stats = std::get<std::vector<std::string>>(*graph.metadata("firrtl.nodeRetention"));
+    require(std::find(stats.begin(), stats.end(), "missing=0") == stats.end(), "hint loss was not diagnosed");
 }
 void hierarchyInputs() {
     const auto path = artifact("firrtl-node-pipeline") / "hierarchy.fir";

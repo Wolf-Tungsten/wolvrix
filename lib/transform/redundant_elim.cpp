@@ -111,12 +111,11 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueType type = wolvrix::lib::grh::ValueType::Logic;
             wolvrix::lib::grh::LogicDomain domain = wolvrix::lib::grh::LogicDomain::FourState;
             std::vector<int64_t> shape;
-            uint64_t nodeScope = 0;
 
             bool operator==(const OpSignature &other) const
             {
                 if (kind != other.kind || width != other.width || isSigned != other.isSigned ||
-                    type != other.type || domain != other.domain || shape != other.shape || nodeScope != other.nodeScope)
+                    type != other.type || domain != other.domain || shape != other.shape)
                 {
                     return false;
                 }
@@ -148,7 +147,6 @@ namespace wolvrix::lib::transform
                 seed = hashCombine(seed, std::hash<bool>{}(sig.isSigned));
                 seed = hashCombine(seed, static_cast<std::size_t>(sig.type));
                 seed = hashCombine(seed, static_cast<std::size_t>(sig.domain));
-                seed = hashCombine(seed, std::hash<uint64_t>{}(sig.nodeScope));
                 for (int64_t dim : sig.shape) seed = hashCombine(seed, std::hash<int64_t>{}(dim));
                 seed = hashCombine(seed, std::hash<std::size_t>{}(sig.operands.size()));
                 for (const auto &operand : sig.operands)
@@ -279,12 +277,10 @@ namespace wolvrix::lib::transform
         }
 
         std::optional<OpSignature> makeSignature(const wolvrix::lib::grh::Graph &graph,
-                                                 wolvrix::lib::grh::OperationId opId,
-                                                 uint64_t nodeScope)
+                                                 wolvrix::lib::grh::OperationId opId)
         {
             OpSignature sig;
             sig.kind = graph.opKind(opId);
-            sig.nodeScope = nodeScope;
             const std::span<const wolvrix::lib::grh::ValueId> operands = graph.opOperands(opId);
             sig.operands.assign(operands.begin(), operands.end());
             const std::span<const wolvrix::lib::grh::AttrKV> attrs = graph.opAttrs(opId);
@@ -555,21 +551,6 @@ namespace wolvrix::lib::transform
                 const wolvrix::lib::grh::OperationKind opKind = graph.opKind(opId);
                 const std::span<const wolvrix::lib::grh::ValueId> operands = graph.opOperands(opId);
                 const std::span<const wolvrix::lib::grh::ValueId> results = graph.opResults(opId);
-                if (ingest::node::rootCarrier(graph, opId)) continue;
-
-                if (opKind == wolvrix::lib::grh::OperationKind::kAssign && operands.size() == 1 &&
-                    results.size() == 1 && ingest::node::annotated(graph, opId)) {
-                    const auto src = operands[0], dst = results[0];
-                    if (graph.sameValueType(src, dst)) {
-                        if (!graph.valueIsInput(dst) && !graph.valueIsInout(dst) &&
-                            !graph.isDeclaredSymbol(graph.valueSymbol(dst))) {
-                            auto onError = [&](const std::string& message) { this->error(graph, message); };
-                            replaceUsers(graph, dst, src, onError);
-                            if (eraseOp(opId)) graphChanged = true;
-                        }
-                        continue;
-                    }
-                }
 
                 if (opKind == wolvrix::lib::grh::OperationKind::kAssign &&
                     operands.size() == 1 && results.size() == 1)
@@ -1341,10 +1322,6 @@ namespace wolvrix::lib::transform
             };
 
             std::unordered_map<OpSignature, CseEntry, OpSignatureHash> seen;
-            const bool hasNodeAnnotations = graph.metadata(ingest::node::kSchema).has_value();
-            // Scope IDs live only in this sweep. Keep the full identity once
-            // per scope instead of copying it into every primitive signature.
-            std::unordered_map<std::string, uint64_t> nodeScopes;
             std::deque<wolvrix::lib::grh::OperationId> cseOps;
             enum : uint8_t { Idle, Queued, Erased };
             std::vector<uint8_t> queued;
@@ -1387,12 +1364,7 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                uint64_t nodeScope = 0;
-                if (hasNodeAnnotations) {
-                    if (auto key = ingest::node::cseScope(graph, opId); !key.empty())
-                        nodeScope = nodeScopes.try_emplace(std::move(key), nodeScopes.size() + 1).first->second;
-                }
-                std::optional<OpSignature> sig = makeSignature(graph, opId, nodeScope);
+                std::optional<OpSignature> sig = makeSignature(graph, opId);
                 if (!sig)
                 {
                     continue;

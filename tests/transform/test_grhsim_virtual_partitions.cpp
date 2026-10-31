@@ -122,9 +122,9 @@ void testActivityAndCloneIsolation() {
         ++nots; owners.insert(owner(fixture.graph, op));
         require(sim::attribute<std::vector<std::string>>(fixture.graph, op, "originModules") == std::vector<std::string>{"top$shared"}, "boundary clone lost source annotation");
     }
-    require(nots >= 3 && owners.size() == nots, "shared boundary was not cloned into separate owners");
+    require(nots == 1 && owners.size() == 1, "boundary cloning exceeded the work budget");
     run(fixture.design, "grhsim-simplify", fixture.session);
-    require(count(fixture.graph, OperationKind::kNot) >= 2, "partition simplify merged clones back together");
+    require(count(fixture.graph, OperationKind::kNot) == 1, "partition simplify changed bounded sharing");
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, fixture.graph);
     std::vector<std::map<std::string, uint64_t>> inputs;

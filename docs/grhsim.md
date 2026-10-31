@@ -30,7 +30,10 @@ leaf simplify by default. Pass options and their contracts are specified in
 [GrhSIM transforms](transform/grhsim-transforms.md). Work limits control
 activity partitions; function line limits control emitted C++ functions.
 For annotated FIRRTL it runs whole-node CSE in `gsim` mode; `off` disables
-whole-node merging while retaining source-node primitive scopes. Policy and
+only additional whole-expression merging. Ordinary CSE and inlining are
+transparent to node annotations. Nonsink `firrtl-nodes=off|prefer|auto` consumes
+current op associations as optional hints (default off); `cost-model=bytes` and
+leaf fusion are separate experiments. Policy and
 configuration are checkpoint metadata and enter generation identity; see
 [FIRRTL node CSE](ingest/node-cse.md).
 

@@ -181,9 +181,18 @@ Attributes normalize(Attributes attributes) {
 
 void write(grh::Graph& graph, grh::OperationId op, Attributes attributes) {
     if (const auto schema = graph.metadata(kSchema);
-        schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != 1))
-        throw std::invalid_argument("unsupported firrtl.nodeSchema (expected int64 1)");
+        schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != kSchemaRevision))
+        throw std::invalid_argument("unsupported firrtl.nodeSchema; re-ingest for soft-node-v2");
     attributes = normalize(std::move(attributes));
+    if (attributes.members.size() > kMaxAssociations || attributes.roots.size() > kMaxAssociations ||
+        attributes.origins.size() > kMaxAssociations) {
+        // Dropping a hint is safe; truncating it into an apparently complete
+        // expression or refusing the functional rewrite is not.
+        attributes = {};
+        const auto old = graph.metadata("firrtl.nodeHintDegraded");
+        const auto count = old && std::holds_alternative<int64_t>(*old) ? std::get<int64_t>(*old) : 0;
+        graph.setMetadata("firrtl.nodeHintDegraded", count + 1);
+    }
     std::vector<std::string> roots;
     std::vector<int64_t> indices;
     for (const auto& root : attributes.roots) {
@@ -198,7 +207,7 @@ void write(grh::Graph& graph, grh::OperationId op, Attributes attributes) {
     put(kMembers, attributes.members); put(kOrigins, attributes.origins);
     put(kRoots, roots); put(kRootResults, indices);
     if (!attributes.members.empty() || !attributes.roots.empty() || !attributes.origins.empty())
-        graph.setMetadata(kSchema, int64_t{1});
+        graph.setMetadata(kSchema, kSchemaRevision);
 }
 
 void copyMembers(grh::Graph& graph, grh::OperationId from, grh::OperationId to) {
@@ -210,9 +219,10 @@ void copyMembers(grh::Graph& graph, grh::OperationId from, grh::OperationId to) 
 }
 
 Attributes remapResults(Attributes attributes, std::span<const int64_t> oldToNew) {
+    std::erase_if(attributes.roots, [&](const Root& root) {
+        return root.result < 0 || static_cast<uint64_t>(root.result) >= oldToNew.size() || oldToNew[root.result] < 0;
+    });
     for (auto& root : attributes.roots) {
-        if (root.result < 0 || static_cast<uint64_t>(root.result) >= oldToNew.size() || oldToNew[root.result] < 0)
-            throw std::invalid_argument("node result remap would lose a live root");
         root.result = oldToNew[root.result];
     }
     return normalize(std::move(attributes));
@@ -232,9 +242,7 @@ void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string
     write(graph, op, std::move(attributes));
 }
 
-Attributes unite(Attributes target, const Attributes& source, MergeReason reason) {
-    if (reason == MergeReason::SameComputation && normalize(target).members != normalize(source).members)
-        throw std::invalid_argument("cross-node attribute union requires a whole-node or execution-leaf merge");
+Attributes unite(Attributes target, const Attributes& source, MergeReason) {
     target.members.insert(target.members.end(), source.members.begin(), source.members.end());
     target.roots.insert(target.roots.end(), source.roots.begin(), source.roots.end());
     target.origins.insert(target.origins.end(), source.origins.begin(), source.origins.end());
@@ -255,7 +263,7 @@ void mergeCseOperations(grh::Graph& graph, grh::OperationId target, grh::Operati
     if (target == source) return;
     if (!annotated(graph, source) && !annotated(graph, target)) return;
     if (!sameScope(graph, target, source))
-        throw std::invalid_argument("primitive CSE would cross a FIRRTL node or execution owner");
+        throw std::invalid_argument("primitive CSE would cross an execution owner");
     if (graph.opResults(target).size() != graph.opResults(source).size())
         throw std::invalid_argument("CSE result count mismatch");
     const auto reason = finalLeaf(owner(graph, target)) || (literal(graph, target) && literal(graph, source))
@@ -266,86 +274,43 @@ void mergeCseOperations(grh::Graph& graph, grh::OperationId target, grh::Operati
     write(graph, source, std::move(remaining));
 }
 
-std::string cseScope(const grh::Graph& graph, grh::OperationId op) {
-    if (!op) return {};
-    const auto partition = owner(graph, op);
-    if (literal(graph, op) || finalLeaf(partition) || !annotated(graph, op)) return {};
-    for (const auto& entry : graph.opAttrs(op)) if (entry.key == kMembers) {
-        const auto* members = std::get_if<std::vector<std::string>>(&entry.value);
-        if (!members) throw std::invalid_argument("wrong node members type");
-        if (!members->empty()) {
-            std::string result = "node:";
-            array(result, *members);
-            return result;
-        }
-    }
-    return "orphan:" + std::to_string(op.index) + ":" + std::to_string(op.generation);
-}
+std::string cseScope(const grh::Graph&, grh::OperationId) { return {}; }
 
 bool sameScope(const grh::Graph& graph, grh::OperationId left, grh::OperationId right) {
-    return left && right && sameOwner(graph, left, right) && cseScope(graph, left) == cseScope(graph, right);
+    return left && right && sameOwner(graph, left, right);
 }
 
 bool mayInline(const grh::Graph& graph, grh::OperationId consumer, grh::OperationId producer) {
-    if (!producer) return false;
-    if (literal(graph, producer) || sameScope(graph, consumer, producer)) return true;
-    const auto args = graph.opOperands(producer), results = graph.opResults(producer);
-    return consumer && sameOwner(graph, consumer, producer) &&
-           graph.opKind(producer) == grh::OperationKind::kAssign && args.size() == 1 && results.size() == 1 &&
-           graph.sameValueType(args[0], results[0]);
+    return producer && (literal(graph, producer) || sameScope(graph, consumer, producer));
 }
 
-bool rootCarrier(const grh::Graph& graph, grh::OperationId op) {
-    if (graph.opKind(op) != grh::OperationKind::kAssign || read(graph, op).roots.empty()) return false;
-    const auto args = graph.opOperands(op);
-    return args.size() == 1 && !literal(graph, graph.valueDef(args[0])) &&
-           !sameScope(graph, op, graph.valueDef(args[0]));
-}
+bool rootCarrier(const grh::Graph&, grh::OperationId) { return false; }
 
 grh::ValueId redirectRoots(grh::Graph& graph, grh::ValueId from, grh::ValueId to) {
     const auto source = graph.valueDef(from);
     if (!source || from == to || !annotated(graph, source)) return to;
     auto original = read(graph, source);
-    Attributes moved;
-    const std::vector<grh::ValueId> results(graph.opResults(source).begin(), graph.opResults(source).end());
-    for (const auto& root : original.roots)
-        if (root.result >= 0 && static_cast<uint64_t>(root.result) < results.size() && results[root.result] == from)
-            moved.roots.push_back({root.key, 0});
-    if (moved.roots.empty()) return to;
-    auto target = graph.valueDef(to);
-    if (target == source && graph.sameValueType(from, to)) {
-        const auto index = std::find(results.begin(), results.end(), to) - results.begin();
-        for (auto& root : original.roots)
-            if (root.result >= 0 && static_cast<uint64_t>(root.result) < results.size() && results[root.result] == from)
-                root.result = index;
-        write(graph, source, std::move(original));
-        return to;
-    }
-    if (!target || !graph.sameValueType(from, to) ||
-        (!literal(graph, target) && !sameScope(graph, source, target))) {
-        target = graph.createOperation(grh::OperationKind::kAssign);
-        const auto carrier = graph.createValue(graph.valueLogicalType(from));
-        graph.addOperand(target, to); graph.addResult(target, carrier);
-        moved.members = original.members;
-        moved.origins = original.origins;
-        write(graph, target, moved);
-        for (const auto name : {std::string_view("grhsim.partition"), std::string_view("grhsim.nodeClone"), std::string_view("originModules")})
-            for (const auto& entry : graph.opAttrs(source))
-                if (entry.key == name) { graph.setAttr(target, name, entry.value); break; }
-        if (const auto location = graph.opSrcLoc(source)) graph.setOpSrcLoc(target, *location);
-        to = carrier;
-    } else {
-        const auto targetResults = graph.opResults(target);
-        const auto index = std::find(targetResults.begin(), targetResults.end(), to) - targetResults.begin();
-        for (auto& root : moved.roots) root.result = index;
-        auto destination = read(graph, target);
-        destination.roots.insert(destination.roots.end(), moved.roots.begin(), moved.roots.end());
-        destination.origins.insert(destination.origins.end(), original.origins.begin(), original.origins.end());
-        write(graph, target, std::move(destination));
-    }
-    std::erase_if(original.roots, [&](const auto& root) {
+    const auto results = graph.opResults(source);
+    const auto matches = [&](const Root& root) {
         return root.result >= 0 && static_cast<uint64_t>(root.result) < results.size() && results[root.result] == from;
-    });
+    };
+    const auto target = graph.valueDef(to);
+    if (target == source) {
+        const auto outputs = graph.opResults(target);
+        const auto index = std::find(outputs.begin(), outputs.end(), to) - outputs.begin();
+        for (auto& root : original.roots) if (matches(root)) root.result = index;
+    } else {
+        if (target && graph.sameValueType(from, to)) {
+            auto destination = read(graph, target);
+            const auto outputs = graph.opResults(target);
+            const auto index = std::find(outputs.begin(), outputs.end(), to) - outputs.begin();
+            for (const auto& root : original.roots) if (matches(root)) destination.roots.push_back({root.key, index});
+            destination.members.insert(destination.members.end(), original.members.begin(), original.members.end());
+            destination.origins.insert(destination.origins.end(), original.origins.begin(), original.origins.end());
+            write(graph, target, std::move(destination));
+        }
+        std::erase_if(original.roots, matches);
+    }
     write(graph, source, std::move(original));
     return to;
 }
@@ -354,12 +319,12 @@ Inspection inspect(const grh::Graph& graph) {
     Inspection result;
     std::map<std::string, NodeRecord> records;
     const auto schema = graph.metadata(kSchema);
-    if (schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != 1))
-        result.errors.push_back("unsupported firrtl.nodeSchema (expected int64 1)");
+    if (schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != kSchemaRevision))
+        result.errors.push_back("unsupported firrtl.nodeSchema; re-ingest for soft-node-v2");
     for (const auto op : graph.operations()) {
         if (!annotated(graph, op)) continue;
         try {
-            if (!schema) throw std::invalid_argument("node attributes require firrtl.nodeSchema=1");
+            if (!schema) throw std::invalid_argument("node attributes require firrtl.nodeSchema=2");
             bool hasRoots = false, hasIndices = false;
             for (const auto& entry : graph.opAttrs(op)) if (isAttribute(entry.key)) {
                 if (entry.key != kMembers && entry.key != kRoots && entry.key != kRootResults && entry.key != kOrigins)
@@ -385,36 +350,8 @@ Inspection inspect(const grh::Graph& graph) {
         }
     }
     for (auto& [identity, record] : records) {
-        if (record.roots.size() > 1) {
-            // Explicit phase/leaf materializations preserve source identity.
-            // Only the owning transform's marked clones may add a root, and
-            // each root must live in a different execution owner.
-            std::set<std::vector<std::string>> owners;
-            unsigned originals = 0; bool valid = true;
-            for (const auto& root : record.roots) {
-                const auto path = owner(graph, root.operation);
-                valid &= !path.empty() && owners.emplace(path.begin(), path.end()).second;
-                const auto clone = graph.getOperation(root.operation).attr("grhsim.nodeClone");
-                valid &= !clone || std::holds_alternative<bool>(*clone);
-                originals += !(clone && std::holds_alternative<bool>(*clone) && std::get<bool>(*clone));
-            }
-            if (!valid || originals > 1) result.errors.push_back("duplicate live roots for node " + identity);
-        }
-        if (record.roots.empty()) {
-            bool escapes = false;
-            const std::unordered_set<grh::OperationId, grh::OperationIdHash> members(record.members.begin(), record.members.end());
-            for (const auto op : record.members) {
-                // Literals may be shared across nodes before partitioning. A dead
-                // node can leave provenance on a literal used by a different node.
-                if (literal(graph, op)) continue;
-                for (const auto value : graph.opResults(op)) {
-                    escapes |= graph.valueIsOutput(value) || graph.valueIsInout(value);
-                    for (const auto& use : graph.valueUsers(value))
-                        escapes |= !members.contains(use.operation);
-                }
-            }
-            if (escapes) result.errors.push_back("live members without a result root for node " + identity);
-        }
+        // Optional associations may overlap, lose roots, or have cloned roots.
+        // Only the representation above is a validity constraint.
         result.nodes.push_back(std::move(record));
     }
     return result;
@@ -446,7 +383,7 @@ void requirePolicy(const grh::Graph& graph) {
     if (!graph.metadata(kSchema) && !graph.metadata(kScopePolicy)) return;
     if (graph.metadata(kScopePolicy) != std::optional<grh::AttributeValue>(std::string(kScopeRevision)) ||
         !graph.metadata(kInventory))
-        throw std::invalid_argument("FIRRTL source-node policy is missing/incompatible; re-ingest the source");
+        throw std::invalid_argument("FIRRTL soft-node-v2 policy is missing/incompatible; re-ingest the source");
 }
 
 void recordDead(grh::Graph& graph, grh::OperationId op) {
@@ -514,7 +451,7 @@ void recordRetention(grh::Graph& graph) {
         if (dead.contains(key)) ++removed;
         else ++missing;
     }
-    grh::AttributeValue census = std::vector<std::string>{"v1",
+    grh::AttributeValue census = std::vector<std::string>{"v2",
         "source-nodes=" + std::to_string(inventory.size()), "available=" + std::to_string(available.size()),
         "roots=" + std::to_string(roots), "dead=" + std::to_string(removed),
         "constant=" + std::to_string(constants.size()), "alias=" + std::to_string(aliases.size()),
@@ -524,7 +461,6 @@ void recordRetention(grh::Graph& graph) {
         "unique-key-bytes=" + std::to_string(uniqueBytes)};
     if (graph.metadata("firrtl.nodeRetention") != std::optional<grh::AttributeValue>(census))
         graph.setMetadata("firrtl.nodeRetention", std::move(census));
-    if (missing) throw std::invalid_argument("FIRRTL source node information was lost: " + std::to_string(missing));
 }
 
 std::string Inspection::report(const grh::Graph& graph) const {

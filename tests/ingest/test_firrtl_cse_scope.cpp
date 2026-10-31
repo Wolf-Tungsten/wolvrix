@@ -82,11 +82,56 @@ void compare(const grh::Design& reference, const grh::Design& candidate) {
         }
     }
 }
+void sameStructure(const grh::Graph& left, const grh::Graph& right) {
+    require(left.operations().size() == right.operations().size(), "annotations changed optimized operation count");
+    std::unordered_map<grh::OperationId, grh::OperationId, grh::OperationIdHash> forward, reverse;
+    std::function<void(grh::ValueId, grh::ValueId)> match = [&](auto a, auto b) {
+        require(left.valueLogicalType(a) == right.valueLogicalType(b), "annotations changed optimized type");
+        const auto x = left.valueDef(a), y = right.valueDef(b);
+        require(bool(x) == bool(y), "annotations retained an otherwise removable producer");
+        if (!x) {
+            require(left.symbolText(left.valueSymbol(a)) == right.symbolText(right.valueSymbol(b)), "optimized input differs");
+            return;
+        }
+        if (forward.contains(x)) { require(forward.at(x) == y, "annotations prevented sharing"); return; }
+        require(!reverse.contains(y), "annotations introduced different sharing");
+        forward.emplace(x, y); reverse.emplace(y, x);
+        require(left.opKind(x) == right.opKind(y), "annotations changed optimized operation");
+        const auto attributes = [](const auto& graph, auto op) {
+            std::vector<grh::AttrKV> result;
+            for (const auto& entry : graph.opAttrs(op))
+                if (!node::isAttribute(entry.key) && entry.key != "grhsim.nodeClone" && entry.key != "originModules") result.push_back(entry);
+            std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
+            return result;
+        };
+        const auto aa = attributes(left, x), bb = attributes(right, y);
+        require(aa.size() == bb.size(), "functional attribute count differs");
+        for (std::size_t i = 0; i < aa.size(); ++i)
+            require(aa[i].key == bb[i].key && aa[i].value == bb[i].value, "functional attributes differ");
+        const auto ax = left.opOperands(x), by = right.opOperands(y);
+        require(ax.size() == by.size(), "optimized arity differs");
+        for (std::size_t i = 0; i < ax.size(); ++i) match(ax[i], by[i]);
+    };
+    for (const auto& port : left.outputPorts()) {
+        const auto found = std::find_if(right.outputPorts().begin(), right.outputPorts().end(),
+                                      [&](const auto& other) { return other.name == port.name; });
+        require(found != right.outputPorts().end(), "output lost"); match(port.value, found->value);
+    }
+}
 void optimize(Fixture& f, bool grhsim) {
-    if (grhsim) {
-        run(f.design, std::make_unique<sim::GrhToGrhsimPass>());
-        run(f.design, std::make_unique<sim::SimplifyPass>());
-    } else run(f.design, std::make_unique<tx::SimplifyPass>());
+    auto unannotated = f.design.clone();
+    for (auto& [name, graph] : unannotated.graphs()) {
+        for (const auto op : graph->operations()) node::write(*graph, op, {});
+        graph->eraseMetadata(node::kSchema);
+    }
+    const auto apply = [&](auto& design) {
+        if (grhsim) {
+            run(design, std::make_unique<sim::GrhToGrhsimPass>());
+            run(design, std::make_unique<sim::SimplifyPass>());
+        } else run(design, std::make_unique<tx::SimplifyPass>());
+    };
+    apply(f.design); apply(unannotated);
+    sameStructure(f.graph, *unannotated.findGraph("top"));
     valid(f.design);
     run(f.design, std::make_unique<tx::GrhVerifyPass>());
 }
@@ -109,8 +154,8 @@ void localAndCrossNode(bool grhsim, OperationKind primitive) {
     f.output("local", local); f.output("other", other); f.output("sv", svOut);
     const auto reference = f.design.clone();
     optimize(f, grhsim);
-    require(count(f.graph, primitive) == (primitive == OperationKind::kAdd ? 5 : 3),
-            "CSE must share inside n1 and SV, keeping n1/n2/SV separate");
+    require(count(f.graph, primitive) <= (primitive == OperationKind::kAdd ? 3 : 1),
+            "ordinary CSE did not share across node and SV sources");
     compare(reference, f.design);
     auto loaded = roundTrip(f.design);
     valid(loaded);
@@ -131,20 +176,10 @@ void rootsAndConstants(bool grhsim) {
     const auto reference = f.design.clone();
     optimize(f, grhsim);
     require(count(f.graph, OperationKind::kAdd) == 0, "node attrs prevented constant folding");
-    const auto inspection = node::inspect(f.graph);
-    for (const auto name : {"alias", "input-alias"}) {
-        const auto found = std::find_if(inspection.nodes.begin(), inspection.nodes.end(),
-                                        [&](const auto& record) { return record.key == key(name); });
-        require(found != inspection.nodes.end() && found->roots.size() == 1, "alias result root was lost");
-        require(f.graph.opKind(found->roots[0].operation) == OperationKind::kAssign,
-                "external alias root must have a transparent carrier");
-    }
     for (const auto op : f.graph.operations()) {
         const auto attrs = node::read(f.graph, op);
         require(std::find(attrs.members.begin(), attrs.members.end(), key("dead")) == attrs.members.end(),
                 "node attrs prevented dead code removal");
-        if (f.graph.opKind(op) == OperationKind::kAnd)
-            require(attrs.members == std::vector<std::string>{key("x")}, "alias label moved onto another node's computation");
     }
     compare(reference, f.design);
 }
@@ -157,7 +192,6 @@ void rewrittenRoot(bool grhsim) {
     f.output("y", outer);
     const auto reference = f.design.clone();
     optimize(f, grhsim);
-    require(node::inspect(f.graph).nodes[0].roots.size() == 1, "NOT/XOR rewrite lost its root");
     compare(reference, f.design);
 }
 
@@ -171,9 +205,6 @@ void rootBecomesInput(bool grhsim) {
     f.output("y", slice);
     const auto reference = f.design.clone();
     optimize(f, grhsim);
-    const auto record = node::inspect(f.graph).nodes.at(0);
-    require(record.roots.size() == 1 && f.graph.opKind(record.roots[0].operation) == OperationKind::kAssign,
-            "slice root simplified to an input without a carrier");
     require(count(f.graph, OperationKind::kConcat) == 0 && count(f.graph, OperationKind::kSliceStatic) == 0,
             "root tracking prevented structural simplification");
     compare(reference, f.design);
@@ -187,8 +218,8 @@ void crossNodeFusion(bool grhsim) {
     f.output("y", outer);
     const auto reference = f.design.clone();
     optimize(f, grhsim);
-    require(count(f.graph, OperationKind::kXor) == 1 && count(f.graph, OperationKind::kNot) == 1,
-            "NOT/XOR fusion crossed a node reference boundary");
+    // optimize() compares complete sharing structure with an unannotated copy;
+    // neither pipeline is required to choose a particular XOR spelling.
     compare(reference, f.design);
 }
 
@@ -205,8 +236,7 @@ void maskedOrBoundary(bool sameNode) {
     sim::RecoverMaskedOrOptions options; options.minTerms = 2;
     run(f.design, std::make_unique<sim::RecoverMaskedOrPass>(options));
     valid(f.design);
-    require(count(f.graph, sim::kMaskedOr) == (sameNode ? 1 : 0),
-            "masked-OR recovery did not respect node expression boundaries");
+    require(count(f.graph, sim::kMaskedOr) == 1, "node hint blocked masked-OR recovery");
     compare(reference, f.design);
 }
 
@@ -224,7 +254,7 @@ void arrays(bool grhsim) {
     const auto reference = f.design.clone();
     optimize(f, grhsim);
     require(count(f.graph, OperationKind::kArrayCreate) == 1, "node attrs prevented array shape normalization");
-    require(count(f.graph, OperationKind::kSliceArray) == 1, "array element recovery crossed a node boundary");
+    require(count(f.graph, OperationKind::kSliceArray) == 0, "node hint blocked array element recovery");
     compare(reference, f.design);
     auto loaded = roundTrip(f.design);
     valid(loaded);
@@ -245,8 +275,8 @@ void isolatedFragments(bool grhsim) {
     f.output("y", result);
     const auto reference = f.design.clone();
     optimize(f, grhsim);
-    require(count(f.graph, OperationKind::kAnd) == 2, "partially annotated FIRRTL fragments became ordinary SV scope");
-    require(node::inspect(f.graph).isolatedFragments.size() == 2, "isolated fragments were absent from inspection");
+    require(count(f.graph, OperationKind::kAnd) == 1, "diagnostic-only provenance blocked CSE");
+    require(node::inspect(f.graph).isolatedFragments.size() == 1, "diagnostic provenance lost from representative");
     compare(reference, f.design);
 }
 

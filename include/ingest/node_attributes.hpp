@@ -16,7 +16,9 @@ inline constexpr std::string_view kRoots = "firrtl.node.roots";
 inline constexpr std::string_view kRootResults = "firrtl.node.rootResults";
 inline constexpr std::string_view kOrigins = "firrtl.node.origins";
 inline constexpr std::string_view kScopePolicy = "firrtl.nodeScopePolicy";
-inline constexpr std::string_view kScopeRevision = "source-node-v1";
+inline constexpr std::string_view kScopeRevision = "soft-node-v2";
+inline constexpr int64_t kSchemaRevision = 2;
+inline constexpr std::size_t kMaxAssociations = 64;
 inline constexpr std::string_view kInventory = "firrtl.nodeInventory";
 inline constexpr std::string_view kEliminated = "firrtl.nodeEliminated";
 
@@ -63,15 +65,14 @@ void mergeEquivalentOperations(grh::Graph& graph, grh::OperationId target,
 // Functional equivalence is the caller's proof; this checks the sharing scope.
 void mergeCseOperations(grh::Graph& graph, grh::OperationId target, grh::OperationId source);
 
-// Functional hashes exclude node attrs. Add this key to the existing execution
-// owner scope; sameScope checks both. Keys are transient and never serialized.
+// Hints never add an optimization scope. Only actual execution owners constrain
+// sharing; the empty key keeps functional signatures annotation-transparent.
 std::string cseScope(const grh::Graph& graph, grh::OperationId op);
 bool sameScope(const grh::Graph& graph, grh::OperationId left, grh::OperationId right);
 bool mayInline(const grh::Graph& graph, grh::OperationId consumer, grh::OperationId producer);
 bool rootCarrier(const grh::Graph& graph, grh::OperationId op);
 
-// Returns a transparent carrier when a root would otherwise move onto an unrelated
-// producer/input. Call before replacing uses and erasing the original operation.
+// Update optional result associations without creating operations or values.
 grh::ValueId redirectRoots(grh::Graph& graph, grh::ValueId from, grh::ValueId to);
 
 struct RootLocation {
@@ -104,7 +105,7 @@ void recordDead(grh::Graph& graph, grh::OperationId op);
 // Copy the source inventory/tombstones with the same qualification as the ops.
 void importInventory(const grh::Graph& source, grh::Graph& target,
                      std::span<const std::string> instancePath);
-// Compact, auditable census. Missing inventory entries are errors, not DCE.
+// Diagnostic census. Optimizations may legitimately lose optional associations.
 void recordRetention(grh::Graph& graph);
 
 } // namespace wolvrix::lib::ingest::node

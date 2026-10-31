@@ -26,7 +26,6 @@ namespace wolvrix::lib::transform::write_detail
         {
             const auto def = graph.valueDef(value);
             if (!def.valid()) break;
-            if (ingest::node::annotated(graph, def)) break;
             const auto operands = graph.opOperands(def);
             if ((graph.opKind(def) != OperationKind::kAssign &&
                  graph.opKind(def) != OperationKind::kConcat) || operands.size() != 1 ||

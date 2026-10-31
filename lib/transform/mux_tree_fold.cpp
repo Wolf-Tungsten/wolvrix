@@ -240,9 +240,6 @@ namespace wolvrix::lib::transform
                     return OperationId::invalid();
                 }
                 const OperationId def = graph_.valueDef(value);
-                // This structural folder has no result/member map for source
-                // nodes. Retain that boundary instead of extracting its internals.
-                if (def.valid() && ingest::node::annotated(graph_, def)) return OperationId::invalid();
                 if (!def.valid() || erased_.count(def) != 0)
                 {
                     return OperationId::invalid();
@@ -682,7 +679,6 @@ namespace wolvrix::lib::transform
                 }
                 for (const OperationId root : muxOps)
                 {
-                    if (ingest::node::annotated(graph_, root)) continue;
                     if (erased_.count(root) != 0)
                     {
                         continue;
@@ -2097,7 +2093,6 @@ namespace wolvrix::lib::transform
                 }
                 for (const OperationId id : candidates)
                 {
-                    if (ingest::node::annotated(graph_, id)) continue;
                     if (erased_.count(id) != 0)
                     {
                         continue;

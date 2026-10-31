@@ -58,10 +58,12 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
   - `loc`: 可选，源码位置与扩展调试信息 `{ file, line, col, endLine, endCol, origin, pass, note }`。
 
 FIRRTL node 信息也使用现有 metadata/attrs 负载：Graph 的
-`firrtl.nodeSchema` 为整数 1；op 的 `firrtl.node.members`、`roots`、`origins`
+`firrtl.nodeSchema` 为整数 2、策略为 `soft-node-v2`；op 的 `firrtl.node.members`、`roots`、`origins`
 为字符串数组，`firrtl.node.rootResults` 为与 roots 等长的整数数组，记录当前
 op 的 result 序号。身份 key 和根映射不保存裸实体 ID。具体字段和 verifier
 约束见 [node 属性](../ingest/node-attributes.md)，不增加独立 JSON 方言。
+这些都是可选来源关联；允许部分保留、重叠及丢失根，不构成 simplify 屏障。
+schema 1 / source-node-v1 checkpoint 必须从源重新 ingest。
 
 ## 存储单元 Port 操作
 - 存储声明类操作使用 `sym` 作为声明名，`attrs` 仅承载类型信息。

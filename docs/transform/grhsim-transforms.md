@@ -33,6 +33,7 @@ grh-to-grhsim
 | `grhsim-split-nonsink-and-sink` | `-top`, `-mem-min-bytes` | the unique top, 64 |
 | `grhsim-partition-nonsink` | `-top`, `-max-node-work`, `-max-supernode-work`, `-segment-penalty`, `-semantic-nodes` | the unique top, 128, 128, 1, 0 |
 | `grhsim-partition-nonsink` clone options | `-clone-shared`, `-clone-max-fanout`, `-max-clones`, `-clone-lossy-compare` | 1, 8, 250000, 1 |
+| `grhsim-partition-nonsink` hint/cost options | `-firrtl-nodes=off|prefer|auto`, `-cost-model=legacy|bytes`, `-fuse-leaves=0|1`, `-report` | off, legacy, 0, no report |
 | `grhsim-partition-sink` | `-top`, `-enable-guard-min-size` | the unique top, 8 (0 disables hoisting) |
 
 Factory arguments use `-key=value`, as with other ordinary passes. There are no
@@ -70,8 +71,7 @@ result/history; effectful calls and random samples do not undergo this CSE.
 On a fully attributed graph it works separately inside each complete leaf
 owner. It preserves exported values/types and cannot merge clones across
 owners. Shared-state narrowing/merging only runs before partitioning.
-Annotated FIRRTL additionally restricts primitive CSE and structural inlining
-to one source-node scope before complete execution leaves exist.
+FIRRTL source associations impose no extra CSE or structural inlining scope.
 `grhsim-node-cse` compares complete pure scalar expressions and applies the
 GSIM count/width/fanout thresholds; see [its contract](../ingest/node-cse.md).
 
@@ -143,7 +143,7 @@ Cost overflow is diagnosed before graph mutation.
 
 Work is at least one per op and grows with Logic result words; mul/div/mod cost
 four times that, external function/DPI calls eight times. A single indivisible
-node may exceed a budget. `semantic-nodes=1` keeps declaration anchors from
+op may exceed a budget. Source nodes have no budget exemption. `semantic-nodes=1` keeps declaration anchors from
 being absorbed. These work limits control activation granularity, not source
 lines. Owners become `[general,nonsink,sn_<key>,node_<key>]`; the initial key is
 derived from an anchor symbol, then remains literal attribute text across rename
@@ -157,6 +157,70 @@ eq/ne comparisons, into consuming nonsink leaves. Clone count limits primary
 copies; supporting constants are copied to the destination too. Clones keep
 types/sources and receive new symbols. `grhsim-simplify` can then simplify each
 complete leaf separately; it cannot merge clones across owners.
+Every copied op, including supporting constants, must fit the leaf and
+supernode work caps. The varying input must already reach the destination
+execution owner, and the original output must cross that boundary. Bytes mode
+also requires saved payload bytes to exceed copied work. These are static
+proxies, not measured activation rates. Default legacy cloning now obeys the
+same caps; the v2 config explicitly distinguishes this corrected policy.
+
+### FIRRTL soft hints
+
+`firrtl-nodes=off` ignores members in partition decisions while retaining attrs.
+`prefer`/`auto` use current, possibly overlapping/rootless member sets to rank
+equal-weight legal coarsening links and equal-cost segmentation candidates.
+Missing associations resolve to off. No hints become indivisible atoms,
+must-link edges, persistent result slots or activity-rate overrides. Different
+source sets and unannotated SV ops can share owners; one set can split. Origins
+are diagnostic only. The local cluster search retains at most 256 canonical
+keys deterministically; this bounded index does not claim region completeness.
+
+Legacy cost retains the common chain/input/sibling coarsening and incoming-value
+objective. Bytes cost is a separate experiment: bypass greedy coarsening, then
+minimize, over topological leaf intervals,
+`sum(rate * payload_bytes) + segment_penalty + sum(rate) * interval_work`.
+Distinct external inputs define each interval's rate sum. Logic payload is
+`max(1,ceil(width/8))`, doubled for FourState; nonlogic uses a nominal 8 bytes.
+Widths include all shaped bits. No FIRRTL-specific activity is assumed. The
+last term approximates unnecessary reevaluation; it is not an empirical
+prediction or a count of actual evals. Cost and hint modes are independently
+selectable. Neither heuristic promises a globally optimal partition.
+
+`fuse-leaves=1` combines adjacent existing leaves within an execution supernode,
+using topological quotient order and the common max-node-work cap. It enables
+later leaf-local simplify; it never crosses phase/SN boundaries. Clone and
+fusion do not use source identity as permission. Sink partitioning subsequently
+rebuilds actual writer prerequisites and SinkSchedule.
+
+`grhsim.nonsinkConfig` is
+`v2/maxNodeWork/maxSupernodeWork/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/fuseLeaves/op-hints-v1`.
+The old eight-field config requires restart from nonsink-sink-split. Schema 1
+source checkpoints require re-ingest. Python uses `firrtl_nodes`, `cost_model`,
+`fuse_leaves`, `report`; the shared FlowOptions uses `nonsink_report`. Make
+exposes XS_GRHSIM_FIRRTL_NODES/COST_MODEL/FUSE_LEAVES/NONSINK_REPORT and the
+matching GRHSIM_REEMIT variables. Defaults remain off/legacy/unfused.
+
+Metadata `grhsim.nonsinkHintStats` and optional text report capture the stage
+immediately after nonsink partition/clone, before subsequent simplify. They
+report coverage/work, multi-member ops, source sets split across SNs, mixed
+association groups (not a language census), hint score, leaves/SNs,
+distinct nonsink boundary payload bytes, consumer payload bytes, copied work
+and cost/budget rejections. Boundary census includes sink/event/output users.
+`hint-score` sums accepted coarsening merges with a shared association and the
+selected segmentation's bounded common-member score. It is not a node count
+or proof that hints changed those decisions; compare owners from off/prefer
+on the same checkpoint to establish that. Rejected cyclic coarsening batches
+do not contribute. `hint-index-references` counts retained initial leaf/key
+pairs; `hint-index-truncated` counts initial insertion overflow events, not
+unique keys lost or later coarsening truncations. Both leaf and cluster key
+sets obey the reported cap. Op/work totals, maximum leaf/SN work and oversized
+op counts make the common budgets auditable.
+An idempotent pass can re-emit the same snapshot; downstream changes do not
+reinterpret it as a current physical layout. `hint-analysis-us` is a log field
+covering index construction through partitioning and report output; it is not
+isolated annotation overhead.
+`inspect_firrtl_partitions` records process wall/RSS and JSON metadata overhead.
+Generation identity includes the exact config and statistics.
 
 ## Sink groups and SinkSchedule
 

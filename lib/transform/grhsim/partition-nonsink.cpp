@@ -2,7 +2,10 @@
 
 #include "partition-internal.hpp"
 
+#include <chrono>
+#include <fstream>
 #include <numeric>
+#include <set>
 #include <tuple>
 
 namespace wolvrix::lib::transform::grhsim {
@@ -11,6 +14,36 @@ using namespace grh;
 using namespace detail;
 using Clusters = std::vector<std::vector<uint32_t>>;
 constexpr uint32_t absent = UINT32_MAX;
+using Hints = std::vector<std::set<std::string>>;
+constexpr std::size_t maxClusterHints = 256;
+
+void addHints(std::set<std::string>& target, const std::set<std::string>& source) {
+    target.insert(source.begin(), source.end());
+    while (target.size() > maxClusterHints) target.erase(std::prev(target.end()));
+}
+
+uint64_t affinity(const std::set<std::string>& left, const std::set<std::string>& right) {
+    uint64_t common = 0;
+    auto a = left.begin(), b = right.begin();
+    while (a != left.end() && b != right.end()) {
+        if (*a < *b) ++a;
+        else if (*b < *a) ++b;
+        else { ++common; ++a; ++b; }
+    }
+    return common;
+}
+
+uint64_t valueBytes(const Graph& graph, ValueId value) {
+    if (graph.valueType(value) != ValueType::Logic) return 8;
+    const auto width = uint64_t(graph.valueWidth(value));
+    return std::max<uint64_t>(1, (width + 7) / 8) *
+        (graph.valueDomain(value) == LogicDomain::FourState ? 2 : 1);
+}
+
+uint64_t multiplyCost(uint64_t left, uint64_t right) {
+    if (right && left > UINT64_MAX / right) throw std::invalid_argument("Activity partition cost overflows uint64");
+    return left * right;
+}
 
 uint64_t addCost(uint64_t left, uint64_t right) {
     if (right > UINT64_MAX - left) throw std::invalid_argument("Activity partition cost overflows uint64");
@@ -87,8 +120,11 @@ bool orderClusters(Clusters& clusters, std::span<const Edge> edges, std::size_t 
 }
 
 bool coarsen(Clusters& clusters, std::span<const Edge> edges, const std::vector<uint64_t>& sizes,
-             uint64_t limit, unsigned mode) {
+             uint64_t limit, unsigned mode, const Hints* hints = nullptr, uint64_t* adopted = nullptr) {
     const Quotient graph(clusters, edges, sizes.size());
+    Hints associated(hints ? clusters.size() : 0);
+    if (hints) for (uint32_t i = 0; i < clusters.size(); ++i)
+        for (const auto node : clusters[i]) addHints(associated[i], (*hints)[node]);
     std::vector<uint32_t> parents(clusters.size());
     std::iota(parents.begin(), parents.end(), 0);
     std::vector<uint64_t> weights(clusters.size());
@@ -98,10 +134,13 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, const std::vector<
         return node;
     };
     bool changed = false;
+    uint64_t localScore = 0;
     const auto merge = [&](uint32_t a, uint32_t b) {
         a = find(a); b = find(b);
         if (a == b || weights[a] + weights[b] > limit) return false;
         if (a > b) std::swap(a, b);
+        if (hints && affinity(associated[a], associated[b])) ++localScore;
+        if (hints) addHints(associated[a], associated[b]);
         parents[b] = a; weights[a] += weights[b]; changed = true;
         return true;
     };
@@ -121,6 +160,12 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, const std::vector<
         std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
             return a.first != b.first ? a.first > b.first : a.second < b.second;
         });
+        if (hints) std::stable_sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first > b.first;
+            const auto x = affinity(associated[a.second.first], associated[a.second.second]);
+            const auto y = affinity(associated[b.second.first], associated[b.second.second]);
+            return x > y;
+        });
         for (const auto& [weight, link] : candidates) merge(link.first, link.second);
     }
     if (!changed) return false;
@@ -133,6 +178,7 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, const std::vector<
     }
     if (!orderClusters(result, edges, sizes.size())) return false;
     clusters = std::move(result);
+    if (adopted) *adopted += localScore;
     return true;
 }
 
@@ -140,7 +186,8 @@ bool coarsen(Clusters& clusters, std::span<const Edge> edges, const std::vector<
 // weighted by firing rate, plus a per-supernode penalty. Work caps control
 // activation granularity; source lines and translation units are irrelevant.
 Clusters segment(const Graph& graph, const Clusters& clusters, std::span<const Edge> edges,
-                 const std::vector<uint64_t>& sizes, uint64_t limit, uint64_t penalty) {
+                 const std::vector<uint64_t>& sizes, uint64_t limit, uint64_t penalty, bool bytes = false,
+                 const Hints* hints = nullptr, uint64_t* adopted = nullptr) {
     const Quotient quotient(clusters, edges, sizes.size());
     std::vector<std::vector<ValueId>> incoming(clusters.size()), outgoing(clusters.size());
     uint32_t lastValue = 0;
@@ -160,13 +207,15 @@ Clusters segment(const Graph& graph, const Clusters& clusters, std::span<const E
     }
     std::vector<uint64_t> prefix(clusters.size() + 1), cost(clusters.size() + 1, UINT64_MAX);
     std::vector<uint32_t> previous(clusters.size() + 1);
+    std::vector<uint64_t> hintScore(clusters.size() + 1);
     for (uint32_t i = 0; i < clusters.size(); ++i) {
         prefix[i + 1] = prefix[i];
         for (const auto node : clusters[i]) prefix[i + 1] += sizes[node];
     }
     cost[0] = 0;
     for (uint32_t end = 1; end <= clusters.size(); ++end) {
-        uint64_t boundary = 0;
+        uint64_t boundary = 0, firing = 0;
+        uint64_t localScore = 0; std::set<std::string> associated;
         const auto rate = [&](ValueId value) {
             auto& cached = values[value.index].rate;
             if (cached) return cached;
@@ -178,19 +227,30 @@ Clusters segment(const Graph& graph, const Clusters& clusters, std::span<const E
         for (uint32_t begin = end; begin > 0;) {
             --begin;
             if (prefix[end] - prefix[begin] > limit && begin + 1 != end) break;
+            if (hints) for (const auto node : clusters[begin]) {
+                localScore += affinity(associated, (*hints)[node]); addHints(associated, (*hints)[node]);
+            }
             for (const auto value : incoming[begin]) {
                 auto& entry = values[value.index];
                 if (entry.seen == end) continue;
                 entry.seen = end;
                 if (entry.source == absent || entry.source < begin) {
-                    entry.counted = end; boundary = addCost(boundary, rate(value));
+                    entry.counted = end;
+                    boundary = addCost(boundary, multiplyCost(rate(value), bytes ? valueBytes(graph, value) : 1));
+                    firing = addCost(firing, rate(value));
                 }
             }
             for (const auto value : outgoing[begin]) if (values[value.index].counted == end) {
-                values[value.index].counted = 0; boundary -= rate(value);
+                values[value.index].counted = 0;
+                boundary -= multiplyCost(rate(value), bytes ? valueBytes(graph, value) : 1);
+                firing -= rate(value);
             }
-            const auto candidate = addCost(addCost(cost[begin], boundary), penalty);
-            if (candidate <= cost[end]) { cost[end] = candidate; previous[end] = begin; }
+            const auto recompute = bytes ? multiplyCost(firing, prefix[end] - prefix[begin]) : 0;
+            const auto candidate = addCost(addCost(addCost(cost[begin], boundary), penalty), recompute);
+            const auto score = hintScore[begin] + localScore;
+            if (candidate < cost[end] || (candidate == cost[end] && (!hints || score >= hintScore[end]))) {
+                cost[end] = candidate; previous[end] = begin; hintScore[end] = score;
+            }
             if (prefix[end] - prefix[begin] > limit) break; // An indivisible oversized node.
         }
     }
@@ -202,26 +262,35 @@ Clusters segment(const Graph& graph, const Clusters& clusters, std::span<const E
         result.push_back(std::move(members)); end = begin;
     }
     std::reverse(result.begin(), result.end());
+    if (hints && adopted) *adopted += hintScore.back();
     return result;
 }
 
 std::string config(const PartitionNonsinkOptions& options) {
-    return std::to_string(options.maxNodeWork) + "/" + std::to_string(options.maxSupernodeWork) + "/" +
+    return "v2/" + std::to_string(options.maxNodeWork) + "/" + std::to_string(options.maxSupernodeWork) + "/" +
         std::to_string(options.segmentPenalty) + "/" + std::to_string(options.semanticNodes) + "/" +
         std::to_string(options.cloneShared) + "/" + std::to_string(options.cloneMaxFanout) + "/" +
-        std::to_string(options.maxClones) + "/" + std::to_string(options.cloneLossyCompare);
+        std::to_string(options.maxClones) + "/" + std::to_string(options.cloneLossyCompare) +
+        "/" + options.firrtlNodes + "/" + options.costModel + "/" + std::to_string(options.fuseLeaves) + "/op-hints-v1";
 }
 
-void cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
+struct CloneStats { uint64_t count = 0, work = 0, budgetRejected = 0, costRejected = 0; };
+
+CloneStats cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
                      std::span<const OperationId> originals) {
-    if (!options.cloneShared || options.maxClones == 0) return;
+    CloneStats stats;
+    if (!options.cloneShared || options.maxClones == 0) return stats;
     const auto nonsink = [&](const Owner& path) { return path.size() >= 4 && path[0] == "general" && path[1] == "nonsink"; };
+    std::map<Owner, uint64_t> leafWork, executionWork;
+    for (const auto op : originals) {
+        auto path = owner(graph, op); if (!nonsink(path)) continue;
+        leafWork[path] += work(graph, op); path.resize(3); executionWork[path] += work(graph, op);
+    }
     std::unordered_set<ValueId, ValueIdHash> boundaries;
     for (const auto op : originals) for (const auto value : graph.opResults(op)) {
         for (const auto& user : graph.valueUsers(value))
             if (ownerView(graph, user.operation) != ownerView(graph, op)) boundaries.insert(value);
     }
-    uint64_t clones = 0;
     for (const auto op : originals) {
         if (!canCloneOperation(graph, op) || graph.opResults(op).size() != 1) continue;
         const auto originalOwner = owner(graph, op);
@@ -257,7 +326,34 @@ void cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
         // One bounded round over the original candidates, with no recursive
         // cloning of a newly-created operation.
         for (const auto& [path, users] : destinations) {
-            if (clones >= options.maxClones) return;
+            if (stats.count >= options.maxClones) return stats;
+            auto execution = path; execution.resize(3);
+            std::set<uint32_t> constants;
+            uint64_t extra = work(graph, op);
+            for (const auto input : args) {
+                const auto constant = graph.valueDef(input);
+                if (constant && graph.opKind(constant) == OperationKind::kConstant && ownerView(graph, constant) != path &&
+                    constants.insert(constant.index).second) extra += work(graph, constant);
+            }
+            if (leafWork[path] + extra > options.maxNodeWork || executionWork[execution] + extra > options.maxSupernodeWork) {
+                ++stats.budgetRejected; continue;
+            }
+            // The input must already reach this execution owner. Then copying a
+            // cheap transform removes one payload without adding an activation
+            // dependency. Charge all copied operations, including literals.
+            bool available = false;
+            if (producer) {
+                auto from = owner(graph, producer); if (from.size() > 3) from.resize(3);
+                available |= from == execution;
+            }
+            for (const auto& user : graph.valueUsers(varying)) {
+                auto destination = owner(graph, user.operation); if (destination.size() > 3) destination.resize(3);
+                available |= destination == execution;
+            }
+            auto from = originalOwner; from.resize(3);
+            if (from == execution || !available || (options.costModel == "bytes" && valueBytes(graph, result) <= extra)) {
+                ++stats.costRejected; continue;
+            }
             std::vector<ValueId> inputs(args.begin(), args.end());
             for (auto& input : inputs) {
                 const auto constant = graph.valueDef(input);
@@ -269,9 +365,10 @@ void cloneBoundaries(Graph& graph, const PartitionNonsinkOptions& options,
             const auto clone = cloneOperation(graph, op, inputs, path);
             const auto copied = graph.opResults(clone)[0];
             for (const auto& use : users) graph.replaceOperand(use.operation, use.operandIndex, copied);
-            ++clones;
+            ++stats.count; stats.work += extra; leafWork[path] += extra; executionWork[execution] += extra;
         }
     }
+    return stats;
 }
 }
 
@@ -287,10 +384,22 @@ PassResult PartitionNonsinkPass::run() {
         if (!options_.maxNodeWork || !options_.maxSupernodeWork || !options_.cloneMaxFanout)
             throw std::invalid_argument("Activity work/fanout limits must be positive");
         graph = &partitionGraph(design(), options_.top);
+        ingest::node::requirePolicy(*graph);
+        if (options_.firrtlNodes != "off" && options_.firrtlNodes != "prefer" && options_.firrtlNodes != "auto")
+            throw std::invalid_argument("firrtl-nodes must be off, prefer or auto");
+        if (options_.costModel != "legacy" && options_.costModel != "bytes")
+            throw std::invalid_argument("cost-model must be legacy or bytes");
         const auto configuration = config(options_);
         if (stage(*graph) == "nonsink-partitioned") {
             if (graph->metadata("grhsim.nonsinkConfig") != std::optional<AttributeValue>(configuration))
                 throw std::invalid_argument("Changed activity configuration requires the nonsink-sink-split checkpoint");
+            if (!options_.report.empty()) {
+                std::ofstream report(options_.report);
+                const auto stats = graph->metadata("grhsim.nonsinkHintStats");
+                if (!report || !stats) throw std::invalid_argument("Cannot re-emit nonsink hint report");
+                for (const auto& line : std::get<std::vector<std::string>>(*stats)) report << line << '\n';
+                if (!report) throw std::invalid_argument("Cannot re-emit nonsink hint report");
+            }
             return result;
         }
         if (stage(*graph) != "nonsink-sink-split") throw std::invalid_argument("Activity partitioning requires nonsink-sink-split stage");
@@ -318,13 +427,31 @@ PassResult PartitionNonsinkPass::run() {
                 }
             }
             const auto weight = work(*graph, op);
-            if (!absorb || target == absent || sizes[target] + weight > options_.maxNodeWork) {
+            if (!absorb || target == absent || sizes[target] + weight > std::min(options_.maxNodeWork, options_.maxSupernodeWork)) {
                 target = sizes.size(); sizes.push_back(0);
             }
             nodeOf[op] = target; sizes[target] += weight;
         }
         std::vector<std::vector<OperationId>> nodes(sizes.size());
         for (const auto op : topo) nodes[nodeOf.at(op)].push_back(op);
+        const auto analysisStarted = std::chrono::steady_clock::now();
+        Hints hints(nodes.size());
+        uint64_t coveredOps = 0, coveredWork = 0, multiMember = 0, adopted = 0, truncated = 0, indexRefs = 0;
+        std::set<std::string> hintKeys;
+        for (const auto op : topo) {
+            const auto attributes = ingest::node::read(*graph, op);
+            if (attributes.members.empty()) continue;
+            ++coveredOps; coveredWork += work(*graph, op);
+            multiMember += attributes.members.size() > 1;
+            for (const auto& key : attributes.members) {
+                auto& local = hints[nodeOf.at(op)];
+                local.insert(key);
+                if (local.size() > maxClusterHints) { local.erase(std::prev(local.end())); ++truncated; }
+                hintKeys.insert(key);
+            }
+        }
+        for (const auto& local : hints) indexRefs += local.size();
+        const bool useHints = options_.firrtlNodes != "off" && coveredOps != 0;
         std::vector<Edge> edges;
         for (const auto op : topo) for (const auto input : graph->opOperands(op)) {
             const auto found = nodeOf.find(graph->valueDef(input));
@@ -342,26 +469,103 @@ PassResult PartitionNonsinkPass::run() {
         Clusters clusters(nodes.size());
         for (uint32_t i = 0; i < nodes.size(); ++i) clusters[i] = {i};
         if (!orderClusters(clusters, edges, nodes.size())) throw std::invalid_argument("Node contraction introduced a cycle");
-        while (!clusters.empty()) {
+        std::vector<uint32_t> nodeRank(nodes.size());
+        for (uint32_t rank = 0; rank < clusters.size(); ++rank) nodeRank[clusters[rank].front()] = rank;
+        while (!clusters.empty() && options_.costModel == "legacy") {
             const auto before = clusters.size();
-            for (unsigned mode = 0; mode < 3; ++mode) coarsen(clusters, edges, sizes, options_.maxSupernodeWork, mode);
+            for (unsigned mode = 0; mode < 3; ++mode)
+                coarsen(clusters, edges, sizes, options_.maxSupernodeWork, mode, useHints ? &hints : nullptr, &adopted);
             if (clusters.size() == before) break;
         }
-        clusters = segment(*graph, clusters, edges, sizes, options_.maxSupernodeWork, options_.segmentPenalty);
+        clusters = segment(*graph, clusters, edges, sizes, options_.maxSupernodeWork, options_.segmentPenalty,
+            options_.costModel == "bytes", useHints ? &hints : nullptr, &adopted);
         result.changed = true;
         for (const auto& cluster : clusters) {
             const auto anchor = nodes[cluster.front()].front();
             const std::string key = "sn_" + std::string(graph->symbolText(graph->operationSymbol(anchor)));
-            for (const auto node : cluster) {
-                const std::string nodeKey = "node_" + std::string(graph->symbolText(graph->operationSymbol(nodes[node].front())));
+            auto ordered = cluster;
+            std::sort(ordered.begin(), ordered.end(), [&](auto a, auto b) { return nodeRank[a] < nodeRank[b]; });
+            uint64_t fusedWork = 0; uint32_t fusedAnchor = ordered.front();
+            for (const auto node : ordered) {
+                if (!options_.fuseLeaves || fusedWork + sizes[node] > options_.maxNodeWork) { fusedAnchor = node; fusedWork = 0; }
+                fusedWork += sizes[node];
+                const std::string nodeKey = "node_" + std::string(graph->symbolText(graph->operationSymbol(
+                    nodes[fusedAnchor].front())));
                 for (const auto op : nodes[node]) graph->setAttr(op, kPartition, Owner{"general", "nonsink", key, nodeKey});
             }
         }
-        cloneBoundaries(*graph, options_, topo);
+        const auto cloneStats = cloneBoundaries(*graph, options_, topo);
+        uint64_t splitHints = 0, leafCount = 0, boundaryBytes = 0, comparedBytes = 0, multiSourceGroups = 0;
+        std::map<std::string, std::set<Owner>> destinations;
+        std::map<Owner, std::set<std::string>> groupSources;
+        std::set<Owner> leaves;
+        std::map<Owner, uint64_t> leafWork, executionWork;
+        uint64_t totalWork = 0, nonsinkOps = 0, oversizedOps = 0;
+        std::unordered_set<ValueId, ValueIdHash> persistent;
+        std::set<std::pair<uint32_t, Owner>> comparisons;
+        for (const auto op : graph->operations()) {
+            const auto path = owner(*graph, op);
+            if (path.size() != 4 || path[0] != "general" || path[1] != "nonsink") continue;
+            leaves.insert(path);
+            Owner execution(path.begin(), path.begin() + 3);
+            const auto weight = work(*graph, op); ++nonsinkOps; totalWork += weight;
+            leafWork[path] += weight; executionWork[execution] += weight;
+            oversizedOps += weight > std::min(options_.maxNodeWork, options_.maxSupernodeWork);
+            const auto attributes = ingest::node::read(*graph, op);
+            for (const auto& key : attributes.members) { destinations[key].insert(execution); groupSources[execution].insert(key); }
+            if (attributes.members.empty()) groupSources[execution].insert("unannotated");
+        }
+        // Census every real consumer, including sink, event and output phases.
+        // The first three nonsink components identify the execution owner.
+        for (const auto op : graph->operations()) {
+            auto execution = owner(*graph, op);
+            if (execution.size() == 4 && execution[0] == "general" && execution[1] == "nonsink") execution.resize(3);
+            for (const auto value : graph->opOperands(op)) {
+                const auto producer = graph->valueDef(value);
+                auto from = producer ? owner(*graph, producer) : Owner{};
+                if (from.size() == 4 && from[0] == "general" && from[1] == "nonsink") from.resize(3);
+                if (from != execution && comparisons.emplace(value.index, execution).second) comparedBytes += valueBytes(*graph, value);
+                if (producer && from.size() == 3 && from[0] == "general" && from[1] == "nonsink" &&
+                    from != execution && persistent.insert(value).second) boundaryBytes += valueBytes(*graph, value);
+            }
+        }
+        leafCount = leaves.size();
+        for (const auto& [key, groups] : destinations) splitHints += groups.size() > 1;
+        for (const auto& [key, sources] : groupSources) multiSourceGroups += sources.size() > 1;
+        uint64_t maxLeaf = 0, maxExecution = 0;
+        for (const auto& [key, weight] : leafWork) maxLeaf = std::max(maxLeaf, weight);
+        for (const auto& [key, weight] : executionWork) maxExecution = std::max(maxExecution, weight);
+        const std::string resolved = useHints ? "prefer" : "off";
+        const std::vector<std::string> stats{"op-hints-v1", "requested=" + options_.firrtlNodes,
+            "resolved=" + resolved, "cost=" + options_.costModel + "-v1",
+            "covered-ops=" + std::to_string(coveredOps), "covered-work=" + std::to_string(coveredWork),
+            "multi-member-ops=" + std::to_string(multiMember), "hint-sets=" + std::to_string(hintKeys.size()),
+            "hint-score=" + std::to_string(adopted), "split-hints=" + std::to_string(splitHints),
+            "mixed-groups=" + std::to_string(multiSourceGroups), "leaves=" + std::to_string(leafCount),
+            "supernodes=" + std::to_string(clusters.size()), "persistent-bytes=" + std::to_string(boundaryBytes),
+            "consumer-bytes=" + std::to_string(comparedBytes),
+            "clone-ops=" + std::to_string(cloneStats.count), "clone-extra-work=" + std::to_string(cloneStats.work),
+            "clone-skip-budget=" + std::to_string(cloneStats.budgetRejected),
+            "clone-skip-cost=" + std::to_string(cloneStats.costRejected),
+            "hint-unused=" + std::string(!coveredOps ? "no-associations" : !useHints ? "disabled" : !adopted ? "no-common-members-in-selected-groups" : "none"),
+            "cluster-hint-cap=" + std::to_string(maxClusterHints),
+            "hint-index-references=" + std::to_string(indexRefs), "hint-index-truncated=" + std::to_string(truncated),
+            "nonsink-ops=" + std::to_string(nonsinkOps), "total-work=" + std::to_string(totalWork),
+            "leaf-max-work=" + std::to_string(maxLeaf), "supernode-max-work=" + std::to_string(maxExecution),
+            "oversized-ops=" + std::to_string(oversizedOps)};
+        graph->setMetadata("grhsim.nonsinkHintStats", stats);
+        if (!options_.report.empty()) {
+            std::ofstream report(options_.report);
+            if (!report) throw std::invalid_argument("Cannot write nonsink hint report");
+            for (const auto& line : stats) report << line << '\n';
+            if (!report) throw std::invalid_argument("Cannot write nonsink hint report");
+        }
         graph->setMetadata("grhsim.nonsinkConfig", configuration);
         graph->setMetadata(kStage, std::string("nonsink-partitioned"));
         verifyPartitionResult(*graph);
-        logInfo("activity_nodes=" + std::to_string(nodes.size()) + " supernodes=" + std::to_string(clusters.size()));
+        logInfo("activity_nodes=" + std::to_string(nodes.size()) + " supernodes=" + std::to_string(clusters.size()) +
+                " hint-analysis-us=" + std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - analysisStarted).count()));
     } catch (const std::exception& exception) {
         if (graph && result.changed) graph->setMetadata(kStage, std::string("nonsink-partitioned-failed"));
         error(exception.what(), graph ? graph->symbol() : std::string{}); result.failed = true;

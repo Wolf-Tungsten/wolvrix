@@ -90,6 +90,17 @@ void configuration() {
     std::string error; const std::string_view args[]={"-firrtl-node-cse=off"};
     require(bool(tx::makePass("grhsim-node-cse",args,error)),error);
 }
+void overlappingHints() {
+    Fixture f; const auto a = f.input("a"), b = f.input("b");
+    const auto first = f.compute(OperationKind::kAnd, {a,b}, key("first"), true);
+    const auto second = f.compute(OperationKind::kXor, {first,b}, key("second"), true);
+    // A valid op DAG can have cyclic source-association dependencies after
+    // rewrites. The optional analysis must skip, never reject the program.
+    node::write(f.graph, f.graph.valueDef(second), {{key("first"), key("second")},
+        {{key("first"), 0}, {key("second"), 0}}, {}});
+    f.output("y", second); convert(f); cse(f);
+    require(f.graph.outputPortValue("y").valid(), "overlapping hints prevented model generation");
+}
 void collisions() {
     sim::detail::NodeTerms terms([](std::string_view) { return 0; });
     const auto a = terms.intern("and:8:input-a:input-b");
@@ -234,5 +245,5 @@ void multipleResults() {
 }
 int main(){try{threshold(4,256,1,false);threshold(5,256,1,true);threshold(2,257,1,true);
 threshold(2,256,2,true);threshold(5,257,2,false,"off");downstreamEquivalence();boundariesAndSubtrees();
-repeatedSuccessor();typeAndAttrs();configuration();collisions();behaviorAndIdentity();incompleteAndInstances();
+repeatedSuccessor();typeAndAttrs();configuration();overlappingHints();collisions();behaviorAndIdentity();incompleteAndInstances();
 distinctInstanceInputs();fullResultTypes();constantPayloads();stateAndEffects();multipleResults();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

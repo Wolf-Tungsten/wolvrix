@@ -127,14 +127,16 @@ division by zero yield X. The explicit `Zero` policy yields zero. The graph reco
 The existing `grh-to-grhsim` pass performs the later TwoState projection. Compare
 SV and FIRRTL simulation with a fixed, recorded invalid-value policy.
 
-Each materialized node leaf emits schema v1 members/origins on its internal
-operations and a root mapping on its named result's transparent assign carrier.
+Each materialized node leaf emits schema 2 members/origins on its internal
+operations and an optional root mapping on its named result's initial assign view.
 Aliases reuse their original producers. Referencing another node reuses its named
 result; it neither clones nor relabels the referenced expression. `nodeAnnotations`
 can explicitly disable these attributes. See [node-attributes.md](node-attributes.md)
-for verification and CSE isolation: the first ordinary simplify pass can share
-within a node, while cross-node internal expressions remain separate. Whole-node
-GSIM-style merging and nonsink consumption are later stages.
+for verification and soft association semantics: ordinary simplify can share
+across nodes and SV, remove named result views and lose roots. No view is kept
+alive solely for these attrs. Whole-expression analysis consumes only provable
+remaining candidates; nonsink partitioning separately uses current member sets
+as optional hints.
 
 ## Verification
 

@@ -13,7 +13,7 @@ namespace wolvrix::lib::transform::grhsim {
 namespace {
 using namespace grh;
 namespace node = ingest::node;
-constexpr std::string_view policy = "gsim-v1";
+constexpr std::string_view policy = "gsim-soft-v2";
 
 // Hashes only index buckets. Comparing the complete local signature (whose
 // children are already exact interned terms) is the equivalence proof.
@@ -61,7 +61,12 @@ struct Analysis {
         }
         for (std::size_t j = 0; j < order.size(); ++j)
             for (const auto user : users[order[j]]) if (!--pending[user]) order.push_back(user);
-        if (order.size() != nodes.size()) throw std::invalid_argument("Cyclic FIRRTL node dependencies");
+        // Optional, overlapping associations need not form a node DAG. Reject
+        // those candidates, never the executable op graph or its simplification.
+        if (order.size() != nodes.size())
+            for (std::size_t i = 0; i < nodes.size(); ++i) if (pending[i]) {
+                nodes[i].reason = "overlapping-dependencies"; order.push_back(i);
+            }
         for (const auto i : order) build(i);
         successors();
     }
@@ -123,6 +128,9 @@ struct Analysis {
     void build(std::size_t index) {
         auto& candidate = nodes[index];
         if (!candidate.root) { ++rejected[candidate.reason]; return; }
+        if (!candidate.reason.empty()) {
+            candidate.term = boundary(candidate.root); ++rejected[candidate.reason]; return;
+        }
         struct Frame { ValueId value; bool expanded; };
         std::vector<Frame> work{{candidate.root, false}};
         std::unordered_set<ValueId, ValueIdHash> active;
@@ -252,7 +260,7 @@ PassResult NodeCsePass::run() {
         if (options_.mode != "gsim" && options_.mode != "off") throw std::invalid_argument("firrtl-node-cse must be off or gsim");
         auto& graph = detail::selectGraph(design(), options_.top);
         node::requirePolicy(graph);
-        const std::string config = "v1/" + options_.mode + "/5/256/1";
+        const std::string config = "v2/" + options_.mode + "/5/256/1";
         if (const auto stored = graph.metadata("firrtl.nodeCseConfig")) {
             if (*stored != AttributeValue(config)) throw std::invalid_argument("FIRRTL node CSE checkpoint configuration differs");
             if (graph.metadata("firrtl.nodeOptimization") != std::optional<AttributeValue>(std::string(policy)))
@@ -281,7 +289,12 @@ PassResult NodeCsePass::run() {
             if (options_.mode == "off" || (!count && !width && !fanout)) { retained += group.size(); continue; }
             byCount += count; byWidth += width; byFanout += fanout;
             auto& target = analysis.nodes[group.front()];
-            for (std::size_t j = 1; j < group.size(); ++j) { merge(analysis, target, analysis.nodes[group[j]]); ++merged; }
+            for (std::size_t j = 1; j < group.size(); ++j) {
+                auto& source = analysis.nodes[group[j]];
+                // Ordinary CSE may already have shared these source results.
+                if (source.root == target.root) continue;
+                merge(analysis, target, source); ++merged;
+            }
         }
         if (merged) { detail::Scope scope(graph, {}); scope.dce(); result.changed = true; }
         std::vector<std::string> stats{"v1", "nodes=" + std::to_string(analysis.nodes.size()), "equivalent=" + std::to_string(equivalents),

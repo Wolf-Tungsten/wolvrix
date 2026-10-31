@@ -126,7 +126,7 @@ void test() {
     }
     run(source, std::make_unique<tx::GrhVerifyPass>());
     run(source, std::make_unique<tx::SimplifyPass>());
-    valid(source); require(count(graph, OperationKind::kAnd) == 3, "first simplify ignored node CSE scope");
+    valid(source); require(count(graph, OperationKind::kAnd) == 1, "node hints blocked ordinary cross-source CSE");
     auto stored = roundTrip(source); valid(stored); run(stored, std::make_unique<tx::GrhVerifyPass>());
     auto unannotated = design(path, false);
     require(node::inspect(*unannotated.findGraph("top")).nodes.empty(), "disabled node annotations still present");

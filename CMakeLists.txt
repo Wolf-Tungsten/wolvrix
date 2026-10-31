@@ -373,6 +373,12 @@ target_compile_definitions(grhsim-virtual-partition-tests PRIVATE
     WOLVRIX_GRHSIM_PARTITION_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts/grhsim-partitions/virtual")
 register_test_exe(grhsim-virtual-partition-tests)
 
+add_executable(grhsim-firrtl-nodes tests/transform/test_grhsim_firrtl_nodes.cpp)
+target_link_libraries(grhsim-firrtl-nodes PRIVATE wolvrix-lib)
+target_compile_definitions(grhsim-firrtl-nodes PRIVATE
+    WOLVRIX_GRHSIM_PARTITION_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/artifacts/grhsim-partitions/firrtl")
+register_test_exe(grhsim-firrtl-nodes)
+
 add_executable(grhsim-sink-schedule-tests tests/transform/test_grhsim_sink_schedule.cpp)
 target_link_libraries(grhsim-sink-schedule-tests PRIVATE wolvrix-lib)
 target_compile_definitions(grhsim-sink-schedule-tests PRIVATE

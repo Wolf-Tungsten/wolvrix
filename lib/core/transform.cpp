@@ -524,6 +524,15 @@ namespace wolvrix::lib::transform
                     eventOptions.top = splitOptions.top = nonsinkOptions.top = sinkOptions.top = value;
                     continue;
                 }
+                if (normalized == "grhsim-partition-nonsink") {
+                    if (key == "-firrtl-nodes" && (value == "off" || value == "prefer" || value == "auto")) {
+                        nonsinkOptions.firrtlNodes = value; continue;
+                    }
+                    if (key == "-cost-model" && (value == "legacy" || value == "bytes")) {
+                        nonsinkOptions.costModel = value; continue;
+                    }
+                    if (key == "-report" && !value.empty()) { nonsinkOptions.report = value; continue; }
+                }
                 uint64_t number = 0;
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
                 if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
@@ -542,6 +551,7 @@ namespace wolvrix::lib::transform
                     else if (key == "-clone-max-fanout" && number) nonsinkOptions.cloneMaxFanout = number;
                     else if (key == "-max-clones") nonsinkOptions.maxClones = number;
                     else if (key == "-clone-lossy-compare" && number <= 1) nonsinkOptions.cloneLossyCompare = number;
+                    else if (key == "-fuse-leaves" && number <= 1) nonsinkOptions.fuseLeaves = number;
                     else { error = "Invalid activity partition option: " + std::string(key); return nullptr; }
                 }
                 else { error = "Invalid " + normalized + " option: " + std::string(key); return nullptr; }

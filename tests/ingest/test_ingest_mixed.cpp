@@ -186,7 +186,9 @@ circuit actual :
             mixed.design->deleteGraph("top");
             mixed.design->cloneGraph(name, "top"); mixed.design->unmarkAsTop(name); mixed.design->markAsTop("top");
         }
+        auto hinted = mixed.design->clone();
         generate(*mixed.design, output / top, driver);
+        generate(hinted, output / (top + "-hints"), driver, {"-firrtl-nodes=prefer", "-cost-model=bytes", "-fuse-leaves=1"});
     }
     const auto parameterPath = output / "parameters.fir";
     std::ofstream(parameterPath) << R"FIR(FIRRTL version 6.0.0
@@ -403,7 +405,7 @@ static unsigned calls;
 extern "C" void ingest_capture(std::uint8_t a,std::uint8_t* y){++calls;*y=(a+3)^85;}
 int main(){GrhSIM_top m;m.init();for(unsigned a=0;a<100;++a){m.clk=0;m.a=a;m.eval();const auto before=calls;m.clk=1;m.eval();assert(calls==before+1);assert(m.y==(((a+3)&255)^85));m.eval();assert(calls==before+1);}}
 )CPP");
-    std::ofstream(output / "run.mk") << ".PHONY: run hierarchy cross-source top svtop parameters abi inline path resource macro dpi\nrun: hierarchy cross-source top svtop parameters abi inline path resource macro dpi\nhierarchy cross-source top svtop parameters abi inline path resource macro dpi:\n\t$(MAKE) -C $@ -f run.mk run\n";
+    std::ofstream(output / "run.mk") << ".PHONY: run hierarchy cross-source top svtop top-hints svtop-hints parameters abi inline path resource macro dpi\nrun: hierarchy cross-source top svtop top-hints svtop-hints parameters abi inline path resource macro dpi\nhierarchy cross-source top svtop top-hints svtop-hints parameters abi inline path resource macro dpi:\n\t$(MAKE) -C $@ -f run.mk run\n";
 }
 }
 int main() { try { test(); return 0; } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

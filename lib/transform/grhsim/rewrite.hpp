@@ -94,8 +94,14 @@ inline void rewrite(Graph& graph, OperationId op, OperationKind kind, std::span<
 
 inline void mergeOrigins(Graph& graph, OperationId target, std::initializer_list<OperationId> sources) {
     for (const auto source : sources)
-        if (source)
+        if (source) {
             if (const auto origins = getOriginModules(graph, source)) mergeOriginModules(graph, target, *origins);
+            if (source != target && ingest::node::annotated(graph, source)) {
+                auto hints = ingest::node::read(graph, source); hints.roots.clear();
+                ingest::node::write(graph, target, ingest::node::unite(ingest::node::read(graph, target),
+                    hints, ingest::node::MergeReason::SameComputation));
+            }
+        }
 }
 
 inline ValueId makeOperation(Graph& graph, OperationId source, OperationKind kind,
@@ -225,11 +231,9 @@ struct Scope {
             if (type.width != from.width || type.kind != from.kind || type.domain != from.domain) return false;
         }
         const auto args = graph.opOperands(op);
-        const bool keepRoot = ingest::node::annotated(graph, op) && !ingest::node::read(graph, op).roots.empty() &&
-            (!graph.valueDef(input) || !ingest::node::sameScope(graph, op, graph.valueDef(input)));
         if (graph.opKind(op) == OperationKind::kAssign && args.size() == 1 && args[0] == input &&
-            (keepRoot || exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input))) return false;
-        if (keepRoot || exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input)) {
+            (exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input))) return false;
+        if (exported(result) || anchored(op) || !local(input) || !graph.sameValueType(result, input)) {
             rewrite(graph, op, OperationKind::kAssign, std::array{input});
         } else {
             mergeOrigins(graph, graph.valueDef(input), {op});

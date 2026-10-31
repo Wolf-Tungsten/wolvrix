@@ -493,7 +493,8 @@ _GRHSIM_PASS_OPTIONS = {
     "grhsim-split-event-and-output": ("top",),
     "grhsim-split-nonsink-and-sink": ("top", "mem_min_bytes"),
     "grhsim-partition-nonsink": ("top", "max_node_work", "max_supernode_work", "segment_penalty",
-                                "semantic_nodes", "clone_shared", "clone_max_fanout", "max_clones", "clone_lossy_compare"),
+                                "semantic_nodes", "clone_shared", "clone_max_fanout", "max_clones", "clone_lossy_compare",
+                                "firrtl_nodes", "cost_model", "fuse_leaves", "report"),
     "grhsim-partition-sink": ("top", "enable_guard_min_size"),
 }
 

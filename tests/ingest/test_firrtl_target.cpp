@@ -40,8 +40,16 @@ void test(const std::filesystem::path& input) {
     for (const auto& port : queue.findGraph("top")->inputPorts()) driver += "if(const auto v=inputs.find(\"" + port.name + "\");v!=inputs.end())m." + port.name + "=v->second;\n";
     driver += "m.eval();\n";
     for (const auto& port : queue.findGraph("top")->outputPorts()) driver += "if(const auto v=expected.find(\"" + port.name + "\");v!=expected.end()&&m." + port.name + "!=v->second)throw std::runtime_error(\"frozen queue compiled mismatch " + port.name + "\");\n";
-    driver += "});}}\n";
-    generate(queue, output / "queue", driver);
+    driver += "});const auto p=m.perf_counters();std::printf(\"queue epoch=%d eval=%llu rounds=%llu compute=%llu commit=%llu writes=%llu\\n\",epoch,(unsigned long long)p.evalCount,(unsigned long long)p.totalRoundCount,(unsigned long long)p.computeBatchExecCount,(unsigned long long)p.commitBatchExecCount,(unsigned long long)p.touchedWriteCount);}}\n";
+    const auto queueSource = queue.clone();
+    generate(queue, output / "queue", driver, {"-clone-shared=0"});
+    for (const std::string mode : {"prefer", "bytes", "fused", "clone"}) {
+        auto candidate = queueSource.clone();
+        generate(candidate, output / ("queue-" + mode), driver, {"-firrtl-nodes=prefer",
+            mode == "bytes" ? "-cost-model=bytes" : "-cost-model=legacy",
+            mode == "fused" ? "-fuse-leaves=1" : "-fuse-leaves=0",
+            mode == "clone" ? "-clone-shared=1" : "-clone-shared=0"});
+    }
     auto sram = restored.clone();
     sram.cloneGraph(request.tops[1], "top");
     for (const auto& name : request.tops) sram.deleteGraph(name);
@@ -107,7 +115,7 @@ m.E=!m.E;m.dft__DOT__cgen=!m.dft__DOT__cgen;m.mbist__DOT__req=!m.mbist__DOT__req
 m.eval();assert(m.out_clock==held);m.clock=0;m.eval();assert(m.out_clock==0);
 }}
 )CPP");
-    std::ofstream(output / "run.mk") << ".PHONY: run queue sram jtag clockgate jtag-failure\nrun: queue sram jtag clockgate jtag-failure\nqueue sram jtag clockgate:\n\t$(MAKE) -C $@ -f run.mk run\njtag-failure: jtag\n\t$(MAKE) -C jtag -f check.mk check\n";
+    std::ofstream(output / "run.mk") << ".PHONY: run queue queue-prefer queue-bytes queue-fused queue-clone sram jtag clockgate jtag-failure\nrun: queue queue-prefer queue-bytes queue-fused queue-clone sram jtag clockgate jtag-failure\nqueue queue-prefer queue-bytes queue-fused queue-clone sram jtag clockgate:\n\t$(MAKE) -C $@ -f run.mk run\njtag-failure: jtag\n\t$(MAKE) -C jtag -f check.mk check\n";
     std::cout << "frozen Queue2/SRAM/Jtag ingest and JSON verified; queue/Jtag ordinary GRH scoreboards verified; compiled drivers generated\n";
 }
 }

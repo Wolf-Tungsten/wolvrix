@@ -62,12 +62,12 @@ void mergeAndRemap() {
     node::mergeCseOperations(f.graph, op1, op1);
     node::mergeEquivalentOperations(f.graph, op1, op1, std::array<int64_t, 1>{0});
     require(node::read(f.graph, op1).roots.size() == 1, "self copy/merge lost the result root");
-    rejects([&] { node::mergeCseOperations(f.graph, op1, op2); }, "primitive CSE crossed node scope");
-    rejects([&] { node::unite(node::read(f.graph, op1), node::read(f.graph, op2),
-                             node::MergeReason::SameComputation); }, "unproven member union was allowed");
-    const auto remapped = node::remapResults(node::read(f.graph, op2), std::array<int64_t, 1>{1});
+    node::mergeCseOperations(f.graph, op1, op2);
+    require(node::unite(node::read(f.graph, op1), node::read(f.graph, op2),
+                        node::MergeReason::SameComputation).members.size() == 2, "CSE associations lost");
+    const auto remapped = node::remapResults(node::Attributes{{key("two")}, {{key("two"), 0}}, {}}, std::array<int64_t, 1>{1});
     require(remapped.roots[0].result == 1, "result remap lost a nonzero result index");
-    rejects([&] { node::remapResults(remapped, std::array<int64_t, 1>{0}); }, "unmapped root was dropped");
+    require(node::remapResults(remapped, std::array<int64_t, 1>{0}).roots.empty(), "unmapped optional root was retained");
     // Whole-node equivalence is proven here directly by the identical operations.
     node::mergeEquivalentOperations(f.graph, op1, op2, std::array<int64_t, 1>{0});
     require(f.graph.eraseOp(op2), "could not erase the equivalent node");
@@ -94,7 +94,7 @@ void invalidMetadata() {
         require(!run(copy, std::make_unique<tx::GrhVerifyPass>(), false), "GRH verifier accepted corrupt node attrs");
     };
     check([](auto& graph, auto op) { graph.eraseMetadata(node::kSchema); });
-    check([](auto& graph, auto op) { graph.setMetadata(node::kSchema, int64_t{2}); });
+    check([](auto& graph, auto op) { graph.setMetadata(node::kSchema, int64_t{1}); });
     check([](auto& graph, auto op) { graph.setMetadata(node::kSchema, std::string("1")); });
     check([](auto& graph, auto op) { graph.setAttr(op, node::kMembers, int64_t{1}); });
     check([](auto& graph, auto op) { graph.eraseAttr(op, node::kRootResults); });
@@ -102,17 +102,7 @@ void invalidMetadata() {
     check([](auto& graph, auto op) { graph.setAttr(op, node::kRootResults, std::vector<int64_t>{1}); });
     check([](auto& graph, auto op) { graph.setAttr(op, "firrtl.node.unknown", true); });
     check([](auto& graph, auto op) { graph.setAttr(op, node::kMembers, std::vector<std::string>{"invalid"}); });
-    check([](auto& graph, auto op) {
-        graph.eraseAttr(op, node::kRoots); graph.eraseAttr(op, node::kRootResults);
-    });
-    check([](auto& graph, auto op) {
-        auto attrs = node::read(graph, op);
-        const auto duplicate = graph.createOperation(OperationKind::kNot);
-        const auto input = graph.opOperands(op)[0];
-        const auto output = graph.createValue(Fixture::type());
-        graph.addOperand(duplicate, input); graph.addResult(duplicate, output);
-        node::write(graph, duplicate, std::move(attrs));
-    });
+
 }
 
 void executionClones() {
@@ -123,13 +113,13 @@ void executionClones() {
     const auto op = f.graph.valueDef(original), copy = f.graph.valueDef(clone);
     f.graph.setAttr(op, "grhsim.partition", std::vector<std::string>{"general"});
     f.graph.setAttr(copy, "grhsim.partition", std::vector<std::string>{"output"});
-    require(!node::inspect(f.graph).errors.empty(), "unmarked duplicate roots accepted across owners");
+    require(node::inspect(f.graph).errors.empty(), "optional phase roots were rejected");
     f.graph.setAttr(copy, "grhsim.nodeClone", true);
     f.output("y", clone); valid(f.design);
     auto loaded = roundTrip(f.design); valid(loaded);
     require(node::inspect(*loaded.findGraph("top")).nodes.at(0).roots.size() == 2, "phase clone root lost across JSON");
     f.graph.setAttr(copy, "grhsim.partition", std::vector<std::string>{"general"});
-    require(!node::inspect(f.graph).errors.empty(), "duplicate roots accepted in one execution owner");
+    require(node::inspect(f.graph).errors.empty(), "optional duplicate source roots were rejected");
 }
 
 void orphanLiteralProvenance() {
@@ -144,7 +134,7 @@ void orphanLiteralProvenance() {
     const auto computation = f.compute(OperationKind::kNot, {value});
     const auto operation = f.graph.valueDef(computation);
     f.tag(operation, dead, false); f.output("escaped", computation);
-    require(!node::inspect(f.graph).errors.empty(), "orphan nonliteral computation escaped without a result root");
+    require(node::inspect(f.graph).errors.empty(), "optional rootless association was rejected");
 }
 
 void multipleResults() {
@@ -198,10 +188,26 @@ void multipleResults() {
     for (const auto& record : node::inspect(f.graph).nodes)
         require(record.roots[0].result == 1, "same-operation root redirection lost a root");
 }
+
+void boundedHints() {
+    Fixture f;
+    const auto input = f.input("a"), value = f.compute(OperationKind::kNot, {input});
+    const auto op = f.graph.valueDef(value); f.output("y", value);
+    node::Attributes attrs;
+    for (unsigned i = 0; i <= node::kMaxAssociations; ++i) attrs.members.push_back(key("node-" + std::to_string(i)));
+    const auto operations = f.graph.operations().size();
+    node::write(f.graph, op, std::move(attrs));
+    require(!node::annotated(f.graph, op), "over-budget hint was retained");
+    require(f.graph.metadata("firrtl.nodeHintDegraded") == grh::AttributeValue(int64_t{1}), "hint degradation not diagnosed");
+    require(f.graph.operations().size() == operations, "hint degradation created scaffolding");
+    node::establishPolicy(f.graph);
+    f.graph.setMetadata(node::kScopePolicy, std::string("source-node-v1"));
+    rejects([&] { node::requirePolicy(f.graph); }, "legacy strong node policy was silently accepted");
+}
 }
 
 int main() {
-    try { identityAndPersistence(); mergeAndRemap(); invalidMetadata(); executionClones(); orphanLiteralProvenance(); multipleResults(); }
+    try { identityAndPersistence(); mergeAndRemap(); invalidMetadata(); executionClones(); orphanLiteralProvenance(); multipleResults(); boundedHints(); }
     catch (const std::exception& error) { std::cerr << "[firrtl-node-attributes] " << error.what() << '\n'; return 1; }
     return 0;
 }

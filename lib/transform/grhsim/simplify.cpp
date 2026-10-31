@@ -334,12 +334,11 @@ public:
     std::string bytes;
 };
 
-std::string cseKey(const Graph& graph, OperationId op, bool nodeScopes) {
+std::string cseKey(const Graph& graph, OperationId op) {
     CseKey key;
     key.bytes.reserve(96);
     const bool history = graph.opKind(op) == kEdgeDetect;
     key.scalar(static_cast<uint32_t>(graph.opKind(op)));
-    if (nodeScopes) key.text(ingest::node::cseScope(graph, op));
     const auto operands = graph.opOperands(op), results = graph.opResults(op);
     key.scalar(static_cast<uint64_t>(operands.size()));
     for (const auto value : operands) {
@@ -365,7 +364,6 @@ bool foldAndShare(Scope& scope, std::span<const OperationId> ordered)
 {
     auto& graph = scope.graph;
     bool changed = false;
-    const bool nodeScopes = graph.metadata(ingest::node::kSchema).has_value();
     std::unordered_map<std::string, ValueId> expressions;
     for (const auto op : ordered) {
         if (!scope.contains(op)) continue;
@@ -403,7 +401,7 @@ bool foldAndShare(Scope& scope, std::span<const OperationId> ordered)
             graph.sameValueType(result, graph.opOperands(op)[0])) continue;
         if (!canCseOperation(graph, op) && graph.opKind(op) != kEdgeDetect) continue;
         if (ordered.size() == 1) continue; // No second expression in this leaf can share it.
-        const auto key = cseKey(graph, op, nodeScopes);
+        const auto key = cseKey(graph, op);
         const auto [it, inserted] = expressions.emplace(key, result);
         if (!inserted && it->second != result) {
             ingest::node::mergeCseOperations(graph, graph.valueDef(it->second), op);

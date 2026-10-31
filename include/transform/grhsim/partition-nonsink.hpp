@@ -15,6 +15,10 @@ struct PartitionNonsinkOptions {
     uint32_t cloneMaxFanout = 8;
     uint32_t maxClones = 250000;
     bool cloneLossyCompare = true;
+    std::string firrtlNodes = "off";
+    std::string costModel = "legacy";
+    bool fuseLeaves = false;
+    std::string report;
 };
 
 class PartitionNonsinkPass final : public Pass {

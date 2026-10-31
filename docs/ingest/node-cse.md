@@ -23,7 +23,7 @@ node p = xor(and(a, b), c)
 node q = or(and(a, b), d)
 ```
 
-Their internal `and` operations stay separate before leaf ownership exists.
+Ordinary primitive CSE can share their internal `and` before this pass.
 For two identical complete expressions the equivalence fact is computed first;
 it can prove downstream equivalence even if the upstream expressions do not
 meet the physical-sharing threshold. There is no commutative operand reorder
@@ -43,7 +43,7 @@ to its consumer boundary. A stable source-key representative receives merged
 roots/member identities and users/outputs are redirected. Matching internal
 terms inherit source identities. DCE removes obsolete private computations;
 declared observations remain typed assign views. Small low-fanout groups remain
-physically independent.
+physically independent only when ordinary CSE has not already shared them.
 
 Candidates require a complete, single scalar Logic result, input dependence
 and only pure CSE-eligible members. Arrays/non-Logic, multiple results, state or
@@ -56,23 +56,24 @@ shape is retained rather than flattened to make a candidate eligible.
 Factory options are `-top=NAME`, `-firrtl-node-cse=off|gsim` and `-report=PATH`.
 Python uses `session.run_pass("grhsim-node-cse", firrtl_node_cse="gsim")`.
 `off` computes/report equivalence without whole-node sharing; ordinary primitive
-scope barriers remain active. Pure SV uses the existing flow without this pass.
+sharing is independent of this option and has no source-node barriers. Pure SV
+uses the same ordinary optimizer and partitioner without this extra analysis.
 
 The pass stores:
 
 | Metadata | Value |
 | --- | --- |
-| `firrtl.nodeScopePolicy` | `source-node-v1`, established at source ingest |
-| `firrtl.nodeOptimization` | `gsim-v1` |
-| `firrtl.nodeCseConfig` | `v1/off/5/256/1` or `v1/gsim/5/256/1` |
+| `firrtl.nodeScopePolicy` | `soft-node-v2`, established at source ingest |
+| `firrtl.nodeOptimization` | `gsim-soft-v2` |
+| `firrtl.nodeCseConfig` | `v2/off/5/256/1` or `v2/gsim/5/256/1` |
 | `firrtl.nodeCseStats` | versioned counts, thresholds hit and skip reasons |
 | `firrtl.nodeRetention` | source availability and attribute byte census |
 
 Same-policy reruns validate rather than physically merge again. Mode/revision
 changes fail. Shared-flow resume rejects missing source-policy evidence or a
 post-converted checkpoint lacking CSE evidence; re-ingest is required. A
-completed converted checkpoint skips repeating pre-CSE optimization, preserving
-the established boundary. Stage metadata and final SinkSchedule are rebuilt in
+completed converted checkpoint skips repeating the completed pre-CSE stage;
+this does not preserve source-expression boundaries. Stage metadata and final SinkSchedule are rebuilt in
 their normal order. Generation identity includes schema, scope policy,
 optimization revision and CSE configuration.
 
@@ -95,5 +96,10 @@ compaction are explicit regressions.
 FIRRTL_NODE_CSE=off|gsim` measures one self-contained real FIRRTL hierarchy.
 It reports key reference/byte repetition, JSON size with/without node metadata,
 elapsed time and process RSS. These are compiler/representation measurements,
-not an end-to-end XiangShan simulation speedup. Node-aware nonsink grouping is
-a separate follow-up.
+not an end-to-end XiangShan simulation speedup. Current op associations are
+consumed separately by the common nonsink partitioner.
+
+Schema 2 associations may overlap or lose roots during ordinary optimization.
+Incomplete/multiple-root/overlapping-dependency candidates are skipped; they
+cannot make a valid executable graph fail or require freezing earlier simplify.
+F08 strong-isolation checkpoints are incompatible and must be re-ingested.

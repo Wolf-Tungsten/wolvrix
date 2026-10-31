@@ -403,10 +403,15 @@ Inspection inspect(const grh::Graph& graph) {
         if (record.roots.empty()) {
             bool escapes = false;
             const std::unordered_set<grh::OperationId, grh::OperationIdHash> members(record.members.begin(), record.members.end());
-            for (const auto op : record.members) for (const auto value : graph.opResults(op)) {
-                escapes |= graph.valueIsOutput(value) || graph.valueIsInout(value);
-                for (const auto& use : graph.valueUsers(value))
-                    escapes |= !members.contains(use.operation);
+            for (const auto op : record.members) {
+                // Literals may be shared across nodes before partitioning. A dead
+                // node can leave provenance on a literal used by a different node.
+                if (literal(graph, op)) continue;
+                for (const auto value : graph.opResults(op)) {
+                    escapes |= graph.valueIsOutput(value) || graph.valueIsInout(value);
+                    for (const auto& use : graph.valueUsers(value))
+                        escapes |= !members.contains(use.operation);
+                }
             }
             if (escapes) result.errors.push_back("live members without a result root for node " + identity);
         }

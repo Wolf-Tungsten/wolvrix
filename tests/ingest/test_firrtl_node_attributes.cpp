@@ -132,6 +132,21 @@ void executionClones() {
     require(!node::inspect(f.graph).errors.empty(), "duplicate roots accepted in one execution owner");
 }
 
+void orphanLiteralProvenance() {
+    Fixture f;
+    const auto value = f.constant("8'd3");
+    const auto literal = f.graph.valueDef(value);
+    const auto dead = key("dead-node"), live = key("live-node");
+    node::write(f.graph, literal, {{dead, live}, {}, {dead, live}});
+    const auto root = f.compute(OperationKind::kAssign, {value}, live, true);
+    f.output("y", root);
+    valid(f.design); valid(roundTrip(f.design));
+    const auto computation = f.compute(OperationKind::kNot, {value});
+    const auto operation = f.graph.valueDef(computation);
+    f.tag(operation, dead, false); f.output("escaped", computation);
+    require(!node::inspect(f.graph).errors.empty(), "orphan nonliteral computation escaped without a result root");
+}
+
 void multipleResults() {
     Fixture f;
     auto& pair = f.design.createGraph("Pair");
@@ -186,7 +201,7 @@ void multipleResults() {
 }
 
 int main() {
-    try { identityAndPersistence(); mergeAndRemap(); invalidMetadata(); executionClones(); multipleResults(); }
+    try { identityAndPersistence(); mergeAndRemap(); invalidMetadata(); executionClones(); orphanLiteralProvenance(); multipleResults(); }
     catch (const std::exception& error) { std::cerr << "[firrtl-node-attributes] " << error.what() << '\n'; return 1; }
     return 0;
 }

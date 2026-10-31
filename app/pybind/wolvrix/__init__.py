@@ -492,9 +492,9 @@ _GRHSIM_PASS_OPTIONS = {
     "grhsim-recover-masked-or": ("top", "min_terms", "report"),
     "grhsim-split-event-and-output": ("top",),
     "grhsim-split-nonsink-and-sink": ("top", "mem_min_bytes"),
-    "grhsim-partition-nonsink": ("top", "max_node_work", "max_supernode_work", "segment_penalty",
+    "grhsim-partition-nonsink": ("top", "max_supernode_nodes", "segment_penalty",
                                 "semantic_nodes", "clone_shared", "clone_max_fanout", "max_clones", "clone_lossy_compare",
-                                "firrtl_nodes", "cost_model", "fuse_leaves", "report"),
+                                "firrtl_nodes", "cost_model", "report"),
     "grhsim-partition-sink": ("top", "enable_guard_min_size"),
 }
 

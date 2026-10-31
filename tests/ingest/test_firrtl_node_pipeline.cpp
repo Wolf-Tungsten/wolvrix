@@ -35,8 +35,8 @@ void partition(grh::Design& design, tx::SessionStore& session) {
     for (const auto name : {"grhsim-split-event-and-output", "grhsim-split-nonsink-and-sink",
          "grhsim-partition-nonsink", "grhsim-simplify", "grhsim-partition-sink"})
         if (std::string_view(name) == "grhsim-partition-nonsink")
-            execute(design, session, name, {"-firrtl-nodes=prefer", "-cost-model=bytes", "-fuse-leaves=1",
-                "-max-node-work=2", "-max-supernode-work=4"});
+            execute(design, session, name, {"-firrtl-nodes=prefer", "-cost-model=bytes",
+                "-max-supernode-nodes=4"});
         else execute(design, session, name);
 }
 std::string fixture() {

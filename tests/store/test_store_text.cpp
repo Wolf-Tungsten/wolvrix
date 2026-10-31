@@ -106,7 +106,7 @@ void testReadableSnapshot() {
     run(design, session, "grh-to-grhsim");
     run(design, session, "grhsim-split-event-and-output");
     run(design, session, "grhsim-split-nonsink-and-sink", {"-mem-min-bytes=4"});
-    run(design, session, "grhsim-partition-nonsink", {"-max-node-work=1", "-max-supernode-work=4", "-clone-shared=0"});
+    run(design, session, "grhsim-partition-nonsink", {"-max-supernode-nodes=4", "-clone-shared=0"});
     run(design, session, "grhsim-partition-sink", {"-enable-guard-min-size=2"});
     store::StoreText readable(nullptr, &session);
     const auto snapshot = readable.storeToString(design);

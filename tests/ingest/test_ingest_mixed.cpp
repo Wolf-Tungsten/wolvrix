@@ -188,7 +188,7 @@ circuit actual :
         }
         auto hinted = mixed.design->clone();
         generate(*mixed.design, output / top, driver);
-        generate(hinted, output / (top + "-hints"), driver, {"-firrtl-nodes=prefer", "-cost-model=bytes", "-fuse-leaves=1"});
+        generate(hinted, output / (top + "-hints"), driver, {"-firrtl-nodes=prefer", "-cost-model=bytes", "-max-supernode-nodes=4"});
     }
     const auto parameterPath = output / "parameters.fir";
     std::ofstream(parameterPath) << R"FIR(FIRRTL version 6.0.0

@@ -7,17 +7,15 @@ namespace wolvrix::lib::transform::grhsim {
 
 struct PartitionNonsinkOptions {
     std::string top;
-    uint32_t maxNodeWork = 128;
-    uint32_t maxSupernodeWork = 128;
+    uint32_t maxSupernodeNodes = 128;
     uint32_t segmentPenalty = 1;
     bool semanticNodes = false;
     bool cloneShared = true;
     uint32_t cloneMaxFanout = 8;
     uint32_t maxClones = 250000;
     bool cloneLossyCompare = true;
-    std::string firrtlNodes = "off";
+    std::string firrtlNodes = "auto";
     std::string costModel = "legacy";
-    bool fuseLeaves = false;
     std::string report;
 };
 

@@ -16,7 +16,7 @@ namespace grh = wolvrix::lib::grh;
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 5 && argc != 9) throw std::invalid_argument("usage: inspect-firrtl-nodes INPUT MODULE off|gsim REPORT [off|prefer|auto legacy|bytes FUSE CLONE]");
+        if (argc != 5 && argc != 9) throw std::invalid_argument("usage: inspect-firrtl-nodes INPUT MODULE off|gsim REPORT [off|prefer|auto legacy|bytes MAX_NODES CLONE]");
         if (std::string_view(argv[3]) != "off" && std::string_view(argv[3]) != "gsim")
             throw std::invalid_argument("node CSE mode must be off or gsim");
         const auto started = std::chrono::steady_clock::now();
@@ -98,9 +98,9 @@ int main(int argc, char** argv) {
             if (!splitFile) throw std::invalid_argument("split checkpoint write failed");
             const std::string hint = "-firrtl-nodes=" + std::string(argv[5]);
             const std::string cost = "-cost-model=" + std::string(argv[6]);
-            const std::string fuse = "-fuse-leaves=" + std::string(argv[7]);
+            const std::string capacity = "-max-supernode-nodes=" + std::string(argv[7]);
             const std::string clone = "-clone-shared=" + std::string(argv[8]);
-            execute("grhsim-partition-nonsink", {hint, cost, fuse, clone});
+            execute("grhsim-partition-nonsink", {hint, cost, capacity, clone});
             const auto census = graph.metadata("grhsim.nonsinkHintStats");
             for (const auto& value : std::get<std::vector<std::string>>(*census)) report << value << '\n';
             report << "partition-report-stage=nonsink-partitioned-before-simplify\n";

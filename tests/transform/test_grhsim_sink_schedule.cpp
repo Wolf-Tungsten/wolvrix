@@ -1,4 +1,5 @@
 #include "grhsim_partition_fixture.hpp"
+#include "ingest/node_attributes.hpp"
 
 namespace {
 using namespace partition_test;
@@ -27,7 +28,7 @@ void testOrderedRunsAndSnapshots() {
     fixture.convert(); const auto reference = fixture.design.clone();
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=4"});
-    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=2", "-max-supernode-work=4"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=4"});
     const auto nonsinkCheckpoint = json(fixture.design);
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
     auto& graph = fixture.graph;
@@ -175,7 +176,7 @@ void testForgedGroupsAndEffectDependencies() {
     fixture.graph.replaceOperand(task, 1, lateProducer);
     fixture.convert(); const auto reference = fixture.design.clone(); fixture.split();
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
-        {"-max-node-work=1", "-max-supernode-work=1", "-clone-shared=0"});
+        {"-max-supernode-nodes=1", "-clone-shared=0"});
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
     auto& graph = fixture.graph;
     const auto& schedule = sim::requireSinkSchedule(&fixture.session, graph);
@@ -262,7 +263,16 @@ void testSharedRunDependencyClosure() {
         fixture.write(OperationKind::kRegisterWritePort, state, {enable, data, clock});
     }
     run(fixture.design, "grh-to-grhsim", fixture.session); fixture.split();
-    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=1", "-max-supernode-work=8", "-clone-shared=0"});
+    // Explicit source nodes keep a long Node DAG for transitive prerequisites;
+    // an unannotated chain now correctly forms one whole MFFC.
+    for (const auto op : fixture.graph.operations()) if (fixture.graph.opKind(op) == OperationKind::kAdd) {
+        const auto key = wolvrix::lib::ingest::node::key({"test", "top", "top", {},
+            std::string(fixture.graph.symbolText(fixture.graph.operationSymbol(op))), {}});
+        wolvrix::lib::ingest::node::write(fixture.graph, op, {{key}, {}, {key}});
+    }
+    wolvrix::lib::ingest::node::establishPolicy(fixture.graph);
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session,
+        {"-max-supernode-nodes=8", "-clone-shared=0", "-firrtl-nodes=prefer"});
     std::set<Owner> expected;
     for (const auto op : fixture.graph.operations()) {
         const auto path = owner(fixture.graph, op);

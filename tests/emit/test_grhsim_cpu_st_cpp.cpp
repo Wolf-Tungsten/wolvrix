@@ -528,7 +528,7 @@ void testModels() {
     fixture.convert(); const auto reference = fixture.design.clone();
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
-    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=2", "-max-supernode-work=4"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=4"});
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=2"});
     std::vector<std::map<std::string, uint64_t>> inputs;
     for (unsigned step = 0; step < 48; ++step) inputs.push_back({{"clock0", step / 2 & 1}, {"clock1", step / 3 & 1},
@@ -586,7 +586,7 @@ void testMultipleNonsinkActivation() {
     graph.bindOutputPort("sum0", sum0); graph.bindOutputPort("sum1", sum1);
     fixture.convert(); fixture.split();
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
-        {"-max-node-work=1", "-max-supernode-work=1"});
+        {"-max-supernode-nodes=1"});
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     std::set<Owner> nonsinks;
     for (const auto op : graph.operations()) {
@@ -1057,7 +1057,7 @@ void testActivityBatchOrder() {
     fixture.graph.bindOutputPort("result", previous);
     fixture.convert(); fixture.split();
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
-        {"-max-node-work=1", "-max-supernode-work=1", "-clone-shared=0"});
+        {"-max-supernode-nodes=1", "-clone-shared=0"});
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     std::set<Owner> owners;
     for (const auto value : values) {
@@ -1585,7 +1585,7 @@ void testSparsePhaseDispatch() {
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=8"});
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
-        {"-max-node-work=2", "-max-supernode-work=4"});
+        {"-max-supernode-nodes=4"});
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
     const auto localOwner = owner(graph, graph.valueDef(localEnable));
     require(localOwner.size() > 1 && localOwner[1] == "small-sink",
@@ -1701,7 +1701,7 @@ void testSinkRunCommonEnableFactors() {
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session);
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
-        {"-max-node-work=2", "-max-supernode-work=4"});
+        {"-max-supernode-nodes=4"});
     run(fixture.design, "grhsim-partition-sink", fixture.session, {"-enable-guard-min-size=0"});
     for (const auto value : localEnables) {
         const auto key = owner(graph, graph.valueDef(value));
@@ -3339,7 +3339,7 @@ void testIndexedMemoryWake() {
     run(fixture.design, "grhsim-split-event-and-output", fixture.session);
     run(fixture.design, "grhsim-split-nonsink-and-sink", fixture.session, {"-mem-min-bytes=1"});
     run(fixture.design, "grhsim-partition-nonsink", fixture.session,
-        {"-max-node-work=1", "-max-supernode-work=1", "-clone-shared=0"});
+        {"-max-supernode-nodes=1", "-clone-shared=0"});
     run(fixture.design, "grhsim-partition-sink", fixture.session);
     std::set<Owner> readers;
     for (const auto value : {a,b,row}) {
@@ -3466,7 +3466,7 @@ void testIndexedMemoryWakeTemporal() {
     const auto reference=fixture.design.clone();
     run(fixture.design,"grhsim-split-event-and-output",fixture.session);
     run(fixture.design,"grhsim-split-nonsink-and-sink",fixture.session,{"-mem-min-bytes=1"});
-    run(fixture.design,"grhsim-partition-nonsink",fixture.session,{"-max-node-work=1","-max-supernode-work=4","-clone-shared=0"});
+    run(fixture.design,"grhsim-partition-nonsink",fixture.session,{"-max-supernode-nodes=4","-clone-shared=0"});
     run(fixture.design,"grhsim-partition-sink",fixture.session);
     auto mixedOwner=owner(graph,graph.valueDef(selected));
     auto fullOwner=owner(graph,graph.valueDef(full));

@@ -51,12 +51,12 @@ void testConesHistoriesAndRestart() {
     require(generalCheckpoint == json(candidate) && generalStamp.matches(*candidate.findGraph("top")), "General split is not idempotent");
     candidate = grh::Design::fromJsonString(json(candidate));
     compare(reference, candidate, {"memory", "q"}, inputs, "nonsink-sink");
-    run(candidate, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=2", "-max-supernode-work=4"});
+    run(candidate, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=4"});
     require(fixture.session.empty(), "activity cutter published an extra plan");
     const auto activity = json(candidate);
     const auto activityStamp = tx::DesignStamp::capture(*candidate.findGraph("top"));
     partition_test::checkpoint(candidate, "nonsink-partitioned");
-    run(candidate, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=2", "-max-supernode-work=4"});
+    run(candidate, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=4"});
     require(activity == json(candidate) && activityStamp.matches(*candidate.findGraph("top")), "activity cutter is not idempotent");
     candidate = grh::Design::fromJsonString(activity);
     run(candidate, "grhsim-simplify", fixture.session);
@@ -115,14 +115,14 @@ void testActivityAndCloneIsolation() {
     fixture.task("display", {one, left}); fixture.task("display", {one, right});
     fixture.convert(); const auto reference = fixture.design.clone(); fixture.split();
     const auto split = json(fixture.design);
-    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=1", "-max-supernode-work=1"});
+    run(fixture.design, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=1"});
     std::set<Owner> owners;
     std::size_t nots = 0;
     for (const auto op : fixture.graph.operations()) if (fixture.graph.opKind(op) == OperationKind::kNot) {
         ++nots; owners.insert(owner(fixture.graph, op));
         require(sim::attribute<std::vector<std::string>>(fixture.graph, op, "originModules") == std::vector<std::string>{"top$shared"}, "boundary clone lost source annotation");
     }
-    require(nots == 1 && owners.size() == 1, "boundary cloning exceeded the work budget");
+    require(nots == 1 && owners.size() == 1, "clone introduced an unavailable input activation");
     run(fixture.design, "grhsim-simplify", fixture.session);
     require(count(fixture.graph, OperationKind::kNot) == 1, "partition simplify changed bounded sharing");
     run(fixture.design, "grhsim-partition-sink", fixture.session);
@@ -131,7 +131,7 @@ void testActivityAndCloneIsolation() {
     for (unsigned i = 0; i < 128; ++i) inputs.push_back({{"x", i}, {"a", i * 17}, {"b", i * 11}});
     compare(reference, fixture.design, {}, inputs, "activity-clones", &schedule);
     auto noClone = grh::Design::fromJsonString(split);
-    run(noClone, "grhsim-partition-nonsink", fixture.session, {"-max-node-work=1", "-max-supernode-work=1", "-clone-shared=0"});
+    run(noClone, "grhsim-partition-nonsink", fixture.session, {"-max-supernode-nodes=1", "-clone-shared=0"});
     require(count(*noClone.findGraph("top"), OperationKind::kNot) == 1, "clone disable option ignored");
 }
 
@@ -186,7 +186,7 @@ void testActivityWeightsAndQuotientValidation() {
         auto& graph = *candidate.findGraph("top");
         graph.setAttr(detectors[hot], "grhsim.activity", int64_t{100});
         run(candidate, "grhsim-partition-nonsink", fixture.session,
-            {"-max-node-work=1", "-max-supernode-work=2", "-clone-shared=0"});
+            {"-max-supernode-nodes=2", "-clone-shared=0"});
         require(sameSupernode(graph, b, hot == 0 ? a : c) && !sameSupernode(graph, a, c),
                 "activity weights did not change the cut at the shared input");
     }
@@ -196,7 +196,7 @@ void testActivityWeightsAndQuotientValidation() {
         for (const auto detector : detectors) invalidGraph.setAttr(detector, "grhsim.activity", weight);
         const auto unchanged = json(invalid);
         require(!run(invalid, "grhsim-partition-nonsink", fixture.session,
-            {"-max-node-work=1", "-max-supernode-work=2", "-segment-penalty=2", "-clone-shared=0"}, false) &&
+            {"-max-supernode-nodes=2", "-segment-penalty=2", "-clone-shared=0"}, false) &&
             unchanged == json(invalid), "invalid/overflowing activity cost mutated the graph");
     }
     // Acyclic ops can still form a cyclic partition quotient: a -> b -> c

@@ -31,9 +31,9 @@ grh-to-grhsim
 | `grhsim-node-cse` | `-top`, `-firrtl-node-cse=off|gsim`, `-report` | the unique top, gsim, no report |
 | `grhsim-split-event-and-output` | `-top` | the unique top |
 | `grhsim-split-nonsink-and-sink` | `-top`, `-mem-min-bytes` | the unique top, 64 |
-| `grhsim-partition-nonsink` | `-top`, `-max-node-work`, `-max-supernode-work`, `-segment-penalty`, `-semantic-nodes` | the unique top, 128, 128, 1, 0 |
+| `grhsim-partition-nonsink` | `-top`, `-max-supernode-nodes`, `-segment-penalty`, `-semantic-nodes` | the unique top, 128, 1, 0 |
 | `grhsim-partition-nonsink` clone options | `-clone-shared`, `-clone-max-fanout`, `-max-clones`, `-clone-lossy-compare` | 1, 8, 250000, 1 |
-| `grhsim-partition-nonsink` hint/cost options | `-firrtl-nodes=off|prefer|auto`, `-cost-model=legacy|bytes`, `-fuse-leaves=0|1`, `-report` | off, legacy, 0, no report |
+| `grhsim-partition-nonsink` hint/cost options | `-firrtl-nodes=off|prefer|auto`, `-cost-model=legacy|bytes`, `-report` | auto, legacy, no report |
 | `grhsim-partition-sink` | `-top`, `-enable-guard-min-size` | the unique top, 8 (0 disables hoisting) |
 
 Factory arguments use `-key=value`, as with other ordinary passes. There are no
@@ -133,94 +133,88 @@ layout or persistent membership tree is published by either split.
 
 ## Activity partitioning
 
-`grhsim-partition-nonsink` requires `nonsink-sink-split`. It forms bounded
-work nodes, coarsens chains/inputs/siblings only with an acyclic quotient, and
-uses dynamic programming over topological segments to minimize distinct incoming
-activation values weighted by rate plus `segment-penalty`. Raw inputs and Event
-pulses participate in boundary costs. A producer's nonnegative integer
-`grhsim.activity` supplies its weight; absent/zero rates use uniform weight 1.
-Cost overflow is diagnosed before graph mutation.
+`grhsim-partition-nonsink` requires `nonsink-sink-split`. It first builds
+execution nodes, then partitions their Node DAG into supernodes. Each nonempty
+node contributes exactly one to `max-supernode-nodes`, regardless of its op
+count, result width or diagnostic work. Node identities survive supernode
+merging. No op/work capacity splits a node.
 
-Work is at least one per op and grows with Logic result words; mul/div/mod cost
-four times that, external function/DPI calls eight times. A single indivisible
-op may exceed a budget. Source nodes have no budget exemption. `semantic-nodes=1` keeps declaration anchors from
-being absorbed. These work limits control activation granularity, not source
-lines. Owners become `[general,nonsink,sn_<key>,node_<key>]`; the initial key is
-derived from an anchor symbol, then remains literal attribute text across rename
-or ID reindexing. Leaf and supernode quotients must remain acyclic, including
-effect-order arcs.
+### Execution node construction
 
-One bounded optional clone round considers cheap scalar TwoState operations
-whose varying input is already a boundary, state read or graph input. It copies
-eligible not/assign and constant xor/add/sub operations, and optionally lossy
-eq/ne comparisons, into consuming nonsink leaves. Clone count limits primary
-copies; supporting constants are copied to the destination too. Clones keep
-types/sources and receive new symbols. `grhsim-simplify` can then simplify each
-complete leaf separately; it cannot merge clones across owners.
-Every copied op, including supporting constants, must fit the leaf and
-supernode work caps. The varying input must already reach the destination
-execution owner, and the original output must cross that boundary. Bytes mode
-also requires saved payload bytes to exceed copied work. These are static
-proxies, not measured activation rates. Default legacy cloning now obeys the
-same caps; the v2 config explicitly distinguishes this corrected policy.
+With `firrtl-nodes=prefer|auto`, current FIRRTL member associations determine
+hinted regions. Identity includes source unit, circuit, module, instance path
+and node name. Bundle field paths normalize to their source family; arrays
+retain shape. Roots are not required and origins never manufacture members.
+Identical membership sets form one execution node. A shared CSE operation with
+multiple families receives one shared owner, distinct from the private
+regions of those families. Overlapping sets do not authorize transitive union
+or reconstruction by cloning.
 
-### FIRRTL soft hints
+The provisional quotient includes actual data and ordered-effect arcs. Cyclic
+components identify conflicting/nonconvex groups; only nonsingleton groups in
+those components lose grouping and fall back to MFFC. Unaffected hints remain
+usable. State reads and effectful operations stay explicit boundary nodes.
 
-`firrtl-nodes=off` ignores members in partition decisions while retaining attrs.
-`prefer`/`auto` use current, possibly overlapping/rootless member sets to rank
-equal-weight legal coarsening links and equal-cost segmentation candidates.
-Missing associations resolve to off. No hints become indivisible atoms,
-must-link edges, persistent result slots or activity-rate overrides. Different
-source sets and unannotated SV ops can share owners; one set can split. Origins
-are diagnostic only. The local cluster search retains at most 256 canonical
-keys deterministically; this bounded index does not claim region completeness.
+Remaining operations form maximal fanout-free cones, traversing reverse
+operation topology. An upstream pure operation joins a cone only when all
+its real consumers are already in that same unhinted cone. Fanout that
+reconverges within one cone is allowed; consumers outside it, graph outputs,
+hinted nodes and state/effect boundaries prevent absorption. There is no
+op-count or work cutoff. `semantic-nodes=1` additionally retains declaration
+anchors as MFFC boundaries. `firrtl-nodes=off` uses MFFC for all ordinary
+logic while preserving source attrs.
 
-Legacy cost retains the common chain/input/sibling coarsening and incoming-value
-objective. Bytes cost is a separate experiment: bypass greedy coarsening, then
-minimize, over topological leaf intervals,
-`sum(rate * payload_bytes) + segment_penalty + sum(rate) * interval_work`.
-Distinct external inputs define each interval's rate sum. Logic payload is
-`max(1,ceil(width/8))`, doubled for FourState; nonlogic uses a nominal 8 bytes.
-Widths include all shaped bits. No FIRRTL-specific activity is assumed. The
-last term approximates unnecessary reevaluation; it is not an empirical
-prediction or a count of actual evals. Cost and hint modes are independently
-selectable. Neither heuristic promises a globally optimal partition.
+Simplify/CSE before partitioning remain annotation-transparent. No source
+root is kept alive or recreated. Owners become
+`[general,nonsink,sn_<key>,node_<key>]`; keys retain literal attribute text
+across rename/reindexing. Actual node and supernode quotients must be acyclic.
+Subsequent simplify operates within these actual execution owners.
 
-`fuse-leaves=1` combines adjacent existing leaves within an execution supernode,
-using topological quotient order and the common max-node-work cap. It enables
-later leaf-local simplify; it never crosses phase/SN boundaries. Clone and
-fusion do not use source identity as permission. Sink partitioning subsequently
-rebuilds actual writer prerequisites and SinkSchedule.
+### Supernode construction
+
+The upper partitioner receives only Node DAG edges and unit node counts.
+Legacy mode coarsens chains/inputs/siblings with an acyclic quotient, then
+uses dynamic programming over topological intervals. Bytes mode skips greedy
+coarsening. Both minimize distinct incoming boundary values plus a per-group
+penalty: `sum(rate * payload) + segment-penalty`. Payload is 1 in legacy
+mode, or actual boundary bytes in bytes mode. A producer's nonnegative integer
+`grhsim.activity` supplies its rate; absent/zero uses 1. Raw inputs and Event
+pulses participate. Cost overflow is diagnosed before mutation. Op work is
+never read by the upper partitioner and firing-times-work is not part of its
+objective. Neither heuristic promises a globally optimal partition.
+
+A 180-op FIRRTL node, a 180-op MFFC node and a one-op node each cost one unit
+of capacity. Capacity K can hold K whole nodes; a K+1th node goes into another
+supernode. Compiler function/file limits remain independent emitter concerns.
+
+### Optional cloning and configuration
+
+One bounded optional clone round considers cheap scalar TwoState transforms
+whose varying input already reaches the destination execution group. Eligible
+not/assign and constant xor/add/sub operations, and optionally eq/ne, copy into
+an existing destination node. Supporting constants follow. Cloning adds ops,
+not node count; it neither reconstructs FIRRTL expressions nor exceeds the
+separate clone-count/fanout limits. Actual dependency/schedule verification
+still applies. Cross-owner simplify cannot undo execution ownership.
 
 `grhsim.nonsinkConfig` is
-`v2/maxNodeWork/maxSupernodeWork/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/fuseLeaves/op-hints-v1`.
-The old eight-field config requires restart from nonsink-sink-split. Schema 1
-source checkpoints require re-ingest. Python uses `firrtl_nodes`, `cost_model`,
-`fuse_leaves`, `report`; the shared FlowOptions uses `nonsink_report`. Make
-exposes XS_GRHSIM_FIRRTL_NODES/COST_MODEL/FUSE_LEAVES/NONSINK_REPORT and the
-matching GRHSIM_REEMIT variables. Defaults remain off/legacy/unfused.
+`v3/maxSupernodeNodes/segmentPenalty/semanticNodes/cloneShared/cloneMaxFanout/maxClones/cloneLossyCompare/firrtlNodes/costModel/hint-mffc-v1`.
+Old work limits, leaf fusion and v2/eight-field completed checkpoints require
+an explicit restart at nonsink-sink-split. Thresholds are never converted from
+op/work units to node counts. Schema 1 source checkpoints require re-ingest.
+Python uses `max_supernode_nodes`; Make exposes
+`XS_GRHSIM_MAX_SUPERNODE_NODES` and
+`GRHSIM_REEMIT_MAX_SUPERNODE_NODES`. Defaults are auto/legacy/128 nodes: use
+available hints, otherwise MFFC. Explicit off remains an ablation option.
 
-Metadata `grhsim.nonsinkHintStats` and optional text report capture the stage
-immediately after nonsink partition/clone, before subsequent simplify. They
-report coverage/work, multi-member ops, source sets split across SNs, mixed
-association groups (not a language census), hint score, leaves/SNs,
-distinct nonsink boundary payload bytes, consumer payload bytes, copied work
-and cost/budget rejections. Boundary census includes sink/event/output users.
-`hint-score` sums accepted coarsening merges with a shared association and the
-selected segmentation's bounded common-member score. It is not a node count
-or proof that hints changed those decisions; compare owners from off/prefer
-on the same checkpoint to establish that. Rejected cyclic coarsening batches
-do not contribute. `hint-index-references` counts retained initial leaf/key
-pairs; `hint-index-truncated` counts initial insertion overflow events, not
-unique keys lost or later coarsening truncations. Both leaf and cluster key
-sets obey the reported cap. Op/work totals, maximum leaf/SN work and oversized
-op counts make the common budgets auditable.
-An idempotent pass can re-emit the same snapshot; downstream changes do not
-reinterpret it as a current physical layout. `hint-analysis-us` is a log field
-covering index construction through partitioning and report output; it is not
-isolated annotation overhead.
-`inspect_firrtl_partitions` records process wall/RSS and JSON metadata overhead.
-Generation identity includes the exact config and statistics.
+`grhsim.nonsinkHintStats` and the optional text report are a snapshot after
+partition/clone and before later simplify. They separately report source
+coverage, FIRRTL/shared/MFFC/boundary node counts, cyclic conflict fallback,
+node counts per supernode, actual boundary/consumer bytes and optional clone
+counts. Work totals/maxima are diagnostic only. Boundary census includes
+sink/event/output users. Replay can re-emit the same snapshot; it never
+reinterprets it as the later physical layout. `hint-analysis-us` covers node
+analysis, partitioning and reporting, rather than an isolated indexing timer.
 
 ## Sink groups and SinkSchedule
 

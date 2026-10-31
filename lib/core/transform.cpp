@@ -525,6 +525,10 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 if (normalized == "grhsim-partition-nonsink") {
+                    if (key == "-max-node-work" || key == "-max-supernode-work" || key == "-fuse-leaves") {
+                        error = "Retired op-work/fusion option; use -max-supernode-nodes (node count) and rebuild from nonsink-sink-split";
+                        return nullptr;
+                    }
                     if (key == "-firrtl-nodes" && (value == "off" || value == "prefer" || value == "auto")) {
                         nonsinkOptions.firrtlNodes = value; continue;
                     }
@@ -543,15 +547,13 @@ namespace wolvrix::lib::transform
                     sinkOptions.enableGuardMinSize = number;
                 else if (normalized == "grhsim-partition-nonsink" && number <= UINT32_MAX)
                 {
-                    if (key == "-max-node-work" && number) nonsinkOptions.maxNodeWork = number;
-                    else if (key == "-max-supernode-work" && number) nonsinkOptions.maxSupernodeWork = number;
+                    if (key == "-max-supernode-nodes" && number) nonsinkOptions.maxSupernodeNodes = number;
                     else if (key == "-segment-penalty") nonsinkOptions.segmentPenalty = number;
                     else if (key == "-semantic-nodes" && number <= 1) nonsinkOptions.semanticNodes = number;
                     else if (key == "-clone-shared" && number <= 1) nonsinkOptions.cloneShared = number;
                     else if (key == "-clone-max-fanout" && number) nonsinkOptions.cloneMaxFanout = number;
                     else if (key == "-max-clones") nonsinkOptions.maxClones = number;
                     else if (key == "-clone-lossy-compare" && number <= 1) nonsinkOptions.cloneLossyCompare = number;
-                    else if (key == "-fuse-leaves" && number <= 1) nonsinkOptions.fuseLeaves = number;
                     else { error = "Invalid activity partition option: " + std::string(key); return nullptr; }
                 }
                 else { error = "Invalid " + normalized + " option: " + std::string(key); return nullptr; }

@@ -12,6 +12,13 @@ int64_t checked(int64_t width, Range range) {
     return width;
 }
 bool integerKind(TypeKind kind) { return kind == TypeKind::UInt || kind == TypeKind::SInt; }
+bool storable(TypePtr type) {
+    if (type->constant) return false;
+    if (type->kind == TypeKind::Vector) return storable(type->element);
+    if (type->kind == TypeKind::Bundle)
+        return std::all_of(type->fields.begin(), type->fields.end(), [](const auto& field) { return !field.flip && storable(field.type); });
+    return integerKind(type->kind);
+}
 int reversed(int flow) { return flow == 3 ? 3 : 3 - flow; }
 }
 
@@ -177,13 +184,21 @@ TypePtr Semantics::merge(TypePtr left, TypePtr right, Range range) {
 void Semantics::collect(std::span<const StmtId> statements) {
     for (const auto id : statements) {
         const auto& statement = body.arena.statements[id];
-        if (statement.kind == StmtKind::Wire) {
+        if (statement.kind == StmtKind::Wire || statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset) {
             Declaration declaration{std::string(statement.name), declaredType(body.arena, statement.type, statement.range), statement.range};
+            if (statement.kind != StmtKind::Wire) {
+                if (!storable(declaration.type)) throw Error(statement.range, "register data must have a passive, non-const storable type");
+                declaration.state = Declaration::Register{statement.operands[0]};
+                if (statement.kind == StmtKind::RegReset) {
+                    declaration.state->reset = statement.operands[1];
+                    declaration.state->initial = statement.operands[2];
+                }
+            }
             declarations.emplace(declaration.name, declaration); declarationOrder.push_back(declaration.name);
         } else if (statement.kind == StmtKind::Node) {
             nodeDeclarations_.emplace(statement.name, id); declarationOrder.emplace_back(statement.name);
         } else if (statement.kind != StmtKind::Connect && statement.kind != StmtKind::Invalidate && statement.kind != StmtKind::When && statement.kind != StmtKind::Skip) {
-            const auto stage = statement.kind == StmtKind::Instance ? "F07" : statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset ? "F05" : "F06";
+            const auto stage = statement.kind == StmtKind::Instance ? "F07" : "F06";
             throw Error(statement.range, "FIRRTL statement lowering is not supported yet for this construct (" + std::string(stage) + ")");
         }
         collect(statement.body); collect(statement.otherwise);
@@ -351,6 +366,16 @@ void Semantics::connect(Projection left, TypePtr leftType, Projection right, Typ
         if (invalid) return; // Invalidating an aggregate only acts on sink leaves.
         throw Error(range, "connect destination does not have sink or duplex flow");
     }
+    auto root = left.expression;
+    while (body.arena.expressions[root].kind == ExprKind::Index || body.arena.expressions[root].kind == ExprKind::Field)
+        root = body.arena.expressions[root].operands[0];
+    const auto& base = body.arena.expressions[root];
+    if (base.kind != ExprKind::Reference) throw Error(range, "connect requires a component destination");
+    const auto depth = declarations.at(std::string(base.name)).conditionDepth;
+    // Hardware declarations are unconditional; only interleaving conditions
+    // (blocks not containing the destination declaration) control a connect.
+    guard = 1;
+    for (std::size_t i = depth; i < conditionGuards_.size(); ++i) guard = guards.conjunction(guard, conditionGuards_[i]);
     if (!invalid) {
         if (leftType->constant && !rightType->constant) throw Error(range, "non-constant source drives a const destination");
         if (leftType->constant)
@@ -371,8 +396,30 @@ std::string Semantics::expressionKey(ExprId id) const {
 void Semantics::statements(std::span<const StmtId> statements, int guard) {
     for (const auto id : statements) {
         const auto& statement = body.arena.statements[id];
-        if (statement.kind == StmtKind::Wire) {
-            declarations.at(std::string(statement.name)).guard = guard;
+        if (statement.kind == StmtKind::Wire || statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset) {
+            auto& declaration = declarations.at(std::string(statement.name));
+            declaration.conditionDepth = conditions_.size();
+            if (declaration.state) {
+                const auto clock = expression(declaration.state->clock);
+                if (clock->kind != TypeKind::Clock) throw Error(statement.range, "register clock must have Clock type");
+                if (declaration.state->reset) {
+                    const auto reset = expression(*declaration.state->reset);
+                    if (reset->kind != TypeKind::UInt && reset->kind != TypeKind::Reset && reset->kind != TypeKind::AsyncReset)
+                        throw Error(statement.range, "register reset must have Reset, AsyncReset or one-bit UInt type");
+                    constrain(reset->width, {}, [](const auto&) { return 1; }, statement.range);
+                    const auto initial = expression(*declaration.state->initial);
+                    equivalent(declaration.type, initial, statement.range);
+                    const auto data = leaves(declaration.type), values = leaves(initial);
+                    for (std::size_t i = 0; i < data.size(); ++i)
+                        constrain(data[i].type->width, {values[i].type->width}, [](const auto& args) { return args[0]; }, statement.range);
+                    checks_.push_back([this, reset, initial, range = statement.range] {
+                        if (width(reset) != 1) throw Error(range, "register reset requires a one-bit UInt");
+                        if (resolvedKind(reset) == TypeKind::AsyncReset)
+                            for (const auto& leaf : leaves(initial))
+                                if (!leaf.type->constant) throw Error(range, "asynchronous reset value must have const type");
+                    });
+                }
+            }
         } else if (statement.kind == StmtKind::Node) {
             auto type = expression(statement.operands[0]);
             if (!passive(type)) throw Error(statement.range, "a node expression must have a passive type");
@@ -390,8 +437,11 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             const auto fixed = staticIndex(statement.operands[0]);
             const int condition = fixed ? (*fixed != 0) : guards.variable(expressionKey(statement.operands[0]), statement.operands[0]);
             conditions_.push_back(type);
+            conditionGuards_.push_back(condition);
             this->statements(statement.body, guards.conjunction(guard, condition));
+            conditionGuards_.back() = guards.negate(condition);
             this->statements(statement.otherwise, guards.conjunction(guard, guards.negate(condition)));
+            conditionGuards_.pop_back();
             conditions_.pop_back();
         }
     }

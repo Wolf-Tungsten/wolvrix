@@ -1,37 +1,8 @@
-#include "firrtl_test_fixture.hpp"
-#include "emit/grhsim/cpu-st-cpp.hpp"
+#include "firrtl_emit_fixture.hpp"
 
 namespace {
 using namespace firrtl_test;
 
-void pass(grh::Design& design, tx::SessionStore& session, std::string_view name) {
-    tx::PassManagerOptions options; options.session = &session;
-    tx::PassManager manager(options); std::string error;
-    auto implementation = tx::makePass(name, {}, error); require(bool(implementation), error);
-    manager.addPass(std::move(implementation)); manager.addPass(std::make_unique<tx::GrhVerifyPass>());
-    tx::PassDiagnostics diagnostics;
-    if (!manager.run(design, diagnostics).success) {
-        std::string text; for (const auto& entry : diagnostics.messages()) text += entry.message + '\n';
-        throw std::runtime_error(std::string(name) + ": " + text);
-    }
-}
-void generate(grh::Design& design, const std::filesystem::path& path, std::string_view driverText) {
-    tx::SessionStore session;
-    for (const auto name : {"grh-to-grhsim", "grhsim-simplify", "grhsim-split-event-and-output", "grhsim-split-nonsink-and-sink", "grhsim-partition-nonsink", "grhsim-partition-sink"}) pass(design, session, name);
-    std::filesystem::remove_all(path); std::filesystem::create_directories(path);
-    namespace emit = wolvrix::lib::emit;
-    emit::EmitDiagnostics diagnostics; emit::GrhSimCpuStCpp emitter(&diagnostics);
-    emit::EmitOptions options; options.outputDir = (path / "model").string(); options.session = &session; options.attributes = {{"waveform", "none"}};
-    if (!emitter.emit(design, options).success) {
-        std::string text; for (const auto& entry : diagnostics.messages()) text += entry.message + '\n';
-        throw std::runtime_error(text);
-    }
-    std::ofstream(path / "driver.cpp") << driverText;
-    std::ofstream(path / "run.mk") << "CXX := clang++\nCXXFLAGS := -std=c++20 -O1 -fno-strict-aliasing\n"
-        << "model/libgrhsim_top.a: model/Makefile\n\t$(MAKE) -C model CXX='$(CXX)' CXXFLAGS='$(CXXFLAGS)'\n"
-        << "driver: driver.cpp model/libgrhsim_top.a\n\t$(CXX) $(CXXFLAGS) -I" << WOLVRIX_FIRRTL_FST_DIR << " $< model/libgrhsim_top.a -lz -o $@\n"
-        << ".PHONY: run\nrun: driver\n\t./driver\n";
-}
 constexpr std::string_view basicDriver = R"CPP(#include "model/grhsim_top.hpp"
 #include <cassert>
 int main() {
@@ -112,7 +83,7 @@ circuit main :
     connect y,UInt<4>(3)
   module state :
     input clk : Clock
-    reg r : UInt<4>,clk
+    cmem r : UInt<4>[4]
   public module main :
     output y : UInt<4>
     node n = UInt<4>(7)
@@ -126,7 +97,7 @@ circuit main :
     request.tops={"helper","main"}; auto both=ingest::readSources(request);
     require(both.success() && both.design->graphs().size()==2,"explicit FIRRTL top selection did not lower both modules");
     request.tops={"main","state"}; auto failed=ingest::readSources(request);
-    require(!failed.success() && !failed.design && diagnostics(failed).find("F05")!=std::string::npos,"failed multi-top read published a partial design");
+    require(!failed.success() && !failed.design && diagnostics(failed).find("F06")!=std::string::npos,"failed multi-top read published a partial design");
     request.tops={"missing"}; auto missing=ingest::readSources(request);
     require(!missing.success() && !missing.design && diagnostics(missing).find("missing")!=std::string::npos,"missing top silently succeeded");
     request.tops={"main"}; request.sources.push_back({ingest::SourceLanguage::Firrtl,path,"other"});

@@ -183,7 +183,7 @@ IngestResult readFirrtl(const IngestRequest& request) {
             auto parsed = firrtl::parseModule(source, index);
             result.diagnostics.insert(result.diagnostics.end(), parsed.diagnostics.begin(), parsed.diagnostics.end());
             if (!parsed.success()) continue;
-            auto signature = firrtl::detail::lowerCombinational(*source, *parsed.body, design, request.firrtl);
+            auto signature = firrtl::detail::lowerModule(*source, *parsed.body, design, request.firrtl);
             for (auto& entry : result.modules)
                 if (entry.sourceUnit == signature.sourceUnit && entry.name == signature.name) entry = signature;
             design.markAsTop(top);

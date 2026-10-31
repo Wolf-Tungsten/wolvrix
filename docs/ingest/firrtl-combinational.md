@@ -4,7 +4,8 @@
 combinational designs into ordinary GRH. The frontend uses its own type analysis
 and lowering in `lib/ingest/firrtl/{semantic,lower}.cpp`; it does not call CIRCT,
 firtool, or the SV frontend. Syntax support and executable support have separate
-boundaries; see [firrtl-parser.md](firrtl-parser.md).
+boundaries; see [firrtl-parser.md](firrtl-parser.md). Register and reset support
+extends this frontend in [firrtl-state.md](firrtl-state.md).
 
 ```cpp
 #include "ingest/ingest.hpp"
@@ -105,12 +106,15 @@ For combinational partial writes, the frontend computes a row-major bit offset
 and merges a shifted data/mask pair into the current driver. An out-of-range write
 preserves that driver. The result returns to the original shaped type through an
 equal-width view. This uses O(rank) operations without per-slot equality/mux
-decoding. Register writes will instead use ordered indexed state ports in F05.
+decoding. Register writes instead use ordered indexed state ports; see
+[firrtl-state.md](firrtl-state.md).
 
 A Boolean decision DAG checks initialization over disjoint static bit intervals,
 including when/else and complementary one-bit Boolean predicates. Predicate keys
-include literal types and widths. Local wire coverage is required only within its
-declaration scope. Dynamic writes need a complete default or sufficient static
+include literal types and widths. Hardware declarations are unconditional; only
+conditions of blocks not containing the destination declaration control its
+connects. Local wires therefore need complete coverage under these interleaving
+conditions. Dynamic writes need a complete default or sufficient static
 coverage; no value is silently supplied for a missing driver. Combinational
 cycles are rejected before publishing the design.
 

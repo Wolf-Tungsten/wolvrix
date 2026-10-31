@@ -6,10 +6,10 @@ The SystemVerilog frontend lives in `lib/ingest/sv.cpp`. Include
 
 `ingest/ingest.hpp` defines the language-independent request and result types.
 It exposes no slang AST or SourceManager types. `readSources` supports SV requests
-and pure FIRRTL combinational requests. FIRRTL interface scanning validates syntax
+and pure FIRRTL combinational/state requests. FIRRTL interface scanning validates syntax
 and returns typed source owners and shared leaf signatures; see
-[FIRRTL parsing](firrtl-parser.md) and [combinational lowering](firrtl-combinational.md).
-Registers, memories, effects, instances, explicit specialization, external binding
+[FIRRTL parsing](firrtl-parser.md), [combinational lowering](firrtl-combinational.md)
+and [state lowering](firrtl-state.md). Memories, effects, instances, explicit specialization, external binding
 and cross-language linking return an error diagnostic at this stage. A failed read
 does not return a partial design. Mixed elaboration is a later implementation stage.
 
@@ -76,6 +76,6 @@ make run_hdlbits_test DUT=001 SKIP_PY_INSTALL=1
 
 The CTest `ingest-driver` case exercises SV dispatch, ownership after releasing
 the original result, owned error locations, FIRRTL scanning and staged rejection
-of unsupported constructs. The FIRRTL suites also exercise actual combinational
+of unsupported constructs. The FIRRTL suites also exercise actual combinational/state
 lowering and generated GrhSIM execution. The session
 tests cover failed replacement, diagnostics, clone/copy and argument-only reads.

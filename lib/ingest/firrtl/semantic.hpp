@@ -76,6 +76,11 @@ struct Connection {
     Range range;
 };
 struct Declaration {
+    struct Register {
+        ExprId clock = 0;
+        std::optional<ExprId> reset;
+        std::optional<ExprId> initial;
+    };
     std::string name;
     TypePtr type;
     Range range;
@@ -83,6 +88,8 @@ struct Declaration {
     std::optional<ExprId> definition;
     bool port = false;
     int guard = 1;
+    std::optional<Register> state;
+    std::size_t conditionDepth = 0;
 };
 struct Leaf {
     TypePtr type;
@@ -119,6 +126,7 @@ private:
     std::vector<unsigned> resetFlags_;
     std::vector<std::function<void()>> checks_;
     std::vector<TypePtr> conditions_;
+    std::vector<int> conditionGuards_;
     std::unordered_map<std::string, StmtId> nodeDeclarations_;
     std::unordered_set<std::string> activeNodes_;
     uint32_t newWidth(int64_t value, Range range);
@@ -142,8 +150,8 @@ private:
     void normalizeGuards();
 };
 
-ModuleSignature lowerCombinational(const Source& source, const ModuleBody& body,
-                                   grh::Design& design, const FirrtlOptions& options);
+ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
+                            grh::Design& design, const FirrtlOptions& options);
 
 } // namespace wolvrix::lib::ingest::firrtl::detail
 #endif

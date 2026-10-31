@@ -1,9 +1,11 @@
 #include "semantic.hpp"
+#include "core/state.hpp"
 #include "ingest/node_attributes.hpp"
 
 #include <algorithm>
 #include <bit>
 #include <set>
+#include <utility>
 
 namespace wolvrix::lib::ingest::firrtl::detail {
 namespace {
@@ -23,6 +25,7 @@ struct Driver {
     Range range;
     // Disjoint half-open bit intervals, with a sentinel at total width.
     std::map<int64_t, int> coverage;
+    std::string regSymbol;
 };
 
 class Lowerer {
@@ -55,6 +58,9 @@ private:
     ValueId index(ExprId expression);
     ValueId inBounds(ValueId index, int64_t extent, Range range);
     ValueId read(ValueId base, const std::vector<ExprId>& indices, Range range);
+    ValueId stateRead(const Driver& driver, const std::vector<ExprId>& indices, Range range);
+    void stateWrite(const Driver& driver, const Declaration::Register& state, ValueId enable,
+                    const std::vector<ValueId>& indices, ValueId data, Range range);
     ValueId expression(ExprId id, const std::vector<std::string>& fields = {});
     ValueId primitive(ExprId id);
     ValueId guard(int id, Range range);
@@ -194,8 +200,10 @@ ValueId Lowerer::expression(ExprId id, const std::vector<std::string>& fields) {
     AccessPath path;
     if (access(id, path)) {
         path.fields.insert(path.fields.end(), fields.begin(), fields.end());
-        const auto base = drivers_.at({path.name, path.fields}).value;
+        const auto& driver = drivers_.at({path.name, path.fields});
+        const auto base = driver.value;
         if (!base) return invalid(logical(projected(id, fields)), expr.range);
+        if (!driver.regSymbol.empty() && !path.indices.empty()) return stateRead(driver, path.indices, expr.range);
         return read(base, path.indices, expr.range);
     }
     if (expr.kind == ExprKind::Field) {
@@ -276,6 +284,37 @@ ValueId Lowerer::primitive(ExprId id) {
     return result;
 }
 
+ValueId Lowerer::stateRead(const Driver& driver, const std::vector<ExprId>& indices, Range range) {
+    auto type = graph_.valueLogicalType(driver.value);
+    std::vector<ValueId> args;
+    auto valid = number(1, 1, range);
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        const auto value = index(indices[i]); args.push_back(value);
+        valid = op(OperationKind::kAnd, {grh::ValueType::Logic, 1, false}, {valid, inBounds(value, type.shape[i], range)}, range);
+        type.width /= type.shape[i];
+    }
+    type.shape.erase(type.shape.begin(), type.shape.begin() + indices.size());
+    // A state observation is an external node dependency, never node-owned work.
+    auto key = std::exchange(nodeKey_, {});
+    const auto result = op(OperationKind::kRegisterReadArrayPort, type, args, range);
+    graph_.setAttr(graph_.valueDef(result), "regSymbol", driver.regSymbol);
+    nodeKey_ = std::move(key);
+    return op(OperationKind::kMux, type, {valid, result, invalid(type, range)}, range);
+}
+void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& state, ValueId enable,
+                         const std::vector<ValueId>& indices, ValueId data, Range range) {
+    const auto writer = graph_.createOperation(indices.empty() ? OperationKind::kRegisterWritePort : OperationKind::kRegisterWriteArrayPort);
+    graph_.addOperand(writer, enable);
+    for (const auto value : indices) graph_.addOperand(writer, value);
+    graph_.addOperand(writer, data); graph_.addOperand(writer, expression(state.clock));
+    std::vector<std::string> edges{"posedge"};
+    if (state.reset && semantics_.resolvedKind(semantics_.expressions[*state.reset]) == TypeKind::AsyncReset) {
+        graph_.addOperand(writer, expression(*state.reset)); edges.push_back("posedge");
+    }
+    graph_.setAttr(writer, "regSymbol", driver.regSymbol); graph_.setAttr(writer, "eventEdge", edges);
+    graph_.setOpSrcLoc(writer, location(range));
+}
+
 ValueId Lowerer::guard(int id, Range range) {
     if (const auto found = guards_.find(id); found != guards_.end()) return found->second;
     ValueId result;
@@ -310,6 +349,22 @@ void Lowerer::connect(const Connection& connection) {
     for (std::size_t i = 0; i < path.indices.size(); ++i) dataType.width /= fullType.shape[i];
     dataType.shape.erase(dataType.shape.begin(), dataType.shape.begin() + path.indices.size());
     auto data = connection.invalid ? invalid(dataType, connection.range) : adapt(expression(connection.source.expression, connection.source.fields), dataType, connection.range);
+    if (!driver.regSymbol.empty()) {
+        const auto& state = *semantics_.declarations.at(path.name).state;
+        auto enable = guard(connection.guard, connection.range);
+        const LogicalType bit{grh::ValueType::Logic, 1, false};
+        if (state.reset) {
+            const auto reset = op(OperationKind::kNot, bit, {expression(*state.reset)}, connection.range);
+            enable = op(OperationKind::kAnd, bit, {enable, reset}, connection.range);
+        }
+        std::vector<ValueId> indices;
+        for (std::size_t i = 0; i < path.indices.size(); ++i) {
+            const auto value = index(path.indices[i]); indices.push_back(value);
+            enable = op(OperationKind::kAnd, bit, {enable, inBounds(value, fullType.shape[i], connection.range)}, connection.range);
+        }
+        stateWrite(driver, state, enable, indices, data, connection.range);
+        return;
+    }
     int64_t offset = 0, stride = fullType.width; bool staticWrite = true;
     for (std::size_t i = 0; i < path.indices.size(); ++i) {
         stride /= fullType.shape[i]; const auto fixed = semantics_.staticIndex(path.indices[i]);
@@ -387,6 +442,7 @@ ModuleSignature Lowerer::run() {
     graph_.setMetadata("firrtl.version", std::string(semantics_.source.version()));
     graph_.setMetadata("firrtl.sourceUnit", std::string(semantics_.source.unit()));
     graph_.setMetadata("firrtl.invalidPolicy", std::string(options_.invalidPolicy == FirrtlInvalidPolicy::Unknown ? "unknown" : "zero"));
+    graph_.setMetadata("firrtl.initPolicy", std::string(options_.initPolicy == FirrtlInitPolicy::Unknown ? "unknown" : "zero"));
     std::set<std::string> names; std::vector<std::string> elided;
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declarations.at(name);
@@ -395,7 +451,7 @@ ModuleSignature Lowerer::run() {
             if (!names.insert(symbol).second) throw Error(declaration.range, "flattened FIRRTL name collision '" + symbol + "'");
             const auto type = logical(leaf); ValueId value;
             if (type.width) {
-                value = graph_.createValue(graph_.internSymbol(symbol), type);
+                value = declaration.state ? graph_.createValue(type) : graph_.createValue(graph_.internSymbol(symbol), type);
                 graph_.setValueSrcLoc(value, location(declaration.range));
                 if (declaration.port) {
                     if (leaf.flow == 1) graph_.bindInputPort(symbol, value);
@@ -403,6 +459,15 @@ ModuleSignature Lowerer::run() {
                 }
             } else elided.push_back(symbol);
             Driver driver{leaf, value, {}, declaration.range, {{0, 0}, {type.width, 0}}};
+            if (declaration.state && value) {
+                driver.regSymbol = symbol;
+                const auto state = graph_.createOperation(OperationKind::kRegister, graph_.internSymbol(symbol));
+                grh::setStateLogicalType(graph_, state, type);
+                grh::InitStep init; init.value = std::to_string(type.width) + (options_.initPolicy == FirrtlInitPolicy::Unknown ? "'bx" : "'b0");
+                grh::setStateInitSpec(graph_, state, {init}); graph_.setOpSrcLoc(state, location(declaration.range));
+                const auto read = graph_.createOperation(OperationKind::kRegisterReadPort);
+                graph_.addResult(read, value); graph_.setAttr(read, "regSymbol", symbol); graph_.setOpSrcLoc(read, location(declaration.range));
+            }
             drivers_.emplace(LeafKey{name, leaf.fields}, std::move(driver));
             if (declaration.port) {
                 PortLeafSignature port; port.name = symbol; port.fieldPath = {name};
@@ -429,8 +494,20 @@ ModuleSignature Lowerer::run() {
         }
     }
     for (const auto& connection : semantics_.connections) connect(connection);
+    // Reset is a final whole-state writer barrier, independent of declaration
+    // placement and ordinary connect priority. Every operand still reads old state.
+    for (const auto& name : semantics_.declarationOrder) {
+        const auto& declaration = semantics_.declarations.at(name);
+        if (!declaration.state || !declaration.state->reset) continue;
+        for (const auto& leaf : semantics_.leaves(declaration.type)) {
+            const auto& driver = drivers_.at({name, leaf.fields});
+            if (!driver.value) continue;
+            const auto data = adapt(expression(*declaration.state->initial, leaf.fields), logical(leaf), declaration.range);
+            stateWrite(driver, *declaration.state, expression(*declaration.state->reset), {}, data, declaration.range);
+        }
+    }
     for (auto& [key, driver] : drivers_) {
-        if (!driver.value || !(driver.leaf.flow & 2)) continue;
+        if (!driver.value || !driver.regSymbol.empty() || !(driver.leaf.flow & 2)) continue;
         const auto required = semantics_.declarations.at(key.first).guard;
         for (auto at = driver.coverage.begin(); std::next(at) != driver.coverage.end(); ++at)
             if (semantics_.guards.conjunction(required, semantics_.guards.negate(at->second)))
@@ -441,8 +518,8 @@ ModuleSignature Lowerer::run() {
 }
 } // namespace
 
-ModuleSignature lowerCombinational(const Source& source, const ModuleBody& body,
-                                   grh::Design& design, const FirrtlOptions& options) {
+ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
+                            grh::Design& design, const FirrtlOptions& options) {
     if (body.interface.kind != ModuleKind::Module)
         throw Error(body.interface.range, "FIRRTL external/class lowering is not supported yet (F06/F07)");
     if (!body.interface.enabledLayers.empty() || !body.interface.knownLayers.empty())

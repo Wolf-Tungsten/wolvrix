@@ -110,11 +110,13 @@ struct ExternalBinding {
 };
 
 enum class FirrtlInvalidPolicy { Unknown, Zero };
+enum class FirrtlInitPolicy { Unknown, Zero };
 
 struct FirrtlOptions {
     std::optional<std::string> expectedVersion;
     bool nodeAnnotations = true;
     FirrtlInvalidPolicy invalidPolicy = FirrtlInvalidPolicy::Unknown;
+    FirrtlInitPolicy initPolicy = FirrtlInitPolicy::Unknown;
 };
 
 struct IngestRequest {

@@ -75,6 +75,7 @@ private:
     ValueId pipeline(ValueId data, ValueId clock, int64_t stages, Range range);
     ValueId clockPulse(ValueId clock, Range range);
     void effects();
+    void instances();
 };
 
 grh::SrcLoc Lowerer::location(Range range) const {
@@ -739,7 +740,7 @@ void Lowerer::checkCycles() const {
         std::vector<Frame> stack{{value}}; colors[value] = 1;
         while (!stack.empty()) {
             auto& frame = stack.back(); const auto definition = graph_.valueDef(frame.value);
-            if (!definition || frame.next == graph_.opOperands(definition).size()) {
+            if (!definition || graph_.opKind(definition) == OperationKind::kInstance || frame.next == graph_.opOperands(definition).size()) {
                 colors[frame.value] = 2; stack.pop_back(); continue;
             }
             const auto dependency = graph_.opOperands(definition)[frame.next++];
@@ -757,10 +758,32 @@ void Lowerer::checkCycles() const {
         }
     }
 }
+void Lowerer::instances() {
+    for (const auto& instance : semantics_.instances) {
+        const auto operation = graph_.createOperation(OperationKind::kInstance);
+        graph_.setAttr(operation, "moduleName", instance.target);
+        graph_.setAttr(operation, "instanceName", instance.name);
+        graph_.setOpSrcLoc(operation, location(instance.range));
+        std::vector<std::string> inputs, outputs;
+        const auto& declaration = semantics_.declarations.at(instance.name);
+        for (const auto& leaf : semantics_.leaves(declaration.type, declaration.flow)) {
+            const auto& driver = drivers_.at({instance.name, leaf.fields});
+            if (!driver.value) continue;
+            std::string port = leaf.fields.front();
+            for (std::size_t i = 1; i < leaf.fields.size(); ++i) port += "__DOT__" + leaf.fields[i];
+            if (leaf.flow == 2) { inputs.push_back(port); graph_.addOperand(operation, driver.value); }
+            else { outputs.push_back(port); graph_.addResult(operation, driver.value); }
+        }
+        graph_.setAttr(operation, "inputPortName", std::move(inputs));
+        graph_.setAttr(operation, "outputPortName", std::move(outputs));
+        graph_.setAttr(operation, "inoutPortName", std::vector<std::string>{});
+    }
+}
 ModuleSignature Lowerer::run() {
     const auto& module = semantics_.body.interface;
-    ModuleSignature signature; signature.name = module.name; signature.sourceUnit = semantics_.source.unit();
-    signature.language = SourceLanguage::Firrtl; signature.location = semantics_.source.position(module.range);
+    ModuleSignature signature; signature.language = SourceLanguage::Firrtl;
+    signature.name = module.name; signature.sourceUnit = semantics_.source.unit();
+    signature.location = semantics_.source.position(module.range);
     graph_.setMetadata("firrtl.version", std::string(semantics_.source.version()));
     graph_.setMetadata("firrtl.sourceUnit", std::string(semantics_.source.unit()));
     graph_.setMetadata("firrtl.invalidPolicy", std::string(options_.invalidPolicy == FirrtlInvalidPolicy::Unknown ? "unknown" : "zero"));
@@ -820,6 +843,7 @@ ModuleSignature Lowerer::run() {
             nodeKey_.clear();
         }
     }
+    instances();
     for (const auto& connection : semantics_.connections) connect(connection);
     // Reset is a final whole-state writer barrier, independent of declaration
     // placement and ordinary connect priority. Every operand still reads old state.
@@ -849,10 +873,11 @@ ModuleSignature Lowerer::run() {
 } // namespace
 
 ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
-                            grh::Design& design, const FirrtlOptions& options) {
+                            grh::Design& design, const FirrtlOptions& options,
+                            const std::map<std::string, ModuleSignature>* interfaces) {
     if (body.interface.kind != ModuleKind::Module)
         throw Error(body.interface.range, "FIRRTL external/class lowering is not supported yet (F06/F07)");
-    Semantics semantics(source, body, options); semantics.analyze();
+    Semantics semantics(source, body, options, interfaces); semantics.analyze();
     auto& graph = design.createGraph(std::string(body.interface.name));
     return Lowerer(semantics, graph, options).run();
 }

@@ -2,7 +2,8 @@
 
 The FIRRTL 6.0.0 frontend rejects unsupported active semantics and publishes no
 partial design. Module linking, external SV binding and Python FIRRTL options
-remain F07. Parser support is broader than executable support.
+are described in [mixed ingestion](mixed.md). Parser support is broader than
+executable support.
 
 ## Clocked effects
 
@@ -69,22 +70,23 @@ are strings. Unknown classes and extra/missing/non-string fields fail.
 | --- | --- | --- |
 | firrtl.transforms.DedupGroupAnnotation | group | Preserve optimization provenance; functional logic remains authoritative. |
 | firrtl.transforms.DontTouchAnnotation | none | Anchor resolved declarations/fields; array selection anchors its containing array. |
-| firrtl.passes.InlineAnnotation | none | Preserve request for F07 hierarchy handling. |
+| firrtl.passes.InlineAnnotation | none | Preserve optimization provenance; flattening uses the ordinary pass. |
 | chisel3.util.experimental.decode.DecodeTableAnnotation | truthTable,minimizedTable | Preserve decoder provenance; do not resynthesize the existing logic. |
-| firrtl.transforms.BlackBoxInlineAnno | name,text | Require extmodule; retain inline SV implementation payload for F07. |
+| firrtl.transforms.BlackBoxInlineAnno | name,text | Require extmodule; feed reachable inline SV implementations to slang. |
+| firrtl.transforms.BlackBoxPathAnno | path | Resolve a reachable SV source path. |
+| firrtl.transforms.BlackBoxResourceAnno | resourceId | Resolve a source under explicit resource roots. |
 
 All records also require class/target. Circuit/module targets are checked.
-Hierarchical DontTouch requires F07; unresolved direct targets fail. Metadata
+Hierarchical DontTouch is currently rejected; unresolved direct targets fail. Metadata
 retains `firrtl.annotationCounts`, selected `firrtl.annotations`, and
-`firrtl.pendingExternalAnnotations` containing original inline JSON. Unicode
+`firrtl.pendingExternalAnnotations` and `firrtl.boundExternalAnnotations` separating
+unused and linked original blackbox JSON. Unicode
 escapes and surrogate pairs are decoded. Unknown initialization/randomization
 annotations are not discarded.
 
-An instance in a selected module fails with a located diagnostic naming the
-instance, target and required module-link/external-implementation binding. The
-result retains signatures, defname, typed parameters and source owners but no
-executable design. Pending payload metadata does not constitute completed SV
-binding.
+Selected instances resolve through the shared mixed linker. A missing external
+implementation fails without publishing a design. Pending payload metadata does
+not constitute completed SV binding.
 
 ## Validation
 

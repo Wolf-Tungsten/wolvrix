@@ -89,8 +89,9 @@ int Guards::negate(int value) {
     const auto branch = branches[value]; return make(branch.variable, negate(branch.low), negate(branch.high));
 }
 
-Semantics::Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options)
-    : source(source), body(body), expressions(body.arena.expressions.size()), enabledLayers_(options.enabledLayers) {
+Semantics::Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options,
+                     const std::map<std::string, ModuleSignature>* interfaces)
+    : source(source), body(body), expressions(body.arena.expressions.size()), enabledLayers_(options.enabledLayers), interfaces_(interfaces) {
     const auto visit = [&](auto&& self, std::span<const Layer> layers, const std::string& parent) -> void {
         for (const auto& layer : layers) {
             const auto path = parent.empty() ? std::string(layer.name) : parent + "." + std::string(layer.name);
@@ -238,9 +239,26 @@ void Semantics::collect(std::span<const StmtId> statements) {
         } else if (statement.kind == StmtKind::Instance) {
             const auto target = source.findModule(statement.target);
             const auto& signature = source.modules()[*target];
-            throw Error(statement.range, "FIRRTL instance '" + std::string(statement.name) + "' requires " +
-                (signature.kind == ModuleKind::External ? "an external implementation binding for '" : "module linking for '") +
-                std::string(statement.target) + "' (not supported yet; F07)");
+            auto type = std::make_shared<SemanticType>(); type->kind = TypeKind::Bundle;
+            for (const auto& port : signature.ports)
+                type->fields.push_back({std::string(port.name), port.direction == LeafDirection::Input,
+                    declaredType(source.arena(), port.type, port.range)});
+            if (interfaces_ && interfaces_->contains(std::string(statement.target))) {
+                const auto& resolved = interfaces_->at(std::string(statement.target));
+                for (const auto& leaf : leaves(type)) {
+                    const auto port = std::find_if(resolved.ports.begin(), resolved.ports.end(),
+                        [&](const auto& entry) { return entry.fieldPath == leaf.fields; });
+                    if (port == resolved.ports.end()) throw Error(statement.range, "instance port missing from resolved interface");
+                    if (port->shape != leaf.shape) throw Error(statement.range, "instance array geometry differs from resolved interface");
+                    constrain(leaf.type->width, {}, [bits = port->elementWidth](const auto&) { return bits; }, statement.range);
+                    if (leaf.type->kind == TypeKind::Reset)
+                        unifyReset(leaf.type, ground(port->sourceType == "AsyncReset" ? TypeKind::AsyncReset : TypeKind::UInt, 1, statement.range), statement.range);
+                }
+            }
+            Declaration declaration{std::string(statement.name), type, statement.range, 1};
+            declaration.layer = activeLayer_;
+            declarations.emplace(declaration.name, declaration); declarationOrder.push_back(declaration.name);
+            instances.push_back({declaration.name, std::string(statement.target), statement.range});
         } else if (statement.kind != StmtKind::Connect && statement.kind != StmtKind::Define && statement.kind != StmtKind::Invalidate && statement.kind != StmtKind::When && statement.kind != StmtKind::Skip &&
                    statement.kind != StmtKind::Printf && statement.kind != StmtKind::Stop && statement.kind != StmtKind::Assert && statement.kind != StmtKind::Assume &&
                    statement.kind != StmtKind::Cover && statement.kind != StmtKind::Intrinsic) {

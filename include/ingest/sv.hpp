@@ -56,6 +56,10 @@ struct SvSourceOwner final : SourceOwner {
 const slang::SourceManager* svSourceManager(const SourceOwners& owners);
 InterfaceScanResult scanSvInterfaces(const IngestRequest& request);
 IngestResult readSystemVerilog(const IngestRequest& request);
+// Declaration names are request-local and bypass ordinary empty-module lowering.
+IngestResult readSystemVerilog(const IngestRequest& request,
+                             const std::unordered_set<std::string>& declarations,
+                             const std::function<std::filesystem::path(const std::vector<std::string>&)>& resolveInterfaces = {});
 
 using ValueId = wolvrix::lib::grh::ValueId;
 using OperationId = wolvrix::lib::grh::OperationId;
@@ -130,6 +134,7 @@ struct ConvertOptions {
     uint32_t maxLoopIterations = 131072;
     uint32_t threadCount = 32;
     bool singleThread = false;
+    std::unordered_set<std::string> linkDeclarations;
 };
 
 class PlanCache;
@@ -245,6 +250,7 @@ struct InstanceInfo {
     PlanSymbolId instanceSymbol;
     PlanSymbolId moduleSymbol;
     bool isBlackbox = false;
+    bool isLinkDeclaration = false;
     std::vector<InstanceParameter> parameters;
     std::string paramSignature;
 };

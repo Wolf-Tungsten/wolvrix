@@ -9,6 +9,7 @@ namespace {
 // generic tree for the large circuit-level payload.
 class Reader {
 public:
+    explicit Reader(std::string_view text) : text_(text) {}
     explicit Reader(const Source& source) : text_(source.annotations()) {
         base_ = static_cast<uint64_t>(text_.data() - source.text().data());
         for (uint64_t i = 0; i < base_; ++i) {
@@ -27,7 +28,7 @@ public:
                 } while (accept(','));
                 expect('}');
             }
-            record.raw = text_.substr(begin, cursor_ - begin);
+            record.raw = std::string(text_.substr(begin, cursor_ - begin));
             record.range.end = base_ + cursor_;
             if (!record.fields.contains("class") || !record.fields.contains("target")) fail("annotation requires class and target");
             record.kind = record.fields.at("class"); record.target = record.fields.at("target");
@@ -75,6 +76,7 @@ private:
         while (cursor_ < text_.size()) {
             auto c = text_[cursor_++];
             if (c == '"') return result;
+            if (static_cast<unsigned char>(c) < 0x20) fail("control character in annotation string");
             if (c != '\\') { result += c; continue; }
             if (cursor_ == text_.size()) fail("truncated annotation string");
             c = text_[cursor_++];
@@ -112,12 +114,19 @@ private:
 AnnotationIndex readAnnotations(const Source& source) {
     if (source.annotations().empty()) return {};
     auto result = Reader(source).parse();
+    validateAnnotations(source, result);
+    return result;
+}
+AnnotationIndex parseAnnotations(std::string_view text) { return Reader(text).parse(); }
+void validateAnnotations(const Source& source, const AnnotationIndex& result) {
     const std::map<std::string, std::vector<std::string>> schemas{
         {"firrtl.transforms.DedupGroupAnnotation", {"class", "target", "group"}},
         {"firrtl.transforms.DontTouchAnnotation", {"class", "target"}},
         {"firrtl.passes.InlineAnnotation", {"class", "target"}},
         {"chisel3.util.experimental.decode.DecodeTableAnnotation", {"class", "target", "truthTable", "minimizedTable"}},
-        {"firrtl.transforms.BlackBoxInlineAnno", {"class", "target", "name", "text"}}
+        {"firrtl.transforms.BlackBoxInlineAnno", {"class", "target", "name", "text"}},
+        {"firrtl.transforms.BlackBoxPathAnno", {"class", "target", "path"}},
+        {"firrtl.transforms.BlackBoxResourceAnno", {"class", "target", "resourceId"}}
     };
     for (const auto& record : result.records) {
         const auto schema = schemas.find(record.kind);
@@ -128,13 +137,12 @@ AnnotationIndex readAnnotations(const Source& source) {
         if (!module) throw Error(record.range, "annotation targets an unknown module '" + record.module + "'");
         const auto circuit = record.target.substr(1, record.target.find('|') - 1);
         if (!circuit.empty() && circuit != source.circuit()) throw Error(record.range, "annotation targets another circuit");
-        if (record.kind == "firrtl.transforms.BlackBoxInlineAnno" && source.modules()[*module].kind != ModuleKind::External)
-            throw Error(record.range, "BlackBoxInlineAnno requires an external module");
+        if (record.kind.starts_with("firrtl.transforms.BlackBox") && source.modules()[*module].kind != ModuleKind::External)
+            throw Error(record.range, "blackbox source annotation requires an external module");
         const auto component = record.target.find('>');
         if (component != std::string::npos && (component + 1 == record.target.size() || record.target.find('>', component + 1) != std::string::npos))
             throw Error(record.range, "malformed annotation component target");
     }
-    return result;
 }
 void applyAnnotations(const Source&, const Module& module, const AnnotationIndex& annotations, grh::Graph& graph) {
     std::vector<std::string> counts, records, external;

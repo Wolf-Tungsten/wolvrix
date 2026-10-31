@@ -958,6 +958,7 @@ public:
 
     Graph& createGraph(std::string name);
     Graph& cloneGraph(std::string_view sourceName, std::string newName);
+    Graph& importGraph(const Graph& source, std::string newName);
     bool deleteGraph(std::string_view name);
     Design clone() const;
     Graph* findGraph(std::string_view name) noexcept;

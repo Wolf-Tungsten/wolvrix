@@ -119,6 +119,9 @@ struct FirrtlOptions {
     FirrtlInitPolicy initPolicy = FirrtlInitPolicy::Unknown;
     // Full layer paths. Selecting a child also enables its ancestors.
     std::vector<std::string> enabledLayers;
+    // Sidecar JSON and explicit filesystem roots for blackbox resources.
+    std::vector<std::string> annotationFiles;
+    std::vector<std::string> resourceRoots;
 };
 
 struct IngestRequest {
@@ -153,6 +156,8 @@ struct IngestResult {
     std::optional<grh::Design> design;
     std::vector<ModuleSignature> modules;
     std::vector<IngestDiagnostic> diagnostics;
+    // Canonical source identities, preprocessing inputs and specialization keys.
+    std::vector<std::string> dependencies;
 
     bool success() const noexcept;
 };

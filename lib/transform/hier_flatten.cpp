@@ -2,6 +2,7 @@
 
 #include "core/grh.hpp"
 #include "core/transform.hpp"
+#include "ingest/node_attributes.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -55,6 +56,7 @@ namespace wolvrix::lib::transform
             // Instance path of the graph currently being inlined; synthetic
             // assigns created on its behalf are stamped with it.
             std::string currentPrefix;
+            std::vector<std::string> nodeInstancePath;
             bool failed = false;
             bool changed = false;
         };
@@ -661,7 +663,10 @@ namespace wolvrix::lib::transform
                 return false;
             }
 
-            return inlineGraphContents(*child, target, childPrefix, childPortMap, state);
+            state.nodeInstancePath.push_back(component);
+            const bool success = inlineGraphContents(*child, target, childPrefix, childPortMap, state);
+            state.nodeInstancePath.pop_back();
+            return success;
         }
 
         InstanceInfo buildInstanceInfo(const wolvrix::lib::grh::Operation &op)
@@ -1098,6 +1103,10 @@ namespace wolvrix::lib::transform
                 if (state.failed)
                 {
                     break;
+                }
+                if (wolvrix::lib::ingest::node::annotated(target, newOp))
+                {
+                    wolvrix::lib::ingest::node::qualify(target, newOp, state.nodeInstancePath);
                 }
                 state.changed = true;
             }

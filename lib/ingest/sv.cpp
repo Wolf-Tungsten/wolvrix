@@ -1,4 +1,5 @@
 #include "ingest/sv.hpp"
+#include "mixed.hpp"
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/ast/ASTVisitor.h"
@@ -34,6 +35,7 @@
 #include "slang/ast/symbols/VariableSymbols.h"
 #include "slang/ast/types/AllTypes.h"
 #include "slang/text/SourceManager.h"
+#include "slang/syntax/SyntaxVisitor.h"
 
 #include <algorithm>
 #include <cctype>
@@ -48,6 +50,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <set>
 #include <thread>
 #if defined(__unix__) || defined(__APPLE__)
 #include <pthread.h>
@@ -59,24 +62,40 @@
 namespace wolvrix::lib::ingest {
 
 const slang::SourceManager* svSourceManager(const SourceOwners& owners) {
+    const slang::SourceManager* manager = nullptr;
     for (const auto& source : owners) {
         const auto* sv = dynamic_cast<const SvSourceOwner*>(source.get());
         if (sv && sv->compilation) {
-            return sv->compilation->getSourceManager();
+            const auto* candidate = sv->compilation->getSourceManager();
+            // SourceLocation buffer IDs are local to one SourceManager.
+            if (manager && manager != candidate) return nullptr;
+            manager = candidate;
         }
     }
-    return nullptr;
+    return manager;
 }
 
-InterfaceScanResult scanSvInterfaces(const IngestRequest& /*request*/) {
+InterfaceScanResult scanSvInterfaces(const IngestRequest& request) {
     InterfaceScanResult result;
-    result.diagnostics.push_back({IngestSeverity::Error,
-                                  "pre-elaboration SystemVerilog interface scanning is not supported yet",
-                                  {}, "ingest-sv"});
+    auto read = readSystemVerilog(request);
+    result.sourceOwners = std::move(read.sourceOwners);
+    result.modules = std::move(read.modules);
+    const bool success = read.success();
+    result.diagnostics = std::move(read.diagnostics);
+    result.success = success;
     return result;
 }
 
 namespace {
+struct InterfaceReferences : slang::syntax::SyntaxVisitor<InterfaceReferences> {
+    std::set<std::string> definitions, instances;
+    void handle(const slang::syntax::ModuleDeclarationSyntax& module) {
+        definitions.emplace(module.header->name.valueText()); visitDefault(module);
+    }
+    void handle(const slang::syntax::HierarchyInstantiationSyntax& instance) {
+        instances.emplace(instance.type.valueText()); visitDefault(instance);
+    }
+};
 
 IngestDiagnostic ownSvDiagnostic(const ConvertDiagnostic& diagnostic,
                                 const slang::SourceManager* sourceManager) {
@@ -128,6 +147,12 @@ IngestDiagnostic ownSvDiagnostic(const ConvertDiagnostic& diagnostic,
 } // namespace
 
 IngestResult readSystemVerilog(const IngestRequest& request) {
+    return readSystemVerilog(request, {});
+}
+
+IngestResult readSystemVerilog(const IngestRequest& request,
+                             const std::unordered_set<std::string>& declarations,
+                             const std::function<std::filesystem::path(const std::vector<std::string>&)>& resolveInterfaces) {
     IngestResult result;
     auto owner = std::make_shared<SvSourceOwner>();
     owner->driver = std::make_shared<slang::driver::Driver>();
@@ -180,6 +205,22 @@ IngestResult readSystemVerilog(const IngestRequest& request) {
         fail("failed to parse sources");
         return result;
     }
+    if (resolveInterfaces) {
+        InterfaceReferences references;
+        for (const auto& tree : driver.syntaxTrees) tree->root().visit(references);
+        std::vector<std::string> required;
+        for (const auto& name : references.definitions) if (declarations.contains(name)) {
+            fail("duplicate real module definition across FIRRTL and SystemVerilog: " + name); return result;
+        }
+        for (const auto& name : references.instances)
+            if (declarations.contains(name)) required.push_back(name);
+        const auto path = resolveInterfaces(required);
+        if (!path.empty()) {
+            auto tree = slang::syntax::SyntaxTree::fromFile(path.string(), driver.sourceManager);
+            if (!tree) { fail("cannot read generated FIRRTL interface declarations"); return result; }
+            driver.syntaxTrees.push_back(std::move(*tree));
+        }
+    }
     owner->compilation = driver.createCompilation();
     auto& compilation = *owner->compilation;
     driver.runAnalysis(compilation);
@@ -189,6 +230,11 @@ IngestResult readSystemVerilog(const IngestRequest& request) {
         const auto severity = slang::getDefaultSeverity(diagnostic.code);
         hasSlangIssues |= severity >= slang::DiagnosticSeverity::Warning;
         hasSlangErrors |= severity >= slang::DiagnosticSeverity::Error || diagnostic.isError();
+        if (severity >= slang::DiagnosticSeverity::Warning || diagnostic.isError()) {
+            ConvertDiagnostic owned; owned.kind = diagnostic.isError() ? ConvertDiagnosticKind::Error : ConvertDiagnosticKind::Warning;
+            owned.message = driver.diagEngine.formatMessage(diagnostic); owned.location = diagnostic.location; owned.passName = "ingest-sv";
+            result.diagnostics.push_back(ownSvDiagnostic(owned, compilation.getSourceManager()));
+        }
     }
     if (hasSlangIssues) {
         driver.reportCompilation(compilation, /* quiet */ true);
@@ -204,6 +250,7 @@ IngestResult readSystemVerilog(const IngestRequest& request) {
     options.abortOnError = true;
     options.enableLogging = request.logLevel != LogLevel::Off;
     options.logLevel = request.logLevel;
+    options.linkDeclarations = declarations;
     ConvertDriver converter(options);
     converter.logger().setSink(request.logSink);
     try {
@@ -218,6 +265,50 @@ IngestResult readSystemVerilog(const IngestRequest& request) {
     }
     if (!result.success()) {
         result.design.reset();
+    }
+    if (result.design) {
+        for (const auto buffer : driver.sourceManager.getAllBuffers()) {
+            const auto& path = driver.sourceManager.getFullPath(buffer);
+            if (!path.empty()) result.dependencies.push_back("sv:" + path.generic_string() +
+                ":fnv1a64:" + sourceIdentity(driver.sourceManager.getSourceText(buffer)));
+        }
+        for (const auto& argument : request.slangArgs) result.dependencies.push_back("slang-arg:" + argument);
+        for (const auto& name : result.design->graphOrder()) {
+            const auto& graph = *result.design->findGraph(name);
+            ModuleSignature signature; signature.language = SourceLanguage::SystemVerilog;
+            signature.name = name; signature.implementationName = name;
+            if (const auto module = graph.metadata("ingest.sourceModule"))
+                signature.implementationName = std::get<std::string>(*module);
+            if (const auto file = graph.metadata("ingest.sourceFile")) {
+                const auto path = std::filesystem::weakly_canonical(std::get<std::string>(*file));
+                for (const auto& source : request.sources) {
+                    const auto input = source.path.is_relative() ? request.inputRoot / source.path : source.path;
+                    if (std::filesystem::weakly_canonical(input) == path) {
+                        signature.sourceUnit = source.unit.empty() ? source.path.generic_string() : source.unit;
+                        break;
+                    }
+                }
+            }
+            const auto ports = [&](const auto& entries, LeafDirection direction) {
+                for (const auto& port : entries) {
+                    PortLeafSignature leaf; leaf.name = port.name;
+                    std::size_t begin = 0;
+                    for (auto end = leaf.name.find("__DOT__");; end = leaf.name.find("__DOT__", begin)) {
+                        leaf.fieldPath.push_back(leaf.name.substr(begin, end - begin));
+                        if (end == std::string::npos) break;
+                        begin = end + 7;
+                    }
+                    leaf.direction = direction;
+                    const auto type = graph.valueLogicalType(port.value);
+                    leaf.valueType = type.kind; leaf.isSigned = type.isSigned; leaf.shape = type.shape;
+                    int64_t elements = 1; for (const auto extent : type.shape) elements *= extent;
+                    leaf.elementWidth = type.width / elements; leaf.sourceType = "SystemVerilog";
+                    signature.ports.push_back(std::move(leaf));
+                }
+            };
+            ports(graph.inputPorts(), LeafDirection::Input); ports(graph.outputPorts(), LeafDirection::Output);
+            result.modules.push_back(std::move(signature));
+        }
     }
     return result;
 }
@@ -426,12 +517,14 @@ std::string parameterValueToString(const slang::ConstantValue& value)
         return "bad";
     }
 
-    std::string sanitized = sanitizeParamToken(value.toString(), true);
-    if (sanitized.empty())
-    {
-        sanitized = "value";
+    if (value.isInteger()) {
+        const auto& integer = value.integer();
+        std::string result = std::to_string(integer.getBitWidth()) + (integer.isSigned() ? "'sb" : "'b");
+        for (int64_t i = integer.getBitWidth(); i-- > 0;) result += integer[static_cast<int32_t>(i)].toChar();
+        return result;
     }
-    return sanitized;
+    const std::string kind = value.isString() ? "string:" : value.isReal() ? "real:" : value.isShortReal() ? "shortreal:" : "aggregate:";
+    const auto text = value.toString(); return kind + std::to_string(text.size()) + ":" + text;
 }
 
 std::string formatIntegerLiteral(const slang::SVInt& value)
@@ -13655,6 +13748,7 @@ void collectInstance(const slang::ast::InstanceSymbol& instance, ModulePlan& pla
         moduleName = instance.name;
     }
     info.moduleSymbol = plan.symbolTable.intern(moduleName);
+    info.isLinkDeclaration = context.options.linkDeclarations.contains(std::string(moduleName));
     ParameterSnapshot params = snapshotParameters(body, info.isBlackbox ? &plan : nullptr);
     if (info.isBlackbox)
     {
@@ -13663,7 +13757,8 @@ void collectInstance(const slang::ast::InstanceSymbol& instance, ModulePlan& pla
     info.paramSignature = params.signature;
     plan.instances.push_back(std::move(info));
 
-    enqueuePlanKey(context, body, std::move(params.signature));
+    if (!plan.instances.back().isLinkDeclaration)
+        enqueuePlanKey(context, body, std::move(params.signature));
 }
 
 void collectInstanceArray(const slang::ast::InstanceArraySymbol& array, ModulePlan& plan,
@@ -14970,6 +15065,26 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 return false;
             }
             auto indexConst = evalConstInt(plan, lowering, slice.index);
+            if (baseType && baseType->getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+                const auto& array = baseType->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
+                out.width = static_cast<int64_t>(computeFixedWidth(array.elementType, *plan.body, context_.diagnostics));
+                out.subWidth = out.width; out.subType = &array.elementType;
+                if (indexConst) {
+                    out.isStatic = true;
+                    const auto lane = array.range.left <= array.range.right ? *indexConst - array.range.left : array.range.left - *indexConst;
+                    out.low = lane * out.width;
+                } else {
+                    auto lane = slice.index;
+                    if (array.range.left <= array.range.right) lane = applyPackedIndexOffset(lane, array.range.left, slice.location);
+                    else {
+                        const auto left = builder.addConstantLiteral(std::to_string(array.range.left), slice.location);
+                        lane = builder.makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kSub, {left, lane}, 32, slice.location);
+                    }
+                    out.indexExpr = applyPackedElementIndex(lane, 0, out.width, slice.location);
+                }
+                elementSliceResolved = true;
+                break;
+            }
             auto packedElement = getPackedArrayElementSlice(baseType);
             if (!packedElement && leafInfo && leafDim < leafInfo->packedDimInfos.size())
             {
@@ -22700,6 +22815,8 @@ private:
             graph_.setAttr(op, "inputPortName", inputNames);
             graph_.setAttr(op, "outputPortName", outputNames);
             graph_.setAttr(op, "inoutPortName", inoutNames);
+            if (instanceInfo.isLinkDeclaration)
+                graph_.setAttr(op, "ingest.link.kind", std::string("declaration"));
 
             if (instanceInfo.instanceSymbol.valid())
             {
@@ -26163,6 +26280,13 @@ wolvrix::lib::grh::Graph& GraphAssembler::build(const PlanKey& key, const Module
     }
     GraphAssemblyState state(context_, *this, *graph, plan, lowering, writeBack);
     state.build();
+    graph->setMetadata("ingest.sourceModule", moduleName);
+    if (plan.body)
+    {
+        graph->setMetadata("ingest.parameterSignature", snapshotParameters(*plan.body, nullptr).signature);
+        if (const auto* sourceManager = plan.body->getCompilation().getSourceManager())
+            graph->setMetadata("ingest.sourceFile", sourceManager->getFullPath(plan.body->getDefinition().location.buffer()).generic_string());
+    }
     return *graph;
 }
 
@@ -26392,6 +26516,22 @@ void processPlanKey(PlanKey key, ConvertContext& context, PlanCache& planCache,
                  "pass2-stmt-lowerer", moduleName);
     const auto stmtStart = ConvertClock::now();
     stmtLowerer.lower(plan, lowering);
+    // Output arrays driven entirely by combinational assignments are values,
+    // not memory state. Route their indexed writes through ordinary write-back.
+    for (auto& signal : plan.signals) {
+        if (signal.kind != SignalKind::Variable || signal.unpackedDims.empty()) continue;
+        const bool output = std::any_of(plan.ports.begin(), plan.ports.end(), [&](const auto& port) {
+            return port.direction == PortDirection::Output && port.symbol.index == signal.symbol.index;
+        });
+        if (!output) continue;
+        bool written = false, combinational = true;
+        for (const auto& statement : lowering.loweredStmts) {
+            if (statement.kind != LoweredStmtKind::Write || statement.write.target.index != signal.symbol.index) continue;
+            written = true;
+            combinational &= statement.write.domain == ControlDomain::Combinational && statement.eventEdges.empty();
+        }
+        if (written && combinational) signal.kind = SignalKind::Net;
+    }
     const auto stmtEnd = ConvertClock::now();
     logPassTiming(context.logger, context.options.enableTiming,
                   "pass2-stmt-lowerer", moduleName, stmtEnd - stmtStart);

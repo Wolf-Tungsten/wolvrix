@@ -40,10 +40,14 @@ namespace wolvrix::lib::transform
     public:
         using wolvrix::lib::diag::Diagnostics::Diagnostics;
 
-        void error(std::string passName, std::string message, std::string context = {});
-        void warning(std::string passName, std::string message, std::string context = {});
-        void info(std::string passName, std::string message, std::string context = {});
-        void debug(std::string passName, std::string message, std::string context = {});
+        void error(std::string passName, std::string message, std::string context = {},
+                   std::optional<diag::SourcePosition> position = {});
+        void warning(std::string passName, std::string message, std::string context = {},
+                     std::optional<diag::SourcePosition> position = {});
+        void info(std::string passName, std::string message, std::string context = {},
+                  std::optional<diag::SourcePosition> position = {});
+        void debug(std::string passName, std::string message, std::string context = {},
+                   std::optional<diag::SourcePosition> position = {});
     };
 
     using TransformDiagnostics = PassDiagnostics;

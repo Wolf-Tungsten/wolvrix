@@ -7,7 +7,7 @@ using namespace firrtl_test;
 void test(const std::filesystem::path& input) {
     ingest::IngestRequest request;
     request.sources.push_back({ingest::SourceLanguage::Firrtl, input, "frozen-xs"});
-    request.tops = {"Queue2_TLBundleA", "sram_array_1p128x138m69s1h0l1b_icache_meta", "JtagBypassChain"};
+    request.tops = {"Queue2_TLBundleA", "sram_array_1p128x138m69s1h0l1b_icache_meta", "JtagBypassChain", "MbistClockGateCell"};
     request.firrtl.invalidPolicy = ingest::FirrtlInvalidPolicy::Zero;
     request.firrtl.initPolicy = ingest::FirrtlInitPolicy::Zero;
     request.firrtl.enabledLayers = {"Verification.Assert"};
@@ -19,7 +19,8 @@ void test(const std::filesystem::path& input) {
     std::ofstream(output / "selected.json") << *store.storeToString(restored);
     for (const auto& name : request.tops) {
         const auto& graph = *restored.findGraph(name);
-        require(count(graph, OperationKind::kInstance) == 0 && count(graph, OperationKind::kBlackbox) == 0, "target accepted a fake external implementation");
+        if (name != "MbistClockGateCell")
+            require(count(graph, OperationKind::kInstance) == 0 && count(graph, OperationKind::kBlackbox) == 0, "target accepted a fake external implementation");
         require(graph.metadata("firrtl.pendingExternalAnnotations").has_value(), "external binding payload was not retained");
     }
     auto queue = restored.clone();
@@ -80,7 +81,33 @@ if(m.RW0__DOT__rdata!=result)throw std::runtime_error("frozen masked 138-bit SRA
     generate(jtag, output / "jtag", driver);
     std::ofstream(output / "jtag/expected.err") << "[fatal] Assertion failed at JtagShifter.scala:72\n\n";
     std::ofstream(output / "jtag/check.mk") << ".PHONY: check\ncheck: driver\n\t@set -eu; status=0; ./driver fail > actual.out 2> actual.err || status=$$?; test $$status -eq 1; test ! -s actual.out; cmp expected.err actual.err\n";
-    std::ofstream(output / "run.mk") << ".PHONY: run queue sram jtag jtag-failure\nrun: queue sram jtag jtag-failure\nqueue sram jtag:\n\t$(MAKE) -C $@ -f run.mk run\njtag-failure: jtag\n\t$(MAKE) -C jtag -f check.mk check\n";
+    auto clockgate = restored.clone();
+    clockgate.cloneGraph("MbistClockGateCell", "top");
+    for (const auto& name : request.tops) { clockgate.unmarkAsTop(name); }
+    clockgate.markAsTop("top");
+    tx::SessionStore clockgateSession;
+    pass(clockgate, clockgateSession, "hier-flatten");
+    pass(clockgate, clockgateSession, "latch-transparent-read");
+    const auto& clockgraph = *clockgate.findGraph("top");
+    require(count(clockgraph, OperationKind::kInstance) == 0 && count(clockgraph, OperationKind::kBlackbox) == 0,
+        "frozen ClockGate did not bind a real SV implementation");
+    require(!node::inspect(clockgraph).nodes.empty(), "frozen clockgate lost FIRRTL node provenance");
+    require(std::count_if(result.dependencies.begin(), result.dependencies.end(), [](const auto& entry) { return entry.starts_with("inline:"); }) == 1,
+        "frozen mixed read collected unreachable blackboxes");
+    generate(clockgate, output / "clockgate", R"CPP(#include "model/grhsim_top.hpp"
+#include <cassert>
+int main(){GrhSIM_top m;m.init();bool held=false;
+for(unsigned bits=0;bits<128;++bits){
+m.clock=0;m.reset=0;m.E=bits&1;m.dft__DOT__cgen=(bits>>1)&1;
+m.mbist__DOT__req=(bits>>2)&1;m.mbist__DOT__readen=(bits>>3)&1;m.mbist__DOT__writeen=(bits>>4)&1;
+m.dft__DOT__ram_mcp_hold=0;m.dft__DOT__ram_aux_clk=0;m.dft__DOT__ram_aux_ckbp=0;
+held=m.dft__DOT__cgen||(m.mbist__DOT__req?(m.mbist__DOT__readen||m.mbist__DOT__writeen):m.E);
+m.eval();assert(m.out_clock==0);m.clock=1;m.eval();assert(m.out_clock==held);
+m.E=!m.E;m.dft__DOT__cgen=!m.dft__DOT__cgen;m.mbist__DOT__req=!m.mbist__DOT__req;
+m.eval();assert(m.out_clock==held);m.clock=0;m.eval();assert(m.out_clock==0);
+}}
+)CPP");
+    std::ofstream(output / "run.mk") << ".PHONY: run queue sram jtag clockgate jtag-failure\nrun: queue sram jtag clockgate jtag-failure\nqueue sram jtag clockgate:\n\t$(MAKE) -C $@ -f run.mk run\njtag-failure: jtag\n\t$(MAKE) -C jtag -f check.mk check\n";
     std::cout << "frozen Queue2/SRAM/Jtag ingest and JSON verified; queue/Jtag ordinary GRH scoreboards verified; compiled drivers generated\n";
 }
 }

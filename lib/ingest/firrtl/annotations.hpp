@@ -9,7 +9,7 @@ struct Annotation {
     std::string target;
     std::string module;
     std::map<std::string, std::string> fields;
-    std::string_view raw;
+    std::string raw;
     Range range;
 };
 struct AnnotationIndex {
@@ -17,6 +17,8 @@ struct AnnotationIndex {
     std::vector<Annotation> records;
 };
 AnnotationIndex readAnnotations(const Source& source);
+AnnotationIndex parseAnnotations(std::string_view text);
+void validateAnnotations(const Source& source, const AnnotationIndex& annotations);
 void applyAnnotations(const Source& source, const Module& module, const AnnotationIndex& annotations, grh::Graph& graph);
 } // namespace wolvrix::lib::ingest::firrtl::detail
 #endif

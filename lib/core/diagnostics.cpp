@@ -63,7 +63,8 @@ namespace wolvrix::lib::diag
                           std::string context,
                           std::string passName,
                           std::string originSymbol,
-                          std::optional<slang::SourceLocation> location)
+                          std::optional<slang::SourceLocation> location,
+                          std::optional<SourcePosition> sourcePosition)
     {
         const bool isError = isErrorKind(kind);
         Diagnostic diag{
@@ -73,6 +74,7 @@ namespace wolvrix::lib::diag
             .passName = std::move(passName),
             .originSymbol = std::move(originSymbol),
             .location = location,
+            .sourcePosition = std::move(sourcePosition),
         };
 
         if (threadLocalEnabled_)

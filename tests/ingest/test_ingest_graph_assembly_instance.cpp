@@ -205,7 +205,7 @@ int testGraphAssemblyInstance(const std::filesystem::path& sourcePath) {
             if (!expectStrings(getAttrStrings(op, "parameterNames"), {"WIDTH"})) {
                 return fail("blackbox parameterNames mismatch");
             }
-            if (!expectStrings(getAttrStrings(op, "parameterValues"), {"4"})) {
+            if (!expectStrings(getAttrStrings(op, "parameterValues"), {"32'sb00000000000000000000000000000100"})) {
                 return fail("blackbox parameterValues mismatch");
             }
             auto instanceName = getAttrString(op, "instanceName");

@@ -2,6 +2,7 @@
 #define WOLVRIX_DIAGNOSTICS_HPP
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,14 @@ namespace wolvrix::lib::diag
         Debug
     };
 
+    // Owned coordinates remain valid across frontends and SourceManager instances.
+    struct SourcePosition
+    {
+        std::string file;
+        uint64_t line = 0;
+        uint64_t column = 0;
+    };
+
     struct Diagnostic
     {
         DiagnosticKind kind = DiagnosticKind::Error;
@@ -29,6 +38,7 @@ namespace wolvrix::lib::diag
         std::string passName;
         std::string originSymbol;
         std::optional<slang::SourceLocation> location;
+        std::optional<SourcePosition> sourcePosition;
     };
 
     class Diagnostics
@@ -53,7 +63,8 @@ namespace wolvrix::lib::diag
                  std::string context = {},
                  std::string passName = {},
                  std::string originSymbol = {},
-                 std::optional<slang::SourceLocation> location = {});
+                 std::optional<slang::SourceLocation> location = {},
+                 std::optional<SourcePosition> sourcePosition = {});
 
     private:
         struct ThreadLocalBuffer

@@ -67,6 +67,12 @@ namespace wolvrix::lib::transform
             return ctx;
         }
 
+        std::optional<diag::SourcePosition> sourcePosition(const std::optional<grh::SrcLoc>& location)
+        {
+            if (!location || location->file.empty()) return {};
+            return diag::SourcePosition{location->file, location->line, location->column};
+        }
+
         constexpr int diagnosticLevel(PassDiagnosticKind kind)
         {
             switch (kind)
@@ -84,24 +90,28 @@ namespace wolvrix::lib::transform
         }
     } // namespace
 
-    void PassDiagnostics::error(std::string passName, std::string message, std::string context)
+    void PassDiagnostics::error(std::string passName, std::string message, std::string context,
+                                std::optional<diag::SourcePosition> position)
     {
-        add(PassDiagnosticKind::Error, std::move(message), std::move(context), std::move(passName));
+        add(PassDiagnosticKind::Error, std::move(message), std::move(context), std::move(passName), {}, {}, std::move(position));
     }
 
-    void PassDiagnostics::warning(std::string passName, std::string message, std::string context)
+    void PassDiagnostics::warning(std::string passName, std::string message, std::string context,
+                                  std::optional<diag::SourcePosition> position)
     {
-        add(PassDiagnosticKind::Warning, std::move(message), std::move(context), std::move(passName));
+        add(PassDiagnosticKind::Warning, std::move(message), std::move(context), std::move(passName), {}, {}, std::move(position));
     }
 
-    void PassDiagnostics::info(std::string passName, std::string message, std::string context)
+    void PassDiagnostics::info(std::string passName, std::string message, std::string context,
+                               std::optional<diag::SourcePosition> position)
     {
-        add(PassDiagnosticKind::Info, std::move(message), std::move(context), std::move(passName));
+        add(PassDiagnosticKind::Info, std::move(message), std::move(context), std::move(passName), {}, {}, std::move(position));
     }
 
-    void PassDiagnostics::debug(std::string passName, std::string message, std::string context)
+    void PassDiagnostics::debug(std::string passName, std::string message, std::string context,
+                                std::optional<diag::SourcePosition> position)
     {
-        add(PassDiagnosticKind::Debug, std::move(message), std::move(context), std::move(passName));
+        add(PassDiagnosticKind::Debug, std::move(message), std::move(context), std::move(passName), {}, {}, std::move(position));
     }
 
     Pass::Pass(std::string id, std::string name, std::string description)
@@ -188,7 +198,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().error(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr));
+        diags().error(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr), sourcePosition(op.srcLoc()));
     }
 
     void Pass::warning(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Operation &op, std::string message)
@@ -197,7 +207,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().warning(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr));
+        diags().warning(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr), sourcePosition(op.srcLoc()));
     }
 
     void Pass::info(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Operation &op, std::string message)
@@ -206,7 +216,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().info(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr));
+        diags().info(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr), sourcePosition(op.srcLoc()));
     }
 
     void Pass::debug(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Operation &op, std::string message)
@@ -215,7 +225,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().debug(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr));
+        diags().debug(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, &op, nullptr), sourcePosition(op.srcLoc()));
     }
 
     void Pass::error(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Value &value, std::string message)
@@ -224,7 +234,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().error(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value));
+        diags().error(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value), sourcePosition(value.srcLoc()));
     }
 
     void Pass::warning(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Value &value, std::string message)
@@ -233,7 +243,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().warning(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value));
+        diags().warning(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value), sourcePosition(value.srcLoc()));
     }
 
     void Pass::info(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Value &value, std::string message)
@@ -242,7 +252,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().info(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value));
+        diags().info(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value), sourcePosition(value.srcLoc()));
     }
 
     void Pass::debug(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Value &value, std::string message)
@@ -251,7 +261,7 @@ namespace wolvrix::lib::transform
         {
             return;
         }
-        diags().debug(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value));
+        diags().debug(name_.empty() ? id_ : name_, std::move(message), formatContext(&graph, nullptr, &value), sourcePosition(value.srcLoc()));
     }
 
     void Pass::error(const wolvrix::lib::grh::Graph &graph, std::string message)

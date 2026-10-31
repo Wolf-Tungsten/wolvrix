@@ -121,6 +121,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/store_text.cpp
     lib/ingest/sv.cpp
     lib/ingest/driver.cpp
+    lib/ingest/mixed.cpp
     lib/ingest/firrtl.cpp
     lib/ingest/node_attributes.cpp
     lib/ingest/firrtl/source.cpp
@@ -807,7 +808,7 @@ target_compile_definitions(transform-repcut-partition-count
 register_test_exe(transform-repcut-partition-count)
 
 # ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects)
+foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects ingest-mixed)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)

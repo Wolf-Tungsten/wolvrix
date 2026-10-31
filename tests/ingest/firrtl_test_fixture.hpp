@@ -27,7 +27,7 @@ inline ingest::IngestResult read(const std::filesystem::path& path, bool annotat
 }
 inline std::string diagnostics(const ingest::IngestResult& result) {
     std::string text;
-    for (const auto& entry : result.diagnostics) text += entry.message + '\n';
+    for (const auto& entry : result.diagnostics) text += entry.context + ": " + entry.message + '\n';
     return text;
 }
 inline grh::Design design(const std::filesystem::path& path, bool annotations = true) {

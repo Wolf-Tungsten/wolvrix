@@ -128,10 +128,16 @@ struct Effect {
     StmtId statement = 0;
     int guard = 1;
 };
+struct Instance {
+    std::string name;
+    std::string target;
+    Range range;
+};
 
 class Semantics {
 public:
-    Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options);
+    Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options,
+              const std::map<std::string, ModuleSignature>* interfaces = nullptr);
     void analyze();
     TypePtr expression(ExprId id);
     std::vector<Leaf> leaves(TypePtr type, int flow = 1) const;
@@ -152,6 +158,7 @@ public:
     std::map<std::string, Memory> memories;
     std::map<std::string, std::pair<std::string, std::size_t>> memoryPorts;
     std::vector<Effect> effects;
+    std::vector<Instance> instances;
     std::unordered_set<StmtId> activeStatements;
     bool layerEnabled(std::string_view path) const;
 
@@ -169,6 +176,7 @@ private:
     std::unordered_set<std::string> knownLayers_;
     std::vector<std::string> enabledLayers_;
     std::string activeLayer_;
+    const std::map<std::string, ModuleSignature>* interfaces_;
     std::string layerPath(const Statement& statement) const;
     uint32_t newWidth(int64_t value, Range range);
     uint32_t newReset(unsigned flags);
@@ -195,7 +203,8 @@ private:
 };
 
 ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
-                            grh::Design& design, const FirrtlOptions& options);
+                            grh::Design& design, const FirrtlOptions& options,
+                            const std::map<std::string, ModuleSignature>* interfaces = nullptr);
 
 } // namespace wolvrix::lib::ingest::firrtl::detail
 #endif

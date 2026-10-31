@@ -5309,6 +5309,13 @@ namespace wolvrix::lib::grh
         return clone;
     }
 
+    Graph &Design::importGraph(const Graph &source, std::string newName)
+    {
+        Graph &destination = createGraph(std::move(newName));
+        cloneGraphContents(source, destination);
+        return destination;
+    }
+
     Design Design::clone() const
     {
         Design cloned;

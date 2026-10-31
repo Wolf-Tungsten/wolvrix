@@ -116,6 +116,20 @@ namespace
         int expected_;
     };
 
+    class LocatedEmitter : public Pass
+    {
+    public:
+        LocatedEmitter() : Pass("located", "located") {}
+        PassResult run() override
+        {
+            for (const auto& name : design().graphOrder()) {
+                const auto& graph = *design().findGraph(name);
+                for (const auto op : graph.operations()) warning(graph, graph.getOperation(op), "located warning");
+            }
+            return {};
+        }
+    };
+
     class VerbosityEmitter : public Pass
     {
     public:
@@ -136,6 +150,25 @@ int main()
 {
     wolvrix::lib::grh::Design design;
     design.createGraph("top");
+
+    {
+        wolvrix::lib::grh::Design sources;
+        for (const std::string file : {"first.sv", "second.fir"}) {
+            auto& graph = sources.createGraph(file);
+            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign);
+            graph.setOpSrcLoc(op, {.file = file, .line = 17, .column = 4});
+        }
+        PassManager manager;
+        manager.addPass(std::make_unique<LocatedEmitter>());
+        PassDiagnostics diagnostics;
+        if (!manager.run(sources, diagnostics).success || diagnostics.messages().size() != 2)
+            return fail("Expected multi-source located warnings");
+        for (std::size_t i = 0; i < 2; ++i) {
+            const auto& position = diagnostics.messages()[i].sourcePosition;
+            if (!position || position->file != (i ? "second.fir" : "first.sv") || position->line != 17 || position->column != 4)
+                return fail("Transform diagnostic lost owned source coordinates");
+        }
+    }
 
     // Case 1: pipeline order and aggregated changed flag
     {

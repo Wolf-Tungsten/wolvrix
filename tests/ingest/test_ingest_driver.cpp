@@ -88,14 +88,13 @@ int main() {
         return !result.success() && !result.design && !result.diagnostics.empty() &&
             result.diagnostics.front().message.find("annotation") != std::string::npos;
     };
-    if (!scanFirrtlInterfaces(firrtl).success || !scanInterfaces(firrtl).success || scanSvInterfaces(request).success ||
+    if (!scanFirrtlInterfaces(firrtl).success || !scanInterfaces(firrtl).success ||
         !rejected(readFirrtl(firrtl)) || !rejected(readSources(firrtl))) {
         return fail("FIRRTL syntax scanning must not grant execution to unknown annotations");
     }
     firrtl.sources.push_back(request.sources.front());
-    if (!unsupported(readSources(firrtl)) ||
-        !unsupported(specializeModule(firrtl, {})) || !unsupported(linkModules(firrtl, {}))) {
-        return fail("mixed elaboration/specialization/linking placeholders must not return empty success");
+    if (readSources(firrtl).design || specializeModule(firrtl, {}).design || linkModules(firrtl, {}).design) {
+        return fail("failed mixed elaboration/specialization/linking returned a partial design");
     }
     return 0;
 }

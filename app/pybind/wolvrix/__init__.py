@@ -144,6 +144,53 @@ class Session:
             path=path,
         )
 
+    def read_sources(
+        self,
+        sources: list[dict],
+        *,
+        tops: list[str] | None = None,
+        input_root: str = "",
+        slang_args: list[str] | None = None,
+        firrtl_options: dict | None = None,
+        external_bindings: list[dict] | None = None,
+        out_design: str = "design.main",
+        replace: bool = False,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_read_sources(
+            self._capsule, sources=sources, out_design=out_design,
+            tops=tops or [], input_root=input_root, slang_args=slang_args or [],
+            firrtl_options=firrtl_options or {}, external_bindings=external_bindings or [],
+            replace=replace, log_level=self._log_level,
+        )
+        return self._complete_action(
+            "read_sources", diagnostics, success=bool(success), out_design=out_design,
+        )
+
+    def read_firrtl(
+        self,
+        path: str,
+        *,
+        sv_sources: list[str] | None = None,
+        tops: list[str] | None = None,
+        input_root: str = "",
+        slang_args: list[str] | None = None,
+        firrtl_options: dict | None = None,
+        external_bindings: list[dict] | None = None,
+        out_design: str = "design.main",
+        replace: bool = False,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_read_firrtl(
+            self._capsule, path=path, out_design=out_design, sv_sources=sv_sources or [],
+            tops=tops or [], input_root=input_root, slang_args=slang_args or [],
+            firrtl_options=firrtl_options or {}, external_bindings=external_bindings or [],
+            replace=replace, log_level=self._log_level,
+        )
+        return self._complete_action(
+            "read_firrtl", diagnostics, success=bool(success), out_design=out_design, path=path,
+        )
+
     def read_json_file(
         self,
         path: str,

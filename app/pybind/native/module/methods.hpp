@@ -19,6 +19,8 @@ namespace wolvrix::app::pybind
     PyObject *py_session_rename(PyObject *self, PyObject *args, PyObject *kwargs);
 
     PyObject *py_session_read_sv(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_read_sources(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_read_firrtl(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_read_json_file(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_load_json_text(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_clone_design(PyObject *self, PyObject *args, PyObject *kwargs);

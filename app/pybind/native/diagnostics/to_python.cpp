@@ -273,8 +273,16 @@ namespace wolvrix::app::pybind
             for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(messages.size()); ++i)
             {
                 const auto &message = messages[static_cast<std::size_t>(i)];
+                wolvrix::lib::ingest::SourcePosition owned;
+                if (message.sourcePosition)
+                {
+                    owned.file = message.sourcePosition->file;
+                    owned.line = message.sourcePosition->line;
+                    owned.column = message.sourcePosition->column;
+                }
                 const auto *position = ingest && (*ingest)[i].location
                                            ? &*(*ingest)[i].location : nullptr;
+                if (!position && message.sourcePosition) position = &owned;
                 PyObject *dict = PyDict_New();
                 if (!dict)
                 {

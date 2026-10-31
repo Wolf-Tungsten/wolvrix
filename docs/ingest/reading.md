@@ -5,14 +5,14 @@ The SystemVerilog frontend lives in `lib/ingest/sv.cpp`. Include
 `core/ingest.hpp` header has been removed.
 
 `ingest/ingest.hpp` defines the language-independent request and result types.
-It exposes no slang AST or SourceManager types. `readSources` supports SV requests
-and pure FIRRTL combinational/state/memory/effect requests. FIRRTL interface scanning validates syntax
+It exposes no slang AST or SourceManager types. `readSources` supports pure and
+mixed SV/FIRRTL requests, hierarchy linking and SV specialization/binding; see
+[mixed ingestion](mixed.md). FIRRTL interface scanning validates syntax
 and returns typed source owners and shared leaf signatures; see
 [FIRRTL parsing](firrtl-parser.md), [combinational lowering](firrtl-combinational.md)
 and [state lowering](firrtl-state.md), plus [memory lowering](firrtl-memory.md)
-and [effects/layers/probes](firrtl-effects.md). Instances, explicit specialization,
-external binding and cross-language linking return an error diagnostic at this stage. A failed read
-does not return a partial design. Mixed elaboration is a later implementation stage.
+and [effects/layers/probes](firrtl-effects.md). A failed read does not return a
+partial design.
 
 Node attribute utilities and primitive CSE isolation are implemented separately;
 see [node-attributes.md](node-attributes.md) for the current scope and schema.
@@ -43,13 +43,13 @@ slang_args=...)`.
 typed parameters and leaf ports. A `PortLeafSignature` contains a field path,
 direction, GRH value type, element width, signedness and array shape. A scalar has
 an empty shape; a 32-bit leaf with `shape={8,4}` holds 1024 bits. These signatures
-describe the shared boundary; they do not implement ABI adapters yet.
+describe the shared boundary used by explicit ABI adapters.
 
 `ParameterValue` distinguishes integer, string and real values. Integers carry an
 explicit width, signedness and MSB-first bit string; they are not reduced to an
 untyped decimal string. `ModuleSpecialization` identifies an implementation and
 typed parameters. `ExternalBinding` pairs a logical module with a specialization
-and named port mappings. The mixed driver will use these records for its module
+and named port mappings. The mixed driver uses these records for its module
 registry before either language lowers cross-language instances.
 
 `IngestResult` owns an optional design, diagnostics, module signatures and a
@@ -59,7 +59,8 @@ trees alive. Clone/copy operations share all owners; loading GRH JSON needs no
 frontend owner. Ingest diagnostics own their filename, line, column and source
 snippet, independently of slang locations and the read result's lifetime.
 
-The Python `Session.read_sv` API is unchanged. It builds an `IngestRequest` and
+Python adds `Session.read_sources` and `Session.read_firrtl`; `read_sv` is unchanged.
+Each builds an `IngestRequest` and
 publishes the design and owners only after a successful read and diagnostic
 conversion. Failed reads with `replace=True` preserve the existing key. Successful
 replacement also works when the old key contains a Python session value. Cloning

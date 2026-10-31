@@ -1,6 +1,7 @@
 #include "ingest/firrtl.hpp"
 #include "firrtl/semantic.hpp"
 #include "firrtl/annotations.hpp"
+#include "mixed.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -152,58 +153,8 @@ InterfaceScanResult scanFirrtlInterfaces(const IngestRequest& request) {
 }
 
 IngestResult readFirrtl(const IngestRequest& request) {
-    IngestResult result;
-    auto scanned = scanFirrtlInterfaces(request);
-    result.sourceOwners = std::move(scanned.sourceOwners); result.modules = std::move(scanned.modules);
-    result.diagnostics = std::move(scanned.diagnostics);
-    if (!scanned.success) return result;
-    using Selection = std::pair<std::shared_ptr<const firrtl::Source>, std::size_t>;
-    std::map<std::string, std::vector<Selection>> modules;
-    std::vector<std::string> tops = request.tops;
-    for (const auto& owner : result.sourceOwners) {
-        const auto source = std::static_pointer_cast<const firrtl::Source>(owner);
-        for (std::size_t i = 0; i < source->modules().size(); ++i)
-            modules[std::string(source->modules()[i].name)].push_back({source, i});
-        if (request.tops.empty()) tops.emplace_back(source->circuit());
-    }
-    grh::Design design;
-    std::map<const firrtl::Source*, firrtl::detail::AnnotationIndex> annotationIndexes;
-    std::unordered_set<std::string> selected;
-    for (const auto& top : tops) {
-        const auto found = modules.find(top);
-        if (found == modules.end() || found->second.size() != 1 || !selected.insert(top).second) {
-            result.diagnostics.push_back({IngestSeverity::Error, "missing, ambiguous or duplicate FIRRTL top '" + top + "'", top, "ingest-firrtl"});
-            continue;
-        }
-        const auto& [source, index] = found->second.front();
-        const auto& module = source->modules()[index];
-        try {
-            if (!annotationIndexes.contains(source.get())) annotationIndexes.emplace(source.get(), firrtl::detail::readAnnotations(*source));
-            if (!request.externalBindings.empty())
-                throw firrtl::detail::Error(module.range, "FIRRTL external binding lowering is not supported yet (F07)");
-            auto parsed = firrtl::parseModule(source, index);
-            result.diagnostics.insert(result.diagnostics.end(), parsed.diagnostics.begin(), parsed.diagnostics.end());
-            if (!parsed.success()) continue;
-            for (const auto& statement : parsed.body->arena.statements)
-                if (statement.kind == firrtl::StmtKind::Cover)
-                    result.diagnostics.push_back({IngestSeverity::Warning,
-                        "FIRRTL cover uses a simulation hit trace; no formal coverage model is generated",
-                        top, "ingest-firrtl", top, source->position(statement.range)});
-            auto signature = firrtl::detail::lowerModule(*source, *parsed.body, design, request.firrtl);
-            firrtl::detail::applyAnnotations(*source, module, annotationIndexes.at(source.get()), *design.findGraph(top));
-            for (auto& entry : result.modules)
-                if (entry.sourceUnit == signature.sourceUnit && entry.name == signature.name) entry = signature;
-            design.markAsTop(top);
-        } catch (const firrtl::detail::Error& error) {
-            result.diagnostics.push_back(firrtl::detail::diagnostic(*source, error, module.name));
-        } catch (const std::exception& error) {
-            result.diagnostics.push_back({IngestSeverity::Error, error.what(), top, "ingest-firrtl", top, source->position(module.range)});
-        }
-    }
-    if (std::none_of(result.diagnostics.begin(), result.diagnostics.end(),
-                     [](const auto& diagnostic) { return diagnostic.kind == IngestSeverity::Error; }))
-        result.design.emplace(std::move(design));
-    return result;
+    return readMixedSources(request);
 }
+
 
 } // namespace wolvrix::lib::ingest

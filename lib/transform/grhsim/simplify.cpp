@@ -349,7 +349,7 @@ std::string cseKey(const Graph& graph, OperationId op, bool nodeScopes) {
     for (const auto value : results) key.type(graph, value);
     std::vector<const AttrKV*> attributes;
     for (const auto& entry : graph.opAttrs(op))
-        if (entry.key != kPartition && entry.key != kOriginModulesKey && !ingest::node::isAttribute(entry.key) &&
+        if (entry.key != kPartition && entry.key != kOriginModulesKey && entry.key != "grhsim.nodeClone" && !ingest::node::isAttribute(entry.key) &&
             !(history && entry.key == "prevInitFallback")) attributes.push_back(&entry);
     std::sort(attributes.begin(), attributes.end(), [](const auto* left, const auto* right) { return left->key < right->key; });
     for (const auto* entry : attributes) {

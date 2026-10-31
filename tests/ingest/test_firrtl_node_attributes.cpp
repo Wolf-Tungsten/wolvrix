@@ -115,6 +115,23 @@ void invalidMetadata() {
     });
 }
 
+void executionClones() {
+    Fixture f;
+    const auto a = f.input("a");
+    const auto original = f.compute(OperationKind::kNot, {a}, key("phase"), true);
+    const auto clone = f.compute(OperationKind::kNot, {a}, key("phase"), true);
+    const auto op = f.graph.valueDef(original), copy = f.graph.valueDef(clone);
+    f.graph.setAttr(op, "grhsim.partition", std::vector<std::string>{"general"});
+    f.graph.setAttr(copy, "grhsim.partition", std::vector<std::string>{"output"});
+    require(!node::inspect(f.graph).errors.empty(), "unmarked duplicate roots accepted across owners");
+    f.graph.setAttr(copy, "grhsim.nodeClone", true);
+    f.output("y", clone); valid(f.design);
+    auto loaded = roundTrip(f.design); valid(loaded);
+    require(node::inspect(*loaded.findGraph("top")).nodes.at(0).roots.size() == 2, "phase clone root lost across JSON");
+    f.graph.setAttr(copy, "grhsim.partition", std::vector<std::string>{"general"});
+    require(!node::inspect(f.graph).errors.empty(), "duplicate roots accepted in one execution owner");
+}
+
 void multipleResults() {
     Fixture f;
     auto& pair = f.design.createGraph("Pair");
@@ -169,7 +186,7 @@ void multipleResults() {
 }
 
 int main() {
-    try { identityAndPersistence(); mergeAndRemap(); invalidMetadata(); multipleResults(); }
+    try { identityAndPersistence(); mergeAndRemap(); invalidMetadata(); executionClones(); multipleResults(); }
     catch (const std::exception& error) { std::cerr << "[firrtl-node-attributes] " << error.what() << '\n'; return 1; }
     return 0;
 }

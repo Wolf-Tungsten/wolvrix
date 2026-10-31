@@ -101,6 +101,7 @@ inline OperationId cloneOperation(Graph& graph, OperationId source,
     const auto op = graph.createOperation(old.kind());
     for (const auto& attr : old.attrs()) graph.setAttr(op, attr.key, attr.value);
     graph.setAttr(op, kPartition, destination);
+    if (ingest::node::annotated(graph, source)) graph.setAttr(op, "grhsim.nodeClone", true);
     if (old.srcLoc()) graph.setOpSrcLoc(op, *old.srcLoc());
     for (const auto value : operands) graph.addOperand(op, value);
     for (const auto value : old.results()) {

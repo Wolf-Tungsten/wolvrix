@@ -85,7 +85,7 @@ inline void replaceOperands(Graph& graph, OperationId op, std::span<const ValueI
 inline void rewrite(Graph& graph, OperationId op, OperationKind kind, std::span<const ValueId> operands) {
     std::vector<std::string> erase;
     for (const auto& attr : graph.opAttrs(op))
-        if (attr.key != kPartition && attr.key != kOriginModulesKey && !ingest::node::isAttribute(attr.key))
+        if (attr.key != kPartition && attr.key != kOriginModulesKey && attr.key != "grhsim.nodeClone" && !ingest::node::isAttribute(attr.key))
             erase.emplace_back(attr.key);
     for (const auto& key : erase) graph.eraseAttr(op, key);
     replaceOperands(graph, op, operands);
@@ -154,7 +154,7 @@ inline std::string expressionKey(const Graph& graph, OperationId op, bool histor
     for (const auto value : graph.opResults(op)) encode(out, graph.valueLogicalType(value));
     std::vector<std::pair<std::string, AttributeValue>> attrs;
     for (const auto& entry : graph.opAttrs(op)) {
-        if (entry.key == kPartition || entry.key == kOriginModulesKey || ingest::node::isAttribute(entry.key) ||
+        if (entry.key == kPartition || entry.key == kOriginModulesKey || entry.key == "grhsim.nodeClone" || ingest::node::isAttribute(entry.key) ||
             (history && entry.key == "prevInitFallback")) continue;
         auto value = entry.value;
         if (history && entry.key == "prevInit") value = slang::SVInt::fromString(std::get<std::string>(value)).toString();

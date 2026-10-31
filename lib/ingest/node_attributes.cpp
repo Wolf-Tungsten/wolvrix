@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -205,6 +206,7 @@ void copyMembers(grh::Graph& graph, grh::OperationId from, grh::OperationId to) 
     auto attributes = read(graph, from);
     attributes.roots.clear();
     write(graph, to, std::move(attributes));
+    if (const auto clone = graph.getOperation(from).attr("grhsim.nodeClone")) graph.setAttr(to, "grhsim.nodeClone", *clone);
 }
 
 Attributes remapResults(Attributes attributes, std::span<const int64_t> oldToNew) {
@@ -327,7 +329,7 @@ grh::ValueId redirectRoots(grh::Graph& graph, grh::ValueId from, grh::ValueId to
         moved.members = original.members;
         moved.origins = original.origins;
         write(graph, target, moved);
-        for (const auto name : {std::string_view("grhsim.partition"), std::string_view("originModules")})
+        for (const auto name : {std::string_view("grhsim.partition"), std::string_view("grhsim.nodeClone"), std::string_view("originModules")})
             for (const auto& entry : graph.opAttrs(source))
                 if (entry.key == name) { graph.setAttr(target, name, entry.value); break; }
         if (const auto location = graph.opSrcLoc(source)) graph.setOpSrcLoc(target, *location);
@@ -383,7 +385,21 @@ Inspection inspect(const grh::Graph& graph) {
         }
     }
     for (auto& [identity, record] : records) {
-        if (record.roots.size() > 1) result.errors.push_back("duplicate live roots for node " + identity);
+        if (record.roots.size() > 1) {
+            // Explicit phase/leaf materializations preserve source identity.
+            // Only the owning transform's marked clones may add a root, and
+            // each root must live in a different execution owner.
+            std::set<std::vector<std::string>> owners;
+            unsigned originals = 0; bool valid = true;
+            for (const auto& root : record.roots) {
+                const auto path = owner(graph, root.operation);
+                valid &= !path.empty() && owners.emplace(path.begin(), path.end()).second;
+                const auto clone = graph.getOperation(root.operation).attr("grhsim.nodeClone");
+                valid &= !clone || std::holds_alternative<bool>(*clone);
+                originals += !(clone && std::holds_alternative<bool>(*clone) && std::get<bool>(*clone));
+            }
+            if (!valid || originals > 1) result.errors.push_back("duplicate live roots for node " + identity);
+        }
         if (record.roots.empty()) {
             bool escapes = false;
             const std::unordered_set<grh::OperationId, grh::OperationIdHash> members(record.members.begin(), record.members.end());

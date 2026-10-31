@@ -305,7 +305,7 @@ namespace wolvrix::lib::transform
             sig.attrs.reserve(attrs.size());
             for (const auto &kv : attrs)
             {
-                if (kv.key == kOriginModulesKey || ingest::node::isAttribute(kv.key))
+                if (kv.key == kOriginModulesKey || kv.key == "grhsim.nodeClone" || ingest::node::isAttribute(kv.key))
                 {
                     continue;
                 }

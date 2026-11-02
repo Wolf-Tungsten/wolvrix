@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,12 +37,95 @@ namespace
         return false;
     }
 
+    bool sameSrcLoc(const std::optional<SrcLoc>& actual, const SrcLoc& expected)
+    {
+        return actual && actual->file == expected.file && actual->line == expected.line &&
+            actual->column == expected.column && actual->endLine == expected.endLine &&
+            actual->endColumn == expected.endColumn && actual->origin == expected.origin &&
+            actual->pass == expected.pass && actual->note == expected.note;
+    }
+
+    int freezeOwnership()
+    {
+        GraphSymbolTable symbols;
+        GraphBuilder builder(symbols);
+        const auto inSymbol = symbols.intern("input"), outSymbol = symbols.intern("output");
+        const auto opSymbol = symbols.intern("compute");
+        const auto input = builder.addValue(inSymbol, 8, false);
+        const auto output = builder.addValue(outSymbol, 8, false);
+        const auto op = builder.addOp(OperationKind::kNot, opSymbol);
+        builder.addOperand(op, input); builder.addResult(op, output);
+        builder.bindInputPort("input", input); builder.bindOutputPort("output", output);
+        const std::vector<std::string> payload{std::string(8192, 'a'), std::string(4096, 'b')};
+        const SrcLoc original{"long/source/file.fir", 10, 2, 12, 7, "FIRRTL", "lower", std::string(4096, 'n')};
+        builder.setAttr(op, "payload", payload);
+        builder.setOpSrcLoc(op, original); builder.setValueSrcLoc(output, original);
+        const GraphBuilder& immutable = builder;
+        const GraphView snapshot = immutable.freeze();
+        builder.setAttr(op, "payload", std::vector<std::string>{"replacement"});
+        builder.setOpSrcLoc(op, SrcLoc{"changed.fir"});
+        builder.setValueSrcLoc(output, SrcLoc{"changed-value.fir"});
+        builder.bindOutputPort("output", input);
+        if (snapshot.opAttr(op, "payload") != AttributeValue(payload) ||
+            !sameSrcLoc(snapshot.opSrcLoc(op), original) || !sameSrcLoc(snapshot.valueSrcLoc(output), original) ||
+            snapshot.outputPorts()[0].value != output ||
+            immutable.freeze().opAttr(op, "payload") != AttributeValue(std::vector<std::string>{"replacement"}))
+            return fail("public const freeze consumed or shared mutable builder payload");
+
+        Design design;
+        auto& graph = design.createGraph("freeze_ownership");
+        const auto deadValue = graph.createValue(graph.internSymbol("dead"), 1, false);
+        const auto deadOp = graph.createOperation(OperationKind::kConstant, graph.internSymbol("dead_op"));
+        graph.addResult(deadOp, deadValue);
+        const auto liveInput = graph.createValue(graph.internSymbol("input"), 8, false,
+                                                  ValueType::Logic, std::vector<int64_t>{2}, LogicDomain::TwoState);
+        const auto liveOutput = graph.createValue(graph.internSymbol("output"), 8, false,
+                                                   ValueType::Logic, std::vector<int64_t>{2}, LogicDomain::TwoState);
+        const auto liveOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("compute"));
+        graph.addOperand(liveOp, liveInput); graph.addResult(liveOp, liveOutput);
+        graph.setAttr(liveOp, "payload", payload); graph.setOpSrcLoc(liveOp, original);
+        graph.setValueSrcLoc(liveOutput, original);
+        graph.bindInputPort("z_input", liveInput); graph.bindOutputPort("a_output", liveOutput);
+        if (!graph.eraseOp(deadOp) || !graph.eraseValue(deadValue)) return fail("could not create freeze ID gaps");
+        graph.freeze();
+        const auto frozenInput = graph.findValue("input"), frozenOutput = graph.findValue("output");
+        const auto frozenOp = graph.findOperation("compute");
+        if (!graph.frozen() || frozenInput.index != 1 || frozenOutput.index != 2 || frozenOp.index != 1 ||
+            graph.getOperation(frozenOp).attr("payload") != AttributeValue(payload) ||
+            !sameSrcLoc(graph.opSrcLoc(frozenOp), original) || !sameSrcLoc(graph.valueSrcLoc(frozenOutput), original) ||
+            graph.opOperands(frozenOp)[0] != frozenInput || graph.opResults(frozenOp)[0] != frozenOutput ||
+            graph.valueDef(frozenOutput) != frozenOp || graph.valueUsers(frozenInput).size() != 1 ||
+            graph.valueUsers(frozenInput)[0].operation != frozenOp ||
+            graph.inputPorts()[0].value != frozenInput || graph.outputPorts()[0].value != frozenOutput ||
+            graph.valueShape(frozenOutput).size() != 1 || graph.valueShape(frozenOutput)[0] != 2 ||
+            graph.valueDomain(frozenOutput) != LogicDomain::TwoState)
+            return fail("Graph::freeze changed remapping, owned payload, SrcLoc, bindings, or uses");
+
+        const auto invalidInput = graph.createValue(graph.internSymbol("erased_input"), 8, false);
+        graph.replaceOperand(frozenOp, 0, invalidInput);
+        if (!graph.eraseValueUnchecked(invalidInput)) return fail("could not create invalid freeze operand");
+        std::string failure;
+        try { graph.freeze(); }
+        catch (const std::runtime_error& error) { failure = error.what(); }
+        if (failure != "ValueId refers to erased value during freeze" || graph.frozen() ||
+            graph.getOperation(frozenOp).attr("payload") != AttributeValue(payload) ||
+            !sameSrcLoc(graph.opSrcLoc(frozenOp), original) || !sameSrcLoc(graph.valueSrcLoc(frozenOutput), original) ||
+            graph.opOperands(frozenOp)[0] != invalidInput)
+            return fail("failed Graph::freeze changed diagnostics or consumed mutable payload");
+        graph.replaceOperand(frozenOp, 0, frozenInput);
+        graph.freeze();
+        if (graph.getOperation(graph.findOperation("compute")).attr("payload") != AttributeValue(payload))
+            return fail("repaired graph lost owned payload after failed freeze");
+        return 0;
+    }
+
 } // namespace
 
 int main()
 {
     try
     {
+        if (freezeOwnership() != 0) return 1;
         {
             Design ordered;
             auto& last = ordered.createGraph("z");

@@ -58,6 +58,48 @@ namespace
 
 int main()
 {
+    // Port flags must keep all three inout values alive during constant
+    // cleanup, and follow every ordinary output alias that folding rebinds.
+    {
+        namespace grh = wolvrix::lib::grh;
+        grh::Design design;
+        auto& graph = design.createGraph("port_bound_constants");
+        const auto in = makeConst(graph, "io_in", "io_in_op", 8, false, "8'h11");
+        const auto out = makeConst(graph, "io_out", "io_out_op", 8, false, "8'h22");
+        const auto oe = makeConst(graph, "io_oe", "io_oe_op", 1, false, "1'b1");
+        graph.bindInoutPort("io", in, out, oe);
+        const auto input = makeConst(graph, "input_const", "input_const_op", 8, false, "8'h33");
+        graph.bindInputPort("input", input);
+        const auto output = makeConst(graph, "output_const", "output_const_op", 8, false, "8'h44");
+        graph.bindOutputPort("direct", output);
+        const auto aliasSource = makeConst(graph, "alias_source", "alias_source_op", 8, false, "8'h66");
+        const auto alias = graph.createValue(graph.internSymbol("alias_output"), 8, false);
+        const auto assign = graph.createOperation(grh::OperationKind::kAssign, graph.internSymbol("alias_assign"));
+        graph.addOperand(assign, aliasSource); graph.addResult(assign, alias);
+        graph.bindOutputPort("alias_a", alias); graph.bindOutputPort("alias_z", alias);
+        makeConst(graph, "unused", "unused_op", 8, false, "8'h77");
+        graph.freeze();
+        PassManager manager; manager.addPass(std::make_unique<ConstantFoldPass>());
+        PassDiagnostics diagnostics;
+        const auto result = manager.run(design, diagnostics);
+        if (!result.success || diagnostics.hasError()) return fail("port-bound constant cleanup failed");
+        for (const auto name : {"io_in", "io_out", "io_oe"}) {
+            const auto value = graph.findValue(name);
+            if (!value || !graph.valueIsInout(value) || graph.valueIsInput(value) || graph.valueIsOutput(value) ||
+                !graph.valueDef(value) || graph.opKind(graph.valueDef(value)) != grh::OperationKind::kConstant)
+                return fail("constant cleanup lost an inout in/out/oe value or its flags");
+        }
+        const auto newOutput = graph.outputPortValue("alias_a");
+        const auto oldAlias = graph.findValue("alias_output");
+        if (!graph.findValue("input_const") || !graph.findValue("output_const") ||
+            !graph.valueIsInput(graph.findValue("input_const")) ||
+            !graph.valueIsOutput(graph.findValue("output_const")) ||
+            graph.outputPortValue("alias_z") != newOutput || !graph.valueIsOutput(newOutput) ||
+            (oldAlias && graph.valueIsOutput(oldAlias)) || graph.findOperation("alias_assign") ||
+            graph.findOperation("unused_op"))
+            return fail("constant cleanup changed direct ports, alias rebinding flags, or unused deletion");
+    }
+
     // Case 1: multi-iteration folding rewires downstream users
     {
         wolvrix::lib::grh::Design design;

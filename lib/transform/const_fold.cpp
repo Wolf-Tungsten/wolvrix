@@ -199,28 +199,12 @@ namespace wolvrix::lib::transform
 
         bool isValuePortBound(const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::ValueId value)
         {
-            for (const auto &port : graph.inputPorts())
-            {
-                if (port.value == value)
-                {
-                    return true;
-                }
-            }
-            for (const auto &port : graph.outputPorts())
-            {
-                if (port.value == value)
-                {
-                    return true;
-                }
-            }
-            for (const auto &port : graph.inoutPorts())
-            {
-                if (port.in == value || port.out == value || port.oe == value)
-                {
-                    return true;
-                }
-            }
-            return false;
+            // Port binding is indexed on the value itself.  Besides avoiding
+            // an O(number-of-ports) scan for every constant result, querying
+            // all three predicates preserves the in/out/oe semantics of an
+            // inout port.
+            return graph.valueIsInput(value) || graph.valueIsOutput(value) ||
+                   graph.valueIsInout(value);
         }
 
         std::optional<ConstantValue> parseConstLiteral(const wolvrix::lib::grh::Graph &graph, const wolvrix::lib::grh::Operation &op, const wolvrix::lib::grh::Value &value, const std::string &literal, const std::function<void(std::string)> &onError)
@@ -711,8 +695,7 @@ namespace wolvrix::lib::transform
             {
                 return false;
             }
-            const wolvrix::lib::grh::Value value = graph.getValue(valueId);
-            return graph.isDeclaredSymbol(value.symbol());
+            return graph.isDeclaredSymbol(graph.valueSymbol(valueId));
         }
 
         struct DeclaredMaterialization
@@ -955,11 +938,14 @@ namespace wolvrix::lib::transform
             }
 
             std::vector<std::string> outputPortsToUpdate;
-            for (const auto &port : graph.outputPorts())
+            if (graph.valueIsOutput(oldValue))
             {
-                if (port.value == oldValue)
+                for (const auto &port : graph.outputPorts())
                 {
-                    outputPortsToUpdate.push_back(port.name);
+                    if (port.value == oldValue)
+                    {
+                        outputPortsToUpdate.push_back(port.name);
+                    }
                 }
             }
 
@@ -1181,8 +1167,7 @@ namespace wolvrix::lib::transform
                                               ctx.protectDeclaredSymbols, op, idx, resId, sv);
                 // Queue before replacing uses: the old result loses its user
                 // list during the rewrite. Erasure is deferred until drained.
-                const auto resultValue = ctx.graph.getValue(resId);
-                for (const auto &use : resultValue.users())
+                for (const auto &use : ctx.graph.valueUsers(resId))
                 {
                     enqueue(use.operation);
                 }
@@ -1368,8 +1353,7 @@ namespace wolvrix::lib::transform
                 {
                     recordDeclaredAssign(declaredAssigns, op, resultId, operandId);
                 }
-                const wolvrix::lib::grh::Value updatedResult = ctx.graph.getValue(resultId);
-                if (updatedResult.users().empty())
+                if (ctx.graph.valueUsers(resultId).empty())
                 {
                     opsToErase.push_back(opId);
                 }
@@ -1417,15 +1401,14 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : ctx.graph.operations())
         {
-            const wolvrix::lib::grh::Operation op = ctx.graph.getOperation(opId);
-            if (op.kind() != wolvrix::lib::grh::OperationKind::kConstant)
+            if (ctx.graph.opKind(opId) != wolvrix::lib::grh::OperationKind::kConstant)
             {
                 continue;
             }
-            const auto &results = op.results();
+            const auto results = ctx.graph.opResults(opId);
             if (results.empty())
             {
-                error(ctx.graph, op, "kConstant missing result");
+                error(ctx.graph, ctx.graph.getOperation(opId), "kConstant missing result");
                 ctx.failed = true;
                 continue;
             }
@@ -1434,7 +1417,7 @@ namespace wolvrix::lib::transform
             {
                 if (!resId.valid())
                 {
-                    error(ctx.graph, op, "kConstant missing result");
+                    error(ctx.graph, ctx.graph.getOperation(opId), "kConstant missing result");
                     ctx.failed = true;
                     live = true;
                     break;
@@ -1449,7 +1432,7 @@ namespace wolvrix::lib::transform
                     live = true;
                     break;
                 }
-                if (!ctx.graph.getValue(resId).users().empty())
+                if (!ctx.graph.valueUsers(resId).empty())
                 {
                     live = true;
                     break;
@@ -1463,10 +1446,9 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : deadConstOps)
         {
-            const wolvrix::lib::grh::Operation op = ctx.graph.getOperation(opId);
             if (!ctx.graph.eraseOp(opId))
             {
-                error(ctx.graph, op, "Failed to erase dead kConstant op");
+                error(ctx.graph, ctx.graph.getOperation(opId), "Failed to erase dead kConstant op");
                 ctx.failed = true;
             }
             else
@@ -1489,8 +1471,7 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : opOrder)
         {
-            const wolvrix::lib::grh::Operation op = ctx.graph.getOperation(opId);
-            const auto kind = op.kind();
+            const auto kind = ctx.graph.opKind(opId);
             
             // Handle unsigned >= 0 (always true) and unsigned <= max (always true)
             bool isGe = (kind == wolvrix::lib::grh::OperationKind::kGe);
@@ -1505,8 +1486,8 @@ namespace wolvrix::lib::transform
                 continue;
             }
             
-            const auto &operands = op.operands();
-            const auto &results = op.results();
+            const auto operands = ctx.graph.opOperands(opId);
+            const auto results = ctx.graph.opResults(opId);
             if (operands.size() < 2 || results.empty())
             {
                 continue;
@@ -1521,13 +1502,8 @@ namespace wolvrix::lib::transform
                 continue;
             }
             
-            const wolvrix::lib::grh::Value lhsValue = ctx.graph.getValue(lhsId);
-            const wolvrix::lib::grh::Value rhsValue = ctx.graph.getValue(rhsId);
-
-            const auto isUnsignedCompare = [&](const wolvrix::lib::grh::Value &lhs,
-                                               const wolvrix::lib::grh::Value &rhs) -> bool {
-                return !(lhs.isSigned() && rhs.isSigned());
-            };
+            const bool lhsSigned = ctx.graph.valueSigned(lhsId);
+            const bool rhsSigned = ctx.graph.valueSigned(rhsId);
 
             const auto isConstZero = [&](wolvrix::lib::grh::ValueId valueId) -> bool {
                 auto it = ctx.constants.find(valueId);
@@ -1544,6 +1520,9 @@ namespace wolvrix::lib::transform
             };
 
             const auto foldToBool = [&](bool value) {
+                // The accepted rewrite needs an owning snapshot: constant
+                // creation and root redirection mutate the graph below.
+                const wolvrix::lib::grh::Operation op = ctx.graph.getOperation(opId);
                 slang::SVInt foldedValue(1, value ? 1 : 0, false);
                 auto onError = [&](const std::string &msg)
                 { this->error(ctx.graph, op, msg); ctx.failed = true; };
@@ -1560,7 +1539,7 @@ namespace wolvrix::lib::transform
                 ++ctx.unsignedCmpSimplified;
             };
 
-            if (isTwoState && isUnsignedCompare(lhsValue, rhsValue))
+            if (isTwoState && !(lhsSigned && rhsSigned))
             {
                 // In 2-state semantics, unsigned 0 > x and x < 0 are always false.
                 if ((isGt && isConstZero(lhsId)) || (isLt && isConstZero(rhsId)))
@@ -1578,7 +1557,7 @@ namespace wolvrix::lib::transform
             
             // Check for unsigned >= 0 (always true for unsigned)
             // LHS must be unsigned, RHS must be constant 0
-            if (isGe && !lhsValue.isSigned())
+            if (isGe && !lhsSigned)
             {
                 auto rhsConstIt = ctx.constants.find(rhsId);
                 if (rhsConstIt != ctx.constants.end())
@@ -1587,21 +1566,7 @@ namespace wolvrix::lib::transform
                     // Check if RHS is zero
                     if (rhsSv.getBitWidth() > 0 && rhsSv.getActiveBits() == 0)
                     {
-                        // Replace with constant 1'b1
-                        slang::SVInt trueValue(1, 1, false);
-                        auto onError = [&](const std::string &msg)
-                        { this->error(ctx.graph, op, msg); ctx.failed = true; };
-                        wolvrix::lib::grh::ValueId newValue =
-                            createReplacementConstant(ctx.graph, *ctx.pool, ctx.constants,
-                                                      ctx.protectDeclaredSymbols, op, 0, resultId, trueValue);
-                        replaceUsers(ctx.graph, resultId, newValue, onError);
-                        if (ctx.protectDeclaredSymbols && isDeclaredValue(ctx.graph, resultId))
-                        {
-                            recordDeclaredConst(declaredAssigns, op, resultId, formatConstLiteral(trueValue));
-                        }
-                        opsToErase.push_back(opId);
-                        simplified = true;
-                        ++ctx.unsignedCmpSimplified;
+                        foldToBool(true);
                         continue;
                     }
                 }
@@ -1609,13 +1574,13 @@ namespace wolvrix::lib::transform
             
             // Check for unsigned <= max_value (always true for unsigned)
             // LHS must be unsigned, RHS must be constant with all 1s at LHS width
-            if (isLe && !lhsValue.isSigned())
+            if (isLe && !lhsSigned)
             {
                 auto rhsConstIt = ctx.constants.find(rhsId);
                 if (rhsConstIt != ctx.constants.end())
                 {
                     const auto &rhsSv = rhsConstIt->second.value;
-                    int64_t lhsWidth = lhsValue.width();
+                    int64_t lhsWidth = ctx.graph.valueWidth(lhsId);
                     
                     if (lhsWidth > 0 && rhsSv.getBitWidth() > 0)
                     {
@@ -1634,21 +1599,7 @@ namespace wolvrix::lib::transform
                         
                         if (allOnes)
                         {
-                            // Replace with constant 1'b1
-                            slang::SVInt trueValue(1, 1, false);
-                            auto onError = [&](const std::string &msg)
-                            { this->error(ctx.graph, op, msg); ctx.failed = true; };
-                            wolvrix::lib::grh::ValueId newValue =
-                                createReplacementConstant(ctx.graph, *ctx.pool, ctx.constants,
-                                                          ctx.protectDeclaredSymbols, op, 0, resultId, trueValue);
-                            replaceUsers(ctx.graph, resultId, newValue, onError);
-                            if (ctx.protectDeclaredSymbols && isDeclaredValue(ctx.graph, resultId))
-                            {
-                                recordDeclaredConst(declaredAssigns, op, resultId, formatConstLiteral(trueValue));
-                            }
-                            opsToErase.push_back(opId);
-                            simplified = true;
-                            ++ctx.unsignedCmpSimplified;
+                            foldToBool(true);
                         }
                     }
                 }

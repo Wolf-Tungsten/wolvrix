@@ -73,12 +73,17 @@ class QualificationContext {
 public:
     explicit QualificationContext(std::span<const std::string> instancePath);
 private:
-    friend void qualify(grh::Graph&, grh::OperationId, QualificationContext&);
+    friend void copyQualified(const grh::Graph&, grh::OperationId,
+                              grh::Graph&, grh::OperationId, QualificationContext&);
     const std::vector<std::string> instancePath_;
     std::unordered_map<std::string, std::string> qualified_;
 };
 void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string> instancePath);
 void qualify(grh::Graph& graph, grh::OperationId op, QualificationContext& context);
+// Borrow source associations until the final qualified payload is built, then
+// move it into the target. Result positions must be preserved by the clone.
+void copyQualified(const grh::Graph& source, grh::OperationId from,
+                   grh::Graph& target, grh::OperationId to, QualificationContext& context);
 Attributes remapResults(Attributes attributes, std::span<const int64_t> oldToNew);
 
 enum class MergeReason { SameComputation, WholeNode, ExecutionLeaf };
@@ -119,6 +124,11 @@ struct Inspection {
 };
 
 Inspection inspect(const grh::Graph& graph);
+// Validate node attributes while collecting every diagnostic, without
+// materializing the inspection census (node records, roots, or fragments).
+// This is the appropriate entry point for passes that only need to reject
+// malformed annotations.
+std::vector<std::string> scanAttributeErrors(const grh::Graph& graph);
 void requireValid(const grh::Graph& graph);
 
 // Establish only at source construction, never to upgrade a loaded checkpoint.

@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -2242,6 +2243,16 @@ namespace wolvrix::lib::grh
 
     GraphView GraphBuilder::freeze() const
     {
+        return freezeImpl(nullptr);
+    }
+
+    GraphView GraphBuilder::freezeConsuming()
+    {
+        return freezeImpl(this);
+    }
+
+    GraphView GraphBuilder::freezeImpl(GraphBuilder* consume) const
+    {
         GraphView view;
         view.graphId_ = graphId_;
 
@@ -2348,7 +2359,8 @@ namespace wolvrix::lib::grh
             view.operations_.push_back(opId);
             view.opKinds_.push_back(opData.kind);
             view.opSymbols_.push_back(opData.symbol);
-            view.opSrcLocs_.push_back(opData.srcLoc);
+            if (consume) view.opSrcLocs_.emplace_back();
+            else view.opSrcLocs_.push_back(opData.srcLoc);
             bindViewSymbol(opData.symbol, GraphView::SymbolKind::kOperation, opId.index, "Operation");
 
             view.opOperandRanges_.push_back(Range{operandOffset, opData.operands.size()});
@@ -2366,7 +2378,7 @@ namespace wolvrix::lib::grh
             resultOffset += opData.results.size();
 
             view.opAttrRanges_.push_back(Range{attrOffset, opData.attrs.size()});
-            view.opAttrs_.insert(view.opAttrs_.end(), opData.attrs.begin(), opData.attrs.end());
+            if (!consume) view.opAttrs_.insert(view.opAttrs_.end(), opData.attrs.begin(), opData.attrs.end());
             attrOffset += opData.attrs.size();
         }
 
@@ -2407,7 +2419,8 @@ namespace wolvrix::lib::grh
             view.valueIsInput_.push_back(valueData.isInput ? 1 : 0);
             view.valueIsOutput_.push_back(valueData.isOutput ? 1 : 0);
             view.valueIsInout_.push_back(valueData.isInout ? 1 : 0);
-            view.valueSrcLocs_.push_back(valueData.srcLoc);
+            if (consume) view.valueSrcLocs_.emplace_back();
+            else view.valueSrcLocs_.push_back(valueData.srcLoc);
             bindViewSymbol(valueData.symbol, GraphView::SymbolKind::kValue, valueId.index, "Value");
 
             OperationId def = OperationId::invalid();
@@ -2418,29 +2431,53 @@ namespace wolvrix::lib::grh
             view.valueDefs_.push_back(def);
         }
 
-        view.inputPorts_.reserve(inputPorts_.size());
-        for (const auto &port : inputPorts_)
-        {
-            Port mapped{port.name, remapValue(port.value)};
-            view.inputPorts_.push_back(mapped);
+        // Sort source indices while the builder is intact. The consuming path
+        // prepares mapped ports with empty names, then transfers names only
+        // after all remapping, validation and allocation have succeeded.
+        const auto portOrder = [](const auto& ports) {
+            std::vector<std::size_t> order(ports.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                return ports[a].name < ports[b].name;
+            });
+            return order;
+        };
+        std::vector<std::size_t> inputOrder, outputOrder, inoutOrder;
+        if (consume) {
+            inputOrder = portOrder(inputPorts_);
+            outputOrder = portOrder(outputPorts_);
+            inoutOrder = portOrder(inoutPorts_);
         }
-        std::sort(view.inputPorts_.begin(), view.inputPorts_.end(), portLess);
+
+        view.inputPorts_.reserve(inputPorts_.size());
+        if (consume) for (const auto& port : inputPorts_) (void)remapValue(port.value);
+        for (std::size_t i = 0; i < inputPorts_.size(); ++i)
+        {
+            const auto& port = inputPorts_[consume ? inputOrder[i] : i];
+            view.inputPorts_.push_back({consume ? std::string{} : port.name, remapValue(port.value)});
+        }
+        if (!consume) std::sort(view.inputPorts_.begin(), view.inputPorts_.end(), portLess);
 
         view.outputPorts_.reserve(outputPorts_.size());
-        for (const auto &port : outputPorts_)
+        if (consume) for (const auto& port : outputPorts_) (void)remapValue(port.value);
+        for (std::size_t i = 0; i < outputPorts_.size(); ++i)
         {
-            Port mapped{port.name, remapValue(port.value)};
-            view.outputPorts_.push_back(mapped);
+            const auto& port = outputPorts_[consume ? outputOrder[i] : i];
+            view.outputPorts_.push_back({consume ? std::string{} : port.name, remapValue(port.value)});
         }
-        std::sort(view.outputPorts_.begin(), view.outputPorts_.end(), portLess);
+        if (!consume) std::sort(view.outputPorts_.begin(), view.outputPorts_.end(), portLess);
 
         view.inoutPorts_.reserve(inoutPorts_.size());
-        for (const auto &port : inoutPorts_)
-        {
-            InoutPort mapped{port.name, remapValue(port.in), remapValue(port.out), remapValue(port.oe)};
-            view.inoutPorts_.push_back(mapped);
+        if (consume) for (const auto& port : inoutPorts_) {
+            (void)remapValue(port.in); (void)remapValue(port.out); (void)remapValue(port.oe);
         }
-        std::sort(view.inoutPorts_.begin(), view.inoutPorts_.end(), inoutPortLess);
+        for (std::size_t i = 0; i < inoutPorts_.size(); ++i)
+        {
+            const auto& port = inoutPorts_[consume ? inoutOrder[i] : i];
+            view.inoutPorts_.push_back({consume ? std::string{} : port.name,
+                remapValue(port.in), remapValue(port.out), remapValue(port.oe)});
+        }
+        if (!consume) std::sort(view.inoutPorts_.begin(), view.inoutPorts_.end(), inoutPortLess);
 
         std::vector<std::vector<ValueUser>> users(valueCount);
         for (std::size_t i = 0; i < operations_.size(); ++i)
@@ -2468,6 +2505,36 @@ namespace wolvrix::lib::grh
             view.valueUserRanges_.push_back(Range{userOffset, bucket.size()});
             view.useList_.insert(view.useList_.end(), bucket.begin(), bucket.end());
             userOffset += bucket.size();
+        }
+
+        if (consume)
+        {
+            // This resize is the final potentially throwing allocation. The
+            // commit below only assigns into preallocated storage using
+            // noexcept moves, so a failed preparation leaves the builder intact.
+            view.opAttrs_.resize(attrOffset);
+            static_assert(std::is_nothrow_move_assignable_v<AttrKV>);
+            static_assert(std::is_nothrow_move_assignable_v<std::optional<SrcLoc>>);
+            static_assert(std::is_nothrow_move_assignable_v<std::string>);
+            static_assert(std::is_nothrow_move_constructible_v<GraphView>);
+            static_assert(std::is_nothrow_move_assignable_v<GraphView>);
+            std::size_t opIndex = 0, attrIndex = 0, valueIndex = 0;
+            for (auto& opData : consume->operations_)
+            {
+                if (!opData.alive) continue;
+                view.opSrcLocs_[opIndex++] = std::move(opData.srcLoc);
+                for (auto& attr : opData.attrs) view.opAttrs_[attrIndex++] = std::move(attr);
+            }
+            for (auto& valueData : consume->values_)
+            {
+                if (valueData.alive) view.valueSrcLocs_[valueIndex++] = std::move(valueData.srcLoc);
+            }
+            for (std::size_t i = 0; i < inputOrder.size(); ++i)
+                view.inputPorts_[i].name = std::move(consume->inputPorts_[inputOrder[i]].name);
+            for (std::size_t i = 0; i < outputOrder.size(); ++i)
+                view.outputPorts_[i].name = std::move(consume->outputPorts_[outputOrder[i]].name);
+            for (std::size_t i = 0; i < inoutOrder.size(); ++i)
+                view.inoutPorts_[i].name = std::move(consume->inoutPorts_[inoutOrder[i]].name);
         }
 
         return view;
@@ -3628,7 +3695,7 @@ namespace wolvrix::lib::grh
         if (builder_)
         {
             owner_->touch();
-            view_ = builder_->freeze();
+            view_ = builder_->freezeConsuming();
             builder_.reset();
             invalidateCaches();
         }

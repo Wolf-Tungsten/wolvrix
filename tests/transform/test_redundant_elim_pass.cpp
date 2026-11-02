@@ -350,6 +350,51 @@ int main()
             return fail("flat temp must stay driven by the pack assign");
     }
 
+    // Output renaming may be the first mutation of a frozen graph. Both an
+    // orphan name collision and a direct rename must keep the remaining ports
+    // valid after the frozen view is released.
+    for (const bool orphanCollision : {false, true}) {
+        using namespace wolvrix::lib::grh;
+        Design renameDesign;
+        Graph& renameGraph = renameDesign.createGraph("frozen_constant_output_names");
+        const std::array<std::string, 2> names{
+            "first_constant_output_with_a_long_name", "second_constant_output_with_a_long_name"};
+        const std::array<std::string, 2> literals{"8'h5a", "8'hc3"};
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            const ValueId value = renameGraph.createValue(
+                renameGraph.internSymbol("temporary_constant_" + std::to_string(index)), 8, false);
+            const OperationId constant = renameGraph.createOperation(OperationKind::kConstant,
+                renameGraph.internSymbol("literal_op_" + std::to_string(index)));
+            renameGraph.addResult(constant, value);
+            renameGraph.setAttr(constant, "constValue", literals[index]);
+            renameGraph.bindOutputPort(names[index], value);
+        }
+        if (orphanCollision)
+            renameGraph.createValue(renameGraph.internSymbol(names.front()), 8, false);
+        renameGraph.freeze();
+
+        PassManager renameManager;
+        renameManager.addPass(std::make_unique<RedundantElimPass>());
+        PassDiagnostics renameDiagnostics;
+        const auto renameResult = renameManager.run(renameDesign, renameDiagnostics);
+        if (!renameResult.success || renameDiagnostics.hasError() || !renameResult.changed)
+            return fail("frozen constant output rename failed");
+        if (renameGraph.outputPorts().size() != names.size())
+            return fail("frozen constant output rename changed the port count");
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            const ValueId output = renameGraph.outputPortValue(names[index]);
+            if (!output.valid() || renameGraph.findValue(names[index]) != output ||
+                !renameGraph.valueIsOutput(output))
+                return fail("frozen constant output rename lost a port binding or symbol");
+            const OperationId definition = renameGraph.valueDef(output);
+            const auto literal = renameGraph.getOperation(definition).attr("constValue");
+            if (renameGraph.opKind(definition) != OperationKind::kConstant || !literal ||
+                !std::holds_alternative<std::string>(*literal) ||
+                std::get<std::string>(*literal) != literals[index])
+                return fail("frozen constant output rename changed a driver");
+        }
+    }
+
     // A shared constant feeding output assigns must keep both output drivers
     // and their source origins when the assigns are replaced with constants.
     {

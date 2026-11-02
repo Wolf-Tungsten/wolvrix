@@ -48,6 +48,13 @@ roots, duplicate source roots, partial/nonconvex regions and phase copies are
 valid. `grhsim.nodeClone=true` is diagnostic only. Representation corruption is
 a verifier error; incomplete source regions are not.
 
+`scanAttributeErrors` performs the same validation and returns the complete
+ordered diagnostic list without building `inspect`'s node/member/root census.
+`redundant-elim` uses this validation entry point. `copyQualified` borrows source
+associations, builds final instance-qualified keys with a shared
+`QualificationContext`, and moves the normalized vectors into the clone.
+Result positions must match the source; no borrowed data survives target mutation.
+
 ## Policy and checkpoints
 
 The lowerer establishes policy and `firrtl.nodeInventory` at source creation.

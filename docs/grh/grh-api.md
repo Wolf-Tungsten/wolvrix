@@ -406,6 +406,14 @@ Graph 有两种内部状态，影响遍历性能：
 
 ### 冻结与解冻
 
+`GraphBuilder::freeze() const` 返回独立快照，保留 builder 的全部数据，后续仍可
+修改 builder 或再次冻结。`Graph::freeze()` 会消耗内部 builder：先完成 ID/端口
+映射、符号绑定验证和目标存储分配，再移动 attributes、op/value SrcLoc 与端口名。
+最后的所有权转移只使用不会抛异常的移动；准备失败时原可变图及其 payload 保留，
+可修复后重试。两条路径保持相同的实体顺序、端口名排序、use-list 和绑定结果。
+`getOperation()` 仍返回拥有数据的快照；`opOperands/opResults/opAttrs/valueUsers`
+返回借用数据，修改图或冻结前应先消费完毕，跨修改的遍历须持有必要的副本。
+
 ```cpp
 // 冻结以优化遍历性能
 graph.freeze();

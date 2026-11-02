@@ -172,13 +172,10 @@ namespace wolvrix::lib::transform
                    !graph.valueIsInout(valueId);
         }
 
-        // Graph has no public lean users accessor, so this materializes the
-        // Value; call sites reach it only for output-port values (rare).
         bool hasOtherUsers(const wolvrix::lib::grh::Graph &graph,
                            wolvrix::lib::grh::ValueId valueId)
         {
-            const wolvrix::lib::grh::Value value = graph.getValue(valueId);
-            return !value.users().empty();
+            return !graph.valueUsers(valueId).empty();
         }
 
         bool isTemporarySymbol(const wolvrix::lib::grh::Graph &graph,
@@ -320,15 +317,12 @@ namespace wolvrix::lib::transform
             return sig;
         }
 
-        // Graph has no public lean users accessor, so this materializes the
-        // Value; call sites reach it only for screened rewrite candidates.
         bool isSingleUser(const wolvrix::lib::grh::Graph &graph,
                           wolvrix::lib::grh::ValueId valueId,
                           wolvrix::lib::grh::OperationId user)
         {
-            const wolvrix::lib::grh::Value value = graph.getValue(valueId);
             std::size_t count = 0;
-            for (const auto &use : value.users())
+            for (const auto &use : graph.valueUsers(valueId))
             {
                 if (use.operation == user)
                 {
@@ -453,11 +447,14 @@ namespace wolvrix::lib::transform
             }
 
             std::vector<std::string> outputPortsToUpdate;
-            for (const auto &port : graph.outputPorts())
+            if (graph.valueIsOutput(from))
             {
-                if (port.value == from)
+                for (const auto &port : graph.outputPorts())
                 {
-                    outputPortsToUpdate.push_back(port.name);
+                    if (port.value == from)
+                    {
+                        outputPortsToUpdate.push_back(port.name);
+                    }
                 }
             }
             for (const auto &portName : outputPortsToUpdate)
@@ -495,9 +492,9 @@ namespace wolvrix::lib::transform
         for (const auto &entry : design().graphs())
         {
             wolvrix::lib::grh::Graph &graph = *entry.second;
-            const auto nodeInspection = ingest::node::inspect(graph);
-            if (!nodeInspection.errors.empty()) {
-                for (const auto& problem : nodeInspection.errors) this->error(graph, problem);
+            const auto nodeErrors = ingest::node::scanAttributeErrors(graph);
+            if (!nodeErrors.empty()) {
+                for (const auto& problem : nodeErrors) this->error(graph, problem);
                 result.failed = true;
                 return result;
             }
@@ -1420,8 +1417,7 @@ namespace wolvrix::lib::transform
                 }
                 auto onError = [&](const std::string &msg)
                 { this->error(graph, graph.getOperation(opId), msg); };
-                const auto resultValue = graph.getValue(resultId);
-                for (const auto &use : resultValue.users())
+                for (const auto &use : graph.valueUsers(resultId))
                 {
                     enqueue(use.operation);
                     // `enqueue` grows both state arrays for operation IDs
@@ -1446,7 +1442,12 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            for (const auto &port : graph.outputPorts())
+            // Renaming a frozen graph's first constant output thaws it and
+            // releases the view that owns this port span.
+            const auto outputPortSpan = graph.outputPorts();
+            const std::vector<wolvrix::lib::grh::Port> outputPorts(
+                outputPortSpan.begin(), outputPortSpan.end());
+            for (const auto &port : outputPorts)
             {
                 if (port.name.empty() || !port.value.valid())
                 {
@@ -1468,12 +1469,9 @@ namespace wolvrix::lib::transform
                 wolvrix::lib::grh::ValueId existing = graph.findValue(port.name);
                 if (existing.valid() && existing != port.value)
                 {
-                    // Cold path (per output port): keep the fat Value for the
-                    // users emptiness check — no lean users accessor exists.
-                    wolvrix::lib::grh::Value existingValue = graph.getValue(existing);
-                    if (existingValue.isInput() || existingValue.isOutput() ||
-                        existingValue.isInout() || existingValue.definingOp().valid() ||
-                        !existingValue.users().empty())
+                    if (graph.valueIsInput(existing) || graph.valueIsOutput(existing) ||
+                        graph.valueIsInout(existing) || graph.valueDef(existing).valid() ||
+                        !graph.valueUsers(existing).empty())
                     {
                         continue;
                     }

@@ -141,12 +141,18 @@ void validateKey(std::string_view encoded) {
 }
 
 template <typename T>
-T attr(const grh::Graph& graph, grh::OperationId op, std::string_view name) {
+const T* borrowedAttr(const grh::Graph& graph, grh::OperationId op, std::string_view name) {
     for (const auto& entry : graph.opAttrs(op)) if (entry.key == name) {
-        if (const auto* value = std::get_if<T>(&entry.value)) return *value;
+        if (const auto* value = std::get_if<T>(&entry.value)) return value;
         throw std::invalid_argument("wrong node attribute type: " + std::string(name));
     }
-    return {};
+    return nullptr;
+}
+
+template <typename T>
+T attr(const grh::Graph& graph, grh::OperationId op, std::string_view name) {
+    const auto* value = borrowedAttr<T>(graph, op, name);
+    return value ? *value : T{};
 }
 
 template <typename T> void unique(std::vector<T>& values) {
@@ -252,19 +258,20 @@ void write(grh::Graph& graph, grh::OperationId op, Attributes attributes) {
     }
     std::vector<std::string> roots;
     std::vector<int64_t> indices;
-    for (const auto& root : attributes.roots) {
+    roots.reserve(attributes.roots.size()); indices.reserve(attributes.roots.size());
+    for (auto& root : attributes.roots) {
         if (root.result < 0 || static_cast<uint64_t>(root.result) >= graph.opResults(op).size())
             throw std::invalid_argument("node root result index out of range");
-        roots.push_back(root.key); indices.push_back(root.result);
+        roots.push_back(std::move(root.key)); indices.push_back(root.result);
     }
-    const auto put = [&](std::string_view name, const auto& value) {
+    const bool hasAttributes = !attributes.members.empty() || !attributes.roots.empty() || !attributes.origins.empty();
+    const auto put = [&](std::string_view name, auto& value) {
         if (value.empty()) graph.eraseAttr(op, name);
-        else graph.setAttr(op, name, value);
+        else graph.setAttr(op, name, std::move(value));
     };
     put(kMembers, attributes.members); put(kOrigins, attributes.origins);
     put(kRoots, roots); put(kRootResults, indices);
-    if (!attributes.members.empty() || !attributes.roots.empty() || !attributes.origins.empty())
-        graph.setMetadata(kSchema, kSchemaRevision);
+    if (hasAttributes) graph.setMetadata(kSchema, kSchemaRevision);
 }
 
 namespace {
@@ -322,22 +329,27 @@ QualificationContext::QualificationContext(std::span<const std::string> instance
 
 void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string> instancePath) {
     if (!annotated(graph, op)) return;
-    auto attributes = read(graph, op);
-    const auto qualifyKey = [&](std::string& encoded) {
-        auto identity = parseKey(encoded);
-        identity.instancePath.insert(identity.instancePath.begin(), instancePath.begin(), instancePath.end());
-        encoded = key(identity);
-    };
-    for (auto& member : attributes.members) qualifyKey(member);
-    for (auto& origin : attributes.origins) qualifyKey(origin);
-    for (auto& root : attributes.roots) qualifyKey(root.key);
-    write(graph, op, std::move(attributes));
+    QualificationContext context(instancePath);
+    copyQualified(graph, op, graph, op, context);
 }
 
 void qualify(grh::Graph& graph, grh::OperationId op, QualificationContext& context) {
-    if (!annotated(graph, op)) return;
-    auto attributes = read(graph, op);
-    const auto qualifyKey = [&](std::string& encoded) {
+    copyQualified(graph, op, graph, op, context);
+}
+
+void copyQualified(const grh::Graph& source, grh::OperationId from,
+                   grh::Graph& target, grh::OperationId to, QualificationContext& context) {
+    if (!annotated(source, from)) return;
+    const auto strings = [&](std::string_view name) -> std::span<const std::string> {
+        const auto* value = borrowedAttr<std::vector<std::string>>(source, from, name);
+        return value ? std::span<const std::string>(*value) : std::span<const std::string>{};
+    };
+    // Match read()'s type-check and length-error order before parsing keys.
+    const auto members = strings(kMembers), origins = strings(kOrigins), roots = strings(kRoots);
+    const auto* rootResults = borrowedAttr<std::vector<int64_t>>(source, from, kRootResults);
+    const std::span<const int64_t> indices = rootResults ? std::span<const int64_t>(*rootResults) : std::span<const int64_t>{};
+    if (roots.size() != indices.size()) throw std::invalid_argument("node roots/rootResults length mismatch");
+    const auto qualifyKey = [&](const std::string& encoded) -> const std::string& {
         auto found = context.qualified_.find(encoded);
         if (found == context.qualified_.end()) {
             auto identity = parseKey(encoded);
@@ -345,12 +357,16 @@ void qualify(grh::Graph& graph, grh::OperationId op, QualificationContext& conte
                 context.instancePath_.begin(), context.instancePath_.end());
             found = context.qualified_.emplace(encoded, key(identity)).first;
         }
-        encoded = found->second;
+        return found->second;
     };
-    for (auto& member : attributes.members) qualifyKey(member);
-    for (auto& origin : attributes.origins) qualifyKey(origin);
-    for (auto& root : attributes.roots) qualifyKey(root.key);
-    write(graph, op, std::move(attributes));
+    Attributes attributes;
+    attributes.members.reserve(members.size()); attributes.origins.reserve(origins.size()); attributes.roots.reserve(roots.size());
+    for (const auto& member : members) attributes.members.push_back(qualifyKey(member));
+    for (const auto& origin : origins) attributes.origins.push_back(qualifyKey(origin));
+    for (std::size_t i = 0; i < roots.size(); ++i) attributes.roots.push_back({qualifyKey(roots[i]), indices[i]});
+    // No borrowed source storage is used across target mutations, including
+    // the in-place qualify() case that thaws a frozen source graph.
+    write(target, to, std::move(attributes));
 }
 
 Attributes unite(Attributes target, const Attributes& source, MergeReason) {
@@ -551,6 +567,14 @@ Inspection inspect(const grh::Graph& graph) {
         result.nodes.push_back(std::move(record));
     }
     return result;
+}
+
+std::vector<std::string> scanAttributeErrors(const grh::Graph& graph) {
+    // Keep this path deliberately free of the inspection census.  The two
+    // callbacks are no-ops, so scanAttributes only validates each annotated
+    // operation and records diagnostics in source order.
+    return scanAttributes(graph, [](grh::OperationId, const AttributeView&) {},
+        [](grh::OperationId, const std::string&, int64_t, grh::ValueId) {});
 }
 
 void requireValid(const grh::Graph& graph) {

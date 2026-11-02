@@ -548,6 +548,11 @@ public:
 private:
     friend class Graph;
 
+    // Only Graph consumes its builder. Validation and allocating work finish
+    // before any owned payload is moved; the public const freeze stays a copy.
+    GraphView freezeConsuming();
+    GraphView freezeImpl(GraphBuilder* consume) const;
+
     struct ValueData {
         SymbolId symbol;
         int32_t width = 0; // total bit width, including every array dimension

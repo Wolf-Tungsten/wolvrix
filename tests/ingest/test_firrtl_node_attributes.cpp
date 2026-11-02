@@ -49,6 +49,8 @@ node::Inspection originalInspection(const grh::Graph& graph) {
 
 void sameValidation(grh::Graph& graph) {
     const auto expected = originalInspection(graph);
+    require(node::scanAttributeErrors(graph) == expected.errors,
+        "validation-only scan changed the complete diagnostic list or order");
     require(node::inspect(graph).report(graph) == expected.report(graph), "borrowed validation changed inspection or diagnostics");
     std::string message;
     try { node::requireValid(graph); }
@@ -65,6 +67,77 @@ void sameValidation(grh::Graph& graph) {
         catch (const std::invalid_argument& error) { message = error.what(); }
         require(message == expected.errors.front(), "retention changed validation failure priority");
     }
+}
+
+void copyQualifiedAcrossGraphs() {
+    Fixture source;
+    const auto sourceInput = source.input("a");
+    const auto sourceOp = source.graph.createOperation(OperationKind::kNot);
+    const auto sourceValue0 = source.graph.createValue(Fixture::type());
+    const auto sourceValue1 = source.graph.createValue(Fixture::type());
+    source.graph.addOperand(sourceOp, sourceInput);
+    source.graph.addResult(sourceOp, sourceValue0);
+    source.graph.addResult(sourceOp, sourceValue1);
+    const auto first = key("qualified-first", {"field", "x/y"});
+    const auto second = key("qualified-second", {"field", "z"});
+    node::write(source.graph, sourceOp,
+        {{second, first, second}, {{second, 1}, {first, 0}}, {first, second}});
+    source.graph.setAttr(sourceOp, node::kMembers, std::vector<std::string>{second, first, second});
+    source.graph.setAttr(sourceOp, node::kOrigins, std::vector<std::string>{second, first, first});
+    source.graph.setAttr(sourceOp, node::kRoots, std::vector<std::string>{second, first, second});
+    source.graph.setAttr(sourceOp, node::kRootResults, std::vector<int64_t>{1, 0, 1});
+
+    Fixture expected;
+    const auto expectedInput = expected.input("a");
+    const auto expectedOp = expected.graph.createOperation(OperationKind::kNot);
+    const auto expectedValue0 = expected.graph.createValue(Fixture::type());
+    const auto expectedValue1 = expected.graph.createValue(Fixture::type());
+    expected.graph.addOperand(expectedOp, expectedInput);
+    expected.graph.addResult(expectedOp, expectedValue0);
+    expected.graph.addResult(expectedOp, expectedValue1);
+    node::write(expected.graph, expectedOp, node::read(source.graph, sourceOp));
+
+    Fixture actual;
+    const auto actualInput = actual.input("a");
+    const auto actualOp = actual.graph.createOperation(OperationKind::kNot);
+    const auto actualValue0 = actual.graph.createValue(Fixture::type());
+    const auto actualValue1 = actual.graph.createValue(Fixture::type());
+    actual.graph.addOperand(actualOp, actualInput);
+    actual.graph.addResult(actualOp, actualValue0);
+    actual.graph.addResult(actualOp, actualValue1);
+
+    const auto sourceAttributes = node::read(source.graph, sourceOp);
+    source.graph.freeze();
+    const std::array<std::vector<std::string>, 4> paths{{{"left"}, {"right"},
+                                                       {"outer", "inner/a"}, {"outer/inner", "a"}}};
+    std::set<std::string> identities;
+    for (const auto& path : paths) {
+        auto qualified = sourceAttributes;
+        const auto prefix = [&](std::string& encoded) {
+            auto identity = node::parseKey(encoded);
+            identity.instancePath.insert(identity.instancePath.begin(), path.begin(), path.end());
+            encoded = node::key(identity);
+        };
+        for (auto& member : qualified.members) prefix(member);
+        for (auto& origin : qualified.origins) prefix(origin);
+        for (auto& root : qualified.roots) prefix(root.key);
+        node::write(expected.graph, expectedOp, std::move(qualified));
+        node::QualificationContext context(path);
+        node::copyQualified(source.graph, sourceOp, actual.graph, actualOp, context);
+        const auto attributes = node::read(actual.graph, actualOp);
+        require(attributes == node::read(expected.graph, expectedOp),
+            "copyQualified changed qualified members, origins, normalization, or root result positions");
+        require(identities.insert(attributes.roots.front().key).second,
+            "copyQualified collided across sibling or nested instance paths");
+        require(source.graph.frozen() && node::read(source.graph, sourceOp) == sourceAttributes,
+            "copyQualified mutated the frozen source associations");
+    }
+    source.design.deleteGraph("top");
+    actual.output("first", actualValue0); actual.output("second", actualValue1);
+    auto restored = roundTrip(actual.design);
+    const auto& restoredGraph = *restored.findGraph("top");
+    require(node::read(restoredGraph, restoredGraph.valueDef(restoredGraph.outputPortValue("second"))) ==
+            node::read(actual.graph, actualOp), "qualified attributes borrowed storage from a deleted source");
 }
 
 // Reference census uses full inspection records and owning sets, as before.
@@ -319,7 +392,21 @@ void invalidMetadata() {
         graph.setAttr(op, node::kMembers, std::vector<std::string>{key("z"), key("a")});
         graph.setAttr(op, node::kOrigins, std::vector<std::string>{"invalid"});
     });
-
+    const auto second = f.compute(OperationKind::kNot, {a}, key("second"), true);
+    f.graph.setMetadata(node::kSchema, int64_t{1});
+    f.graph.setAttr(op, node::kMembers, int64_t{1});
+    f.graph.setAttr(f.graph.valueDef(second), node::kRootResults, std::vector<int64_t>{5});
+    const auto expected = originalInspection(f.graph).errors;
+    require(expected.size() == 3, "multi-diagnostic fixture did not produce all expected errors");
+    sameValidation(f.graph);
+    tx::PassManager manager; manager.addPass(std::make_unique<tx::RedundantElimPass>());
+    tx::PassDiagnostics diagnostics;
+    const auto result = manager.run(f.design, diagnostics);
+    require(!result.success && diagnostics.messages().size() == expected.size(),
+        "redundant-elim did not preserve every node diagnostic");
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        require(diagnostics.messages()[i].message == expected[i],
+            "redundant-elim changed node diagnostic text or order");
 }
 
 void retentionEquivalence() {
@@ -870,7 +957,7 @@ void flattenedInventory(bool fail) {
 }
 
 int main() {
-    try { canonicalValidationEquivalence(); identityAndPersistence(); mergeAndRemap(); invalidMetadata(); retentionEquivalence(); executionClones(); orphanLiteralProvenance(); multipleResults(); boundedHints(); deadInventory(); qualificationContext(); inventoryImportBatch(); inventoryImportBoundaries(); flattenedInventory(false); flattenedInventory(true); }
+    try { canonicalValidationEquivalence(); identityAndPersistence(); mergeAndRemap(); invalidMetadata(); retentionEquivalence(); executionClones(); orphanLiteralProvenance(); multipleResults(); boundedHints(); deadInventory(); qualificationContext(); copyQualifiedAcrossGraphs(); inventoryImportBatch(); inventoryImportBoundaries(); flattenedInventory(false); flattenedInventory(true); }
     catch (const std::exception& error) { std::cerr << "[firrtl-node-attributes] " << error.what() << '\n'; return 1; }
     return 0;
 }

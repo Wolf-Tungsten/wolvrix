@@ -23,11 +23,9 @@ namespace wolvrix::lib::transform
 
     namespace
     {
-        using wolvrix::lib::grh::Operation;
         using wolvrix::lib::grh::OperationId;
         using wolvrix::lib::grh::OperationIdHash;
         using wolvrix::lib::grh::OperationKind;
-        using wolvrix::lib::grh::Value;
         using wolvrix::lib::grh::ValueId;
         using wolvrix::lib::grh::ValueIdHash;
 
@@ -152,25 +150,6 @@ namespace wolvrix::lib::transform
             }
         }
 
-        bool isPortValue(const Value &value)
-        {
-            return value.isInput() || value.isOutput() || value.isInout();
-        }
-
-        std::optional<std::string> getAttrString(const Operation &op, std::string_view key)
-        {
-            auto attr = op.attr(key);
-            if (!attr)
-            {
-                return std::nullopt;
-            }
-            if (const auto *value = std::get_if<std::string>(&*attr))
-            {
-                return *value;
-            }
-            return std::nullopt;
-        }
-
         StorageInfo &ensureStorage(std::unordered_map<std::string, StorageInfo> &map, const std::string &sym)
         {
             auto [it, inserted] = map.try_emplace(sym);
@@ -203,17 +182,25 @@ namespace wolvrix::lib::transform
             }
         }
 
-        std::optional<std::string> getStorageSymbol(const Operation &op)
+        // Screening/storage propagation only needs the operation kind and one
+        // symbol attribute.  Borrow those fields directly from the graph so
+        // the hot liveness walk does not allocate an Operation snapshot.
+        std::optional<std::string> getStorageSymbol(const wolvrix::lib::grh::Graph &graph,
+                                                     OperationId opId)
         {
-            switch (op.kind())
+            const OperationKind kind = graph.opKind(opId);
+            switch (kind)
             {
             case OperationKind::kRegister:
-            case OperationKind::kLatch:
-                if (!op.symbolText().empty())
+            case OperationKind::kLatch: {
+                const auto symbol = graph.operationSymbol(opId);
+                const auto text = graph.symbolText(symbol);
+                if (!text.empty())
                 {
-                    return std::string(op.symbolText());
+                    return std::string(text);
                 }
                 return std::nullopt;
+            }
             case OperationKind::kRegisterReadPort:
             case OperationKind::kRegisterReadArrayPort:
             case OperationKind::kRegisterWritePort:
@@ -221,10 +208,25 @@ namespace wolvrix::lib::transform
             case OperationKind::kRegisterWriteArrayPort:
             case OperationKind::kRegisterWriteArrayMaskPort:
             case OperationKind::kRegisterFillPort:
-                return getAttrString(op, "regSymbol");
             case OperationKind::kLatchReadPort:
-            case OperationKind::kLatchWritePort:
-                return getAttrString(op, "latchSymbol");
+            case OperationKind::kLatchWritePort: {
+                const std::string_view key =
+                    (kind == OperationKind::kLatchReadPort || kind == OperationKind::kLatchWritePort)
+                        ? "latchSymbol" : "regSymbol";
+                for (const auto &attribute : graph.opAttrs(opId))
+                {
+                    if (attribute.key != key)
+                    {
+                        continue;
+                    }
+                    if (const auto *text = std::get_if<std::string>(&attribute.value))
+                    {
+                        return *text;
+                    }
+                    return std::nullopt;
+                }
+                return std::nullopt;
+            }
             default:
                 return std::nullopt;
             }
@@ -434,12 +436,13 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
                 OpInfo info;
                 info.id = opId;
-                info.kind = op.kind();
-                info.operands = std::vector<ValueId>(op.operands().begin(), op.operands().end());
-                info.results = std::vector<ValueId>(op.results().begin(), op.results().end());
+                info.kind = graph.opKind(opId);
+                const auto operands = graph.opOperands(opId);
+                const auto results = graph.opResults(opId);
+                info.operands.assign(operands.begin(), operands.end());
+                info.results.assign(results.begin(), results.end());
                 const std::size_t infoIndex = ops.size();
                 ops.push_back(std::move(info));
                 if (opId.index < opIndexById.size())
@@ -462,12 +465,11 @@ namespace wolvrix::lib::transform
 
             for (const auto &info : ops)
             {
-                const Operation op = graph.getOperation(info.id);
                 switch (info.kind)
                 {
                 case OperationKind::kRegister:
                 case OperationKind::kLatch: {
-                    auto sym = getStorageSymbol(op);
+                    auto sym = getStorageSymbol(graph, info.id);
                     if (sym)
                     {
                         ensureStorage(*storageMapForKind(info.kind, regInfos, latchInfos), *sym).declOp = info.id;
@@ -484,7 +486,7 @@ namespace wolvrix::lib::transform
                 case OperationKind::kRegisterWriteArrayMaskPort:
                 case OperationKind::kRegisterFillPort:
                 case OperationKind::kLatchWritePort: {
-                    auto sym = getStorageSymbol(op);
+                    auto sym = getStorageSymbol(graph, info.id);
                     auto *map = storageMapForKind(info.kind, regInfos, latchInfos);
                     if (sym && map)
                     {
@@ -576,9 +578,9 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation op = graph.getOperation(opId);
-                    auto symText = getStorageSymbol(op);
-                    auto *map = storageMapForKind(op.kind(), regInfos, latchInfos);
+                    const OperationKind kind = graph.opKind(opId);
+                    auto symText = getStorageSymbol(graph, opId);
+                    auto *map = storageMapForKind(kind, regInfos, latchInfos);
                     if (symText && map)
                     {
                         ensureStorage(*map, *symText).declaredRoot = true;
@@ -666,10 +668,9 @@ namespace wolvrix::lib::transform
                     }
 
                     const OpInfo &info = ops[static_cast<std::size_t>(opIdx)];
-                    const Operation op = graph.getOperation(opId);
                     if (isStateReadOp(info.kind) || isStateWriteOp(info.kind) || isStateDeclOp(info.kind))
                     {
-                        auto sym = getStorageSymbol(op);
+                        auto sym = getStorageSymbol(graph, opId);
                         auto *map = storageMapForKind(info.kind, regInfos, latchInfos);
                         if (sym && map)
                         {
@@ -868,6 +869,10 @@ namespace wolvrix::lib::transform
                 setSessionValue(options_.outputKey, report.str(), "stats");
             }
 
+            // A frozen graph's value span belongs to its view.  The first
+            // erase thaws the graph and releases that view, so retain the ID
+            // traversal before beginning mutations.
+            const std::vector<ValueId> valueOrder(valueSpan.begin(), valueSpan.end());
             ingest::node::DeadRootBatch deadRoots(graph);
             for (const auto &info : ops)
             {
@@ -884,14 +889,14 @@ namespace wolvrix::lib::transform
             deadRoots.flush();
 
             std::vector<ValueId> deadValues;
-            for (const auto valueId : valueSpan)
+            for (const auto valueId : valueOrder)
             {
                 if (!valueId.valid())
                 {
                     continue;
                 }
-                const Value value = graph.getValue(valueId);
-                if (isPortValue(value))
+                if (graph.valueIsInput(valueId) || graph.valueIsOutput(valueId) ||
+                    graph.valueIsInout(valueId))
                 {
                     continue;
                 }
@@ -904,11 +909,11 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                if (!value.users().empty())
+                if (!graph.valueUsers(valueId).empty())
                 {
                     continue;
                 }
-                const OperationId defOp = value.definingOp();
+                const OperationId defOp = graph.valueDef(valueId);
                 if (defOp.valid() && defOp.index < liveOpMask.size() && liveOpMask[defOp.index] != 0)
                 {
                     continue;

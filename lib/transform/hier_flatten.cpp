@@ -1535,8 +1535,23 @@ namespace wolvrix::lib::transform
                 }
 
                 bool hasOrigins = false;
+                bool hasNodeAttrs = false;
                 for (const auto &attr : sourceAttrs)
                 {
+                    if (wolvrix::lib::ingest::node::isAttribute(attr.key))
+                    {
+                        hasNodeAttrs = true;
+                        // The supported associations are built once below,
+                        // after results have their final positions. Preserve
+                        // unknown attributes for the existing verifier error.
+                        if (attr.key == wolvrix::lib::ingest::node::kMembers ||
+                            attr.key == wolvrix::lib::ingest::node::kOrigins ||
+                            attr.key == wolvrix::lib::ingest::node::kRoots ||
+                            attr.key == wolvrix::lib::ingest::node::kRootResults)
+                        {
+                            continue;
+                        }
+                    }
                     if (attr.key != kOriginModulesKey)
                     {
                         rewriteAttr(newOp, attr.key, attr.value);
@@ -1601,18 +1616,18 @@ namespace wolvrix::lib::transform
                 {
                     break;
                 }
-                if (wolvrix::lib::ingest::node::annotated(target, newOp))
+                if (hasNodeAttrs)
                 {
                     ++state.metrics.annotatedOperations;
                     if (state.profile)
                     {
                         const auto started = FlattenClock::now();
-                        wolvrix::lib::ingest::node::qualify(target, newOp, nodeQualification);
+                        wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
                         state.metrics.qualification += FlattenClock::now() - started;
                     }
                     else
                     {
-                        wolvrix::lib::ingest::node::qualify(target, newOp, nodeQualification);
+                        wolvrix::lib::ingest::node::copyQualified(source, opId, target, newOp, nodeQualification);
                     }
                 }
                 state.changed = true;

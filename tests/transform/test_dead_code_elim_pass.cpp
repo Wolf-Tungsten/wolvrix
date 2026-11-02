@@ -92,6 +92,33 @@ namespace
 int main()
 {
     {
+        namespace grh = wolvrix::lib::grh;
+        grh::Design design;
+        auto& graph = design.createGraph("frozen_inout_roots");
+        const auto in = makeConst(graph, "io_in", "io_in_op", 8, false, "8'h11");
+        const auto out = makeConst(graph, "io_out", "io_out_op", 8, false, "8'h22");
+        const auto oe = makeConst(graph, "io_oe", "io_oe_op", 1, false, "1'b1");
+        graph.bindInoutPort("io", in, out, oe);
+        const auto dead = makeConst(graph, "dead", "dead_op", 8, false, "8'h33");
+        const auto orphan = graph.createValue(graph.internSymbol("orphan"), 8, false);
+        (void)dead; (void)orphan;
+        graph.freeze();
+        PassManager manager; manager.addPass(std::make_unique<DeadCodeElimPass>());
+        PassDiagnostics diagnostics;
+        const auto result = manager.run(design, diagnostics);
+        if (!result.success || diagnostics.hasError() || !result.changed)
+            return fail("DCE on a frozen graph with inout roots failed");
+        if (graph.findOperation("dead_op") || graph.findValue("dead") || graph.findValue("orphan"))
+            return fail("frozen DCE retained a dead operation or isolated value");
+        for (const auto name : {"io_in", "io_out", "io_oe"}) {
+            const auto value = graph.findValue(name);
+            if (!value || !graph.valueIsInout(value) || !graph.valueDef(value) ||
+                graph.opKind(graph.valueDef(value)) != grh::OperationKind::kConstant || !graph.valueUsers(value).empty())
+                return fail("frozen DCE lost an inout in/out/oe root or damaged its users");
+        }
+    }
+
+    {
         wolvrix::lib::grh::Design design;
         wolvrix::lib::grh::Graph &graph = design.createGraph("g");
 

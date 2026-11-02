@@ -36,6 +36,7 @@ namespace wolvrix::lib::emit
                 name.starts_with("compute.wide.helper.index_"))
                 return "compute.wide.slice";
             if (name.starts_with("compute.wide.helper.kCountTrailingZeros") ||
+                name.starts_with("compute.wide.helper.kCountOnes") ||
                 name.starts_with("compute.wide.helper.ctz_"))
                 return "wide_scan";
             if (name.starts_with("compute.wide.helper.kReduce") ||

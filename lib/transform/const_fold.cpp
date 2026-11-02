@@ -92,6 +92,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLogicOr:
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
+            case wolvrix::lib::grh::OperationKind::kCountOnes:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
             case wolvrix::lib::grh::OperationKind::kReduceOr:
             case wolvrix::lib::grh::OperationKind::kReduceXor:
@@ -373,6 +374,13 @@ namespace wolvrix::lib::transform
                        operand[static_cast<int32_t>(count)].value == 0) ++count;
                 return slang::SVInt(count);
             }
+            case wolvrix::lib::grh::OperationKind::kCountOnes: {
+                if (operand.hasUnknown()) return std::nullopt;
+                uint64_t count = 0;
+                for (int32_t i = 0; i < operand.getBitWidth(); ++i)
+                    count += operand[i].value != 0;
+                return slang::SVInt(count);
+            }
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
                 return slang::SVInt(operand.reductionAnd());
             case wolvrix::lib::grh::OperationKind::kReduceOr:
@@ -398,10 +406,11 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
 
-            if (op.kind() == wolvrix::lib::grh::OperationKind::kCountTrailingZeros &&
+            if ((op.kind() == wolvrix::lib::grh::OperationKind::kCountTrailingZeros ||
+                 op.kind() == wolvrix::lib::grh::OperationKind::kCountOnes) &&
                 (op.operands().size() != 1 || op.results().size() != 1))
             {
-                onError("kCountTrailingZeros requires one input and one result");
+                onError("counting intrinsic requires one input and one result");
                 return std::nullopt;
             }
             std::vector<slang::SVInt> operands;
@@ -487,6 +496,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kNot:
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
+            case wolvrix::lib::grh::OperationKind::kCountOnes:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
             case wolvrix::lib::grh::OperationKind::kReduceOr:
             case wolvrix::lib::grh::OperationKind::kReduceXor:

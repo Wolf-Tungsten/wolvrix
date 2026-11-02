@@ -8989,6 +8989,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kLogicNot:
             case OperationKind::kReduceAnd:
             case OperationKind::kCountTrailingZeros:
+            case OperationKind::kCountOnes:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
             case OperationKind::kReduceNor:
@@ -13270,7 +13271,8 @@ namespace wolvrix::lib::emit
             for (OperationId opId : graph.operations())
             {
                 const Operation op = graph.getOperation(opId);
-                if (op.kind() == OperationKind::kCountTrailingZeros)
+                if (op.kind() == OperationKind::kCountTrailingZeros ||
+                    op.kind() == OperationKind::kCountOnes)
                 {
                     const auto inputs = op.operands();
                     const auto outputs = op.results();
@@ -13279,7 +13281,7 @@ namespace wolvrix::lib::emit
                         graph.valueType(outputs[0]) != ValueType::Logic || graph.valueSigned(outputs[0]) ||
                         graph.valueWidth(outputs[0]) != int32_t(std::bit_width(uint32_t(graph.valueWidth(inputs[0])))))
                     {
-                        error = "invalid kCountTrailingZeros type or arity: " + std::string(op.symbolText());
+                        error = "invalid counting intrinsic type or arity: " + std::string(op.symbolText());
                         return false;
                     }
                 }
@@ -17173,6 +17175,7 @@ template<class Index>
             case OperationKind::kReduceAnd:
             case OperationKind::kReduceNand:
             case OperationKind::kCountTrailingZeros:
+            case OperationKind::kCountOnes:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceNor:
             case OperationKind::kReduceXor:
@@ -20312,6 +20315,9 @@ template<class Index>
                 return logicBoolExpr(unaryWordsBoolExpr(operandWords(0, graph.valueWidth(operands[0])),
                                                         graph.valueWidth(operands[0]),
                                                         "grhsim_reduce_nand_words"));
+            case OperationKind::kCountOnes:
+                return "grhsim_popcount_words(" + operandExprs[0] + ", " +
+                       std::to_string(graph.valueWidth(operands[0])) + ")";
             case OperationKind::kCountTrailingZeros:
                 return "grhsim_ctz_words(" + operandExprs[0] + ", " +
                        std::to_string(graph.valueWidth(operands[0])) + ")";
@@ -20538,6 +20544,7 @@ template<class Index>
                 case OperationKind::kReduceAnd:
                 case OperationKind::kReduceNand:
                 case OperationKind::kCountTrailingZeros:
+            case OperationKind::kCountOnes:
                 case OperationKind::kReduceOr:
                 case OperationKind::kReduceNor:
                 case OperationKind::kReduceXor:
@@ -21102,6 +21109,7 @@ template<class Index>
                     case OperationKind::kReduceAnd:
                     case OperationKind::kReduceNand:
                     case OperationKind::kCountTrailingZeros:
+            case OperationKind::kCountOnes:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -21506,6 +21514,9 @@ template<class Index>
                 return ScalarLogicExpr{"grhsim_reduce_and_u64(" + operands[0] + ", " + std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
             case OperationKind::kReduceNand:
                 return ScalarLogicExpr{"grhsim_reduce_nand_u64(" + operands[0] + ", " + std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
+            case OperationKind::kCountOnes:
+                return ScalarLogicExpr{"grhsim_popcount_u64(" + operands[0] + ", " +
+                    std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
             case OperationKind::kCountTrailingZeros:
                 return ScalarLogicExpr{"grhsim_ctz_u64(" + operands[0] + ", " +
                     std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
@@ -22521,6 +22532,7 @@ template<class Index>
             case OperationKind::kLogicNot:
             case OperationKind::kReduceAnd:
             case OperationKind::kCountTrailingZeros:
+            case OperationKind::kCountOnes:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
             case OperationKind::kReduceNor:
@@ -26811,6 +26823,7 @@ template<class Index>
                     case OperationKind::kReduceAnd:
                     case OperationKind::kReduceNand:
                     case OperationKind::kCountTrailingZeros:
+            case OperationKind::kCountOnes:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -28371,6 +28384,9 @@ template<class Index>
                                     }
                                     break;
                                 }
+                                case OperationKind::kCountOnes:
+                                    addShape("wide.helper.popcount_word_iterations", operandWords);
+                                    break;
                                 case OperationKind::kCountTrailingZeros:
                                     addShape("wide.helper.ctz_word_iterations", operandWords);
                                     break;
@@ -30578,6 +30594,8 @@ template<class Index>
             *stream << "inline std::uint64_t grhsim_ctz_u64(std::uint64_t value, std::size_t width)\n{\n"
                     << "    value = grhsim_trunc_u64(value, width);\n"
                     << "    return value ? std::countr_zero(value) : width;\n}\n\n";
+            *stream << "inline std::uint64_t grhsim_popcount_u64(std::uint64_t value, std::size_t width)\n{\n"
+                    << "    return static_cast<std::uint64_t>(std::popcount(grhsim_trunc_u64(value, width)));\n}\n\n";
             *stream << R"CTZ(template <typename Words>
 inline std::uint64_t grhsim_ctz_words(const Words &value, std::size_t width)
 {
@@ -30590,6 +30608,19 @@ inline std::uint64_t grhsim_ctz_words(const Words &value, std::size_t width)
 }
 
 )CTZ";
+            *stream << R"POPCOUNT(template <typename Words>
+inline std::uint64_t grhsim_popcount_words(const Words &value, std::size_t width)
+{
+    const std::size_t words = (width + 63u) / 64u;
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < words; ++i) {
+        const auto wordWidth = std::min<std::size_t>(64, width - i * 64);
+        total += static_cast<std::uint64_t>(std::popcount(grhsim_trunc_u64(value[i], wordWidth)));
+    }
+    return total;
+}
+
+)POPCOUNT";
             *stream << "inline std::uint64_t grhsim_mux_u64(std::uint64_t cond, std::uint64_t trueValue, std::uint64_t falseValue)\n{\n";
             *stream << "    const std::uint64_t trueMask = static_cast<std::uint64_t>(-static_cast<std::int64_t>(cond != 0));\n";
             *stream << "    return (trueValue & trueMask) | (falseValue & ~trueMask);\n";

@@ -6023,6 +6023,9 @@ namespace wolvrix::lib::emit
                 case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
                     reportError("kCountTrailingZeros currently requires the GrhSIM backend", opContext);
                     break;
+                case wolvrix::lib::grh::OperationKind::kCountOnes:
+                    reportError("kCountOnes currently requires the GrhSIM backend", opContext);
+                    break;
                 case wolvrix::lib::grh::OperationKind::kXMRRead:
                 case wolvrix::lib::grh::OperationKind::kXMRWrite:
                     reportError("Unresolved XMR operation in emit", opContext);

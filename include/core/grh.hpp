@@ -81,7 +81,8 @@ enum class OperationKind {
     kDpicCall,
     kXMRRead,
     kXMRWrite,
-    kCountTrailingZeros
+    kCountTrailingZeros,
+    kCountOnes
 };
 
 std::string_view toString(OperationKind kind) noexcept;

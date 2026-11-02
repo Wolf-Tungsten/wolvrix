@@ -3218,7 +3218,9 @@ private:
                                    const slang::ast::SubroutineSymbol& subroutine)
     {
         const std::string_view name = subroutine.name;
-        if (!name.starts_with("wolvrix_ctz_")) return false;
+        const bool isCtz = name.starts_with("wolvrix_ctz_");
+        const bool isPopcount = name.starts_with("wolvrix_popcount_");
+        if (!isCtz && !isPopcount) return false;
         const auto reject = [&](std::string_view reason) {
             reportUnsupported(call, std::string("Invalid simulation intrinsic: ") + std::string(reason));
             return true;
@@ -3230,8 +3232,8 @@ private:
                 declaration->c_identifier.valueText() != name)
                 return reject("C linkage alias changes the registered contract");
         }
-        constexpr std::string_view prefix = "wolvrix_ctz_v1_w";
-        if (!name.starts_with(prefix)) return reject("unknown CTZ contract version");
+        const std::string_view prefix = isCtz ? "wolvrix_ctz_v1_w" : "wolvrix_popcount_v1_w";
+        if (!name.starts_with(prefix)) return reject("unknown simulation intrinsic contract version");
         const auto digits = name.substr(prefix.size());
         int32_t width = 0;
         const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), width);
@@ -3269,8 +3271,9 @@ private:
             input = makeSliceDynamic(input, addConstantLiteral("0", location), width, location);
         int32_t resultWidth = 0;
         for (uint32_t n = static_cast<uint32_t>(width); n; n >>= 1) ++resultWidth;
-        ExprNodeId result = makeOperationWithWidth(
-            wolvrix::lib::grh::OperationKind::kCountTrailingZeros, {input}, resultWidth, location);
+        const auto operation = isCtz ? wolvrix::lib::grh::OperationKind::kCountTrailingZeros
+                                     : wolvrix::lib::grh::OperationKind::kCountOnes;
+        ExprNodeId result = makeOperationWithWidth(operation, {input}, resultWidth, location);
         WriteIntent intent;
         intent.target = target;
         intent.value = resizeValueToWidth(result, 32, false, location);

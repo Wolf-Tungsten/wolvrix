@@ -2646,7 +2646,8 @@ namespace wolvrix::lib::grh
             "kDpicCall",
             "kXMRRead",
             "kXMRWrite",
-            "kCountTrailingZeros"};
+            "kCountTrailingZeros",
+            "kCountOnes"};
 
         void writeAttributeValue(slang::JsonWriter &writer, const AttributeValue &value)
         {

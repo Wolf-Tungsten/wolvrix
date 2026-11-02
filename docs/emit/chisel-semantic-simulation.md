@@ -24,6 +24,15 @@
 输入传播，常量折叠/CSE/DCE、跨组物化和变化检测沿用原有路径。对宽值只保留完整
 输入依赖，不能把硬件内部的每个优先级树节点误报成独立仿真活动。
 
+### 2026-11-03：PopCount 的布局门控实证
+
+同名 `utility.PopCount` 已加入 `Bits/UInt` 与 `Vec/Seq` 两类重载。只有紧凑的 packed
+输入进入 `wolvrix_popcount_v1_w<N>` 和 `kCountOnes`；`Vec[Bool]`、`Seq[Bool]` 保持
+`chisel3.util.PopCount` 的硬件树。香山完整生成中 1,095 个 packed 调用进入 intrinsic，
+7,140 个分布式调用保留硬件。node030 CPU96 的 8 对单线程 C100000 测量中，B 平均
+回退 0.665717%，因此这条路线目前只作为实验入口，不默认开启。详细数据见
+[TNO0397](../../../pdocs/grhsim_opt_thj/TNO0397_popcount_intrinsic_packed_layout_walltime_20261103.md)。
+
 当前实验覆盖 `1,2,3,4,5,6,7,8,9,10,14,15,16,17,31,32,33,36,38,63,64,65,
 127,128,129,255,256,257,511,512,1024` 位的打包和分散 Bool 输入；实际 XiangShan
 配置额外包含 `5,6,10,14,36,38` 位。所有宽度都保留为矩阵项，不按速度挑选。

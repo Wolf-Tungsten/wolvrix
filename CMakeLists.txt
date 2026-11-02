@@ -179,7 +179,9 @@ target_compile_definitions(wolvrix-lib
         WOLVRIX_HAVE_MT_KAHYPAR=${WOLVRIX_HAVE_MT_KAHYPAR}
         WOLVRIX_HAVE_LIBFST=${WOLVRIX_HAVE_LIBFST}
     PRIVATE
-        WOLVRIX_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        # This project is also configured as a subdirectory by tools/grhsim32;
+        # use its own source root for vendored runtime resources.
+        WOLVRIX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 set_target_properties(wolvrix-lib PROPERTIES
     BUILD_RPATH "$ORIGIN"
@@ -204,7 +206,7 @@ endif()
 if (WOLVRIX_BUILD_PYTHON_PACKAGE)
     find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
-    set(WOLVRIX_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/app/pybind")
+    set(WOLVRIX_PYTHON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/app/pybind")
     set(WOLVRIX_PYTHON_BUILD_DIR "${CMAKE_BINARY_DIR}/python")
     set(WOLVRIX_PYTHON_PURELIB_DIR ".")
     set(WOLVRIX_PYTHON_PLATLIB_DIR ".")
@@ -228,7 +230,7 @@ if (WOLVRIX_BUILD_PYTHON_PACKAGE)
     Python_add_library(wolvrix_python MODULE ${WOLVRIX_PYBIND_SOURCES})
     target_include_directories(wolvrix_python
         PRIVATE
-            "${CMAKE_SOURCE_DIR}/app/pybind"
+            "${CMAKE_CURRENT_SOURCE_DIR}/app/pybind"
     )
     target_link_libraries(wolvrix_python
         PRIVATE
@@ -275,8 +277,8 @@ enable_testing()
 # Tests
 # -----------------------------------------------------------------------------
 # Common test paths
-set(WOLF_SV_TEST_INPUT_DIR "${CMAKE_SOURCE_DIR}/tests/data")
-set(WOLF_SV_INGEST_TEST_DATA_DIR "${CMAKE_SOURCE_DIR}/tests/ingest/data")
+set(WOLF_SV_TEST_INPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+set(WOLF_SV_INGEST_TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/ingest/data")
 set(WOLF_SV_TEST_ARTIFACT_DIR "${CMAKE_BINARY_DIR}/artifacts")
 
 set(EMIT_ARTIFACT_DIR "${WOLF_SV_TEST_ARTIFACT_DIR}/emit")
@@ -467,6 +469,10 @@ register_test_exe(emit-grhsim-execution-plan)
 add_executable(emit-grhsim-guard-activity tests/emit/test_grhsim_guard_activity.cpp)
 target_link_libraries(emit-grhsim-guard-activity PRIVATE wolvrix-lib)
 register_test_exe(emit-grhsim-guard-activity)
+add_executable(emit-grhsim-ctz tests/emit/test_grhsim_ctz.cpp)
+target_link_libraries(emit-grhsim-ctz PRIVATE wolvrix-lib)
+target_compile_definitions(emit-grhsim-ctz PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/build/artifacts")
+register_test_exe(emit-grhsim-ctz)
 add_executable(emit-grhsim-partition-work tests/emit/test_grhsim_partition_work.cpp)
 target_link_libraries(emit-grhsim-partition-work PRIVATE wolvrix-lib)
 target_compile_definitions(emit-grhsim-partition-work PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")

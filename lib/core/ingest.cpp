@@ -32,6 +32,8 @@
 #include "slang/ast/symbols/VariableSymbols.h"
 #include "slang/ast/types/AllTypes.h"
 #include "slang/text/SourceManager.h"
+#include "slang/syntax/AllSyntax.h"
+#include <charconv>
 
 #include <algorithm>
 #include <cctype>
@@ -3210,9 +3212,79 @@ private:
         return true;
     }
 
+    // Versioned semantic transport. This call is consumed before the generic
+    // event-driven DPI path and produces an ordinary combinational SSA value.
+    bool handleSimulationIntrinsic(const slang::ast::CallExpression& call,
+                                   const slang::ast::SubroutineSymbol& subroutine)
+    {
+        const std::string_view name = subroutine.name;
+        if (!name.starts_with("wolvrix_ctz_")) return false;
+        const auto reject = [&](std::string_view reason) {
+            reportUnsupported(call, std::string("Invalid simulation intrinsic: ") + std::string(reason));
+            return true;
+        };
+        const auto* syntax = subroutine.getSyntax();
+        if (syntax) {
+            const auto* declaration = syntax->as_if<slang::syntax::DPIImportSyntax>();
+            if (declaration && !declaration->c_identifier.valueText().empty() &&
+                declaration->c_identifier.valueText() != name)
+                return reject("C linkage alias changes the registered contract");
+        }
+        constexpr std::string_view prefix = "wolvrix_ctz_v1_w";
+        if (!name.starts_with(prefix)) return reject("unknown CTZ contract version");
+        const auto digits = name.substr(prefix.size());
+        int32_t width = 0;
+        const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), width);
+        if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() ||
+            width <= 0 || digits != std::to_string(width))
+            return reject("invalid logical width");
+        int32_t carrier = width;
+        for (int32_t candidate : {1, 8, 16, 32, 64})
+            if (candidate >= width) { carrier = candidate; break; }
+        const auto args = call.arguments();
+        const auto formals = subroutine.getArguments();
+        if (subroutine.subroutineKind != slang::ast::SubroutineKind::Function ||
+            !subroutine.getReturnType().isVoid() || args.size() != 2 || formals.size() != 2)
+            return reject("expected void function with one input and one output");
+        if (formals[0]->direction != slang::ast::ArgumentDirection::In ||
+            formals[1]->direction != slang::ast::ArgumentDirection::Out ||
+            !formals[0]->getType().isIntegral() || !formals[1]->getType().isIntegral() ||
+            formals[0]->getType().getBitWidth() != uint64_t(carrier) ||
+            formals[1]->getType().getBitWidth() != 32 ||
+            formals[0]->getType().isFourState() || formals[1]->getType().isFourState())
+            return reject("DPI transport signature mismatch");
+        if (domain != ControlDomain::Combinational || !eventContext.edges.empty() || eventContext.hasTiming)
+            return reject("expected unclocked combinational call");
+        const auto location = call.sourceRange.start();
+        const auto guard = currentGuard(location);
+        if (guard != kInvalidPlanIndex) {
+            const auto constant = evalConstInt(plan, lowering, guard);
+            if (!constant || *constant != 1) return reject("enable must be constant true");
+        }
+        ExprNodeId input = lowerExpression(unwrapDpiArgument(*args[0], false));
+        const auto target = resolveSimpleSymbol(unwrapDpiArgument(*args[1], true));
+        if (input == kInvalidPlanIndex || !target.valid()) return reject("unsupported input or output binding");
+        // Logical width, not ABI padding, defines the zero result and tail mask.
+        if (carrier != width)
+            input = makeSliceDynamic(input, addConstantLiteral("0", location), width, location);
+        int32_t resultWidth = 0;
+        for (uint32_t n = static_cast<uint32_t>(width); n; n >>= 1) ++resultWidth;
+        ExprNodeId result = makeOperationWithWidth(
+            wolvrix::lib::grh::OperationKind::kCountTrailingZeros, {input}, resultWidth, location);
+        WriteIntent intent;
+        intent.target = target;
+        intent.value = resizeValueToWidth(result, 32, false, location);
+        intent.guard = guard;
+        intent.domain = ControlDomain::Combinational;
+        intent.location = location;
+        recordWriteIntent(std::move(intent));
+        return true;
+    }
+
     bool handleDpiCall(const slang::ast::CallExpression& call,
                        const slang::ast::SubroutineSymbol& subroutine)
     {
+        if (handleSimulationIntrinsic(call, subroutine)) return true;
         if (!ensureEdgeSensitive(call.sourceRange.start(), "dpi"))
         {
             return true;

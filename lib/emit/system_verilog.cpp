@@ -6020,6 +6020,9 @@ namespace wolvrix::lib::emit
                     addSequentialStmt(*seqKey, stmt.str(), opId);
                     break;
                 }
+                case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
+                    reportError("kCountTrailingZeros currently requires the GrhSIM backend", opContext);
+                    break;
                 case wolvrix::lib::grh::OperationKind::kXMRRead:
                 case wolvrix::lib::grh::OperationKind::kXMRWrite:
                     reportError("Unresolved XMR operation in emit", opContext);

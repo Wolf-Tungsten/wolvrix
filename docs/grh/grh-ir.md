@@ -681,6 +681,36 @@ res[0] = constValue
 | `kReduceXor` | `^oper[0]` |
 | `kReduceXnor` | `~^oper[0]` |
 
+### 6.2.5.1 尾零计数（`kCountTrailingZeros`）
+
+`kCountTrailingZeros` 是一个无副作用的纯组合运算，用于保留“最低置位位”的
+语义。它不表示硬件必须采用某一种编码器或扫描树；硬件 RTL 可以继续使用原有
+的优先编码结构，GrhSIM emitter 可以选择等价的字级实现。
+
+**operands**:
+- `oper[0]` (`N`): `N` 位无符号二态位向量，`N > 0`
+
+**results**:
+- `res[0]`: 能表示 `0..N` 的无符号值；`oper[0]` 的最低置位位为 `i` 时结果为
+  `i`，全零输入时结果为 `N`
+
+**attrs**: 无。输入和结果都是单一定义，没有时钟、enable、存储或外部副作用。
+
+示例（`N = 8`）：
+
+```text
+0000_0001 -> 0
+0001_0000 -> 4
+0000_0000 -> 8
+```
+
+导入层只接受版本化的 `wolvrix_ctz_v1_w<N>` DPI transport，并验证其输入逻辑
+宽度、输出 ABI 和恒真 enable；不满足契约的普通 DPI 仍按普通 DPI 处理或报错。
+导入后不保留 `kDpicCall`，而是创建普通组合 SSA 节点。二态 GrhSIM lowering
+对单机器字调用定义了零输入行为，对多字值从低字向高字扫描并屏蔽尾字无效位。
+四态 RTL 结果不能由这个二态节点单独代表，故该操作当前只在 GrhSIM 二态语义
+下启用。
+
 ---
 
 ### 6.2.6 移位运算

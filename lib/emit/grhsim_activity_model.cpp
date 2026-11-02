@@ -35,6 +35,9 @@ namespace wolvrix::lib::emit
                 name.starts_with("compute.wide.helper_cross_word") ||
                 name.starts_with("compute.wide.helper.index_"))
                 return "compute.wide.slice";
+            if (name.starts_with("compute.wide.helper.kCountTrailingZeros") ||
+                name.starts_with("compute.wide.helper.ctz_"))
+                return "wide_scan";
             if (name.starts_with("compute.wide.helper.kReduce") ||
                 name.starts_with("compute.wide.helper.reduce_"))
                 return "compute.wide.reduce";
@@ -116,6 +119,8 @@ namespace wolvrix::lib::emit
                 return "compute.wide.slice.cross_word_merges";
             if (name == "compute.wide.helper.index_normalizations")
                 return "compute.wide.slice.index_normalizations";
+            if (name == "compute.wide.helper.ctz_word_iterations")
+                return "compute.wide.scan.word_iterations_upper";
             if (name == "compute.wide.helper.reduce_word_iterations")
                 return "compute.wide.reduce.word_iterations";
             if (name == "compute.wide.helper.replication_lanes")

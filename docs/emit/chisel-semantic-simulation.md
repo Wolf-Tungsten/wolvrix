@@ -1,10 +1,32 @@
 # Chisel 语义接口、双实现与 Wolvrix 接入设计
 
-状态：研究设计，尚未新增生产 Chisel API、GRH OperationKind 或 C++ 模型插件 ABI。
+状态：研究设计；当前已增加一个受版本契约保护的 GrhSIM 专用
+`kCountTrailingZeros` 实验实现，尚未把它作为通用公共模型插件 ABI。
 实验依据见 [扩展实证](../../../pdocs/grhsim_opt_thj/TNO0377_chisel_pattern_expanded_evidence_20261029.md)
 和 [真实 MSHR 计数](../../../pdocs/grhsim_opt_thj/TNO0378_chisel_pattern_frozen_mshr_count_20261029.md)。
 
 ## 为什么需要保留语义
+
+### 当前实验：PriorityEncoder 的同名 utility 包装
+
+`testcase/xiangshan/utility` 提供了同名 `utility.PriorityEncoder`，默认分支直接
+调用完整限定名 `chisel3.util.PriorityEncoder`。在一次 XiangShan elaboration
+作用域内通过 `--wolvrix-sim-primitives priority-encode` 才选择仿真原语；关闭时
+生成结果与原有硬件实现相同。Parallel、WithFlag 和 Default 包装保持自己的公共
+接口和零输入/默认值语义。
+
+开启时，utility 将输入送入无时钟模块中的 `IntrinsicExpr("circt_dpi_call", ...)`，
+名称为 `wolvrix_ctz_v1_w<N>`。这是 Verilog 中的中转契约：firtool 当前仍生成
+`context function void` 加 `output int`，Wolvrix 导入器验证后把调用转成
+`kCountTrailingZeros`。因此最终生成的 GrhSIM C++ 没有 DPI 调用或外部实现依赖。
+
+原语是普通组合数据流的一部分：输入使用现有 ValueId，结果单一定义，活动从真实
+输入传播，常量折叠/CSE/DCE、跨组物化和变化检测沿用原有路径。对宽值只保留完整
+输入依赖，不能把硬件内部的每个优先级树节点误报成独立仿真活动。
+
+当前实验覆盖 `1,2,3,4,5,6,7,8,9,10,14,15,16,17,31,32,33,36,38,63,64,65,
+127,128,129,255,256,257,511,512,1024` 位的打包和分散 Bool 输入；实际 XiangShan
+配置额外包含 `5,6,10,14,36,38` 位。所有宽度都保留为矩阵项，不按速度挑选。
 
 同一个逻辑功能可以有不同的硬件结构和软件实现。研究观察到：
 

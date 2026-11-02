@@ -425,8 +425,11 @@ PassResult SimplifyPass::run()
     try {
         if (options_.maxRounds == 0) throw std::invalid_argument("max-rounds must be positive");
         auto& graph = detail::selectGraph(design(), options_.top);
+        ingest::node::DeadRootBatch deadRoots(graph);
         PassManager verifier; verifier.addPass(std::make_unique<GrhVerifyPass>());
         if (!verifier.run(design(), diags()).success) return {false, true, {}};
+        const auto stage = graph.metadata(kStage);
+        const bool verifiedUnpartitioned = stage && *stage == AttributeValue(std::string("converted"));
         auto ordered = orderedOperations(graph); // Check cycles before the first mutation.
         std::unordered_set<uint32_t> anchors;
         for (const auto symbol : graph.declaredSymbols()) anchors.insert(symbol.value);
@@ -485,11 +488,12 @@ PassResult SimplifyPass::run()
                 const auto operations = std::span<const OperationId>(grouped).subspan(group.begin, group.end - group.begin);
                 // Partitioned scopes visit their own members. New operations
                 // are collected with their owner at the next rewrite round.
-                Scope scope(graph, owner, owner.empty() ? std::nullopt : std::optional(operations), &anchors, &owner);
+                Scope scope(graph, owner, owner.empty() ? std::nullopt : std::optional(operations), &anchors, &owner,
+                            verifiedUnpartitioned);
                 timed(0, [&] { return foldAndShare(scope, operations); });
                 timed(1, [&] { return muxChains(scope); });
                 if (owner.empty()) timed(2, [&] { return detail::mergeEquivalentStates(scope); });
-                timed(3, [&] { return scope.dce(); });
+                timed(3, [&] { return scope.dce(&deadRoots); });
                 timed(4, [&] { return detail::simplifyUsedBits(scope); });
             }
             result.changed = result.changed || changed;
@@ -512,6 +516,7 @@ PassResult SimplifyPass::run()
             logInfo(timing.str());
         } while (changed && round < options_.maxRounds);
         if (changed) warning("Reached max-rounds before convergence");
+        deadRoots.flush();
         logInfo("rounds=" + std::to_string(round) + " owners=" + std::to_string(ownerCount));
         if (!verifier.run(design(), diags()).success) result.failed = true;
     } catch (const std::exception& error) {

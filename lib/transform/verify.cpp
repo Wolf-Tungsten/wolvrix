@@ -253,22 +253,21 @@ namespace wolvrix::lib::transform
 
             for (const ValueId valueId : graph->values())
             {
-                const Value value = graph->getValue(valueId);
-                const std::string name(value.symbolText());
-                try { value.logicalType().validate(); }
+                // Keep checked access outside the diagnostic catch, as getValue was.
+                const LogicalType type = graph->valueLogicalType(valueId);
+                try { type.validate(); }
                 catch (const std::exception& exception)
                 {
-                    error(*graph, value, "grh.verify: " + std::string(exception.what()));
+                    error(*graph, graph->getValue(valueId), "grh.verify: " + std::string(exception.what()));
                 }
-                if (value.type() == ValueType::Logic && value.width() <= 0)
+                if (type.kind == ValueType::Logic && type.width <= 0)
                 {
-                    error(*graph, value, "grh.verify: Logic value width must be positive");
+                    error(*graph, graph->getValue(valueId), "grh.verify: Logic value width must be positive");
                 }
-                if (auto problem = shapeProblem(value.width(), value.type(), value.shape()))
+                if (auto problem = shapeProblem(type.width, type.kind, type.shape))
                 {
-                    error(*graph, value, "grh.verify: " + *problem);
+                    error(*graph, graph->getValue(valueId), "grh.verify: " + *problem);
                 }
-                (void)name;
             }
 
             for (const Port &port : graph->inputPorts())

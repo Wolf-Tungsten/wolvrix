@@ -29,6 +29,52 @@ void compare(const grh::Design& candidate, const grh::Design& reference, bool re
     };
     if (rename) firrtl_state_test::renameTrace(check); else firrtl_state_test::priorityTrace(check);
 }
+void constantStateIndexBounds() {
+    auto result = text("constant-state-index-bounds", R"FIR(    input clk : Clock
+    input i : UInt<2>
+    output exactOut : UInt<4>
+    output rowOut : UInt<4>[2]
+    output selectedOut : UInt<4>
+    output missingOut : UInt<4>
+    reg r : UInt<4>[2][2], clk
+    connect r[0][0], UInt<4>(3)
+    connect r[0][1], UInt<4>(4)
+    connect r[1][0], UInt<4>(5)
+    connect r[1][1], UInt<4>(6)
+    connect r[UInt<2>(2)][i], UInt<4>(15)
+    node exact = r[0][0]
+    node row = r[1]
+    node selected = r[UInt<2>(0)][i]
+    node missing = r[UInt<2>(2)][i]
+    connect exactOut, exact
+    connect rowOut, row
+    connect selectedOut, selected
+    connect missingOut, missing
+)FIR");
+    require(result.success(), diagnostics(result));
+    auto& graph = *result.design->findGraph("top");
+    require(count(graph, OperationKind::kLt) == 1, "constant state indices created runtime bounds checks");
+    require(count(graph, OperationKind::kRegisterWriteArrayPort) == 4,
+        "constant out-of-bounds state write was materialized");
+    for (const auto op : graph.operations())
+        if (graph.opKind(op) == OperationKind::kRegisterReadArrayPort || grh::isRegisterWritePortKind(graph.opKind(op)))
+            require(!graph.getOperation(op).attr("firrtl.node.members"), "indexed state access entered node scope");
+    run(*result.design, std::make_unique<tx::GrhVerifyPass>()); node::requireValid(graph);
+    auto restored = roundTrip(*result.design);
+    for (const auto* candidate : {&graph, restored.findGraph("top")}) {
+        grhsim_test::Oracle oracle(*candidate);
+        for (unsigned i = 0; i < 4; ++i) {
+            oracle.eval({{"clk", 0}, {"i", i}});
+            const auto evaluated = oracle.eval({{"clk", 1}, {"i", i}});
+            const auto output = [&](std::string_view name) {
+                return slang::SVInt::fromString(evaluated.outputs.at(std::string(name))).as<uint64_t>();
+            };
+            require(output("exactOut") == 3 && output("rowOut") == 0x65 &&
+                output("selectedOut") == (i < 2 ? 3 + i : 0) && output("missingOut") == 0,
+                "constant/mixed state indices changed old-state reads or no-op writes");
+        }
+    }
+}
 void typesAndPolicies() {
     error("state-clock", "    input clk : UInt<1>\n    reg r : UInt<4>, clk\n", "Clock type");
     error("state-reset", "    input clk : Clock\n    input rst : UInt<2>\n    regreset r : UInt<4>, clk, rst, UInt<4>(0)\n", "one-bit");
@@ -117,6 +163,71 @@ void typesAndPolicies() {
     require(count(*empty.design->findGraph("top"), OperationKind::kRegister) == 0, "zero-width state materialized");
     auto asyncConst = text("state-const-reset-input", "    input clk : Clock\n    input rst : AsyncReset\n    input data : const UInt<4>\n    regreset r : UInt<4>, clk, rst, data\n");
     require(asyncConst.success(), diagnostics(asyncConst));
+    auto aggregateReset = text("state-constant-wire-reset", R"FIR(    input clk : Clock
+    input arst : AsyncReset
+    output y : UInt<8>[2]
+    wire value : UInt<8>[2]
+    connect value[0], UInt<8>(7)
+    connect value[1], UInt<8>(11)
+    regreset r : UInt<8>[2], clk, arst, value
+    connect r, r
+    connect y, r
+)FIR");
+    require(aggregateReset.success(), diagnostics(aggregateReset));
+    grhsim_test::Oracle aggregate(*aggregateReset.design->findGraph("top"));
+    aggregate.eval({{"clk", 0}, {"arst", 0}});
+    require(slang::SVInt::fromString(aggregate.eval({{"arst", 1}}).outputs.at("y")).as<uint64_t>() == 0x0b07,
+        "aggregate constant wire reset did not fire asynchronously");
+    auto invalidReset = text("state-invalid-wire-reset", R"FIR(    input clk : Clock
+    input arst : AsyncReset
+    output y : {valid : UInt<1>, data : UInt<8>}[2]
+    wire value : {valid : UInt<1>, data : UInt<8>}[2]
+    connect value[0].valid, UInt<1>(0)
+    invalidate value[0].data
+    connect value[1].valid, UInt<1>(0)
+    invalidate value[1].data
+    regreset r : {valid : UInt<1>, data : UInt<8>}[2], clk, arst, value
+    connect r[0].valid, UInt<1>(1)
+    connect r[0].data, UInt<8>(7)
+    connect r[1].valid, UInt<1>(1)
+    connect r[1].data, UInt<8>(11)
+    connect y, r
+)FIR", ingest::FirrtlInvalidPolicy::Unknown);
+    require(invalidReset.success(), diagnostics(invalidReset));
+    grhsim_test::Oracle invalidOracle(*invalidReset.design->findGraph("top"), {}, nullptr, true);
+    invalidOracle.eval({{"clk", 0}, {"arst", 0}});
+    const auto definedOutput = invalidOracle.eval({{"clk", 1}}).outputs;
+    require(slang::SVInt::fromString(definedOutput.at("y__DOT__data")).as<uint64_t>() == 0x0b07,
+        "invalid reset fixture did not first write defined data");
+    const auto invalidOutput = invalidOracle.eval({{"arst", 1}}).outputs;
+    require(slang::SVInt::fromString(invalidOutput.at("y__DOT__valid")).as<uint64_t>() == 0 &&
+            slang::SVInt::fromString(invalidOutput.at("y__DOT__data")).hasUnknown(),
+        "invalid constant async reset lost defined fields or unknown data");
+    auto fieldReset = text("state-constant-field-reset", R"FIR(    input clk : Clock
+    input arst : AsyncReset
+    input d : UInt<8>
+    output y : UInt<8>
+    wire value : {c : UInt<8>, variable : UInt<8>}[2]
+    connect value[0].c, UInt<8>(7)
+    connect value[0].variable, d
+    connect value[1].c, d
+    connect value[1].variable, d
+    wire copied : {c : UInt<8>, variable : UInt<8>}
+    connect copied, value[0]
+    regreset r : UInt<8>, clk, arst, copied.c
+    connect r, d
+    connect y, r
+)FIR");
+    require(fieldReset.success(), diagnostics(fieldReset));
+    grhsim_test::Oracle fieldOracle(*fieldReset.design->findGraph("top"));
+    fieldOracle.eval({{"clk", 0}, {"arst", 0}, {"d", 99}});
+    require(slang::SVInt::fromString(fieldOracle.eval({{"clk", 1}}).outputs.at("y")).as<uint64_t>() == 99,
+        "constant field reset fixture did not write runtime data");
+    require(slang::SVInt::fromString(fieldOracle.eval({{"arst", 1}, {"d", 42}}).outputs.at("y")).as<uint64_t>() == 7,
+        "unrelated runtime bundle fields or array elements changed constant asynchronous reset");
+    error("state-variable-element-reset", "    input clk : Clock\n    input arst : AsyncReset\n    input d : UInt<8>\n    wire value : UInt<8>[2]\n    connect value[0], UInt<8>(7)\n    connect value[1], d\n    regreset r : UInt<8>, clk, arst, value[1]\n", "const type");
+    error("state-variable-field-reset", "    input clk : Clock\n    input arst : AsyncReset\n    input d : UInt<8>\n    wire value : {c : UInt<8>, variable : UInt<8>}\n    connect value.c, UInt<8>(7)\n    connect value.variable, d\n    regreset r : UInt<8>, clk, arst, value.variable\n", "const type");
+    error("state-variable-wire-reset", "    input clk : Clock\n    input arst : AsyncReset\n    input d : UInt<8>\n    wire value : UInt<8>\n    connect value, d\n    regreset r : UInt<8>, clk, arst, value\n", "const type");
 }
 
 std::string driver(bool rename, bool reference = false) {
@@ -155,6 +266,7 @@ std::string driver(bool rename, bool reference = false) {
 }
 void test() {
     typesAndPolicies();
+    constantStateIndexBounds();
     const auto output = artifact("firrtl-state");
     for (const std::string name : {"rename", "priority"}) {
         auto result = source(name); require(result.success(), diagnostics(result));

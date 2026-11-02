@@ -159,6 +159,11 @@ void errors() {
     error("negative-uint", "    node a = UInt(-1)\n", "cannot be negative", 4);
     error("const-source", "    input a : UInt<1>\n    output y : const UInt<1>\n    connect y,a\n", "non-constant source", 6);
     error("const-condition", "    input sel : UInt<1>\n    output y : const UInt<1>\n    connect y,UInt(0)\n    when sel : connect y,UInt(1)\n", "non-constant when", 7);
+    auto localConstant = text("const-local-condition", "    input sel : UInt<1>\n    output y : UInt<8>\n    connect y,UInt<8>(0)\n    when sel :\n      wire c : const UInt<8>\n      connect c,UInt<8>(42)\n      connect y,c\n");
+    require(localConstant.success(), diagnostics(localConstant));
+    Oracle local(*localConstant.design->findGraph("top"));
+    require(local.output("y", {{"sel", 0}}) == 0 && local.output("y", {{"sel", 1}}) == 42,
+        "enclosing condition incorrectly gates local const wire initialization");
     error("cycle", "    output y : UInt<4>\n    wire w : UInt<4>\n    connect w,add(w,UInt<1>(1))\n    connect y,w\n", "combinational cycle", 5);
     error("unsupported-effect", "    input clk : Clock\n    fflush(clk, UInt<1>(1))\n", "not supported yet", 5);
     auto bounded=text("bounded-width-cycle",R"FIR(    output y : UInt<16>

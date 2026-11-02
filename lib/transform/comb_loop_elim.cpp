@@ -4068,8 +4068,9 @@ namespace wolvrix::lib::transform
                 for (const auto opId : graph.operations())
                 {
                     const OperationKind opKind = graph.opKind(opId);
-                    if (isBoundaryOp(opKind) &&
-                        opKind != OperationKind::kRegisterReadArrayPort)
+                    if ((isBoundaryOp(opKind) &&
+                         opKind != OperationKind::kRegisterReadArrayPort) ||
+                        (options_.treatInstancesAsBoundary && opKind == OperationKind::kInstance))
                     {
                         continue;
                     }
@@ -4095,8 +4096,9 @@ namespace wolvrix::lib::transform
                 for (const auto opId : graph.operations())
                 {
                     const OperationKind opKind = graph.opKind(opId);
-                    if (isBoundaryOp(opKind) &&
-                        opKind != OperationKind::kRegisterReadArrayPort)
+                    if ((isBoundaryOp(opKind) &&
+                         opKind != OperationKind::kRegisterReadArrayPort) ||
+                        (options_.treatInstancesAsBoundary && opKind == OperationKind::kInstance))
                     {
                         continue;
                     }
@@ -4285,6 +4287,12 @@ namespace wolvrix::lib::transform
                             ++initialDynArrayLoops;
                         }
                     }
+                }
+                else
+                {
+                    // No repair can run, so the unchanged graph would yield
+                    // the same empty loop set in every subsequent analysis.
+                    continue;
                 }
             }
 

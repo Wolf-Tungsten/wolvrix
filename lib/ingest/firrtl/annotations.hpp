@@ -15,6 +15,9 @@ struct Annotation {
 struct AnnotationIndex {
     std::map<std::string, uint64_t> counts;
     std::vector<Annotation> records;
+    // Record indices grouped by module, retaining source order within each
+    // group. This avoids rescanning the circuit annotation payload per graph.
+    std::map<std::string, std::vector<std::size_t>> byModule;
 };
 AnnotationIndex readAnnotations(const Source& source);
 AnnotationIndex parseAnnotations(std::string_view text);

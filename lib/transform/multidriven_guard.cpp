@@ -3,6 +3,7 @@
 #include "core/grh.hpp"
 
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -29,34 +30,34 @@ namespace wolvrix::lib::transform
             bool valid = false;
         };
 
-        std::optional<std::string> getAttrString(const wolvrix::lib::grh::Operation &op,
-                                                 std::string_view key)
+        std::optional<std::string_view> getAttrString(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+                                                      std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
+            for (const auto &entry : attrs)
             {
-                return std::nullopt;
-            }
-            if (auto value = std::get_if<std::string>(&*attr))
-            {
-                return *value;
+                if (entry.key == key)
+                {
+                    if (const auto *value = std::get_if<std::string>(&entry.value))
+                    {
+                        return *value;
+                    }
+                    return std::nullopt;
+                }
             }
             return std::nullopt;
         }
 
-        std::optional<std::vector<std::string>> getAttrStrings(const wolvrix::lib::grh::Operation &op,
-                                                                std::string_view key)
+        const std::vector<std::string> *getAttrStrings(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+                                                       std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
+            for (const auto &entry : attrs)
             {
-                return std::nullopt;
+                if (entry.key == key)
+                {
+                    return std::get_if<std::vector<std::string>>(&entry.value);
+                }
             }
-            if (auto values = std::get_if<std::vector<std::string>>(&*attr))
-            {
-                return *values;
-            }
-            return std::nullopt;
+            return nullptr;
         }
 
         std::string describeOp(const wolvrix::lib::grh::Graph &graph,
@@ -140,10 +141,11 @@ namespace wolvrix::lib::transform
                 }
             };
 
-            for (const auto &port : graph->inoutPorts())
+            const auto &graphView = *graph;
+            for (const auto &port : graphView.inoutPorts())
             {
-                const auto outDef = graph->getValue(port.out).definingOp();
-                const auto oeDef = graph->getValue(port.oe).definingOp();
+                const auto outDef = graphView.valueDef(port.out);
+                const auto oeDef = graphView.valueDef(port.oe);
                 if (outDef.valid())
                 {
                     markDriven(port.out, graph, outDef, std::string());
@@ -154,18 +156,18 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            for (const auto opId : graph->operations())
+            for (const auto opId : graphView.operations())
             {
                 if (!opId.valid())
                 {
                     continue;
                 }
-                const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
+                if (graphView.opKind(opId) != wolvrix::lib::grh::OperationKind::kInstance)
                 {
                     continue;
                 }
-                const std::string moduleName = getAttrString(op, "moduleName").value_or(std::string());
+                const auto attrs = graphView.opAttrs(opId);
+                const std::string_view moduleName = getAttrString(attrs, "moduleName").value_or(std::string_view());
                 wolvrix::lib::grh::Graph *child = moduleName.empty()
                                                      ? nullptr
                                                      : design().findGraph(moduleName);
@@ -174,9 +176,9 @@ namespace wolvrix::lib::transform
                     continue;
                 }
 
-                auto inputNames = getAttrStrings(op, "inputPortName");
-                auto outputNames = getAttrStrings(op, "outputPortName");
-                auto inoutNames = getAttrStrings(op, "inoutPortName");
+                const auto *inputNames = getAttrStrings(attrs, "inputPortName");
+                const auto *outputNames = getAttrStrings(attrs, "outputPortName");
+                const auto *inoutNames = getAttrStrings(attrs, "inoutPortName");
                 const std::size_t inputCount = inputNames
                                                    ? inputNames->size()
                                                    : child->inputPorts().size();
@@ -190,8 +192,8 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                const auto operands = op.operands();
-                const auto results = op.results();
+                const auto operands = graphView.opOperands(opId);
+                const auto results = graphView.opResults(opId);
                 const std::size_t expectedOperands = inputCount + inoutCount;
                 const std::size_t expectedResults = outputCount + inoutCount * 2;
                 if (operands.size() < expectedOperands || results.size() < expectedResults)
@@ -243,14 +245,14 @@ namespace wolvrix::lib::transform
                     const auto outIt = childInfo.driven.find(childInout.out);
                     if (outIt != childInfo.driven.end())
                     {
-                        std::string inst = getAttrString(op, "instanceName").value_or(moduleName);
+                        std::string inst = std::string(getAttrString(attrs, "instanceName").value_or(moduleName));
                         std::string path = joinPath(inst, outIt->second.path);
                         markDriven(results[outIndex], outIt->second.graph, outIt->second.op, std::move(path));
                     }
                     const auto oeIt = childInfo.driven.find(childInout.oe);
                     if (oeIt != childInfo.driven.end())
                     {
-                        std::string inst = getAttrString(op, "instanceName").value_or(moduleName);
+                        std::string inst = std::string(getAttrString(attrs, "instanceName").value_or(moduleName));
                         std::string path = joinPath(inst, oeIt->second.path);
                         markDriven(results[oeIndex], oeIt->second.graph, oeIt->second.op, std::move(path));
                     }
@@ -269,27 +271,28 @@ namespace wolvrix::lib::transform
                 continue;
             }
             wolvrix::lib::grh::Graph &graph = *entry.second;
+            const auto &graphView = graph;
 
-            for (const auto opId : graph.operations())
+            for (const auto opId : graphView.operations())
             {
                 if (!opId.valid())
                 {
                     continue;
                 }
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
+                if (graphView.opKind(opId) != wolvrix::lib::grh::OperationKind::kInstance)
                 {
                     continue;
                 }
 
-                const std::string moduleName = getAttrString(op, "moduleName").value_or(std::string());
-                const std::optional<std::string> instanceName = getAttrString(op, "instanceName");
+                const auto attrs = graphView.opAttrs(opId);
+                const std::string_view moduleName = getAttrString(attrs, "moduleName").value_or(std::string_view());
+                const std::optional<std::string_view> instanceName = getAttrString(attrs, "instanceName");
                 wolvrix::lib::grh::Graph *child = moduleName.empty()
                                                      ? nullptr
                                                      : design().findGraph(moduleName);
-                auto inputNames = getAttrStrings(op, "inputPortName");
-                auto outputNames = getAttrStrings(op, "outputPortName");
-                auto inoutNames = getAttrStrings(op, "inoutPortName");
+                const auto *inputNames = getAttrStrings(attrs, "inputPortName");
+                const auto *outputNames = getAttrStrings(attrs, "outputPortName");
+                const auto *inoutNames = getAttrStrings(attrs, "inoutPortName");
 
                 const std::size_t inputCount = inputNames
                                                    ? inputNames->size()
@@ -306,32 +309,36 @@ namespace wolvrix::lib::transform
                     continue;
                 }
 
-                const auto operands = op.operands();
-                const auto results = op.results();
+                const auto operands = graphView.opOperands(opId);
+                const auto results = graphView.opResults(opId);
                 const std::size_t expectedOperands = inputCount + inoutCount;
                 const std::size_t expectedResults = outputCount + inoutCount * 2;
                 if (operands.size() < expectedOperands || results.size() < expectedResults)
                 {
-                    warning(graph, op, "multidriven-guard: instance port counts do not match inout ports");
+                    warning(graph, graph.getOperation(opId),
+                            "multidriven-guard: instance port counts do not match inout ports");
                     continue;
                 }
 
                 if (!child)
                 {
-                    warning(graph, op, "multidriven-guard: instance module graph not found; skipping inout checks");
+                    warning(graph, graph.getOperation(opId),
+                            "multidriven-guard: instance module graph not found; skipping inout checks");
                     continue;
                 }
 
                 DriveInfo &childInfo = computeDriveInfo(computeDriveInfo, child);
                 if (childInfo.inProgress && !childInfo.valid)
                 {
-                    warning(graph, op, "multidriven-guard: recursive instance detected; skipping inout checks");
+                    warning(graph, graph.getOperation(opId),
+                            "multidriven-guard: recursive instance detected; skipping inout checks");
                     continue;
                 }
                 const auto childInouts = child->inoutPorts();
                 if (!inoutNames && childInouts.size() < inoutCount)
                 {
-                    warning(graph, op, "multidriven-guard: child inout port count mismatch");
+                    warning(graph, graph.getOperation(opId),
+                            "multidriven-guard: child inout port count mismatch");
                     continue;
                 }
                 std::unordered_map<std::string_view, std::size_t> childInoutByName;
@@ -354,8 +361,8 @@ namespace wolvrix::lib::transform
                         auto it = childInoutByName.find(portName);
                         if (it == childInoutByName.end())
                         {
-                            warning(graph, op, "multidriven-guard: missing inout port in child graph: " +
-                                                std::string(portName));
+                            warning(graph, graph.getOperation(opId),
+                                    "multidriven-guard: missing inout port in child graph: " + std::string(portName));
                             continue;
                         }
                         childIndex = it->second;
@@ -369,7 +376,8 @@ namespace wolvrix::lib::transform
                     const std::size_t oeIndex = outputCount + inoutCount + i;
                     if (outIndex >= results.size() || oeIndex >= results.size())
                     {
-                        warning(graph, op, "multidriven-guard: inout result index out of range");
+                        warning(graph, graph.getOperation(opId),
+                                "multidriven-guard: inout result index out of range");
                         continue;
                     }
 
@@ -387,8 +395,7 @@ namespace wolvrix::lib::transform
                         {
                             return;
                         }
-                        const wolvrix::lib::grh::Value value = graph.getValue(parentValue);
-                        const wolvrix::lib::grh::OperationId defOpId = value.definingOp();
+                        const wolvrix::lib::grh::OperationId defOpId = graphView.valueDef(parentValue);
                         if (!defOpId.valid() || defOpId == opId)
                         {
                             return;
@@ -412,7 +419,7 @@ namespace wolvrix::lib::transform
                         message.append(" port=");
                         message.append(portName);
                         message.append(" parent_value=");
-                        message.append(value.symbolText());
+                        message.append(graph.symbolText(graph.valueSymbol(parentValue)));
                         message.append(" parent_def=");
                         message.append(parentDef);
                         message.append(" child_def=");
@@ -439,7 +446,7 @@ namespace wolvrix::lib::transform
                         }
                         message.append(" graph=");
                         message.append(graph.symbol());
-                        error(graph, op, std::move(message));
+                        error(graph, graph.getOperation(opId), std::move(message));
                         conflictCount += 1;
                     };
 

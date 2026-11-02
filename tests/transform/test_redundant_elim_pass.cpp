@@ -1,7 +1,11 @@
 #include "core/grh.hpp"
 #include "transform/redundant_elim.hpp"
+#include "transform/const_fold.hpp"
 #include "core/transform.hpp"
+#include "ingest/node_attributes.hpp"
+#include "slang/numeric/SVInt.h"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <string>
@@ -344,6 +348,106 @@ int main()
             return fail("flat temp value must stay flat");
         if (tempGraph.getValue(flatW).definingOp() != pack)
             return fail("flat temp must stay driven by the pack assign");
+    }
+
+    // A shared constant feeding output assigns must keep both output drivers
+    // and their source origins when the assigns are replaced with constants.
+    {
+        using namespace wolvrix::lib::grh;
+        Design constantDesign;
+        Graph& constantGraph = constantDesign.createGraph("constant_output_assign");
+        const ValueId literal = constantGraph.createValue(constantGraph.internSymbol("literal"), 8, false);
+        const OperationId constant = constantGraph.createOperation(OperationKind::kConstant,
+            constantGraph.internSymbol("literal_op"));
+        constantGraph.addResult(constant, literal);
+        constantGraph.setAttr(constant, "constValue", std::string("8'h5a"));
+        constantGraph.setAttr(constant, "originModules", std::vector<std::string>{"constant_source"});
+        namespace node = wolvrix::lib::ingest::node;
+        const auto nodeKey = [&](const std::string& name) {
+            return node::key({"source", "Circuit", "constant_output_assign", {}, name, {}});
+        };
+        node::write(constantGraph, constant, {{nodeKey("literal")}, {{nodeKey("literal"), 0}}, {}});
+        for (const std::string name : {"first", "second"}) {
+            const ValueId output = constantGraph.createValue(constantGraph.internSymbol(name), 8, false);
+            const OperationId assign = constantGraph.createOperation(OperationKind::kAssign,
+                constantGraph.internSymbol(name + "_assign"));
+            constantGraph.addOperand(assign, literal);
+            constantGraph.addResult(assign, output);
+            constantGraph.setAttr(assign, "originModules", std::vector<std::string>{name});
+            node::write(constantGraph, assign, {{nodeKey(name)}, {{nodeKey(name), 0}}, {}});
+            constantGraph.bindOutputPort(name, output);
+        }
+        node::establishPolicy(constantGraph);
+        PassManager constantManager;
+        constantManager.addPass(std::make_unique<RedundantElimPass>());
+        PassDiagnostics constantDiagnostics;
+        PassManagerResult constantResult;
+        try {
+            constantResult = constantManager.run(constantDesign, constantDiagnostics);
+        } catch (const std::exception& error) {
+            return fail(std::string("constant output assign rewrite threw: ") + error.what());
+        }
+        if (!constantResult.success || constantDiagnostics.hasError())
+            return fail("constant output assign rewrite failed");
+        for (const auto& port : constantGraph.outputPorts()) {
+            const OperationId definition = constantGraph.valueDef(port.value);
+            if (constantGraph.opKind(definition) != OperationKind::kConstant)
+                return fail("constant output assign was not folded into a constant driver");
+            if ((port.name == "second") != (definition == constant))
+                return fail("shared constant should clone for first output and reparent for final user");
+            const auto origins = getOriginModules(constantGraph, definition);
+            if (!origins || std::find(origins->begin(), origins->end(), port.name) == origins->end() ||
+                std::find(origins->begin(), origins->end(), "constant_source") == origins->end())
+                return fail("constant output assign lost source origins");
+            const auto attributes = node::read(constantGraph, definition);
+            if (std::find(attributes.members.begin(), attributes.members.end(), nodeKey(port.name)) == attributes.members.end() ||
+                std::find(attributes.members.begin(), attributes.members.end(), nodeKey("literal")) == attributes.members.end())
+                return fail("constant output assign lost node associations");
+        }
+        if (!node::inspect(constantGraph).errors.empty())
+            return fail("constant output assign produced invalid node associations");
+    }
+
+    // Short literals are first interpreted in the source value's type. Moving
+    // them directly to a result with different signedness changes extension.
+    for (const bool sourceSigned : {false, true}) {
+        for (const int outputs : {1, 2}) {
+            using namespace wolvrix::lib::grh;
+            Design signedDesign;
+            Graph& signedGraph = signedDesign.createGraph("constant_output_cast");
+            const ValueId literal = signedGraph.createValue(signedGraph.internSymbol("literal"), 8, sourceSigned);
+            const OperationId constant = signedGraph.createOperation(OperationKind::kConstant,
+                signedGraph.internSymbol("literal_op"));
+            signedGraph.addResult(constant, literal);
+            signedGraph.setAttr(constant, "constValue", std::string("1'b1"));
+            for (int index = 0; index < outputs; ++index) {
+                const std::string name = "out" + std::to_string(index);
+                const ValueId output = signedGraph.createValue(signedGraph.internSymbol(name), 8, !sourceSigned);
+                const OperationId assign = signedGraph.createOperation(OperationKind::kAssign,
+                    signedGraph.internSymbol(name + "_assign"));
+                signedGraph.addOperand(assign, literal);
+                signedGraph.addResult(assign, output);
+                signedGraph.bindOutputPort(name, output);
+            }
+            PassManager signedManager;
+            signedManager.addPass(std::make_unique<RedundantElimPass>());
+            signedManager.addPass(std::make_unique<ConstantFoldPass>());
+            PassDiagnostics signedDiagnostics;
+            if (!signedManager.run(signedDesign, signedDiagnostics).success || signedDiagnostics.hasError())
+                return fail("constant output cast rewrite failed");
+            for (const auto& port : signedGraph.outputPorts()) {
+                const auto definition = signedGraph.getOperation(signedGraph.valueDef(port.value));
+                const auto text = definition.attr("constValue");
+                if (definition.kind() != OperationKind::kConstant || !text || !std::holds_alternative<std::string>(*text))
+                    return fail("constant output cast did not evaluate to a constant");
+                auto bits = slang::SVInt::fromString(std::get<std::string>(*text));
+                bits.setSigned(signedGraph.valueSigned(port.value));
+                bits = bits.resize(8);
+                bits.setSigned(false);
+                if (bits.as<uint64_t>() != std::optional<uint64_t>(sourceSigned ? 255 : 1))
+                    return fail("constant output rewrite changed short-literal sign extension");
+            }
+        }
     }
 
     return 0;

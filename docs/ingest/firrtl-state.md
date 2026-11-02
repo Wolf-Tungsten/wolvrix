@@ -14,8 +14,10 @@ register data. The clock expression must have Clock type. Reset expressions
 must have UInt<1>, Reset or AsyncReset type; abstract Reset follows the existing
 constraint solver. Reset data must have an equivalent type, allowing width
 extension/truncation under the normal FIRRTL rules. Reset data and connects both
-constrain inferred register widths. AsyncReset data must be const typed, which
-also permits const input ports; it need not be a literal. Synchronous reset data
+constrain inferred register widths. AsyncReset data must be const typed or have
+provably constant combinational drivers; const input ports, constant wires and
+invalid fields in constant aggregate reset values are supported. Invalid data
+retains the selected invalid policy. Synchronous reset data
 can depend on inputs or old state, including the register itself.
 
 Bundle fields become separate named `kRegister` declarations. Vector dimensions
@@ -65,6 +67,47 @@ Both carry regSymbol=table and eventEdge=[posedge]. A whole write uses
 `kRegisterReadArrayPort [index0,...]`, with regSymbol and a suffix-shaped result;
 whole reads use `kRegisterReadPort []`. Index operands correspond to shape
 dimensions from outermost to innermost; row-major element zero occupies low bits.
+
+For an indexed writer, operand zero is the effective one-bit enable, followed
+by one operand per consumed shape dimension, then the data for the remaining
+suffix, then its event clock. AsyncReset adds a reset event operand after the
+clock as described below. `regSymbol` identifies the state declaration; it is
+an attribute, not an operand. A state read port has only the index operands and
+returns old state with the width and shape left after consuming them.
+
+Recognized in-range integer and UInt literal indices contribute no runtime
+bounds comparisons. Dynamic dimensions each contribute an unsigned
+`index < extent`; their conjunction gates a read's invalid-value mux or a
+writer's effective enable. The literal index operands remain on the ports.
+An entirely fixed valid read returns the read-port result directly. A recognized
+OOB UInt literal returns invalid without creating an indexed read port, and a
+connect with such an index creates no writer. Bare integer OOB syntax is rejected
+during type analysis. The invalid result keeps the selected suffix geometry and follows
+`invalidPolicy`; a skipped state write leaves both prior state and other
+ordered writes unaffected.
+
+For example, `reg table : UInt<4>[3][2], clock` declares 24 bits with shape
+`[2,3]`. For `i : UInt<2>` and `data : UInt<4>`:
+
+| FIRRTL access | Normalized GRH behavior |
+| --- | --- |
+| `table[i]` | `kRegisterReadArrayPort [i]` returns width 12, shape `[3]`; select invalid if `i >= 2` |
+| `table[i][UInt<2>(2)]` | Read operands `[i,2]` return a scalar width 4; only `i < 2` is checked |
+| `table[i][UInt<2>(3)]` | Scalar width-4 invalid constant, independent of `i` |
+| `connect table[i][UInt<2>(2)], data` | Writer operands `[enable & (i < 2), i, 2, data, clock]` |
+| `connect table[i][UInt<2>(3)], data` | No writer; no state bits change |
+
+In the writer row, `enable` includes the containing condition and any ordinary
+write reset gate. These direct register writes identify their target region
+through index operands. CHIRRTL mports additionally carry a per-bit memory
+write mask so unwritten portions of the addressed row retain state. The mask is
+consumed by a memory writer such as `kRegisterWriteArrayMaskPort
+[enable,addr,data,bitMask,clock]`: `addr` selects the row, `data` supplies one
+complete row, and each one in the row-width `bitMask` permits that bit to change.
+Ordinary wires and outputs use a local mask only when merging dynamic partial
+data; they do not accumulate this separate memory coverage mask. See
+[firrtl-memory.md](firrtl-memory.md) for explicit standard-memory masks and mport
+mask accumulation.
 
 The later enabled writer wins only in its overlapping region. Whole writes,
 subarray writes and element writes can appear in either order. Every writer's

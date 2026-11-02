@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace wolvrix::lib::ingest::node {
@@ -53,8 +54,31 @@ struct Attributes {
 Attributes read(const grh::Graph& graph, grh::OperationId op);
 Attributes normalize(Attributes attributes);
 void write(grh::Graph& graph, grh::OperationId op, Attributes attributes);
+// Fast path for a freshly-created operation with one already-canonical node
+// key. The caller owns the proof that key() produced the canonical encoding;
+// this function preserves the same schema, member, origin and optional root
+// attributes without re-normalizing or reparsing the key.
+void writeSingleCanonical(grh::Graph& graph, grh::OperationId op,
+                          std::string_view key, bool root = false,
+                          int64_t rootResult = 0);
+// Lowering fast path. The caller must have initialized firrtl.nodeSchema to
+// kSchemaRevision and must pass a key produced by key().
+void writeSingleCanonicalReady(grh::Graph& graph, grh::OperationId op,
+                               std::string_view key, bool root = false,
+                               int64_t rootResult = 0);
 void copyMembers(grh::Graph& graph, grh::OperationId from, grh::OperationId to);
+// One immutable instance path per context. Cache strings own their storage;
+// graph attribute edits and recursive path changes cannot invalidate them.
+class QualificationContext {
+public:
+    explicit QualificationContext(std::span<const std::string> instancePath);
+private:
+    friend void qualify(grh::Graph&, grh::OperationId, QualificationContext&);
+    const std::vector<std::string> instancePath_;
+    std::unordered_map<std::string, std::string> qualified_;
+};
 void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string> instancePath);
+void qualify(grh::Graph& graph, grh::OperationId op, QualificationContext& context);
 Attributes remapResults(Attributes attributes, std::span<const int64_t> oldToNew);
 
 enum class MergeReason { SameComputation, WholeNode, ExecutionLeaf };
@@ -100,8 +124,34 @@ void requireValid(const grh::Graph& graph);
 // Establish only at source construction, never to upgrade a loaded checkpoint.
 void establishPolicy(grh::Graph& graph);
 void requirePolicy(const grh::Graph& graph);
-// Call only after the caller has proved that the result is dead.
+// Record only proven-dead results, before erasing their operations. Explicitly
+// flush once at the graph/pass boundary, before verification or persistence.
+class DeadRootBatch {
+public:
+    explicit DeadRootBatch(grh::Graph& graph);
+    void record(grh::OperationId op);
+    void flush();
+private:
+    grh::Graph& graph_;
+    bool enabled_;
+    std::vector<std::string> pending_;
+};
+// Single-operation convenience; repeated deletions should share a batch.
 void recordDead(grh::Graph& graph, grh::OperationId op);
+// Own qualified imports until an explicit graph/pass boundary. Source graphs
+// may be deleted before flush; no verification/persistence may precede it.
+// Flush on success and explicit failure returns; destruction never publishes.
+class InventoryImportBatch {
+public:
+    explicit InventoryImportBatch(grh::Graph& target);
+    void record(const grh::Graph& source, std::span<const std::string> instancePath);
+    void flush();
+private:
+    grh::Graph& target_;
+    bool pendingImport_ = false;
+    std::vector<std::string> inventory_;
+    std::vector<std::string> eliminated_;
+};
 // Copy the source inventory/tombstones with the same qualification as the ops.
 void importInventory(const grh::Graph& source, grh::Graph& target,
                      std::span<const std::string> instancePath);

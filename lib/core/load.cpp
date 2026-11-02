@@ -2,15 +2,18 @@
 #include "core/op_descriptor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -107,9 +110,26 @@ namespace wolvrix::lib::load
             StringArray
         };
 
+        struct JsonValue;
+        class JsonFileInput;
+
+        struct JsonArray
+        {
+            class Iterator;
+            std::vector<JsonValue> entries;
+            std::shared_ptr<JsonFileInput> file;
+            uint64_t offset = 0;
+            std::size_t count = 0;
+
+            std::size_t size() const;
+            void push_back(JsonValue entry);
+            Iterator begin() const;
+            Iterator end() const;
+        };
+
         struct JsonValue
         {
-            using Array = std::vector<JsonValue>;
+            using Array = JsonArray;
             using Object = std::map<std::string, JsonValue, std::less<>>;
 
             std::variant<std::nullptr_t, bool, int64_t, double, std::string, Array, Object> value;
@@ -189,6 +209,13 @@ namespace wolvrix::lib::load
                 return std::get<Object>(value);
             }
         };
+
+        void JsonArray::push_back(JsonValue entry)
+        {
+            entries.push_back(std::move(entry));
+        }
+
+        std::size_t JsonArray::size() const { return file ? count : entries.size(); }
 
         class JsonParser
         {
@@ -562,6 +589,294 @@ namespace wolvrix::lib::load
             return parser.parse();
         }
 
+        class JsonFileInput
+        {
+        public:
+            explicit JsonFileInput(const std::filesystem::path &path) : stream_(path, std::ios::binary)
+            {
+                if (!stream_) throw std::runtime_error("Failed to open JSON file: " + path.string());
+                stream_.seekg(0, std::ios::end);
+                const auto end = stream_.tellg();
+                if (end < 0) throw std::runtime_error("Failed to determine JSON file size: " + path.string());
+                size_ = static_cast<uint64_t>(end);
+            }
+
+            uint64_t size() const { return size_; }
+            uint64_t position() const { return position_; }
+
+            void seek(uint64_t offset)
+            {
+                if (offset > size_) throw std::runtime_error("JSON file offset exceeds file size");
+                position_ = offset;
+            }
+
+            int peek()
+            {
+                if (position_ == size_) return -1;
+                if (position_ < bufferOffset_ || position_ - bufferOffset_ >= buffered_)
+                {
+                    stream_.clear();
+                    stream_.seekg(static_cast<std::streamoff>(position_));
+                    const auto length = static_cast<std::streamsize>(
+                        std::min<uint64_t>(buffer_.size(), size_ - position_));
+                    stream_.read(buffer_.data(), length);
+                    if (stream_.gcount() != length)
+                        throw std::runtime_error("Failed to read JSON file");
+                    bufferOffset_ = position_;
+                    buffered_ = static_cast<std::size_t>(length);
+                }
+                return static_cast<unsigned char>(buffer_[position_ - bufferOffset_]);
+            }
+
+            int take()
+            {
+                const int value = peek();
+                if (value != -1) ++position_;
+                return value;
+            }
+
+        private:
+            std::ifstream stream_;
+            std::array<char, 64 * 1024> buffer_{};
+            uint64_t size_ = 0;
+            uint64_t position_ = 0;
+            uint64_t bufferOffset_ = 0;
+            std::size_t buffered_ = 0;
+        };
+
+        // Arrays retain only a file interval and element count. Their iterators
+        // materialize one record, including nested lazy arrays, at a time.
+        class JsonFileParser
+        {
+        public:
+            explicit JsonFileParser(std::shared_ptr<JsonFileInput> file) : file_(std::move(file)) {}
+
+            JsonValue parse()
+            {
+                file_->seek(0);
+                skipWhitespace();
+                auto result = parseValue(true);
+                skipWhitespace();
+                if (file_->peek() != -1)
+                    throw std::runtime_error("Trailing characters after JSON document");
+                return result;
+            }
+
+            JsonValue parseElement(uint64_t offset)
+            {
+                file_->seek(offset);
+                skipWhitespace();
+                return parseValue(true);
+            }
+
+            uint64_t nextElement(uint64_t offset)
+            {
+                file_->seek(offset);
+                skipWhitespace();
+                expect(',');
+                skipWhitespace();
+                return file_->position();
+            }
+
+        private:
+            JsonValue parseValue(bool materialize)
+            {
+                switch (file_->peek())
+                {
+                case '{': return parseObject(materialize);
+                case '[': return parseArray(materialize);
+                case '"': return parseString(materialize);
+                case 't': return parseLiteral("true", JsonValue{true}, materialize);
+                case 'f': return parseLiteral("false", JsonValue{false}, materialize);
+                case 'n': return parseLiteral("null", JsonValue{nullptr}, materialize);
+                case -1: throw std::runtime_error("Unexpected end of JSON input");
+                default:
+                    if (file_->peek() == '-' || digit(file_->peek())) return parseNumber(materialize);
+                    throw std::runtime_error("Invalid JSON value");
+                }
+            }
+
+            JsonValue parseObject(bool materialize)
+            {
+                JsonValue::Object object;
+                expect('{');
+                skipWhitespace();
+                if (consume('}')) return JsonValue{std::move(object)};
+                while (true)
+                {
+                    skipWhitespace();
+                    auto key = parseString(materialize);
+                    skipWhitespace();
+                    expect(':');
+                    skipWhitespace();
+                    auto value = parseValue(materialize);
+                    if (materialize)
+                        object.emplace(std::move(std::get<std::string>(key.value)), std::move(value));
+                    skipWhitespace();
+                    if (consume('}')) break;
+                    expect(',');
+                }
+                return JsonValue{std::move(object)};
+            }
+
+            JsonValue parseArray(bool materialize)
+            {
+                expect('[');
+                skipWhitespace();
+                JsonArray array;
+                array.offset = file_->position();
+                if (!consume(']'))
+                {
+                    while (true)
+                    {
+                        parseValue(false);
+                        ++array.count;
+                        skipWhitespace();
+                        if (consume(']')) break;
+                        expect(',');
+                        skipWhitespace();
+                    }
+                }
+                if (materialize) array.file = file_;
+                return JsonValue{std::move(array)};
+            }
+
+            JsonValue parseString(bool materialize)
+            {
+                expect('"');
+                std::string token;
+                if (materialize) token.push_back('"');
+                while (true)
+                {
+                    const int value = file_->take();
+                    if (value == -1) throw std::runtime_error("Unterminated JSON string");
+                    const char ch = static_cast<char>(value);
+                    if (materialize) token.push_back(ch);
+                    if (ch == '"') break;
+                    if (value < 0x20) throw std::runtime_error("Invalid control character in string");
+                    if (ch != '\\') continue;
+                    const int escaped = file_->take();
+                    if (escaped == -1) throw std::runtime_error("Invalid escape sequence");
+                    if (materialize) token.push_back(static_cast<char>(escaped));
+                    switch (escaped)
+                    {
+                    case '"': case '\\': case '/': case 'b': case 'f': case 'n': case 'r': case 't': break;
+                    case 'u':
+                        for (unsigned i = 0; i < 4; ++i)
+                        {
+                            const int hex = file_->take();
+                            if (!digit(hex) && !(hex >= 'a' && hex <= 'f') && !(hex >= 'A' && hex <= 'F'))
+                                throw std::runtime_error("Invalid unicode escape");
+                            if (materialize) token.push_back(static_cast<char>(hex));
+                        }
+                        break;
+                    default: throw std::runtime_error("Invalid escape sequence");
+                    }
+                }
+                // Reuse the text parser's Unicode and escape representation.
+                return materialize ? parseJson(token) : JsonValue{nullptr};
+            }
+
+            JsonValue parseNumber(bool materialize)
+            {
+                std::string token;
+                const auto append = [&] { token.push_back(static_cast<char>(file_->take())); };
+                if (file_->peek() == '-') append();
+                if (file_->peek() == '0') append();
+                else
+                {
+                    if (!digit(file_->peek())) throw std::runtime_error("Invalid JSON number");
+                    while (digit(file_->peek())) append();
+                }
+                if (file_->peek() == '.')
+                {
+                    append();
+                    if (!digit(file_->peek())) throw std::runtime_error("Invalid JSON number");
+                    while (digit(file_->peek())) append();
+                }
+                if (file_->peek() == 'e' || file_->peek() == 'E')
+                {
+                    append();
+                    if (file_->peek() == '+' || file_->peek() == '-') append();
+                    if (!digit(file_->peek())) throw std::runtime_error("Invalid JSON number");
+                    while (digit(file_->peek())) append();
+                }
+                auto result = parseJson(token);
+                return materialize ? std::move(result) : JsonValue{nullptr};
+            }
+
+            JsonValue parseLiteral(std::string_view literal, JsonValue value, bool materialize)
+            {
+                for (const char expected : literal)
+                    if (file_->take() != expected) throw std::runtime_error("Invalid JSON literal");
+                return materialize ? std::move(value) : JsonValue{nullptr};
+            }
+
+            static bool digit(int ch) { return ch >= '0' && ch <= '9'; }
+
+            void skipWhitespace()
+            {
+                while (file_->peek() != -1 && std::isspace(static_cast<unsigned char>(file_->peek())))
+                    file_->take();
+            }
+
+            bool consume(char ch)
+            {
+                if (file_->peek() != ch) return false;
+                file_->take();
+                return true;
+            }
+
+            void expect(char ch)
+            {
+                if (!consume(ch)) throw std::runtime_error("Unexpected character in JSON stream");
+            }
+
+            std::shared_ptr<JsonFileInput> file_;
+        };
+
+        class JsonArray::Iterator
+        {
+        public:
+            Iterator(const JsonArray &array, std::size_t index) : array_(&array), index_(index), offset_(array.offset) {}
+
+            const JsonValue &operator*()
+            {
+                if (!array_->file) return array_->entries[index_];
+                if (!value_)
+                {
+                    value_ = std::make_unique<JsonValue>(JsonFileParser(array_->file).parseElement(offset_));
+                    next_ = array_->file->position();
+                }
+                return *value_;
+            }
+
+            Iterator &operator++()
+            {
+                if (array_->file)
+                {
+                    operator*();
+                    if (index_ + 1 < array_->count)
+                        offset_ = JsonFileParser(array_->file).nextElement(next_);
+                    value_.reset();
+                }
+                ++index_;
+                return *this;
+            }
+
+            bool operator!=(const Iterator &other) const { return index_ != other.index_; }
+
+        private:
+            const JsonArray *array_;
+            std::size_t index_;
+            uint64_t offset_;
+            uint64_t next_ = 0;
+            std::unique_ptr<JsonValue> value_;
+        };
+
+        JsonArray::Iterator JsonArray::begin() const { return Iterator(*this, 0); }
+        JsonArray::Iterator JsonArray::end() const { return Iterator(*this, size()); }
+
         AttributeKind parseAttributeKind(std::string_view text)
         {
             if (text == "bool")
@@ -674,11 +989,12 @@ namespace wolvrix::lib::load
                     throw std::runtime_error("Bool array attribute missing values");
                 }
                 std::vector<bool> arr;
+                arr.reserve(valuesIt->second.asArray("attribute.vs").size());
                 for (const auto &entry : valuesIt->second.asArray("attribute.vs"))
                 {
                     arr.push_back(entry.asBool("attribute.vs[]"));
                 }
-                return validateAndReturn(AttributeValue{arr});
+                return validateAndReturn(AttributeValue{std::move(arr)});
             }
             case AttributeKind::IntArray:
             {
@@ -687,11 +1003,12 @@ namespace wolvrix::lib::load
                     throw std::runtime_error("Int array attribute missing values");
                 }
                 std::vector<int64_t> arr;
+                arr.reserve(valuesIt->second.asArray("attribute.vs").size());
                 for (const auto &entry : valuesIt->second.asArray("attribute.vs"))
                 {
                     arr.push_back(entry.asInt("attribute.vs[]"));
                 }
-                return validateAndReturn(AttributeValue{arr});
+                return validateAndReturn(AttributeValue{std::move(arr)});
             }
             case AttributeKind::DoubleArray:
             {
@@ -700,11 +1017,12 @@ namespace wolvrix::lib::load
                     throw std::runtime_error("Double array attribute missing values");
                 }
                 std::vector<double> arr;
+                arr.reserve(valuesIt->second.asArray("attribute.vs").size());
                 for (const auto &entry : valuesIt->second.asArray("attribute.vs"))
                 {
                     arr.push_back(entry.asDouble("attribute.vs[]"));
                 }
-                return validateAndReturn(AttributeValue{arr});
+                return validateAndReturn(AttributeValue{std::move(arr)});
             }
             case AttributeKind::StringArray:
             {
@@ -713,11 +1031,12 @@ namespace wolvrix::lib::load
                     throw std::runtime_error("String array attribute missing values");
                 }
                 std::vector<std::string> arr;
+                arr.reserve(valuesIt->second.asArray("attribute.vs").size());
                 for (const auto &entry : valuesIt->second.asArray("attribute.vs"))
                 {
                     arr.push_back(entry.asString("attribute.vs[]"));
                 }
-                return validateAndReturn(AttributeValue{arr});
+                return validateAndReturn(AttributeValue{std::move(arr)});
             }
             }
             throw std::runtime_error("Unhandled attribute kind");
@@ -779,7 +1098,8 @@ namespace wolvrix::lib::load
 
     } // namespace
 
-    wolvrix::lib::grh::Design LoadJson::load(std::string_view json)
+    template<typename Parse>
+    static wolvrix::lib::grh::Design loadDesignJson(Parse &&parse, uint64_t bytes)
     {
         const bool timingEnabled = jsonTimingEnabled();
         const std::size_t progressStep = timingEnabled ? jsonTimingStep() : 0;
@@ -794,12 +1114,12 @@ namespace wolvrix::lib::load
         {
             parseStart = TimingClock::now();
         }
-        JsonValue root = parseJson(json);
+        JsonValue root = parse();
         if (timingEnabled)
         {
             const auto parseEnd = TimingClock::now();
             std::ostringstream details;
-            details << "bytes=" << json.size();
+            details << "bytes=" << bytes;
             logJsonTiming("load_json.parse", toMillis(parseEnd - parseStart), details.str());
         }
         const auto &rootObj = root.asObject("design");
@@ -981,12 +1301,10 @@ namespace wolvrix::lib::load
                 }
             }
 
-            std::unordered_map<std::string, ValueId> valueBySymbol;
             std::unordered_set<uint32_t> declaredInputs;
             std::unordered_set<uint32_t> declaredOutputs;
             std::unordered_set<uint32_t> declaredInouts;
 
-            valueBySymbol.reserve(valuesArray.size());
             const std::size_t ioReserve = std::max<std::size_t>(32, valuesArray.size() / 32);
             declaredInputs.reserve(ioReserve);
             declaredOutputs.reserve(ioReserve);
@@ -1081,7 +1399,6 @@ namespace wolvrix::lib::load
                     const auto now = TimingClock::now();
                     valuesCreateMs += toMillis(now - valueCreateStart);
                 }
-                valueBySymbol.emplace(symbol, valueId);
 
                 bool isInput = inIt->second.asBool("value.in");
                 bool isOutput = outIt->second.asBool("value.out");
@@ -1199,18 +1516,18 @@ namespace wolvrix::lib::load
                         {
                             throw std::runtime_error("Port value symbol is empty");
                         }
-                        auto valueIt = valueBySymbol.find(valueName);
-                        if (valueIt == valueBySymbol.end())
+                        const auto valueId = graph.findValue(valueName);
+                        if (!valueId.valid())
                         {
                             throw std::runtime_error("Port references unknown value: " + valueName);
                         }
                         if (isInput)
                         {
-                            inputPorts.push_back(Port{portNameText, valueIt->second});
+                            inputPorts.push_back(Port{portNameText, valueId});
                         }
                         else
                         {
-                            outputPorts.push_back(Port{portNameText, valueIt->second});
+                            outputPorts.push_back(Port{portNameText, valueId});
                         }
                         if (timingEnabled)
                         {
@@ -1264,15 +1581,14 @@ namespace wolvrix::lib::load
                         {
                             throw std::runtime_error("Inout port value symbol is empty");
                         }
-                        auto inIt = valueBySymbol.find(inName);
-                        auto outIt = valueBySymbol.find(outName);
-                        auto oeIt = valueBySymbol.find(oeName);
-                        if (inIt == valueBySymbol.end() || outIt == valueBySymbol.end() ||
-                            oeIt == valueBySymbol.end())
+                        const auto inValue = graph.findValue(inName);
+                        const auto outValue = graph.findValue(outName);
+                        const auto oeValue = graph.findValue(oeName);
+                        if (!inValue.valid() || !outValue.valid() || !oeValue.valid())
                         {
                             throw std::runtime_error("Inout port references unknown value");
                         }
-                        inoutPorts.push_back(InoutPort{portNameText, inIt->second, outIt->second, oeIt->second});
+                        inoutPorts.push_back(InoutPort{portNameText, inValue, outValue, oeValue});
                         if (timingEnabled)
                         {
                             const auto now = TimingClock::now();
@@ -1519,12 +1835,12 @@ namespace wolvrix::lib::load
                         for (const auto &entry : *inputsArray)
                         {
                             const std::string &symbol = entry.asString("operation.in[]");
-                            auto valueIt = valueBySymbol.find(symbol);
-                            if (valueIt == valueBySymbol.end())
+                            const auto valueId = graph.findValue(symbol);
+                            if (!valueId.valid())
                             {
                                 throw std::runtime_error("Operand references unknown value: " + symbol);
                             }
-                            graph.addOperand(opId, valueIt->second);
+                            graph.addOperand(opId, valueId);
                             ++opsInRefs;
                         }
                     }
@@ -1551,12 +1867,12 @@ namespace wolvrix::lib::load
                         for (const auto &entry : *outputsArray)
                         {
                             const std::string &symbol = entry.asString("operation.out[]");
-                            auto valueIt = valueBySymbol.find(symbol);
-                            if (valueIt == valueBySymbol.end())
+                            const auto valueId = graph.findValue(symbol);
+                            if (!valueId.valid())
                             {
                                 throw std::runtime_error("Result references unknown value: " + symbol);
                             }
-                            graph.addResult(opId, valueIt->second);
+                            graph.addResult(opId, valueId);
                             ++opsOutRefs;
                         }
                     }
@@ -1737,6 +2053,17 @@ namespace wolvrix::lib::load
         }
 
         return design;
+    }
+
+    wolvrix::lib::grh::Design LoadJson::load(std::string_view json)
+    {
+        return loadDesignJson([&] { return parseJson(json); }, json.size());
+    }
+
+    wolvrix::lib::grh::Design LoadJson::loadFile(const std::filesystem::path &path)
+    {
+        auto file = std::make_shared<JsonFileInput>(path);
+        return loadDesignJson([&] { return JsonFileParser(file).parse(); }, file->size());
     }
 
 } // namespace wolvrix::lib::load

@@ -4,6 +4,7 @@
 #include "ingest/sv.hpp"
 #include "firrtl/annotations.hpp"
 #include "firrtl/semantic.hpp"
+#include "transform/comb_loop_elim.hpp"
 #include "transform/verify.hpp"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 
 namespace wolvrix::lib::ingest {
 namespace {
@@ -45,8 +47,9 @@ std::string metadata(const grh::Graph& graph, std::string_view name) {
     const auto value = graph.metadata(name); return value ? std::get<std::string>(*value) : std::string{};
 }
 std::string attribute(const grh::Graph& graph, grh::OperationId op, std::string_view name) {
-    const auto value = graph.getOperation(op).attr(name);
-    return value ? std::get<std::string>(*value) : std::string{};
+    for (const auto& entry : graph.opAttrs(op))
+        if (entry.key == name) return std::get<std::string>(entry.value);
+    return {};
 }
 int32_t flatWidth(const PortLeafSignature& port) {
     int64_t width = port.elementWidth;
@@ -58,6 +61,13 @@ int32_t flatWidth(const PortLeafSignature& port) {
     }
     return static_cast<int32_t>(width);
 }
+bool samePortSignature(const PortLeafSignature& left, const PortLeafSignature& right) {
+    return left.name == right.name && left.fieldPath == right.fieldPath &&
+        left.direction == right.direction && left.valueType == right.valueType &&
+        left.elementWidth == right.elementWidth && left.isSigned == right.isSigned &&
+        left.shape == right.shape && left.shapeFieldDepths == right.shapeFieldDepths &&
+        left.sourceType == right.sourceType && left.isConst == right.isConst;
+}
 struct FirrtlEntry {
     std::shared_ptr<const firrtl::Source> source;
     std::size_t index = 0;
@@ -65,6 +75,7 @@ struct FirrtlEntry {
     unsigned state = 0;
     std::string graph;
 };
+using ParsedModuleKey = std::pair<const firrtl::Source*, std::size_t>;
 std::string readText(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::invalid_argument("cannot read blackbox source or annotation file: " + path.string());
@@ -81,6 +92,7 @@ private:
     IngestResult result_;
     grh::Design design_;
     std::map<std::string, FirrtlEntry> firrtl_;
+    std::map<ParsedModuleKey, std::shared_ptr<const firrtl::ModuleBody>> parsedModules_;
     std::map<std::string, ModuleSignature> interfaces_;
     std::map<const firrtl::Source*, firrtl::detail::AnnotationIndex> annotations_;
     std::map<std::string, std::string> svGraphs_;
@@ -95,6 +107,9 @@ private:
     std::filesystem::path write(std::string_view contents, std::string_view extension);
     void collectAnnotations();
     void collectBlackboxes(const std::string& module);
+    void resolveFirrtlInterfaces(const std::vector<std::string>& tops);
+    std::shared_ptr<const firrtl::ModuleBody> parseFirrtlModule(const FirrtlEntry& entry,
+                                                                std::string_view name);
     std::string ensureImplementation(const ModuleSpecialization& specialization);
     std::string ensureFirrtl(const std::string& name);
     std::string ensureSv(const ModuleSpecialization& specialization);
@@ -102,6 +117,7 @@ private:
     std::string adapter(const ModuleSignature& source, const std::string& target,
                         const std::vector<PortBinding>& bindings);
     void bindDeclarations(grh::Graph& graph);
+    void canonicalizeGeneratedLocations();
     void checkHierarchy();
     std::string prototypes(const std::vector<std::string>& names);
 };
@@ -148,7 +164,9 @@ void Transaction::collectAnnotations() {
                 firrtl::detail::AnnotationIndex one; one.records.push_back(record);
                 firrtl::detail::validateAnnotations(*selected, one);
                 auto& destination = annotations_.at(selected);
-                ++destination.counts[record.kind]; destination.records.push_back(std::move(record));
+                ++destination.counts[record.kind];
+                destination.byModule[record.module].push_back(destination.records.size());
+                destination.records.push_back(std::move(record));
             }
         } catch (const firrtl::detail::Error& failure) {
             const auto offset = std::min<std::size_t>(failure.range.begin, text.size());
@@ -207,6 +225,206 @@ void Transaction::collectBlackboxes(const std::string& module) {
     }
 }
 
+std::shared_ptr<const firrtl::ModuleBody> Transaction::parseFirrtlModule(const FirrtlEntry& entry,
+                                                                          std::string_view name) {
+    const ParsedModuleKey key{entry.source.get(), entry.index};
+    if (const auto found = parsedModules_.find(key); found != parsedModules_.end()) {
+        return found->second;
+    }
+
+    auto parsed = firrtl::parseModule(entry.source, entry.index);
+    if (!parsed.success()) throw std::invalid_argument("cannot parse FIRRTL module: " + std::string(name));
+    auto body = std::make_shared<firrtl::ModuleBody>(std::move(*parsed.body));
+    const auto [found, inserted] = parsedModules_.emplace(key, std::move(body));
+    return found->second;
+}
+
+void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) {
+    // Abstract Reset belongs to the connected hierarchy. Defaulting an isolated
+    // child port to UInt before seeing its parent loses asynchronous resets.
+    using Endpoint = std::pair<std::string, std::vector<std::string>>;
+    struct Reset { std::size_t parent; unsigned flags = 0; };
+    std::map<Endpoint, std::size_t> endpoints;
+    std::vector<Reset> resets;
+    const auto endpoint = [&](const Endpoint& key) {
+        const auto [found, inserted] = endpoints.emplace(key, resets.size());
+        if (inserted) resets.push_back({found->second});
+        return found->second;
+    };
+    const auto root = [&](std::size_t id) {
+        while (resets[id].parent != id) { resets[id].parent = resets[resets[id].parent].parent; id = resets[id].parent; }
+        return id;
+    };
+    const auto merge = [&](std::size_t left, std::size_t right, const firrtl::Range& range) {
+        left = root(left); right = root(right);
+        resets[right].parent = left; resets[left].flags |= resets[right].flags;
+        if (resets[left].flags == 3)
+            throw firrtl::detail::Error(range, "Reset is connected to both synchronous and asynchronous resets across the hierarchy");
+    };
+    std::map<std::string, unsigned> states;
+    std::map<std::string, std::set<std::string>> reverseParents;
+    std::set<std::string> dirtyModules;
+    std::set<std::string> changedModules;
+    std::set<std::string> resolvedModules;
+    bool firstRound = true;
+    bool changed = false;
+    std::map<Endpoint, std::size_t> portIndices;
+    std::set<Endpoint> inferredWidths;
+    for (const auto& [name, entry] : firrtl_) {
+        for (std::size_t i = 0; i < entry.signature.ports.size(); ++i) {
+            const auto& port = entry.signature.ports[i];
+            const Endpoint key{name, port.fieldPath};
+            portIndices.emplace(key, i);
+            if (port.elementWidth < 0) inferredWidths.insert(key);
+        }
+    }
+    std::map<Endpoint, int32_t> drivenWidths;
+    const auto visit = [&](auto&& self, const std::string& name) -> void {
+        const auto found = firrtl_.find(name);
+        if (found == firrtl_.end() || found->second.signature.external) return;
+        if (states[name] == 2) return;
+        if (states[name] == 1) throw std::invalid_argument("recursive module dependency: " + name);
+        states[name] = 1;
+        const auto& entry = found->second;
+
+        const auto parsed = parseFirrtlModule(entry, name);
+        try {
+            bool childChanged = false;
+            const auto dependencies = [&](auto&& walk, std::span<const firrtl::StmtId> statements, std::string layer) -> void {
+                for (const auto id : statements) {
+                    const auto& statement = parsed->arena.statements[id];
+                    if (statement.kind == firrtl::StmtKind::LayerBlock) {
+                        const auto path = layer.empty() ? std::string(statement.target) : layer + "." + std::string(statement.target);
+                        if (std::any_of(request_.firrtl.enabledLayers.begin(), request_.firrtl.enabledLayers.end(),
+                            [&](const auto& enabled) { return enabled == path || enabled.starts_with(path + "."); }))
+                            walk(walk, statement.body, path);
+                        continue;
+                    }
+                    if (statement.kind == firrtl::StmtKind::Instance) {
+                        const std::string target(statement.target);
+                        if (firrtl_.contains(target)) reverseParents[target].insert(name);
+                        self(self, target);
+                        childChanged |= changedModules.contains(target) || resolvedModules.contains(target);
+                    }
+                    walk(walk, statement.body, layer); walk(walk, statement.otherwise, layer);
+                }
+            };
+            dependencies(dependencies, parsed->statements, {});
+            if (!firstRound && !dirtyModules.contains(name) && !childChanged) {
+                states[name] = 2;
+                return;
+            }
+
+            firrtl::detail::Semantics semantics(*entry.source, *parsed, request_.firrtl, &interfaces_);
+            semantics.analyze(true);
+
+            auto signature = entry.signature; signature.ports.clear();
+            std::map<uint32_t, std::size_t> groups;
+            std::map<std::string, std::string> instances;
+            for (const auto& instance : semantics.instances) instances.emplace(instance.name, instance.target);
+            for (const auto& declarationName : semantics.declarationOrder) {
+                const auto& declaration = semantics.declarations.at(declarationName);
+                if (!declaration.port && !instances.contains(declarationName)) continue;
+                for (const auto& leaf : semantics.leavesCached(declaration.type, declaration.flow)) {
+                    auto path = leaf.fields; path.insert(path.begin(), declarationName);
+                    if (instances.contains(declarationName) && semantics.width(leaf.type) >= 0) {
+                        const Endpoint target{instances.at(declarationName), leaf.fields};
+                        if (inferredWidths.contains(target)) {
+                            const auto [width, inserted] = drivenWidths.emplace(target, semantics.width(leaf.type));
+                            if (!inserted) width->second = std::max(width->second, static_cast<int32_t>(semantics.width(leaf.type)));
+                        }
+                    }
+                    if (leaf.type->kind == firrtl::TypeKind::Reset) {
+                        const auto id = endpoint({name, path});
+                        resets[root(id)].flags |= semantics.resetConstraint(leaf.type);
+                        const auto [group, inserted] = groups.emplace(semantics.resetGroup(leaf.type), id);
+                        if (!inserted) merge(id, group->second, declaration.range);
+                        if (instances.contains(declarationName))
+                            merge(id, endpoint({instances.at(declarationName), leaf.fields}), declaration.range);
+                    }
+                    if (!declaration.port) continue;
+                    PortLeafSignature port; port.name = declarationName; port.fieldPath = path;
+                    for (const auto& field : leaf.fields) port.name += "__DOT__" + field;
+                    port.direction = leaf.flow == 1 ? LeafDirection::Input : LeafDirection::Output;
+                    port.elementWidth = static_cast<int32_t>(semantics.width(leaf.type)); port.shape = leaf.shape;
+                    port.shapeFieldDepths = leaf.shapeFieldDepths;
+                    port.isSigned = leaf.type->kind == firrtl::TypeKind::SInt; port.isConst = leaf.type->constant;
+                    port.requiresTypeResolution = port.elementWidth <= 0 ||
+                        std::find(port.shape.begin(), port.shape.end(), 0) != port.shape.end() || leaf.probe != firrtl::TypeKind::Unknown;
+                    const auto kind = leaf.type->kind;
+                    port.sourceType = kind == firrtl::TypeKind::Reset ? "Reset" : kind == firrtl::TypeKind::AsyncReset ? "AsyncReset" :
+                        kind == firrtl::TypeKind::Clock ? "Clock" : kind == firrtl::TypeKind::SInt ? "SInt" : "UInt";
+                    if (leaf.probe != firrtl::TypeKind::Unknown)
+                        port.sourceType = std::string(leaf.probe == firrtl::TypeKind::Probe ? "Probe<" : "RWProbe<") + port.sourceType + ">";
+                    signature.ports.push_back(std::move(port));
+                }
+            }
+            const auto& previous = interfaces_.at(name);
+            bool signatureChanged = signature.ports.size() != previous.ports.size();
+            for (std::size_t i = 0; i < signature.ports.size(); ++i) {
+                const auto& port = signature.ports[i];
+                const Endpoint key{name, port.fieldPath};
+                const auto prior = portIndices.find(key);
+                const bool portChanged = prior == portIndices.end() || prior->second >= previous.ports.size() ||
+                    !samePortSignature(port, previous.ports[prior->second]);
+                signatureChanged |= portChanged;
+            }
+            changed |= signatureChanged;
+            if (signatureChanged) resolvedModules.insert(name);
+            for (std::size_t i = 0; i < signature.ports.size(); ++i) portIndices[{name, signature.ports[i].fieldPath}] = i;
+            interfaces_[name] = std::move(signature); states[name] = 2;
+        } catch (const firrtl::detail::Error& failure) {
+            result_.diagnostics.push_back(firrtl::detail::diagnostic(*entry.source, failure, name)); throw;
+        }
+    };
+    std::size_t round = 0;
+    do {
+        changed = false; states.clear(); resolvedModules.clear();
+        for (const auto& top : tops) visit(visit, top);
+        for (const auto& [key, bits] : drivenWidths) {
+            const auto module = interfaces_.find(key.first);
+            const auto portIndex = portIndices.find(key);
+            if (module == interfaces_.end() || portIndex == portIndices.end() ||
+                portIndex->second >= module->second.ports.size())
+                throw std::invalid_argument("missing FIRRTL inferred width port: " + key.first);
+            auto& port = module->second.ports[portIndex->second];
+            if (bits > port.elementWidth) {
+                port.elementWidth = bits;
+                changed = true;
+                resolvedModules.insert(key.first);
+            }
+        }
+        if (++round > firrtl_.size() * 2 + 1)
+            throw std::invalid_argument("hierarchical FIRRTL width inference did not converge");
+        if (request_.logSink && request_.logLevel <= LogLevel::Info)
+            request_.logSink({LogLevel::Info, "ingest-firrtl", "hierarchical interface inference round=" + std::to_string(round) +
+                " modules=" + std::to_string(states.size()) + " changed=" + (changed ? "1" : "0")});
+        firstRound = false;
+        dirtyModules.clear();
+        if (changed) {
+            for (const auto& module : resolvedModules) {
+                // A width update is applied to the module's interface after
+                // its visit; re-analyze that module before propagating to
+                // parents so its derived output widths become visible.
+                dirtyModules.insert(module);
+                const auto parents = reverseParents.find(module);
+                if (parents == reverseParents.end()) continue;
+                dirtyModules.insert(parents->second.begin(), parents->second.end());
+            }
+        }
+        changedModules.swap(resolvedModules);
+    } while (changed);
+    for (const auto& [key, id] : endpoints) {
+        const auto found = portIndices.find(key);
+        if (found == portIndices.end()) continue;
+        auto& port = interfaces_.at(key.first).ports[found->second];
+        if (port.sourceType == "Reset") {
+            port.sourceType = resets[root(id)].flags == 2 ? "AsyncReset" : "UInt";
+            port.requiresTypeResolution = !port.elementWidth || std::find(port.shape.begin(), port.shape.end(), 0) != port.shape.end();
+        }
+    }
+}
+
 std::string Transaction::prototypes(const std::vector<std::string>& names) {
     std::string text;
     for (const auto& name : names) {
@@ -244,6 +462,33 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
     std::set<std::string> bound;
     for (const auto& binding : bindings)
         if (!bound.insert(binding.sourcePort).second) throw std::invalid_argument("duplicate source port binding: " + binding.sourcePort);
+    const auto hasPort = [&](const std::string& name) {
+        return child->inputPortValue(name) || child->outputPortValue(name) ||
+            std::any_of(child->inoutPorts().begin(), child->inoutPorts().end(), [&](const auto& port) { return port.name == name; });
+    };
+    const auto connect = [&](const PortLeafSignature& port, const std::string& targetPort,
+                             grh::ValueId value, bool scalarized = false) {
+        const auto expected = port.direction == LeafDirection::Input ? child->inputPortValue(targetPort) : child->outputPortValue(targetPort);
+        if (!expected || !used.insert(targetPort).second) throw std::invalid_argument("missing, duplicate or wrong-direction implementation port: " + source.name + "." + targetPort);
+        const auto targetType = child->valueLogicalType(expected);
+        const auto sourceType = graph.valueLogicalType(value);
+        if (sourceType.width != targetType.width || sourceType.kind != targetType.kind || sourceType.domain != targetType.domain ||
+            (scalarized && !targetType.shape.empty()) ||
+            (!sourceType.shape.empty() && !targetType.shape.empty() && sourceType.shape != targetType.shape))
+            throw std::invalid_argument("incompatible boundary ABI width, kind, domain or shape: " + source.name + "." + port.name);
+        const auto bridge = sourceType == targetType ? value : graph.createValue(targetType);
+        if (port.direction == LeafDirection::Input) {
+            inputs.push_back(targetPort); graph.addOperand(instance, bridge);
+        } else {
+            outputs.push_back(targetPort); graph.addResult(instance, bridge);
+        }
+        if (bridge != value) {
+            const auto assign = graph.createOperation(grh::OperationKind::kAssign);
+            graph.setAttr(assign, "ingest.abi.view", true);
+            graph.addOperand(assign, port.direction == LeafDirection::Input ? value : bridge);
+            graph.addResult(assign, port.direction == LeafDirection::Input ? bridge : value);
+        }
+    };
     for (const auto& port : source.ports) {
         if (!flatWidth(port)) continue;
         if (port.requiresTypeResolution)
@@ -252,7 +497,7 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
         auto targetPort = port.name;
         const auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto& value) { return value.sourcePort == port.name; });
         if (binding != bindings.end()) targetPort = binding->implementationPort;
-        else if (!child->inputPortValue(targetPort) && !child->outputPortValue(targetPort)) {
+        else if (!hasPort(targetPort)) {
             // FIRRTL's emitted flat ABI joins Bundle paths with '_'.
             targetPort.clear();
             for (const auto& field : port.fieldPath) {
@@ -260,26 +505,61 @@ std::string Transaction::adapter(const ModuleSignature& source, const std::strin
                 targetPort += field;
             }
         }
-        const auto expected = port.direction == LeafDirection::Input ? child->inputPortValue(targetPort) : child->outputPortValue(targetPort);
-        if (!expected || !used.insert(targetPort).second) throw std::invalid_argument("missing, duplicate or wrong-direction implementation port: " + source.name + "." + targetPort);
-        const auto targetType = child->valueLogicalType(expected);
         const grh::LogicalType sourceType{port.valueType, flatWidth(port), port.isSigned, grh::LogicDomain::FourState, port.shape};
-        if (sourceType.width != targetType.width || sourceType.kind != targetType.kind || sourceType.domain != targetType.domain ||
-            (!sourceType.shape.empty() && !targetType.shape.empty() && sourceType.shape != targetType.shape))
-            throw std::invalid_argument("incompatible boundary ABI width, kind, domain or shape: " + source.name + "." + port.name);
         const auto value = graph.createValue(graph.internSymbol(port.name), sourceType);
-        const auto bridge = sourceType == targetType ? value : graph.createValue(targetType);
-        if (port.direction == LeafDirection::Input) {
-            graph.bindInputPort(port.name, value); inputs.push_back(targetPort); graph.addOperand(instance, bridge);
-        } else {
-            graph.bindOutputPort(port.name, value); outputs.push_back(targetPort); graph.addResult(instance, bridge);
+        if (port.direction == LeafDirection::Input) graph.bindInputPort(port.name, value);
+        else graph.bindOutputPort(port.name, value);
+        if (binding != bindings.end() || hasPort(targetPort) || port.shape.empty()) {
+            connect(port, targetPort, value);
+            continue;
         }
-        if (bridge != value) {
-            const auto assign = graph.createOperation(grh::OperationKind::kAssign);
-            graph.setAttr(assign, "ingest.abi.view", true);
-            graph.addOperand(assign, port.direction == LeafDirection::Input ? value : bridge);
-            graph.addResult(assign, port.direction == LeafDirection::Input ? bridge : value);
-        }
+        // Chisel blackboxes may expose r[0].data as scalar SV r_0_data.
+        // Preserve the FIRRTL array on this side and unpack only at the ABI.
+        if (port.shapeFieldDepths.size() != port.shape.size() ||
+            !std::is_sorted(port.shapeFieldDepths.begin(), port.shapeFieldDepths.end()) ||
+            std::any_of(port.shapeFieldDepths.begin(), port.shapeFieldDepths.end(),
+                [&](std::size_t depth) { return !depth || depth > port.fieldPath.size(); }))
+            throw std::invalid_argument("missing FIRRTL array ABI path: " + source.name + "." + port.name);
+        std::vector<int64_t> indices;
+        const auto scalarName = [&]() {
+            std::string name;
+            std::size_t dimension = 0;
+            for (std::size_t field = 0; field < port.fieldPath.size(); ++field) {
+                if (!name.empty()) name += '_';
+                name += port.fieldPath[field];
+                while (dimension < indices.size() && port.shapeFieldDepths[dimension] == field + 1)
+                    name += '_' + std::to_string(indices[dimension++]);
+            }
+            return name;
+        };
+        const auto split = [&](auto&& self, std::size_t dimension, grh::ValueId aggregate) -> void {
+            if (dimension == port.shape.size()) {
+                connect(port, scalarName(), aggregate, true);
+                return;
+            }
+            auto elementType = graph.valueLogicalType(aggregate);
+            elementType.width /= elementType.shape.front();
+            elementType.shape.erase(elementType.shape.begin());
+            std::vector<grh::ValueId> elements;
+            for (int64_t index = 0; index < port.shape[dimension]; ++index) {
+                const auto element = graph.createValue(elementType);
+                if (port.direction == LeafDirection::Input) {
+                    const auto offset = graph.createValue(grh::LogicalType{grh::ValueType::Logic, 32, false, grh::LogicDomain::FourState, {}});
+                    const auto constant = graph.createOperation(grh::OperationKind::kConstant);
+                    graph.setAttr(constant, "constValue", "32'd" + std::to_string(index)); graph.addResult(constant, offset);
+                    const auto slice = graph.createOperation(grh::OperationKind::kSliceArray);
+                    graph.addOperand(slice, aggregate); graph.addOperand(slice, offset); graph.addResult(slice, element);
+                }
+                indices.push_back(index); self(self, dimension + 1, element); indices.pop_back();
+                elements.push_back(element);
+            }
+            if (port.direction == LeafDirection::Output) {
+                const auto create = graph.createOperation(grh::OperationKind::kArrayCreate);
+                for (const auto element : elements) graph.addOperand(create, element);
+                graph.addResult(create, aggregate);
+            }
+        };
+        split(split, 0, value);
     }
     if (used.size() != child->inputPorts().size() + child->outputPorts().size() || !child->inoutPorts().empty())
         throw std::invalid_argument("implementation port count differs from FIRRTL interface: " + source.name);
@@ -315,15 +595,13 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
                     throw std::invalid_argument("missing external implementation binding for '" + name + "' (" + implementation.implementationName + ")");
                 target = ensureSv(implementation);
             }
-            entry.graph = adapter(entry.signature, target, ports);
+            entry.graph = adapter(interfaces_.at(name), target, ports);
         } else {
-            auto parsed = firrtl::parseModule(entry.source, entry.index);
-            result_.diagnostics.insert(result_.diagnostics.end(), parsed.diagnostics.begin(), parsed.diagnostics.end());
-            if (!parsed.success()) throw std::invalid_argument("cannot parse FIRRTL module: " + name);
+            const auto parsed = parseFirrtlModule(entry, name);
             std::map<std::string, std::string> targets;
             const auto dependencies = [&](auto&& self, std::span<const firrtl::StmtId> statements, std::string layer) -> void {
                 for (const auto id : statements) {
-                    const auto& statement = parsed.body->arena.statements[id];
+                    const auto& statement = parsed->arena.statements[id];
                     if (statement.kind == firrtl::StmtKind::LayerBlock) {
                         const auto path = layer.empty() ? std::string(statement.target) : layer + "." + std::string(statement.target);
                         const bool enabled = std::any_of(request_.firrtl.enabledLayers.begin(), request_.firrtl.enabledLayers.end(),
@@ -337,16 +615,18 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
                     self(self, statement.body, layer); self(self, statement.otherwise, layer);
                 }
             };
-            dependencies(dependencies, parsed.body->statements, {});
-            entry.signature = firrtl::detail::lowerModule(*entry.source, *parsed.body, design_, request_.firrtl, &interfaces_);
+            dependencies(dependencies, parsed->statements, {});
+            entry.signature = firrtl::detail::lowerModule(*entry.source, *parsed, design_, request_.firrtl, &interfaces_);
             interfaces_[name] = entry.signature; entry.graph = name;
             auto& graph = *design_.findGraph(name);
-            for (const auto& statement : parsed.body->arena.statements) if (statement.kind == firrtl::StmtKind::Cover)
+
+            for (const auto& statement : parsed->arena.statements) if (statement.kind == firrtl::StmtKind::Cover)
                 result_.diagnostics.push_back({IngestSeverity::Warning, "FIRRTL cover uses a simulation hit trace; no formal coverage model is generated",
                     name, "ingest-firrtl", name, entry.source->position(statement.range)});
             for (const auto op : graph.operations()) if (graph.opKind(op) == grh::OperationKind::kInstance)
                 graph.setAttr(op, "moduleName", targets.at(attribute(graph, op, "moduleName")));
             firrtl::detail::applyAnnotations(*entry.source, entry.source->modules()[entry.index], annotations_.at(entry.source.get()), graph);
+            parsedModules_.erase(ParsedModuleKey{entry.source.get(), entry.index});
         }
         entry.state = 2; return entry.graph;
     } catch (const firrtl::detail::Error& failure) {
@@ -473,6 +753,37 @@ void Transaction::checkHierarchy() {
     };
     for (const auto& top : design_.topGraphs()) visit(top);
 }
+void Transaction::canonicalizeGeneratedLocations() {
+    if (directory_.empty()) return;
+    const auto prefix = directory_.generic_string() + "/";
+    std::map<std::string, std::string> identities;
+    const auto canonical = [&](const std::string& file) -> std::string {
+        if (file.empty()) return file;
+        const auto path = std::filesystem::absolute(file).lexically_normal().generic_string();
+        if (!path.starts_with(prefix)) return file;
+        const auto found = identities.find(path);
+        if (found != identities.end()) return found->second;
+        const auto name = "generated-sv:fnv1a64:" + identity(readText(path)) + "/" + path.substr(prefix.size());
+        identities.emplace(path, name);
+        return name;
+    };
+    // Source-unit binding checks use physical paths until linking is complete.
+    // Published generated-source locations use content identity, as dependencies do.
+    for (const auto& [key, name] : svGraphs_) {
+        auto* graph = design_.findGraph(name);
+        if (!graph) continue; // Specialization wrappers have already been removed.
+        const auto file = metadata(*graph, "ingest.sourceFile");
+        if (!file.empty()) graph->setMetadata("ingest.sourceFile", canonical(file));
+        for (const auto value : graph->values()) if (auto loc = graph->valueSrcLoc(value)) {
+            loc->file = canonical(loc->file);
+            graph->setValueSrcLoc(value, std::move(*loc));
+        }
+        for (const auto op : graph->operations()) if (auto loc = graph->opSrcLoc(op)) {
+            loc->file = canonical(loc->file);
+            graph->setOpSrcLoc(op, std::move(*loc));
+        }
+    }
+}
 IngestResult Transaction::run(const ModuleSpecialization* specialization) {
     auto firrtlRequest = request_; firrtlRequest.sources.clear();
     for (const auto& input : request_.sources) {
@@ -511,11 +822,14 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             if (!bound.insert(binding.moduleName).second) throw std::invalid_argument("duplicate external binding: " + binding.moduleName);
         }
         if (specialization) {
+            if (specialization->language == SourceLanguage::Firrtl)
+                resolveFirrtlInterfaces({specialization->implementationName});
             const auto graph = ensureImplementation(*specialization);
             design_.markAsTop(graph); tops.clear();
         }
         if (tops.empty() && !specialization) for (const auto& owner : result_.sourceOwners)
             if (const auto source = std::dynamic_pointer_cast<const firrtl::Source>(owner)) tops.emplace_back(source->circuit());
+        if (!specialization) resolveFirrtlInterfaces(tops);
         std::set<std::string> selected;
         for (const auto& top : tops) {
             if (!selected.insert(top).second) throw std::invalid_argument("duplicate top module: " + top);
@@ -543,6 +857,7 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             graph.setMetadata("firrtl.boundExternalAnnotations", boundAnnotations);
             graph.setMetadata("firrtl.pendingExternalAnnotations", pendingAnnotations);
         }
+        canonicalizeGeneratedLocations();
         result_.design.emplace(std::move(design_));
     } catch (const std::exception& failure) { error(failure.what()); }
     return std::move(result_);
@@ -581,12 +896,15 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
                     const auto* names = attr ? std::get_if<std::vector<std::string>>(&*attr) : nullptr;
                     if (!names || names->size() != ports.size() || values.size() != ports.size())
                         throw std::invalid_argument("linked instance port count differs: " + target + "." + std::string(key));
+                    std::unordered_map<std::string_view, grh::ValueId> portValues;
+                    portValues.reserve(ports.size());
+                    for (const auto& port : ports) portValues.emplace(port.name, port.value);
                     std::set<std::string> used;
                     for (std::size_t i = 0; i < names->size(); ++i) {
-                        const auto port = std::find_if(ports.begin(), ports.end(), [&](const auto& entry) { return entry.name == (*names)[i]; });
-                        if (port == ports.end() || !used.insert((*names)[i]).second)
+                        const auto port = portValues.find(std::string_view((*names)[i]));
+                        if (port == portValues.end() || !used.insert((*names)[i]).second)
                             throw std::invalid_argument("unknown or duplicate linked instance port: " + target + "." + (*names)[i]);
-                        if (graph->valueLogicalType(values[i]) != child->valueLogicalType(port->value))
+                        if (graph->valueLogicalType(values[i]) != child->valueLogicalType(port->second))
                             throw std::invalid_argument("incompatible linked instance port ABI: " + target + "." + (*names)[i]);
                     }
                 };
@@ -604,6 +922,17 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
         return false;
     }
     transform::PassManager manager;
+    const bool pendingCycles = std::any_of(design.graphs().begin(), design.graphs().end(), [](const auto& entry) {
+        return entry.second->metadata("firrtl.pendingCombLoopCheck").has_value();
+    });
+    if (pendingCycles) {
+        transform::CombLoopElimOptions options;
+        options.failOnTrueLoop = true;
+        // Check module-local array dependencies here. Instance input/output
+        // dependencies become precise after the ordinary hier-flatten pass.
+        options.treatInstancesAsBoundary = true;
+        manager.addPass(std::make_unique<transform::CombLoopElimPass>(options));
+    }
     manager.addPass(std::make_unique<transform::GrhVerifyPass>());
     transform::PassDiagnostics verification;
     const bool success = manager.run(design, verification).success;
@@ -613,6 +942,19 @@ bool verifyLinkedDesign(grh::Design& design, std::vector<IngestDiagnostic>& diag
         diagnostics.push_back({entry.kind == diag::DiagnosticKind::Error ? IngestSeverity::Error : IngestSeverity::Warning,
             entry.message, entry.context, entry.passName, entry.originSymbol, std::move(position)});
     }
+    if (pendingCycles && !success) {
+        const auto message = std::find_if(verification.messages().begin(), verification.messages().end(), [](const auto& entry) {
+            return entry.passName == "comb-loop-elim";
+        });
+        std::optional<SourcePosition> position;
+        if (message != verification.messages().end() && message->sourcePosition) {
+            const auto& source = *message->sourcePosition;
+            position = SourcePosition{{}, source.file, source.line, source.column, {}, {}};
+        }
+        diagnostics.push_back({IngestSeverity::Error, "combinational cycle in FIRRTL connections remains after range analysis", {}, "ingest-link", {}, std::move(position)});
+    }
+    if (success && pendingCycles)
+        for (const auto& entry : design.graphs()) entry.second->eraseMetadata("firrtl.pendingCombLoopCheck");
     return success;
 }
 
@@ -629,7 +971,9 @@ std::string parameterLiteral(const ParameterValue& value) {
     std::ostringstream out; out << std::setprecision(std::numeric_limits<double>::max_digits10) << real;
     auto text = out.str(); if (text.find_first_of(".eE") == std::string::npos) text += ".0"; return text;
 }
-IngestResult readMixedSources(const IngestRequest& request) { return Transaction(request).run(); }
+IngestResult readMixedSources(const IngestRequest& request) {
+    return Transaction(request).run();
+}
 IngestResult readSpecializedSources(const IngestRequest& request, const ModuleSpecialization& specialization) {
     return Transaction(request).run(&specialization);
 }

@@ -2305,6 +2305,7 @@ namespace wolvrix::lib::transform
 
             void sweepDead()
             {
+                ingest::node::DeadRootBatch deadRoots(graph_);
                 // The fold rewires/orphans whole cones (e.g. a padded concat
                 // built per field where only one field is read); one full scan
                 // seeds every already-dead pure-comb op so the worklist sweep
@@ -2342,8 +2343,7 @@ namespace wolvrix::lib::transform
                     bool dead = true;
                     for (const ValueId result : resultSpan)
                     {
-                        const Value resultValue = graph_.getValue(result);
-                        if (!resultValue.users().empty() ||
+                        if (!graph_.valueUsers(result).empty() ||
                             graph_.valueIsInput(result) || graph_.valueIsOutput(result) ||
                             graph_.valueIsInout(result))
                         {
@@ -2370,7 +2370,7 @@ namespace wolvrix::lib::transform
                         }
                     }
                     erased_.insert(id);
-                    ingest::node::recordDead(graph_, id);
+                    deadRoots.record(id);
                     graph_.eraseOp(id);
                     for (const ValueId result : results)
                     {
@@ -2383,6 +2383,7 @@ namespace wolvrix::lib::transform
                         ++sweptOps_;
                     }
                 }
+                deadRoots.flush();
             }
 
             Graph &graph_;

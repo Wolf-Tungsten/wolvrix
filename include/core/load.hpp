@@ -3,6 +3,7 @@
 
 #include "core/grh.hpp"
 
+#include <filesystem>
 #include <string_view>
 
 namespace wolvrix::lib::load
@@ -20,6 +21,7 @@ namespace wolvrix::lib::load
     {
     public:
         wolvrix::lib::grh::Design load(std::string_view data) override;
+        wolvrix::lib::grh::Design loadFile(const std::filesystem::path &path);
     };
 
 } // namespace wolvrix::lib::load

@@ -38,10 +38,12 @@ namespace {
         std::vector<const Owner*> owners;
         owners.reserve(operations.size());
         std::map<int64_t, std::size_t> effects;
+        bool hasSupernodes = false;
         for (const auto op : graph.operations()) {
             positions[op.index] = owners.size();
             const auto* owner = ownerAttribute(graph, op);
             owners.push_back(owner ? owner : &empty);
+            hasSupernodes |= owner && owner->size() == 4 && (*owner)[1] == "nonsink";
             if (const auto order = attribute<int64_t>(graph, op, "grhsim.effectOrder")) effects.emplace(*order, positions[op.index]);
         }
         std::vector<std::pair<std::size_t, std::size_t>> edges;
@@ -80,6 +82,8 @@ namespace {
         };
         if (!acyclic(owners.size(), edges)) return "Cyclic computation or effect-order dependencies";
         for (const bool supernodes : {false, true}) {
+            // Without a collapsible owner, both quotient graphs are identical.
+            if (supernodes && !hasSupernodes) break;
             std::map<Owner, std::size_t> indices;
             std::vector<std::size_t> quotient(owners.size());
             for (std::size_t i = 0; i < owners.size(); ++i) {

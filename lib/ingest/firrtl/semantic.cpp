@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <set>
 
 namespace wolvrix::lib::ingest::firrtl::detail {
 namespace {
@@ -105,6 +106,21 @@ Semantics::Semantics(const Source& source, const ModuleBody& body, const FirrtlO
         if (!knownLayers_.contains(std::string(path))) throw Error(body.interface.range, "unknown module enabled layer");
         if (!layerEnabled(path)) throw Error(body.interface.range, "module requires explicitly enabled layer '" + std::string(path) + "'");
     }
+}
+const PortLeafSignature* Semantics::resolvedPort(std::string_view module,
+                                                 const std::vector<std::string>& fields) const {
+    if (!interfaces_) return nullptr;
+    auto cached = interfacePorts_.find(module);
+    if (cached == interfacePorts_.end()) {
+        const auto signature = interfaces_->find(std::string(module));
+        if (signature == interfaces_->end()) return nullptr;
+        std::map<std::vector<std::string>, const PortLeafSignature*> ports;
+        for (const auto& port : signature->second.ports)
+            ports.emplace(port.fieldPath, &port); // preserve find_if's first duplicate
+        cached = interfacePorts_.emplace(signature->first, std::move(ports)).first;
+    }
+    const auto port = cached->second.find(fields);
+    return port == cached->second.end() ? nullptr : port->second;
 }
 bool Semantics::layerEnabled(std::string_view path) const {
     if (path.empty()) return true;
@@ -244,14 +260,13 @@ void Semantics::collect(std::span<const StmtId> statements) {
                 type->fields.push_back({std::string(port.name), port.direction == LeafDirection::Input,
                     declaredType(source.arena(), port.type, port.range)});
             if (interfaces_ && interfaces_->contains(std::string(statement.target))) {
-                const auto& resolved = interfaces_->at(std::string(statement.target));
-                for (const auto& leaf : leaves(type)) {
-                    const auto port = std::find_if(resolved.ports.begin(), resolved.ports.end(),
-                        [&](const auto& entry) { return entry.fieldPath == leaf.fields; });
-                    if (port == resolved.ports.end()) throw Error(statement.range, "instance port missing from resolved interface");
+                for (const auto& leaf : leavesCached(type)) {
+                    const auto* port = resolvedPort(statement.target, leaf.fields);
+                    if (!port) throw Error(statement.range, "instance port missing from resolved interface");
                     if (port->shape != leaf.shape) throw Error(statement.range, "instance array geometry differs from resolved interface");
-                    constrain(leaf.type->width, {}, [bits = port->elementWidth](const auto&) { return bits; }, statement.range);
-                    if (leaf.type->kind == TypeKind::Reset)
+                    if (port->elementWidth >= 0)
+                        constrain(leaf.type->width, {}, [bits = port->elementWidth](const auto&) { return bits; }, statement.range);
+                    if (leaf.type->kind == TypeKind::Reset && port->sourceType != "Reset")
                         unifyReset(leaf.type, ground(port->sourceType == "AsyncReset" ? TypeKind::AsyncReset : TypeKind::UInt, 1, statement.range), statement.range);
                 }
             }
@@ -470,8 +485,8 @@ void Semantics::connect(Projection left, TypePtr leftType, Projection right, Typ
     if (!invalid) {
         if (leftType->constant && !rightType->constant) throw Error(range, "non-constant source drives a const destination");
         if (leftType->constant)
-            for (const auto& condition : conditions_)
-                if (!condition->constant) throw Error(range, "non-constant when predicate controls a const destination");
+            for (std::size_t i = depth; i < conditions_.size(); ++i)
+                if (!conditions_[i]->constant) throw Error(range, "non-constant when predicate controls a const destination");
         constrain(leftType->width, {rightType->width}, [](const auto& args) { return args[0]; }, range);
     }
     connections.push_back({std::move(left), std::move(right), guard, invalid, range});
@@ -493,7 +508,8 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             if (layerEnabled(path)) { auto previous = activeLayer_; activeLayer_ = path; this->statements(statement.body, guard); activeLayer_ = std::move(previous); }
             continue;
         }
-        if (statement.kind == StmtKind::Wire || statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset) {
+        if (statement.kind == StmtKind::Wire || statement.kind == StmtKind::Reg || statement.kind == StmtKind::RegReset ||
+            statement.kind == StmtKind::Instance) {
             auto& declaration = declarations.at(std::string(statement.name));
             declaration.conditionDepth = conditions_.size();
             if (declaration.state) {
@@ -506,14 +522,17 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
                     constrain(reset->width, {}, [](const auto&) { return 1; }, statement.range);
                     const auto initial = expression(*declaration.state->initial);
                     equivalent(declaration.type, initial, statement.range);
-                    const auto data = leaves(declaration.type), values = leaves(initial);
+                    const auto& data = leavesCached(declaration.type), values = leavesCached(initial);
                     for (std::size_t i = 0; i < data.size(); ++i)
                         constrain(data[i].type->width, {values[i].type->width}, [](const auto& args) { return args[0]; }, statement.range);
-                    checks_.push_back([this, reset, initial, range = statement.range] {
+                    checks_.push_back([this, reset, initial, expression = *declaration.state->initial, range = statement.range] {
                         if (width(reset) != 1) throw Error(range, "register reset requires a one-bit UInt");
-                        if (resolvedKind(reset) == TypeKind::AsyncReset)
-                            for (const auto& leaf : leaves(initial))
-                                if (!leaf.type->constant) throw Error(range, "asynchronous reset value must have const type");
+                        if (resolvedKind(reset) == TypeKind::AsyncReset) {
+                            const auto& values = leavesCached(initial);
+                            if (std::any_of(values.begin(), values.end(), [](const auto& leaf) { return !leaf.type->constant; }) &&
+                                !constantValue(expression))
+                                throw Error(range, "asynchronous reset value must have const type or provably constant drivers");
+                        }
                     });
                 }
             }
@@ -549,7 +568,7 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             if (!b->layer.empty() && a->layer != b->layer && !a->layer.starts_with(b->layer + "."))
                 throw Error(statement.range, "probe definition would expose a disabled source color");
             equivalent(a->element, b->element, statement.range);
-            const auto left = leaves(a->element), right = leaves(b->element);
+            const auto& left = leavesCached(a->element), right = leavesCached(b->element);
             for (std::size_t i = 0; i < left.size(); ++i) {
                 constrain(left[i].type->width, {right[i].type->width}, [](const auto& args) { return args[0]; }, statement.range);
                 checks_.push_back([this, a = left[i].type, b = right[i].type, range = statement.range] {
@@ -583,7 +602,7 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             auto operands = statement.operands;
             if (statement.kind == StmtKind::Intrinsic) {
                 const auto& call = body.arena.expressions[operands.at(0)];
-                if (call.name != "circt_chisel_ifelsefatal" || call.type || call.operands.size() != 3)
+                if (call.name != "circt_chisel_ifelsefatal" || call.type || call.operands.size() < 3)
                     throw Error(statement.range, "unsupported effect intrinsic '" + std::string(call.name) + "'");
                 bool format = false;
                 for (const auto& parameter : call.parameters) {
@@ -602,8 +621,8 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
                 constrain(type->width, {}, [](const auto&) { return 1; }, statement.range);
                 checks_.push_back([this, type, range = statement.range] { if (width(type) != 1) throw Error(range, "effect predicate and enable must have UInt<1> type"); });
             }
-            if (statement.kind == StmtKind::Printf || statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume) {
-                const auto start = statement.kind == StmtKind::Printf ? 3u : 4u;
+            if (statement.kind == StmtKind::Printf || statement.kind == StmtKind::Assert || statement.kind == StmtKind::Assume || statement.kind == StmtKind::Intrinsic) {
+                const auto start = statement.kind == StmtKind::Printf || statement.kind == StmtKind::Intrinsic ? 3u : 4u;
                 for (std::size_t i = start; i < operands.size(); ++i) {
                     auto type = expression(operands[i]);
                     if (!integerKind(type->kind) && type->kind != TypeKind::Clock && type->kind != TypeKind::Reset && type->kind != TypeKind::AsyncReset)
@@ -614,7 +633,7 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
         }
     }
 }
-void Semantics::solve() {
+void Semantics::solve(bool allowUnknownWidths) {
     std::deque<std::size_t> pending;
     std::vector<bool> queued(constraints_.size(), true);
     std::size_t steps = 0;
@@ -634,8 +653,99 @@ void Semantics::solve() {
         result.value = next;
         for (const auto user : result.users) if (!queued[user]) { queued[user] = true; pending.push_back(user); }
     }
-    for (const auto& bits : widths_) if (bits.value < 0) throw Error(bits.range, "FIRRTL width cannot be inferred from its drivers");
+    for (const auto& bits : widths_) if (bits.value < 0) {
+        if (allowUnknownWidths) return;
+        throw Error(bits.range, "FIRRTL width cannot be inferred from its drivers");
+    }
     for (const auto& check : checks_) check();
+}
+bool Semantics::constantValue(ExprId id) const {
+    // Chisel aggregate reset literals are often connected through ordinary
+    // wires. Only the selected leaf and overlapping elements constrain it.
+    struct Path { ExprId base; std::vector<std::string> fields; std::vector<ExprId> indices; };
+    const auto path = [&](auto&& self, ExprId id) -> Path {
+        const auto& expr = body.arena.expressions[id];
+        if (expr.kind != ExprKind::Field && expr.kind != ExprKind::Index) return {id, {}, {}};
+        auto result = self(self, expr.operands[0]);
+        if (expr.kind == ExprKind::Field) result.fields.emplace_back(expr.name);
+        else result.indices.push_back(expr.operands[1]);
+        return result;
+    };
+    // Checks run after collecting every connection. Share this index and leaf
+    // proofs across all register resets in the module.
+    if (!constantDriversReady_) {
+        for (std::size_t i = 0; i < connections.size(); ++i) {
+            const auto& connection = connections[i];
+            auto sink = path(path, connection.sink.expression);
+            sink.fields.insert(sink.fields.end(), connection.sink.fields.begin(), connection.sink.fields.end());
+            const auto& base = body.arena.expressions[sink.base];
+            constantDrivers_[{std::string(base.name), sink.fields}].push_back({i, std::move(sink.indices)});
+        }
+        constantDriversReady_ = true;
+    }
+    std::set<ConstantSelection> active;
+    std::function<bool(ExprId, std::vector<std::string>, std::vector<ExprId>)> expression;
+    std::function<bool(int)> guard;
+    guard = [&](int id) {
+        if (id < 2) return true;
+        const auto& branch = guards.branches[id];
+        return expression(guards.expressions[branch.variable], {}, {}) && guard(branch.low) && guard(branch.high);
+    };
+    expression = [&](ExprId id, std::vector<std::string> fields, std::vector<ExprId> indices) {
+        auto access = path(path, id);
+        access.fields.insert(access.fields.end(), fields.begin(), fields.end());
+        access.indices.insert(access.indices.end(), indices.begin(), indices.end());
+        id = access.base; fields = std::move(access.fields); indices = std::move(access.indices);
+        std::vector<std::optional<int64_t>> selected;
+        for (const auto index : indices) {
+            selected.push_back(staticIndex(index));
+            if (!selected.back() && !expression(index, {}, {})) return false;
+        }
+        if (expressions[id] && fields.empty()) {
+            const auto& values = leavesCached(expressions[id]);
+            if (std::any_of(values.begin(), values.end(), [](const auto& leaf) { return !leaf.fields.empty(); }))
+                return std::all_of(values.begin(), values.end(), [&](const auto& leaf) { return expression(id, leaf.fields, indices); });
+        }
+        if (expressions[id] && projected(expressions[id], fields)->constant) return true;
+        const auto& expr = body.arena.expressions[id];
+        if (expr.kind == ExprKind::Integer || expr.kind == ExprKind::UInt || expr.kind == ExprKind::SInt) return true;
+        if (expr.kind == ExprKind::Reference) {
+            const std::string name(expr.name);
+            const ConstantSelection key{name, fields, selected};
+            if (const auto cached = constantValues_.find(key); cached != constantValues_.end()) return cached->second;
+            const auto found = declarations.find(name);
+            if (found == declarations.end() || found->second.state || found->second.port || !active.insert(key).second) return false;
+            bool result = false;
+            if (found->second.definition) result = expression(*found->second.definition, fields, indices);
+            else if (const auto drivers = constantDrivers_.find({name, fields}); drivers != constantDrivers_.end()) {
+                for (const auto& driver : drivers->second) {
+                    const auto& connection = connections[driver.connection];
+                    if (!connection.guard) continue;
+                    bool overlaps = true;
+                    for (std::size_t i = 0; i < std::min(selected.size(), driver.indices.size()); ++i) {
+                        const auto index = staticIndex(driver.indices[i]);
+                        if (index && selected[i] && *index != *selected[i]) { overlaps = false; break; }
+                    }
+                    if (!overlaps) continue;
+                    const bool staticIndices = std::all_of(driver.indices.begin(), driver.indices.end(),
+                        [&](const auto index) { return staticIndex(index) || expression(index, {}, {}); });
+                    std::vector<ExprId> remaining;
+                    if (indices.size() > driver.indices.size()) remaining.assign(indices.begin() + driver.indices.size(), indices.end());
+                    if (!staticIndices || !guard(connection.guard) || (!connection.invalid &&
+                        !expression(connection.source.expression, connection.source.fields, std::move(remaining)))) {
+                        result = false; break;
+                    }
+                    result = true;
+                }
+            }
+            active.erase(key); constantValues_.emplace(key, result); return result;
+        }
+        if (expr.kind == ExprKind::Mux)
+            return expression(expr.operands[0], {}, {}) && expression(expr.operands[1], fields, indices) && expression(expr.operands[2], fields, indices);
+        if (expr.kind != ExprKind::Primitive) return false;
+        return std::all_of(expr.operands.begin(), expr.operands.end(), [&](ExprId arg) { return expression(arg, {}, {}); });
+    };
+    return expression(id, {}, {});
 }
 void Semantics::normalizeGuards() {
     Guards normalized;
@@ -670,10 +780,22 @@ void Semantics::normalizeGuards() {
     for (auto& [name, declaration] : declarations) declaration.guard = convert(declaration.guard);
     for (auto& [name, memory] : memories) for (auto& port : memory.ports) port.guard = convert(port.guard);
     guards = std::move(normalized);
+    constantValues_.clear();
 }
-void Semantics::analyze() {
+void Semantics::analyze(bool allowUnknownWidths) {
     for (const auto& port : body.interface.ports) {
         auto type = declaredType(body.arena, port.type, port.range);
+        if (interfaces_ && interfaces_->contains(std::string(body.interface.name))) {
+            for (const auto& leaf : leavesCached(type)) {
+                auto path = leaf.fields; path.insert(path.begin(), std::string(port.name));
+                const auto* resolved = resolvedPort(body.interface.name, path);
+                if (!resolved) continue;
+                if (resolved->elementWidth >= 0)
+                    constrain(leaf.type->width, {}, [bits = resolved->elementWidth](const auto&) { return bits; }, port.range);
+                if (leaf.type->kind == TypeKind::Reset && resolved->sourceType != "Reset")
+                    unifyReset(leaf.type, ground(resolved->sourceType == "AsyncReset" ? TypeKind::AsyncReset : TypeKind::UInt, 1, port.range), port.range);
+            }
+        }
         declarations.emplace(std::string(port.name), Declaration{std::string(port.name), type, port.range, port.direction == LeafDirection::Input ? 1 : 2, {}, true});
         declarationOrder.emplace_back(port.name);
     }
@@ -682,21 +804,45 @@ void Semantics::analyze() {
         const auto& port = memories.at(entry.first).ports[entry.second];
         declarations.at(name).flow = (port.read ? 1 : 0) | (port.write ? 2 : 0);
     }
-    statements(body.statements, 1); solve(); normalizeGuards();
-    for (const auto& [name, declaration] : declarations) for (const auto& leaf : leaves(declaration.type, declaration.flow)) total(leaf);
+    statements(body.statements, 1); solve(allowUnknownWidths); normalizeGuards();
+    for (const auto& [name, declaration] : declarations) for (const auto& leaf : leavesCached(declaration.type, declaration.flow))
+        if (!allowUnknownWidths || width(leaf.type) >= 0) total(leaf);
 }
 int64_t Semantics::width(TypePtr type) const { return widths_.at(type->width).value; }
 TypeKind Semantics::resolvedKind(TypePtr type) const {
     return type->kind == TypeKind::Reset ? (resetFlags(type->reset) == 2 ? TypeKind::AsyncReset : TypeKind::UInt) : type->kind;
 }
+uint32_t Semantics::resetGroup(TypePtr type) const {
+    auto id = type->reset;
+    while (resetParents_[id] != id) id = resetParents_[id];
+    return id;
+}
+unsigned Semantics::resetConstraint(TypePtr type) const { return resetFlags(type->reset); }
 std::vector<Leaf> Semantics::leaves(TypePtr type, int flow) const {
+    return computeLeaves(std::move(type), flow);
+}
+const std::vector<Leaf>& Semantics::leavesCached(TypePtr type, int flow) const {
+    const auto key = std::pair{type, flow};
+    if (const auto found = leavesCache_.find(key); found != leavesCache_.end()) {
+        return found->second;
+    }
+
+    const auto& result = leavesCache_.emplace(key, computeLeaves(type, flow)).first->second;
+
+    return result;
+}
+std::vector<Leaf> Semantics::computeLeaves(TypePtr type, int flow) const {
     std::vector<Leaf> result;
     std::function<void(TypePtr, Leaf)> visit = [&](TypePtr current, Leaf leaf) {
         if (current->kind == TypeKind::Probe || current->kind == TypeKind::RWProbe) {
             leaf.probe = current->kind;
             if (layerEnabled(current->layer)) visit(current->element, std::move(leaf));
         }
-        else if (current->kind == TypeKind::Vector) { leaf.shape.push_back(current->extent); visit(current->element, std::move(leaf)); }
+        else if (current->kind == TypeKind::Vector) {
+            leaf.shape.push_back(current->extent);
+            leaf.shapeFieldDepths.push_back(leaf.fields.size() + 1);
+            visit(current->element, std::move(leaf));
+        }
         else if (current->kind == TypeKind::Bundle) {
             for (const auto& field : current->fields) { auto child = leaf; child.fields.push_back(field.name); if (field.flip) child.flow = reversed(child.flow); visit(field.type, std::move(child)); }
         } else { leaf.type = current; result.push_back(std::move(leaf)); }

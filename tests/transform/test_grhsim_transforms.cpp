@@ -315,6 +315,104 @@ void testConstantAliasConvergence() {
     compare(reference, roundTrip(b.design), {}, 4, "r3-constant-aliases");
 }
 
+void testCseAttributePayloads() {
+    Builder b;
+    const auto input = b.input("input", 8), rhs = b.input("rhs", 8);
+    const std::array<grh::AttributeValue, 8> payloads{
+        true, int64_t{-7}, -7.0, std::string(4096, 'x'),
+        std::vector<bool>{true, false}, std::vector<int64_t>{-7, 0, 9},
+        std::vector<double>{-7.0, 0.5}, std::vector<std::string>{"", std::string("a\0b", 3), std::string(1024, 'y')}
+    };
+    std::vector<grh::OperationId> representatives;
+    for (std::size_t i = 0; i < payloads.size(); ++i) {
+        for (int copy = 0; copy < 2; ++copy) {
+            const auto result = b.compute(OperationKind::kAnd, b.type(8), {input, rhs});
+            const auto op = b.graph.valueDef(result);
+            if (!copy) representatives.push_back(op);
+            b.graph.setAttr(op, "csePayload", payloads[i]);
+            if (i >= 4) {
+                for (int extra = 0; extra < 5; ++extra)
+                    b.graph.setAttr(op, "cseExtra" + std::to_string(extra), std::string("same"));
+            }
+            b.graph.setAttr(op, "originModules", std::vector<std::string>{
+                "source" + std::to_string(i) + "_" + std::to_string(copy)});
+            b.output("out" + std::to_string(i) + "_" + std::to_string(copy), result);
+        }
+    }
+    const auto reference = b.design.clone(); convert(b.design);
+    b.graph.freeze();
+    simplify(b.design);
+    require(count(b.graph, OperationKind::kAnd) == payloads.size(), "CSE lost attribute payload identity");
+    for (std::size_t i = 0; i < payloads.size(); ++i) {
+        const auto op = representatives[i];
+        require(b.graph.opKind(op) == OperationKind::kAnd, "CSE changed the first representative");
+        require(b.graph.getOperation(op).attr("csePayload") == std::optional(payloads[i]), "CSE changed an attribute payload");
+        require(transform::getOriginModules(b.graph, op) == std::vector<std::string>{
+            "source" + std::to_string(i) + "_0", "source" + std::to_string(i) + "_1"}, "CSE changed origin ordering");
+    }
+    bool changed = true;
+    require(run(b.design, std::make_unique<sim::SimplifyPass>(), &changed) && !changed,
+            "attribute-key CSE did not converge");
+    compare(reference, roundTrip(b.design), {}, 128, "r3-cse-attribute-payloads");
+}
+
+void testVerifiedUnpartitionedScope() {
+    Builder b;
+    const auto input = b.input("input", 8);
+    const auto value = b.compute(OperationKind::kNot, b.type(8), {input});
+    const auto alias = b.compute(OperationKind::kAssign, b.type(8), {value});
+    b.output("out", value);
+    convert(b.design);
+    require(run(b.design, std::make_unique<transform::GrhVerifyPass>()), "converted scope verify failed");
+    sim::detail::Scope scanned(b.graph, {});
+    sim::detail::Scope verified(b.graph, {}, std::nullopt, nullptr, nullptr, true);
+    const auto op = b.graph.valueDef(value);
+    auto outside = op; outside.index += static_cast<uint32_t>(b.graph.operations().size()) + 1;
+    auto foreign = op; ++foreign.graph.index;
+    const auto rejection = [](const sim::detail::Scope& scope, grh::OperationId operation) {
+        try { (void)scope.contains(operation); }
+        catch (const std::exception& error) { return std::string(error.what()); }
+        return std::string{};
+    };
+    const auto check = [&] {
+        require(!scanned.contains({}) && !verified.contains({}), "invalid scope operation became local");
+        require(scanned.contains(op) && verified.contains(op), "converted operation left its scope");
+        for (const auto invalid : {outside, foreign}) {
+            const auto expected = rejection(scanned, invalid);
+            require(!expected.empty() && rejection(verified, invalid) == expected,
+                    "verified scope changed invalid-operation rejection");
+        }
+    };
+    check();
+    b.graph.freeze(); check();
+    const auto appended = b.compute(OperationKind::kNot, b.graph.valueLogicalType(value), {input});
+    const auto appendedOp = b.graph.valueDef(appended);
+    require(scanned.contains(appendedOp) && verified.contains(appendedOp), "new operation left converted scope");
+    require(b.graph.eraseOp(appendedOp), "scope fixture erase failed");
+    const auto erasedError = rejection(scanned, appendedOp);
+    require(!erasedError.empty() && rejection(verified, appendedOp) == erasedError,
+            "verified scope changed erased-operation rejection");
+    const auto aliasOp = b.graph.valueDef(alias);
+    require(verified.alias(aliasOp, value), "scope alias was not erased");
+    scanned.erased.insert(aliasOp);
+    require(!scanned.contains(aliasOp) && !verified.contains(aliasOp), "scope erasure lost its short circuit");
+    check();
+
+    Builder invalid;
+    const auto arg = invalid.input("arg", 8);
+    const auto result = invalid.compute(OperationKind::kNot, invalid.type(8), {arg});
+    invalid.output("out", result); convert(invalid.design);
+    const std::array<grh::AttributeValue, 3> owners{
+        std::vector<std::string>{}, std::vector<std::string>{"general"}, int64_t{1}
+    };
+    for (const auto& owner : owners) {
+        invalid.graph.setAttr(invalid.graph.valueDef(result), sim::kPartition, owner);
+        const auto stamp = transform::DesignStamp::capture(invalid.graph);
+        require(!run(invalid.design, std::make_unique<sim::SimplifyPass>()) && stamp.matches(invalid.graph),
+                "converted graph with a partition was optimized");
+    }
+}
+
 void testNamedAliasConsumers() {
     Builder b;
     const auto input = b.input("input", 8), rhs = b.input("rhs", 8);
@@ -528,6 +626,13 @@ void testOwnersAndDetectorKeys() {
         internalProbes.emplace_back(b.graph.symbolText(b.graph.valueSymbol(port.value)));
     }
     b.graph.setMetadata(sim::kStage, std::string("nonsink-partitioned"));
+    const sim::detail::Owner firstOwner{"general", "nonsink", "sn0", "leaf"};
+    const sim::detail::Owner secondOwner{"general", "nonsink", "sn1", "leaf"};
+    sim::detail::Scope unowned(b.graph, {}), firstScope(b.graph, firstOwner), secondScope(b.graph, secondOwner);
+    require(!unowned.contains(b.graph.valueDef(roots[0])) &&
+            firstScope.contains(b.graph.valueDef(roots[0])) && !firstScope.contains(b.graph.valueDef(roots[2])) &&
+            secondScope.contains(b.graph.valueDef(roots[2])) && !secondScope.contains(b.graph.valueDef(roots[0])),
+            "default scope membership lost its partition barrier");
     const auto before = b.design.clone(); simplify(b.design);
     require(count(b.graph, OperationKind::kAnd) == 2, "same-owner CSE or cross-owner barrier failed");
     compare(before, roundTrip(b.design), internalProbes, 128, "r3-owner-isolation");
@@ -556,7 +661,7 @@ int main() {
     try {
         testOperandReplacement();
         testGenerateGroupMembershipIndex();
-        testEventsCallsAndPacking(); testConstantAliasConvergence(); testNamedAliasConsumers(); testArraysAndWriters(); testNarrowingAndStateSharing(); testMaskedOr();
+        testEventsCallsAndPacking(); testConstantAliasConvergence(); testCseAttributePayloads(); testVerifiedUnpartitionedScope(); testNamedAliasConsumers(); testArraysAndWriters(); testNarrowingAndStateSharing(); testMaskedOr();
         testPackingRejectionsAndOrigins(); testFourStateBoundaries(); testSelectRules(); testOwnersAndDetectorKeys();
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     std::cout << "GRH-based GrhSIM conversion/optimization observations agree\n";

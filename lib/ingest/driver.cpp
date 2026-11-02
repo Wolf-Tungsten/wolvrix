@@ -5,6 +5,7 @@
 #include "mixed.hpp"
 
 #include <algorithm>
+#include <tuple>
 
 namespace wolvrix::lib::ingest {
 
@@ -52,7 +53,35 @@ IngestResult readSources(const IngestRequest& request) {
                                       {}, "ingest"});
         return result;
     }
-    return readSystemVerilog(request);
+    auto result = readSystemVerilog(request);
+    if (result.success()) {
+        // Parallel SV conversion publishes in completion order. Canonicalize
+        // request-level lists while preserving every graph's values and ops.
+        auto& design = *result.design;
+        design.sortGraphOrder();
+        std::vector<grh::SymbolId> declared(design.declaredSymbols().begin(), design.declaredSymbols().end());
+        std::sort(declared.begin(), declared.end(), [&](auto left, auto right) {
+            return design.symbolText(left) < design.symbolText(right);
+        });
+        design.clearDeclaredSymbols();
+        for (const auto symbol : declared) design.addDeclaredSymbol(symbol);
+        std::sort(result.modules.begin(), result.modules.end(), [](const auto& left, const auto& right) {
+            return left.name < right.name;
+        });
+        std::sort(result.dependencies.begin(), result.dependencies.end());
+        const SourcePosition empty;
+        const auto diagnosticKey = [&](const IngestDiagnostic& entry) {
+            const auto& location = entry.location ? *entry.location : empty;
+            return std::tuple{entry.location.has_value(),
+                std::tie(location.file.native(), location.line, location.column, location.unit,
+                         location.sourceLine, location.sourceInfo, entry.kind, entry.passName,
+                         entry.context, entry.originSymbol, entry.message)};
+        };
+        std::stable_sort(result.diagnostics.begin(), result.diagnostics.end(), [&](const auto& left, const auto& right) {
+            return diagnosticKey(left) < diagnosticKey(right);
+        });
+    }
+    return result;
 }
 
 IngestResult specializeModule(const IngestRequest& request,

@@ -45,6 +45,7 @@ void flattenPort(const firrtl::Source& source, firrtl::TypeId id, PortLeafSignat
     }
     if (type.kind == Kind::Vector) {
         leaf.shape.push_back(type.extent);
+        leaf.shapeFieldDepths.push_back(leaf.fieldPath.size());
         if (!type.extent) leaf.requiresTypeResolution = true;
         flattenPort(source, type.element, std::move(leaf), leaves, aliases, depth + 1); return;
     }
@@ -155,6 +156,5 @@ InterfaceScanResult scanFirrtlInterfaces(const IngestRequest& request) {
 IngestResult readFirrtl(const IngestRequest& request) {
     return readMixedSources(request);
 }
-
 
 } // namespace wolvrix::lib::ingest

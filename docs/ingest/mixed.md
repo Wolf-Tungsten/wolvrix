@@ -26,6 +26,8 @@ with wolvrix.Session() as session:
 `read_sv` retains its existing arguments. Relative explicit source, annotation
 and resource paths use `input_root`; slang option paths retain slang semantics.
 An empty top list with FIRRTL inputs selects their circuit main modules.
+`node_annotations` defaults to `True`; the bounded bringup configuration below
+shows how to disable these optional source associations explicitly.
 
 ## Elaboration and publication
 
@@ -81,6 +83,27 @@ result is the destination representation. No truncation, extension, lane
 permutation or state change occurs. Lane zero occupies low bits after frontend
 index normalization. Two shaped interfaces must have identical shape.
 
+When a complete leaf port is absent, a shaped FIRRTL leaf can bind to its
+complete set of scalar SV ports. The signature's `shapeFieldDepths` records
+where each Vector dimension occurs among `fieldPath` components: depth counts
+fields including the root port. For `r[0].data`, `fieldPath={r,data}`,
+`shape={1}` and `shapeFieldDepths={1}`, so its SV name is `r_0_data`.
+For `r.data[0]`, the depth is 2 and the name is `r_data_0`.
+For `io[1].data[0]`, depths `{1,2}` produce `io_1_data_0`.
+An existing complete array/packed port takes priority. Explicit port bindings
+also select complete leaves; element positions are never guessed from names.
+
+The adapter preserves the original leaf's shape, including singleton extents.
+On inputs, each `kSliceArray` takes the current array value and a constant
+element index, producing one element with the leading shape dimension removed.
+On outputs, each `kArrayCreate` takes elements in increasing index order and
+produces an array whose shape prepends that dimension. Multidimensional arrays
+repeat this extraction/reassembly per dimension. For `[2][2]`, element order is
+`[0][0], [0][1], [1][0], [1][1]`; `[0][0]` occupies the low bits. All scalar
+ports must match element width, kind, domain and direction, be unshaped, and
+cover the implementation exactly once. Missing elements, extra ports and
+collisions such as array `a[0]` and scalar `a_0` fail the transaction.
+
 Unknown, duplicate, missing, wrong-direction and extra ports fail. Width, value
 kind and logic domain must agree. Analog/inout and unresolved Reset/Probe interfaces
 are rejected. Instances require declarations in their FIRRTL circuit; a reference
@@ -132,6 +155,99 @@ Node member/root attributes survive imports and hierarchy flattening, retaining
 individual instance path components. Full GSIM-style node CSE and nonsink node
 consumption remain F08/F09 work. Hierarchical DontTouch and unsupported source
 semantics fail explicitly.
+
+Hierarchy flattening collects qualified node inventories and eliminated roots
+across instances, then merges and deduplicates each list once before returning
+to the pass manager's retention census. The batch owns its keys so source
+graphs can be released first. An explicit failed-pass return also publishes
+imports for the attempted expansion; it does not certify that partial graph.
+Inventory imports without a source node policy remain a no-op. Per-operation
+node attributes and the generated simulator's operations are unchanged.
+
+FIRRTL array element connections can form apparent cycles at whole-value
+granularity. Before publication, range analysis resolves these module-local
+dependencies and rejects real local cycles. During this check, instances are
+boundaries: treating every child input as a dependency of every child output
+would falsely reject ready/enqueue handshakes. The simulation flow runs
+`hier-flatten` followed by `comb-loop-elim` to check the actual cross-module
+dependencies before conversion.
+
+## Node annotations and bounded bringup
+
+The XiangShan Make entry defaults `XS_FIRRTL_NODE_ANNOTATIONS=on` and records
+`node_annotations=true` in the sources manifest. Explicit `off` omits optional
+source node associations and their policy, inventory and retention metadata.
+External implementation annotations such as BlackBox records, source locations,
+and type, linking and semantic checks continue to apply.
+
+The default pipeline profile remains `full`; downstream defaults remain
+`XS_GRHSIM_FIRRTL_NODE_CSE=gsim` and `XS_GRHSIM_FIRRTL_NODES=auto`. An explicit
+functional bringup can disable source annotations together with both consumers:
+
+```sh
+XS_GRHSIM_PIPELINE_PROFILE=bringup make xs_firrtl_grhsim \
+  XS_FIRRTL_INPUT=ptmp/xs/rtl/rtl/SimTop.fir \
+  XS_FIRRTL_BUILD=ptmp/firrtl-ingest/functional-bringup \
+  XS_FIRRTL_NODE_ANNOTATIONS=off \
+  XS_GRHSIM_FIRRTL_NODE_CSE=off \
+  XS_GRHSIM_FIRRTL_NODES=off
+```
+
+Use the SV resources, include paths and harness configuration belonging to the
+frozen input. The separate output directory distinguishes this attempt from
+the full profile. The two downstream settings disable source node CSE and
+nonsink source hints respectively; the upstream annotation switch alone does
+not select both downstream policies.
+
+The bringup ordinary GRH pipeline contains exactly seven stages, in order:
+`xmr-resolve`, `multidriven-guard`, `blackbox-guard`, `latch-transparent-read`,
+`hier-flatten`, `comb-loop-elim`, and `memory-init-check`. It omits ordinary GRH
+`simplify` and its two surrounding explicit `grh.verify` calls. Conversion still
+runs complete structural verification before and after `grh-to-grhsim`; later
+GrhSIM optimization, partitioning and emit follow the shared pipeline.
+
+The Make target bounds the complete FIRRTL-to-C++ producer with
+`timeout --signal=KILL 20m`. Starting at producer launch, FIRRTL input, ingest,
+all GRH passes, checkpoints, conversion, partitioning and C++ emit share that
+single deadline. Expiry sends SIGKILL immediately; checkpoints and profiles do
+not reset the budget. This documents a bringup configuration, without claiming
+completed full-chip generation, simulation or equivalence. The original
+annotated full-profile/prefer validation and performance comparisons remain
+separate work.
+
+## Generated source identity
+
+Successful SV-only `readSources()` requests publish graph traversal, design
+declarations, module signatures, dependencies and diagnostics in deterministic
+order, independently of parallel conversion completion. Graph objects and their
+IDs, graph contents, top selection order and duplicate diagnostics are preserved.
+Failed requests retain their original diagnostic priority.
+
+Linking and explicit source-unit checks use physical source paths. Before a
+successful mixed design is published, generated SV paths in `ingest.sourceFile`
+and operation/value source locations become
+`generated-sv:fnv1a64:<content-hash>/<transaction-relative-name>`. For example,
+an inline blackbox may use `generated-sv:fnv1a64:<hash>/inline/ClockGate.sv`.
+This is a logical source identity, not a filesystem path. Original input paths,
+line/column numbers, pass names and source notes are preserved. Diagnostics can
+still name the physical transaction file used by the frontend.
+
+This prevents request-local temporary directories from changing serialized
+graph identity across otherwise identical ingests. The mixed fixture compares
+complete JSON from repeated reads for inline, path and resource blackboxes.
+
+## Ingest implementation
+
+FIRRTL interface inference revisits modules through width/Reset dependencies.
+Each analysis indexes only the interfaces it uses; parent invalidation checks
+only direct children. Parsed module bodies are cached within the transaction
+and released after lowering. Type/leaf caches live within one module analysis.
+Source notes cached during lowering own their text, and public source positions
+continue to own their file, source line and source-info strings.
+
+Temporary F12 counters, timing scopes and profiling/cache-disable environment
+switches have been removed. External benchmarks can still measure the complete
+ingest call and compare serialized designs without changing the native path.
 
 ## Validation
 

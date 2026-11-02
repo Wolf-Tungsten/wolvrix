@@ -2,6 +2,8 @@
 
 #include "partition-internal.hpp"
 
+#include <algorithm>
+
 namespace wolvrix::lib::transform::grhsim {
 namespace {
 using namespace grh;
@@ -28,12 +30,17 @@ PassResult SplitNonsinkAndSinkPass::run() {
             return result;
         }
         if (stage(*graph) != "event-output-split") throw std::invalid_argument("General split requires event-output-split stage");
-        const auto topo = topological(*graph, [&](OperationId op) { return owner(*graph, op) == Owner{"general"}; });
+        const Owner generalOwner{"general"};
+        const auto topo = topological(*graph, [&](OperationId op) { return ownerView(*graph, op) == generalOwner; });
+        const auto hasHistory = [&](OperationId op) {
+            const auto attrs = graph->opAttrs(op);
+            return std::any_of(attrs.begin(), attrs.end(), [](const auto& attr) { return attr.key == "grhsim.history"; });
+        };
         std::unordered_map<OperationId, std::string, OperationIdHash> policy;
         for (const auto op : graph->operations()) {
             if (graph->opKind(op) != OperationKind::kRegister && graph->opKind(op) != OperationKind::kLatch) continue;
             const auto type = stateLogicalType(*graph, op);
-            policy[op] = type.kind == ValueType::Logic && !graph->getOperation(op).attr("grhsim.history") &&
+            policy[op] = type.kind == ValueType::Logic && !hasHistory(op) &&
                          (uint64_t(type.width) + 7) / 8 >= options_.memMinBytes ? "large-sink" : "small-sink";
         }
         // A pure cone can move to a sink only when every use already belongs
@@ -52,9 +59,8 @@ PassResult SplitNonsinkAndSinkPass::run() {
                 OperationId writer;
                 bool shared = false;
                 for (const auto value : graph->opResults(op)) {
-                    const auto view = graph->getValue(value);
-                    if (view.isOutput() || view.isInout()) shared = true;
-                    for (const auto& use : view.users()) {
+                    if (graph->valueIsOutput(value) || graph->valueIsInout(value)) shared = true;
+                    for (const auto& use : graph->valueUsers(value)) {
                         const auto found = destinations.find(use.operation);
                         if (found == destinations.end() || found->second.size() != 2 || found->second[1] == "nonsink") {
                             shared = true; continue;

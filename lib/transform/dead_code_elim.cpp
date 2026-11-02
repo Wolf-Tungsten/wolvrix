@@ -868,18 +868,20 @@ namespace wolvrix::lib::transform
                 setSessionValue(options_.outputKey, report.str(), "stats");
             }
 
+            ingest::node::DeadRootBatch deadRoots(graph);
             for (const auto &info : ops)
             {
                 if (info.id.valid() && info.id.index < liveOpMask.size() && liveOpMask[info.id.index] != 0)
                 {
                     continue;
                 }
-                ingest::node::recordDead(graph, info.id);
+                deadRoots.record(info.id);
                 if (graph.eraseOpUnchecked(info.id))
                 {
                     graphChanged = true;
                 }
             }
+            deadRoots.flush();
 
             std::vector<ValueId> deadValues;
             for (const auto valueId : valueSpan)

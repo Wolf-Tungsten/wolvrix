@@ -39,6 +39,10 @@ namespace wolvrix::lib::transform
         // Treat true loops as pass failures.
         bool failOnTrueLoop = false;
 
+        // Analyze only module-local connections. Instance outputs are roots;
+        // cross-module loops must be checked after hierarchy flattening.
+        bool treatInstancesAsBoundary = false;
+
         // Enable array-aware loop analysis and fragmentation (kSliceArray
         // leaves the "uncertain" black hole). When false, kSliceArray keeps
         // the legacy behavior (analysis gives up on the loop).

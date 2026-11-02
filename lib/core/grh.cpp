@@ -450,6 +450,15 @@ namespace wolvrix::lib::grh
         return id;
     }
 
+    SymbolId SymbolTable::internFresh(std::string_view text)
+    {
+        SymbolId id;
+        id.value = static_cast<uint32_t>(textById_.size());
+        textById_.emplace_back(text);
+        symbolsByText_.emplace(textById_.back(), id);
+        return id;
+    }
+
     SymbolId SymbolTable::lookup(std::string_view text) const
     {
         auto it = symbolsByText_.find(text);
@@ -2048,6 +2057,64 @@ namespace wolvrix::lib::grh
         attrs.insert(it, AttrKV{std::string(key), std::move(value)});
     }
 
+    void GraphBuilder::setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
+                                             bool root, int64_t rootResult)
+    {
+        constexpr std::string_view kMembers = "firrtl.node.members";
+        constexpr std::string_view kOrigins = "firrtl.node.origins";
+        constexpr std::string_view kRoots = "firrtl.node.roots";
+        constexpr std::string_view kRootResults = "firrtl.node.rootResults";
+        if (canonicalKey.empty())
+        {
+            throw std::invalid_argument("FIRRTL node identity requires a canonical key");
+        }
+        const std::size_t opIdx = opIndex(op);
+        auto &operation = operations_[opIdx];
+        if (!operation.alive)
+        {
+            throw std::runtime_error("OperationId refers to erased operation");
+        }
+        if (root && (rootResult < 0 || static_cast<uint64_t>(rootResult) >= operation.results.size()))
+        {
+            throw std::invalid_argument("node root result index out of range");
+        }
+
+        // Canonical node writes in FIRRTL lowering target fresh operations. If
+        // a caller supplies an existing attribute list, preserve the generic
+        // replacement semantics and its deterministic ordering.
+        if (!operation.attrs.empty())
+        {
+            const std::string owned(canonicalKey);
+            setAttr(op, kMembers, std::vector<std::string>{owned});
+            setAttr(op, kOrigins, std::vector<std::string>{owned});
+            if (root)
+            {
+                setAttr(op, kRoots, std::vector<std::string>{owned});
+                setAttr(op, kRootResults, std::vector<int64_t>{rootResult});
+            }
+            else
+            {
+                eraseAttr(op, kRoots);
+                eraseAttr(op, kRootResults);
+            }
+            return;
+        }
+
+        const std::string owned(canonicalKey);
+        auto single = [&]() { return std::vector<std::string>{owned}; };
+        auto &attrs = operation.attrs;
+        attrs.reserve(root ? 4 : 2);
+        // AttrKV order is canonical and must remain lexicographically sorted;
+        // rootResults sorts before roots because uppercase 'R' precedes 's'.
+        attrs.push_back(AttrKV{std::string(kMembers), single()});
+        attrs.push_back(AttrKV{std::string(kOrigins), single()});
+        if (root)
+        {
+            attrs.push_back(AttrKV{std::string(kRootResults), std::vector<int64_t>{rootResult}});
+            attrs.push_back(AttrKV{std::string(kRoots), single()});
+        }
+    }
+
     void GraphBuilder::setOpKind(OperationId op, OperationKind kind)
     {
         const std::size_t opIdx = opIndex(op);
@@ -3373,11 +3440,8 @@ namespace wolvrix::lib::grh
             candidate.append(std::to_string(nextInternalOpSym_++));
             if (!symbols_.contains(candidate))
             {
-                SymbolId sym = internSymbol(candidate);
-                if (sym.valid())
-                {
-                    return sym;
-                }
+                owner_->touch();
+                return symbols_.internFresh(candidate);
             }
         }
     }
@@ -3392,11 +3456,8 @@ namespace wolvrix::lib::grh
             candidate.append(std::to_string(nextInternalValSym_++));
             if (!symbols_.contains(candidate))
             {
-                SymbolId sym = internSymbol(candidate);
-                if (sym.valid())
-                {
-                    return sym;
-                }
+                owner_->touch();
+                return symbols_.internFresh(candidate);
             }
         }
     }
@@ -4575,6 +4636,14 @@ namespace wolvrix::lib::grh
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
+    void Graph::setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
+                                      bool root, int64_t rootResult)
+    {
+        GraphBuilder &builder = ensureBuilder();
+        builder.setCanonicalNodeAttrs(op, canonicalKey, root, rootResult);
+        // No cache invalidation needed - doesn't affect value/op/port lists
+    }
+
     void Graph::setOpKind(OperationId op, OperationKind kind)
     {
         GraphBuilder &builder = ensureBuilder();
@@ -5422,6 +5491,15 @@ namespace wolvrix::lib::grh
             return std::string_view{};
         }
         return designSymbols_.text(id);
+    }
+
+    void Design::sortGraphOrder()
+    {
+        if (!std::is_sorted(graphOrder_.begin(), graphOrder_.end()))
+        {
+            std::sort(graphOrder_.begin(), graphOrder_.end());
+            touch();
+        }
     }
 
     void Design::addDeclaredSymbol(SymbolId sym)

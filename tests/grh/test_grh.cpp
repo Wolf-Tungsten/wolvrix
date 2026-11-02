@@ -42,7 +42,35 @@ int main()
 {
     try
     {
+        {
+            Design ordered;
+            auto& last = ordered.createGraph("z");
+            const auto id = last.id();
+            ordered.createGraph("a");
+            ordered.markAsTop("z");
+            ordered.registerGraphAlias("alias", last);
+            ordered.sortGraphOrder();
+            if (ordered.graphOrder() != std::vector<std::string>{"a", "z"} ||
+                ordered.findGraph("alias") != &last || last.id() != id ||
+                ordered.topGraphs() != std::vector<std::string>{"z"})
+                return fail("sorting graph traversal changed graph identity, aliases or tops");
+        }
         Design design;
+        {
+            Graph &generated = design.createGraph("internal_symbols");
+            const auto occupied = generated.internSymbol("_op_0");
+            const auto reserved = generated.internSymbol("_op_1");
+            generated.createOperation(OperationKind::kConstant, occupied);
+            const auto op = generated.createOperation(OperationKind::kConstant);
+            const auto valReserved = generated.internSymbol("_val_0");
+            const auto value = generated.createValue(1, false);
+            if (generated.symbolText(generated.getOperation(op).symbol()) != "_op_2" ||
+                generated.symbolText(generated.valueSymbol(value)) != "_val_1" ||
+                generated.lookupSymbol("_op_1") != reserved ||
+                generated.lookupSymbol("_val_0") != valReserved)
+                return fail("internal symbol generation changed collision or reservation order");
+            design.deleteGraph("internal_symbols");
+        }
         Graph &graph = design.createGraph("demo");
 
         SymbolId symA = graph.internSymbol("a");

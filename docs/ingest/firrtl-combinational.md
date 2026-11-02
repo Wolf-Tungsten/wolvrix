@@ -91,10 +91,36 @@ data image. Bundle declaration order does not silently become an SV packed layou
 
 `packet[i].data[j]` uses `kSliceArray(base,i,j)`: operand zero is the flattened
 data leaf, subsequent operands are indices in source order, and the result has
-the suffix shape after consuming those indices. Bounds checks select the chosen
-invalid value on an out-of-range read. The operation count scales with rank,
-independently of the number of slots. Width adaptation of whole arrays uses
-element slices and `kArrayCreate` when element widths differ.
+the suffix shape after consuming those indices. A dynamic dimension contributes
+an unsigned `kLt(index,extent)` bounds check; the extent is represented at a width
+that cannot truncate it. Multiple dynamic dimensions combine their checks with
+`kAnd`. The read then uses `kMux [inBounds, selected, invalid]`: operand zero is
+the one-bit condition, operand one is the selected array value, and operand two
+is the invalid value of the same width and suffix shape. Invalid means X under
+`FirrtlInvalidPolicy::Unknown` and zero under `Zero`.
+
+Bare nonnegative integer indices and UInt literal payloads of at most 62 bits
+are recognized directly by lower. A recognized in-range index remains an index
+operand but contributes no runtime check. An entirely fixed valid read needs no
+bounds mux. Other expression forms retain dynamic checks. Bare integer OOB
+syntax such as `a[2]` for a two-element Vector is a semantic error; an expression
+index such as `a[UInt<2>(2)]` is well typed and lowers directly to invalid when
+its literal is recognized as OOB. Any such OOB dimension determines the whole
+selected result, including when other dimensions are dynamic.
+
+For example, `input a : UInt<4>[3][2]` has total width 24 and shape `[2,3]`:
+the final FIRRTL suffix is the outer dimension. With `input i : UInt<2>`:
+
+| FIRRTL expression | Result | Lowered read, omitting assign views |
+| --- | --- | --- |
+| `a[1][2]` | Width 4, scalar | `kSliceArray [a,1,2]`, no bounds check |
+| `a[i]` | Width 12, shape `[3]` | Select row `i`, guarded by `i < 2` |
+| `a[i][UInt<2>(2)]` | Width 4, scalar | `kSliceArray [a,i,2]`, guarded only by `i < 2` |
+| `a[i][UInt<2>(3)]` | Width 4, scalar | Invalid constant; no array slice |
+
+The operation count scales with rank, independently of the number of slots.
+Width adaptation of whole arrays uses element slices and `kArrayCreate` when
+element widths differ.
 
 Connects first form ordered connection intents. Bundle flips reverse the
 appropriate ground connections. Later whole connects replace earlier drivers;
@@ -102,12 +128,44 @@ later partial connects replace only their indexed subarray. Conditional connects
 use muxes. Reads of wires and output ports observe final connectivity, regardless
 of the read's textual position.
 
-For combinational partial writes, the frontend computes a row-major bit offset
-and merges a shifted data/mask pair into the current driver. An out-of-range write
-preserves that driver. The result returns to the original shaped type through an
-equal-width view. This uses O(rank) operations without per-slot equality/mux
-decoding. Register writes instead use ordered indexed state ports; see
-[firrtl-state.md](firrtl-state.md).
+For combinational partial writes with static indices, the frontend splices the
+updated slice between the unchanged high and low slices. A conditional static
+write selects only that slice before splicing it; untouched bits do not depend
+on its guard. For example, reading `m[1]` to conditionally update `m[0]` does not
+make `m[1]` depend on that condition. This also avoids selecting the full array
+for each static partial write in the generated simulator.
+Consecutive static partial writes share a packed accumulator, avoiding repeated
+conversion of every array element. The final assign restores the declaration's
+shape; CHIRRTL memory write data restores its leaf shape at the memory boundary.
+For a partial write containing dynamic indices, lower computes a row-major bit
+offset and merges a shifted data/mask pair into the current driver. Only dynamic
+dimensions contribute bounds checks. An OOB dynamic index preserves the driver;
+a recognized OOB literal skips the write entirely, even in a mixed access. A
+skipped write supplies no initialization coverage. Probe definitions retain
+their requirement for a valid static component destination. The result returns
+to the original shaped type through an equal-width view. This uses O(rank)
+operations without per-slot equality/mux decoding. Register writes instead use
+ordered indexed state ports; see [firrtl-state.md](firrtl-state.md).
+
+For the same `[2,3]` array, this writes only the last cell of a valid row:
+
+```firrtl
+wire w : UInt<4>[3][2]
+connect w, a
+connect w[i][UInt<2>(2)], data
+connect w[i][UInt<2>(3)], UInt<4>(15)
+```
+
+Here `data` is UInt<4>. The valid write has bit offset `12*i + 8`, and a local
+data-merge mask of `0xf << (12*i + 8)` within the 24-bit driver. It replaces those
+four bits when `i < 2`; all other bits retain `a`. The final OOB connect changes
+nothing. Whole and static wire/output connects need no memory write mask;
+dynamic wire/output connects retain the local mask consumed by their data merge.
+CHIRRTL mport connects additionally accumulate a bit mask of written portions,
+with the guard and dynamic bounds gating that accumulation. That mask feeds
+the memory writer; ordinary wire/output connects create no such extra coverage
+mask. Standard memory ports continue to use their explicit `mask`/`wmask`
+fields; see [firrtl-memory.md](firrtl-memory.md).
 
 A Boolean decision DAG checks initialization over disjoint static bit intervals,
 including when/else and complementary one-bit Boolean predicates. Predicate keys
@@ -116,7 +174,11 @@ conditions of blocks not containing the destination declaration control its
 connects. Local wires therefore need complete coverage under these interleaving
 conditions. Dynamic writes need a complete default or sufficient static
 coverage; no value is silently supplied for a missing driver. Combinational
-cycles are rejected before publishing the design.
+cycles are rejected before publishing the design. Whole-array cycles involving
+partial element dependencies are checked by the shared range analysis before
+publication. For example `m[0][1] = a < b; m[1][0] = not(m[0][1])` has no element
+cycle; range analysis removes the apparent whole-array cycle while preserving
+the public array shape. A mutual dependency between both elements is rejected.
 
 ## Logic domain and node metadata
 

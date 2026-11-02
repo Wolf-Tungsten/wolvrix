@@ -445,6 +445,11 @@ target_compile_definitions(store-json
 
 register_test_exe(store-json)
 
+add_executable(load-json-file tests/store/test_load_json_file.cpp)
+target_link_libraries(load-json-file PRIVATE wolvrix-lib)
+target_compile_definitions(load-json-file PRIVATE WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}")
+register_test_exe(load-json-file)
+
 add_executable(store-json-ir
     tests/store/test_store_json_ir.cpp
 )
@@ -815,7 +820,7 @@ target_compile_definitions(transform-repcut-partition-count
 register_test_exe(transform-repcut-partition-count)
 
 # ingest: FIRRTL syntax, combinational lowering and node CSE boundaries
-foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects ingest-mixed grhsim-node-cse firrtl-node-pipeline)
+foreach(test_name firrtl-node-attributes firrtl-cse-scope firrtl-parser firrtl-comb firrtl-aggregate firrtl-widths firrtl-state firrtl-memory firrtl-effects ingest-mixed ingest-indexes grhsim-node-cse firrtl-node-pipeline)
     string(REPLACE "-" "_" test_file ${test_name})
     add_executable(${test_name} tests/ingest/test_${test_file}.cpp)
     target_link_libraries(${test_name} PRIVATE wolvrix-lib)

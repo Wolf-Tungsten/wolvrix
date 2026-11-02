@@ -640,7 +640,8 @@ namespace wolvrix::lib::transform
                         continue;
                     }
 
-                    if (isOutputPortValue(graph, dstId) && !hasOtherUsers(graph, dstId))
+                    if (isOutputPortValue(graph, dstId) && !hasOtherUsers(graph, dstId) &&
+                        graph.sameValueType(srcId, dstId))
                     {
                         const wolvrix::lib::grh::OperationId constOpId = graph.valueDef(srcId);
                         if (constOpId.valid())
@@ -669,22 +670,42 @@ namespace wolvrix::lib::transform
                                 {
                                     continue;
                                 }
+                                const bool reparent = isSingleUser(graph, srcId, opId) &&
+                                    !graph.valueIsOutput(srcId);
+                                std::vector<std::string> origins;
+                                if (const auto source = getOriginModules(graph, opId))
+                                    appendOriginModules(origins, *source);
+                                if (const auto source = getOriginModules(graph, constOpId))
+                                    appendOriginModules(origins, *source);
+                                const auto nodeAttributes = ingest::node::unite(
+                                    ingest::node::read(graph, constOpId),
+                                    ingest::node::read(graph, opId),
+                                    ingest::node::MergeReason::SameComputation);
+                                const auto restoreAttributes = [&](auto target) {
+                                    if (!origins.empty()) graph.setAttr(target, kOriginModulesKey, origins);
+                                    ingest::node::write(graph, target, nodeAttributes);
+                                };
                                 if (!eraseOp(opId))
                                 {
                                     continue;
                                 }
-                                if (isSingleUser(graph, srcId, opId) &&
-                                    !graph.valueIsOutput(srcId))
+                                if (reparent)
                                 {
+                                    bool reparented = false;
                                     try
                                     {
                                         graph.replaceResult(constOpId, 0, dstId);
-                                        graphChanged = true;
-                                        continue;
+                                        reparented = true;
                                     }
                                     catch (const std::exception &)
                                     {
                                         // Fall through to clone path.
+                                    }
+                                    if (reparented)
+                                    {
+                                        restoreAttributes(constOpId);
+                                        graphChanged = true;
+                                        continue;
                                     }
                                 }
 
@@ -698,7 +719,7 @@ namespace wolvrix::lib::transform
                                                           opSym);
                                 graph.addResult(newConst, dstId);
                                 graph.setAttr(newConst, "constValue", literalText);
-                                inheritOrigin(graph, newConst, {opId, constOpId});
+                                restoreAttributes(newConst);
                                 graph.setOpSrcLoc(newConst,
                                                   makeTransformSrcLoc("redundant-elim", "clone_const"));
                                 graphChanged = true;

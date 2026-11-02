@@ -173,6 +173,10 @@ private:
         std::size_t operator()(const std::string &value) const noexcept;
     };
 
+    friend class Graph;
+    // Graph has already checked that this generated text is absent.
+    SymbolId internFresh(std::string_view text);
+
     struct StringEq {
         using is_transparent = void;
         bool operator()(const std::string &lhs, const std::string &rhs) const noexcept;
@@ -521,6 +525,11 @@ public:
     bool removeOutputPort(std::string_view name);
     bool removeInoutPort(std::string_view name);
     void setAttr(OperationId op, std::string_view key, AttributeValue value);
+    // Write the canonical FIRRTL node attributes on a freshly-created
+    // operation. The implementation may append the already-sorted known
+    // attributes directly; non-empty attribute lists fall back to setAttr.
+    void setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
+                               bool root = false, int64_t rootResult = 0);
     void setOpKind(OperationId op, OperationKind kind);
     bool eraseAttr(OperationId op, std::string_view key);
     void setValueSrcLoc(ValueId value, SrcLoc loc);
@@ -886,6 +895,9 @@ public:
     bool eraseValue(ValueId value);
     bool eraseValueUnchecked(ValueId value);
     void setAttr(OperationId op, std::string_view key, AttributeValue value);
+    // See GraphBuilder::setCanonicalNodeAttrs.
+    void setCanonicalNodeAttrs(OperationId op, std::string_view canonicalKey,
+                               bool root = false, int64_t rootResult = 0);
     void setOpKind(OperationId op, OperationKind kind);
     bool eraseAttr(OperationId op, std::string_view key);
     void setValueSrcLoc(ValueId value, SrcLoc loc);
@@ -980,6 +992,8 @@ public:
 
     const std::unordered_map<std::string, std::unique_ptr<Graph>>& graphs() const noexcept { return graphs_; }
     const std::vector<std::string>& graphOrder() const noexcept { return graphOrder_; }
+    // Sort traversal order without moving graphs or changing their IDs.
+    void sortGraphOrder();
 
     static Design fromJsonString(std::string_view json);
 

@@ -3,6 +3,7 @@
 #include "ingest/node_attributes.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <set>
 #include <utility>
@@ -12,11 +13,45 @@ namespace {
 using grh::LogicalType;
 using grh::OperationKind;
 using grh::ValueId;
+using LeafKey = std::pair<std::string, std::vector<std::string>>;
 
 struct AccessPath {
-    std::string name;
-    std::vector<std::string> fields;
-    std::vector<ExprId> indices;
+    std::string_view name;
+    template <typename T, std::size_t InlineCapacity>
+    class InlinePath {
+    public:
+        void push_back(const T& value) {
+            if (heap_.empty() && size_ < InlineCapacity) {
+                inline_[size_++] = value;
+                return;
+            }
+            if (heap_.empty()) {
+                heap_.reserve(InlineCapacity * 2);
+                heap_.insert(heap_.end(), inline_.begin(), inline_.end());
+            }
+            heap_.push_back(value);
+            ++size_;
+        }
+        template <typename Range>
+        void append(const Range& values) {
+            for (const auto& value : values) push_back(value);
+        }
+        bool empty() const noexcept { return size_ == 0; }
+        std::size_t size() const noexcept { return size_; }
+        const T& operator[](std::size_t index) const noexcept {
+            return heap_.empty() ? inline_[index] : heap_[index];
+        }
+        std::span<const T> span() const noexcept {
+            return heap_.empty() ? std::span<const T>(inline_.data(), size_)
+                                 : std::span<const T>(heap_.data(), heap_.size());
+        }
+    private:
+        std::array<T, InlineCapacity> inline_{};
+        std::vector<T> heap_;
+        std::size_t size_ = 0;
+    };
+    InlinePath<std::string_view, 4> fields;
+    InlinePath<ExprId, 2> indices;
 };
 struct Driver {
     Leaf leaf;
@@ -29,23 +64,74 @@ struct Driver {
     ValueId memoryMask;
 };
 
+struct LeafKeyView {
+    std::string_view name;
+    std::span<const std::string> fields;
+};
+
+struct LeafKeyBorrowedView {
+    std::string_view name;
+    std::span<const std::string_view> fields;
+};
+
+struct LeafKeyLess {
+    using is_transparent = void;
+
+    static std::string_view name(const LeafKey& key) { return key.first; }
+    static std::string_view name(const LeafKeyView& key) { return key.name; }
+    static std::string_view name(const LeafKeyBorrowedView& key) { return key.name; }
+    static const std::vector<std::string>& fields(const LeafKey& key) { return key.second; }
+    static std::span<const std::string> fields(const LeafKeyView& key) { return key.fields; }
+    static std::span<const std::string_view> fields(const LeafKeyBorrowedView& key) { return key.fields; }
+
+    template <typename LeftFields, typename RightFields>
+    static bool less(std::string_view leftName, const LeftFields& leftFields,
+                     std::string_view rightName, const RightFields& rightFields) {
+        if (leftName != rightName) return leftName < rightName;
+        const auto count = std::min(leftFields.size(), rightFields.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto left = std::string_view(leftFields[i]);
+            const auto right = std::string_view(rightFields[i]);
+            if (left != right) return left < right;
+        }
+        return leftFields.size() < rightFields.size();
+    }
+
+    template <typename Left, typename Right>
+    bool operator()(const Left& left, const Right& right) const {
+        return less(name(left), fields(left), name(right), fields(right));
+    }
+};
+
 class Lowerer {
 public:
     Lowerer(Semantics& semantics, grh::Graph& graph, const FirrtlOptions& options)
-        : semantics_(semantics), graph_(graph), options_(options) {}
+        : semantics_(semantics), graph_(graph), options_(options), sourceFile_(semantics.source.path().generic_string()) {}
     ModuleSignature run();
 private:
-    using LeafKey = std::pair<std::string, std::vector<std::string>>;
     Semantics& semantics_;
     grh::Graph& graph_;
     const FirrtlOptions& options_;
-    std::map<LeafKey, Driver> drivers_;
+    // Source locations are attached to every generated op/value, but the
+    // source file and line-level FIRRTL info are shared by a large number of
+    // generated operations. Keep owned strings here so location()
+    // avoids rescanning the source for each operation on the same line.
+    std::string sourceFile_;
+    mutable uint64_t locationLine_ = 0;
+    mutable std::string locationSourceInfo_;
+    std::map<LeafKey, Driver, LeafKeyLess> drivers_;
     std::map<int, ValueId> guards_;
     std::unordered_map<ValueId, ValueId, grh::ValueIdHash> clockPulses_;
     std::string nodeKey_;
+    bool nodeSchemaReady_ = false;
+    void ensureNodeSchema();
+    Driver& findDriver(std::string_view name, std::span<const std::string> fields);
+    const Driver& findDriver(std::string_view name, std::span<const std::string> fields) const;
+    Driver& findDriver(std::string_view name, std::span<const std::string_view> fields);
+    const Driver& findDriver(std::string_view name, std::span<const std::string_view> fields) const;
     grh::SrcLoc location(Range range) const;
     LogicalType logical(const Leaf& leaf) const;
-    Leaf projected(ExprId expression, const std::vector<std::string>& fields) const;
+    const Leaf& projected(ExprId expression, const std::vector<std::string>& fields) const;
     ValueId op(OperationKind kind, const LogicalType& type, std::span<const ValueId> args, Range range);
     ValueId op(OperationKind kind, const LogicalType& type, std::initializer_list<ValueId> args, Range range) {
         return op(kind, type, std::span(args.begin(), args.size()), range);
@@ -59,12 +145,12 @@ private:
     bool access(ExprId expression, AccessPath& path) const;
     ValueId index(ExprId expression);
     ValueId inBounds(ValueId index, int64_t extent, Range range);
-    ValueId read(ValueId base, const std::vector<ExprId>& indices, Range range);
-    ValueId stateRead(const Driver& driver, const std::vector<ExprId>& indices, Range range);
+    ValueId read(ValueId base, std::span<const ExprId> indices, Range range);
+    ValueId stateRead(const Driver& driver, std::span<const ExprId> indices, Range range);
     void stateWrite(const Driver& driver, const Declaration::Register& state, ValueId enable,
                     const std::vector<ValueId>& indices, ValueId data, Range range);
     ValueId expression(ExprId id, const std::vector<std::string>& fields = {});
-    ValueId primitive(ExprId id);
+    ValueId primitive(ExprId id, const LogicalType& type);
     ValueId guard(int id, Range range);
     void connect(const Connection& connection);
     void cover(Driver& driver, int64_t begin, int64_t end, int guard);
@@ -78,36 +164,90 @@ private:
     void instances();
 };
 
+void Lowerer::ensureNodeSchema() {
+    if (nodeSchemaReady_) return;
+    graph_.setMetadata(node::kSchema, node::kSchemaRevision);
+    nodeSchemaReady_ = true;
+}
+
 grh::SrcLoc Lowerer::location(Range range) const {
-    const auto position = semantics_.source.position(range);
     grh::SrcLoc result;
-    result.file = position.file.generic_string();
-    result.line = static_cast<uint32_t>(position.line);
-    result.column = static_cast<uint32_t>(position.column);
-    result.pass = "ingest-firrtl"; result.note = position.sourceInfo;
+    result.file = sourceFile_;
+    result.line = static_cast<uint32_t>(range.line);
+    result.column = static_cast<uint32_t>(range.column);
+    std::string_view sourceInfo = range.info;
+    if (sourceInfo.empty()) {
+        if (locationLine_ == range.line) {
+            sourceInfo = locationSourceInfo_;
+        }
+        else {
+            locationLine_ = range.line;
+            locationSourceInfo_ = sourceInfoAt(semantics_.source, range);
+            sourceInfo = locationSourceInfo_;
+        }
+    }
+    result.pass = "ingest-firrtl"; result.note = sourceInfo;
     return result;
+}
+Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string> fields) {
+    const auto found = drivers_.find(LeafKeyView{name, fields});
+    if (found == drivers_.end()) throw std::out_of_range("map::at");
+    return found->second;
+}
+const Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string> fields) const {
+    const auto found = drivers_.find(LeafKeyView{name, fields});
+    if (found == drivers_.end()) throw std::out_of_range("map::at");
+    return found->second;
+}
+Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string_view> fields) {
+    const auto found = drivers_.find(LeafKeyBorrowedView{name, fields});
+    if (found == drivers_.end()) throw std::out_of_range("map::at");
+    return found->second;
+}
+const Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string_view> fields) const {
+    const auto found = drivers_.find(LeafKeyBorrowedView{name, fields});
+    if (found == drivers_.end()) throw std::out_of_range("map::at");
+    return found->second;
 }
 LogicalType Lowerer::logical(const Leaf& leaf) const {
     return {grh::ValueType::Logic, static_cast<int32_t>(semantics_.total(leaf)),
             semantics_.resolvedKind(leaf.type) == TypeKind::SInt, grh::LogicDomain::FourState, leaf.shape};
 }
-Leaf Lowerer::projected(ExprId id, const std::vector<std::string>& fields) const {
-    const auto leaves = semantics_.leaves(semantics_.expressions[id]);
+const Leaf& Lowerer::projected(ExprId id, const std::vector<std::string>& fields) const {
+    const auto& leaves = semantics_.leavesCached(semantics_.expressions[id]);
+    if (fields.empty() && leaves.size() == 1 && leaves.front().fields.empty()) return leaves.front();
     const auto found = std::find_if(leaves.begin(), leaves.end(), [&](const auto& leaf) { return leaf.fields == fields; });
     if (found == leaves.end()) throw std::logic_error("invalid FIRRTL expression leaf");
     return *found;
 }
 ValueId Lowerer::op(OperationKind kind, const LogicalType& type, std::span<const ValueId> args, Range range) {
     if (!type.width) return {};
+
     const auto operation = graph_.createOperation(kind);
+
     const auto result = graph_.createValue(type);
+
+    if (!nodeKey_.empty()) graph_.reserveOpAttrCapacity(operation, 2);
+    if (args.size() > 1) graph_.reserveOpOperandCapacity(operation, args.size());
     for (const auto value : args) {
         if (!value) throw std::logic_error("zero-width FIRRTL operand was not eliminated");
         graph_.addOperand(operation, value);
     }
+
     graph_.addResult(operation, result);
-    graph_.setOpSrcLoc(operation, location(range)); graph_.setValueSrcLoc(result, location(range));
-    if (!nodeKey_.empty()) node::write(graph_, operation, {{nodeKey_}, {}, {nodeKey_}});
+
+    // Source::position scans the FIRRTL source line and materializes strings.
+    // Both entities share the same range, so compute it once and move the
+    // second copy into the value record while preserving both source locations.
+    auto sourceLocation = location(range);
+    graph_.setOpSrcLoc(operation, sourceLocation);
+    graph_.setValueSrcLoc(result, std::move(sourceLocation));
+
+    if (!nodeKey_.empty()) {
+        ensureNodeSchema();
+
+        node::writeSingleCanonicalReady(graph_, operation, nodeKey_);
+    }
     return result;
 }
 ValueId Lowerer::constant(const LogicalType& type, std::string bits, Range range) {
@@ -148,6 +288,7 @@ ValueId Lowerer::adapt(ValueId value, const LogicalType& type, Range range) {
     if (!type.shape.empty()) {
         auto childType = type; childType.width /= type.shape[0]; childType.shape.erase(childType.shape.begin());
         std::vector<ValueId> children;
+        children.reserve(type.shape[0]);
         for (int64_t i = 0; i < type.shape[0]; ++i) {
             auto sourceType = original; sourceType.width /= original.shape[0]; sourceType.shape.erase(sourceType.shape.begin());
             const auto child = op(OperationKind::kSliceArray, sourceType, {value, number(i, 32, range)}, range);
@@ -170,11 +311,17 @@ ValueId Lowerer::adapt(ValueId value, const LogicalType& type, Range range) {
 
 bool Lowerer::access(ExprId id, AccessPath& path) const {
     const auto& expr = semantics_.body.arena.expressions[id];
-    if (expr.kind == ExprKind::Reference) { path.name = expr.name; return true; }
+
+    if (expr.kind == ExprKind::Reference) {
+        path.name = expr.name; return true;
+    }
     if (expr.kind != ExprKind::Field && expr.kind != ExprKind::Index) return false;
     if (!access(expr.operands[0], path)) return false;
-    if (expr.kind == ExprKind::Field) path.fields.emplace_back(expr.name);
-    else path.indices.push_back(expr.operands[1]);
+    if (expr.kind == ExprKind::Field) {
+        path.fields.push_back(expr.name);
+    } else {
+        path.indices.push_back(expr.operands[1]);
+    }
     return true;
 }
 ValueId Lowerer::index(ExprId id) {
@@ -188,40 +335,52 @@ ValueId Lowerer::inBounds(ValueId value, int64_t extent, Range range) {
     const LogicalType type{grh::ValueType::Logic, width, false};
     return op(OperationKind::kLt, {grh::ValueType::Logic, 1, false}, {adapt(value, type, range), number(extent, width, range)}, range);
 }
-ValueId Lowerer::read(ValueId base, const std::vector<ExprId>& indices, Range range) {
+ValueId Lowerer::read(ValueId base, std::span<const ExprId> indices, Range range) {
     if (indices.empty() || !base) return base;
     const auto original = graph_.valueLogicalType(base);
     auto resultType = original;
-    std::vector<ValueId> operands{base};
+    for (std::size_t i = 0; i < indices.size(); ++i) resultType.width /= original.shape[i];
+    resultType.shape.erase(resultType.shape.begin(), resultType.shape.begin() + indices.size());
+    for (std::size_t i = 0; i < indices.size(); ++i)
+        if (const auto fixed = semantics_.staticIndex(indices[i]); fixed && *fixed >= original.shape[i])
+            return invalid(resultType, range);
+    std::vector<ValueId> operands;
+    operands.reserve(indices.size() + 1);
+    operands.push_back(base);
     ValueId valid;
     for (std::size_t i = 0; i < indices.size(); ++i) {
         const auto value = index(indices[i]); operands.push_back(value);
+        if (semantics_.staticIndex(indices[i])) continue;
         const auto inside = inBounds(value, original.shape[i], range);
         valid = valid ? op(OperationKind::kAnd, {grh::ValueType::Logic, 1, false}, {valid, inside}, range) : inside;
-        resultType.width /= original.shape[i];
     }
-    resultType.shape.erase(resultType.shape.begin(), resultType.shape.begin() + indices.size());
     const auto result = op(OperationKind::kSliceArray, resultType, operands, range);
-    return op(OperationKind::kMux, resultType, {valid, result, invalid(resultType, range)}, range);
+    return valid ? op(OperationKind::kMux, resultType, {valid, result, invalid(resultType, range)}, range) : result;
 }
 ValueId Lowerer::expression(ExprId id, const std::vector<std::string>& fields) {
     const auto& expr = semantics_.body.arena.expressions[id];
-    if (!semantics_.total(projected(id, fields))) return {};
+
+
+    const auto& projectedLeaf = projected(id, fields);
+    if (!semantics_.total(projectedLeaf)) return {};
     AccessPath path;
     if (access(id, path)) {
-        path.fields.insert(path.fields.end(), fields.begin(), fields.end());
-        const auto& driver = drivers_.at({path.name, path.fields});
+        path.fields.append(fields);
+        const auto& driver = findDriver(path.name, path.fields.span());
         const auto base = driver.value;
-        if (!base) return invalid(logical(projected(id, fields)), expr.range);
-        if (!driver.regSymbol.empty() && !path.indices.empty()) return stateRead(driver, path.indices, expr.range);
-        return read(base, path.indices, expr.range);
+        if (!base) return invalid(logical(projectedLeaf), expr.range);
+        if (!driver.regSymbol.empty() && !path.indices.empty()) return stateRead(driver, path.indices.span(), expr.range);
+        return read(base, path.indices.span(), expr.range);
     }
     if (expr.kind == ExprKind::Field) {
         auto projection = fields; projection.insert(projection.begin(), std::string(expr.name));
         return expression(expr.operands[0], projection);
     }
-    if (expr.kind == ExprKind::Index) return read(expression(expr.operands[0], fields), {expr.operands[1]}, expr.range);
-    const auto type = logical(projected(id, fields));
+    if (expr.kind == ExprKind::Index) {
+        const std::array<ExprId, 1> indexExpression{expr.operands[1]};
+        return read(expression(expr.operands[0], fields), indexExpression, expr.range);
+    }
+    const auto type = logical(projectedLeaf);
     if (expr.kind == ExprKind::UInt || expr.kind == ExprKind::SInt) {
         auto value = literal(expr.literal, type.isSigned, expr.range);
         if (value.negative) value.bits.insert(value.bits.begin(), type.width - value.bits.size(), '1');
@@ -233,23 +392,32 @@ ValueId Lowerer::expression(ExprId id, const std::vector<std::string>& fields) {
         const auto b = adapt(expression(expr.operands[2], fields), type, expr.range);
         return op(OperationKind::kMux, type, {select, a, b}, expr.range);
     }
-    if (expr.kind == ExprKind::Primitive) return primitive(id);
+    if (expr.kind == ExprKind::Primitive) {
+        return primitive(id, type);
+    }
     if (expr.kind == ExprKind::Probe || expr.kind == ExprKind::RWProbe || expr.kind == ExprKind::Read) return expression(expr.operands[0], fields);
     throw Error(expr.range, "FIRRTL expression lowering is not supported yet (F06)");
 }
 
-ValueId Lowerer::primitive(ExprId id) {
+ValueId Lowerer::primitive(ExprId id, const LogicalType& type) {
     const auto& expr = semantics_.body.arena.expressions[id];
+
     const auto word = expr.name; const auto range = expr.range;
-    const auto type = logical(projected(id, {}));
     std::vector<ValueId> args;
     std::vector<int64_t> widths, parameters;
+    args.reserve(expr.operands.size());
+    widths.reserve(expr.operands.size());
+    parameters.reserve(expr.operands.size());
     for (const auto arg : expr.operands) {
-        if (semantics_.body.arena.expressions[arg].kind == ExprKind::Integer) parameters.push_back(*semantics_.staticIndex(arg));
-        else { args.push_back(expression(arg)); widths.push_back(semantics_.width(semantics_.expressions[arg])); }
+        if (semantics_.body.arena.expressions[arg].kind == ExprKind::Integer) {
+            parameters.push_back(*semantics_.staticIndex(arg));
+        } else {
+            args.push_back(expression(arg)); widths.push_back(semantics_.width(semantics_.expressions[arg]));
+        }
     }
     if (word == "cat") {
         std::vector<ValueId> nonzero;
+        nonzero.reserve(args.size());
         for (const auto arg : args) if (arg) nonzero.push_back(arg);
         return nonzero.size() == 1 ? view(nonzero[0], type, range) : op(OperationKind::kConcat, type, nonzero, range);
     }
@@ -295,22 +463,29 @@ ValueId Lowerer::primitive(ExprId id) {
     return result;
 }
 
-ValueId Lowerer::stateRead(const Driver& driver, const std::vector<ExprId>& indices, Range range) {
+ValueId Lowerer::stateRead(const Driver& driver, std::span<const ExprId> indices, Range range) {
     auto type = graph_.valueLogicalType(driver.value);
+    const auto shape = type.shape;
+    for (std::size_t i = 0; i < indices.size(); ++i) type.width /= shape[i];
+    type.shape.erase(type.shape.begin(), type.shape.begin() + indices.size());
+    for (std::size_t i = 0; i < indices.size(); ++i)
+        if (const auto fixed = semantics_.staticIndex(indices[i]); fixed && *fixed >= shape[i])
+            return invalid(type, range);
     std::vector<ValueId> args;
-    auto valid = number(1, 1, range);
+    args.reserve(indices.size());
+    ValueId valid;
     for (std::size_t i = 0; i < indices.size(); ++i) {
         const auto value = index(indices[i]); args.push_back(value);
-        valid = op(OperationKind::kAnd, {grh::ValueType::Logic, 1, false}, {valid, inBounds(value, type.shape[i], range)}, range);
-        type.width /= type.shape[i];
+        if (semantics_.staticIndex(indices[i])) continue;
+        const auto inside = inBounds(value, shape[i], range);
+        valid = valid ? op(OperationKind::kAnd, {grh::ValueType::Logic, 1, false}, {valid, inside}, range) : inside;
     }
-    type.shape.erase(type.shape.begin(), type.shape.begin() + indices.size());
     // A state observation is an external node dependency, never node-owned work.
     auto key = std::exchange(nodeKey_, {});
     const auto result = op(OperationKind::kRegisterReadArrayPort, type, args, range);
     graph_.setAttr(graph_.valueDef(result), "regSymbol", driver.regSymbol);
     nodeKey_ = std::move(key);
-    return op(OperationKind::kMux, type, {valid, result, invalid(type, range)}, range);
+    return valid ? op(OperationKind::kMux, type, {valid, result, invalid(type, range)}, range) : result;
 }
 void Lowerer::stateWrite(const Driver& driver, const Declaration::Register& state, ValueId enable,
                          const std::vector<ValueId>& indices, ValueId data, Range range) {
@@ -352,16 +527,21 @@ void Lowerer::connect(const Connection& connection) {
     if (!connection.guard) return;
     AccessPath path;
     if (!access(connection.sink.expression, path)) throw Error(connection.range, "connect requires a component destination");
-    path.fields.insert(path.fields.end(), connection.sink.fields.begin(), connection.sink.fields.end());
-    auto& driver = drivers_.at({path.name, path.fields});
+    path.fields.append(connection.sink.fields);
+    auto& driver = findDriver(path.name, path.fields.span());
     if (!driver.value) return;
     const auto fullType = graph_.valueLogicalType(driver.value);
     auto dataType = fullType;
     for (std::size_t i = 0; i < path.indices.size(); ++i) dataType.width /= fullType.shape[i];
     dataType.shape.erase(dataType.shape.begin(), dataType.shape.begin() + path.indices.size());
+    for (std::size_t i = 0; i < path.indices.size(); ++i)
+        if (const auto fixed = semantics_.staticIndex(path.indices[i]); fixed && *fixed >= fullType.shape[i]) {
+            if (connection.define) throw Error(connection.range, "probe definition requires a static component destination");
+            return;
+        }
     auto data = connection.invalid ? invalid(dataType, connection.range) : adapt(expression(connection.source.expression, connection.source.fields), dataType, connection.range);
     if (!driver.regSymbol.empty()) {
-        const auto& state = *semantics_.declarations.at(path.name).state;
+        const auto& state = *semantics_.declarations.at(std::string(path.name)).state;
         auto enable = guard(connection.guard, connection.range);
         const LogicalType bit{grh::ValueType::Logic, 1, false};
         if (state.reset) {
@@ -369,8 +549,10 @@ void Lowerer::connect(const Connection& connection) {
             enable = op(OperationKind::kAnd, bit, {enable, reset}, connection.range);
         }
         std::vector<ValueId> indices;
+        indices.reserve(path.indices.size());
         for (std::size_t i = 0; i < path.indices.size(); ++i) {
             const auto value = index(path.indices[i]); indices.push_back(value);
+            if (semantics_.staticIndex(path.indices[i])) continue;
             enable = op(OperationKind::kAnd, bit, {enable, inBounds(value, fullType.shape[i], connection.range)}, connection.range);
         }
         stateWrite(driver, state, enable, indices, data, connection.range);
@@ -392,14 +574,38 @@ void Lowerer::connect(const Connection& connection) {
     auto current = driver.current;
     if (!current) current = invalid(fullType, connection.range);
     auto enable = guard(connection.guard, connection.range);
-    auto writeMask = constant(fullType, std::string(dataType.width, '1'), connection.range);
-    if (!path.indices.empty()) {
+    const bool trackMemoryMask = semantics_.memoryPorts.contains(std::string(path.name));
+    ValueId writeMask;
+    if (trackMemoryMask) writeMask = constant(fullType, std::string(dataType.width, '1'), connection.range);
+    if (!path.indices.empty() && staticWrite) {
+        // Guard only the written slice. An array-wide mux would introduce
+        // false dependencies from the condition to untouched elements.
+        auto flatType = fullType; flatType.shape.clear(); flatType.isSigned = false;
+        auto partType = dataType; partType.shape.clear(); partType.isSigned = false;
+        const auto prior = view(current, flatType, connection.range);
+        auto part = view(data, partType, connection.range);
+        if (connection.guard != 1)
+            part = op(OperationKind::kMux, partType,
+                {enable, part, slice(prior, offset, dataType.width, false, connection.range)}, connection.range);
+        std::vector<ValueId> pieces;
+        pieces.reserve(3);
+        const auto end = offset + dataType.width;
+        if (end < fullType.width) pieces.push_back(slice(prior, end, fullType.width - end, false, connection.range));
+        pieces.push_back(part);
+        if (offset) pieces.push_back(slice(prior, 0, offset, false, connection.range));
+        // Keep the packed accumulator between partial writes. Rebuilding the
+        // shaped array here would repeatedly unpack and repack every element.
+        data = pieces.size() == 1 ? pieces[0] : op(OperationKind::kConcat, flatType, pieces, connection.range);
+        if (trackMemoryMask)
+            writeMask = constant(fullType, std::string(dataType.width, '1') + std::string(offset, '0'), connection.range);
+    } else if (!path.indices.empty()) {
         const LogicalType offsetType{grh::ValueType::Logic, 32, false};
         const LogicalType bit{grh::ValueType::Logic, 1, false};
         auto bitOffset = number(0, 32, connection.range); stride = fullType.width;
         for (std::size_t i = 0; i < path.indices.size(); ++i) {
             stride /= fullType.shape[i]; const auto value = index(path.indices[i]);
-            enable = op(OperationKind::kAnd, bit, {enable, inBounds(value, fullType.shape[i], connection.range)}, connection.range);
+            if (!semantics_.staticIndex(path.indices[i]))
+                enable = op(OperationKind::kAnd, bit, {enable, inBounds(value, fullType.shape[i], connection.range)}, connection.range);
             auto term = adapt(value, offsetType, connection.range);
             if (stride != 1) {
                 auto productType = offsetType; productType.width = 64;
@@ -413,14 +619,14 @@ void Lowerer::connect(const Connection& connection) {
         const auto mask = constant(flatType, std::string(dataType.width, '1'), connection.range);
         payload = op(OperationKind::kShl, flatType, {payload, bitOffset}, connection.range);
         const auto shifted = op(OperationKind::kShl, flatType, {mask, bitOffset}, connection.range);
-        writeMask = view(shifted, fullType, connection.range);
+        if (trackMemoryMask) writeMask = view(shifted, fullType, connection.range);
         const auto clear = op(OperationKind::kNot, flatType, {shifted}, connection.range);
         const auto kept = op(OperationKind::kAnd, flatType, {view(current, flatType, connection.range), clear}, connection.range);
         data = view(op(OperationKind::kOr, flatType, {kept, payload}, connection.range), fullType, connection.range);
     }
-    driver.current = connection.guard == 1 && path.indices.empty() ? data :
-        op(OperationKind::kMux, fullType, {enable, data, current}, connection.range);
-    if (semantics_.memoryPorts.contains(path.name)) {
+    driver.current = staticWrite && (connection.guard == 1 || !path.indices.empty()) ? data :
+        op(OperationKind::kMux, fullType, {enable, data, view(current, fullType, connection.range)}, connection.range);
+    if (trackMemoryMask) {
         auto mask = driver.memoryMask ? driver.memoryMask : number(0, fullType.width, connection.range);
         mask = view(mask, fullType, connection.range);
         const auto merged = op(OperationKind::kOr, fullType, {mask, writeMask}, connection.range);
@@ -431,7 +637,11 @@ void Lowerer::drive(ValueId target, ValueId source, Range range, bool root) {
     if (!target) return;
     const auto operation = graph_.createOperation(OperationKind::kAssign);
     graph_.addOperand(operation, source); graph_.addResult(operation, target); graph_.setOpSrcLoc(operation, location(range));
-    if (root && !nodeKey_.empty()) node::write(graph_, operation, {{nodeKey_}, {{nodeKey_, 0}}, {nodeKey_}});
+    if (root && !nodeKey_.empty()) {
+        ensureNodeSchema();
+        graph_.reserveOpAttrCapacity(operation, 4);
+        node::writeSingleCanonicalReady(graph_, operation, nodeKey_, true);
+    }
 }
 
 bool Lowerer::memorySource(const LeafKey& key) const {
@@ -498,8 +708,8 @@ void Lowerer::memories() {
         std::map<std::string, ValueId> writeModes;
         if (!memory.standard) for (const auto& port : memory.ports) if (port.read && port.write) {
             auto mode = number(0, 1, port.range);
-            for (const auto& leaf : semantics_.leaves(memory.data)) {
-                const auto mask = drivers_.at({port.name, leaf.fields}).memoryMask;
+            for (const auto& leaf : semantics_.leavesCached(memory.data)) {
+                const auto mask = findDriver(port.name, leaf.fields).memoryMask;
                 if (mask) mode = op(OperationKind::kOr, bit, {mode, op(OperationKind::kReduceOr, bit, {mask}, port.range)}, port.range);
             }
             writeModes.emplace(port.name, mode);
@@ -510,7 +720,7 @@ void Lowerer::memories() {
             ValueId initiatingEnable;
             std::vector<std::pair<ValueId, ValueId>> pendingWrites;
         };
-        for (const auto& leaf : semantics_.leaves(memory.data)) {
+        for (const auto& leaf : semantics_.leavesCached(memory.data)) {
             const auto type = logical(leaf); if (!type.width) continue;
             auto storage = type; storage.shape.insert(storage.shape.begin(), memory.depth);
             auto storedLeaf = leaf; storedLeaf.shape.insert(storedLeaf.shape.begin(), memory.depth);
@@ -526,7 +736,7 @@ void Lowerer::memories() {
                 const auto field = [&](std::string_view member, bool data = false) -> Driver& {
                     std::vector<std::string> path{port.name, std::string(member)};
                     if (data) path.insert(path.end(), leaf.fields.begin(), leaf.fields.end());
-                    return drivers_.at({name, path});
+                    return findDriver(name, path);
                 };
                 Port lowered{&port};
                 if (memory.standard) {
@@ -563,8 +773,8 @@ void Lowerer::memories() {
                 } else {
                     lowered.address = index(*port.address); lowered.clock = clockSource(expression(*port.clock));
                     lowered.readEnable = guard(port.guard, port.range);
-                    auto& driver = drivers_.at({port.name, leaf.fields});
-                    lowered.writeData = driver.current ? driver.current : invalid(type, port.range);
+                    auto& driver = findDriver(port.name, leaf.fields);
+                    lowered.writeData = driver.current ? view(driver.current, type, port.range) : invalid(type, port.range);
                     lowered.writeMask = driver.memoryMask ? driver.memoryMask : view(number(0, type.width, port.range), type, port.range);
                     lowered.writeEnable = both(guard(port.guard, port.range), op(OperationKind::kReduceOr, bit, {lowered.writeMask}, port.range), port.range);
                     if (port.read && port.write) lowered.readEnable = both(lowered.readEnable, op(OperationKind::kNot, bit, {writeModes.at(port.name)}, port.range), port.range);
@@ -667,7 +877,7 @@ void Lowerer::memories() {
                 fields.insert(fields.end(), leaf.fields.begin(), leaf.fields.end());
                 // Write-only mports have no expression value. Their data is
                 // consumed directly from the ordered connection driver.
-                if (memory.standard || port.source->read) drive(drivers_.at({target, fields}).value, data, port.source->range);
+                if (memory.standard || port.source->read) drive(findDriver(target, fields).value, data, port.source->range);
             }
         }
     }
@@ -682,6 +892,7 @@ void Lowerer::effects() {
         if (statement.kind == StmtKind::Intrinsic) {
             const auto& call = semantics_.body.arena.expressions[operands[0]]; operands = call.operands;
             for (const auto& parameter : call.parameters) if (parameter.name == "format") text = decodeString(parameter.value);
+            for (std::size_t i = 3; i < operands.size(); ++i) arguments.push_back(expression(operands[i]));
         } else if (statement.kind != StmtKind::Stop) {
             const auto format = verification ? 3u : 2u;
             text = decodeString(semantics_.body.arena.expressions[operands[format]].literal);
@@ -745,6 +956,17 @@ void Lowerer::checkCycles() const {
             }
             const auto dependency = graph_.opOperands(definition)[frame.next++];
             if (colors[dependency] == 1) {
+                const auto begin = std::find_if(stack.begin(), stack.end(), [&](const auto& entry) { return entry.value == dependency; });
+                const bool arrayCycle = std::any_of(begin, stack.end(), [&](const auto& entry) {
+                    return !graph_.valueShape(entry.value).empty();
+                });
+                if (arrayCycle) {
+                    // Partial connects preserve arrays. A dependency on another
+                    // element can look cyclic at whole-value granularity. The
+                    // linked frontend must resolve it with range analysis.
+                    graph_.setMetadata("firrtl.pendingCombLoopCheck", true);
+                    continue;
+                }
                 const auto loc = graph_.valueSrcLoc(dependency);
                 Range range;
                 if (loc) {
@@ -766,8 +988,8 @@ void Lowerer::instances() {
         graph_.setOpSrcLoc(operation, location(instance.range));
         std::vector<std::string> inputs, outputs;
         const auto& declaration = semantics_.declarations.at(instance.name);
-        for (const auto& leaf : semantics_.leaves(declaration.type, declaration.flow)) {
-            const auto& driver = drivers_.at({instance.name, leaf.fields});
+        for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
+            const auto& driver = findDriver(instance.name, leaf.fields);
             if (!driver.value) continue;
             std::string port = leaf.fields.front();
             for (std::size_t i = 1; i < leaf.fields.size(); ++i) port += "__DOT__" + leaf.fields[i];
@@ -792,7 +1014,7 @@ ModuleSignature Lowerer::run() {
     std::set<std::string> names; std::vector<std::string> elided;
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declarations.at(name);
-        for (const auto& leaf : semantics_.leaves(declaration.type, declaration.flow)) {
+        for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
             auto symbol = name; for (const auto& field : leaf.fields) symbol += "__DOT__" + field;
             if (!names.insert(symbol).second) throw Error(declaration.range, "flattened FIRRTL name collision '" + symbol + "'");
             const auto type = logical(leaf); ValueId value;
@@ -820,6 +1042,7 @@ ModuleSignature Lowerer::run() {
                 port.fieldPath.insert(port.fieldPath.end(), leaf.fields.begin(), leaf.fields.end());
                 port.direction = leaf.flow == 1 ? LeafDirection::Input : LeafDirection::Output;
                 port.elementWidth = static_cast<int32_t>(semantics_.width(leaf.type)); port.shape = leaf.shape;
+                port.shapeFieldDepths = leaf.shapeFieldDepths;
                 port.isSigned = type.isSigned; port.isConst = leaf.type->constant; port.requiresTypeResolution = !type.width;
                 const auto kind = semantics_.resolvedKind(leaf.type);
                 port.sourceType = kind == TypeKind::SInt ? "SInt" : kind == TypeKind::Clock ? "Clock" : kind == TypeKind::AsyncReset ? "AsyncReset" : "UInt";
@@ -835,8 +1058,8 @@ ModuleSignature Lowerer::run() {
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declarations.at(name);
         if (!declaration.definition) continue;
-        for (const auto& leaf : semantics_.leaves(declaration.type)) {
-            const auto value = drivers_.at({name, leaf.fields}).value;
+        for (const auto& leaf : semantics_.leavesCached(declaration.type)) {
+            const auto value = findDriver(name, leaf.fields).value;
             if (!value) continue;
             if (options_.nodeAnnotations) nodeKey_ = node::key({std::string(semantics_.source.unit()), std::string(semantics_.source.circuit()), std::string(module.name), {}, name, leaf.fields});
             drive(value, expression(*declaration.definition, leaf.fields), declaration.range, true);
@@ -850,8 +1073,8 @@ ModuleSignature Lowerer::run() {
     for (const auto& name : semantics_.declarationOrder) {
         const auto& declaration = semantics_.declarations.at(name);
         if (!declaration.state || !declaration.state->reset) continue;
-        for (const auto& leaf : semantics_.leaves(declaration.type)) {
-            const auto& driver = drivers_.at({name, leaf.fields});
+        for (const auto& leaf : semantics_.leavesCached(declaration.type)) {
+            const auto& driver = findDriver(name, leaf.fields);
             if (!driver.value) continue;
             const auto data = adapt(expression(*declaration.state->initial, leaf.fields), logical(leaf), declaration.range);
             stateWrite(driver, *declaration.state, expression(*declaration.state->reset), {}, data, declaration.range);

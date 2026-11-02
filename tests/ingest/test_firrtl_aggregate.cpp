@@ -1,4 +1,6 @@
 #include "firrtl_test_fixture.hpp"
+#include "transform/const_fold.hpp"
+#include "slang/numeric/SVInt.h"
 
 namespace {
 using namespace firrtl_test;
@@ -6,7 +8,69 @@ void shape(const grh::Graph& graph, std::string_view name, int width, std::vecto
     const auto value = graph.findValue(name); require(bool(value), "missing flattened leaf: "+std::string(name));
     require(graph.valueWidth(value)==width && std::vector<int64_t>(graph.valueShape(value).begin(),graph.valueShape(value).end())==expected, "wrong aggregate geometry: "+std::string(name));
 }
+void rectangularMixedIndexBounds() {
+    // FIRRTL's final suffix is the outer dimension: this is two rows of three.
+    const std::string body = R"FIR(    input a : UInt<4>[3][2]
+    input i : UInt<2>
+    input data : UInt<4>
+    output rowOut : UInt<4>[3]
+    output selectedOut : UInt<4>
+    output typedOut : UInt<4>
+    output missingOut : UInt<4>
+    output matrixOut : UInt<4>[3][2]
+    output noOpOut : UInt<4>[3][2]
+    node row = a[i]
+    node selected = a[i][2]
+    node typed = a[i][UInt<2>(2)]
+    node missing = a[i][UInt<2>(3)]
+    wire w : UInt<4>[3][2]
+    connect w, a
+    connect w[i][UInt<2>(2)], data
+    connect w[i][UInt<2>(3)], UInt<4>(15)
+    wire noOp : UInt<4>[3][2]
+    connect noOp, a
+    connect noOp[i][UInt<2>(3)], UInt<4>(15)
+    connect rowOut, row
+    connect selectedOut, selected
+    connect typedOut, typed
+    connect missingOut, missing
+    connect matrixOut, w
+    connect noOpOut, noOp
+)FIR";
+    for (const auto policy : {ingest::FirrtlInvalidPolicy::Unknown, ingest::FirrtlInvalidPolicy::Zero}) {
+        auto result = text("rectangular-mixed-index-bounds", body, policy);
+        require(result.success(), diagnostics(result));
+        run(*result.design, std::make_unique<tx::GrhVerifyPass>());
+        auto restored = roundTrip(*result.design);
+        for (const auto* candidate : {result.design->findGraph("top"), restored.findGraph("top")}) {
+            shape(*candidate, "a", 24, {2, 3});
+            shape(*candidate, "row", 12, {3}); shape(*candidate, "rowOut", 12, {3});
+            shape(*candidate, "selected", 4, {}); shape(*candidate, "typed", 4, {});
+            shape(*candidate, "missing", 4, {});
+            shape(*candidate, "matrixOut", 24, {2, 3}); shape(*candidate, "noOpOut", 24, {2, 3});
+            Oracle oracle(*candidate);
+            for (const uint64_t value : {UINT64_C(0x654321), UINT64_C(0xabcdef)})
+                for (unsigned i = 0; i < 4; ++i) for (unsigned data : {0u, 9u, 15u}) {
+                    const std::map<std::string, uint64_t> inputs{{"a", value}, {"i", i}, {"data", data}};
+                    const auto offset = 12*i + 8;
+                    const auto expectedSelected = i < 2 ? (value >> offset) & 15 : 0;
+                    const auto expectedMatrix = i < 2 ?
+                        (value & ~(UINT64_C(15) << offset)) | (uint64_t(data) << offset) : value;
+                    require(oracle.output("rowOut", inputs) == (i < 2 ? (value >> (12*i)) & 4095 : 0),
+                        "dynamic first index changed the rectangular suffix shape or row stride");
+                    require(oracle.output("selectedOut", inputs) == expectedSelected &&
+                        oracle.output("typedOut", inputs) == expectedSelected &&
+                        oracle.output("missingOut", inputs) == 0,
+                        "static second index used the wrong extent or changed invalid read behavior");
+                    require(oracle.output("matrixOut", inputs) == expectedMatrix &&
+                        oracle.output("noOpOut", inputs) == value,
+                        "UInt second-index out-of-bounds write changed a rectangular array");
+                }
+        }
+    }
+}
 void geometry() {
+    rectangularMixedIndexBounds();
     auto source = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR)/"comb/aggregate.fir");
     auto& graph = *source.findGraph("top");
     shape(graph,"packet__DOT__valid",2,{2}); shape(graph,"packet__DOT__data",16,{2,2});
@@ -112,6 +176,62 @@ void accessSize() {
         previous=graph.operations().size(); run(*result.design,std::make_unique<tx::GrhVerifyPass>());
     }
 }
+void constantIndexBounds() {
+    const std::string body = R"FIR(    input a : UInt<4>[2][2]
+    input i : UInt<2>
+    input data : UInt<4>
+    output exactOut : UInt<4>
+    output rowOut : UInt<4>[2]
+    output selectedOut : UInt<4>
+    output missingOut : UInt<4>
+    output matrixOut : UInt<4>[2][2]
+    node exact = a[1][0]
+    node row = a[1]
+    node selected = a[UInt<2>(1)][i]
+    node missing = a[UInt<2>(2)][i]
+    wire w : UInt<4>[2][2]
+    connect w, a
+    connect w[UInt<2>(2)][i], UInt<4>(15)
+    connect w[UInt<2>(1)][i], data
+    connect exactOut, exact
+    connect rowOut, row
+    connect selectedOut, selected
+    connect missingOut, missing
+    connect matrixOut, w
+)FIR";
+    for (const auto policy : {ingest::FirrtlInvalidPolicy::Unknown, ingest::FirrtlInvalidPolicy::Zero}) {
+        auto result = text("constant-index-bounds", body, policy);
+        require(result.success(), diagnostics(result));
+        auto& graph = *result.design->findGraph("top");
+        require(count(graph, OperationKind::kLt) == 2, "constant indices created runtime bounds checks");
+        const auto missingRoot = graph.valueDef(graph.findValue("missing"));
+        const auto missingValue = graph.opOperands(missingRoot)[0];
+        require(graph.opKind(graph.valueDef(missingValue)) == OperationKind::kConstant &&
+            std::get<std::string>(*graph.getOperation(graph.valueDef(missingValue)).attr("constValue")) ==
+                (policy == ingest::FirrtlInvalidPolicy::Unknown ? "4'bx" : "4'b0"),
+            "constant out-of-bounds read did not use the selected invalid policy");
+        run(*result.design, std::make_unique<tx::GrhVerifyPass>()); node::requireValid(graph);
+        auto restored = roundTrip(*result.design);
+        for (const auto* candidate : {&graph, restored.findGraph("top")}) {
+            Oracle oracle(*candidate);
+            for (unsigned value : {0x1234u, 0xabcdu}) for (unsigned i = 0; i < 4; ++i) {
+                const auto outputs = std::map<std::string, uint64_t>{{"a", value}, {"i", i}, {"data", 9}};
+                const auto expected = i < 2 ? (value & ~(15u << (8 + 4*i))) | (9u << (8 + 4*i)) : value;
+                require(oracle.output("exactOut", outputs) == ((value >> 8) & 15) &&
+                    oracle.output("rowOut", outputs) == (value >> 8) &&
+                    oracle.output("selectedOut", outputs) == (i < 2 ? (value >> (8 + 4*i)) & 15 : 0) &&
+                    oracle.output("missingOut", outputs) == 0 && oracle.output("matrixOut", outputs) == expected,
+                    "constant/mixed indices changed partial shape, invalid reads or no-op writes");
+            }
+        }
+    }
+    auto assignment = text("unmasked-wire", "    input a : UInt<4>\n    output y : UInt<4>\n    connect y, a\n");
+    require(assignment.success(), diagnostics(assignment));
+    const auto& graph = *assignment.design->findGraph("top");
+    for (const auto op : graph.operations()) if (graph.opKind(op) == OperationKind::kConstant)
+        require(std::get<std::string>(*graph.getOperation(op).attr("constValue")) != "4'b1111",
+            "ordinary wire assignment created an unused memory write mask");
+}
 void inferredAlias() {
     const auto path=artifact("firrtl-fixtures")/"inferred-alias.fir";
     std::ofstream(path)<<R"FIR(FIRRTL version 6.0.0
@@ -131,8 +251,116 @@ circuit top :
     require(result.modules[0].ports[2].elementWidth==7 && !result.modules[0].ports[2].requiresTypeResolution,"inferred array signature used total width as element width");
     Oracle oracle(graph); require(oracle.output("y",{{"a",7},{"b",79}})==((79<<7)|7),"alias/vector element widths were not shared and inferred");
 }
+void elementDependencies() {
+    auto result = text("array-element-dependencies", R"FIR(    input a : UInt<4>
+    input b : UInt<4>
+    output y : UInt<1>[2][2]
+    wire matrix : UInt<1>[2][2]
+    connect matrix[0][0], UInt<1>(0)
+    connect matrix[0][1], lt(a,b)
+    connect matrix[1][0], not(matrix[0][1])
+    connect matrix[1][1], UInt<1>(0)
+    connect y, matrix
+)FIR");
+    require(result.success(), diagnostics(result));
+    auto restored = roundTrip(*result.design);
+    const auto& graph = *restored.findGraph("top");
+    shape(graph, "y", 4, {2, 2});
+    require(!graph.metadata("firrtl.pendingCombLoopCheck"), "range cycle check was deferred past publication");
+    Oracle oracle(graph);
+    for (unsigned a = 0; a < 16; ++a) for (unsigned b = 0; b < 16; ++b)
+        require(oracle.output("y", {{"a", a}, {"b", b}}) == (a < b ? 2 : 4),
+            "acyclic element dependencies changed while preserving arrays");
+    valid(restored);
+    auto cycle = text("real-array-cycle", R"FIR(    output y : UInt<1>[2]
+    connect y[0], not(y[1])
+    connect y[1], not(y[0])
+)FIR");
+    require(!cycle.success() && !cycle.design && diagnostics(cycle).find("combinational cycle") != std::string::npos,
+        "range analysis accepted a real array element cycle");
+}
+void conditionalElementDependencies() {
+    auto result = text("conditional-array-element-dependencies", R"FIR(    input initial : UInt<1>[24]
+    input outer : UInt<1>
+    input a : UInt<1>
+    input b : UInt<1>
+    input c : UInt<1>
+    output y : UInt<1>[24]
+    wire flags : UInt<1>[24]
+    connect flags, initial
+    when outer :
+      connect flags[13], a
+      connect flags[21], b
+      connect flags[5], c
+      node selected = or(or(flags[13],flags[21]),flags[5])
+      when selected : connect flags[4], UInt<1>(0)
+    else :
+      connect flags[13], UInt<1>(0)
+      connect flags[21], UInt<1>(0)
+      connect flags[4], UInt<1>(0)
+      connect flags[5], UInt<1>(0)
+      connect flags[19], a
+    connect flags[3], b
+    connect y, flags
+)FIR");
+    require(result.success(), diagnostics(result));
+    auto restored = roundTrip(*result.design);
+    const auto check = [&](const grh::Design& design) {
+        const auto& graph = *design.findGraph("top");
+        shape(graph, "y", 24, {24});
+        Oracle oracle(graph);
+        for (unsigned initial : {0u, 0xffffffu, 0xa5c39fu, 0x1b72e4u})
+            for (unsigned bits = 0; bits < 16; ++bits) {
+                const unsigned outer = bits & 1, a = (bits >> 1) & 1;
+                const unsigned b = (bits >> 2) & 1, c = (bits >> 3) & 1;
+                unsigned expected = initial;
+                const auto set = [&](unsigned index, unsigned value) {
+                    expected = (expected & ~(1u << index)) | (value << index);
+                };
+                if (outer) {
+                    set(13, a); set(21, b); set(5, c);
+                    if (a || b || c) set(4, 0);
+                } else {
+                    set(13, 0); set(21, 0); set(4, 0); set(5, 0); set(19, a);
+                }
+                set(3, b);
+                require(oracle.output("y", {{"initial", initial}, {"outer", outer}, {"a", a}, {"b", b}, {"c", c}}) == expected,
+                    "conditional partial connect introduced dependencies on untouched array elements");
+            }
+    };
+    check(*result.design); check(restored);
+    run(restored, std::make_unique<tx::SimplifyPass>()); valid(restored); check(restored);
+    for (unsigned high : {5u, 10u}) {
+        auto unknown = text("unknown-conditional-element", std::string(R"FIR(    output y : UInt<4>[2]
+    wire condition : UInt<1>
+    invalidate condition
+    connect y[0], UInt<4>(5)
+    connect y[1], UInt<4>()FIR") + std::to_string(high) + R"FIR()
+    when condition : connect y[1], UInt<4>(5)
+)FIR", ingest::FirrtlInvalidPolicy::Unknown);
+        require(unknown.success(), diagnostics(unknown));
+        tx::ConstantFoldOptions options;
+        options.xFold = tx::ConstantFoldOptions::XFoldMode::Propagate;
+        run(*unknown.design, std::make_unique<tx::ConstantFoldPass>(options));
+        const auto& graph = *unknown.design->findGraph("top");
+        const auto output = graph.outputPortValue("y");
+        const auto operation = graph.valueDef(output);
+        require(graph.opKind(operation) == OperationKind::kConstant, "four-state conditional fixture did not fold");
+        const auto merged = slang::SVInt::fromString(std::get<std::string>(*graph.getOperation(operation).attr("constValue")));
+        require(merged.slice(3, 0).as<uint64_t>() == 5 &&
+            (high == 5 ? merged.as<uint64_t>() == 0x55 : merged.slice(7, 4).hasUnknown()),
+            "unknown partial-write guard changed untouched bits or lost the written slice's merge");
+    }
+    auto cycle = text("real-conditional-array-cycle", R"FIR(    output y : UInt<1>[2]
+    connect y[0], UInt<1>(1)
+    connect y[1], UInt<1>(0)
+    when y[0] : connect y[0], UInt<1>(0)
+)FIR");
+    require(!cycle.success() && !cycle.design && diagnostics(cycle).find("combinational cycle") != std::string::npos,
+        "conditional partial connect hid a real dependency on its own destination");
+}
 }
 int main() {
-    try { geometry(); flowsAndCoverage(); accessSize(); inferredAlias(); return 0; }
+    try { geometry(); flowsAndCoverage(); accessSize(); constantIndexBounds(); inferredAlias(); elementDependencies(); conditionalElementDependencies(); return 0; }
     catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

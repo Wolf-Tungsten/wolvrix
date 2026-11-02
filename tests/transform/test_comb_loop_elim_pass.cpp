@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "transform/comb_loop_elim.hpp"
 #include "core/transform.hpp"
+#include "transform/hier_flatten.hpp"
 #include "transform/verify.hpp"
 
 #include <iostream>
@@ -1467,10 +1468,101 @@ namespace
         return 0;
     }
 
+    int test_instance_boundary(bool crossModuleLoop)
+    {
+        using namespace wolvrix::lib::grh;
+        Design design;
+        auto &child = design.createGraph("child");
+        const auto enq = makeValue(child, "enq", 1);
+        const auto ready = makeValue(child, "ready", 1);
+        const auto echo = makeValue(child, "echo", 1);
+        child.bindInputPort("enq", enq);
+        child.bindOutputPort("ready", ready);
+        child.bindOutputPort("echo", echo);
+        const auto readySource = crossModuleLoop ? enq : makeConst(child, "one", 1, "1'b1");
+        makeUnaryOp(child, OperationKind::kAssign, readySource, ready, "drive_ready");
+        makeUnaryOp(child, OperationKind::kAssign, enq, echo, "drive_echo");
+
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto feedback = makeValue(top, "feedback", 1);
+        const auto observed = makeValue(top, "observed", 1);
+        top.bindOutputPort("ready", feedback);
+        top.bindOutputPort("echo", observed);
+        const auto instance = top.createOperation(OperationKind::kInstance, top.internSymbol("child_op"));
+        top.addOperand(instance, feedback);
+        top.addResult(instance, feedback);
+        top.addResult(instance, observed);
+        top.setAttr(instance, "moduleName", std::string("child"));
+        top.setAttr(instance, "instanceName", std::string("u_child"));
+        top.setAttr(instance, "inputPortName", std::vector<std::string>{"enq"});
+        top.setAttr(instance, "outputPortName", std::vector<std::string>{"ready", "echo"});
+
+        CombLoopElimOptions options;
+        options.failOnTrueLoop = true;
+        PassManager conservative;
+        conservative.addPass(std::make_unique<CombLoopElimPass>(options));
+        PassDiagnostics conservativeDiags;
+        if (conservative.run(design, conservativeDiags).success)
+        {
+            return fail("Default loop analysis silently ignored instance dependencies");
+        }
+
+        options.treatInstancesAsBoundary = true;
+        PassManager local;
+        local.addPass(std::make_unique<CombLoopElimPass>(options));
+        local.addPass(std::make_unique<GrhVerifyPass>());
+        PassDiagnostics localDiags;
+        if (!local.run(design, localDiags).success || localDiags.hasError())
+        {
+            for (const auto &message : localDiags.messages()) std::cerr << message.message << '\n';
+            return fail("Module-local analysis traversed an instance boundary");
+        }
+
+        options.treatInstancesAsBoundary = false;
+        PassManager flattened;
+        flattened.addPass(std::make_unique<HierFlattenPass>());
+        flattened.addPass(std::make_unique<CombLoopElimPass>(options));
+        PassDiagnostics flatDiags;
+        const bool success = flattened.run(design, flatDiags).success;
+        if (success == crossModuleLoop)
+        {
+            return fail("Flattened loop analysis did not distinguish true feedback from an independent ready output");
+        }
+        if (!crossModuleLoop)
+        {
+            return verifyLoopFreeAndLegal(design, "instance-ready");
+        }
+        return 0;
+    }
+
+    int test_instance_boundary_keeps_local_loop()
+    {
+        using namespace wolvrix::lib::grh;
+        Design design;
+        auto &graph = design.createGraph("local_loop");
+        const auto value = makeValue(graph, "value", 1);
+        makeUnaryOp(graph, OperationKind::kNot, value, value, "invert");
+        CombLoopElimOptions options;
+        options.failOnTrueLoop = true;
+        options.treatInstancesAsBoundary = true;
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>(options));
+        PassDiagnostics diags;
+        if (manager.run(design, diags).success)
+        {
+            return fail("Instance boundary mode ignored a module-local true loop");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
 {
+    if (int rc = test_instance_boundary(false); rc != 0) return rc;
+    if (int rc = test_instance_boundary(true); rc != 0) return rc;
+    if (int rc = test_instance_boundary_keeps_local_loop(); rc != 0) return rc;
     if (int rc = test_false_loop_fixed(true); rc != 0) return rc;
     if (int rc = test_false_loop_fixed(); rc != 0)
     {

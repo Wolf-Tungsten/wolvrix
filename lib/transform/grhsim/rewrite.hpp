@@ -178,13 +178,16 @@ struct Scope {
     std::unordered_set<uint32_t> anchors;
     const std::unordered_set<uint32_t>* sharedAnchors = nullptr;
     std::optional<std::span<const OperationId>> members;
+    const bool verifiedUnpartitioned;
     std::unordered_set<OperationId, OperationIdHash> erased;
 
     Scope(Graph& graph, const Owner& partition, std::optional<std::span<const OperationId>> members = std::nullopt,
-          const std::unordered_set<uint32_t>* sharedAnchors = nullptr, const Owner* sharedPartition = nullptr)
+          const std::unordered_set<uint32_t>* sharedAnchors = nullptr, const Owner* sharedPartition = nullptr,
+          bool verifiedUnpartitioned = false)
         : graph(graph), ownedPartition(sharedPartition ? Owner{} : partition),
           partition(sharedPartition ? *sharedPartition : ownedPartition),
-          sharedAnchors(sharedAnchors), members(members) {
+          sharedAnchors(sharedAnchors), members(members),
+          verifiedUnpartitioned(verifiedUnpartitioned && this->partition.empty()) {
         if (!sharedAnchors) {
             for (const auto symbol : graph.declaredSymbols()) anchors.insert(symbol.value);
             for (const auto& group : graph.generateGroups())
@@ -204,6 +207,12 @@ struct Scope {
     }
     bool contains(OperationId op) const {
         if (!op || erased.contains(op)) return false;
+        if (verifiedUnpartitioned) {
+            // Full verification proved that converted operations have no
+            // owner. Keep the original ID and erased-operation checks.
+            (void)graph.opKind(op);
+            return true;
+        }
         for (const auto& entry : graph.opAttrs(op)) if (entry.key == kPartition) {
             if (const auto* path = std::get_if<Owner>(&entry.value)) return *path == partition;
             throw std::invalid_argument("Wrong attribute type: " + std::string(kPartition));
@@ -245,7 +254,9 @@ struct Scope {
         }
         return true;
     }
-    bool dce() {
+    bool dce(ingest::node::DeadRootBatch* sharedDeadRoots = nullptr) {
+        ingest::node::DeadRootBatch localDeadRoots(graph);
+        auto& deadRoots = sharedDeadRoots ? *sharedDeadRoots : localDeadRoots;
         bool changed = false;
         auto queue = operations();
         while (!queue.empty()) {
@@ -259,13 +270,14 @@ struct Scope {
             })) continue;
             const std::vector<ValueId> results(outputs.begin(), outputs.end());
             const std::vector<ValueId> args(graph.opOperands(op).begin(), graph.opOperands(op).end());
-            ingest::node::recordDead(graph, op);
+            deadRoots.record(op);
             if (!graph.eraseOp(op)) continue;
             erased.insert(op);
             for (const auto value : results) graph.eraseValue(value);
             for (const auto arg : args) if (const auto producer = graph.valueDef(arg)) queue.push_back(producer);
             changed = true;
         }
+        if (!sharedDeadRoots) deadRoots.flush();
         return changed;
     }
 };

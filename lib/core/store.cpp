@@ -2,6 +2,7 @@
 #include "core/op_descriptor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
@@ -118,14 +120,98 @@ namespace wolvrix::lib::store
 
         constexpr int kIndentSize = 2;
 
-        void appendDouble(std::string &out, double value)
+        // The same writer targets an owned string or a bounded file buffer.
+        // No graph-sized JSON string is needed for PrettyCompact file output.
+        class JsonOutput
+        {
+        public:
+            explicit JsonOutput(std::string &text) : text_(&text) {}
+            explicit JsonOutput(std::ostream &stream) : stream_(&stream) {}
+
+            void append(std::string_view text)
+            {
+                if (text_)
+                {
+                    text_->append(text);
+                }
+                else
+                {
+                    auto remaining = text;
+                    while (!remaining.empty())
+                    {
+                        if (used_ == buffer_.size()) drain();
+                        const std::size_t count = std::min(remaining.size(), buffer_.size() - used_);
+                        std::copy_n(remaining.data(), count, buffer_.data() + used_);
+                        used_ += count;
+                        remaining.remove_prefix(count);
+                    }
+                }
+                bytes_ += text.size();
+            }
+
+            void append(std::size_t count, char value)
+            {
+                bytes_ += count;
+                if (text_)
+                {
+                    text_->append(count, value);
+                    return;
+                }
+                while (count != 0)
+                {
+                    if (used_ == buffer_.size()) drain();
+                    const std::size_t part = std::min(count, buffer_.size() - used_);
+                    std::fill_n(buffer_.data() + used_, part, value);
+                    used_ += part;
+                    count -= part;
+                }
+            }
+
+            void push_back(char value)
+            {
+                if (text_)
+                {
+                    text_->push_back(value);
+                }
+                else
+                {
+                    if (used_ == buffer_.size()) drain();
+                    buffer_[used_++] = value;
+                }
+                ++bytes_;
+            }
+
+            void finish()
+            {
+                if (stream_) drain();
+            }
+
+            std::size_t size() const { return bytes_; }
+
+        private:
+            void drain()
+            {
+                if (used_ == 0) return;
+                stream_->write(buffer_.data(), static_cast<std::streamsize>(used_));
+                if (!*stream_) throw std::runtime_error("Failed to write JSON output");
+                used_ = 0;
+            }
+
+            std::string *text_ = nullptr;
+            std::ostream *stream_ = nullptr;
+            std::array<char, 64 * 1024> buffer_;
+            std::size_t used_ = 0;
+            std::size_t bytes_ = 0;
+        };
+
+        void appendDouble(JsonOutput &out, double value)
         {
             std::ostringstream oss;
             oss << value;
             out.append(oss.str());
         }
 
-        void appendQuotedString(std::string &out, std::string_view text)
+        void appendQuotedString(JsonOutput &out, std::string_view text)
         {
             out.push_back('"');
             for (char c : text)
@@ -389,7 +475,7 @@ namespace wolvrix::lib::store
             }
         }
 
-        void appendNewlineAndIndent(std::string &out, int indent)
+        void appendNewlineAndIndent(JsonOutput &out, int indent)
         {
             out.push_back('\n');
             out.append(static_cast<std::size_t>(indent * kIndentSize), ' ');
@@ -744,7 +830,7 @@ namespace wolvrix::lib::store
         }
 
         template <typename Writer>
-        void writeInlineObject(std::string &out, JsonPrintMode mode, Writer &&writer)
+        void writeInlineObject(JsonOutput &out, JsonPrintMode mode, Writer &&writer)
         {
             out.push_back('{');
             bool first = true;
@@ -763,7 +849,7 @@ namespace wolvrix::lib::store
             out.push_back('}');
         }
 
-        void writeDebugInline(std::string &out, JsonPrintMode mode,
+        void writeDebugInline(JsonOutput &out, JsonPrintMode mode,
                               const std::optional<wolvrix::lib::grh::SrcLoc> &debugInfo)
         {
             writeInlineObject(out, mode, [&](auto &&prop)
@@ -935,7 +1021,7 @@ namespace wolvrix::lib::store
             }
         }
 
-        void writeUsersInline(std::string &out, const wolvrix::lib::grh::Graph &graph, std::span<const wolvrix::lib::grh::ValueUser> users, JsonPrintMode mode)
+        void writeUsersInline(JsonOutput &out, const wolvrix::lib::grh::Graph &graph, std::span<const wolvrix::lib::grh::ValueUser> users, JsonPrintMode mode)
         {
             std::vector<wolvrix::lib::grh::ValueUser> ordered(users.begin(), users.end());
             std::sort(ordered.begin(), ordered.end(), [&](const auto &a, const auto &b) {
@@ -970,13 +1056,25 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void writeAttrsInline(std::string &out, std::span<const wolvrix::lib::grh::AttrKV> attrs, JsonPrintMode mode)
+        const wolvrix::lib::grh::AttrKV &attributeRef(const wolvrix::lib::grh::AttrKV &attr)
+        {
+            return attr;
+        }
+
+        const wolvrix::lib::grh::AttrKV &attributeRef(const wolvrix::lib::grh::AttrKV *attr)
+        {
+            return *attr;
+        }
+
+        template <typename Range>
+        void writeAttrsInline(JsonOutput &out, const Range &attrs, JsonPrintMode mode)
         {
             out.push_back('{');
             bool firstAttr = true;
             const char *comma = commaToken(mode);
-            for (const auto &attr : attrs)
+            for (const auto &entry : attrs)
             {
+                const auto &attr = attributeRef(entry);
                 if (!firstAttr)
                 {
                     out.append(comma);
@@ -1102,7 +1200,7 @@ namespace wolvrix::lib::store
             out.push_back('}');
         }
 
-        void writeValueInline(std::string &out, const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::ValueId value, JsonPrintMode mode)
+        void writeValueInline(JsonOutput &out, const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::ValueId value, JsonPrintMode mode)
         {
             writeInlineObject(out, mode, [&](auto &&prop)
                               {
@@ -1156,7 +1254,7 @@ namespace wolvrix::lib::store
                               });
         }
 
-        void writePortInline(std::string &out, std::string_view name, std::string_view valueSymbol, JsonPrintMode mode)
+        void writePortInline(JsonOutput &out, std::string_view name, std::string_view valueSymbol, JsonPrintMode mode)
         {
             writeInlineObject(out, mode, [&](auto &&prop)
                               {
@@ -1171,7 +1269,7 @@ namespace wolvrix::lib::store
                               });
         }
 
-        void writeOperationInline(std::string &out, const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::OperationId op, JsonPrintMode mode)
+        void writeOperationInline(JsonOutput &out, const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::OperationId op, JsonPrintMode mode)
         {
             writeInlineObject(out, mode, [&](auto &&prop)
                               {
@@ -1225,7 +1323,7 @@ namespace wolvrix::lib::store
         }
 
         template <typename Range, typename Fn>
-        void writeInlineArray(std::string &out, JsonPrintMode mode, int elementIndent, const Range &range, Fn &&writeElement)
+        void writeInlineArray(JsonOutput &out, JsonPrintMode mode, int elementIndent, const Range &range, Fn &&writeElement)
         {
             (void)mode;
             out.push_back('[');
@@ -1247,7 +1345,7 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void writePortsPrettyCompact(std::string &out,
+        void writePortsPrettyCompact(JsonOutput &out,
                                      const wolvrix::lib::grh::Graph &graph,
                                      std::span<const wolvrix::lib::grh::Port> ports,
                                      JsonPrintMode mode,
@@ -1276,7 +1374,7 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void writeInoutPortsPrettyCompact(std::string &out,
+        void writeInoutPortsPrettyCompact(JsonOutput &out,
                                           const wolvrix::lib::grh::Graph &graph,
                                           std::span<const wolvrix::lib::grh::InoutPort> ports,
                                           JsonPrintMode mode,
@@ -1318,7 +1416,7 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void writeGenerateGroupsInline(std::string &out,
+        void writeGenerateGroupsInline(JsonOutput &out,
                                        const wolvrix::lib::grh::Graph &graph,
                                        int indent)
         {
@@ -1371,7 +1469,7 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void writeGraphPrettyCompact(std::string &out,
+        void writeGraphPrettyCompact(JsonOutput &out,
                                      const wolvrix::lib::grh::Graph &graph,
                                      int baseIndent,
                                      GraphWriteStats *stats,
@@ -1417,8 +1515,10 @@ namespace wolvrix::lib::store
             appendNewlineAndIndent(out, indent);
             appendQuotedString(out, "metadata");
             out.append(": ");
-            std::vector<wolvrix::lib::grh::AttrKV> metadata(graph.metadata().begin(), graph.metadata().end());
-            std::sort(metadata.begin(), metadata.end(), [](const auto &a, const auto &b) { return a.key < b.key; });
+            std::vector<const wolvrix::lib::grh::AttrKV *> metadata;
+            metadata.reserve(graph.metadata().size());
+            for (const auto &attr : graph.metadata()) metadata.push_back(&attr);
+            std::sort(metadata.begin(), metadata.end(), [](const auto *a, const auto *b) { return a->key < b->key; });
             writeAttrsInline(out, metadata, JsonPrintMode::PrettyCompact);
             out.push_back(',');
 
@@ -1601,7 +1701,7 @@ namespace wolvrix::lib::store
             return names[index - 1];
         }
 
-        void writeUsersInlineIr(std::string &out,
+        void writeUsersInlineIr(JsonOutput &out,
                                 std::span<const wolvrix::lib::grh::ValueUser> users,
                                 const std::vector<std::string> &opNames,
                                 JsonPrintMode mode)
@@ -1628,7 +1728,7 @@ namespace wolvrix::lib::store
             out.push_back(']');
         }
 
-        void writeAttrsInlineIr(std::string &out,
+        void writeAttrsInlineIr(JsonOutput &out,
                                 std::span<const wolvrix::lib::grh::AttrKV> attrs,
                                 JsonPrintMode mode)
         {
@@ -1762,9 +1862,8 @@ namespace wolvrix::lib::store
             out.push_back('}');
         }
 
-        std::string serializePrettyCompact(const wolvrix::lib::grh::Design &design, std::span<const wolvrix::lib::grh::Graph *const> topGraphs)
+        void serializePrettyCompact(JsonOutput &out, const wolvrix::lib::grh::Design &design, std::span<const wolvrix::lib::grh::Graph *const> topGraphs)
         {
-            std::string out;
             int indent = 0;
 
             out.push_back('{');
@@ -1902,7 +2001,6 @@ namespace wolvrix::lib::store
 
             appendNewlineAndIndent(out, indent - 1);
             out.push_back('}');
-            return out;
         }
 
         std::string serializeDesignJson(const wolvrix::lib::grh::Design &design,
@@ -1917,7 +2015,12 @@ namespace wolvrix::lib::store
                 return serializeWithJsonWriter(design, topGraphs, /* pretty */ true);
             case JsonPrintMode::PrettyCompact:
             default:
-                return serializePrettyCompact(design, topGraphs);
+            {
+                std::string text;
+                JsonOutput out(text);
+                serializePrettyCompact(out, design, topGraphs);
+                return text;
+            }
             }
         }
     } // namespace
@@ -2079,32 +2182,11 @@ namespace wolvrix::lib::store
     {
         StoreResult result;
 
-        std::string jsonText;
         const bool timingEnabled = jsonTimingEnabled();
         TimingClock::time_point totalStart;
-        TimingClock::time_point serializeStart;
         if (timingEnabled)
         {
             totalStart = TimingClock::now();
-            serializeStart = totalStart;
-        }
-        try
-        {
-            jsonText = serializeDesignJson(design, topGraphs, options.jsonMode);
-        }
-        catch (const std::exception &ex)
-        {
-            reportError("Failed to serialize design to JSON: " + std::string(ex.what()));
-            result.success = false;
-            return result;
-        }
-        if (timingEnabled)
-        {
-            const auto serializeEnd = TimingClock::now();
-            std::ostringstream details;
-            details << "bytes=" << jsonText.size()
-                    << " mode=" << jsonModeName(options.jsonMode);
-            logJsonTiming("store_json.serialize", toMillis(serializeEnd - serializeStart), details.str());
         }
 
         const std::string filename = options.outputFilename.value_or(std::string("grh.json"));
@@ -2121,14 +2203,54 @@ namespace wolvrix::lib::store
         {
             writeStart = TimingClock::now();
         }
-        *stream << jsonText;
+        std::size_t bytes = 0;
+        const bool streaming = options.jsonMode == JsonPrintMode::PrettyCompact;
+        try
+        {
+            if (streaming)
+            {
+                JsonOutput out(*stream);
+                serializePrettyCompact(out, design, topGraphs);
+                out.finish();
+                bytes = out.size();
+            }
+            else
+            {
+                // slang::JsonWriter owns its complete output; retain its
+                // existing Compact/Pretty formatting and string path.
+                const std::string jsonText = serializeDesignJson(design, topGraphs, options.jsonMode);
+                bytes = jsonText.size();
+                if (timingEnabled)
+                {
+                    const auto serializeEnd = TimingClock::now();
+                    std::ostringstream details;
+                    details << "bytes=" << bytes << " mode=" << jsonModeName(options.jsonMode);
+                    logJsonTiming("store_json.serialize", toMillis(serializeEnd - writeStart), details.str());
+                    writeStart = serializeEnd;
+                }
+                *stream << jsonText;
+                if (!*stream) throw std::runtime_error("Failed to write JSON output");
+            }
+            stream->flush();
+            if (!*stream) throw std::runtime_error("Failed to flush JSON output");
+            stream->close();
+            if (stream->fail()) throw std::runtime_error("Failed to close JSON output");
+        }
+        catch (const std::exception &ex)
+        {
+            if (stream->is_open()) stream->close();
+            reportError("Failed to store design as JSON: " + std::string(ex.what()), outputPath.string());
+            result.success = false;
+            return result;
+        }
         if (timingEnabled)
         {
             const auto writeEnd = TimingClock::now();
             std::ostringstream details;
-            details << "bytes=" << jsonText.size()
+            details << "bytes=" << bytes
                     << " path=" << outputPath.string();
-            logJsonTiming("store_json.write_file", toMillis(writeEnd - writeStart), details.str());
+            logJsonTiming(streaming ? "store_json.serialize_write_file" : "store_json.write_file",
+                          toMillis(writeEnd - writeStart), details.str());
             const auto totalEnd = TimingClock::now();
             logJsonTiming("store_json.total", toMillis(totalEnd - totalStart));
         }

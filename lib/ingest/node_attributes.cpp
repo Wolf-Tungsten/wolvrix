@@ -5,11 +5,11 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace wolvrix::lib::ingest::node {
 namespace {
-
 void quote(std::string& out, std::string_view text) {
     constexpr char hex[] = "0123456789abcdef";
     out += '"';
@@ -82,6 +82,63 @@ private:
     std::string_view text;
     std::size_t cursor = 0;
 };
+
+// Validate the canonical representation without allocating an Identity and
+// serializing it again. Invalid input still uses KeyParser for its diagnostic.
+class CanonicalKeyValidator {
+public:
+    explicit CanonicalKeyValidator(std::string_view text) : text_(text) {}
+    bool valid() {
+        return take('[') && string() && take(',') && string() && take(',') && string() && take(',') &&
+            strings() && take(',') && string() && take(',') && strings() && take(']') && cursor_ == text_.size();
+    }
+private:
+    bool take(char ch) {
+        if (cursor_ == text_.size() || text_[cursor_] != ch) return false;
+        ++cursor_;
+        return true;
+    }
+    bool string() {
+        if (!take('"')) return false;
+        bool nonempty = false;
+        while (cursor_ < text_.size()) {
+            const unsigned char ch = text_[cursor_++];
+            if (ch == '"') return nonempty;
+            if (ch < 32) return false;
+            nonempty = true;
+            if (ch != '\\') continue;
+            if (cursor_ == text_.size()) return false;
+            const char escaped = text_[cursor_++];
+            if (escaped == '"' || escaped == '\\') continue;
+            if (escaped != 'u' || text_.size() - cursor_ < 4 || text_.substr(cursor_, 2) != "00") return false;
+            cursor_ += 2;
+            const auto digit = [](char value) {
+                if (value >= '0' && value <= '9') return value - '0';
+                if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+                return -1;
+            };
+            const int high = digit(text_[cursor_++]), low = digit(text_[cursor_++]);
+            // quote() uses lowercase \\u00hh only for bytes below 32.
+            if (high < 0 || low < 0 || high * 16 + low >= 32) return false;
+        }
+        return false;
+    }
+    bool strings() {
+        if (!take('[')) return false;
+        if (take(']')) return true;
+        for (;;) {
+            if (!string()) return false;
+            if (take(']')) return true;
+            if (!take(',')) return false;
+        }
+    }
+    std::string_view text_;
+    std::size_t cursor_ = 0;
+};
+
+void validateKey(std::string_view encoded) {
+    if (!CanonicalKeyValidator(encoded).valid()) (void)parseKey(encoded);
+}
 
 template <typename T>
 T attr(const grh::Graph& graph, grh::OperationId op, std::string_view name) {
@@ -173,9 +230,9 @@ Attributes read(const grh::Graph& graph, grh::OperationId op) {
 
 Attributes normalize(Attributes attributes) {
     unique(attributes.members); unique(attributes.origins); unique(attributes.roots);
-    for (const auto& member : attributes.members) (void)parseKey(member);
-    for (const auto& origin : attributes.origins) (void)parseKey(origin);
-    for (const auto& root : attributes.roots) (void)parseKey(root.key);
+    for (const auto& member : attributes.members) validateKey(member);
+    for (const auto& origin : attributes.origins) validateKey(origin);
+    for (const auto& root : attributes.roots) validateKey(root.key);
     return attributes;
 }
 
@@ -210,6 +267,38 @@ void write(grh::Graph& graph, grh::OperationId op, Attributes attributes) {
         graph.setMetadata(kSchema, kSchemaRevision);
 }
 
+namespace {
+void writeSingleCanonicalImpl(grh::Graph& graph, grh::OperationId op,
+                              std::string_view canonicalKey, bool root,
+                              int64_t rootResult) {
+    if (canonicalKey.empty()) throw std::invalid_argument("FIRRTL node identity requires a canonical key");
+
+    if (const auto schema = graph.metadata(kSchema);
+        schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != kSchemaRevision))
+        throw std::invalid_argument("unsupported firrtl.nodeSchema; re-ingest for soft-node-v2");
+    if (root && (rootResult < 0 || static_cast<uint64_t>(rootResult) >= graph.opResults(op).size()))
+        throw std::invalid_argument("node root result index out of range");
+    graph.setCanonicalNodeAttrs(op, canonicalKey, root, rootResult);
+
+    graph.setMetadata(kSchema, kSchemaRevision);
+}
+} // namespace
+
+void writeSingleCanonical(grh::Graph& graph, grh::OperationId op,
+                          std::string_view canonicalKey, bool root,
+                          int64_t rootResult) {
+    writeSingleCanonicalImpl(graph, op, canonicalKey, root, rootResult);
+}
+
+void writeSingleCanonicalReady(grh::Graph& graph, grh::OperationId op,
+                               std::string_view canonicalKey, bool root,
+                               int64_t rootResult) {
+    if (canonicalKey.empty()) throw std::invalid_argument("FIRRTL node identity requires a canonical key");
+    if (root && (rootResult < 0 || static_cast<uint64_t>(rootResult) >= graph.opResults(op).size()))
+        throw std::invalid_argument("node root result index out of range");
+    graph.setCanonicalNodeAttrs(op, canonicalKey, root, rootResult);
+}
+
 void copyMembers(grh::Graph& graph, grh::OperationId from, grh::OperationId to) {
     if (from == to || !annotated(graph, from)) return;
     auto attributes = read(graph, from);
@@ -228,6 +317,9 @@ Attributes remapResults(Attributes attributes, std::span<const int64_t> oldToNew
     return normalize(std::move(attributes));
 }
 
+QualificationContext::QualificationContext(std::span<const std::string> instancePath)
+    : instancePath_(instancePath.begin(), instancePath.end()) {}
+
 void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string> instancePath) {
     if (!annotated(graph, op)) return;
     auto attributes = read(graph, op);
@@ -235,6 +327,25 @@ void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string
         auto identity = parseKey(encoded);
         identity.instancePath.insert(identity.instancePath.begin(), instancePath.begin(), instancePath.end());
         encoded = key(identity);
+    };
+    for (auto& member : attributes.members) qualifyKey(member);
+    for (auto& origin : attributes.origins) qualifyKey(origin);
+    for (auto& root : attributes.roots) qualifyKey(root.key);
+    write(graph, op, std::move(attributes));
+}
+
+void qualify(grh::Graph& graph, grh::OperationId op, QualificationContext& context) {
+    if (!annotated(graph, op)) return;
+    auto attributes = read(graph, op);
+    const auto qualifyKey = [&](std::string& encoded) {
+        auto found = context.qualified_.find(encoded);
+        if (found == context.qualified_.end()) {
+            auto identity = parseKey(encoded);
+            identity.instancePath.insert(identity.instancePath.begin(),
+                context.instancePath_.begin(), context.instancePath_.end());
+            found = context.qualified_.emplace(encoded, key(identity)).first;
+        }
+        encoded = found->second;
     };
     for (auto& member : attributes.members) qualifyKey(member);
     for (auto& origin : attributes.origins) qualifyKey(origin);
@@ -315,40 +426,125 @@ grh::ValueId redirectRoots(grh::Graph& graph, grh::ValueId from, grh::ValueId to
     return to;
 }
 
+namespace {
+struct AttributeView {
+    std::span<const std::string> members, origins, roots;
+    std::span<const int64_t> indices;
+};
+
+template <typename T>
+std::span<const T> arrayView(const grh::AttributeValue* attribute, std::string_view name) {
+    if (!attribute) return {};
+    if (const auto* values = std::get_if<std::vector<T>>(attribute)) return *values;
+    throw std::invalid_argument("wrong node attribute type: " + std::string(name));
+}
+
+std::optional<AttributeView> attributeView(const grh::Graph& graph, grh::OperationId op, bool schema) {
+    const grh::AttributeValue *members = nullptr, *origins = nullptr, *roots = nullptr, *indices = nullptr;
+    std::string_view unknown;
+    bool annotated = false;
+    for (const auto& entry : graph.opAttrs(op)) if (isAttribute(entry.key)) {
+        annotated = true;
+        if (entry.key == kMembers) members = &entry.value;
+        else if (entry.key == kOrigins) origins = &entry.value;
+        else if (entry.key == kRoots) roots = &entry.value;
+        else if (entry.key == kRootResults) indices = &entry.value;
+        else if (unknown.empty()) unknown = entry.key;
+    }
+    if (!annotated) return std::nullopt;
+    if (!schema) throw std::invalid_argument("node attributes require firrtl.nodeSchema=2");
+    if (!unknown.empty()) throw std::invalid_argument("unknown node attribute: " + std::string(unknown));
+    if (bool(roots) != bool(indices)) throw std::invalid_argument("node roots/rootResults must be paired");
+    AttributeView result;
+    result.members = arrayView<std::string>(members, kMembers);
+    result.origins = arrayView<std::string>(origins, kOrigins);
+    result.roots = arrayView<std::string>(roots, kRoots);
+    result.indices = arrayView<int64_t>(indices, kRootResults);
+    if (result.roots.size() != result.indices.size())
+        throw std::invalid_argument("node roots/rootResults length mismatch");
+    return result;
+}
+
+class AttributeValidation {
+public:
+    void validate(const AttributeView& attributes) {
+        bool normalized = keys(attributes.members);
+        normalized = keys(attributes.origins) && normalized;
+        const auto root = [&](std::size_t i) { return std::pair(std::string_view(attributes.roots[i]), attributes.indices[i]); };
+        bool rootsNormalized = true;
+        for (std::size_t i = 1; i < attributes.roots.size(); ++i)
+            rootsNormalized &= root(i - 1) < root(i);
+        if (rootsNormalized) {
+            for (const auto& encoded : attributes.roots) canonical(encoded);
+        } else {
+            std::vector<std::pair<std::string_view, int64_t>> roots;
+            for (std::size_t i = 0; i < attributes.roots.size(); ++i) roots.push_back(root(i));
+            unique(roots);
+            for (const auto& [encoded, index] : roots) canonical(encoded);
+        }
+        if (!normalized || !rootsNormalized) throw std::invalid_argument("node attributes are not sorted/unique");
+    }
+private:
+    void canonical(std::string_view encoded) {
+        if (canonical_.contains(encoded)) return;
+        validateKey(encoded);
+        canonical_.insert(encoded);
+    }
+    bool keys(std::span<const std::string> keys) {
+        const bool normalized = std::adjacent_find(keys.begin(), keys.end(),
+            [](const auto& left, const auto& right) { return left >= right; }) == keys.end();
+        if (normalized) {
+            for (const auto& encoded : keys) canonical(encoded);
+        } else {
+            std::vector<std::string_view> sorted(keys.begin(), keys.end());
+            unique(sorted);
+            for (const auto& encoded : sorted) canonical(encoded);
+        }
+        return normalized;
+    }
+    std::unordered_set<std::string_view> canonical_;
+};
+
+template <typename Attributes, typename Root>
+std::vector<std::string> scanAttributes(const grh::Graph& graph, Attributes attributes, Root root) {
+    std::vector<std::string> errors;
+    const auto schema = graph.metadata(kSchema);
+    if (schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != kSchemaRevision))
+        errors.push_back("unsupported firrtl.nodeSchema; re-ingest for soft-node-v2");
+    AttributeValidation validation;
+    for (const auto op : graph.operations()) {
+        try {
+            const auto view = attributeView(graph, op, schema.has_value());
+            if (!view) continue;
+            validation.validate(*view);
+            attributes(op, *view);
+            const auto outputs = graph.opResults(op);
+            for (std::size_t i = 0; i < view->roots.size(); ++i) {
+                const auto index = view->indices[i];
+                if (index < 0 || static_cast<uint64_t>(index) >= outputs.size())
+                    throw std::invalid_argument("node root result index out of range");
+                root(op, view->roots[i], index, outputs[index]);
+            }
+        } catch (const std::exception& error) {
+            errors.push_back(std::string(graph.getOperation(op).symbolText()) + ": " + error.what());
+        }
+    }
+    return errors;
+}
+}
+
 Inspection inspect(const grh::Graph& graph) {
     Inspection result;
     std::map<std::string, NodeRecord> records;
-    const auto schema = graph.metadata(kSchema);
-    if (schema && (!std::holds_alternative<int64_t>(*schema) || std::get<int64_t>(*schema) != kSchemaRevision))
-        result.errors.push_back("unsupported firrtl.nodeSchema; re-ingest for soft-node-v2");
-    for (const auto op : graph.operations()) {
-        if (!annotated(graph, op)) continue;
-        try {
-            if (!schema) throw std::invalid_argument("node attributes require firrtl.nodeSchema=2");
-            bool hasRoots = false, hasIndices = false;
-            for (const auto& entry : graph.opAttrs(op)) if (isAttribute(entry.key)) {
-                if (entry.key != kMembers && entry.key != kRoots && entry.key != kRootResults && entry.key != kOrigins)
-                    throw std::invalid_argument("unknown node attribute: " + entry.key);
-                hasRoots |= entry.key == kRoots; hasIndices |= entry.key == kRootResults;
-            }
-            if (hasRoots != hasIndices) throw std::invalid_argument("node roots/rootResults must be paired");
-            const auto attributes = read(graph, op);
-            if (normalize(attributes) != attributes) throw std::invalid_argument("node attributes are not sorted/unique");
-            if (attributes.members.empty() && !literal(graph, op)) result.isolatedFragments.push_back(op);
-            for (const auto& member : attributes.members) {
-                auto& record = records[member]; record.key = member; record.members.push_back(op);
-            }
-            for (const auto& root : attributes.roots) {
-                const auto outputs = graph.opResults(op);
-                if (root.result < 0 || static_cast<uint64_t>(root.result) >= outputs.size())
-                    throw std::invalid_argument("node root result index out of range");
-                auto& record = records[root.key]; record.key = root.key;
-                record.roots.push_back({op, root.result, outputs[root.result]});
-            }
-        } catch (const std::exception& error) {
-            result.errors.push_back(std::string(graph.getOperation(op).symbolText()) + ": " + error.what());
+    result.errors = scanAttributes(graph, [&](grh::OperationId op, const AttributeView& attributes) {
+        if (attributes.members.empty() && !literal(graph, op)) result.isolatedFragments.push_back(op);
+        for (const auto& member : attributes.members) {
+            auto& record = records[member]; record.key = member; record.members.push_back(op);
         }
-    }
+    }, [&](grh::OperationId op, const std::string& key, int64_t index, grh::ValueId value) {
+        auto& record = records[key]; record.key = key;
+        record.roots.push_back({op, index, value});
+    });
     for (auto& [identity, record] : records) {
         // Optional associations may overlap, lose roots, or have cloned roots.
         // Only the representation above is a validity constraint.
@@ -358,17 +554,26 @@ Inspection inspect(const grh::Graph& graph) {
 }
 
 void requireValid(const grh::Graph& graph) {
-    const auto result = inspect(graph);
-    if (!result.errors.empty()) throw std::invalid_argument("FIRRTL node attributes: " + result.errors.front());
+    const auto errors = scanAttributes(graph, [](grh::OperationId, const AttributeView&) {},
+        [](grh::OperationId, const std::string&, int64_t, grh::ValueId) {});
+    if (!errors.empty()) throw std::invalid_argument("FIRRTL node attributes: " + errors.front());
 }
 
 namespace {
-std::vector<std::string> metadataKeys(const grh::Graph& graph, std::string_view name) {
-    const auto value = graph.metadata(name);
+const grh::AttributeValue* metadataValue(const grh::Graph& graph, std::string_view name) {
+    for (const auto& entry : graph.metadata()) if (entry.key == name) return &entry.value;
+    return nullptr;
+}
+std::span<const std::string> metadataKeyView(const grh::Graph& graph, std::string_view name) {
+    const auto* value = metadataValue(graph, name);
     if (!value) return {};
-    const auto* keys = std::get_if<std::vector<std::string>>(&*value);
+    const auto* keys = std::get_if<std::vector<std::string>>(value);
     if (!keys) throw std::invalid_argument("wrong FIRRTL inventory metadata type");
     return *keys;
+}
+std::vector<std::string> metadataKeys(const grh::Graph& graph, std::string_view name) {
+    const auto keys = metadataKeyView(graph, name);
+    return {keys.begin(), keys.end()};
 }
 }
 
@@ -380,86 +585,134 @@ void establishPolicy(grh::Graph& graph) {
 }
 
 void requirePolicy(const grh::Graph& graph) {
-    if (!graph.metadata(kSchema) && !graph.metadata(kScopePolicy)) return;
-    if (graph.metadata(kScopePolicy) != std::optional<grh::AttributeValue>(std::string(kScopeRevision)) ||
-        !graph.metadata(kInventory))
+    const auto* policy = metadataValue(graph, kScopePolicy);
+    if (!metadataValue(graph, kSchema) && !policy) return;
+    const auto* revision = policy ? std::get_if<std::string>(policy) : nullptr;
+    if (!revision || *revision != kScopeRevision || !metadataValue(graph, kInventory))
         throw std::invalid_argument("FIRRTL soft-node-v2 policy is missing/incompatible; re-ingest the source");
 }
 
+DeadRootBatch::DeadRootBatch(grh::Graph& graph)
+    : graph_(graph), enabled_(graph.metadata(kScopePolicy).has_value()) {}
+
+void DeadRootBatch::record(grh::OperationId op) {
+    if (!enabled_) return;
+    // Dead-root recording is a hot path during broad cone sweeps. Borrow the
+    // roots attribute directly instead of materializing members/origins and
+    // parsing every root into NodeRecord objects. Keep attr<T>'s first-match
+    // and wrong-type behavior: only the first roots attribute is observed.
+    for (const auto& entry : graph_.opAttrs(op)) {
+        if (!isAttribute(entry.key)) continue;
+        if (entry.key != kRoots) continue;
+        const auto* roots = std::get_if<std::vector<std::string>>(&entry.value);
+        if (!roots) throw std::invalid_argument("wrong node attribute type: firrtl.node.roots");
+        for (const auto& root : *roots) pending_.push_back(root);
+        return;
+    }
+}
+
+void DeadRootBatch::flush() {
+    if (pending_.empty()) return;
+    auto dead = metadataKeys(graph_, kEliminated);
+    for (auto& key : pending_) dead.push_back(std::move(key));
+    unique(dead); graph_.setMetadata(kEliminated, std::move(dead));
+    pending_.clear();
+}
+
 void recordDead(grh::Graph& graph, grh::OperationId op) {
-    if (!graph.metadata(kScopePolicy) || !annotated(graph, op)) return;
-    const auto attributes = read(graph, op);
-    if (attributes.roots.empty()) return;
-    auto dead = metadataKeys(graph, kEliminated);
-    for (const auto& root : attributes.roots) dead.push_back(root.key);
-    unique(dead); graph.setMetadata(kEliminated, std::move(dead));
+    DeadRootBatch batch(graph); batch.record(op); batch.flush();
+}
+
+InventoryImportBatch::InventoryImportBatch(grh::Graph& target) : target_(target) {}
+
+void InventoryImportBatch::record(const grh::Graph& source,
+                                  std::span<const std::string> instancePath) {
+    if (!metadataValue(source, kScopePolicy)) return;
+    requirePolicy(source);
+    if (metadataValue(target_, kScopePolicy)) requirePolicy(target_);
+    const auto append = [&](std::string_view name, std::vector<std::string>& pending) {
+        (void)metadataKeyView(target_, name);
+        for (const auto& encoded : metadataKeyView(source, name)) {
+            auto identity = parseKey(encoded);
+            identity.instancePath.insert(identity.instancePath.begin(), instancePath.begin(), instancePath.end());
+            pending.push_back(key(identity));
+        }
+    };
+    append(kInventory, inventory_); append(kEliminated, eliminated_);
+    // Keep the policy structurally valid while imports remain private. No
+    // metadata is added when every source lacks the FIRRTL policy.
+    if (!metadataValue(target_, kInventory)) target_.setMetadata(kInventory, std::vector<std::string>{});
+    if (!eliminated_.empty() && !metadataValue(target_, kEliminated))
+        target_.setMetadata(kEliminated, std::vector<std::string>{});
+    if (!metadataValue(target_, kScopePolicy)) target_.setMetadata(kScopePolicy, std::string(kScopeRevision));
+    pendingImport_ = true;
+}
+
+void InventoryImportBatch::flush() {
+    if (!pendingImport_) return;
+    const auto merge = [&](std::string_view name, std::vector<std::string>& pending) {
+        const auto existing = metadataKeyView(target_, name);
+        pending.reserve(pending.size() + existing.size());
+        pending.insert(pending.end(), existing.begin(), existing.end());
+        unique(pending);
+        if (!pending.empty() || name == kInventory) target_.setMetadata(name, std::move(pending));
+        pending.clear();
+    };
+    merge(kInventory, inventory_); merge(kEliminated, eliminated_);
+    pendingImport_ = false;
 }
 
 void importInventory(const grh::Graph& source, grh::Graph& target,
                      std::span<const std::string> instancePath) {
-    if (!source.metadata(kScopePolicy)) return;
-    requirePolicy(source);
-    if (target.metadata(kScopePolicy)) requirePolicy(target);
-    for (const auto name : {kInventory, kEliminated}) {
-        auto keys = metadataKeys(target, name);
-        for (const auto& encoded : metadataKeys(source, name)) {
-            auto identity = parseKey(encoded);
-            identity.instancePath.insert(identity.instancePath.begin(), instancePath.begin(), instancePath.end());
-            keys.push_back(key(identity));
-        }
-        unique(keys);
-        if (!keys.empty() || name == kInventory) target.setMetadata(name, std::move(keys));
-    }
-    target.setMetadata(kScopePolicy, std::string(kScopeRevision));
+    InventoryImportBatch batch(target); batch.record(source, instancePath); batch.flush();
 }
 
 void recordRetention(grh::Graph& graph) {
     if (!graph.metadata(kScopePolicy)) return;
     requirePolicy(graph);
-    const auto inspection = inspect(graph);
-    if (!inspection.errors.empty()) throw std::invalid_argument(inspection.errors.front());
-    std::set<std::string> keys, available, constants, aliases, shared, fragments;
-    std::size_t references = 0, bytes = 0, roots = 0;
-    for (const auto& record : inspection.nodes) {
-        if (!record.roots.empty()) available.insert(record.key);
-        else fragments.insert(record.key);
-        roots += record.roots.size();
-        for (const auto& root : record.roots) {
-            auto operation = root.operation;
-            const auto args = graph.opOperands(operation);
-            if (graph.opKind(operation) == grh::OperationKind::kAssign && args.size() == 1) {
-                aliases.insert(record.key);
-                operation = graph.valueDef(args[0]);
-            }
-            if (operation && literal(graph, operation)) constants.insert(record.key);
-            if (read(graph, root.operation).roots.size() > 1) shared.insert(record.key);
-        }
-    }
-    for (const auto op : graph.operations()) {
-        const auto attributes = read(graph, op);
-        const auto add = [&](const std::string& key) { keys.insert(key); ++references; bytes += key.size(); };
-        for (const auto& key : attributes.members) add(key);
+    enum Flags : unsigned { Member = 1, Root = 2, Constant = 4, Alias = 8, Shared = 16 };
+    std::unordered_map<std::string_view, unsigned> keys;
+    std::size_t references = 0, bytes = 0, roots = 0, isolated = 0;
+    const auto errors = scanAttributes(graph, [&](grh::OperationId op, const AttributeView& attributes) {
+        if (attributes.members.empty() && !literal(graph, op)) ++isolated;
+        const auto add = [&](const std::string& key) -> unsigned& {
+            ++references; bytes += key.size(); return keys[key];
+        };
+        for (const auto& key : attributes.members) add(key) |= Member;
         for (const auto& key : attributes.origins) add(key);
-        for (const auto& root : attributes.roots) add(root.key);
+        const auto args = graph.opOperands(op);
+        const bool alias = graph.opKind(op) == grh::OperationKind::kAssign && args.size() == 1;
+        const bool constant = literal(graph, alias ? graph.valueDef(args[0]) : op);
+        for (const auto& key : attributes.roots)
+            add(key) |= Root | (alias ? Alias : 0) | (constant ? Constant : 0) |
+                (attributes.roots.size() > 1 ? Shared : 0);
+        roots += attributes.roots.size();
+    }, [](grh::OperationId, const std::string&, int64_t, grh::ValueId) {});
+    if (!errors.empty()) throw std::invalid_argument(errors.front());
+    const auto eliminated = metadataKeyView(graph, kEliminated);
+    const std::unordered_set<std::string_view> dead(eliminated.begin(), eliminated.end());
+    const auto inventory = metadataKeyView(graph, kInventory);
+    std::size_t missing = 0, removed = 0, uniqueBytes = 0, available = 0, constants = 0, aliases = 0, shared = 0, fragments = 0;
+    for (const auto& [key, flags] : keys) {
+        uniqueBytes += key.size();
+        available += bool(flags & Root); constants += bool(flags & Constant);
+        aliases += bool(flags & Alias); shared += bool(flags & Shared);
+        fragments += bool(flags & Member) && !(flags & Root);
     }
-    const auto eliminated = metadataKeys(graph, kEliminated);
-    const std::set<std::string> dead(eliminated.begin(), eliminated.end());
-    const auto inventory = metadataKeys(graph, kInventory);
-    std::size_t missing = 0, removed = 0, uniqueBytes = 0;
-    for (const auto& key : keys) uniqueBytes += key.size();
-    for (const auto& key : inventory) if (!available.contains(key)) {
+    for (const auto& key : inventory) if (const auto found = keys.find(key); found == keys.end() || !(found->second & Root)) {
         if (dead.contains(key)) ++removed;
         else ++missing;
     }
     grh::AttributeValue census = std::vector<std::string>{"v2",
-        "source-nodes=" + std::to_string(inventory.size()), "available=" + std::to_string(available.size()),
+        "source-nodes=" + std::to_string(inventory.size()), "available=" + std::to_string(available),
         "roots=" + std::to_string(roots), "dead=" + std::to_string(removed),
-        "constant=" + std::to_string(constants.size()), "alias=" + std::to_string(aliases.size()),
-        "shared=" + std::to_string(shared.size()), "fragments=" + std::to_string(fragments.size()),
-        "isolated=" + std::to_string(inspection.isolatedFragments.size()), "missing=" + std::to_string(missing),
+        "constant=" + std::to_string(constants), "alias=" + std::to_string(aliases),
+        "shared=" + std::to_string(shared), "fragments=" + std::to_string(fragments),
+        "isolated=" + std::to_string(isolated), "missing=" + std::to_string(missing),
         "key-references=" + std::to_string(references), "key-bytes=" + std::to_string(bytes),
         "unique-key-bytes=" + std::to_string(uniqueBytes)};
-    if (graph.metadata("firrtl.nodeRetention") != std::optional<grh::AttributeValue>(census))
+    const auto* previous = metadataValue(graph, "firrtl.nodeRetention");
+    if (!previous || *previous != census)
         graph.setMetadata("firrtl.nodeRetention", std::move(census));
 }
 

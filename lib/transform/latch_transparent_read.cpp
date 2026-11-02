@@ -3,6 +3,7 @@
 #include "core/grh.hpp"
 
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -12,17 +13,19 @@ namespace wolvrix::lib::transform
 
     namespace
     {
-        std::optional<std::string> getAttrString(const wolvrix::lib::grh::Operation &op,
-                                                 std::string_view key)
+        std::optional<std::string_view> getAttrString(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+                                                      std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
+            for (const auto &entry : attrs)
             {
-                return std::nullopt;
-            }
-            if (auto value = std::get_if<std::string>(&*attr))
-            {
-                return *value;
+                if (entry.key == key)
+                {
+                    if (const auto *value = std::get_if<std::string>(&entry.value))
+                    {
+                        return *value;
+                    }
+                    return std::nullopt;
+                }
             }
             return std::nullopt;
         }
@@ -70,48 +73,50 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
+                const auto kind = graph.opKind(opId);
+                const auto attrs = graph.opAttrs(opId);
                 
-                if (op.kind() == wolvrix::lib::grh::OperationKind::kLatch)
+                if (kind == wolvrix::lib::grh::OperationKind::kLatch)
                 {
-                    auto widthAttr = op.attr("width");
-                    auto signedAttr = op.attr("isSigned");
                     int32_t width = 1;
                     bool isSigned = false;
-                    if (widthAttr)
+                    for (const auto &attr : attrs)
                     {
-                        if (auto w = std::get_if<int64_t>(&*widthAttr))
+                        if (attr.key == "width")
                         {
-                            width = static_cast<int32_t>(*w);
+                            if (const auto *w = std::get_if<int64_t>(&attr.value))
+                            {
+                                width = static_cast<int32_t>(*w);
+                            }
+                        }
+                        else if (attr.key == "isSigned")
+                        {
+                            if (const auto *s = std::get_if<bool>(&attr.value))
+                            {
+                                isSigned = *s;
+                            }
                         }
                     }
-                    if (signedAttr)
-                    {
-                        if (auto s = std::get_if<bool>(&*signedAttr))
-                        {
-                            isSigned = *s;
-                        }
-                    }
-                    
-                    std::string symbol = std::string(op.symbolText());
+                    std::string symbol = std::string(graph.symbolText(graph.operationSymbol(opId)));
                     LatchInfo &info = latchBySymbol[symbol];
                     info.latchOpId = opId;
                     info.width = width;
                     info.isSigned = isSigned;
                 }
-                else if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort)
+                else if (kind == wolvrix::lib::grh::OperationKind::kLatchWritePort)
                 {
-                    auto latchSymOpt = getAttrString(op, "latchSymbol");
+                    auto latchSymOpt = getAttrString(attrs, "latchSymbol");
                     if (!latchSymOpt)
                     {
-                        warning(graph, op, "kLatchWritePort missing latchSymbol attribute");
+                        warning(graph, graph.getOperation(opId), "kLatchWritePort missing latchSymbol attribute");
                         continue;
                     }
                     
-                    auto operands = op.operands();
+                    const auto operands = graph.opOperands(opId);
                     if (operands.size() < 2)
                     {
-                        error(graph, op, "kLatchWritePort must have at least 2 operands (updateCond, nextValue)");
+                        error(graph, graph.getOperation(opId),
+                              "kLatchWritePort must have at least 2 operands (updateCond, nextValue)");
                         result.failed = true;
                         continue;
                     }
@@ -122,17 +127,17 @@ namespace wolvrix::lib::transform
                     writeInfo.nextValue = operands[1];
                     writeInfo.mask = operands.size() >= 3 ? operands[2] : wolvrix::lib::grh::ValueId::invalid();
                     
-                    latchBySymbol[*latchSymOpt].writePorts.push_back(writeInfo);
+                    latchBySymbol[std::string(*latchSymOpt)].writePorts.push_back(writeInfo);
                 }
-                else if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort)
+                else if (kind == wolvrix::lib::grh::OperationKind::kLatchReadPort)
                 {
-                    auto latchSymOpt = getAttrString(op, "latchSymbol");
+                    auto latchSymOpt = getAttrString(attrs, "latchSymbol");
                     if (!latchSymOpt)
                     {
-                        warning(graph, op, "kLatchReadPort missing latchSymbol attribute");
+                        warning(graph, graph.getOperation(opId), "kLatchReadPort missing latchSymbol attribute");
                         continue;
                     }
-                    latchBySymbol[*latchSymOpt].readPortOps.push_back(opId);
+                    latchBySymbol[std::string(*latchSymOpt)].readPortOps.push_back(opId);
                 }
             }
 
@@ -177,16 +182,15 @@ namespace wolvrix::lib::transform
                 // Process each read port
                 for (const auto readPortOpId : info.readPortOps)
                 {
-                    const wolvrix::lib::grh::Operation readPortOp = graph.getOperation(readPortOpId);
-                    auto results = readPortOp.results();
+                    const auto results = graph.opResults(readPortOpId);
                     if (results.empty())
                     {
                         continue;
                     }
                     const wolvrix::lib::grh::ValueId readResult = results[0];
-                    const wolvrix::lib::grh::Value readValue = graph.getValue(readResult);
+                    const auto users = graph.valueUsers(readResult);
                     const std::vector<wolvrix::lib::grh::ValueUser> originalUsers(
-                        readValue.users().begin(), readValue.users().end());
+                        users.begin(), users.end());
                     
                     // Create the transparent read logic:
                     // When updateCond is 1, return new value (with mask consideration)

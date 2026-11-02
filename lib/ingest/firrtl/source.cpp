@@ -22,6 +22,38 @@ bool noErrors(const std::vector<IngestDiagnostic>& diagnostics) {
         return diagnostic.kind == IngestSeverity::Error;
     });
 }
+std::string_view sourceLine(std::string_view text, Range range) {
+    const auto offset = std::min<uint64_t>(range.begin, text.size());
+    const auto previous = offset ? text.rfind('\n', offset - 1) : std::string_view::npos;
+    const auto begin = previous == std::string_view::npos ? 0 : previous + 1;
+    const auto next = text.find('\n', offset);
+    return text.substr(begin, (next == std::string_view::npos ? text.size() : next) - begin);
+}
+std::string_view lineInfo(std::string_view line, std::string_view info) {
+    if (!info.empty()) return info;
+
+
+    char quote = 0;
+    for (std::size_t i = 0; i + 1 < line.size(); ++i) {
+        const auto c = line[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; }
+        else if (c == '"' || c == '\'' || c == '`') quote = c;
+        else if (c == ';') break;
+        else if (c == '@' && line[i + 1] == '[') {
+            const auto start = i;
+            for (i += 2; i < line.size(); ++i) {
+                if (line[i] == '\\') ++i;
+                else if (line[i] == ']') return line.substr(start, i + 1 - start);
+            }
+            break;
+        }
+    }
+    return {};
+}
+}
+
+std::string_view detail::sourceInfoAt(const Source& source, Range range) {
+    return range.info.empty() ? lineInfo(sourceLine(source.text(), range), {}) : range.info;
 }
 
 std::string_view Arena::intern(std::string_view name) { return *names_.insert(name).first; }
@@ -71,30 +103,9 @@ SourcePosition Source::position(Range range) const {
     SourcePosition position;
     position.unit = impl_->unit; position.file = impl_->path;
     position.line = range.line; position.column = range.column;
-    const auto offset = std::min<uint64_t>(range.begin, impl_->text.size());
-    const auto previous = offset ? impl_->text.rfind('\n', offset - 1) : std::string_view::npos;
-    const auto begin = previous == std::string_view::npos ? 0 : previous + 1;
-    const auto next = impl_->text.find('\n', offset);
-    const auto line = impl_->text.substr(begin, (next == std::string_view::npos ? impl_->text.size() : next) - begin);
+    const auto line = sourceLine(impl_->text, range);
     position.sourceLine = line;
-    position.sourceInfo = range.info;
-    if (position.sourceInfo.empty()) {
-        char quote = 0;
-        for (std::size_t i = 0; i + 1 < line.size(); ++i) {
-            const auto c = line[i];
-            if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; }
-            else if (c == '"' || c == '\'' || c == '`') quote = c;
-            else if (c == ';') break;
-            else if (c == '@' && line[i + 1] == '[') {
-                const auto start = i;
-                for (i += 2; i < line.size(); ++i) {
-                    if (line[i] == '\\') ++i;
-                    else if (line[i] == ']') { position.sourceInfo = line.substr(start, i + 1 - start); break; }
-                }
-                break;
-            }
-        }
-    }
+    position.sourceInfo = lineInfo(line, range.info);
     return position;
 }
 

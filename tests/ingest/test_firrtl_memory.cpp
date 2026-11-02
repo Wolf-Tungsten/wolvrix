@@ -243,7 +243,44 @@ void bundleRdwr() {
         "if(m.pa!=expected.at(\"pa\")||m.pb!=expected.at(\"pb\")||m.qa!=expected.at(\"qa\")||m.qb!=expected.at(\"qb\"))throw std::runtime_error(\"compiled bundle rdwr mode\");});}}\n");
     models.push_back("bundle-rdwr");
 }
+void partialArrayPort() {
+    auto result = text("memory-partial-array-port", R"FIR(    input clk : Clock
+    input wen : UInt<1>
+    input second : UInt<1>
+    input a : UInt<4>
+    input b : UInt<4>
+    output y : UInt<4>[2]
+    cmem m : UInt<4>[2][3]
+    write mport w = m[UInt<2>(1)], clk
+    read mport r = m[UInt<2>(1)], clk
+    when wen :
+      connect w[0], a
+      when second : connect w[1], b
+    connect y, r
+)FIR");
+    require(result.success(), diagnostics(result)); valid(*result.design);
+    auto restored = roundTrip(*result.design); valid(restored);
+    grhsim_test::Oracle oracle(*restored.findGraph("top"));
+    const auto cycle = [&](unsigned wen, unsigned second, unsigned a, unsigned b) {
+        oracle.eval({{"clk", 0}, {"wen", wen}, {"second", second}, {"a", a}, {"b", b}});
+        return slang::SVInt::fromString(oracle.eval({{"clk", 1}}).outputs.at("y")).as<uint64_t>();
+    };
+    require(cycle(1, 1, 3, 12) == 0xc3 && cycle(1, 0, 5, 9) == 0xc5 && cycle(0, 1, 15, 15) == 0xc5,
+        "partial array mport lost its shape, mask or untouched element");
+    generate(restored, artifact("firrtl-memory") / "partial-array-port", R"CPP(#include "model/grhsim_top.hpp"
+#include <stdexcept>
+int main(){GrhSIM_top m;m.init();
+    const auto cycle=[&](unsigned wen,unsigned second,unsigned a,unsigned b,unsigned expected){
+        m.clk=0;m.wen=wen;m.second=second;m.a=a;m.b=b;m.eval();m.clk=1;m.eval();
+        if((unsigned(m.y[0])|(unsigned(m.y[1])<<4))!=expected)throw std::runtime_error("partial array mport");
+    };
+    cycle(1,1,3,12,0xc3);cycle(1,0,5,9,0xc5);cycle(0,1,15,15,0xc5);
+}
+)CPP");
+    models.push_back("partial-array-port");
+}
 void test() {
+    partialArrayPort();
     bundleRdwr();
     fourState(); depthOne();
     aggregateAndClocks("masked"); aggregateAndClocks("multi-clock"); aggregateAndClocks("chirrtl");

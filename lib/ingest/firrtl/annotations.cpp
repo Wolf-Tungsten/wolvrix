@@ -38,7 +38,9 @@ public:
             const auto end = record.target.find_first_of("/>", separator + 1);
             record.module = record.target.substr(separator + 1, end - separator - 1);
             if (record.module.empty()) fail("annotation target requires a module");
-            ++result.counts[record.kind]; result.records.push_back(std::move(record));
+            ++result.counts[record.kind];
+            result.byModule[record.module].push_back(result.records.size());
+            result.records.push_back(std::move(record));
         } while (accept(','));
         expect(']'); space(); if (cursor_ != text_.size()) fail("trailing annotation content");
         return result;
@@ -145,33 +147,57 @@ void validateAnnotations(const Source& source, const AnnotationIndex& result) {
     }
 }
 void applyAnnotations(const Source&, const Module& module, const AnnotationIndex& annotations, grh::Graph& graph) {
-    std::vector<std::string> counts, records, external;
+    std::vector<std::string> counts, records;
     for (const auto& [kind, count] : annotations.counts) counts.push_back(kind + "=" + std::to_string(count));
-    for (const auto& record : annotations.records) {
-        if (record.kind == "firrtl.transforms.BlackBoxInlineAnno") external.emplace_back(record.raw);
-        if (record.module != module.name) continue;
+    std::vector<const Annotation*> targets;
+    const auto grouped = annotations.byModule.find(std::string(module.name));
+    if (grouped != annotations.byModule.end()) for (const auto index : grouped->second) {
+        const auto& record = annotations.records[index];
         records.emplace_back(record.raw);
-        if (record.kind != "firrtl.transforms.DontTouchAnnotation") continue;
-        const auto at = record.target.find('>'); if (at == std::string::npos) continue;
+        if (record.kind == "firrtl.transforms.DontTouchAnnotation" && record.target.find('>') != std::string::npos)
+            targets.push_back(&record);
+    }
+    std::map<std::string_view, std::vector<grh::SymbolId>, std::less<>> anchors;
+    if (!targets.empty()) {
+        for (const auto value : graph.values()) {
+            const auto symbol = graph.valueSymbol(value);
+            anchors[graph.symbolText(symbol)].push_back(symbol);
+        }
+        for (const auto op : graph.operations()) {
+            if (graph.opKind(op) != grh::OperationKind::kRegister) continue;
+            const auto symbol = graph.operationSymbol(op);
+            anchors[graph.symbolText(symbol)].push_back(symbol);
+            for (const auto& attribute : graph.opAttrs(op)) {
+                if (attribute.key != "firrtl.memory") continue;
+                if (const auto name = std::get_if<std::string>(&attribute.value)) anchors[*name].push_back(symbol);
+            }
+        }
+    }
+    // Empty anchor entries resolve erased zero-width leaves without inventing
+    // executable carriers. Keep their owning metadata copy alive with the index.
+    const auto elided = targets.empty() ? std::nullopt : graph.metadata("firrtl.elidedLeaves");
+    if (elided)
+        for (const auto& name : std::get<std::vector<std::string>>(*elided)) anchors.try_emplace(name);
+    for (const auto* target : targets) {
+        const auto& record = *target;
+        const auto at = record.target.find('>');
         if (record.target.find('/') < at) throw Error(module.range, "hierarchical DontTouch target requires F07");
         std::string symbol = record.target.substr(at + 1);
         const auto index = symbol.find('['); if (index != std::string::npos) symbol.resize(index);
         for (auto dot = symbol.find('.'); dot != std::string::npos; dot = symbol.find('.', dot + 7)) symbol.replace(dot, 1, "__DOT__");
         bool found = false;
-        for (const auto value : graph.values()) {
-            const auto name = graph.symbolText(graph.valueSymbol(value));
-            if (name == symbol || name.starts_with(symbol + "__DOT__")) { graph.addDeclaredSymbol(graph.valueSymbol(value)); found = true; }
-        }
-        if (!found) {
-            for (const auto op : graph.operations()) {
-                const auto memory = graph.getOperation(op).attr("firrtl.memory");
-                if (memory && *memory == grh::AttributeValue(symbol)) { graph.addDeclaredSymbol(graph.operationSymbol(op)); found = true; }
-            }
+        const auto anchor = [&](const auto& entry) {
+            for (const auto symbol : entry.second) graph.addDeclaredSymbol(symbol);
+            found = true;
+        };
+        if (const auto exact = anchors.find(symbol); exact != anchors.end()) anchor(*exact);
+        const auto prefix = symbol + "__DOT__";
+        for (auto field = anchors.lower_bound(prefix); field != anchors.end() && field->first.starts_with(prefix); ++field) {
+            anchor(*field);
         }
         if (!found) throw Error(module.range, "DontTouch target cannot be resolved: " + record.target);
     }
     graph.setMetadata("firrtl.annotationCounts", counts);
     graph.setMetadata("firrtl.annotations", records);
-    graph.setMetadata("firrtl.pendingExternalAnnotations", external);
 }
 } // namespace wolvrix::lib::ingest::firrtl::detail

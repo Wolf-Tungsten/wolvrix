@@ -28,6 +28,9 @@ struct Source::Impl {
 };
 
 namespace detail {
+// Borrows range.info or the immutable Source text; callers own any cached copy.
+std::string_view sourceInfoAt(const Source& source, Range range);
+
 inline constexpr std::size_t kMaxErrors = 32;
 inline constexpr std::size_t kMaxNesting = 256;
 

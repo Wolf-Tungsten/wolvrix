@@ -18,6 +18,23 @@ void print(const std::vector<in::IngestDiagnostic>& diagnostics) {
 std::string design(std::string_view body) {
     return "FIRRTL version 6.0.0\ncircuit T :\n  module T :\n    input a : UInt<8>\n    output y : UInt<8>\n" + std::string(body);
 }
+void sourceInfoScanning() {
+    for (const auto& [line, expected] : std::vector<std::pair<std::string, std::string>>{
+             {"    skip ; @[comment.scala 1:1]", ""},
+             {"    printf(clk, en, \"@[quoted.scala 1:1]\") @[real.scala 2:3]", "@[real.scala 2:3]"},
+             {"    printf(clk, en, \"escaped \\\" @[quoted]\") ; @[comment]", ""},
+             {"    skip @[long/path/with/escaped\\]bracket.scala 4:5]", "@[long/path/with/escaped\\]bracket.scala 4:5]"},
+             {"    skip", ""}}) {
+        const auto text = design(line); // Also exercise the final line without a newline.
+        auto indexed = fi::indexText(text, "source-info.fir", "source-info");
+        require(indexed.success(), "source-info fixture indexing failed");
+        const auto begin = text.size() - line.size();
+        auto position = indexed.source->position({begin, text.size(), 6, 1, {}});
+        indexed = {};
+        require(position.sourceLine == line && position.sourceInfo == expected,
+                "source info scanner changed quoting, comments, escapes or ownership");
+    }
+}
 void validFixture() {
     auto index = fi::indexFile(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "parser.fir", "fixture");
     if (!index.success()) print(index.diagnostics);
@@ -234,7 +251,7 @@ void resourceAndLineBoundaries() {
 }
 }
 int main() {
-    try { validFixture(); errors(); propertiesAndInterning(); memoryPortScope(); signaturesAndRequests(); resourceAndLineBoundaries(); }
+    try { sourceInfoScanning(); validFixture(); errors(); propertiesAndInterning(); memoryPortScope(); signaturesAndRequests(); resourceAndLineBoundaries(); }
     catch (const std::exception& error) { std::cerr << "[firrtl-parser] " << error.what() << '\n'; return 1; }
     return 0;
 }

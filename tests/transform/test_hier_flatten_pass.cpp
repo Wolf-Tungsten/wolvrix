@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "core/store.hpp"
 #include "core/transform.hpp"
+#include "ingest/node_attributes.hpp"
 #include "transform/hier_flatten.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace wolvrix::lib::transform;
@@ -737,8 +739,799 @@ int testDpiImportOriginMerge()
     return 0;
 }
 
+// Reverse port order and dead slots expose both positional-map changes and
+// stale IDs when definitions are compacted before inlining shared instances.
+void buildSourceFreezeDesign(wolvrix::lib::grh::Design &design, int namedInstances)
+{
+    namespace grh = wolvrix::lib::grh;
+    namespace node = wolvrix::lib::ingest::node;
+    auto &child = design.createGraph("child");
+    auto &top = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto dead = child.createOperation(grh::OperationKind::kNot);
+    const auto deadValue = child.createValue(8, false);
+    child.addResult(dead, deadValue);
+    child.eraseOp(dead);
+    child.eraseValue(deadValue);
+
+    const auto z = child.createValue(child.internSymbol("z"), 8, false);
+    const auto a = child.createValue(child.internSymbol("a"), 8, false);
+    const auto y = child.createValue(child.internSymbol("y"), 8, false);
+    child.bindInputPort("z", z);
+    child.bindInputPort("a", a);
+    child.bindOutputPort("y", y);
+    const auto difference = child.createOperation(grh::OperationKind::kSub, child.internSymbol("difference"));
+    child.addDeclaredSymbol(child.operationSymbol(difference));
+    child.addOperand(difference, z);
+    child.addOperand(difference, a);
+    child.addResult(difference, y);
+    child.setAttr(difference, "fixture", std::string("source-freeze"));
+    grh::SrcLoc location;
+    location.file = "source-freeze.fir";
+    location.line = 41;
+    child.setOpSrcLoc(difference, location);
+    location.line = 42;
+    child.setValueSrcLoc(y, location);
+    child.setMetadata("fixture.source", std::string("preserved"));
+    const auto group = child.addGenerateGroup(child.internSymbol("gen"), child.lookupSymbol("difference"));
+    child.addGenerateGroupSymbol(group, child.operationSymbol(difference));
+    const auto identity = node::key({"source-freeze.fir", "Circuit", "child", {"local"}, "difference", {}});
+    node::write(child, difference, {{identity}, {{identity, 0}}, {identity}});
+    node::establishPolicy(child);
+
+    const auto topZ = top.createValue(top.internSymbol("z"), 8, false);
+    const auto topA = top.createValue(top.internSymbol("a"), 8, false);
+    top.bindInputPort("z", topZ);
+    top.bindInputPort("a", topA);
+    top.addDeclaredSymbol(top.valueSymbol(topZ));
+    top.addDeclaredSymbol(top.valueSymbol(topA));
+    for (int i = 0; i < 2; ++i)
+    {
+        const auto output = top.createValue(top.internSymbol("y" + std::to_string(i)), 8, false);
+        top.bindOutputPort("y" + std::to_string(i), output);
+        top.addDeclaredSymbol(top.valueSymbol(output));
+        const auto instance = top.createOperation(grh::OperationKind::kInstance,
+                                                  top.internSymbol("instance" + std::to_string(i)));
+        top.setAttr(instance, "moduleName", std::string("child"));
+        top.setAttr(instance, "instanceName", "u" + std::to_string(i));
+        top.addOperand(instance, topZ);
+        top.addOperand(instance, topA);
+        top.addResult(instance, output);
+        if (i < namedInstances)
+        {
+            top.setAttr(instance, "inputPortName", std::vector<std::string>{"z", "a"});
+            top.setAttr(instance, "outputPortName", std::vector<std::string>{"y"});
+        }
+    }
+}
+
+int checkSourceFreezeWiring(const wolvrix::lib::grh::Design &design)
+{
+    namespace node = wolvrix::lib::ingest::node;
+    const auto &top = *design.findGraph("top");
+    for (int i = 0; i < 2; ++i)
+    {
+        const auto op = top.findOperation("u" + std::to_string(i) + "$difference");
+        if (!op.valid()) return fail("source freeze lost a shared instance operation");
+        const auto operands = top.opOperands(op);
+        if (operands.size() != 2 || operands[0] != top.findValue("z") || operands[1] != top.findValue("a") ||
+            top.valueDef(top.findValue("y" + std::to_string(i))) != op)
+            return fail("source freeze changed reverse-order instance wiring");
+        if (getAttrString(top.getOperation(op), "fixture") != "source-freeze" ||
+            !top.opSrcLoc(op) || top.opSrcLoc(op)->line != 41 ||
+            !findGenerateGroup(top, "u" + std::to_string(i) + "$gen", "difference"))
+            return fail("source freeze changed attributes, locations, or generate groups");
+    }
+    const auto inspection = node::inspect(top);
+    if (!inspection.errors.empty() || inspection.nodes.size() != 2)
+        return fail("source freeze changed shared-instance FIRRTL node identities");
+    return 0;
+}
+
+int testSourceFreezeEquivalence()
+{
+    std::optional<std::string> baseline;
+    for (const int namedInstances : {0, 2})
+    {
+        wolvrix::lib::grh::Design design;
+        buildSourceFreezeDesign(design, namedInstances);
+        auto *const source = design.findGraph("child");
+        auto *const top = design.findGraph("top");
+        const auto oldIndex = source->findOperation("difference").index;
+        const auto inventory = source->metadata(wolvrix::lib::ingest::node::kInventory);
+        HierFlattenOptions options;
+        options.preserveFlattenedModules = true;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError())
+            return fail("source freeze equivalence flatten failed");
+        if (design.findGraph("top") != top || design.findGraph("child") != source ||
+            source->frozen() != (namedInstances == 2) ||
+            source->metadata("fixture.source") != wolvrix::lib::grh::AttributeValue(std::string("preserved")) ||
+            source->metadata(wolvrix::lib::ingest::node::kInventory) != inventory ||
+            !findGenerateGroup(*source, "gen", "difference") ||
+            !source->valueSrcLoc(source->findValue("y")) ||
+            source->valueSrcLoc(source->findValue("y"))->line != 42)
+            return fail("source freeze changed preserved graph identity or metadata");
+        if (namedInstances == 2 && source->findOperation("difference").index >= oldIndex)
+            return fail("named source definition was not compacted before flatten");
+        if (const int result = checkSourceFreezeWiring(design)) return result;
+        design.deleteGraph("child");
+        wolvrix::lib::store::StoreDiagnostics storeDiags;
+        wolvrix::lib::store::StoreJson store(&storeDiags);
+        const auto json = store.storeToString(design);
+        if (!json || storeDiags.hasError()) return fail("source freeze equivalence JSON store failed");
+        if (baseline && *baseline != *json)
+            return fail("frozen and positional source flatten results differ");
+        baseline = json;
+    }
+    return 0;
+}
+
+int testSourceFreezeFallbackAndFailure()
+{
+    namespace grh = wolvrix::lib::grh;
+    // A named peer cannot make a source safe when another reference uses the
+    // original, non-lexical positional port order (including legacy bad types).
+    for (const bool wrongType : {false, true})
+    {
+        grh::Design design;
+        buildSourceFreezeDesign(design, 1);
+        auto &top = *design.findGraph("top");
+        if (wrongType) top.setAttr(top.findOperation("instance1"), "inputPortName", int64_t(7));
+        HierFlattenOptions options;
+        options.preserveFlattenedModules = true;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || design.findGraph("child")->frozen())
+            return fail("shared positional source was frozen or rejected");
+        if (const int result = checkSourceFreezeWiring(design)) return result;
+    }
+
+    grh::Design design;
+    buildSourceFreezeDesign(design, 2);
+    auto *const source = design.findGraph("child");
+    auto *const top = design.findGraph("top");
+    design.createGraph("unused");
+    const auto missing = top->createOperation(grh::OperationKind::kInstance);
+    top->setAttr(missing, "moduleName", std::string("missing"));
+    PassManager manager;
+    manager.addPass(std::make_unique<HierFlattenPass>());
+    PassDiagnostics diags;
+    if (manager.run(design, diags).success || !diags.hasError() || design.graphs().size() != 3 ||
+        design.findGraph("child") != source || design.findGraph("top") != top || !source->frozen())
+        return fail("source freeze changed the failed flatten source graph set");
+    if (diags.messages().back().message != "Instance module not found: missing")
+        return fail("source freeze changed missing-module diagnostics");
+    if (const int result = checkSourceFreezeWiring(design)) return result;
+    const auto inventory = top->metadata(wolvrix::lib::ingest::node::kInventory);
+    if (!inventory || std::get<std::vector<std::string>>(*inventory).size() != 2)
+        return fail("failed source freeze flatten did not publish shared inventory");
+    return 0;
+}
+
+int testSourceFreezeBlackboxRetention()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (const bool namedBlackbox : {false, true})
+    {
+        grh::Design design;
+        buildSourceFreezeDesign(design, 2);
+        auto *const source = design.findGraph("child");
+        auto &top = *design.findGraph("top");
+        const auto blackbox = top.createOperation(grh::OperationKind::kBlackbox);
+        top.setAttr(blackbox, "moduleName", std::string("child"));
+        top.setAttr(blackbox, "instanceName", std::string("opaque"));
+        if (namedBlackbox)
+        {
+            top.setAttr(blackbox, "inputPortName", std::vector<std::string>{"z", "a"});
+            top.setAttr(blackbox, "outputPortName", std::vector<std::string>{"y"});
+        }
+        top.addOperand(blackbox, top.findValue("z"));
+        top.addOperand(blackbox, top.findValue("a"));
+        top.addResult(blackbox, top.createValue(8, false));
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || design.graphs().size() != 2 ||
+            design.findGraph("child") != source || source->frozen() != namedBlackbox ||
+            top.opKind(blackbox) != grh::OperationKind::kBlackbox ||
+            (!namedBlackbox && source->inputPorts().front().name != "z"))
+            return fail("source freeze changed blackbox definition retention or positional ports");
+        const auto operands = top.opOperands(blackbox);
+        if (operands.size() != 2 || operands[0] != top.findValue("z") || operands[1] != top.findValue("a"))
+            return fail("source freeze changed retained blackbox wiring");
+        if (const int result = checkSourceFreezeWiring(design)) return result;
+    }
+    return 0;
+}
+
+int testSourceFreezeDiagnosticFallback()
+{
+    namespace grh = wolvrix::lib::grh;
+    const std::array<std::vector<std::string>, 3> badNames{{{"z"}, {"z", "z"}, {"z", "missing"}}};
+    const std::array<std::string_view, 3> errors{{"Instance port list does not match module ports",
+        "Flatten missing mapping for port value (input)", "Flatten missing input port: missing"}};
+    for (std::size_t i = 0; i < badNames.size(); ++i)
+    {
+        grh::Design design;
+        buildSourceFreezeDesign(design, 2);
+        auto &top = *design.findGraph("top");
+        top.setAttr(top.findOperation("instance1"), "inputPortName", badNames[i]);
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>());
+        PassDiagnostics diags;
+        if (manager.run(design, diags).success || !diags.hasError() ||
+            design.graphs().size() != 2 || design.findGraph("child")->frozen() ||
+            !diags.messages().back().message.starts_with(errors[i]))
+            return fail("source freeze changed malformed port-map diagnostics");
+    }
+
+    grh::Design design;
+    buildSourceFreezeDesign(design, 2);
+    auto &source = *design.findGraph("child");
+    const auto erasedOperand = source.createValue(8, false);
+    source.replaceOperand(source.findOperation("difference"), 0, erasedOperand);
+    source.eraseValueUnchecked(erasedOperand);
+    PassManager manager;
+    manager.addPass(std::make_unique<HierFlattenPass>());
+    PassDiagnostics diags;
+    if (manager.run(design, diags).success || !diags.hasError() || source.frozen() ||
+        design.graphs().size() != 2 || diags.messages().back().message != "Flatten missing operand mapping")
+        return fail("failed source freeze replaced existing invalid-graph diagnostics");
+    const auto summary = std::find_if(diags.messages().begin(), diags.messages().end(), [](const auto &diagnostic) {
+        return diagnostic.message == "source freeze eligible=1 frozen=0 already-frozen=0 skipped-positional=0 failed-freeze=1";
+    });
+    return summary != diags.messages().end() ? 0 : fail("failed source freeze summary missing");
+}
+
+// Different port names may share a child input ValueId. Preserve the
+// original unordered_map::emplace rule: the first instance operand wins.
+int testSharedPortInputFirstMapping()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (const bool inout : {false, true})
+    {
+        for (const unsigned portCase : {0U, 1U, 2U, 3U})
+        {
+            const bool named = (portCase & 1U) != 0;
+            const std::vector<std::string> portNames = portCase < 2U
+                ? std::vector<std::string>{"p0", "p1"}
+                : std::vector<std::string>{"z", "a"};
+            grh::Design design;
+            auto &child = design.createGraph("child");
+            auto &top = design.createGraph("top");
+            design.markAsTop("top");
+            const auto shared = child.createValue(child.internSymbol("shared"), 8, false);
+            std::array<grh::ValueId, 2> childOutputs;
+            std::array<grh::ValueId, 2> childOes;
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                childOutputs[i] = child.createValue(8, false);
+                if (inout)
+                {
+                    childOes[i] = child.createValue(1, false);
+                    child.bindInoutPort(portNames[i], shared, childOutputs[i], childOes[i]);
+                    const auto one = child.createOperation(grh::OperationKind::kConstant);
+                    child.setAttr(one, "constValue", std::string("1'b1"));
+                    child.addResult(one, childOes[i]);
+                }
+                else
+                {
+                    child.bindInputPort(portNames[i], shared);
+                    child.bindOutputPort("y" + std::to_string(i), childOutputs[i]);
+                }
+                const auto observe = child.createOperation(grh::OperationKind::kAssign,
+                    child.internSymbol("observe" + std::to_string(i)));
+                child.addDeclaredSymbol(child.operationSymbol(observe));
+                child.addOperand(observe, shared);
+                child.addResult(observe, childOutputs[i]);
+            }
+
+            const auto first = top.createValue(top.internSymbol("first"), 8, false);
+            const auto second = top.createValue(top.internSymbol("second"), 8, false);
+            top.bindInputPort("first", first);
+            top.bindInputPort("second", second);
+            std::array<grh::ValueId, 2> outputs;
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                outputs[i] = top.createValue(top.internSymbol("y" + std::to_string(i)), 8, false);
+                top.bindOutputPort("y" + std::to_string(i), outputs[i]);
+            }
+            const auto instance = top.createOperation(grh::OperationKind::kInstance);
+            top.setAttr(instance, "moduleName", std::string("child"));
+            top.setAttr(instance, "instanceName", std::string("u"));
+            top.addOperand(instance, first);
+            top.addOperand(instance, second);
+            for (const auto output : outputs) top.addResult(instance, output);
+            if (inout)
+            {
+                for (std::size_t i = 0; i < 2; ++i)
+                    top.addResult(instance, top.createValue(1, false));
+            }
+            if (named)
+            {
+                top.setAttr(instance, inout ? "inoutPortName" : "inputPortName",
+                    portNames);
+                if (!inout)
+                    top.setAttr(instance, "outputPortName", std::vector<std::string>{"y0", "y1"});
+            }
+            HierFlattenOptions options;
+            options.symProtect = HierFlattenOptions::SymProtectMode::None;
+            PassManager manager;
+            manager.addPass(std::make_unique<HierFlattenPass>(options));
+            PassDiagnostics diags;
+            if (!manager.run(design, diags).success || diags.hasError())
+                return fail("flatten rejected aliased child port inputs");
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                const auto observe = top.findOperation("u$observe" + std::to_string(i));
+                if (!observe.valid() || top.opOperands(observe).size() != 1 ||
+                    top.opOperands(observe)[0] != first || top.valueDef(outputs[i]) != observe)
+                    return fail("flatten overwrote the first aliased input/inout mapping");
+            }
+        }
+    }
+    return 0;
+}
+
+int testForwardSymbolReferences()
+{
+    namespace grh = wolvrix::lib::grh;
+    struct Reference
+    {
+        grh::OperationKind kind;
+        const char *name;
+        const char *attr;
+        const char *target;
+        grh::OperationKind targetKind;
+    };
+    const std::array<Reference, 3> references{{
+        {grh::OperationKind::kRegisterReadPort, "reg_read", "regSymbol", "state", grh::OperationKind::kRegister},
+        {grh::OperationKind::kLatchReadPort, "latch_read", "latchSymbol", "lat", grh::OperationKind::kLatch},
+        {grh::OperationKind::kAssign, "ordinary_ref", "regSymbol", "ordinary", grh::OperationKind::kNot}}};
+    for (const bool namedPorts : {false, true})
+    {
+        grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto input = child.createValue(child.internSymbol("x"), 1, false);
+        const auto ordinaryResult = child.createValue(1, false);
+        child.bindInputPort("x", input);
+        for (std::size_t i = 0; i < references.size(); ++i)
+        {
+            const auto &reference = references[i];
+            const auto output = child.createValue(child.internSymbol("y" + std::to_string(i)), 1, false);
+            child.bindOutputPort("y" + std::to_string(i), output);
+            const auto op = child.createOperation(reference.kind, child.internSymbol(reference.name));
+            child.addDeclaredSymbol(child.operationSymbol(op));
+            if (reference.kind == grh::OperationKind::kAssign) child.addOperand(op, ordinaryResult);
+            child.addResult(op, output);
+            child.setAttr(op, reference.attr, std::string(reference.target));
+        }
+        // Every target follows its reference. The ordinary target is deliberately
+        // undeclared: arbitrary operation symbols must survive the rename filter.
+        for (const auto &reference : references)
+        {
+            const auto op = child.createOperation(reference.targetKind, child.internSymbol(reference.target));
+            if (reference.targetKind == grh::OperationKind::kNot)
+            {
+                child.addOperand(op, input);
+                child.addResult(op, ordinaryResult);
+            }
+            else
+            {
+                child.addDeclaredSymbol(child.operationSymbol(op));
+                child.setAttr(op, "width", int64_t{1});
+                child.setAttr(op, "isSigned", false);
+            }
+        }
+        const auto topInput = top.createValue(top.internSymbol("x"), 1, false);
+        top.bindInputPort("x", topInput);
+        top.addDeclaredSymbol(top.valueSymbol(topInput));
+        const auto instance = top.createOperation(grh::OperationKind::kInstance);
+        top.addOperand(instance, topInput);
+        for (std::size_t i = 0; i < references.size(); ++i)
+        {
+            const auto name = "y" + std::to_string(i);
+            const auto output = top.createValue(top.internSymbol(name), 1, false);
+            top.bindOutputPort(name, output);
+            top.addDeclaredSymbol(top.valueSymbol(output));
+            top.addResult(instance, output);
+        }
+        top.setAttr(instance, "moduleName", std::string("child"));
+        top.setAttr(instance, "instanceName", std::string("u_child"));
+        if (namedPorts)
+        {
+            top.setAttr(instance, "inputPortName", std::vector<std::string>{"x"});
+            top.setAttr(instance, "outputPortName", std::vector<std::string>{"y0", "y1", "y2"});
+        }
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError() || design.graphs().size() != 1)
+            return fail("forward symbol-reference flatten failed");
+        for (std::size_t i = 0; i < references.size(); ++i)
+        {
+            const auto &reference = references[i];
+            const auto op = top.findOperation("u_child$" + std::string(reference.name));
+            if (!op.valid() || top.valueDef(top.findValue("y" + std::to_string(i))) != op)
+                return fail("forward symbol reference lost its result mapping");
+            const auto targetName = getAttrString(top.getOperation(op), reference.attr);
+            const auto target = targetName ? top.findOperation(*targetName) : grh::OperationId::invalid();
+            if (!target.valid() || *targetName == reference.target || top.opKind(target) != reference.targetKind)
+                return fail("forward symbol reference did not resolve to the cloned target");
+            if (reference.targetKind == grh::OperationKind::kNot)
+            {
+                if (top.opOperands(op).size() != 1 || top.valueDef(top.opOperands(op)[0]) != target)
+                    return fail("forward reference to an ordinary operation resolved incorrectly");
+            }
+            else if (*targetName != "u_child$" + std::string(reference.target))
+                return fail("forward state reference lost its declared hierarchical name");
+        }
+    }
+    return 0;
+}
+
+int testDpiCallBeforeImportSiblingDedup()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (const bool namedPorts : {false, true})
+    {
+        grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto input = child.createValue(child.internSymbol("x"), 1, false);
+        const auto output = child.createValue(child.internSymbol("y"), 1, false);
+        child.bindInputPort("x", input);
+        child.bindOutputPort("y", output);
+        const auto call = child.createOperation(grh::OperationKind::kDpicCall);
+        child.addOperand(call, input);
+        child.addResult(call, output);
+        child.setAttr(call, "targetImportSymbol", std::string("dpi_forward"));
+        child.setAttr(call, "inArgName", std::vector<std::string>{"x"});
+        child.setAttr(call, "outArgName", std::vector<std::string>{});
+        child.setAttr(call, "hasReturn", true);
+        const auto dpiImport = child.createOperation(grh::OperationKind::kDpicImport, child.internSymbol("dpi_forward"));
+        child.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+        child.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1});
+        child.setAttr(dpiImport, "argsName", std::vector<std::string>{"x"});
+        child.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+        child.setAttr(dpiImport, "argsType", std::vector<std::string>{"logic"});
+        child.setAttr(dpiImport, "hasReturn", true);
+        child.setAttr(dpiImport, "returnWidth", int64_t{1});
+        child.setAttr(dpiImport, "returnSigned", false);
+        const auto topInput = top.createValue(top.internSymbol("x"), 1, false);
+        top.bindInputPort("x", topInput);
+        top.addDeclaredSymbol(top.valueSymbol(topInput));
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto name = "y" + std::to_string(i);
+            const auto topOutput = top.createValue(top.internSymbol(name), 1, false);
+            top.bindOutputPort(name, topOutput);
+            top.addDeclaredSymbol(top.valueSymbol(topOutput));
+            const auto instance = top.createOperation(grh::OperationKind::kInstance);
+            top.addOperand(instance, topInput);
+            top.addResult(instance, topOutput);
+            top.setAttr(instance, "moduleName", std::string("child"));
+            top.setAttr(instance, "instanceName", "u" + std::to_string(i));
+            if (namedPorts)
+            {
+                top.setAttr(instance, "inputPortName", std::vector<std::string>{"x"});
+                top.setAttr(instance, "outputPortName", std::vector<std::string>{"y"});
+            }
+        }
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>());
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError() || design.graphs().size() != 1)
+            return fail("DPI call-before-import sibling flatten failed");
+        unsigned imports = 0;
+        unsigned calls = 0;
+        for (const auto op : top.operations())
+        {
+            imports += top.opKind(op) == grh::OperationKind::kDpicImport;
+            calls += top.opKind(op) == grh::OperationKind::kDpicCall;
+        }
+        const auto resolvedImport = top.findOperation("dpi_forward");
+        if (imports != 1 || calls != 2 || !resolvedImport.valid())
+            return fail("DPI sibling calls did not share exactly one import");
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto resolvedCall = top.valueDef(top.findValue("y" + std::to_string(i)));
+            if (!resolvedCall.valid() || top.opKind(resolvedCall) != grh::OperationKind::kDpicCall ||
+                getAttrString(top.getOperation(resolvedCall), "targetImportSymbol") != "dpi_forward" ||
+                top.opOperands(resolvedCall).size() != 1 || top.opOperands(resolvedCall)[0] != topInput)
+                return fail("DPI call-before-import lost its target or sibling port mapping");
+        }
+    }
+    return 0;
+}
+
+int testUnresolvedSymbolReferenceDiagnostics()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (const bool namedPorts : {false, true})
+    for (const char *attr : {"regSymbol", "latchSymbol", "targetImportSymbol"})
+    for (const std::string target : {"missing", "unbound", "value", "instance"})
+    {
+        grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto input = child.createValue(child.internSymbol("value"), 1, false);
+        const auto output = child.createValue(child.internSymbol("y"), 1, false);
+        child.bindInputPort("value", input);
+        child.bindOutputPort("y", output);
+        const auto reference = child.createOperation(grh::OperationKind::kAssign);
+        child.addOperand(reference, input);
+        child.addResult(reference, output);
+        child.setAttr(reference, attr, target);
+        if (target == "unbound") child.internSymbol(target);
+        if (target == "instance")
+        {
+            design.createGraph("leaf");
+            const auto nested = child.createOperation(grh::OperationKind::kInstance, child.internSymbol(target));
+            child.setAttr(nested, "moduleName", std::string("leaf"));
+            child.setAttr(nested, "instanceName", std::string("u_leaf"));
+            child.setAttr(nested, "inputPortName", std::vector<std::string>{});
+            child.setAttr(nested, "outputPortName", std::vector<std::string>{});
+        }
+        const auto sourceSymbol = child.lookupSymbol(target);
+        if ((target == "missing" && sourceSymbol.valid()) ||
+            (target != "missing" && !sourceSymbol.valid()) ||
+            (target == "unbound" && (child.findValue(sourceSymbol).valid() || child.findOperation(sourceSymbol).valid())))
+            return fail("unresolved reference fixture has the wrong symbol binding");
+        const auto topInput = top.createValue(top.internSymbol("x"), 1, false);
+        const auto topOutput = top.createValue(top.internSymbol("y"), 1, false);
+        top.bindInputPort("x", topInput);
+        top.bindOutputPort("y", topOutput);
+        const auto instance = top.createOperation(grh::OperationKind::kInstance);
+        top.addOperand(instance, topInput);
+        top.addResult(instance, topOutput);
+        top.setAttr(instance, "moduleName", std::string("child"));
+        top.setAttr(instance, "instanceName", std::string("u_child"));
+        if (namedPorts)
+        {
+            top.setAttr(instance, "inputPortName", std::vector<std::string>{"value"});
+            top.setAttr(instance, "outputPortName", std::vector<std::string>{"y"});
+        }
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>());
+        PassDiagnostics diags;
+        const auto result = manager.run(design, diags);
+        const auto errors = std::count_if(diags.messages().begin(), diags.messages().end(), [](const auto &diagnostic) {
+            return diagnostic.kind == PassDiagnosticKind::Error;
+        });
+        if (result.success || !diags.hasError() || errors != 1 ||
+            diags.messages().back().message != "Flatten unresolved symbol reference: " + target)
+            return fail("flatten changed the unresolved " + std::string(attr) + " diagnostic for " + target);
+    }
+    return 0;
+}
+
+int testCloneMetadataPreservation()
+{
+    namespace grh = wolvrix::lib::grh;
+    for (const bool namedPorts : {false, true})
+    for (int provenance = 0; provenance < 4; ++provenance)
+    {
+        grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+        const auto input = child.createValue(child.internSymbol("x"), 8, false);
+        const auto intermediate = child.createValue(8, false);
+        const auto output = child.createValue(child.internSymbol("y"), 8, false);
+        child.bindInputPort("x", input);
+        child.bindOutputPort("y", output);
+        const auto producer = child.createOperation(grh::OperationKind::kNot, child.internSymbol("producer"));
+        child.addDeclaredSymbol(child.operationSymbol(producer));
+        child.addOperand(producer, input);
+        child.addResult(producer, intermediate);
+        const auto forward = child.createOperation(grh::OperationKind::kAssign);
+        child.addOperand(forward, intermediate);
+        child.addResult(forward, output);
+        child.setAttr(producer, "before", std::string("preserve-before"));
+        if (provenance == 1) child.setAttr(producer, kOriginModulesKey, std::vector<std::string>{});
+        if (provenance == 2) child.setAttr(producer, kOriginModulesKey, std::vector<std::string>{"leaf", "u0", "leaf"});
+        // Preserve the historical overwrite behavior for a non-vector attr.
+        if (provenance == 3) child.setAttr(producer, kOriginModulesKey, int64_t{7});
+        child.setAttr(producer, "after", std::string("preserve-after"));
+        grh::SrcLoc location;
+        location.file = "a/long/source/path/whose/storage/must/outlive/each/clone/source.fir";
+        location.line = 12; location.column = 4; location.endLine = 14; location.endColumn = 9;
+        location.origin = "original-frontend-location";
+        location.pass = "ingest-firrtl";
+        location.note = "a source location note with independently owned string storage";
+        child.setOpSrcLoc(producer, location);
+        child.setValueSrcLoc(intermediate, location);
+        const auto sameLocation = [&](const std::optional<grh::SrcLoc> &actual) {
+            return actual && actual->file == location.file && actual->line == location.line &&
+                   actual->column == location.column && actual->endLine == location.endLine &&
+                   actual->endColumn == location.endColumn && actual->origin == location.origin &&
+                   actual->pass == location.pass && actual->note == location.note;
+        };
+        const auto topInput = top.createValue(top.internSymbol("x"), 8, false);
+        top.bindInputPort("x", topInput);
+        top.addDeclaredSymbol(top.valueSymbol(topInput));
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto name = "y" + std::to_string(i);
+            const auto value = top.createValue(top.internSymbol(name), 8, false);
+            top.bindOutputPort(name, value);
+            top.addDeclaredSymbol(top.valueSymbol(value));
+            const auto instance = top.createOperation(grh::OperationKind::kInstance);
+            top.addOperand(instance, topInput);
+            top.addResult(instance, value);
+            top.setAttr(instance, "moduleName", std::string("child"));
+            top.setAttr(instance, "instanceName", "u" + std::to_string(i));
+            if (namedPorts)
+            {
+                top.setAttr(instance, "inputPortName", std::vector<std::string>{"x"});
+                top.setAttr(instance, "outputPortName", std::vector<std::string>{"y"});
+            }
+        }
+        HierFlattenOptions options;
+        options.preserveFlattenedModules = true;
+        PassManager manager;
+        manager.addPass(std::make_unique<HierFlattenPass>(options));
+        PassDiagnostics diags;
+        if (!manager.run(design, diags).success || diags.hasError())
+            return fail("metadata clone flatten failed");
+        const auto sourceProducer = child.findOperation("producer");
+        if (!sameLocation(child.opSrcLoc(sourceProducer)) ||
+            !sameLocation(child.valueSrcLoc(child.opResults(sourceProducer)[0])))
+            return fail("cloning moved metadata out of its preserved source definition");
+        std::vector<std::string> expectedKeys;
+        for (const auto &attr : child.opAttrs(sourceProducer)) expectedKeys.push_back(attr.key);
+        if (provenance == 0) expectedKeys.emplace_back(kOriginModulesKey);
+        for (int i = 0; i < 2; ++i)
+        {
+            const std::string prefix = "u" + std::to_string(i);
+            const auto clone = top.findOperation(prefix + "$producer");
+            if (!clone.valid() || !sameLocation(top.opSrcLoc(clone)) ||
+                !sameLocation(top.valueSrcLoc(top.opResults(clone)[0])))
+                return fail("cloned value or operation source location changed");
+            const auto expectedOrigins = provenance == 2
+                ? (i == 0 ? std::vector<std::string>{"leaf", "u0", "leaf"}
+                          : std::vector<std::string>{"u1", "leaf", "u0", "leaf"})
+                : std::vector<std::string>{prefix};
+            if (getOriginModules(top, clone) != expectedOrigins)
+                return fail("clone changed provenance order, duplicates, or empty-attr handling");
+            std::vector<std::string> actualKeys;
+            for (const auto &attr : top.opAttrs(clone)) actualKeys.push_back(attr.key);
+            if (actualKeys != expectedKeys ||
+                getAttrString(top.getOperation(clone), "before") != "preserve-before" ||
+                getAttrString(top.getOperation(clone), "after") != "preserve-after")
+                return fail("cloning changed generic attributes or their insertion order");
+        }
+    }
+    return 0;
+}
+
+int testFrozenNestedDefinitionsAndPassReuse()
+{
+    namespace grh = wolvrix::lib::grh;
+    grh::Design design;
+    // Keep outer reference sets live while enough distinct inner definitions
+    // are visited to grow the cache, then revisit every definition as a sibling.
+    constexpr int depth = 24;
+    std::vector<grh::Graph *> modules;
+    for (int i = 0; i < depth; ++i) modules.push_back(&design.createGraph("m" + std::to_string(i)));
+    auto &top = design.createGraph("top");
+    design.markAsTop("top");
+    const auto instantiate = [](grh::Graph &graph, std::string module, std::string name,
+                                grh::ValueId input, grh::ValueId output) {
+        const auto instance = graph.createOperation(grh::OperationKind::kInstance);
+        graph.addOperand(instance, input);
+        graph.addResult(instance, output);
+        graph.setAttr(instance, "moduleName", std::move(module));
+        graph.setAttr(instance, "instanceName", std::move(name));
+        graph.setAttr(instance, "inputPortName", std::vector<std::string>{"x"});
+        graph.setAttr(instance, "outputPortName", std::vector<std::string>{"y"});
+    };
+    const auto state = [](grh::Graph &graph, const std::string &name) {
+        const auto op = graph.createOperation(grh::OperationKind::kRegister, graph.internSymbol(name));
+        graph.addDeclaredSymbol(graph.operationSymbol(op));
+        graph.setAttr(op, "width", int64_t{8});
+        graph.setAttr(op, "isSigned", false);
+        graph.setAttr(op, "initValue", std::string("8'b0"));
+    };
+    for (int i = 0; i < depth; ++i)
+    {
+        auto &graph = *modules[i];
+        const auto input = graph.createValue(graph.internSymbol("x"), 8, false);
+        const auto output = graph.createValue(graph.internSymbol("y"), 8, false);
+        graph.bindInputPort("x", input);
+        graph.bindOutputPort("y", output);
+        auto nested = input;
+        if (i + 1 < depth)
+        {
+            nested = graph.createValue(8, false);
+            instantiate(graph, "m" + std::to_string(i + 1), "nested", input, nested);
+        }
+        // These ops use the outer cached set after recursively adding entries.
+        state(graph, "state");
+        const auto readValue = graph.createValue(8, false);
+        const auto read = graph.createOperation(grh::OperationKind::kRegisterReadPort, graph.internSymbol("read"));
+        graph.addDeclaredSymbol(graph.operationSymbol(read));
+        graph.addResult(read, readValue);
+        graph.setAttr(read, "regSymbol", std::string("state"));
+        const auto combine = graph.createOperation(grh::OperationKind::kXor);
+        graph.addOperand(combine, nested);
+        graph.addOperand(combine, readValue);
+        graph.addResult(combine, output);
+    }
+    const auto topInput = top.createValue(top.internSymbol("x"), 8, false);
+    top.bindInputPort("x", topInput);
+    top.addDeclaredSymbol(top.valueSymbol(topInput));
+    const auto addTopInstance = [&](int ordinal) {
+        const auto name = "y" + std::to_string(ordinal);
+        const auto output = top.createValue(top.internSymbol(name), 8, false);
+        top.bindOutputPort(name, output);
+        top.addDeclaredSymbol(top.valueSymbol(output));
+        instantiate(top, "m0", "u" + std::to_string(ordinal), topInput, output);
+    };
+    addTopInstance(0); addTopInstance(1);
+    HierFlattenOptions options;
+    options.preserveFlattenedModules = true;
+    PassManager manager;
+    manager.addPass(std::make_unique<HierFlattenPass>(options));
+    PassDiagnostics first;
+    if (!manager.run(design, first).success || first.hasError())
+        return fail("frozen nested-definition flatten failed");
+    for (const auto *module : modules)
+        if (!module->frozen()) return fail("nested definition did not exercise frozen-source caching");
+    const auto checkReads = [&](int ordinal, bool updated) {
+        std::string prefix = "u" + std::to_string(ordinal);
+        for (int i = 0; i < depth; ++i)
+        {
+            const auto read = top.findOperation(prefix + "$read");
+            const auto targetName = prefix + (updated && i == 0 ? "$fresh_state" : "$state");
+            const auto target = top.findOperation(targetName);
+            if (!read.valid() || !target.valid() || top.opKind(target) != grh::OperationKind::kRegister ||
+                getAttrString(top.getOperation(read), "regSymbol") != targetName)
+                return false;
+            prefix += "$nested";
+        }
+        return true;
+    };
+    if (!checkReads(0, false) || !checkReads(1, false))
+        return fail("nested cache growth or sibling reuse changed symbol-reference remapping");
+
+    // Thaw and change the preserved source, then reuse the same pass object.
+    // A stale per-pass symbol set would omit the new forward reference target.
+    auto &source = *modules.front();
+    source.setAttr(source.findOperation("read"), "regSymbol", std::string("fresh_state"));
+    state(source, "fresh_state");
+    if (source.frozen()) return fail("source edit did not exercise a thawed definition");
+    addTopInstance(2);
+    PassDiagnostics second;
+    if (!manager.run(design, second).success || second.hasError() || !source.frozen())
+        return fail("same-pass flatten failed after modifying a retained definition");
+    if (!checkReads(0, false) || !checkReads(1, false) || !checkReads(2, true))
+        return fail("same-pass source mutation reused stale mappings or changed earlier instances");
+    return 0;
+}
+
 int main()
 {
+    if (const int result = testFrozenNestedDefinitionsAndPassReuse()) return result;
+    if (const int result = testCloneMetadataPreservation()) return result;
+    if (const int result = testSharedPortInputFirstMapping()) return result;
+    if (const int result = testForwardSymbolReferences()) return result;
+    if (const int result = testDpiCallBeforeImportSiblingDedup()) return result;
+    if (const int result = testUnresolvedSymbolReferenceDiagnostics()) return result;
+    if (const int result = testSourceFreezeEquivalence()) return result;
+    if (const int result = testSourceFreezeFallbackAndFailure()) return result;
+    if (const int result = testSourceFreezeBlackboxRetention()) return result;
+    if (const int result = testSourceFreezeDiagnosticFallback()) return result;
     if (const int result = testSharedScalarIndexShape(); result != 0)
         return result;
     if (const int result = testDpiImportOriginMerge(); result != 0)

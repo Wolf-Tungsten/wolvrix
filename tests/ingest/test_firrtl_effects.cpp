@@ -31,6 +31,83 @@ void annotations() {
     reject(R"JSON({"class":"firrtl.passes.InlineAnnotation","target":"~wrong|top"})JSON", "another circuit");
     reject(R"JSON({"class":"firrtl.passes.InlineAnnotation","target":"~|missing"})JSON", "unknown module");
     reject(R"JSON({"class":"firrtl.passes.InlineAnnotation","target":"~|top","x":"\ud800"})JSON", "surrogate");
+
+    const std::string zeroWidth = R"FIR(FIRRTL version 6.0.0
+circuit top :%[[
+  {"class":"firrtl.transforms.DontTouchAnnotation","target":"~|top>packet.mask"},
+  {"class":"firrtl.transforms.DontTouchAnnotation","target":"~|top>empty[1]"}
+]]
+  public module top :
+    input packet : {mask : UInt<0>, data : UInt<8>}
+    output y : UInt<8>
+    wire empty : UInt<0>[2]
+    connect y, packet.data
+)FIR";
+    std::ofstream(path) << zeroWidth;
+    result = read(path); require(result.success(), diagnostics(result));
+    restored = roundTrip(*result.design);
+    auto& zeroGraph = *restored.findGraph("top");
+    require(zeroGraph.declaredSymbols().empty() && !zeroGraph.findValue("packet__DOT__mask") && !zeroGraph.findValue("empty"),
+        "zero-width DontTouch created a fake executable carrier");
+    require(std::get<std::vector<std::string>>(*zeroGraph.metadata("firrtl.annotations")).size() == 2,
+        "zero-width DontTouch annotation was dropped");
+    valid(restored);
+    auto missing = zeroWidth;
+    missing.replace(missing.find("packet.mask"), std::string("packet.mask").size(), "packet.missing");
+    std::ofstream(path) << missing;
+    result = read(path);
+    require(!result.success() && diagnostics(result).find("DontTouch target cannot be resolved") != std::string::npos,
+        "zero-width target handling accepted an unknown field");
+
+    std::ofstream(path) << R"FIR(FIRRTL version 6.0.0
+circuit top :%[[
+  {"class":"firrtl.transforms.DontTouchAnnotation","target":"~|top>state"},
+  {"class":"firrtl.transforms.DontTouchAnnotation","target":"~|top>packet"}
+]]
+  public module top :
+    input clock : Clock
+    input reset : Reset
+    input a : UInt<3>
+    regreset state : UInt<3>, clock, reset, UInt<3>(0)
+    reg packet : {tag : UInt<3>, bytes : UInt<8>[2]}, clock
+    connect state, a
+    connect packet.tag, a
+    connect packet.bytes[0], UInt<8>(1)
+    connect packet.bytes[1], UInt<8>(2)
+)FIR";
+    result = read(path); require(result.success(), diagnostics(result));
+    restored = roundTrip(*result.design);
+    run(restored, std::make_unique<tx::SimplifyPass>());
+    const auto& stateGraph = *restored.findGraph("top");
+    for (const auto& name : {"state", "packet__DOT__tag", "packet__DOT__bytes"}) {
+        const auto state = stateGraph.findOperation(name);
+        require(state && stateGraph.getOperation(state).kind() == OperationKind::kRegister,
+            "DontTouch did not preserve the register declaration");
+    }
+    valid(restored);
+
+    std::ofstream(path) << R"FIR(FIRRTL version 6.0.0
+circuit top :%[[
+  {"class":"firrtl.transforms.DontTouchAnnotation","target":"~|top>storage"}
+]]
+  public module top :
+    cmem storage : {tag : UInt<3>, bytes : UInt<8>[2]}[4]
+    cmem storageExtra : UInt<8>[4]
+)FIR";
+    result = read(path); require(result.success(), diagnostics(result));
+    restored = roundTrip(*result.design);
+    auto& memoryGraph = *restored.findGraph("top");
+    require(memoryGraph.declaredSymbols().size() == 2,
+        "memory DontTouch did not anchor exactly the aggregate memory leaves");
+    for (const auto symbol : memoryGraph.declaredSymbols()) {
+        const auto state = memoryGraph.findOperation(memoryGraph.symbolText(symbol));
+        require(state && memoryGraph.getOperation(state).attr("firrtl.memory") == std::optional<grh::AttributeValue>(std::string("storage")),
+            "memory DontTouch anchored an unrelated declaration");
+    }
+    run(restored, std::make_unique<tx::SimplifyPass>());
+    for (const auto symbol : memoryGraph.declaredSymbols())
+        require(memoryGraph.findOperation(memoryGraph.symbolText(symbol)).valid(), "memory DontTouch declaration lost in simplify");
+    valid(restored);
 }
 void probes(const std::filesystem::path& output) {
     auto result = text("probe-aggregate", R"FIR(    input en : UInt<1>
@@ -184,6 +261,7 @@ void test() {
     terminal(output, "assert", "assert(clk, UInt<1>(0), en, \"bad=%d\", data)", 1, "[fatal] bad=9\n");
     terminal(output, "assume", "assume(clk, UInt<1>(0), en, \"assumed=%d\", data)", 1, "[fatal] assumed=9\n");
     terminal(output, "intrinsic", "intrinsic(circt_chisel_ifelsefatal<format=\"intrinsic bad\",label=\"chisel3_builtin\">,clk,UInt<1>(0),en)", 1, "[fatal] intrinsic bad\n");
+    terminal(output, "intrinsic-args", "intrinsic(circt_chisel_ifelsefatal<format=\"intrinsic bad %d 0x%x\",label=\"chisel3_builtin\">,clk,UInt<1>(0),en,UInt<8>(42),UInt<8>(42))", 1, "[fatal] intrinsic bad 42 0x2a\n");
     error("effect-width", "    input c : Clock\n    printf(c, UInt<2>(1), \"x\")\n", "UInt<1>");
     error("effect-format", "    input c : Clock\n    printf(c, UInt<1>(1), \"%d\")\n", "argument count");
     error("effect-unknown-intrinsic", "    intrinsic(unknown_effect)\n", "unsupported effect intrinsic");
@@ -198,7 +276,7 @@ void test() {
             "missing external implementation did not produce a binding request");
     require(external.modules.size() == 2 && external.modules.front().external && external.modules.front().implementationName == "Impl",
             "external signature was lost with the binding diagnostic");
-    std::ofstream(output / "run.mk") << ".PHONY: run ordered probes layers stop stop-negative assert assume intrinsic\nrun: ordered probes layers stop stop-negative assert assume intrinsic\nordered probes layers:\n\t$(MAKE) -C $@ -f run.mk run\nstop stop-negative assert assume intrinsic:\n\t$(MAKE) -C $@ -f run.mk driver\n\t$(MAKE) -C $@ -f check.mk check\n";
+    std::ofstream(output / "run.mk") << ".PHONY: run ordered probes layers stop stop-negative assert assume intrinsic intrinsic-args\nrun: ordered probes layers stop stop-negative assert assume intrinsic intrinsic-args\nordered probes layers:\n\t$(MAKE) -C $@ -f run.mk run\nstop stop-negative assert assume intrinsic intrinsic-args:\n\t$(MAKE) -C $@ -f run.mk driver\n\t$(MAKE) -C $@ -f check.mk check\n";
 }
 }
 int main() { try { test(); return 0; } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

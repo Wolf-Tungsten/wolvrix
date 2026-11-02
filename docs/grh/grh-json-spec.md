@@ -10,6 +10,15 @@ StoreJson 输出 GRH 设计的紧凑 JSON 表示，统一 CLI 与测试的入口
 - `PrettyCompact`（默认）：保持顶层/Graph 缩进，但 `vals`/`ports`/`ops` 元素各占一行。
 - `Pretty`: 全量缩进换行（每个字段独立一行）。
 
+`PrettyCompact` 的文件输出与 `StoreJson::storeToString` 使用同一套排版规则，逐字节一致；
+文件路径通过固定 64 KiB 输出缓冲区增量写入，不构建完整 JSON 字符串。
+Graph metadata 只排序属性指针，不复制属性负载。图名/别名排序和单个常量格式化等
+局部临时数据仍会分配内存。`storeToString` 按接口约定保留完整字符串；`Compact` 和
+`Pretty` 继续使用 Slang JsonWriter 的完整字符串输出路径。
+
+文件打开、写入、flush 和 close 均成功后才返回成功的 artifact。失败会记录诊断并返回
+`success=false` 和空 artifact 列表；目标文件可能已包含部分内容，不能作为有效 checkpoint 使用。
+
 ## 顶层结构
 
 数组构造以普通 op 名 `kArrayCreate` 持久化，operands 按低元素到高元素排列。
@@ -153,6 +162,18 @@ JSON 中若仍保留该 op，表示流程未完成。
 - `Compact` 模式无多余空格与换行；`PrettyCompact` 模式下 `vals`、`ports.in/out`、`ops` 数组的元素均单行展示；`Pretty` 模式每个字段独立换行。
 
 ## 兼容性
+
+`LoadJson::loadFile(path)` 和 Python `read_json_file` 使用 64 KiB 输入缓冲，
+将 JSON 数组保留为可定位的文件区间，按记录读取 value/op 和属性数组。
+因此不同时保存完整文件文本和完整 JSON DOM；对象字段顺序、端口顺序、
+属性编码和旧格式兼容规则与文本入口相同。加载不冻结图，不恢复旧 ID。
+属性数组直接积累为最终类型的向量；最终 Graph 和单条记录本身仍需内存。
+非数组对象仍会物化，含大量标量属性的 metadata 对象和单个超长字符串
+也会占用额外内存，不保证任意规模输入都能装入。文件须在整个同步读取过程中保持不变。
+`LoadJson::load(text)` / `load_json_text` 保留完整文本 DOM 路径。
+文件错误、语法或图构建错误都在 session 发布新设计之前返回；失败替换
+保留已有设计。
+
 - Design 解析要求使用 `graphs/vals/ports/ops` 等新键名；属性对象支持 `t/k/kind` 与 `v/value`、`vs/values` 的兼容别名。
 - 无 formatVersion 的旧基础 GRH 默认为 FourState；不接受未知显式版本。
   已删除的 `kAssignAs` 明确拒绝，提示重新生成。扩展 op 必须声明所属方言版本，

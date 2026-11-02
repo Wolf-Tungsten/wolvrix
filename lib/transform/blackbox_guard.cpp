@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -38,34 +39,34 @@ namespace wolvrix::lib::transform
             std::vector<InoutSpec> inouts;
         };
 
-        std::optional<std::string> getAttrString(const wolvrix::lib::grh::Operation &op,
-                                                 std::string_view key)
+        std::optional<std::string_view> getAttrString(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+                                                      std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
+            for (const auto &entry : attrs)
             {
-                return std::nullopt;
-            }
-            if (auto value = std::get_if<std::string>(&*attr))
-            {
-                return *value;
+                if (entry.key == key)
+                {
+                    if (const auto *value = std::get_if<std::string>(&entry.value))
+                    {
+                        return *value;
+                    }
+                    return std::nullopt;
+                }
             }
             return std::nullopt;
         }
 
-        std::optional<std::vector<std::string>> getAttrStrings(const wolvrix::lib::grh::Operation &op,
-                                                                std::string_view key)
+        const std::vector<std::string> *getAttrStrings(std::span<const wolvrix::lib::grh::AttrKV> attrs,
+                                                       std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
+            for (const auto &entry : attrs)
             {
-                return std::nullopt;
+                if (entry.key == key)
+                {
+                    return std::get_if<std::vector<std::string>>(&entry.value);
+                }
             }
-            if (auto values = std::get_if<std::vector<std::string>>(&*attr))
-            {
-                return *values;
-            }
-            return std::nullopt;
+            return nullptr;
         }
 
         std::string opContext(const wolvrix::lib::grh::Graph &graph,
@@ -97,10 +98,9 @@ namespace wolvrix::lib::transform
             {
                 return spec;
             }
-            const wolvrix::lib::grh::Value value = graph.getValue(valueId);
-            spec.width = std::max<int32_t>(1, value.width());
-            spec.isSigned = value.isSigned();
-            spec.type = value.type();
+            spec.width = std::max<int32_t>(1, graph.valueWidth(valueId));
+            spec.isSigned = graph.valueSigned(valueId);
+            spec.type = graph.valueType(valueId);
             return spec;
         }
 
@@ -185,13 +185,13 @@ namespace wolvrix::lib::transform
             const wolvrix::lib::grh::Graph &graph = *entry.second;
             for (const auto opId : graph.operations())
             {
-                const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kBlackbox)
+                if (graph.opKind(opId) != wolvrix::lib::grh::OperationKind::kBlackbox)
                 {
                     continue;
                 }
                 const std::string context = opContext(graph, opId);
-                auto moduleName = getAttrString(op, "moduleName");
+                const auto attrs = graph.opAttrs(opId);
+                auto moduleName = getAttrString(attrs, "moduleName");
                 if (!moduleName || moduleName->empty())
                 {
                     warning("blackbox-guard: missing moduleName", context);
@@ -199,13 +199,13 @@ namespace wolvrix::lib::transform
                 }
                 if (design().findGraph(*moduleName) != nullptr)
                 {
-                    convertibleModules.insert(*moduleName);
+                    convertibleModules.insert(std::string(*moduleName));
                     continue;
                 }
 
-                auto inputNames = getAttrStrings(op, "inputPortName");
-                auto outputNames = getAttrStrings(op, "outputPortName");
-                auto inoutNames = getAttrStrings(op, "inoutPortName");
+                auto inputNames = getAttrStrings(attrs, "inputPortName");
+                auto outputNames = getAttrStrings(attrs, "outputPortName");
+                auto inoutNames = getAttrStrings(attrs, "inoutPortName");
                 if (!inputNames || !outputNames)
                 {
                     warning("blackbox-guard: missing port names", context);
@@ -214,12 +214,12 @@ namespace wolvrix::lib::transform
                 const std::size_t inCount = inputNames->size();
                 const std::size_t outCount = outputNames->size();
                 const std::size_t inoutCount = inoutNames ? inoutNames->size() : 0;
-                const auto &operands = op.operands();
-                const auto &results = op.results();
+                const auto operands = graph.opOperands(opId);
+                const auto results = graph.opResults(opId);
                 bool sizeMismatch = false;
 
                 StubSpec spec;
-                spec.moduleName = *moduleName;
+                spec.moduleName = std::string(*moduleName);
                 spec.inputs.reserve(inCount);
                 spec.outputs.reserve(outCount);
                 spec.inouts.reserve(inoutCount);
@@ -281,7 +281,7 @@ namespace wolvrix::lib::transform
                     warning("blackbox-guard: port count mismatch; using fallback widths", context);
                 }
 
-                auto it = stubs.find(*moduleName);
+                auto it = stubs.find(std::string(*moduleName));
                 if (it == stubs.end())
                 {
                     stubs.emplace(*moduleName, std::move(spec));
@@ -290,7 +290,7 @@ namespace wolvrix::lib::transform
                 {
                     warning("blackbox-guard: blackbox port signature mismatch; keeping first stub", context);
                 }
-                convertibleModules.insert(*moduleName);
+                convertibleModules.insert(std::string(*moduleName));
             }
         }
 
@@ -339,17 +339,17 @@ namespace wolvrix::lib::transform
                 wolvrix::lib::grh::Graph &graph = *entry.second;
                 for (const auto opId : graph.operations())
                 {
-                    const wolvrix::lib::grh::Operation op = graph.getOperation(opId);
-                    if (op.kind() != wolvrix::lib::grh::OperationKind::kBlackbox)
+                    if (graph.opKind(opId) != wolvrix::lib::grh::OperationKind::kBlackbox)
                     {
                         continue;
                     }
-                    auto moduleName = getAttrString(op, "moduleName");
+                    const auto attrs = graph.opAttrs(opId);
+                    auto moduleName = getAttrString(attrs, "moduleName");
                     if (!moduleName || moduleName->empty())
                     {
                         continue;
                     }
-                    if (convertibleModules.find(*moduleName) == convertibleModules.end())
+                    if (convertibleModules.find(std::string(*moduleName)) == convertibleModules.end())
                     {
                         continue;
                     }

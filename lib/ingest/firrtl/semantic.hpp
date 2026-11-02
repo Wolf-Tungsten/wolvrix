@@ -100,6 +100,7 @@ struct Leaf {
     std::vector<std::string> fields;
     int flow = 3;
     TypeKind probe = TypeKind::Unknown;
+    std::vector<std::size_t> shapeFieldDepths;
 };
 
 // Both standard memory ports and CHIRRTL accesses use this frontend-only model.
@@ -138,15 +139,19 @@ class Semantics {
 public:
     Semantics(const Source& source, const ModuleBody& body, const FirrtlOptions& options,
               const std::map<std::string, ModuleSignature>* interfaces = nullptr);
-    void analyze();
+    void analyze(bool allowUnknownWidths = false);
     TypePtr expression(ExprId id);
     std::vector<Leaf> leaves(TypePtr type, int flow = 1) const;
+    const std::vector<Leaf>& leavesCached(TypePtr type, int flow = 1) const;
     int64_t width(TypePtr type) const;
     int64_t total(const Leaf& leaf) const;
     TypeKind resolvedKind(TypePtr type) const;
+    uint32_t resetGroup(TypePtr type) const;
+    unsigned resetConstraint(TypePtr type) const;
     TypePtr projected(TypePtr type, const std::vector<std::string>& fields) const;
     std::optional<int64_t> staticIndex(ExprId id) const;
     std::string expressionKey(ExprId id) const;
+    bool constantValue(ExprId id) const;
 
     const Source& source;
     const ModuleBody& body;
@@ -163,6 +168,13 @@ public:
     bool layerEnabled(std::string_view path) const;
 
 private:
+    using ConstantLeaf = std::pair<std::string, std::vector<std::string>>;
+    using ConstantSelection = std::tuple<std::string, std::vector<std::string>, std::vector<std::optional<int64_t>>>;
+    struct ConstantDriver { std::size_t connection; std::vector<ExprId> indices; };
+    mutable bool constantDriversReady_ = false;
+    mutable std::map<ConstantLeaf, std::vector<ConstantDriver>> constantDrivers_;
+    mutable std::map<ConstantSelection, bool> constantValues_;
+    mutable std::map<std::pair<TypePtr, int>, std::vector<Leaf>> leavesCache_;
     std::vector<Width> widths_;
     std::vector<WidthConstraint> constraints_;
     std::vector<uint32_t> resetParents_;
@@ -177,6 +189,15 @@ private:
     std::vector<std::string> enabledLayers_;
     std::string activeLayer_;
     const std::map<std::string, ModuleSignature>* interfaces_;
+    std::vector<Leaf> computeLeaves(TypePtr type, int flow) const;
+    // The interface map is owned by Transaction and may be replaced between
+    // Semantics objects. Keep only borrowed first-match pointers for this
+    // analysis, indexing only interfaces used by this module. Never retain
+    // this cache past the current Semantics object.
+    mutable std::unordered_map<std::string_view,
+        std::map<std::vector<std::string>, const PortLeafSignature*>> interfacePorts_;
+    const PortLeafSignature* resolvedPort(std::string_view module,
+                                          const std::vector<std::string>& fields) const;
     std::string layerPath(const Statement& statement) const;
     uint32_t newWidth(int64_t value, Range range);
     uint32_t newReset(unsigned flags);
@@ -195,7 +216,7 @@ private:
     TypePtr merge(TypePtr left, TypePtr right, Range range);
     bool passive(TypePtr type) const;
     int flow(ExprId id) const;
-    void solve();
+    void solve(bool allowUnknownWidths);
     void normalizeGuards();
     void collectMemory(const Statement& statement);
     void collectMemoryPort(const Statement& statement);

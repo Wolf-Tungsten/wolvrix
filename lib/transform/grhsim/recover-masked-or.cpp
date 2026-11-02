@@ -256,7 +256,9 @@ PassResult RecoverMaskedOrPass::run()
             result.changed = recover(scope, options_.minTerms, report.is_open() ? &report : nullptr, regions) || result.changed;
         }
         // Cleanup follows all matching, so each stored candidate ID remains live.
-        for (const auto& owner : owners) { detail::Scope scope(graph, owner); result.changed = scope.dce() || result.changed; }
+        ingest::node::DeadRootBatch deadRoots(graph);
+        for (const auto& owner : owners) { detail::Scope scope(graph, owner); result.changed = scope.dce(&deadRoots) || result.changed; }
+        deadRoots.flush();
         if (report.is_open()) {
             report.flush(); if (!report) throw std::runtime_error("Failed writing maskedOr report");
             result.artifacts.push_back(options_.report.string());

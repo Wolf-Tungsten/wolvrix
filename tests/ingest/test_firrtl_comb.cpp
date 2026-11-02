@@ -106,7 +106,40 @@ circuit main :
     auto ambiguous=ingest::readSources(request);
     require(!ambiguous.success() && !ambiguous.design && diagnostics(ambiguous).find("ambiguous")!=std::string::npos,"ambiguous module identity silently bound");
 }
+void sourceInfoOwnership() {
+    const std::string first = "@[/long/source/path/that/exceeds/small/string/storage/First.scala 152:69]";
+    const std::string second = "@[/another/long/source/path/that/exceeds/small/string/storage/Second.scala 153:70]";
+    auto result = text("source-info-ownership",
+        "    input a : UInt<5>\n"
+        "    input b : UInt<5>\n"
+        "    output y : UInt<8>\n"
+        "    node n = add(and(a, b), or(a, b)) " + first + "\n"
+        "    connect y, add(and(n, n), or(n, n)) " + second + "\n");
+    require(result.success(), diagnostics(result));
+    result.sourceOwners.clear();
+    const auto check = [&](const grh::Graph& graph) {
+        unsigned checked = 0;
+        for (const auto op : graph.operations()) {
+            const auto kind = graph.opKind(op);
+            if (kind != OperationKind::kAnd && kind != OperationKind::kOr && kind != OperationKind::kAdd) continue;
+            const auto loc = graph.opSrcLoc(op);
+            require(loc && (loc->line == 7 || loc->line == 8), "nested expression source line lost");
+            const auto& expected = loc->line == 7 ? first : second;
+            require(loc->note == expected, "nested expression source info borrowed temporary storage");
+            for (const auto value : graph.opResults(op)) {
+                const auto valueLoc = graph.valueSrcLoc(value);
+                require(valueLoc && valueLoc->note == expected, "expression result source info changed");
+            }
+            ++checked;
+        }
+        require(checked == 6, "source info fixture did not exercise nested expressions on both lines");
+    };
+    check(*result.design->findGraph("top"));
+    auto stored = roundTrip(*result.design);
+    check(*stored.findGraph("top"));
+}
 void test() {
+    sourceInfoOwnership();
     selection();
     const auto path = std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "comb/basic.fir";
     auto source = design(path); auto& graph = *source.findGraph("top");

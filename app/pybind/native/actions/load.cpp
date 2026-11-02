@@ -2,6 +2,7 @@
 
 #include "native/diagnostics/to_python.hpp"
 #include "native/session/storage.hpp"
+#include "core/load.hpp"
 
 #include <exception>
 #include <string>
@@ -33,19 +34,10 @@ namespace wolvrix::app::pybind
             return nullptr;
         }
 
-        std::string contents;
-        std::string readError;
-        if (!readFileText(path, contents, readError))
-        {
-            return makeActionResult(false,
-                                    singleDiagnostic(wolvrix::lib::diag::DiagnosticKind::Error,
-                                                     readError, "read_json_file"),
-                                    nullptr);
-        }
-
         try
         {
-            auto design = wolvrix::lib::grh::Design::fromJsonString(contents);
+            wolvrix::lib::load::LoadJson loader;
+            auto design = loader.loadFile(path);
             if (replace)
             {
                 sessionEraseKey(*session, outDesign);

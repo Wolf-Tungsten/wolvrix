@@ -77,7 +77,11 @@ are strings. Unknown classes and extra/missing/non-string fields fail.
 | firrtl.transforms.BlackBoxResourceAnno | resourceId | Resolve a source under explicit resource roots. |
 
 All records also require class/target. Circuit/module targets are checked.
-Hierarchical DontTouch is currently rejected; unresolved direct targets fail. Metadata
+Hierarchical DontTouch is currently rejected; unresolved direct targets fail.
+Register targets anchor the state operation; its read result can use a generated
+value name. Aggregate targets anchor each surviving field declaration.
+Direct targets erased as zero-width leaves resolve through `firrtl.elidedLeaves`;
+their annotations remain recorded without creating executable values or anchors. Metadata
 retains `firrtl.annotationCounts`, selected `firrtl.annotations`, and
 `firrtl.pendingExternalAnnotations` and `firrtl.boundExternalAnnotations` separating
 unused and linked original blackbox JSON. Unicode

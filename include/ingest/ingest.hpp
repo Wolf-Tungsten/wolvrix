@@ -4,6 +4,7 @@
 #include "core/grh.hpp"
 #include "core/logging.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -73,6 +74,9 @@ struct PortLeafSignature {
     int32_t elementWidth = 0;
     bool isSigned = false;
     std::vector<int64_t> shape;
+    // Field-path depth of each Vector dimension: r[0].data has depth 1,
+    // while r.data[0] has depth 2. Arrays remain shaped GRH values.
+    std::vector<std::size_t> shapeFieldDepths;
     // Scanning retains source semantics before width/reset/ABI resolution.
     std::string sourceType;
     bool requiresTypeResolution = false;

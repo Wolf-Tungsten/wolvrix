@@ -381,11 +381,11 @@ GrhSIM 包不依赖 Verilator，默认 `make` 构建 `libgrhsim_<top>.a`；
 `init()` 重置模型状态和计时统计；第一个 `eval()` 建立输入边沿基线，初始高电平不视为
 上升沿。常规同步设计应先执行时钟低电平的 eval，再翻转时钟。
 
-生成的 GrhSIM Makefile 对 Clang 21 的 x86/SSE2 向量 shuffle 错误代码生成加入兼容处理：
-目标未启用 SSSE3 时自动追加 `-fno-slp-vectorize`，保留 `-O3` 和循环向量化。
-GCC、其他 Clang 版本、非 x86 目标及显式启用 SSSE3 的构建不追加该选项。
-检测使用调用方的 `CXX/CPPFLAGS/CXXFLAGS`，Verilator 的生成/编译路径不变。
-这是规避已复现的编译器错误，不是 RTL 或分区的特例优化。
+生成的 GrhSIM Makefile 保留编译器默认优化，不按 Clang 版本或目标架构自动追加
+`-fno-slp-vectorize`；`GRHSIM_COMPILER_FLAGS` 默认为空。历史 SSE2 shuffle 和
+bool change-reduction 的复现用例继续保留，编译器验证失败时直接报告，后续在 Clang
+层定位和修复，不自动关闭 SLP。更换优化选项后须清理旧 PCH/对象并重新编译。
+Verilator 的生成/编译路径不变。
 
 当前边界：
 

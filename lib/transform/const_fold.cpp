@@ -93,6 +93,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
             case wolvrix::lib::grh::OperationKind::kCountOnes:
+            case wolvrix::lib::grh::OperationKind::kGrayDecode:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
             case wolvrix::lib::grh::OperationKind::kReduceOr:
             case wolvrix::lib::grh::OperationKind::kReduceXor:
@@ -381,6 +382,16 @@ namespace wolvrix::lib::transform
                     count += operand[i].value != 0;
                 return slang::SVInt(count);
             }
+            case wolvrix::lib::grh::OperationKind::kGrayDecode: {
+                if (operand.hasUnknown()) return std::nullopt;
+                slang::SVInt result(operand.getBitWidth(), 0, false);
+                bool prefix = false;
+                for (int32_t i = operand.getBitWidth() - 1; i >= 0; --i) {
+                    prefix ^= operand[i].value != 0;
+                    result.set(i, i, slang::SVInt(1, prefix ? 1u : 0u, false));
+                }
+                return result;
+            }
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
                 return slang::SVInt(operand.reductionAnd());
             case wolvrix::lib::grh::OperationKind::kReduceOr:
@@ -407,10 +418,11 @@ namespace wolvrix::lib::transform
             }
 
             if ((op.kind() == wolvrix::lib::grh::OperationKind::kCountTrailingZeros ||
-                 op.kind() == wolvrix::lib::grh::OperationKind::kCountOnes) &&
+                 op.kind() == wolvrix::lib::grh::OperationKind::kCountOnes ||
+                 op.kind() == wolvrix::lib::grh::OperationKind::kGrayDecode) &&
                 (op.operands().size() != 1 || op.results().size() != 1))
             {
-                onError("counting intrinsic requires one input and one result");
+                onError("unary intrinsic requires one input and one result");
                 return std::nullopt;
             }
             std::vector<slang::SVInt> operands;
@@ -497,6 +509,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kCountTrailingZeros:
             case wolvrix::lib::grh::OperationKind::kCountOnes:
+            case wolvrix::lib::grh::OperationKind::kGrayDecode:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:
             case wolvrix::lib::grh::OperationKind::kReduceOr:
             case wolvrix::lib::grh::OperationKind::kReduceXor:

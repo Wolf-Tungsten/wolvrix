@@ -711,6 +711,29 @@ res[0] = constValue
 四态 RTL 结果不能由这个二态节点单独代表，故该操作当前只在 GrhSIM 二态语义
 下启用。
 
+### 6.2.5.2 Gray 解码（`kGrayDecode`）
+
+`kGrayDecode` 是一个无副作用的纯组合运算，将 `N` 位 Gray 编码转换为同宽的
+二进制值。位 `N-1` 作为最高位前缀，低位依次与更高位 Gray 输入做异或：
+
+```text
+binary[N-1] = gray[N-1]
+binary[i]   = binary[i+1] ^ gray[i]
+```
+
+**operands**:
+- `oper[0]`: `N` 位无符号二态位向量，`N > 0`
+
+**results**:
+- `res[0]`: `N` 位无符号二态位向量
+
+输入和结果都是单一定义，没有时钟、enable、存储或外部副作用。导入层只接受
+版本化的 `wolvrix_gray_decode_v1_w<N>` DPI transport；ABI 承载宽度在 `N <= 64`
+时向上取到 `1/8/16/32/64`，更宽输入保持 packed bit vector。导入后创建普通
+组合 SSA 节点，GrhSIM 对单字使用移位异或前缀，对多字值按低位到高位的字数组
+传播并屏蔽尾字无效位。当前只承诺二态 GrhSIM 语义，普通 SystemVerilog emitter
+不会尝试发射该专用操作。
+
 ---
 
 ### 6.2.6 移位运算

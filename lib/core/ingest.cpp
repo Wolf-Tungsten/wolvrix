@@ -3220,7 +3220,8 @@ private:
         const std::string_view name = subroutine.name;
         const bool isCtz = name.starts_with("wolvrix_ctz_");
         const bool isPopcount = name.starts_with("wolvrix_popcount_");
-        if (!isCtz && !isPopcount) return false;
+        const bool isGrayDecode = name.starts_with("wolvrix_gray_decode_");
+        if (!isCtz && !isPopcount && !isGrayDecode) return false;
         const auto reject = [&](std::string_view reason) {
             reportUnsupported(call, std::string("Invalid simulation intrinsic: ") + std::string(reason));
             return true;
@@ -3232,7 +3233,9 @@ private:
                 declaration->c_identifier.valueText() != name)
                 return reject("C linkage alias changes the registered contract");
         }
-        const std::string_view prefix = isCtz ? "wolvrix_ctz_v1_w" : "wolvrix_popcount_v1_w";
+        const std::string_view prefix = isCtz ? "wolvrix_ctz_v1_w" :
+                                         isPopcount ? "wolvrix_popcount_v1_w" :
+                                                       "wolvrix_gray_decode_v1_w";
         if (!name.starts_with(prefix)) return reject("unknown simulation intrinsic contract version");
         const auto digits = name.substr(prefix.size());
         int32_t width = 0;
@@ -3248,11 +3251,12 @@ private:
         if (subroutine.subroutineKind != slang::ast::SubroutineKind::Function ||
             !subroutine.getReturnType().isVoid() || args.size() != 2 || formals.size() != 2)
             return reject("expected void function with one input and one output");
+        const int32_t expectedOutputWidth = isGrayDecode ? carrier : 32;
         if (formals[0]->direction != slang::ast::ArgumentDirection::In ||
             formals[1]->direction != slang::ast::ArgumentDirection::Out ||
             !formals[0]->getType().isIntegral() || !formals[1]->getType().isIntegral() ||
             formals[0]->getType().getBitWidth() != uint64_t(carrier) ||
-            formals[1]->getType().getBitWidth() != 32 ||
+            formals[1]->getType().getBitWidth() != uint64_t(expectedOutputWidth) ||
             formals[0]->getType().isFourState() || formals[1]->getType().isFourState())
             return reject("DPI transport signature mismatch");
         if (domain != ControlDomain::Combinational || !eventContext.edges.empty() || eventContext.hasTiming)
@@ -3269,14 +3273,16 @@ private:
         // Logical width, not ABI padding, defines the zero result and tail mask.
         if (carrier != width)
             input = makeSliceDynamic(input, addConstantLiteral("0", location), width, location);
-        int32_t resultWidth = 0;
-        for (uint32_t n = static_cast<uint32_t>(width); n; n >>= 1) ++resultWidth;
+        int32_t resultWidth = isGrayDecode ? width : 0;
+        if (!isGrayDecode)
+            for (uint32_t n = static_cast<uint32_t>(width); n; n >>= 1) ++resultWidth;
         const auto operation = isCtz ? wolvrix::lib::grh::OperationKind::kCountTrailingZeros
-                                     : wolvrix::lib::grh::OperationKind::kCountOnes;
+                                     : isPopcount ? wolvrix::lib::grh::OperationKind::kCountOnes
+                                                  : wolvrix::lib::grh::OperationKind::kGrayDecode;
         ExprNodeId result = makeOperationWithWidth(operation, {input}, resultWidth, location);
         WriteIntent intent;
         intent.target = target;
-        intent.value = resizeValueToWidth(result, 32, false, location);
+        intent.value = resizeValueToWidth(result, expectedOutputWidth, false, location);
         intent.guard = guard;
         intent.domain = ControlDomain::Combinational;
         intent.location = location;

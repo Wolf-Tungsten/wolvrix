@@ -37,6 +37,22 @@
 宽度≥4 的 405 个调用。该轮 8 对测量 B 平均回退 1.136902%，95% 区间跨零；因此阈值
 4 也暂不成为默认策略，详见 [TNO0398](../../../pdocs/grhsim_opt_thj/TNO0398_popcount_ge4_intrinsic_walltime_20261103.md)。
 
+### 2026-11-03：Gray-to-binary 的 packed 原语接入
+
+utility 层新增 `GrayToBinary`。它的默认实现使用对数级移位异或前缀，保持原有硬件
+生成；单次 elaboration 选择 `--wolvrix-sim-primitives gray-decode` 时，只有 packed
+`Bits/UInt` 输入改走 `IntrinsicExpr("circt_dpi_call", ...)`，调用名为
+`wolvrix_gray_decode_v1_w<N>`。`Vec[Bool]` 没有这个入口，避免自动增加打包成本。
+
+Wolvrix 导入器把这个版本化 transport 转成同宽的 `kGrayDecode`，输入和输出都是
+普通组合 SSA 值；GrhSIM 的单字和多字 C++ helper 均已生成并通过功能检查。DPI 的
+`context function` 仍只是 Verilog 中转形式，生成的 C++ 不保留 DPI 调用。
+
+目前 XiangShan/Rocket-Chip 源码中的 `GrayCounter` 是 Gray 编码器，尚未发现可在不
+改变语义的情况下直接替换的完整 Gray-to-binary packed 调用。因此本轮只完成 utility、
+Verilog、GRH 和 C++ lowering fixture，没有据此宣称香山整机 walltime 收益；完整整机
+测量须先找到实际使用点或加入明确的局部调用。
+
 当前实验覆盖 `1,2,3,4,5,6,7,8,9,10,14,15,16,17,31,32,33,36,38,63,64,65,
 127,128,129,255,256,257,511,512,1024` 位的打包和分散 Bool 输入；实际 XiangShan
 配置额外包含 `5,6,10,14,36,38` 位。所有宽度都保留为矩阵项，不按速度挑选。

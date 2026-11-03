@@ -8990,6 +8990,7 @@ namespace wolvrix::lib::emit
             case OperationKind::kReduceAnd:
             case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+            case OperationKind::kGrayDecode:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
             case OperationKind::kReduceNor:
@@ -13272,16 +13273,30 @@ namespace wolvrix::lib::emit
             {
                 const Operation op = graph.getOperation(opId);
                 if (op.kind() == OperationKind::kCountTrailingZeros ||
-                    op.kind() == OperationKind::kCountOnes)
+                    op.kind() == OperationKind::kCountOnes ||
+                    op.kind() == OperationKind::kGrayDecode)
                 {
                     const auto inputs = op.operands();
                     const auto outputs = op.results();
-                    if (inputs.size() != 1 || outputs.size() != 1 ||
-                        graph.valueType(inputs[0]) != ValueType::Logic || graph.valueWidth(inputs[0]) <= 0 ||
-                        graph.valueType(outputs[0]) != ValueType::Logic || graph.valueSigned(outputs[0]) ||
-                        graph.valueWidth(outputs[0]) != int32_t(std::bit_width(uint32_t(graph.valueWidth(inputs[0])))))
+                    bool validIntrinsic = inputs.size() == 1 && outputs.size() == 1;
+                    if (validIntrinsic)
                     {
-                        error = "invalid counting intrinsic type or arity: " + std::string(op.symbolText());
+                        validIntrinsic = graph.valueType(inputs[0]) == ValueType::Logic &&
+                                         graph.valueWidth(inputs[0]) > 0 &&
+                                         graph.valueType(outputs[0]) == ValueType::Logic &&
+                                         !graph.valueSigned(outputs[0]);
+                    }
+                    if (validIntrinsic)
+                    {
+                        const int32_t expectedWidth =
+                            op.kind() == OperationKind::kGrayDecode
+                                ? graph.valueWidth(inputs[0])
+                                : int32_t(std::bit_width(uint32_t(graph.valueWidth(inputs[0]))));
+                        validIntrinsic = graph.valueWidth(outputs[0]) == expectedWidth;
+                    }
+                    if (!validIntrinsic)
+                    {
+                        error = "invalid unary intrinsic type or arity: " + std::string(op.symbolText());
                         return false;
                     }
                 }
@@ -17176,6 +17191,7 @@ template<class Index>
             case OperationKind::kReduceNand:
             case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+            case OperationKind::kGrayDecode:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceNor:
             case OperationKind::kReduceXor:
@@ -20321,6 +20337,9 @@ template<class Index>
             case OperationKind::kCountTrailingZeros:
                 return "grhsim_ctz_words(" + operandExprs[0] + ", " +
                        std::to_string(graph.valueWidth(operands[0])) + ")";
+            case OperationKind::kGrayDecode:
+                return "grhsim_gray_decode_words(" + operandExprs[0] + ", " +
+                       std::to_string(graph.valueWidth(operands[0])) + ")";
             case OperationKind::kReduceOr:
                 return logicBoolExpr(unaryWordsBoolExpr(operandWords(0, graph.valueWidth(operands[0])),
                                                         graph.valueWidth(operands[0]),
@@ -20545,6 +20564,7 @@ template<class Index>
                 case OperationKind::kReduceNand:
                 case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+                case OperationKind::kGrayDecode:
                 case OperationKind::kReduceOr:
                 case OperationKind::kReduceNor:
                 case OperationKind::kReduceXor:
@@ -21110,6 +21130,7 @@ template<class Index>
                     case OperationKind::kReduceNand:
                     case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+                    case OperationKind::kGrayDecode:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -21519,6 +21540,9 @@ template<class Index>
                     std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
             case OperationKind::kCountTrailingZeros:
                 return ScalarLogicExpr{"grhsim_ctz_u64(" + operands[0] + ", " +
+                    std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
+            case OperationKind::kGrayDecode:
+                return ScalarLogicExpr{"grhsim_gray_decode_u64(" + operands[0] + ", " +
                     std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
             case OperationKind::kReduceOr:
                 return ScalarLogicExpr{"grhsim_reduce_or_u64(" + operands[0] + ", " + std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
@@ -22533,6 +22557,7 @@ template<class Index>
             case OperationKind::kReduceAnd:
             case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+            case OperationKind::kGrayDecode:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceXor:
             case OperationKind::kReduceNor:
@@ -26824,6 +26849,7 @@ template<class Index>
                     case OperationKind::kReduceNand:
                     case OperationKind::kCountTrailingZeros:
             case OperationKind::kCountOnes:
+                    case OperationKind::kGrayDecode:
                     case OperationKind::kReduceOr:
                     case OperationKind::kReduceNor:
                     case OperationKind::kReduceXor:
@@ -28389,6 +28415,9 @@ template<class Index>
                                     break;
                                 case OperationKind::kCountTrailingZeros:
                                     addShape("wide.helper.ctz_word_iterations", operandWords);
+                                    break;
+                                case OperationKind::kGrayDecode:
+                                    addShape("wide.helper.gray_decode_word_iterations", operandWords);
                                     break;
                                 case OperationKind::kReduceAnd:
                                 case OperationKind::kReduceNand:
@@ -30596,6 +30625,11 @@ template<class Index>
                     << "    return value ? std::countr_zero(value) : width;\n}\n\n";
             *stream << "inline std::uint64_t grhsim_popcount_u64(std::uint64_t value, std::size_t width)\n{\n"
                     << "    return static_cast<std::uint64_t>(std::popcount(grhsim_trunc_u64(value, width)));\n}\n\n";
+            *stream << "inline std::uint64_t grhsim_gray_decode_u64(std::uint64_t value, std::size_t width)\n{\n"
+                    << "    value = grhsim_trunc_u64(value, width);\n"
+                    << "    for (std::size_t shift = 1; shift < width; shift <<= 1)\n"
+                    << "        value ^= value >> shift;\n"
+                    << "    return grhsim_trunc_u64(value, width);\n}\n\n";
             *stream << R"CTZ(template <typename Words>
 inline std::uint64_t grhsim_ctz_words(const Words &value, std::size_t width)
 {
@@ -30621,6 +30655,30 @@ inline std::uint64_t grhsim_popcount_words(const Words &value, std::size_t width
 }
 
 )POPCOUNT";
+            *stream << R"GRAY(template <typename Words>
+inline std::array<std::uint64_t, std::tuple_size_v<Words>> grhsim_gray_decode_words(
+    const Words &value, std::size_t width)
+{
+    constexpr std::size_t N = std::tuple_size_v<Words>;
+    std::array<std::uint64_t, N> out = value;
+    for (std::size_t shift = 1; shift < width; shift <<= 1) {
+        const std::size_t wordShift = shift / 64u;
+        const std::size_t bitShift = shift % 64u;
+        std::array<std::uint64_t, N> shifted{};
+        for (std::size_t word = 0; word < N; ++word) {
+            if (word + wordShift >= N) continue;
+            shifted[word] = out[word + wordShift] >> bitShift;
+            if (bitShift != 0 && word + wordShift + 1u < N)
+                shifted[word] |= out[word + wordShift + 1u] << (64u - bitShift);
+        }
+        for (std::size_t word = 0; word < N; ++word) out[word] ^= shifted[word];
+    }
+    if (width != 0 && (width % 64u) != 0u)
+        out[(width - 1u) / 64u] &= (UINT64_C(1) << (width % 64u)) - UINT64_C(1);
+    return out;
+}
+
+)GRAY";
             *stream << "inline std::uint64_t grhsim_mux_u64(std::uint64_t cond, std::uint64_t trueValue, std::uint64_t falseValue)\n{\n";
             *stream << "    const std::uint64_t trueMask = static_cast<std::uint64_t>(-static_cast<std::int64_t>(cond != 0));\n";
             *stream << "    return (trueValue & trueMask) | (falseValue & ~trueMask);\n";

@@ -460,6 +460,26 @@ namespace wolvrix::lib::grh
         return id;
     }
 
+    SymbolId SymbolTable::tryInternFresh(std::string_view text)
+    {
+        const SymbolId id{static_cast<uint32_t>(textById_.size())};
+        auto [entry, inserted] = symbolsByText_.try_emplace(std::string(text), id);
+        if (!inserted)
+        {
+            return SymbolId::invalid();
+        }
+        try
+        {
+            textById_.push_back(entry->first);
+        }
+        catch (...)
+        {
+            symbolsByText_.erase(entry);
+            throw;
+        }
+        return id;
+    }
+
     SymbolId SymbolTable::lookup(std::string_view text) const
     {
         auto it = symbolsByText_.find(text);
@@ -2813,6 +2833,22 @@ namespace wolvrix::lib::grh
 
     Design::Design() : instanceId_(nextDesignInstance()) {}
 
+    Design::ParallelMutationScope::ParallelMutationScope(Design& design) : design_(design) {
+        if (design_.deferGraphRevisions_)
+            throw std::logic_error("Parallel graph mutation scopes cannot be nested");
+        ++design_.revision_;
+        design_.deferGraphRevisions_ = true;
+    }
+
+    Design::ParallelMutationScope::~ParallelMutationScope() noexcept {
+        design_.deferGraphRevisions_ = false;
+        ++design_.revision_;
+    }
+
+    Design::ParallelMutationScope Design::parallelGraphMutation() {
+        return ParallelMutationScope(*this);
+    }
+
     Design::Design(Design &&other) noexcept
     {
         *this = std::move(other);
@@ -3120,15 +3156,18 @@ namespace wolvrix::lib::grh
 
     namespace
     {
-        std::optional<std::size_t> eventEdgeAttrCount(const std::optional<AttributeValue> &attr)
+        std::optional<std::size_t> eventEdgeAttrCount(std::span<const AttrKV> attrs)
         {
-            if (!attr)
+            for (const auto &attr : attrs)
             {
-                return std::nullopt;
-            }
-            if (const auto *edges = std::get_if<std::vector<std::string>>(&*attr))
-            {
-                return edges->size();
+                if (attr.key == "eventEdge")
+                {
+                    if (const auto *edges = std::get_if<std::vector<std::string>>(&attr.value))
+                    {
+                        return edges->size();
+                    }
+                    return std::nullopt;
+                }
             }
             return std::nullopt;
         }
@@ -3208,25 +3247,37 @@ namespace wolvrix::lib::grh
     std::optional<std::size_t> firstEventOperandIndex(const Operation &op)
     {
         return firstEventOperandIndexImpl(op.kind(), op.operands().size(),
-                                          eventEdgeAttrCount(op.attr("eventEdge")));
+                                          eventEdgeAttrCount(op.attrs()));
     }
 
     std::optional<std::size_t> firstEventOperandIndex(const GraphView &view, OperationId op)
     {
         return firstEventOperandIndexImpl(view.opKind(op), view.opOperands(op).size(),
-                                          eventEdgeAttrCount(view.opAttr(op, "eventEdge")));
+                                          eventEdgeAttrCount(view.opAttrs(op)));
+    }
+
+    std::optional<std::size_t> firstEventOperandIndex(const Graph &graph, OperationId op)
+    {
+        return firstEventOperandIndexImpl(graph.opKind(op), graph.opOperands(op).size(),
+                                          eventEdgeAttrCount(graph.opAttrs(op)));
     }
 
     std::optional<std::size_t> arrayPortIndexCount(const Operation &op)
     {
         return arrayPortIndexCountImpl(op.kind(), op.operands().size(),
-                                       eventEdgeAttrCount(op.attr("eventEdge")));
+                                       eventEdgeAttrCount(op.attrs()));
     }
 
     std::optional<std::size_t> arrayPortIndexCount(const GraphView &view, OperationId op)
     {
         return arrayPortIndexCountImpl(view.opKind(op), view.opOperands(op).size(),
-                                       eventEdgeAttrCount(view.opAttr(op, "eventEdge")));
+                                       eventEdgeAttrCount(view.opAttrs(op)));
+    }
+
+    std::optional<std::size_t> arrayPortIndexCount(const Graph &graph, OperationId op)
+    {
+        return arrayPortIndexCountImpl(graph.opKind(op), graph.opOperands(op).size(),
+                                       eventEdgeAttrCount(graph.opAttrs(op)));
     }
 
     std::string_view toString(ValueType type) noexcept
@@ -3480,7 +3531,7 @@ namespace wolvrix::lib::grh
             return existing;
         }
         owner_->touch();
-        return symbols_.intern(text);
+        return symbols_.internFresh(text);
     }
 
     SymbolId Graph::lookupSymbol(std::string_view text) const
@@ -3505,10 +3556,10 @@ namespace wolvrix::lib::grh
             std::string candidate = base;
             candidate.push_back('_');
             candidate.append(std::to_string(nextInternalOpSym_++));
-            if (!symbols_.contains(candidate))
+            if (const SymbolId symbol = symbols_.tryInternFresh(candidate); symbol.valid())
             {
                 owner_->touch();
-                return symbols_.internFresh(candidate);
+                return symbol;
             }
         }
     }
@@ -3521,10 +3572,10 @@ namespace wolvrix::lib::grh
             std::string candidate = base;
             candidate.push_back('_');
             candidate.append(std::to_string(nextInternalValSym_++));
-            if (!symbols_.contains(candidate))
+            if (const SymbolId symbol = symbols_.tryInternFresh(candidate); symbol.valid())
             {
                 owner_->touch();
-                return symbols_.internFresh(candidate);
+                return symbol;
             }
         }
     }
@@ -5351,6 +5402,11 @@ namespace wolvrix::lib::grh
 
     Graph &Design::createGraph(std::string symbol)
     {
+        return publishGraph(createUnpublishedGraph(std::move(symbol)));
+    }
+
+    std::unique_ptr<Graph> Design::createUnpublishedGraph(std::string symbol)
+    {
         touch();
         if (symbol.empty())
         {
@@ -5362,8 +5418,19 @@ namespace wolvrix::lib::grh
         }
         SymbolId graphSymbol = designSymbols_.contains(symbol) ? designSymbols_.lookup(symbol) : designSymbols_.intern(symbol);
         GraphId graphId = designSymbols_.allocateGraphId(graphSymbol);
-        auto instance = std::make_unique<Graph>(*this, std::move(symbol), graphId);
-        return addGraphInternal(std::move(instance));
+        return std::make_unique<Graph>(*this, std::move(symbol), graphId);
+    }
+
+    Graph& Design::publishGraph(std::unique_ptr<Graph> graph) {
+        if (!graph) throw std::invalid_argument("Cannot publish a null graph");
+        if (&graph->owner() != this)
+            throw std::invalid_argument("Cannot publish a graph owned by another design");
+        const auto symbol = designSymbols_.lookup(graph->symbol());
+        if (!symbol.valid() || designSymbols_.lookupGraphId(symbol) != graph->id())
+            throw std::invalid_argument("Cannot publish a graph without its reserved GraphId");
+        if (graphs_.contains(graph->symbol()))
+            throw std::runtime_error("Duplicated graph symbol: " + graph->symbol());
+        return addGraphInternal(std::move(graph));
     }
 
     bool Design::deleteGraph(std::string_view name)

@@ -29,14 +29,14 @@ namespace wolvrix::lib::transform
             std::size_t dataIndex = 0;
         };
 
-        std::optional<std::string> storageAttr(const grh::Operation &op)
+        std::optional<std::string> storageAttr(OperationKind kind)
         {
-            if (op.kind() == OperationKind::kLatchWritePort ||
-                op.kind() == OperationKind::kLatchReadPort)
+            if (kind == OperationKind::kLatchWritePort ||
+                kind == OperationKind::kLatchReadPort)
                 return "latchSymbol";
-            if (grh::isRegisterWritePortKind(op.kind()) ||
-                op.kind() == OperationKind::kRegisterReadPort ||
-                op.kind() == OperationKind::kRegisterReadArrayPort)
+            if (grh::isRegisterWritePortKind(kind) ||
+                kind == OperationKind::kRegisterReadPort ||
+                kind == OperationKind::kRegisterReadArrayPort)
                 return "regSymbol";
             return std::nullopt;
         }
@@ -47,12 +47,12 @@ namespace wolvrix::lib::transform
             data = strip(graph, data);
             const auto def = graph.valueDef(data);
             if (!def.valid() || graph.valueWidth(data) != width) return false;
-            const auto op = graph.getOperation(def);
-            const auto attr = op.attr("regSymbol");
+            if (graph.opKind(def) != OperationKind::kRegisterReadArrayPort) return false;
+            const auto operands = graph.opOperands(def);
+            const auto *attr = findAttr(graph, def, "regSymbol");
             const auto *reg = attr ? std::get_if<std::string>(&*attr) : nullptr;
-            return op.kind() == OperationKind::kRegisterReadArrayPort &&
-                   op.operands().size() == 1 && reg && *reg == symbol &&
-                   constant(graph, op.operands()[0]) == row;
+            return operands.size() == 1 && reg && *reg == symbol &&
+                   constant(graph, operands[0]) == row;
         }
 
         bool holdsWhole(const Graph &graph, ValueId data, const std::string &attrName,
@@ -61,13 +61,13 @@ namespace wolvrix::lib::transform
             data = strip(graph, data);
             const auto def = graph.valueDef(data);
             if (!def.valid() || graph.valueWidth(data) != width) return false;
-            const auto op = graph.getOperation(def);
-            const auto attr = op.attr(attrName);
+            const auto kind = graph.opKind(def);
+            const auto *attr = findAttr(graph, def, attrName);
             const auto *storage = attr ? std::get_if<std::string>(&*attr) : nullptr;
             const bool readKind = attrName == "latchSymbol"
-                ? op.kind() == OperationKind::kLatchReadPort
-                : op.kind() == OperationKind::kRegisterReadPort;
-            return readKind && op.operands().empty() && storage && *storage == symbol;
+                ? kind == OperationKind::kLatchReadPort
+                : kind == OperationKind::kRegisterReadPort;
+            return readKind && graph.opOperands(def).empty() && storage && *storage == symbol;
         }
 
         bool holdsIdentity(const Graph &graph, ValueId data, const std::string &attrName,
@@ -118,10 +118,12 @@ namespace wolvrix::lib::transform
                 return {{}, booleans.literal(false)};
             const auto def = graph.valueDef(data);
             if (!def.valid() || graph.opKind(def) != OperationKind::kMux) return {data, booleans.literal(true)};
-            const auto source = graph.getOperation(def);
-            const auto cond = source.operands()[0];
-            const auto yes = pruneHolds(graph, booleans, source.operands()[1], attrName, symbol, row, width);
-            const auto no = pruneHolds(graph, booleans, source.operands()[2], attrName, symbol, row, width);
+            const auto operands = graph.opOperands(def);
+            // Recursive pruning can thaw or grow the graph.
+            const auto cond = operands[0], yesInput = operands[1], noInput = operands[2];
+            const auto sourceLoc = graph.opSrcLoc(def);
+            const auto yes = pruneHolds(graph, booleans, yesInput, attrName, symbol, row, width);
+            const auto no = pruneHolds(graph, booleans, noInput, attrName, symbol, row, width);
             ValueId active;
             if (yes.active == no.active) active = yes.active;
             else if (constant(graph, yes.active) == 1)
@@ -140,7 +142,7 @@ namespace wolvrix::lib::transform
             // surviving payload is a valid don't-care replacement there.
             if (!yes.data.valid()) return {no.data, active};
             if (!no.data.valid() || yes.data == no.data) return {yes.data, active};
-            if (yes.data == source.operands()[1] && no.data == source.operands()[2]) return {data, active};
+            if (yes.data == yesInput && no.data == noInput) return {data, active};
             const auto result = graph.createValue(width, graph.valueSigned(data),
                                                   graph.valueType(data), graph.valueShape(data));
             const auto mux = graph.createOperation(OperationKind::kMux, graph.makeInternalOpSym());
@@ -148,17 +150,18 @@ namespace wolvrix::lib::transform
             graph.addOperand(mux, yes.data);
             graph.addOperand(mux, no.data);
             graph.addResult(mux, result);
-            if (source.srcLoc()) graph.setOpSrcLoc(mux, *source.srcLoc());
+            if (sourceLoc) graph.setOpSrcLoc(mux, *sourceLoc);
             return {result, active};
         }
 
-        std::optional<uint64_t> writeRow(const Graph &graph, const grh::Operation &op)
+        std::optional<uint64_t> writeRow(const Graph &graph, OperationId op)
         {
-            if (op.kind() != OperationKind::kRegisterWriteArrayPort &&
-                op.kind() != OperationKind::kRegisterWriteArrayMaskPort) return std::nullopt;
-            const auto count = grh::arrayPortIndexCount(op);
-            if (!count || *count != 1 || op.operands().size() < 2) return std::nullopt;
-            return constant(graph, op.operands()[1]);
+            if (graph.opKind(op) != OperationKind::kRegisterWriteArrayPort &&
+                graph.opKind(op) != OperationKind::kRegisterWriteArrayMaskPort) return std::nullopt;
+            const auto count = grh::arrayPortIndexCount(graph, op);
+            const auto operands = graph.opOperands(op);
+            if (!count || *count != 1 || operands.size() < 2) return std::nullopt;
+            return constant(graph, operands[1]);
         }
 
         bool readsStorage(const Graph &graph, ValueId value, const std::string &attrName,
@@ -174,11 +177,10 @@ namespace wolvrix::lib::transform
             bool reads = false;
             if (def.valid())
             {
-                const auto op = graph.getOperation(def);
-                const auto attr = op.attr(attrName);
+                const auto *attr = findAttr(graph, def, attrName);
                 if (const auto *reg = attr ? std::get_if<std::string>(&*attr) : nullptr)
                     reads = *reg == symbol;
-                for (auto input : op.operands())
+                for (auto input : graph.opOperands(def))
                     if (readsStorage(graph, input, attrName, symbol, memo, budget, depth + 1))
                     { reads = true; break; }
             }
@@ -204,12 +206,11 @@ namespace wolvrix::lib::transform
             std::map<std::pair<std::string, std::string>, std::vector<OperationId>> groups;
             for (const auto id : graph.operations())
             {
-                const auto op = graph.getOperation(id);
-                const auto attrName = storageAttr(op);
-                if (!attrName ||
-                    !(grh::isRegisterWritePortKind(op.kind()) ||
-                      op.kind() == OperationKind::kLatchWritePort)) continue;
-                const auto attr = op.attr(*attrName);
+                const auto kind = graph.opKind(id);
+                if (!(grh::isRegisterWritePortKind(kind) || kind == OperationKind::kLatchWritePort)) continue;
+                const auto attrName = storageAttr(kind);
+                if (!attrName) continue;
+                const auto *attr = findAttr(graph, id, *attrName);
                 if (const auto *symbol = attr ? std::get_if<std::string>(&*attr) : nullptr)
                     groups[{*attrName, *symbol}].push_back(id);
             }
@@ -228,34 +229,35 @@ namespace wolvrix::lib::transform
                 std::vector<std::size_t> unknownRows;
                 for (std::size_t pos = 0; pos < writes.size(); ++pos)
                 {
-                    if (auto row = writeRow(graph, graph.getOperation(writes[pos])))
+                    if (auto row = writeRow(graph, writes[pos]))
                         byRow[*row].push_back(pos);
                     else unknownRows.push_back(pos);
                 }
                 for (std::size_t pos = 0; pos < writes.size(); ++pos)
                 {
-                    const auto op = graph.getOperation(writes[pos]);
-                    const auto indexCount = grh::arrayPortIndexCount(op);
+                    const auto kind = graph.opKind(writes[pos]);
+                    const auto operands = graph.opOperands(writes[pos]);
+                    const auto indexCount = grh::arrayPortIndexCount(graph, writes[pos]);
                     const bool arrayCandidate =
-                        (op.kind() == OperationKind::kRegisterWriteArrayPort ||
-                         op.kind() == OperationKind::kRegisterWriteArrayMaskPort) &&
-                        indexCount && *indexCount == 1 && op.operands().size() >= 3;
+                        (kind == OperationKind::kRegisterWriteArrayPort ||
+                         kind == OperationKind::kRegisterWriteArrayMaskPort) &&
+                        indexCount && *indexCount == 1 && operands.size() >= 3;
                     const bool wholeCandidate =
-                        (attrName == "latchSymbol" && op.kind() == OperationKind::kLatchWritePort &&
-                         op.operands().size() >= 3) ||
+                        (attrName == "latchSymbol" && kind == OperationKind::kLatchWritePort &&
+                         operands.size() >= 3) ||
                         (attrName == "regSymbol" &&
-                         ((op.kind() == OperationKind::kRegisterWritePort &&
-                           op.operands().size() >= 2) ||
-                          (op.kind() == OperationKind::kRegisterWriteMaskPort &&
-                           op.operands().size() >= 3)));
+                         ((kind == OperationKind::kRegisterWritePort &&
+                           operands.size() >= 2) ||
+                          (kind == OperationKind::kRegisterWriteMaskPort &&
+                           operands.size() >= 3)));
                     if (!arrayCandidate && !wholeCandidate) continue;
                     const std::optional<uint64_t> row = arrayCandidate
-                        ? constant(graph, op.operands()[1]) : std::nullopt;
+                        ? constant(graph, operands[1]) : std::nullopt;
                     if (arrayCandidate && !row) continue;
-                    const auto enable = op.operands()[0];
+                    const auto enable = operands[0];
                     const std::size_t dataIndex = arrayCandidate ? 1 + *indexCount : 1;
-                    if (dataIndex >= op.operands().size()) continue;
-                    const auto data = op.operands()[dataIndex];
+                    if (dataIndex >= operands.size()) continue;
+                    const auto data = operands[dataIndex];
                     std::vector<Arm> arms;
                     std::vector<Literal> path;
                     unsigned budget = 256;
@@ -284,9 +286,9 @@ namespace wolvrix::lib::transform
                             for (auto before : positions)
                             {
                                 if (before >= pos) break;
-                                const auto prior = graph.getOperation(writes[before]);
-                                if (prior.operands().empty()) continue;
-                                facts.emplace_back(prior.operands()[0], true);
+                                const auto priorOperands = graph.opOperands(writes[before]);
+                                if (priorOperands.empty()) continue;
+                                facts.emplace_back(priorOperands[0], true);
                                 const bool disjoint = contradictory(graph, facts);
                                 facts.pop_back();
                                 if (!disjoint) { safe = false; break; }

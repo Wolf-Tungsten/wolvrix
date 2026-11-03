@@ -119,6 +119,10 @@ enum class FirrtlInitPolicy { Unknown, Zero };
 struct FirrtlOptions {
     std::optional<std::string> expectedVersion;
     bool nodeAnnotations = true;
+    // Number of independent FIRRTL module lowerers. One preserves the legacy
+    // serial path; larger values lower into final-owner unpublished graphs
+    // before the transaction publishes them in dependency order.
+    std::size_t lowerThreads = 1;
     FirrtlInvalidPolicy invalidPolicy = FirrtlInvalidPolicy::Unknown;
     FirrtlInitPolicy initPolicy = FirrtlInitPolicy::Unknown;
     // Full layer paths. Selecting a child also enables its ancestors.

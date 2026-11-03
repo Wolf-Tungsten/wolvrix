@@ -11,12 +11,21 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <iomanip>
 #include <limits>
+#include <mutex>
+#include <queue>
 #include <set>
 #include <sstream>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 namespace wolvrix::lib::ingest {
 namespace {
@@ -75,6 +84,78 @@ struct FirrtlEntry {
     unsigned state = 0;
     std::string graph;
 };
+struct PreloweredFirrtl {
+    std::unique_ptr<grh::Graph> graph;
+    ModuleSignature signature;
+    std::exception_ptr failure;
+};
+
+class FirrtlThreadPool {
+public:
+    explicit FirrtlThreadPool(std::size_t count) {
+        workers_.reserve(count);
+        try {
+            for (std::size_t index = 0; index < count; ++index)
+                workers_.emplace_back([this] { run(); });
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+            }
+            ready_.notify_all();
+            for (auto& worker : workers_)
+                if (worker.joinable()) worker.join();
+            throw;
+        }
+    }
+    FirrtlThreadPool(const FirrtlThreadPool&) = delete;
+    FirrtlThreadPool& operator=(const FirrtlThreadPool&) = delete;
+    ~FirrtlThreadPool() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_all();
+        for (auto& worker : workers_)
+            if (worker.joinable()) worker.join();
+    }
+
+    template <typename Function>
+    auto submit(Function&& function) -> std::future<std::invoke_result_t<Function>> {
+        using Result = std::invoke_result_t<Function>;
+        auto task = std::make_shared<std::packaged_task<Result()>>(
+            std::forward<Function>(function));
+        auto result = task->get_future();
+        {
+            std::lock_guard lock(mutex_);
+            if (stopping_) throw std::runtime_error("FIRRTL thread pool is stopped");
+            tasks_.emplace([task = std::move(task)]() mutable { (*task)(); });
+        }
+        ready_.notify_one();
+        return result;
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(mutex_);
+                ready_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+                if (stopping_ && tasks_.empty()) return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<std::function<void()>> tasks_;
+    std::vector<std::thread> workers_;
+    bool stopping_ = false;
+};
 using ParsedModuleKey = std::pair<const firrtl::Source*, std::size_t>;
 std::string readText(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -94,6 +175,7 @@ private:
     std::map<std::string, FirrtlEntry> firrtl_;
     std::map<ParsedModuleKey, std::shared_ptr<const firrtl::ModuleBody>> parsedModules_;
     std::map<std::string, ModuleSignature> interfaces_;
+    std::map<std::string, PreloweredFirrtl> prelowered_;
     std::map<const firrtl::Source*, firrtl::detail::AnnotationIndex> annotations_;
     std::map<std::string, std::string> svGraphs_;
     std::map<std::string, std::string> specializations_;
@@ -108,6 +190,7 @@ private:
     void collectAnnotations();
     void collectBlackboxes(const std::string& module);
     void resolveFirrtlInterfaces(const std::vector<std::string>& tops);
+    void prepareFirrtlLowering(const std::vector<std::string>& roots);
     std::shared_ptr<const firrtl::ModuleBody> parseFirrtlModule(const FirrtlEntry& entry,
                                                                 std::string_view name);
     std::string ensureImplementation(const ModuleSpecialization& specialization);
@@ -425,6 +508,99 @@ void Transaction::resolveFirrtlInterfaces(const std::vector<std::string>& tops) 
     }
 }
 
+void Transaction::prepareFirrtlLowering(const std::vector<std::string>& roots) {
+    const std::size_t requested = request_.firrtl.lowerThreads;
+    if (requested <= 1 || roots.empty()) return;
+    const auto preparationStarted = std::chrono::steady_clock::now();
+
+    // Discover reachable modules before workers start. This mirrors
+    // ensureFirrtl's layer selection and preserves lazy error behavior.
+    std::set<std::string> reachable;
+    std::set<std::string> visiting;
+    const auto discover = [&](auto&& self, const std::string& name) -> void {
+        const auto found = firrtl_.find(name);
+        if (found == firrtl_.end() || found->second.signature.external ||
+            reachable.contains(name) || !visiting.insert(name).second) return;
+        const auto parsed = parseFirrtlModule(found->second, name);
+        const auto walk = [&](auto&& walkSelf, std::span<const firrtl::StmtId> statements,
+                              std::string layer) -> void {
+            for (const auto statementId : statements) {
+                const auto& statement = parsed->arena.statements[statementId];
+                if (statement.kind == firrtl::StmtKind::LayerBlock) {
+                    const auto path = layer.empty() ? std::string(statement.target) :
+                        layer + "." + std::string(statement.target);
+                    const bool enabled = std::any_of(request_.firrtl.enabledLayers.begin(),
+                        request_.firrtl.enabledLayers.end(), [&](const auto& selected) {
+                            return selected == path || selected.starts_with(path + ".");
+                        });
+                    if (enabled) walkSelf(walkSelf, statement.body, path);
+                    continue;
+                }
+                if (statement.kind == firrtl::StmtKind::Instance)
+                    self(self, std::string(statement.target));
+                walkSelf(walkSelf, statement.body, layer);
+                walkSelf(walkSelf, statement.otherwise, layer);
+            }
+        };
+        walk(walk, parsed->statements, {});
+        visiting.erase(name);
+        reachable.insert(name);
+    };
+    for (const auto& root : roots) discover(discover, root);
+    if (reachable.empty()) return;
+
+    const std::size_t workers = std::min(requested, reachable.size());
+    // Interface signatures are immutable during worker execution. Share one
+    // snapshot so each module task does not copy the entire module map.
+    const auto interfaces = std::make_shared<const std::map<std::string, ModuleSignature>>(interfaces_);
+    const auto options = request_.firrtl;
+    // Allocate graphs with their final owner and IDs on the coordinator.
+    // Defer catalog insertion until serial publication; hash table traversal
+    // order also affects verification diagnostics.
+    std::vector<std::pair<std::string, std::unique_ptr<grh::Graph>>> graphs;
+    graphs.reserve(reachable.size());
+    for (const auto& name : reachable) {
+        graphs.emplace_back(name, design_.createUnpublishedGraph(name));
+    }
+    const auto loweringStarted = std::chrono::steady_clock::now();
+    {
+        // The pool is destroyed (and joins) before the mutation scope, also
+        // on exceptions. Coalesce owner revision updates at this boundary.
+        auto mutation = design_.parallelGraphMutation();
+        FirrtlThreadPool pool(workers);
+        std::vector<std::pair<std::string, std::future<PreloweredFirrtl>>> pending;
+        pending.reserve(graphs.size());
+        for (auto& [name, graph] : graphs) {
+            const auto& entry = firrtl_.at(name);
+            const auto body = parseFirrtlModule(entry, name);
+            pending.emplace_back(name, pool.submit(
+                [source = entry.source, body, graph = std::move(graph), interfaces, options]() mutable {
+                    PreloweredFirrtl result;
+                    result.graph = std::move(graph);
+                    try {
+                        result.signature = firrtl::detail::lowerModule(*source, *body, *result.graph,
+                                                                       options, interfaces.get());
+                    } catch (...) {
+                        // Re-throw in ensureFirrtl's deterministic dependency
+                        // order through the normal source-aware diagnostics.
+                        result.failure = std::current_exception();
+                    }
+                    return result;
+                }));
+        }
+        for (auto& [name, future] : pending)
+            prelowered_.insert_or_assign(name, future.get());
+    }
+    if (request_.logSink && request_.logLevel <= LogLevel::Info)
+        request_.logSink({LogLevel::Info, "ingest-firrtl",
+            "parallel FIRRTL lowering threads=" + std::to_string(workers) +
+            " modules=" + std::to_string(prelowered_.size()) +
+            " prepare_s=" + std::to_string(std::chrono::duration<double>(
+                loweringStarted - preparationStarted).count()) +
+            " lower_s=" + std::to_string(std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - loweringStarted).count())});
+}
+
 std::string Transaction::prototypes(const std::vector<std::string>& names) {
     std::string text;
     for (const auto& name : names) {
@@ -616,7 +792,16 @@ std::string Transaction::ensureFirrtl(const std::string& name) {
                 }
             };
             dependencies(dependencies, parsed->statements, {});
-            entry.signature = firrtl::detail::lowerModule(*entry.source, *parsed, design_, request_.firrtl, &interfaces_);
+            if (const auto prelowered = prelowered_.find(name); prelowered != prelowered_.end()) {
+                if (prelowered->second.failure) std::rethrow_exception(prelowered->second.failure);
+                if (!prelowered->second.graph)
+                    throw std::runtime_error("parallel FIRRTL lowering produced no graph: " + name);
+                design_.publishGraph(std::move(prelowered->second.graph));
+                entry.signature = std::move(prelowered->second.signature);
+                prelowered_.erase(prelowered);
+            } else {
+                entry.signature = firrtl::detail::lowerModule(*entry.source, *parsed, design_, request_.firrtl, &interfaces_);
+            }
             interfaces_[name] = entry.signature; entry.graph = name;
             auto& graph = *design_.findGraph(name);
 
@@ -822,14 +1007,19 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             if (!bound.insert(binding.moduleName).second) throw std::invalid_argument("duplicate external binding: " + binding.moduleName);
         }
         if (specialization) {
-            if (specialization->language == SourceLanguage::Firrtl)
+            if (specialization->language == SourceLanguage::Firrtl) {
                 resolveFirrtlInterfaces({specialization->implementationName});
+                prepareFirrtlLowering({specialization->implementationName});
+            }
             const auto graph = ensureImplementation(*specialization);
             design_.markAsTop(graph); tops.clear();
         }
         if (tops.empty() && !specialization) for (const auto& owner : result_.sourceOwners)
             if (const auto source = std::dynamic_pointer_cast<const firrtl::Source>(owner)) tops.emplace_back(source->circuit());
-        if (!specialization) resolveFirrtlInterfaces(tops);
+        if (!specialization) {
+            resolveFirrtlInterfaces(tops);
+            prepareFirrtlLowering(tops);
+        }
         std::set<std::string> selected;
         for (const auto& top : tops) {
             if (!selected.insert(top).second) throw std::invalid_argument("duplicate top module: " + top);
@@ -858,6 +1048,8 @@ IngestResult Transaction::run(const ModuleSpecialization* specialization) {
             graph.setMetadata("firrtl.pendingExternalAnnotations", pendingAnnotations);
         }
         canonicalizeGeneratedLocations();
+        if (!prelowered_.empty())
+            throw std::runtime_error("unpublished FIRRTL modules remain at transaction commit");
         result_.design.emplace(std::move(design_));
     } catch (const std::exception& failure) { error(failure.what()); }
     return std::move(result_);

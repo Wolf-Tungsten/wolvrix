@@ -822,6 +822,9 @@ int checkSourceFreezeWiring(const wolvrix::lib::grh::Design &design)
             !top.opSrcLoc(op) || top.opSrcLoc(op)->line != 41 ||
             !findGenerateGroup(top, "u" + std::to_string(i) + "$gen", "difference"))
             return fail("source freeze changed attributes, locations, or generate groups");
+        const auto *group = findGenerateGroup(top, "u" + std::to_string(i) + "$gen", "difference");
+        if (group->symbols.size() != 1 || group->symbols.front() != top.operationSymbol(op))
+            return fail("source freeze generated group did not retain its instance's target operation symbol");
     }
     const auto inspection = node::inspect(top);
     if (!inspection.errors.empty() || inspection.nodes.size() != 2)

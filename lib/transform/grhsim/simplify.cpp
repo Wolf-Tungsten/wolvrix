@@ -5,6 +5,8 @@
 #include "transform/verify.hpp"
 
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <deque>
 
 namespace wolvrix::lib::transform::grhsim {
@@ -12,11 +14,15 @@ namespace {
 using namespace grh;
 using detail::Scope;
 
-std::vector<OperationId> orderedOperations(const Graph& graph)
+std::vector<OperationId> orderedOperations(const Graph& graph, detail::SimplifyMetrics* metrics = nullptr)
 {
     std::vector<OperationId> result;
     const auto operations = graph.operations();
     result.reserve(operations.size());
+    if (metrics) {
+        ++metrics->topoRebuilds;
+        metrics->topoVisited += operations.size();
+    }
     uint32_t last = 0;
     for (const auto op : operations) last = std::max(last, op.index);
     // This table lives only during a read-only traversal of one graph. No
@@ -26,13 +32,19 @@ std::vector<OperationId> orderedOperations(const Graph& graph)
         std::size_t count = 0;
         for (const auto arg : graph.opOperands(op)) count += bool(graph.valueDef(arg));
         pending[op.index] = count;
-        if (!count) result.push_back(op);
+        if (!count) {
+            result.push_back(op);
+            if (metrics) ++metrics->topoEnqueued;
+        }
     }
     for (std::size_t cursor = 0; cursor < result.size(); ++cursor) {
         const auto op = result[cursor];
         for (const auto value : graph.opResults(op)) {
             for (const auto& user : graph.valueUsers(value))
-                if (--pending.at(user.operation.index) == 0) result.push_back(user.operation);
+                if (--pending.at(user.operation.index) == 0) {
+                    result.push_back(user.operation);
+                    if (metrics) ++metrics->topoEnqueued;
+                }
         }
     }
     if (result.size() != operations.size())
@@ -64,6 +76,7 @@ bool makeConstant(Graph& graph, OperationId op, slang::SVInt bits)
 
 bool fold(Scope& scope, OperationId op)
 {
+    if (scope.metrics) ++scope.metrics->foldVisits;
     auto& graph = scope.graph;
     const auto kind = graph.opKind(op);
     if (kind == OperationKind::kConstant || operationEffect(graph, op) != OpEffect::Pure ||
@@ -75,6 +88,7 @@ bool fold(Scope& scope, OperationId op)
     std::vector<slang::SVInt> args;
     for (const auto arg : graph.opOperands(op)) {
         if (!scope.local(arg)) return false;
+        if (scope.metrics) ++scope.metrics->constantLookups;
         const auto bits = detail::constantBits(graph, arg);
         if (!bits) return false;
         args.push_back(*bits);
@@ -119,7 +133,9 @@ bool fold(Scope& scope, OperationId op)
     const bool structural = kind == OperationKind::kAssign || kind == OperationKind::kConcat ||
         kind == OperationKind::kArrayCreate || kind == OperationKind::kSliceStatic || kind == OperationKind::kSliceArray;
     if (bits->hasUnknown() && !structural) return false;
-    return makeConstant(graph, op, *bits);
+    const bool changed = makeConstant(graph, op, *bits);
+    if (changed && scope.metrics) ++scope.metrics->foldChanges;
+    return changed;
 }
 
 bool canonicalize(Scope& scope, OperationId op)
@@ -132,6 +148,7 @@ bool canonicalize(Scope& scope, OperationId op)
     const auto result = results[0];
     const auto type = graph.valueLogicalType(result);
     const auto constant = [&](ValueId value) {
+        if (scope.metrics) ++scope.metrics->constantLookups;
         return scope.local(value) ? detail::constantBits(graph, value) : std::nullopt;
     };
     const auto alias = [&](ValueId input) { return scope.alias(op, input); };
@@ -275,6 +292,7 @@ bool muxChains(Scope& scope)
     std::vector<OperationId> buffer;
     const auto operations = scope.operationRange(buffer);
     for (const auto op : operations) {
+        if (scope.metrics) ++scope.metrics->muxVisits;
         if (!eligible(op)) continue;
         std::vector<OperationId> chain{op};
         while (chain.size() < 64) {
@@ -285,6 +303,10 @@ bool muxChains(Scope& scope)
             chain.push_back(next);
         }
         if (chain.size() < 3) continue;
+        if (scope.metrics) {
+            ++scope.metrics->muxChains;
+            ++scope.metrics->muxChanges;
+        }
         std::vector<ValueId> args;
         for (const auto link : chain) args.push_back(graph.opOperands(link)[0]);
         for (const auto link : chain) args.push_back(graph.opOperands(link)[1]);
@@ -300,12 +322,17 @@ bool muxChains(Scope& scope)
 // persistent clock signature's textual format in expressionKey unchanged.
 class CseKey {
 public:
+    explicit CseKey(ingest::node::NodeKeyInterner* interner = nullptr) : interner_(interner) {}
     template <typename T> void scalar(T value) {
         static_assert(std::is_arithmetic_v<T>);
         bytes.append(reinterpret_cast<const char*>(&value), sizeof(value));
     }
     void text(std::string_view value) {
-        scalar(static_cast<uint64_t>(value.size())); bytes.append(value);
+        if (interner_) {
+            scalar(interner_->intern(value));
+        } else {
+            scalar(static_cast<uint64_t>(value.size())); bytes.append(value);
+        }
     }
     void type(const Graph& graph, ValueId value) {
         scalar(static_cast<uint8_t>(graph.valueType(value)));
@@ -332,10 +359,12 @@ public:
         }, attribute);
     }
     std::string bytes;
+private:
+    ingest::node::NodeKeyInterner* interner_ = nullptr;
 };
 
-std::string cseKey(const Graph& graph, OperationId op) {
-    CseKey key;
+std::string cseKey(const Graph& graph, OperationId op, ingest::node::NodeKeyInterner* interner = nullptr) {
+    CseKey key(interner);
     key.bytes.reserve(96);
     const bool history = graph.opKind(op) == kEdgeDetect;
     key.scalar(static_cast<uint32_t>(graph.opKind(op)));
@@ -389,7 +418,9 @@ bool foldAndShare(Scope& scope, std::span<const OperationId> ordered)
         if (graph.opResults(op).size() != 1) continue;
         if (fold(scope, op)) changed = true;
         const auto symbol = graph.operationSymbol(op);
+        if (scope.metrics) ++scope.metrics->canonicalizeVisits;
         if (canonicalize(scope, op)) {
+            if (scope.metrics) ++scope.metrics->canonicalizeChanges;
             changed = true;
             if (graph.findOperation(symbol) != op) continue;
         }
@@ -401,10 +432,15 @@ bool foldAndShare(Scope& scope, std::span<const OperationId> ordered)
             graph.sameValueType(result, graph.opOperands(op)[0])) continue;
         if (!canCseOperation(graph, op) && graph.opKind(op) != kEdgeDetect) continue;
         if (ordered.size() == 1) continue; // No second expression in this leaf can share it.
-        const auto key = cseKey(graph, op);
+        if (scope.metrics) ++scope.metrics->cseKeys;
+        const auto key = cseKey(graph, op, scope.keyInterner);
         const auto [it, inserted] = expressions.emplace(key, result);
         if (!inserted && it->second != result) {
             ingest::node::mergeCseOperations(graph, graph.valueDef(it->second), op);
+            if (scope.metrics) {
+                ++scope.metrics->cseMerges;
+                ++scope.metrics->nodeMerges;
+            }
             detail::mergeOrigins(graph, graph.valueDef(it->second), {op});
             changed = scope.alias(op, it->second) || changed;
         }
@@ -425,18 +461,23 @@ PassResult SimplifyPass::run()
     try {
         if (options_.maxRounds == 0) throw std::invalid_argument("max-rounds must be positive");
         auto& graph = detail::selectGraph(design(), options_.top);
+        const bool statsEnabled = std::getenv("WOLVRIX_GRHSIM_SIMPLIFY_STATS") != nullptr ||
+                                  std::getenv("WOLVRIX_SIMPLIFY_STATS") != nullptr;
         ingest::node::DeadRootBatch deadRoots(graph);
         PassManager verifier; verifier.addPass(std::make_unique<GrhVerifyPass>());
         if (!verifier.run(design(), diags()).success) return {false, true, {}};
         const auto stage = graph.metadata(kStage);
         const bool verifiedUnpartitioned = stage && *stage == AttributeValue(std::string("converted"));
         auto ordered = orderedOperations(graph); // Check cycles before the first mutation.
+        detail::SimplifyMetrics metrics;
+        ingest::node::NodeKeyInterner cseKeyInterner;
         std::unordered_set<uint32_t> anchors;
         for (const auto symbol : graph.declaredSymbols()) anchors.insert(symbol.value);
         for (const auto& group : graph.generateGroups())
             for (const auto symbol : group.symbols) anchors.insert(symbol.value);
         uint32_t round = 0;
         std::size_t ownerCount = 0;
+        std::set<detail::Owner> dirtyOwners;
         bool changed = false;
         do {
             using Clock = std::chrono::steady_clock;
@@ -451,6 +492,13 @@ PassResult SimplifyPass::run()
                 changed = updated || changed;
             };
             changed = false;
+            if (statsEnabled) {
+                metrics.reset();
+                metrics.topoVisited = ordered.size();
+                metrics.topoEnqueued = ordered.size();
+            }
+            const auto operationsBefore = graph.operations().size();
+            const auto valuesBefore = graph.values().size();
             struct Member { const detail::Owner* owner; OperationId operation; std::size_t order; };
             std::vector<Member> members;
             members.reserve(ordered.size());
@@ -483,22 +531,66 @@ PassResult SimplifyPass::run()
             }
             ownerCount = groups.size();
             members.clear();
+            const bool seedAllOwners = round == 0;
+            std::set<detail::Owner> nextDirtyOwners;
+            const auto addOwner = [&](std::set<detail::Owner>& destination, OperationId operation) {
+                if (!operation) return;
+                destination.insert(detail::owner(graph, operation));
+            };
+            const auto touchNeighbors = [&](std::set<detail::Owner>& destination,
+                                            const detail::Owner& current,
+                                            std::span<const OperationId> operations) {
+                // A rewrite can change the value seen by consumers in another
+                // owner, or remove the last use of a producer. Wake both
+                // sides. Scope::contains also filters operations erased by an
+                // earlier rewrite in this same scope.
+                destination.insert(current);
+                for (const auto operation : operations) {
+                    if (!graph.findOperation(graph.operationSymbol(operation)) ||
+                        detail::ownerView(graph, operation) != current) continue;
+                    for (const auto result : graph.opResults(operation)) {
+                        for (const auto& use : graph.valueUsers(result)) addOwner(destination, use.operation);
+                    }
+                    for (const auto operand : graph.opOperands(operation))
+                        if (const auto producer = graph.valueDef(operand)) addOwner(destination, producer);
+                }
+            };
             for (const auto& group : groups) {
                 const auto owner = detail::owner(graph, group.representative);
+                if (!seedAllOwners && !dirtyOwners.contains(owner)) {
+                    if (statsEnabled) ++metrics.ownersSkipped;
+                    continue;
+                }
+                if (statsEnabled) ++metrics.ownersVisited;
                 const auto operations = std::span<const OperationId>(grouped).subspan(group.begin, group.end - group.begin);
                 // Partitioned scopes visit their own members. New operations
                 // are collected with their owner at the next rewrite round.
                 Scope scope(graph, owner, owner.empty() ? std::nullopt : std::optional(operations), &anchors, &owner,
-                            verifiedUnpartitioned);
-                timed(0, [&] { return foldAndShare(scope, operations); });
-                timed(1, [&] { return muxChains(scope); });
-                if (owner.empty()) timed(2, [&] { return detail::mergeEquivalentStates(scope); });
-                timed(3, [&] { return scope.dce(&deadRoots); });
-                timed(4, [&] { return detail::simplifyUsedBits(scope); });
+                            verifiedUnpartitioned, statsEnabled ? &metrics : nullptr, &cseKeyInterner);
+                std::array<bool, 5> scopeUpdates{};
+                const auto scopeTimed = [&](std::size_t index, auto&& action) {
+                    const auto begin = Clock::now();
+                    const bool updated = action();
+                    elapsed[index] += Clock::now() - begin;
+                    scopeUpdates[index] = updated || scopeUpdates[index];
+                    updates[index] = updated || updates[index];
+                    changed = updated || changed;
+                };
+                scopeTimed(0, [&] { return foldAndShare(scope, operations); });
+                scopeTimed(1, [&] { return muxChains(scope); });
+                if (owner.empty()) scopeTimed(2, [&] { return detail::mergeEquivalentStates(scope); });
+                scopeTimed(3, [&] { return scope.dce(&deadRoots); });
+                scopeTimed(4, [&] { return detail::simplifyUsedBits(scope); });
+                const bool scopeChanged = std::any_of(scopeUpdates.begin(), scopeUpdates.end(),
+                                                       [](bool update) { return update; });
+                if (scopeChanged) touchNeighbors(nextDirtyOwners, owner, operations);
             }
+            dirtyOwners = std::move(nextDirtyOwners);
             result.changed = result.changed || changed;
             ++round;
-            if (changed) timed(5, [&] { ordered = orderedOperations(graph); return false; });
+            if (changed) timed(5, [&] { ordered = orderedOperations(graph, statsEnabled ? &metrics : nullptr); return false; });
+            const auto operationsAfter = graph.operations().size();
+            const auto valuesAfter = graph.values().size();
             const auto milliseconds = [](auto duration) {
                 return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
             };
@@ -513,6 +605,34 @@ PassResult SimplifyPass::run()
                    << " topo-ms=" << milliseconds(elapsed[5])
                    << " updates=";
             for (std::size_t i = 0; i < 5; ++i) timing << (updates[i] ? '1' : '0');
+            if (statsEnabled) {
+                metrics.cseKeyInterns = cseKeyInterner.size();
+                metrics.cseKeyBytes = cseKeyInterner.bytes();
+                timing << " stats-fold-visits=" << metrics.foldVisits
+                       << " stats-fold-changes=" << metrics.foldChanges
+                       << " stats-constant-lookups=" << metrics.constantLookups
+                       << " stats-canonicalize-visits=" << metrics.canonicalizeVisits
+                       << " stats-canonicalize-changes=" << metrics.canonicalizeChanges
+                       << " stats-mux-visits=" << metrics.muxVisits
+                       << " stats-mux-chains=" << metrics.muxChains
+                       << " stats-mux-changes=" << metrics.muxChanges
+                       << " stats-cse-keys=" << metrics.cseKeys
+                       << " stats-cse-merges=" << metrics.cseMerges
+                       << " stats-node-merges=" << metrics.nodeMerges
+                       << " stats-aliases=" << metrics.aliases
+                       << " stats-dce-visited=" << metrics.dceVisited
+                       << " stats-dce-enqueued=" << metrics.dceEnqueued
+                       << " stats-dce-erased=" << metrics.dceErased
+                       << " stats-topo-visited=" << metrics.topoVisited
+                       << " stats-topo-enqueued=" << metrics.topoEnqueued
+                       << " stats-topo-rebuilds=" << metrics.topoRebuilds
+                       << " stats-owners-visited=" << metrics.ownersVisited
+                       << " stats-owners-skipped=" << metrics.ownersSkipped
+                       << " stats-cse-key-interns=" << metrics.cseKeyInterns
+                       << " stats-cse-key-bytes=" << metrics.cseKeyBytes
+                       << " stats-op-delta=" << static_cast<std::int64_t>(operationsAfter) - static_cast<std::int64_t>(operationsBefore)
+                       << " stats-value-delta=" << static_cast<std::int64_t>(valuesAfter) - static_cast<std::int64_t>(valuesBefore);
+            }
             logInfo(timing.str());
         } while (changed && round < options_.maxRounds);
         if (changed) warning("Reached max-rounds before convergence");

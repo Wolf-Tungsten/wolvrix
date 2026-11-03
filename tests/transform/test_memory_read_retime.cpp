@@ -170,6 +170,7 @@ int main()
     // A tagged read replaced by retiming must keep its root on the new
     // output view, for both ROM and RAM paths.
     for (const bool ram : {false, true})
+    for (const bool frozen : {false, true})
     {
         Design design;
         Graph &graph = buildBaseReadPath(design, ram, false);
@@ -178,6 +179,7 @@ int main()
         const auto oldResult = graph.outputPortValue("data");
         node::write(graph, graph.valueDef(oldResult), {{identity}, {{identity, 0}}, {identity}});
         node::establishPolicy(graph);
+        if (frozen) graph.freeze();
         PassManager manager; manager.addPass(std::make_unique<MemoryReadRetimePass>());
         PassDiagnostics diagnostics;
         const auto result = manager.run(design, diagnostics);

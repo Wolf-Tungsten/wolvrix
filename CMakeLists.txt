@@ -43,6 +43,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # Ensure important runtime/artifact directories exist at configure time
 file(MAKE_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 
+# slang's mimalloc integration replaces global C++ new/delete, including GRH
+# containers. Keep the allocator choice explicit at the project boundary.
+option(SLANG_USE_MIMALLOC "Use mimalloc for global C++ allocations" ON)
+set(WOLVRIX_MIMALLOC_GENERIC_COLLECT "1000000" CACHE STRING
+    "Generic allocation slow paths between bundled mimalloc whole-heap scans")
 add_subdirectory(external/slang)
 
 option(WOLVRIX_MTKAHYPAR_BUILD_SHARED "Build vendored mt-kahypar as a shared library" OFF)
@@ -105,6 +110,7 @@ endif()
 
 # Libraries
 set(WOLVRIX_LIB_SOURCES
+    lib/core/allocator.cpp
     lib/core/diagnostics.cpp
     lib/core/grh.cpp
     lib/core/op_descriptor.cpp
@@ -177,6 +183,22 @@ target_link_libraries(wolvrix-lib
     PUBLIC
         slang::slang
 )
+
+# Only change defaults on our private, bundled allocator. A shared or imported
+# mimalloc can already be in use by other threads in an embedding application.
+if (SLANG_USE_MIMALLOC AND TARGET mimalloc-static)
+    get_target_property(WOLVRIX_SLANG_LINK_LIBRARIES slang::slang LINK_LIBRARIES)
+    get_target_property(WOLVRIX_MIMALLOC_IMPORTED mimalloc-static IMPORTED)
+    if ("mimalloc-static" IN_LIST WOLVRIX_SLANG_LINK_LIBRARIES AND NOT WOLVRIX_MIMALLOC_IMPORTED)
+        if (NOT WOLVRIX_MIMALLOC_GENERIC_COLLECT MATCHES "^[1-9][0-9]*$" OR
+            WOLVRIX_MIMALLOC_GENERIC_COLLECT GREATER 1000000)
+            message(FATAL_ERROR "WOLVRIX_MIMALLOC_GENERIC_COLLECT must be in [1, 1000000]")
+        endif()
+        target_compile_definitions(wolvrix-lib PRIVATE
+            WOLVRIX_BUNDLED_MIMALLOC_DEFAULTS
+            WOLVRIX_MIMALLOC_GENERIC_COLLECT=${WOLVRIX_MIMALLOC_GENERIC_COLLECT})
+    endif()
+endif()
 
 if (WOLVRIX_HAVE_MT_KAHYPAR)
     target_link_libraries(wolvrix-lib

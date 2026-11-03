@@ -1,8 +1,32 @@
 #include <Python.h>
 
+#include "core/allocator.hpp"
 #include "native/module/methods.hpp"
 
+namespace wolvrix::app::pybind {
+
+PyObject *py_allocator_configuration(PyObject *, PyObject *) {
+    const auto config = wolvrix::lib::allocator::configuration();
+    PyObject *genericCollect;
+    if (config.genericCollect > 0) {
+        genericCollect = PyLong_FromLong(config.genericCollect);
+    } else {
+        Py_INCREF(Py_None);
+        genericCollect = Py_None;
+    }
+    if (!genericCollect) {
+        return nullptr;
+    }
+    return Py_BuildValue("{s:O,s:O,s:N}", "mimalloc", config.mimalloc ? Py_True : Py_False,
+                         "project_defaults", config.projectDefaults ? Py_True : Py_False,
+                         "generic_collect", genericCollect);
+}
+
+} // namespace wolvrix::app::pybind
+
 static PyMethodDef WolvrixMethods[] = {
+    {"allocator_configuration", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_allocator_configuration), METH_NOARGS,
+     "Private benchmark diagnostics for the effective native allocator configuration."},
     {"create_session", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_create_session), METH_NOARGS,
      "create_session() -> Session capsule"},
     {"session_close", reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_close), METH_VARARGS,

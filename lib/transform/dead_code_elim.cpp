@@ -336,14 +336,20 @@ namespace wolvrix::lib::transform
     PassResult DeadCodeElimPass::run()
     {
         const auto timingStart = std::chrono::steady_clock::now();
+        stats_ = {};
         PassResult result;
         bool anyChanged = false;
         const std::size_t graphCount = design().graphs().size();
+        auto *dirty = getSessionValue<DirtyWorklist>("simplify.dirty");
+        const auto activeGraphs = dirty ? dirty->take(id()) : std::nullopt;
+        if (dirty && dirty->active && !activeGraphs) return {};
+        std::unordered_set<std::string> changedGraphNames;
         logDebug("begin graphs=" + std::to_string(graphCount));
         std::size_t changedGraphs = 0;
 
         for (const auto &entry : design().graphs())
         {
+            if (activeGraphs && !activeGraphs->contains(entry.first)) continue;
             wolvrix::lib::grh::Graph &graph = *entry.second;
             bool graphChanged = false;
 
@@ -445,6 +451,7 @@ namespace wolvrix::lib::transform
                 info.results.assign(results.begin(), results.end());
                 const std::size_t infoIndex = ops.size();
                 ops.push_back(std::move(info));
+                ++stats_.operationsVisited;
                 if (opId.index < opIndexById.size())
                 {
                     opIndexById[opId.index] = static_cast<int32_t>(infoIndex);
@@ -884,6 +891,7 @@ namespace wolvrix::lib::transform
                 if (graph.eraseOpUnchecked(info.id))
                 {
                     graphChanged = true;
+                    ++stats_.opsRemoved;
                 }
             }
             deadRoots.flush();
@@ -925,6 +933,7 @@ namespace wolvrix::lib::transform
                 if (graph.eraseValueUnchecked(valueId))
                 {
                     graphChanged = true;
+                    ++stats_.valuesRemoved;
                 }
             }
 
@@ -932,11 +941,18 @@ namespace wolvrix::lib::transform
             if (graphChanged)
             {
                 ++changedGraphs;
+                changedGraphNames.insert(entry.first);
             }
         }
 
         result.changed = anyChanged;
         result.failed = false;
+        if (dirty) {
+            for (const auto& graph : changedGraphNames)
+                dirty->enqueue("redundant-elim", graph);
+        }
+        stats_.graphs = graphCount;
+        stats_.changedGraphs = changedGraphs;
         std::string message = "graphs=" + std::to_string(graphCount);
         message.append(", changedGraphs=");
         message.append(std::to_string(changedGraphs));

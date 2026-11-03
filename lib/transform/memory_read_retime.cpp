@@ -21,28 +21,26 @@ namespace wolvrix::lib::transform
 
     namespace
     {
-        using wolvrix::lib::grh::Operation;
         using wolvrix::lib::grh::OperationId;
         using wolvrix::lib::grh::OperationKind;
         using wolvrix::lib::grh::SrcLoc;
         using wolvrix::lib::grh::SymbolId;
-        using wolvrix::lib::grh::Value;
         using wolvrix::lib::grh::ValueId;
         using wolvrix::lib::grh::ValueType;
 
-        template <typename T>
-        std::optional<T> getAttr(const Operation &op, std::string_view key)
+        const wolvrix::lib::grh::AttributeValue *findAttr(
+            const wolvrix::lib::grh::Graph &graph, OperationId op, std::string_view key)
         {
-            auto attr = op.attr(key);
-            if (!attr)
-            {
-                return std::nullopt;
-            }
-            if (const auto *value = std::get_if<T>(&*attr))
-            {
-                return *value;
-            }
-            return std::nullopt;
+            for (const auto &attr : graph.opAttrs(op))
+                if (attr.key == key) return &attr.value;
+            return nullptr;
+        }
+
+        template <typename T>
+        const T *getAttr(const wolvrix::lib::grh::Graph &graph, OperationId op, std::string_view key)
+        {
+            const auto *attr = findAttr(graph, op, key);
+            return attr ? std::get_if<T>(attr) : nullptr;
         }
 
         std::optional<slang::SVInt> parseConstLiteral(std::string_view literal)
@@ -95,18 +93,16 @@ namespace wolvrix::lib::transform
             {
                 return std::nullopt;
             }
-            const Value value = graph.getValue(valueId);
-            const OperationId def = value.definingOp();
+            const OperationId def = graph.valueDef(valueId);
             if (!def.valid())
             {
                 return std::nullopt;
             }
-            const Operation op = graph.getOperation(def);
-            if (op.kind() != OperationKind::kConstant)
+            if (graph.opKind(def) != OperationKind::kConstant)
             {
                 return std::nullopt;
             }
-            auto literal = getAttr<std::string>(op, "constValue");
+            const auto *literal = getAttr<std::string>(graph, def, "constValue");
             if (!literal)
             {
                 return std::nullopt;
@@ -329,33 +325,33 @@ namespace wolvrix::lib::transform
             return resized.as<int64_t>();
         }
 
-        bool anyInitAttrs(const Operation &op)
+        bool anyInitAttrs(const wolvrix::lib::grh::Graph &graph, OperationId op)
         {
-            return op.attr("initKind").has_value() ||
-                   op.attr("initFile").has_value() ||
-                   op.attr("initValue").has_value() ||
-                   op.attr("initStart").has_value() ||
-                   op.attr("initLen").has_value();
+            return findAttr(graph, op, "initKind") ||
+                   findAttr(graph, op, "initFile") ||
+                   findAttr(graph, op, "initValue") ||
+                   findAttr(graph, op, "initStart") ||
+                   findAttr(graph, op, "initLen");
         }
 
-        bool buildLiteralInitTable(const Operation &memoryOp,
+        bool buildLiteralInitTable(const wolvrix::lib::grh::Graph &graph, OperationId memoryOp,
                                    int64_t rowCount,
                                    int32_t width,
                                    std::vector<std::optional<std::string>> &table,
                                    std::string &reason)
         {
             table.assign(static_cast<std::size_t>(rowCount), std::nullopt);
-            if (!anyInitAttrs(memoryOp))
+            if (!anyInitAttrs(graph, memoryOp))
             {
                 reason = "memory init attrs missing";
                 return false;
             }
 
-            auto kindsOpt = getAttr<std::vector<std::string>>(memoryOp, "initKind");
-            auto filesOpt = getAttr<std::vector<std::string>>(memoryOp, "initFile");
-            auto startsOpt = getAttr<std::vector<int64_t>>(memoryOp, "initStart");
-            auto lensOpt = getAttr<std::vector<int64_t>>(memoryOp, "initLen");
-            auto values = getAttr<std::vector<std::string>>(memoryOp, "initValue").value_or(std::vector<std::string>{});
+            const auto *kindsOpt = getAttr<std::vector<std::string>>(graph, memoryOp, "initKind");
+            const auto *filesOpt = getAttr<std::vector<std::string>>(graph, memoryOp, "initFile");
+            const auto *startsOpt = getAttr<std::vector<int64_t>>(graph, memoryOp, "initStart");
+            const auto *lensOpt = getAttr<std::vector<int64_t>>(graph, memoryOp, "initLen");
+            const auto *values = getAttr<std::vector<std::string>>(graph, memoryOp, "initValue");
             if (!kindsOpt || !filesOpt || !startsOpt || !lensOpt)
             {
                 reason = "memory init attrs incomplete";
@@ -382,7 +378,7 @@ namespace wolvrix::lib::transform
                     return false;
                 }
                 const std::string literalText =
-                    (i < values.size() && !values[i].empty()) ? values[i] : makeZeroLiteral(width);
+                    (values && i < values->size() && !(*values)[i].empty()) ? (*values)[i] : makeZeroLiteral(width);
                 auto parsed = parseConstLiteral(literalText);
                 if (!parsed)
                 {
@@ -439,24 +435,23 @@ namespace wolvrix::lib::transform
             GraphIndex index;
             for (const OperationId opId : graph.operations())
             {
-                const Operation op = graph.getOperation(opId);
-                switch (op.kind())
+                switch (graph.opKind(opId))
                 {
                 case OperationKind::kRegister:
                     // Array registers (shape attr) play the retired kMemory
                     // declaration role for this pass.
-                    if (op.attr("shape").has_value())
+                    if (findAttr(graph, opId, "shape"))
                     {
-                        index.memoryDecls.emplace(std::string(op.symbolText()), opId);
+                        index.memoryDecls.emplace(std::string(graph.symbolText(graph.operationSymbol(opId))), opId);
                     }
                     else
                     {
-                        index.registerDecls.emplace(std::string(op.symbolText()), opId);
+                        index.registerDecls.emplace(std::string(graph.symbolText(graph.operationSymbol(opId))), opId);
                     }
                     break;
                 case OperationKind::kRegisterReadPort:
                 {
-                    auto regSymbol = getAttr<std::string>(op, "regSymbol");
+                    const auto *regSymbol = getAttr<std::string>(graph, opId, "regSymbol");
                     if (regSymbol)
                     {
                         index.registerReadPorts[*regSymbol].push_back(opId);
@@ -466,7 +461,7 @@ namespace wolvrix::lib::transform
                 case OperationKind::kRegisterWritePort:
                 case OperationKind::kRegisterWriteMaskPort:
                 {
-                    auto regSymbol = getAttr<std::string>(op, "regSymbol");
+                    const auto *regSymbol = getAttr<std::string>(graph, opId, "regSymbol");
                     if (regSymbol)
                     {
                         index.registerWritePorts[*regSymbol].push_back(opId);
@@ -476,7 +471,7 @@ namespace wolvrix::lib::transform
                 case OperationKind::kRegisterWriteArrayPort:
                 case OperationKind::kRegisterWriteArrayMaskPort:
                 {
-                    auto regSymbol = getAttr<std::string>(op, "regSymbol");
+                    const auto *regSymbol = getAttr<std::string>(graph, opId, "regSymbol");
                     if (regSymbol)
                     {
                         index.memoryWritePorts[*regSymbol].push_back(opId);
@@ -598,33 +593,32 @@ namespace wolvrix::lib::transform
                                                 bool keepDeclaredSymbols,
                                                 Stats &stats)
         {
-            const Operation readOp = graph.getOperation(readOpId);
-            if (readOp.kind() != OperationKind::kRegisterReadArrayPort ||
-                readOp.operands().size() != 1 ||
-                readOp.results().size() != 1)
+            const auto readOperands = graph.opOperands(readOpId);
+            const auto readResults = graph.opResults(readOpId);
+            if (graph.opKind(readOpId) != OperationKind::kRegisterReadArrayPort ||
+                readOperands.size() != 1 || readResults.size() != 1)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
 
-            const ValueId addressValue = readOp.operands()[0];
-            const ValueId readResult = readOp.results()[0];
-            const Value address = graph.getValue(addressValue);
-            const Value output = graph.getValue(readResult);
-            const OperationId addressReadId = address.definingOp();
+            const ValueId addressValue = readOperands[0];
+            const ValueId readResult = readResults[0];
+            const OperationId addressReadId = graph.valueDef(addressValue);
+            const bool outputSigned = graph.valueSigned(readResult);
+            const ValueType outputType = graph.valueType(readResult);
             if (!addressReadId.valid())
             {
                 ++stats.skipNonRegisterAddr;
                 return std::nullopt;
             }
-            const Operation addressReadOp = graph.getOperation(addressReadId);
-            if (addressReadOp.kind() != OperationKind::kRegisterReadPort)
+            if (graph.opKind(addressReadId) != OperationKind::kRegisterReadPort)
             {
                 ++stats.skipNonRegisterAddr;
                 return std::nullopt;
             }
 
-            auto addressRegSymbol = getAttr<std::string>(addressReadOp, "regSymbol");
+            const auto *addressRegSymbol = getAttr<std::string>(graph, addressReadId, "regSymbol");
             if (!addressRegSymbol)
             {
                 ++stats.skipMalformed;
@@ -636,8 +630,9 @@ namespace wolvrix::lib::transform
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
-            const Operation addressRegOp = graph.getOperation(regDeclIt->second);
-            const int32_t addrWidth = static_cast<int32_t>(getAttr<int64_t>(addressRegOp, "width").value_or(address.width()));
+            const OperationId addressRegOp = regDeclIt->second;
+            const auto *widthAttr = getAttr<int64_t>(graph, addressRegOp, "width");
+            const int32_t addrWidth = static_cast<int32_t>(widthAttr ? *widthAttr : graph.valueWidth(addressValue));
             if (addrWidth <= 0)
             {
                 ++stats.skipMalformed;
@@ -648,8 +643,8 @@ namespace wolvrix::lib::transform
             if (regReadIt == index.registerReadPorts.end() ||
                 regReadIt->second.size() != 1 ||
                 regReadIt->second.front() != addressReadId ||
-                address.users().size() != 1 ||
-                address.users().front().operation != readOpId)
+                graph.valueUsers(addressValue).size() != 1 ||
+                graph.valueUsers(addressValue).front().operation != readOpId)
             {
                 ++stats.skipAddrFanout;
                 return std::nullopt;
@@ -670,16 +665,16 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             const OperationId addressWriteId = regWriteIt->second.front();
-            const Operation addressWriteOp = graph.getOperation(addressWriteId);
+            const auto addressWriteOperands = graph.opOperands(addressWriteId);
             // Only whole writes (no mask operand) keep the retime equivalence.
-            if (addressWriteOp.kind() != OperationKind::kRegisterWritePort ||
-                addressWriteOp.operands().size() < 2)
+            if (graph.opKind(addressWriteId) != OperationKind::kRegisterWritePort ||
+                addressWriteOperands.size() < 2)
             {
                 ++stats.skipPartialMask;
                 return std::nullopt;
             }
 
-            auto memorySymbol = getAttr<std::string>(readOp, "regSymbol");
+            const auto *memorySymbol = getAttr<std::string>(graph, readOpId, "regSymbol");
             if (!memorySymbol)
             {
                 ++stats.skipMalformed;
@@ -691,19 +686,20 @@ namespace wolvrix::lib::transform
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
-            const Operation memoryOp = graph.getOperation(memoryDeclIt->second);
-            const auto memoryShape =
-                getAttr<std::vector<int64_t>>(memoryOp, "shape").value_or(std::vector<int64_t>{});
-            const int64_t memoryTotalWidth = getAttr<int64_t>(memoryOp, "width").value_or(0);
-            if (memoryShape.size() != 1 || memoryShape.front() <= 0 || memoryTotalWidth <= 0 ||
-                memoryTotalWidth % memoryShape.front() != 0)
+            const OperationId memoryOp = memoryDeclIt->second;
+            const auto *memoryShape = getAttr<std::vector<int64_t>>(graph, memoryOp, "shape");
+            const auto *memoryWidth = getAttr<int64_t>(graph, memoryOp, "width");
+            const int64_t memoryTotalWidth = memoryWidth ? *memoryWidth : 0;
+            if (!memoryShape || memoryShape->size() != 1 || memoryShape->front() <= 0 || memoryTotalWidth <= 0 ||
+                memoryTotalWidth % memoryShape->front() != 0)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
-            const int64_t rowCount = memoryShape.front();
+            const int64_t rowCount = memoryShape->front();
             const int32_t dataWidth = static_cast<int32_t>(memoryTotalWidth / rowCount);
-            const bool dataSigned = getAttr<bool>(memoryOp, "isSigned").value_or(output.isSigned());
+            const auto *signedAttr = getAttr<bool>(graph, memoryOp, "isSigned");
+            const bool dataSigned = signedAttr ? *signedAttr : outputSigned;
             if (dataWidth <= 0)
             {
                 ++stats.skipMalformed;
@@ -720,16 +716,16 @@ namespace wolvrix::lib::transform
             candidate.addressRegisterSymbol = *addressRegSymbol;
             candidate.readResult = readResult;
             candidate.addressValue = addressValue;
-            candidate.nextAddress = addressWriteOp.operands()[1];
-            candidate.addressEnable = addressWriteOp.operands()[0];
+            candidate.nextAddress = addressWriteOperands[1];
+            candidate.addressEnable = addressWriteOperands[0];
             candidate.addrWidth = addrWidth;
             candidate.dataWidth = dataWidth;
             candidate.dataSigned = dataSigned;
-            candidate.dataType = output.type();
+            candidate.dataType = outputType;
 
             // If both address init and memory init are statically known, preserve data reg init.
             // Otherwise leave data_reg uninitialized and do not guarantee time 0 equivalence.
-            if (auto addrInit = getAttr<std::string>(addressRegOp, "initValue"))
+            if (const auto *addrInit = getAttr<std::string>(graph, addressRegOp, "initValue"))
             {
                 if (auto addrIndex = extractIndexFromLiteral(*addrInit, addrWidth))
                 {
@@ -737,7 +733,7 @@ namespace wolvrix::lib::transform
                     std::string initReason;
                     if (*addrIndex >= 0 &&
                         *addrIndex < rowCount &&
-                        buildLiteralInitTable(memoryOp, rowCount, dataWidth, initTable, initReason) &&
+                        buildLiteralInitTable(graph, memoryOp, rowCount, dataWidth, initTable, initReason) &&
                         initTable[static_cast<std::size_t>(*addrIndex)].has_value())
                     {
                         candidate.dataInitValue = *initTable[static_cast<std::size_t>(*addrIndex)];
@@ -745,20 +741,20 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            auto addrEdges = getAttr<std::vector<std::string>>(addressWriteOp, "eventEdge");
-            if (!addrEdges || addrEdges->size() != addressWriteOp.operands().size() - 2)
+            const auto *addrEdges = getAttr<std::vector<std::string>>(graph, addressWriteId, "eventEdge");
+            if (!addrEdges || addrEdges->size() != addressWriteOperands.size() - 2)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
             candidate.eventEdges = *addrEdges;
-            candidate.events.assign(addressWriteOp.operands().begin() + 2, addressWriteOp.operands().end());
+            candidate.events.assign(addressWriteOperands.begin() + 2, addressWriteOperands.end());
 
             const auto memWriteIt = index.memoryWritePorts.find(*memorySymbol);
             const std::size_t memWriteCount = memWriteIt == index.memoryWritePorts.end() ? 0 : memWriteIt->second.size();
             if (memWriteCount == 0)
             {
-                if (keepDeclaredSymbols && graph.isDeclaredSymbol(addressRegOp.symbol()))
+                if (keepDeclaredSymbols && graph.isDeclaredSymbol(graph.operationSymbol(addressRegOp)))
                 {
                     ++stats.skipDeclaredSymbol;
                     return std::nullopt;
@@ -773,9 +769,9 @@ namespace wolvrix::lib::transform
             }
 
             const OperationId memoryWriteId = memWriteIt->second.front();
-            const Operation memoryWriteOp = graph.getOperation(memoryWriteId);
+            const auto memoryWriteOperands = graph.opOperands(memoryWriteId);
             const std::optional<std::size_t> memEventStart =
-                wolvrix::lib::grh::firstEventOperandIndex(memoryWriteOp);
+                wolvrix::lib::grh::firstEventOperandIndex(graph, memoryWriteId);
             // One address index is required: layouts are
             //   WriteArray:     [cond, addr, data, events...]
             //   WriteArrayMask: [cond, addr, data, mask, events...]
@@ -785,34 +781,33 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             const bool memWriteHasMask =
-                memoryWriteOp.kind() == OperationKind::kRegisterWriteArrayMaskPort;
+                graph.opKind(memoryWriteId) == OperationKind::kRegisterWriteArrayMaskPort;
             if (*memEventStart != (memWriteHasMask ? 4 : 3))
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
-            const auto memEdges = getAttr<std::vector<std::string>>(memoryWriteOp, "eventEdge");
-            if (!memEdges || memEdges->size() != memoryWriteOp.operands().size() - *memEventStart)
+            const auto *memEdges = getAttr<std::vector<std::string>>(graph, memoryWriteId, "eventEdge");
+            if (!memEdges || memEdges->size() != memoryWriteOperands.size() - *memEventStart)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
             }
             if (!valueEq(candidate.events,
-                         std::span<const ValueId>(memoryWriteOp.operands().begin() + *memEventStart,
-                                                  memoryWriteOp.operands().size() - *memEventStart)) ||
+                         memoryWriteOperands.subspan(*memEventStart)) ||
                 *memEdges != candidate.eventEdges)
             {
                 ++stats.skipMismatchedEventDomain;
                 return std::nullopt;
             }
             if (memWriteHasMask &&
-                !isFullMaskConst(graph, memoryWriteOp.operands()[*memEventStart - 1], dataWidth))
+                !isFullMaskConst(graph, memoryWriteOperands[*memEventStart - 1], dataWidth))
             {
                 ++stats.skipWriteportPartialMask;
                 return std::nullopt;
             }
-            if (graph.getValue(memoryWriteOp.operands()[1]).width() != addrWidth ||
-                graph.getValue(memoryWriteOp.operands()[*memEventStart - (memWriteHasMask ? 2 : 1)]).width() != dataWidth)
+            if (graph.valueWidth(memoryWriteOperands[1]) != addrWidth ||
+                graph.valueWidth(memoryWriteOperands[*memEventStart - (memWriteHasMask ? 2 : 1)]) != dataWidth)
             {
                 ++stats.skipMalformed;
                 return std::nullopt;
@@ -820,9 +815,9 @@ namespace wolvrix::lib::transform
 
             candidate.mode = Candidate::Mode::SimpleRam;
             candidate.memoryWriteOp = memoryWriteId;
-            candidate.memoryWriteEnable = memoryWriteOp.operands()[0];
-            candidate.memoryWriteAddress = memoryWriteOp.operands()[1];
-            candidate.memoryWriteData = memoryWriteOp.operands()[*memEventStart - (memWriteHasMask ? 2 : 1)];
+            candidate.memoryWriteEnable = memoryWriteOperands[0];
+            candidate.memoryWriteAddress = memoryWriteOperands[1];
+            candidate.memoryWriteData = memoryWriteOperands[*memEventStart - (memWriteHasMask ? 2 : 1)];
             return candidate;
         }
 
@@ -982,8 +977,7 @@ namespace wolvrix::lib::transform
             std::vector<Candidate> candidates;
             for (const OperationId opId : graph.operations())
             {
-                const Operation op = graph.getOperation(opId);
-                if (op.kind() != OperationKind::kRegisterReadArrayPort)
+                if (graph.opKind(opId) != OperationKind::kRegisterReadArrayPort)
                 {
                     continue;
                 }

@@ -237,7 +237,7 @@ namespace
     }
 
     // Pattern R: constant-index read mux tree folds to one dynamic array read.
-    int testReadTreeFold()
+    int testReadTreeFold(bool frozen = false)
     {
         grh::Design design;
         grh::Graph &graph = design.createGraph("g");
@@ -268,6 +268,7 @@ namespace
             graph.createOperation(grh::OperationKind::kAssign, graph.internSymbol("drive_out"));
         graph.addOperand(drive, chain);
         graph.addResult(drive, out);
+        if (frozen) graph.freeze();
 
         PassManager manager;
         manager.addPass(std::make_unique<MuxTreeFoldPass>());
@@ -548,7 +549,7 @@ namespace
         return next;
     }
 
-    int testGuardedWriteNormalization(bool withOr)
+    int testGuardedWriteNormalization(bool withOr, bool frozen = false)
     {
         grh::Design design;
         auto &graph = design.createGraph("guarded");
@@ -634,6 +635,7 @@ namespace
             cases.push_back(std::move(c));
         }
         const auto originalWrites = countKind(graph, grh::OperationKind::kRegisterWriteArrayPort);
+        if (frozen) graph.freeze();
         PassManager normalizer;
         normalizer.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
         PassDiagnostics diags;
@@ -643,6 +645,7 @@ namespace
         for (const auto &c : cases)
             if (evaluateWrites(graph, c.inputs, c.old) != c.expected)
                 return fail("guarded writes: normalization changed state transition");
+        if (frozen) graph.freeze();
         PassManager manager;
         manager.addPass(std::make_unique<MuxTreeFoldPass>(true));
         manager.addPass(std::make_unique<GrhVerifyPass>());
@@ -728,6 +731,65 @@ namespace
         return operands.size() == 2 &&
                ((operands[0] == lhs && operands[1] == rhs) ||
                 (operands[0] == rhs && operands[1] == lhs));
+    }
+
+    int testFrozenPruningProvenance()
+    {
+        grh::Design design;
+        auto &graph = design.createGraph("frozen_pruning");
+        makeRegister(graph, "q", 8);
+        const auto clock = makeInput(graph, "clk", 1);
+        const auto enable = makeInput(graph, "enable", 1);
+        const auto condition = makeInput(graph, "condition", 1);
+        const auto hold = makeInput(graph, "hold", 1);
+        const auto dataA = makeInput(graph, "data_a", 8);
+        const auto dataB = makeInput(graph, "data_b", 8);
+        const auto old = makeReadWhole(graph, "q", "old", 8);
+        const auto inner = makeMux(graph, "inner", 8, hold, old, dataA);
+        const auto outer = makeMux(graph, "outer", 8, condition, inner, dataB);
+        grh::SrcLoc muxLoc;
+        muxLoc.file = "f16.fir";
+        muxLoc.line = 12;
+        muxLoc.column = 3;
+        muxLoc.origin = "firrtl";
+        muxLoc.note = std::string(192, 'm');
+        graph.setOpSrcLoc(graph.valueDef(outer), muxLoc);
+        const auto originalWrite = makeWholeWrite(graph, "write", "q", enable, outer, clock);
+        grh::SrcLoc writeLoc = muxLoc;
+        writeLoc.line = 13;
+        writeLoc.note = std::string(192, 'w');
+        graph.setOpSrcLoc(originalWrite, writeLoc);
+        const std::vector<std::string> origins{std::string(192, 'o'), "nested"};
+        graph.setAttr(originalWrite, "originModules", origins);
+        graph.freeze();
+
+        PassManager manager;
+        manager.addPass(std::make_unique<RegisterWriteNormalizePass>(true));
+        manager.addPass(std::make_unique<GrhVerifyPass>());
+        PassDiagnostics diagnostics;
+        const auto result = manager.run(design, diagnostics);
+        if (!result.success || !result.changed || diagnostics.hasError())
+            return fail("frozen pruning: pipeline failed");
+        grh::OperationId write;
+        for (const auto id : graph.operations())
+            if (graph.opKind(id) == grh::OperationKind::kRegisterWritePort) write = id;
+        if (!write.valid()) return fail("frozen pruning: write disappeared");
+        const auto writeOp = graph.getOperation(write);
+        const auto originsAttr = writeOp.attr("originModules");
+        if (!originsAttr || std::get_if<std::vector<std::string>>(&*originsAttr) == nullptr ||
+            std::get<std::vector<std::string>>(*originsAttr) != origins || !writeOp.srcLoc() ||
+            writeOp.srcLoc()->note != writeLoc.note || writeOp.srcLoc()->line != writeLoc.line)
+            return fail("frozen pruning: write attributes or source location changed");
+        const auto payload = graph.valueDef(writeOp.operands()[1]);
+        if (!payload.valid() || graph.opKind(payload) != grh::OperationKind::kMux)
+            return fail("frozen pruning: pruned branches did not rebuild the payload mux");
+        const auto operands = graph.opOperands(payload);
+        const auto location = graph.opSrcLoc(payload);
+        if (operands.size() != 3 || operands[0] != condition || operands[1] != dataA ||
+            operands[2] != dataB || !location || location->note != muxLoc.note ||
+            location->file != muxLoc.file || location->line != muxLoc.line)
+            return fail("frozen pruning: recursive graph growth lost payload or provenance");
+        return 0;
     }
 
     int testGlobalWriteFamilies()
@@ -1037,6 +1099,10 @@ int main()
     }
     if (int rc = testGuardedWriteNormalization(false)) return rc;
     if (int rc = testGuardedWriteNormalization(true)) return rc;
+    if (int rc = testReadTreeFold(true)) return rc;
+    if (int rc = testGuardedWriteNormalization(false, true)) return rc;
+    if (int rc = testGuardedWriteNormalization(true, true)) return rc;
+    if (int rc = testFrozenPruningProvenance()) return rc;
     if (int rc = testIdentityOverridesEarlierWrite()) return rc;
     if (int rc = testTwoStateOptIn()) return rc;
     if (int rc = testGlobalWriteFamilies()) return rc;

@@ -28,6 +28,21 @@ and resource paths use `input_root`; slang option paths retain slang semantics.
 An empty top list with FIRRTL inputs selects their circuit main modules.
 `node_annotations` defaults to `True`; the bounded bringup configuration below
 shows how to disable these optional source associations explicitly.
+`lower_threads` defaults to `1`. Values greater than one create a fixed worker
+pool for the transaction. Workers take reachable FIRRTL modules from a shared
+queue and lower each directly into its own graph in the final design; a worker
+takes the next module as soon as it finishes. The coordinator creates all target
+graphs with their final design owner and IDs before starting workers, and keeps
+them outside the graph catalog until publication. A scoped graph mutation batch advances the
+design revision at its boundaries instead of writing a shared revision counter
+for every operation. The scope outlives the pool and its worker joins; no
+revision-based analyses or design catalog mutations run inside it.
+Results and failures are published in dependency order, including interleaved
+SV implementations and ABI adapters. Publication transfers the graph's
+`unique_ptr` into the design catalog without copying graph contents. This also
+preserves hash table insertion order used by verification diagnostics.
+Interface resolution, mixed-language binding, diagnostics, and the final
+linked-design verification remain serialized.
 
 ## Elaboration and publication
 
@@ -248,6 +263,24 @@ continue to own their file, source line and source-info strings.
 Temporary F12 counters, timing scopes and profiling/cache-disable environment
 switches have been removed. External benchmarks can still measure the complete
 ingest call and compare serialized designs without changing the native path.
+
+### Allocator configuration
+
+`SLANG_USE_MIMALLOC` defaults to `ON`; Slang's integration replaces global C++
+`new`/`delete`, so it also affects graph construction and transformation. For
+the private bundled static allocator, `WOLVRIX_MIMALLOC_GENERIC_COLLECT`
+defaults to `1000000` generic slow allocations between whole-heap scans and
+accepts integers in `[1, 1000000]`. The library sets this default once during
+initialization. Explicit `MIMALLOC_GENERIC_COLLECT` settings retain precedence;
+the bundled allocator clamps `0` to `1`, which increases scan frequency.
+Delayed-free maintenance between these scans remains enabled.
+
+Imported/shared allocator defaults are managed by the embedding application.
+`SLANG_USE_MIMALLOC=OFF` disables Slang's global replacement while retaining
+its arena allocation strategy. Allocator policy is not changed by an ingest,
+graph, transformation or worker. FIRRTL declaration and Driver lookup caches
+remain local to one module analysis/lowering; sorted containers still determine
+publication and diagnostic order.
 
 ## Validation
 

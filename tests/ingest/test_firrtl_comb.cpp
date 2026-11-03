@@ -138,8 +138,25 @@ void sourceInfoOwnership() {
     auto stored = roundTrip(*result.design);
     check(*stored.findGraph("top"));
 }
+void symbolLookupSemantics() {
+    auto source = design(std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) /
+                         "comb/parallel_symbols.fir");
+    constexpr const char* input =
+        "shared_reference_name_that_exceeds_small_string_storage_and_is_reused_across_modules";
+    Oracle first(*source.findGraph("first"));
+    Oracle second(*source.findGraph("second"));
+    for (const uint64_t value : {uint64_t{0}, uint64_t{1}, uint64_t{17},
+                                 uint64_t{255}, uint64_t{8191}}) {
+        const std::map<std::string, uint64_t> inputs{{input, value}};
+        require(first.output("y", inputs) == 255,
+                "repeated long-name lookup changed first module semantics");
+        require(second.output("y", inputs) == value,
+                "same-name declarations or drivers crossed module scope");
+    }
+}
 void test() {
     sourceInfoOwnership();
+    symbolLookupSemantics();
     selection();
     const auto path = std::filesystem::path(WOLVRIX_FIRRTL_TEST_DATA_DIR) / "comb/basic.fir";
     auto source = design(path); auto& graph = *source.findGraph("top");

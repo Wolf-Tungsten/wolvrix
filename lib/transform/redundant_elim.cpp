@@ -481,9 +481,14 @@ namespace wolvrix::lib::transform
     PassResult RedundantElimPass::run()
     {
         const auto timingStart = std::chrono::steady_clock::now();
+        stats_ = {};
         PassResult result;
         bool anyChanged = false;
         const std::size_t graphCount = design().graphs().size();
+        auto *dirty = getSessionValue<DirtyWorklist>("simplify.dirty");
+        const auto activeGraphs = dirty ? dirty->take(id()) : std::nullopt;
+        if (dirty && dirty->active && !activeGraphs) return {};
+        std::unordered_set<std::string> changedGraphNames;
         logDebug("begin graphs=" + std::to_string(graphCount));
         std::size_t changedGraphs = 0;
         std::size_t opsRemoved = 0;
@@ -491,8 +496,13 @@ namespace wolvrix::lib::transform
 
         for (const auto &entry : design().graphs())
         {
+            if (activeGraphs && !activeGraphs->contains(entry.first)) continue;
             wolvrix::lib::grh::Graph &graph = *entry.second;
-            const auto nodeErrors = ingest::node::scanAttributeErrors(graph);
+            const auto nodeErrors = [&]() {
+                if (auto *cache = getSessionValue<ingest::node::ValidationCache>("firrtl.node.validation"))
+                    return ingest::node::scanAttributeErrors(graph, *cache);
+                return ingest::node::scanAttributeErrors(graph);
+            }();
             if (!nodeErrors.empty()) {
                 for (const auto& problem : nodeErrors) this->error(graph, problem);
                 result.failed = true;
@@ -541,6 +551,7 @@ namespace wolvrix::lib::transform
                                                   graph.operations().end());
             for (const auto opId : ops)
             {
+                ++stats_.operationsVisited;
                 // Lean screening (stage-07): kind/operand/result/attr reads go
                 // through the Graph id/span accessors; a fat Operation is
                 // materialized only on rewrite error paths that need one for
@@ -1499,6 +1510,7 @@ namespace wolvrix::lib::transform
             if (graphChanged)
             {
                 ++changedGraphs;
+                changedGraphNames.insert(entry.first);
             }
             if (std::getenv("WOLVRIX_SIMPLIFY_PHASE_TIMING") != nullptr)
             {
@@ -1520,6 +1532,17 @@ namespace wolvrix::lib::transform
 
         result.changed = anyChanged;
         result.failed = false;
+        if (dirty) {
+            for (const auto& graph : changedGraphNames) {
+                dirty->enqueue("const-fold", graph);
+                dirty->enqueue("redundant-elim", graph);
+                dirty->enqueue("dead-code-elim", graph);
+            }
+        }
+        stats_.graphs = graphCount;
+        stats_.changedGraphs = changedGraphs;
+        stats_.opsRemoved = opsRemoved;
+        stats_.valuesRemoved = valuesRemoved;
         std::string message = "graphs=" + std::to_string(graphCount);
         message.append(", changedGraphs=");
         message.append(std::to_string(changedGraphs));

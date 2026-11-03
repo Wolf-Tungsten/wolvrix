@@ -57,6 +57,14 @@ void sameValidation(grh::Graph& graph) {
     catch (const std::invalid_argument& error) { message = error.what(); }
     require(message == (expected.errors.empty() ? "" : "FIRRTL node attributes: " + expected.errors.front()),
         "validation-only scan changed the first error or prefix");
+    node::ValidationCache cache;
+    require(node::scanAttributeErrors(graph, cache) == expected.errors && cache.misses == 1 && cache.hits == 0,
+        "revision validation cache did not populate deterministically");
+    require(node::scanAttributeErrors(graph, cache) == expected.errors && cache.hits == 1,
+        "revision validation cache did not reuse a stable graph result");
+    graph.setMetadata("firrtl.validationProbe", true);
+    require(node::scanAttributeErrors(graph, cache) == expected.errors && cache.misses == 2,
+        "revision validation cache reused a result after graph mutation");
     node::establishPolicy(graph);
     std::vector<std::string> keys;
     for (const auto& record : expected.nodes) keys.push_back(record.key);
@@ -138,6 +146,25 @@ void copyQualifiedAcrossGraphs() {
     const auto& restoredGraph = *restored.findGraph("top");
     require(node::read(restoredGraph, restoredGraph.valueDef(restoredGraph.outputPortValue("second"))) ==
             node::read(actual.graph, actualOp), "qualified attributes borrowed storage from a deleted source");
+}
+
+void keyInterner() {
+    node::NodeKeyInterner interner;
+    const auto first = interner.intern("canonical-node-key");
+    const auto duplicate = interner.intern("canonical-node-key");
+    const auto second = interner.intern("another-node-key");
+    require(first == duplicate && first != second && interner.size() == 2,
+        "node-key interner did not reuse canonical IDs");
+    require(interner.value(first) == "canonical-node-key" &&
+            interner.bytes() == std::string_view("canonical-node-key").size() +
+                std::string_view("another-node-key").size(),
+        "node-key interner lost canonical storage accounting");
+    auto copy = interner;
+    require(copy.value(first) == interner.value(first) && copy.size() == interner.size(),
+        "node-key interner copy rebuilt dangling IDs");
+    auto moved = std::move(copy);
+    require(moved.value(second) == "another-node-key" && moved.size() == interner.size(),
+        "node-key interner move rebuilt dangling IDs");
 }
 
 // Reference census uses full inspection records and owning sets, as before.
@@ -608,6 +635,12 @@ std::string qualifiedKey(std::string_view encoded, std::span<const std::string> 
 }
 
 void qualificationContext() {
+    node::NodeKeyInterner interner;
+    const auto interned = node::key({"fixture", "Circuit", "child", {}, "shared", {}});
+    const auto firstId = interner.intern(interned);
+    require(firstId == interner.intern(interned) && interner.size() == 1 &&
+            interner.bytes() == interned.size() && interner.value(firstId) == interned,
+        "node-key interner failed to reuse canonical storage");
     Fixture fixture;
     const auto value = fixture.compute(OperationKind::kNot, {fixture.input("a")});
     fixture.output("y", value);
@@ -642,6 +675,9 @@ void qualificationContext() {
     }
     node::write(actual, candidateOp, original); node::qualify(actual, candidateOp, context);
     require(node::read(actual, candidateOp) == parentAttributes, "nested context changed its parent's cache");
+    require(context.stats().lookups > context.stats().hits && context.stats().hits > 0 &&
+            context.stats().misses > 0 && context.stats().inputBytes > 0 && context.stats().outputBytes > 0,
+        "qualification context did not report key interning reuse");
 
     const auto failure = [](const auto& action) {
         try { action(); }
@@ -957,7 +993,7 @@ void flattenedInventory(bool fail) {
 }
 
 int main() {
-    try { canonicalValidationEquivalence(); identityAndPersistence(); mergeAndRemap(); invalidMetadata(); retentionEquivalence(); executionClones(); orphanLiteralProvenance(); multipleResults(); boundedHints(); deadInventory(); qualificationContext(); copyQualifiedAcrossGraphs(); inventoryImportBatch(); inventoryImportBoundaries(); flattenedInventory(false); flattenedInventory(true); }
+    try { canonicalValidationEquivalence(); identityAndPersistence(); mergeAndRemap(); invalidMetadata(); retentionEquivalence(); executionClones(); orphanLiteralProvenance(); multipleResults(); boundedHints(); deadInventory(); qualificationContext(); keyInterner(); copyQualifiedAcrossGraphs(); inventoryImportBatch(); inventoryImportBoundaries(); flattenedInventory(false); flattenedInventory(true); }
     catch (const std::exception& error) { std::cerr << "[firrtl-node-attributes] " << error.what() << '\n'; return 1; }
     return 0;
 }

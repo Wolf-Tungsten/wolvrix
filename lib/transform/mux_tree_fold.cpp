@@ -28,9 +28,9 @@ namespace wolvrix::lib::transform
         using wolvrix::lib::grh::OperationIdHash;
         using wolvrix::lib::grh::OperationKind;
         using wolvrix::lib::grh::SymbolId;
-        using wolvrix::lib::grh::Value;
         using wolvrix::lib::grh::ValueId;
         using wolvrix::lib::grh::ValueIdHash;
+        using write_detail::findAttr;
 
         // ------------------------------------------------------------------
         // constant literal helpers
@@ -267,13 +267,13 @@ namespace wolvrix::lib::transform
                     {
                         return value;
                     }
-                    const Operation op = graph_.getOperation(def);
-                    if ((op.kind() == OperationKind::kAssign ||
-                         op.kind() == OperationKind::kConcat) &&
-                        op.operands().size() == 1 &&
-                        graph_.valueWidth(value) == graph_.valueWidth(op.operands()[0]))
+                    const auto kind = graph_.opKind(def);
+                    const auto operands = graph_.opOperands(def);
+                    if ((kind == OperationKind::kAssign || kind == OperationKind::kConcat) &&
+                        operands.size() == 1 &&
+                        graph_.valueWidth(value) == graph_.valueWidth(operands[0]))
                     {
-                        value = op.operands()[0];
+                        value = operands[0];
                         continue;
                     }
                     return value;
@@ -289,8 +289,7 @@ namespace wolvrix::lib::transform
                 {
                     return std::nullopt;
                 }
-                const Operation op = graph_.getOperation(def);
-                const auto attr = op.attr("constValue");
+                const auto *attr = findAttr(graph_, def, "constValue");
                 if (!attr)
                 {
                     return std::nullopt;
@@ -329,10 +328,10 @@ namespace wolvrix::lib::transform
                     return std::nullopt;
                 }
                 const OperationKind kind = graph_.opKind(def);
-                const Operation op = graph_.getOperation(def);
-                if (op.operands().size() == 1 && graph_.valueWidth(value) == 1)
+                const auto operands = graph_.opOperands(def);
+                if (operands.size() == 1 && graph_.valueWidth(value) == 1)
                 {
-                    const auto input = strip(op.operands()[0]);
+                    const auto input = strip(operands[0]);
                     if (kind == OperationKind::kReduceOr || kind == OperationKind::kReduceNor ||
                         (kind == OperationKind::kLogicNot && graph_.valueWidth(input) > 1))
                         return EqConstMatch{input, 0, kind != OperationKind::kReduceOr};
@@ -356,12 +355,12 @@ namespace wolvrix::lib::transform
                 {
                     return std::nullopt;
                 }
-                if (op.operands().size() != 2)
+                if (operands.size() != 2)
                 {
                     return std::nullopt;
                 }
-                const ValueId lhs = strip(op.operands()[0]);
-                const ValueId rhs = strip(op.operands()[1]);
+                const ValueId lhs = strip(operands[0]);
+                const ValueId rhs = strip(operands[1]);
                 const bool isEq = kind == OperationKind::kEq;
                 if (auto rc = asConstUint(rhs))
                 {
@@ -387,15 +386,14 @@ namespace wolvrix::lib::transform
                     graph_.opKind(op) == OperationKind::kRegister)
                 {
                     info.op = op;
-                    const Operation regOp = graph_.getOperation(op);
-                    if (const auto attr = regOp.attr("width"))
+                    if (const auto *attr = findAttr(graph_, op, "width"))
                     {
                         if (const auto *w = std::get_if<int64_t>(&*attr))
                         {
                             info.width = *w;
                         }
                     }
-                    if (const auto attr = regOp.attr("shape"))
+                    if (const auto *attr = findAttr(graph_, op, "shape"))
                     {
                         if (const auto *dims = std::get_if<std::vector<int64_t>>(&*attr))
                         {
@@ -431,16 +429,16 @@ namespace wolvrix::lib::transform
                 {
                     return std::nullopt;
                 }
-                const Operation op = graph_.getOperation(def);
-                const OperationKind kind = op.kind();
+                const OperationKind kind = graph_.opKind(def);
+                const auto operands = graph_.opOperands(def);
                 if (kind == OperationKind::kRegisterReadArrayPort)
                 {
-                    const auto indexCount = wolvrix::lib::grh::arrayPortIndexCount(op);
-                    if (!indexCount || *indexCount != 1 || op.operands().size() != 1)
+                    const auto indexCount = wolvrix::lib::grh::arrayPortIndexCount(graph_, def);
+                    if (!indexCount || *indexCount != 1 || operands.size() != 1)
                     {
                         return std::nullopt;
                     }
-                    const auto attr = op.attr("regSymbol");
+                    const auto *attr = findAttr(graph_, def, "regSymbol");
                     if (!attr)
                     {
                         return std::nullopt;
@@ -459,17 +457,17 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const auto index = asConstUint(op.operands()[0]);
+                    const auto index = asConstUint(operands[0]);
                     if (!index || *index >= static_cast<uint64_t>(info->elemCount))
                     {
                         return std::nullopt;
                     }
                     return ElemReadMatch{*sym, static_cast<int64_t>(*index)};
                 }
-                if (kind == OperationKind::kSliceStatic && op.operands().size() == 1)
+                if (kind == OperationKind::kSliceStatic && operands.size() == 1)
                 {
-                    const auto startAttr = op.attr("sliceStart");
-                    const auto endAttr = op.attr("sliceEnd");
+                    const auto *startAttr = findAttr(graph_, def, "sliceStart");
+                    const auto *endAttr = findAttr(graph_, def, "sliceEnd");
                     if (!startAttr || !endAttr)
                     {
                         return std::nullopt;
@@ -480,14 +478,13 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const ValueId base = strip(op.operands()[0]);
+                    const ValueId base = strip(operands[0]);
                     const OperationId baseDef = defOf(base);
                     if (!baseDef.valid() || graph_.opKind(baseDef) != OperationKind::kRegisterReadPort)
                     {
                         return std::nullopt;
                     }
-                    const Operation baseOp = graph_.getOperation(baseDef);
-                    const auto attr = baseOp.attr("regSymbol");
+                    const auto *attr = findAttr(graph_, baseDef, "regSymbol");
                     if (!attr)
                     {
                         return std::nullopt;
@@ -514,16 +511,15 @@ namespace wolvrix::lib::transform
                     }
                     return ElemReadMatch{*sym, index};
                 }
-                if (kind == OperationKind::kSliceArray && op.operands().size() == 2)
+                if (kind == OperationKind::kSliceArray && operands.size() == 2)
                 {
-                    const ValueId base = strip(op.operands()[0]);
+                    const ValueId base = strip(operands[0]);
                     const OperationId baseDef = defOf(base);
                     if (!baseDef.valid() || graph_.opKind(baseDef) != OperationKind::kRegisterReadPort)
                     {
                         return std::nullopt;
                     }
-                    const Operation baseOp = graph_.getOperation(baseDef);
-                    const auto attr = baseOp.attr("regSymbol");
+                    const auto *attr = findAttr(graph_, baseDef, "regSymbol");
                     if (!attr)
                     {
                         return std::nullopt;
@@ -542,7 +538,7 @@ namespace wolvrix::lib::transform
                     {
                         return std::nullopt;
                     }
-                    const auto index = asConstUint(op.operands()[1]);
+                    const auto index = asConstUint(operands[1]);
                     if (!index || *index >= static_cast<uint64_t>(info->elemCount))
                     {
                         return std::nullopt;
@@ -597,15 +593,15 @@ namespace wolvrix::lib::transform
                         return false;
                     }
                 }
-                const Operation lhsOp = graph_.getOperation(lhsDef);
-                const Operation rhsOp = graph_.getOperation(rhsDef);
-                if (lhsOp.operands().size() != rhsOp.operands().size())
+                const auto lhsOperands = graph_.opOperands(lhsDef);
+                const auto rhsOperands = graph_.opOperands(rhsDef);
+                if (lhsOperands.size() != rhsOperands.size())
                 {
                     return false;
                 }
-                for (std::size_t i = 0; i < lhsOp.operands().size(); ++i)
+                for (std::size_t i = 0; i < lhsOperands.size(); ++i)
                 {
-                    if (!sameValue(lhsOp.operands()[i], rhsOp.operands()[i], depth - 1))
+                    if (!sameValue(lhsOperands[i], rhsOperands[i], depth - 1))
                     {
                         return false;
                     }
@@ -683,12 +679,12 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation rootOp = graph_.getOperation(root);
-                    if (rootOp.results().size() != 1 || rootOp.operands().size() != 3)
+                    const auto rootResults = graph_.opResults(root);
+                    if (rootResults.size() != 1 || graph_.opOperands(root).size() != 3)
                     {
                         continue;
                     }
-                    const ValueId rootResult = rootOp.results()[0];
+                    const ValueId rootResult = rootResults[0];
                     if (foldedTreeResults_.count(rootResult) != 0)
                     {
                         continue; // inner node of an already folded tree
@@ -717,13 +713,13 @@ namespace wolvrix::lib::transform
                     OperationId cur = root;
                     while (true)
                     {
-                        const Operation curOp = graph_.getOperation(cur);
-                        if (curOp.operands().size() != 3)
+                        const auto curOperands = graph_.opOperands(cur);
+                        if (curOperands.size() != 3)
                         {
                             ok = false;
                             break;
                         }
-                        const auto eqc = asEqConst(curOp.operands()[0]);
+                        const auto eqc = asEqConst(curOperands[0]);
                         if (!eqc)
                         {
                             ok = false;
@@ -743,8 +739,8 @@ namespace wolvrix::lib::transform
                             ok = false;
                             break;
                         }
-                        const ValueId leafValue = eqc->isEq ? curOp.operands()[1] : curOp.operands()[2];
-                        const ValueId contValue = eqc->isEq ? curOp.operands()[2] : curOp.operands()[1];
+                        const ValueId leafValue = eqc->isEq ? curOperands[1] : curOperands[2];
+                        const ValueId contValue = eqc->isEq ? curOperands[2] : curOperands[1];
                         const auto leaf = asElemRead(leafValue, elemWidth);
                         if (!leaf || static_cast<uint64_t>(leaf->index) != eqc->constant)
                         {
@@ -767,7 +763,7 @@ namespace wolvrix::lib::transform
                             break;
                         }
                         conds.push_back(eqc->constant);
-                        treeResults.push_back(curOp.results()[0]);
+                        treeResults.push_back(graph_.opResults(cur)[0]);
                         if (conds.size() > (1 << 16))
                         {
                             ok = false;
@@ -874,8 +870,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation op = graph_.getOperation(id);
-                    const auto attr = op.attr("regSymbol");
+                    const auto *attr = findAttr(graph_, id, "regSymbol");
                     if (!attr)
                     {
                         continue;
@@ -1050,22 +1045,22 @@ namespace wolvrix::lib::transform
 
                 for (const OperationId id : ops)
                 {
-                    const Operation op = graph_.getOperation(id);
-                    if (op.kind() != OperationKind::kRegisterWriteArrayPort)
+                    if (graph_.opKind(id) != OperationKind::kRegisterWriteArrayPort)
                     {
                         return; // non-array write in the group: leave the register alone
                     }
-                    const auto indexCount = wolvrix::lib::grh::arrayPortIndexCount(op);
+                    const auto operands = graph_.opOperands(id);
+                    const auto indexCount = wolvrix::lib::grh::arrayPortIndexCount(graph_, id);
                     if (!indexCount || *indexCount != 1)
                     {
                         return;
                     }
-                    const auto eventStart = wolvrix::lib::grh::firstEventOperandIndex(op);
+                    const auto eventStart = wolvrix::lib::grh::firstEventOperandIndex(graph_, id);
                     if (!eventStart || *eventStart != 3)
                     {
                         return; // [updateCond, i0, data, events...] layout required
                     }
-                    const auto edgeAttr = op.attr("eventEdge");
+                    const auto *edgeAttr = findAttr(graph_, id, "eventEdge");
                     if (!edgeAttr)
                     {
                         return;
@@ -1075,15 +1070,14 @@ namespace wolvrix::lib::transform
                     {
                         return;
                     }
-                    std::vector<ValueId> opEvents(op.operands().begin() + *eventStart,
-                                                  op.operands().end());
+                    const auto opEvents = operands.subspan(*eventStart);
                     if (opEvents.size() != edges->size())
                     {
                         return;
                     }
                     if (!signatureKnown)
                     {
-                        events = opEvents;
+                        events.assign(opEvents.begin(), opEvents.end());
                         eventEdges = *edges;
                         signatureKnown = true;
                     }
@@ -1107,14 +1101,14 @@ namespace wolvrix::lib::transform
                             return;
                         }
                     }
-                    const auto indexConst = asConstUint(op.operands()[1]);
+                    const auto indexConst = asConstUint(operands[1]);
                     if (!indexConst || *indexConst >= static_cast<uint64_t>(elemCount))
                     {
                         return;
                     }
                     const int64_t entry = static_cast<int64_t>(*indexConst);
-                    const ValueId enable = strip(op.operands()[0]);
-                    const ValueId data = strip(op.operands()[2]);
+                    const ValueId enable = strip(operands[0]);
+                    const ValueId data = strip(operands[2]);
 
                     if (const auto constText = asConstText(data))
                     {
@@ -1137,12 +1131,12 @@ namespace wolvrix::lib::transform
                         {
                             break;
                         }
-                        const Operation muxOp = graph_.getOperation(curDef);
-                        if (muxOp.operands().size() != 3)
+                        const auto muxOperands = graph_.opOperands(curDef);
+                        if (muxOperands.size() != 3)
                         {
                             return;
                         }
-                        const ValueId condValue = strip(muxOp.operands()[0]);
+                        const ValueId condValue = strip(muxOperands[0]);
                         auto eqc = asEqConst(condValue);
                         ValueId enableTerm;
                         if (!eqc)
@@ -1152,22 +1146,22 @@ namespace wolvrix::lib::transform
                             {
                                 return;
                             }
-                            const Operation andOp = graph_.getOperation(condDef);
-                            if (andOp.operands().size() != 2)
+                            const auto andOperands = graph_.opOperands(condDef);
+                            if (andOperands.size() != 2)
                             {
                                 return;
                             }
-                            eqc = asEqConst(andOp.operands()[0]);
+                            eqc = asEqConst(andOperands[0]);
                             if (eqc)
                             {
-                                enableTerm = strip(andOp.operands()[1]);
+                                enableTerm = strip(andOperands[1]);
                             }
                             else
                             {
-                                eqc = asEqConst(andOp.operands()[1]);
+                                eqc = asEqConst(andOperands[1]);
                                 if (eqc)
                                 {
-                                    enableTerm = strip(andOp.operands()[0]);
+                                    enableTerm = strip(andOperands[0]);
                                 }
                             }
                             if (!eqc)
@@ -1185,12 +1179,12 @@ namespace wolvrix::lib::transform
                             return;
                         }
                         chain.levels.push_back(WriteLevel{enableTerm, strip(eqc->ptr),
-                                                          strip(muxOp.operands()[1])});
+                                                          strip(muxOperands[1])});
                         if (chain.levels.size() > 64)
                         {
                             return;
                         }
-                        cur = strip(muxOp.operands()[2]);
+                        cur = strip(muxOperands[2]);
                     }
                     if (chain.levels.empty() || chainByEntry[entry])
                     {
@@ -1306,8 +1300,7 @@ namespace wolvrix::lib::transform
                 // ---- rewrite ----
                 for (const auto &slot : chainByEntry)
                 {
-                    const Operation op = graph_.getOperation(slot->op);
-                    for (const ValueId operand : op.operands())
+                    for (const ValueId operand : graph_.opOperands(slot->op))
                     {
                         const OperationId producer = defOf(operand);
                         if (producer.valid())
@@ -1324,8 +1317,7 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation op = graph_.getOperation(slot->op);
-                    for (const ValueId operand : op.operands())
+                    for (const ValueId operand : graph_.opOperands(slot->op))
                     {
                         const OperationId producer = defOf(operand);
                         if (producer.valid())
@@ -1435,12 +1427,12 @@ namespace wolvrix::lib::transform
                 const auto def = defOf(data);
                 if (def.valid() && graph_.opKind(def) == OperationKind::kMux)
                 {
-                    const auto op = graph_.getOperation(def);
-                    if (op.operands().size() != 3 || graph_.valueWidth(op.operands()[0]) != 1) return false;
-                    path.emplace_back(op.operands()[0], true);
-                    if (!dataArms(op.operands()[1], path, arms, budget)) return false;
+                    const auto operands = graph_.opOperands(def);
+                    if (operands.size() != 3 || graph_.valueWidth(operands[0]) != 1) return false;
+                    path.emplace_back(operands[0], true);
+                    if (!dataArms(operands[1], path, arms, budget)) return false;
                     path.back().second = false;
-                    if (!dataArms(op.operands()[2], path, arms, budget)) return false;
+                    if (!dataArms(operands[2], path, arms, budget)) return false;
                     path.pop_back();
                     return true;
                 }
@@ -1582,27 +1574,36 @@ namespace wolvrix::lib::transform
                 if (writes.size() < 2) return reject("segment-too-small");
                 std::vector<GuardedPort> ports;
                 std::map<uint64_t, std::vector<std::size_t>> orderByRow;
-                const auto reference = graph_.getOperation(writes.front());
-                const auto start = wolvrix::lib::grh::firstEventOperandIndex(reference);
+                const auto reference = writes.front();
+                const auto start = wolvrix::lib::grh::firstEventOperandIndex(graph_, reference);
                 if (!start) return reject("missing-event-signature");
+                // The arm planner appends gates. Retain only the event
+                // signature across its first thaw and later graph growth.
+                const auto referenceArgs = graph_.opOperands(reference);
+                const std::vector<ValueId> referenceOperands(referenceArgs.begin(), referenceArgs.end());
+                const auto *referenceAttr = findAttr(graph_, reference, "eventEdge");
+                if (!referenceAttr) return reject("missing-event-signature");
+                const wolvrix::lib::grh::AttributeValue referenceEdges = *referenceAttr;
                 for (auto id : writes)
                 {
-                    const auto op = graph_.getOperation(id);
-                    const auto eventStart = wolvrix::lib::grh::firstEventOperandIndex(op);
+                    const auto borrowedOperands = graph_.opOperands(id);
+                    const auto eventStart = wolvrix::lib::grh::firstEventOperandIndex(graph_, id);
+                    const auto *edges = findAttr(graph_, id, "eventEdge");
                     if (!eventStart || *start != *eventStart ||
-                        op.attr("eventEdge") != reference.attr("eventEdge") ||
-                        op.operands().size() != reference.operands().size()) return reject("event-signature-mismatch");
-                    for (std::size_t i = *start; i < op.operands().size(); ++i)
-                        if (!sameValue(op.operands()[i], reference.operands()[i], 16)) return reject("event-value-mismatch");
-                    const auto row = asConstUint(op.operands()[1]);
+                        !edges || *edges != referenceEdges ||
+                        borrowedOperands.size() != referenceOperands.size()) return reject("event-signature-mismatch");
+                    for (std::size_t i = *start; i < borrowedOperands.size(); ++i)
+                        if (!sameValue(borrowedOperands[i], referenceOperands[i], 16)) return reject("event-value-mismatch");
+                    const auto row = asConstUint(borrowedOperands[1]);
                     if (!row || *row >= static_cast<uint64_t>(elementCount)) return reject("invalid-static-row");
                     std::vector<DataArm> arms;
                     std::vector<write_detail::Literal> path;
                     unsigned budget = 256;
-                    if (!dataArms(op.operands()[2], path, arms, budget)) return reject("data-expansion-budget");
+                    if (!dataArms(borrowedOperands[2], path, arms, budget)) return reject("data-expansion-budget");
+                    const auto writeEnable = borrowedOperands[0];
                     for (const auto &arm : arms)
                     {
-                        auto guard = op.operands()[0];
+                        auto guard = writeEnable;
                         for (const auto &[condition, positive] : arm.path)
                             guard = booleans_.combine(OperationKind::kAnd, guard,
                                 positive ? condition : booleans_.negate(condition));
@@ -1686,7 +1687,7 @@ namespace wolvrix::lib::transform
                 {
                     if (!id.valid() || erased_.contains(id) ||
                         !wolvrix::lib::grh::isRegisterWritePortKind(graph_.opKind(id))) continue;
-                    const auto attr = graph_.getOperation(id).attr("regSymbol");
+                    const auto *attr = findAttr(graph_, id, "regSymbol");
                     if (const auto *symbol = attr ? std::get_if<std::string>(&*attr) : nullptr)
                         groups[*symbol].push_back(id);
                 }
@@ -1715,10 +1716,10 @@ namespace wolvrix::lib::transform
                     };
                     for (auto id : writes)
                     {
-                        const auto op = graph_.getOperation(id);
-                        if (op.kind() == OperationKind::kRegisterWriteArrayPort &&
-                            wolvrix::lib::grh::arrayPortIndexCount(op) == 1 &&
-                            op.operands().size() >= 3 && asConstUint(op.operands()[1]))
+                        const auto operands = graph_.opOperands(id);
+                        if (graph_.opKind(id) == OperationKind::kRegisterWriteArrayPort &&
+                            wolvrix::lib::grh::arrayPortIndexCount(graph_, id) == 1 &&
+                            operands.size() >= 3 && asConstUint(operands[1]))
                             segment.push_back(id);
                         else
                         {
@@ -1783,13 +1784,13 @@ namespace wolvrix::lib::transform
                 {
                     return -1;
                 }
-                const Operation sliceOp = graph_.getOperation(def);
-                if (sliceOp.operands().size() != 1)
+                const auto sliceOperands = graph_.opOperands(def);
+                if (sliceOperands.size() != 1)
                 {
                     return -1;
                 }
-                const auto startAttr = sliceOp.attr("sliceStart");
-                const auto endAttr = sliceOp.attr("sliceEnd");
+                const auto *startAttr = findAttr(graph_, def, "sliceStart");
+                const auto *endAttr = findAttr(graph_, def, "sliceEnd");
                 if (!startAttr || !endAttr)
                 {
                     return -1;
@@ -1800,18 +1801,18 @@ namespace wolvrix::lib::transform
                 {
                     return -1;
                 }
-                const ValueId repValue = strip(sliceOp.operands()[0]);
+                const ValueId repValue = strip(sliceOperands[0]);
                 const OperationId repDef = defOf(repValue);
                 if (!repDef.valid() || graph_.opKind(repDef) != OperationKind::kReplicate)
                 {
                     return -1;
                 }
-                const Operation repOp = graph_.getOperation(repDef);
-                if (repOp.operands().size() != 1)
+                const auto repOperands = graph_.opOperands(repDef);
+                if (repOperands.size() != 1)
                 {
                     return -1;
                 }
-                const ValueId assembled = strip(repOp.operands()[0]);
+                const ValueId assembled = strip(repOperands[0]);
                 const int64_t assembledWidth = graph_.getValue(assembled).width();
                 if (assembledWidth <= 0 || elemWidth > assembledWidth)
                 {
@@ -1862,9 +1863,8 @@ namespace wolvrix::lib::transform
                 const OperationId def = defOf(value);
                 if (def.valid() && graph_.opKind(def) == OperationKind::kConcat)
                 {
-                    const Operation op = graph_.getOperation(def);
                     int64_t offset = width;
-                    for (const ValueId child : op.operands())
+                    for (const ValueId child : graph_.opOperands(def))
                     {
                         const int64_t childWidth = graph_.getValue(strip(child)).width();
                         offset -= childWidth;
@@ -1925,10 +1925,7 @@ namespace wolvrix::lib::transform
                     const OperationId def = defOf(value);
                     if (def.valid() && graph_.opKind(def) == OperationKind::kConcat)
                     {
-                        // Bind a named copy: operands() spans the Operation's
-                        // own storage, so iterating a temporary would dangle.
-                        const Operation concatOp = graph_.getOperation(def);
-                        for (const ValueId child : concatOp.operands())
+                        for (const ValueId child : graph_.opOperands(def))
                         {
                             flatten(child);
                         }
@@ -1936,8 +1933,7 @@ namespace wolvrix::lib::transform
                     }
                     inputs.push_back(value);
                 };
-                const Operation baseOp = graph_.getOperation(baseDef);
-                for (const ValueId child : baseOp.operands())
+                for (const ValueId child : graph_.opOperands(baseDef))
                 {
                     flatten(child);
                 }
@@ -1952,18 +1948,19 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
-                const Operation lsbOp = graph_.getOperation(lsbDef);
-                const auto regAttr = lsbOp.attr("regSymbol");
+                const auto *regAttr = findAttr(graph_, lsbDef, "regSymbol");
                 if (!regAttr)
                 {
                     return false;
                 }
-                const auto *regSym = std::get_if<std::string>(&*regAttr);
-                if (!regSym)
+                const auto *regSymbol = std::get_if<std::string>(&*regAttr);
+                if (!regSymbol)
                 {
                     return false;
                 }
-                const RegisterInfo *info = findRegister(*regSym);
+                // Pad constants and clamping can thaw or grow the graph.
+                const std::string regSym = *regSymbol;
+                const RegisterInfo *info = findRegister(regSym);
                 if (!info || info->elemWidth != elemWidth ||
                     graph_.getValue(lsb).width() != info->elemCount * elemWidth)
                 {
@@ -1985,12 +1982,12 @@ namespace wolvrix::lib::transform
                     const OperationId runDef = defOf(run);
                     if (runDef.valid() && graph_.opKind(runDef) == OperationKind::kReplicate)
                     {
-                        const Operation repOp = graph_.getOperation(runDef);
-                        if (repOp.operands().size() != 1)
+                        const auto repOperands = graph_.opOperands(runDef);
+                        if (repOperands.size() != 1)
                         {
                             return false;
                         }
-                        const auto repAttr = repOp.attr("rep");
+                        const auto *repAttr = findAttr(graph_, runDef, "rep");
                         if (!repAttr)
                         {
                             return false;
@@ -2000,7 +1997,7 @@ namespace wolvrix::lib::transform
                         {
                             return false;
                         }
-                        const ValueId elem = strip(repOp.operands()[0]);
+                        const ValueId elem = strip(repOperands[0]);
                         if (graph_.getValue(elem).width() != elemWidth)
                         {
                             return false;
@@ -2010,7 +2007,7 @@ namespace wolvrix::lib::transform
                             padValue = elem;
                             havePad = true;
                             if (const auto elemRead = asElemRead(elem, elemWidth);
-                                elemRead && elemRead->regSym == *regSym)
+                                elemRead && elemRead->regSym == regSym)
                             {
                                 padElem = elemRead->index;
                             }
@@ -2050,12 +2047,12 @@ namespace wolvrix::lib::transform
                 {
                     // element pad: index clamp  arr[idx < N ? idx : padElem]
                     const ValueId clamped = makeIndexClamp(index, info->elemCount, padElem, pw);
-                    folded = makeArrayRead(*regSym, clamped, elemWidth);
+                    folded = makeArrayRead(regSym, clamped, elemWidth);
                 }
                 else
                 {
                     // const/generic pad: idx < N ? arr[idx] : pad
-                    const ValueId directRead = makeArrayRead(*regSym, index, elemWidth);
+                    const ValueId directRead = makeArrayRead(regSym, index, elemWidth);
                     const ValueId limitConst =
                         makeConst(static_cast<uint64_t>(info->elemCount), pw);
                     const ValueId ltResult =
@@ -2097,12 +2094,13 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation op = graph_.getOperation(id);
-                    if (op.operands().size() != 2 || op.results().size() != 1)
+                    const auto operands = graph_.opOperands(id);
+                    const auto results = graph_.opResults(id);
+                    if (operands.size() != 2 || results.size() != 1)
                     {
                         continue;
                     }
-                    const ValueId result = op.results()[0];
+                    const ValueId result = results[0];
                     if (graph_.valueIsOutput(result) || graph_.valueIsInout(result) ||
                         !graph_.valueShape(result).empty())
                     {
@@ -2113,12 +2111,12 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    ValueId index = strip(op.operands()[1]);
+                    ValueId index = strip(operands[1]);
                     if (graph_.valueSigned(index) || !graph_.valueShape(index).empty())
                     {
                         continue;
                     }
-                    const ValueId base = strip(op.operands()[0]);
+                    const ValueId base = strip(operands[0]);
                     const OperationId baseDef = defOf(base);
                     if (!baseDef.valid())
                     {
@@ -2127,8 +2125,7 @@ namespace wolvrix::lib::transform
                     if (graph_.opKind(baseDef) == OperationKind::kRegisterReadPort)
                     {
                         // dynamic read directly on a whole-register read
-                        const Operation baseOp = graph_.getOperation(baseDef);
-                        const auto attr = baseOp.attr("regSymbol");
+                        const auto *attr = findAttr(graph_, baseDef, "regSymbol");
                         if (!attr)
                         {
                             continue;
@@ -2143,7 +2140,8 @@ namespace wolvrix::lib::transform
                         {
                             continue;
                         }
-                        const ValueId read = makeArrayRead(*sym, index, elemWidth);
+                        const std::string symbol = *sym;
+                        const ValueId read = makeArrayRead(symbol, index, elemWidth);
                         graph_.replaceAllUsesWithView(result, read);
                         sweepSeeds_.push_back(id);
                         ++padReadsFolded_;
@@ -2153,8 +2151,8 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const Operation concat = graph_.getOperation(baseDef);
-                    const int64_t concatInputs = static_cast<int64_t>(concat.operands().size());
+                    const auto concatOperands = graph_.opOperands(baseDef);
+                    const int64_t concatInputs = static_cast<int64_t>(concatOperands.size());
                     if (concatInputs < 2)
                     {
                         continue;
@@ -2170,7 +2168,7 @@ namespace wolvrix::lib::transform
                         const int64_t element = concatInputs - 1 - j;
                         ValueId constVal;
                         const int64_t source = traceElementSource(
-                            concat.operands()[static_cast<std::size_t>(j)], elemWidth,
+                            concatOperands[static_cast<std::size_t>(j)], elemWidth,
                             regSym, info, constVal);
                         if (source == -1)
                         {

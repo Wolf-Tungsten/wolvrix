@@ -152,16 +152,17 @@ public:
     std::optional<int64_t> staticIndex(ExprId id) const;
     std::string expressionKey(ExprId id) const;
     bool constantValue(ExprId id) const;
+    const Declaration& declaration(std::string_view name) const;
 
     const Source& source;
     const ModuleBody& body;
-    std::map<std::string, Declaration> declarations;
+    std::map<std::string, Declaration, std::less<>> declarations;
     std::vector<std::string> declarationOrder;
     std::vector<Connection> connections;
     std::vector<TypePtr> expressions;
     Guards guards;
     std::map<std::string, Memory> memories;
-    std::map<std::string, std::pair<std::string, std::size_t>> memoryPorts;
+    std::map<std::string, std::pair<std::string, std::size_t>, std::less<>> memoryPorts;
     std::vector<Effect> effects;
     std::vector<Instance> instances;
     std::unordered_set<StmtId> activeStatements;
@@ -175,6 +176,10 @@ private:
     mutable std::map<ConstantLeaf, std::vector<ConstantDriver>> constantDrivers_;
     mutable std::map<ConstantSelection, bool> constantValues_;
     mutable std::map<std::pair<TypePtr, int>, std::vector<Leaf>> leavesCache_;
+    // Map nodes own both names and declarations and are never erased during
+    // this analysis. Cache only hits so later declarations remain visible.
+    mutable std::unordered_map<std::string_view, const Declaration*> declarationCache_;
+    const Declaration* findDeclaration(std::string_view name) const;
     std::vector<Width> widths_;
     std::vector<WidthConstraint> constraints_;
     std::vector<uint32_t> resetParents_;
@@ -225,6 +230,9 @@ private:
 
 ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
                             grh::Design& design, const FirrtlOptions& options,
+                            const std::map<std::string, ModuleSignature>* interfaces = nullptr);
+ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
+                            grh::Graph& graph, const FirrtlOptions& options,
                             const std::map<std::string, ModuleSignature>* interfaces = nullptr);
 
 } // namespace wolvrix::lib::ingest::firrtl::detail

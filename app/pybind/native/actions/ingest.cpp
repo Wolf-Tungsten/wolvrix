@@ -67,9 +67,15 @@ namespace wolvrix::app::pybind
     }
     void options(ingest::IngestRequest& request, PyObject* firrtl, PyObject* bindings) {
         if (firrtl != Py_None) {
-            knownFields(firrtl, {"expected_version", "node_annotations", "invalid_policy", "init_policy", "enabled_layers", "annotation_files", "resource_roots"});
+            knownFields(firrtl, {"expected_version", "node_annotations", "lower_threads", "invalid_policy", "init_policy", "enabled_layers", "annotation_files", "resource_roots"});
             if (const auto version = field(firrtl, "expected_version")) request.firrtl.expectedVersion = stringValue(version, "expected_version");
             if (const auto nodes = field(firrtl, "node_annotations")) request.firrtl.nodeAnnotations = boolean(nodes, "node_annotations");
+            if (const auto threads = field(firrtl, "lower_threads")) {
+                if (!PyLong_Check(threads) || PyBool_Check(threads)) throw std::invalid_argument("lower_threads must be an integer");
+                const auto count = PyLong_AsUnsignedLongLong(threads);
+                if (PyErr_Occurred() || count > SIZE_MAX) throw std::invalid_argument("lower_threads out of range");
+                request.firrtl.lowerThreads = static_cast<std::size_t>(count);
+            }
             if (const auto layers = field(firrtl, "enabled_layers")) strings(layers, request.firrtl.enabledLayers);
             if (const auto paths = field(firrtl, "annotation_files")) strings(paths, request.firrtl.annotationFiles);
             if (const auto paths = field(firrtl, "resource_roots")) strings(paths, request.firrtl.resourceRoots);

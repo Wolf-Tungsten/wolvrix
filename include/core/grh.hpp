@@ -174,8 +174,10 @@ private:
     };
 
     friend class Graph;
-    // Graph has already checked that this generated text is absent.
+    // Graph has already checked that this text is absent.
     SymbolId internFresh(std::string_view text);
+    // Insert once; an existing reservation is a miss, not a reusable symbol.
+    SymbolId tryInternFresh(std::string_view text);
 
     struct StringEq {
         using is_transparent = void;
@@ -718,10 +720,12 @@ private:
 // array write ports (missing eventEdge attr or too few operands).
 [[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const Operation &op);
 [[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const GraphView &view, OperationId op);
+[[nodiscard]] std::optional<std::size_t> firstEventOperandIndex(const Graph &graph, OperationId op);
 // Number of index operands of an array port op (kRegisterReadArrayPort /
 // kRegisterWriteArrayPort / kRegisterWriteArrayMaskPort); nullopt otherwise.
 [[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const Operation &op);
 [[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const GraphView &view, OperationId op);
+[[nodiscard]] std::optional<std::size_t> arrayPortIndexCount(const Graph &graph, OperationId op);
 
 class Design;
 
@@ -964,6 +968,20 @@ private:
 
 class Design {
 public:
+    class ParallelMutationScope {
+    public:
+        ~ParallelMutationScope() noexcept;
+        ParallelMutationScope(const ParallelMutationScope&) = delete;
+        ParallelMutationScope& operator=(const ParallelMutationScope&) = delete;
+        ParallelMutationScope(ParallelMutationScope&&) = delete;
+        ParallelMutationScope& operator=(ParallelMutationScope&&) = delete;
+
+    private:
+        friend class Design;
+        explicit ParallelMutationScope(Design& design);
+        Design& design_;
+    };
+
     Design();
     Design(Design&& other) noexcept;
     Design& operator=(Design&& other) noexcept;
@@ -973,7 +991,19 @@ public:
     uint64_t instanceId() const noexcept { return instanceId_; }
     uint64_t revision() const noexcept { return revision_; }
 
+    // Create and destroy on the coordinating thread. Each worker exclusively
+    // mutates one precreated graph; join all workers before scope destruction.
+    // Do not mutate the design catalog, move the design, use revision caches,
+    // or nest scopes while graph revisions are deferred.
+    [[nodiscard]] ParallelMutationScope parallelGraphMutation();
+
     Graph& createGraph(std::string name);
+    // Allocate and publish only on the coordinating thread. An unpublished
+    // graph is absent from graphs()/graphOrder(); its owner must remain alive
+    // and unmoved until publication or discard. Discarding reserves its name
+    // and GraphId for the remaining lifetime of the design.
+    [[nodiscard]] std::unique_ptr<Graph> createUnpublishedGraph(std::string name);
+    Graph& publishGraph(std::unique_ptr<Graph> graph);
     Graph& cloneGraph(std::string_view sourceName, std::string newName);
     Graph& importGraph(const Graph& source, std::string newName);
     bool deleteGraph(std::string_view name);
@@ -1004,13 +1034,16 @@ public:
 
 private:
     friend class Graph;
-    void touch() noexcept { ++revision_; }
+    void touch() noexcept {
+        if (!deferGraphRevisions_) ++revision_;
+    }
     Graph& addGraphInternal(std::unique_ptr<Graph> graph);
     void resetGraphOwners();
 
     DesignSymbolTable designSymbols_;
     uint64_t instanceId_ = 0;
     uint64_t revision_ = 0;
+    bool deferGraphRevisions_ = false;
     std::unordered_map<std::string, std::unique_ptr<Graph>> graphs_;
     std::unordered_map<std::string, std::string> graphAliasBySymbol_;
     std::vector<std::string> graphOrder_;

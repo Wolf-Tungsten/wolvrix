@@ -120,11 +120,15 @@ private:
     mutable uint64_t locationLine_ = 0;
     mutable std::string locationSourceInfo_;
     std::map<LeafKey, Driver, LeafKeyLess> drivers_;
+    // Empty field paths (including arrays) use one hash lookup. Both the key
+    // storage and Driver addresses belong to stable, never-erased map nodes.
+    std::unordered_map<std::string_view, Driver*> rootDrivers_;
     std::map<int, ValueId> guards_;
     std::unordered_map<ValueId, ValueId, grh::ValueIdHash> clockPulses_;
     std::string nodeKey_;
     bool nodeSchemaReady_ = false;
     void ensureNodeSchema();
+    Driver* rootDriver(std::string_view name) const;
     Driver& findDriver(std::string_view name, std::span<const std::string> fields);
     const Driver& findDriver(std::string_view name, std::span<const std::string> fields) const;
     Driver& findDriver(std::string_view name, std::span<const std::string_view> fields);
@@ -189,22 +193,31 @@ grh::SrcLoc Lowerer::location(Range range) const {
     result.pass = "ingest-firrtl"; result.note = sourceInfo;
     return result;
 }
+Driver* Lowerer::rootDriver(std::string_view name) const {
+    const auto found = rootDrivers_.find(name);
+    if (found == rootDrivers_.end()) throw std::out_of_range("map::at");
+    return found->second;
+}
 Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string> fields) {
+    if (fields.empty()) return *rootDriver(name);
     const auto found = drivers_.find(LeafKeyView{name, fields});
     if (found == drivers_.end()) throw std::out_of_range("map::at");
     return found->second;
 }
 const Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string> fields) const {
+    if (fields.empty()) return *rootDriver(name);
     const auto found = drivers_.find(LeafKeyView{name, fields});
     if (found == drivers_.end()) throw std::out_of_range("map::at");
     return found->second;
 }
 Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string_view> fields) {
+    if (fields.empty()) return *rootDriver(name);
     const auto found = drivers_.find(LeafKeyBorrowedView{name, fields});
     if (found == drivers_.end()) throw std::out_of_range("map::at");
     return found->second;
 }
 const Driver& Lowerer::findDriver(std::string_view name, std::span<const std::string_view> fields) const {
+    if (fields.empty()) return *rootDriver(name);
     const auto found = drivers_.find(LeafKeyBorrowedView{name, fields});
     if (found == drivers_.end()) throw std::out_of_range("map::at");
     return found->second;
@@ -541,7 +554,7 @@ void Lowerer::connect(const Connection& connection) {
         }
     auto data = connection.invalid ? invalid(dataType, connection.range) : adapt(expression(connection.source.expression, connection.source.fields), dataType, connection.range);
     if (!driver.regSymbol.empty()) {
-        const auto& state = *semantics_.declarations.at(std::string(path.name)).state;
+        const auto& state = *semantics_.declaration(path.name).state;
         auto enable = guard(connection.guard, connection.range);
         const LogicalType bit{grh::ValueType::Logic, 1, false};
         if (state.reset) {
@@ -574,7 +587,7 @@ void Lowerer::connect(const Connection& connection) {
     auto current = driver.current;
     if (!current) current = invalid(fullType, connection.range);
     auto enable = guard(connection.guard, connection.range);
-    const bool trackMemoryMask = semantics_.memoryPorts.contains(std::string(path.name));
+    const bool trackMemoryMask = semantics_.memoryPorts.contains(path.name);
     ValueId writeMask;
     if (trackMemoryMask) writeMask = constant(fullType, std::string(dataType.width, '1'), connection.range);
     if (!path.indices.empty() && staticWrite) {
@@ -987,7 +1000,7 @@ void Lowerer::instances() {
         graph_.setAttr(operation, "instanceName", instance.name);
         graph_.setOpSrcLoc(operation, location(instance.range));
         std::vector<std::string> inputs, outputs;
-        const auto& declaration = semantics_.declarations.at(instance.name);
+        const auto& declaration = semantics_.declaration(instance.name);
         for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
             const auto& driver = findDriver(instance.name, leaf.fields);
             if (!driver.value) continue;
@@ -1012,8 +1025,9 @@ ModuleSignature Lowerer::run() {
     graph_.setMetadata("firrtl.initPolicy", std::string(options_.initPolicy == FirrtlInitPolicy::Unknown ? "unknown" : "zero"));
     graph_.setMetadata("firrtl.enabledLayers", options_.enabledLayers);
     std::set<std::string> names; std::vector<std::string> elided;
+    rootDrivers_.reserve(semantics_.declarationOrder.size());
     for (const auto& name : semantics_.declarationOrder) {
-        const auto& declaration = semantics_.declarations.at(name);
+        const auto& declaration = semantics_.declaration(name);
         for (const auto& leaf : semantics_.leavesCached(declaration.type, declaration.flow)) {
             auto symbol = name; for (const auto& field : leaf.fields) symbol += "__DOT__" + field;
             if (!names.insert(symbol).second) throw Error(declaration.range, "flattened FIRRTL name collision '" + symbol + "'");
@@ -1036,7 +1050,8 @@ ModuleSignature Lowerer::run() {
                 const auto read = graph_.createOperation(OperationKind::kRegisterReadPort);
                 graph_.addResult(read, value); graph_.setAttr(read, "regSymbol", symbol); graph_.setOpSrcLoc(read, location(declaration.range));
             }
-            drivers_.emplace(LeafKey{name, leaf.fields}, std::move(driver));
+            const auto entry = drivers_.emplace(LeafKey{name, leaf.fields}, std::move(driver)).first;
+            if (leaf.fields.empty()) rootDrivers_.emplace(entry->first.first, &entry->second);
             if (declaration.port) {
                 PortLeafSignature port; port.name = symbol; port.fieldPath = {name};
                 port.fieldPath.insert(port.fieldPath.end(), leaf.fields.begin(), leaf.fields.end());
@@ -1056,7 +1071,7 @@ ModuleSignature Lowerer::run() {
     }
     if (!elided.empty()) graph_.setMetadata("firrtl.elidedLeaves", std::move(elided));
     for (const auto& name : semantics_.declarationOrder) {
-        const auto& declaration = semantics_.declarations.at(name);
+        const auto& declaration = semantics_.declaration(name);
         if (!declaration.definition) continue;
         for (const auto& leaf : semantics_.leavesCached(declaration.type)) {
             const auto value = findDriver(name, leaf.fields).value;
@@ -1071,7 +1086,7 @@ ModuleSignature Lowerer::run() {
     // Reset is a final whole-state writer barrier, independent of declaration
     // placement and ordinary connect priority. Every operand still reads old state.
     for (const auto& name : semantics_.declarationOrder) {
-        const auto& declaration = semantics_.declarations.at(name);
+        const auto& declaration = semantics_.declaration(name);
         if (!declaration.state || !declaration.state->reset) continue;
         for (const auto& leaf : semantics_.leavesCached(declaration.type)) {
             const auto& driver = findDriver(name, leaf.fields);
@@ -1085,7 +1100,7 @@ ModuleSignature Lowerer::run() {
     for (auto& [key, driver] : drivers_) {
         if (!driver.value || !driver.regSymbol.empty() || !(driver.leaf.flow & 2)) continue;
         if (memorySource(key) || semantics_.memoryPorts.contains(key.first)) continue;
-        const auto required = semantics_.declarations.at(key.first).guard;
+        const auto required = semantics_.declaration(key.first).guard;
         for (auto at = driver.coverage.begin(); std::next(at) != driver.coverage.end(); ++at)
             if (semantics_.guards.conjunction(required, semantics_.guards.negate(at->second)))
                 throw Error(driver.range, "FIRRTL component '" + key.first + "' is not fully initialized on every path");
@@ -1104,6 +1119,15 @@ ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
         throw Error(body.interface.range, "FIRRTL external/class lowering is not supported yet (F06/F07)");
     Semantics semantics(source, body, options, interfaces); semantics.analyze();
     auto& graph = design.createGraph(std::string(body.interface.name));
+    return Lowerer(semantics, graph, options).run();
+}
+
+ModuleSignature lowerModule(const Source& source, const ModuleBody& body,
+                            grh::Graph& graph, const FirrtlOptions& options,
+                            const std::map<std::string, ModuleSignature>* interfaces) {
+    if (body.interface.kind != ModuleKind::Module)
+        throw Error(body.interface.range, "FIRRTL external/class lowering is not supported yet (F06/F07)");
+    Semantics semantics(source, body, options, interfaces); semantics.analyze();
     return Lowerer(semantics, graph, options).run();
 }
 } // namespace wolvrix::lib::ingest::firrtl::detail

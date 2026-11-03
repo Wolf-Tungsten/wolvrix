@@ -283,13 +283,27 @@ void Semantics::collect(std::span<const StmtId> statements) {
     }
 }
 
+const Declaration* Semantics::findDeclaration(std::string_view name) const {
+    if (const auto cached = declarationCache_.find(name); cached != declarationCache_.end())
+        return cached->second;
+    const auto found = declarations.find(name);
+    if (found == declarations.end()) return nullptr;
+    declarationCache_.emplace(found->first, &found->second);
+    return &found->second;
+}
+const Declaration& Semantics::declaration(std::string_view name) const {
+    const auto* found = findDeclaration(name);
+    if (!found) throw std::out_of_range("map::at");
+    return *found;
+}
 TypePtr Semantics::expression(ExprId id) {
     if (expressions.at(id)) return expressions[id];
     const auto& expr = body.arena.expressions[id];
     TypePtr result;
     if (expr.kind == ExprKind::Reference) {
-        const std::string name(expr.name);
-        if (!declarations.contains(name)) {
+        const auto* found = findDeclaration(expr.name);
+        if (!found) {
+            const std::string name(expr.name);
             const auto node = nodeDeclarations_.find(name);
             if (node == nodeDeclarations_.end()) throw Error(expr.range, "unknown FIRRTL component");
             if (!activeNodes_.insert(name).second) throw Error(expr.range, "cyclic node definition");
@@ -298,11 +312,12 @@ TypePtr Semantics::expression(ExprId id) {
             auto type = expression(definition.operands[0]);
             activeLayer_ = std::move(previous);
             if (!passive(type)) throw Error(definition.range, "a node expression must have a passive type");
-            declarations.emplace(name, Declaration{name, type, definition.range, 1, definition.operands[0]});
-            declarations.at(name).layer = nodeLayers_.at(name);
+            const auto entry = declarations.emplace(name, Declaration{name, type, definition.range, 1, definition.operands[0]}).first;
+            entry->second.layer = nodeLayers_.at(name);
             activeNodes_.erase(name);
+            found = &entry->second;
         }
-        result = declarations.at(name).type;
+        result = found->type;
     } else if (expr.kind == ExprKind::Field) {
         const auto base = expression(expr.operands[0]);
         if (base->kind != TypeKind::Bundle) throw Error(expr.range, "field selection requires a Bundle");
@@ -430,7 +445,7 @@ TypePtr Semantics::expression(ExprId id) {
 
 int Semantics::flow(ExprId id) const {
     const auto& expr = body.arena.expressions[id];
-    if (expr.kind == ExprKind::Reference) return declarations.at(std::string(expr.name)).flow;
+    if (expr.kind == ExprKind::Reference) return declaration(expr.name).flow;
     if (expr.kind == ExprKind::Index) return flow(expr.operands[0]);
     if (expr.kind == ExprKind::Field) {
         const auto base = expressions[expr.operands[0]];
@@ -474,10 +489,10 @@ void Semantics::connect(Projection left, TypePtr leftType, Projection right, Typ
         root = body.arena.expressions[root].operands[0];
     const auto& base = body.arena.expressions[root];
     if (base.kind != ExprKind::Reference) throw Error(range, "connect requires a component destination");
-    if (!activeLayer_.empty() && declarations.at(std::string(base.name)).layer != activeLayer_)
+    if (!activeLayer_.empty() && declaration(base.name).layer != activeLayer_)
         throw Error(range, "layerblock cannot drive a component declared outside its layer");
-    const auto port = memoryPorts.find(std::string(base.name));
-    const auto depth = port == memoryPorts.end() ? declarations.at(std::string(base.name)).conditionDepth : 0;
+    const auto port = memoryPorts.find(base.name);
+    const auto depth = port == memoryPorts.end() ? declaration(base.name).conditionDepth : 0;
     // Hardware declarations are unconditional; only interleaving conditions
     // (blocks not containing the destination declaration) control a connect.
     guard = 1;
@@ -562,7 +577,7 @@ void Semantics::statements(std::span<const StmtId> statements, int guard) {
             while (body.arena.expressions[root].kind == ExprKind::Index || body.arena.expressions[root].kind == ExprKind::Field)
                 root = body.arena.expressions[root].operands[0];
             const auto& destination = body.arena.expressions[root];
-            const bool local = destination.kind == ExprKind::Reference && declarations.at(std::string(destination.name)).layer == activeLayer_;
+            const bool local = destination.kind == ExprKind::Reference && declaration(destination.name).layer == activeLayer_;
             if (!activeLayer_.empty() && !local && a->layer != activeLayer_)
                 throw Error(statement.range, "probe definition in a layerblock requires the same layer color");
             if (!b->layer.empty() && a->layer != b->layer && !a->layer.starts_with(b->layer + "."))
@@ -713,10 +728,10 @@ bool Semantics::constantValue(ExprId id) const {
             const std::string name(expr.name);
             const ConstantSelection key{name, fields, selected};
             if (const auto cached = constantValues_.find(key); cached != constantValues_.end()) return cached->second;
-            const auto found = declarations.find(name);
-            if (found == declarations.end() || found->second.state || found->second.port || !active.insert(key).second) return false;
+            const auto* found = findDeclaration(name);
+            if (!found || found->state || found->port || !active.insert(key).second) return false;
             bool result = false;
-            if (found->second.definition) result = expression(*found->second.definition, fields, indices);
+            if (found->definition) result = expression(*found->definition, fields, indices);
             else if (const auto drivers = constantDrivers_.find({name, fields}); drivers != constantDrivers_.end()) {
                 for (const auto& driver : drivers->second) {
                     const auto& connection = connections[driver.connection];
@@ -800,6 +815,7 @@ void Semantics::analyze(bool allowUnknownWidths) {
         declarationOrder.emplace_back(port.name);
     }
     collect(body.statements); inferMemoryPorts(body.statements);
+    declarationCache_.reserve(declarationOrder.size());
     for (const auto& [name, entry] : memoryPorts) {
         const auto& port = memories.at(entry.first).ports[entry.second];
         declarations.at(name).flow = (port.read ? 1 : 0) | (port.write ? 2 : 0);

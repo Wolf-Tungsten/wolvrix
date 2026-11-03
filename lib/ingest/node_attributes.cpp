@@ -1,6 +1,7 @@
 #include "ingest/node_attributes.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -201,6 +202,65 @@ std::string key(const Identity& identity) {
     return result;
 }
 
+void NodeKeyInterner::rebuildIndex() {
+    ids_.clear();
+    ids_.reserve(values_.size());
+    for (std::size_t index = 0; index < values_.size(); ++index)
+        ids_.emplace(std::string_view(values_[index]), static_cast<NodeKeyId>(index));
+}
+
+NodeKeyInterner::NodeKeyInterner(const NodeKeyInterner& other)
+    : values_(other.values_), bytes_(other.bytes_) {
+    rebuildIndex();
+}
+
+NodeKeyInterner& NodeKeyInterner::operator=(const NodeKeyInterner& other) {
+    if (this == &other) return *this;
+    values_ = other.values_;
+    bytes_ = other.bytes_;
+    rebuildIndex();
+    return *this;
+}
+
+NodeKeyInterner::NodeKeyInterner(NodeKeyInterner&& other)
+    : values_(std::move(other.values_)), bytes_(other.bytes_) {
+    rebuildIndex();
+    other.ids_.clear();
+    other.bytes_ = 0;
+}
+
+NodeKeyInterner& NodeKeyInterner::operator=(NodeKeyInterner&& other) {
+    if (this == &other) return *this;
+    values_ = std::move(other.values_);
+    bytes_ = other.bytes_;
+    rebuildIndex();
+    other.ids_.clear();
+    other.bytes_ = 0;
+    return *this;
+}
+
+NodeKeyId NodeKeyInterner::intern(std::string_view encoded) {
+    const auto found = ids_.find(encoded);
+    if (found != ids_.end()) return found->second;
+    if (values_.size() >= std::numeric_limits<NodeKeyId>::max())
+        throw std::length_error("too many FIRRTL node keys in transient interner");
+    const NodeKeyId id = static_cast<NodeKeyId>(values_.size());
+    values_.emplace_back(encoded);
+    try {
+        ids_.emplace(std::string_view(values_.back()), id);
+    } catch (...) {
+        values_.pop_back();
+        throw;
+    }
+    bytes_ += encoded.size();
+    return id;
+}
+
+std::string_view NodeKeyInterner::value(NodeKeyId id) const {
+    if (id >= values_.size()) throw std::out_of_range("invalid transient FIRRTL node key id");
+    return values_[id];
+}
+
 Identity parseKey(std::string_view encoded) {
     KeyParser parser(encoded);
     Identity identity;
@@ -349,21 +409,31 @@ void copyQualified(const grh::Graph& source, grh::OperationId from,
     const auto* rootResults = borrowedAttr<std::vector<int64_t>>(source, from, kRootResults);
     const std::span<const int64_t> indices = rootResults ? std::span<const int64_t>(*rootResults) : std::span<const int64_t>{};
     if (roots.size() != indices.size()) throw std::invalid_argument("node roots/rootResults length mismatch");
-    const auto qualifyKey = [&](const std::string& encoded) -> const std::string& {
-        auto found = context.qualified_.find(encoded);
-        if (found == context.qualified_.end()) {
+    const auto qualifyKey = [&](const std::string& encoded) -> std::string_view {
+        ++context.stats_.lookups;
+        context.stats_.inputBytes += encoded.size();
+        const auto sourceId = context.sourceKeys_.intern(encoded);
+        auto found = context.qualified_.find(sourceId);
+        if (found != context.qualified_.end()) {
+            ++context.stats_.hits;
+            return context.qualifiedKeys_.value(found->second);
+        }
+        ++context.stats_.misses;
+        {
             auto identity = parseKey(encoded);
             identity.instancePath.insert(identity.instancePath.begin(),
                 context.instancePath_.begin(), context.instancePath_.end());
-            found = context.qualified_.emplace(encoded, key(identity)).first;
+            const auto qualifiedId = context.qualifiedKeys_.intern(key(identity));
+            found = context.qualified_.emplace(sourceId, qualifiedId).first;
+            context.stats_.outputBytes += context.qualifiedKeys_.value(qualifiedId).size();
         }
-        return found->second;
+        return context.qualifiedKeys_.value(found->second);
     };
     Attributes attributes;
     attributes.members.reserve(members.size()); attributes.origins.reserve(origins.size()); attributes.roots.reserve(roots.size());
-    for (const auto& member : members) attributes.members.push_back(qualifyKey(member));
-    for (const auto& origin : origins) attributes.origins.push_back(qualifyKey(origin));
-    for (std::size_t i = 0; i < roots.size(); ++i) attributes.roots.push_back({qualifyKey(roots[i]), indices[i]});
+    for (const auto& member : members) attributes.members.emplace_back(qualifyKey(member));
+    for (const auto& origin : origins) attributes.origins.emplace_back(qualifyKey(origin));
+    for (std::size_t i = 0; i < roots.size(); ++i) attributes.roots.push_back({std::string(qualifyKey(roots[i])), indices[i]});
     // No borrowed source storage is used across target mutations, including
     // the in-place qualify() case that thaws a frozen source graph.
     write(target, to, std::move(attributes));
@@ -577,9 +647,35 @@ std::vector<std::string> scanAttributeErrors(const grh::Graph& graph) {
         [](grh::OperationId, const std::string&, int64_t, grh::ValueId) {});
 }
 
+std::vector<std::string> scanAttributeErrors(const grh::Graph& graph, ValidationCache& cache) {
+    const auto instance = graph.owner().instanceId();
+    const auto revision = graph.owner().revision();
+    const auto id = graph.id();
+    const uint64_t key = (static_cast<uint64_t>(id.index) << 32) | id.generation;
+    auto found = cache.entries.find(key);
+    if (cache.populated && found != cache.entries.end() && found->second.instance == instance &&
+        found->second.revision == revision && found->second.graph == id) {
+        ++cache.hits;
+        return found->second.errors;
+    }
+    ++cache.misses;
+    auto& entry = cache.entries[key];
+    entry.instance = instance;
+    entry.revision = revision;
+    entry.graph = id;
+    entry.errors = scanAttributeErrors(graph);
+    cache.populated = true;
+    return entry.errors;
+}
+
 void requireValid(const grh::Graph& graph) {
     const auto errors = scanAttributes(graph, [](grh::OperationId, const AttributeView&) {},
         [](grh::OperationId, const std::string&, int64_t, grh::ValueId) {});
+    if (!errors.empty()) throw std::invalid_argument("FIRRTL node attributes: " + errors.front());
+}
+
+void requireValid(const grh::Graph& graph, ValidationCache& cache) {
+    const auto errors = scanAttributeErrors(graph, cache);
     if (!errors.empty()) throw std::invalid_argument("FIRRTL node attributes: " + errors.front());
 }
 

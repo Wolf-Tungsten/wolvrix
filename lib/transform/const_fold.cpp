@@ -1001,6 +1001,7 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : ctx.graph.operations())
         {
+            ++ctx.constantsVisited;
             // Lean screening: no Operation/Value materialization per op —
             // aggregate reset literals make the constValue attribute strings
             // huge, and the fat copies dominated this sweep (stage-07).
@@ -1085,6 +1086,7 @@ namespace wolvrix::lib::transform
             {
                 queued[opId.index] = Queued;
                 worklist.push_back(opId);
+                ++ctx.worklistEnqueued;
             }
         };
         for (const auto opId : ctx.graph.operations())
@@ -1098,6 +1100,7 @@ namespace wolvrix::lib::transform
         {
             const auto opId = worklist.front();
             worklist.pop_front();
+            ++ctx.worklistPopped;
             if (queued[opId.index] == Folded)
             {
                 continue;
@@ -1234,6 +1237,7 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : opOrder)
         {
+            ++ctx.sliceCandidates;
             // Lean read-only screening through the Graph's id/span accessors
             // (no fat Value/Operation materialization); the fat Operation is
             // fetched only for accepted candidates (error/declared-assign
@@ -1401,6 +1405,7 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : ctx.graph.operations())
         {
+            ++ctx.deadConstantCandidates;
             if (ctx.graph.opKind(opId) != wolvrix::lib::grh::OperationKind::kConstant)
             {
                 continue;
@@ -1471,6 +1476,7 @@ namespace wolvrix::lib::transform
 
         for (const auto opId : opOrder)
         {
+            ++ctx.comparisonCandidates;
             const auto kind = ctx.graph.opKind(opId);
             
             // Handle unsigned >= 0 (always true) and unsigned <= max (always true)
@@ -1674,10 +1680,15 @@ namespace wolvrix::lib::transform
     PassResult ConstantFoldPass::run()
     {
         needsRevisit_ = false;
+        stats_ = {};
         PassResult result;
         ConstantStore constants;
         bool failed = false;
         const std::size_t graphCount = design().graphs().size();
+        auto *dirty = getSessionValue<DirtyWorklist>("simplify.dirty");
+        const auto activeGraphs = dirty ? dirty->take(id()) : std::nullopt;
+        if (dirty && dirty->active && !activeGraphs) return {};
+        std::unordered_set<std::string> changedGraphNames;
         logDebug("begin graphs=" + std::to_string(graphCount));
         std::size_t changedGraphs = 0;
         std::size_t totalDedupedConstants = 0;
@@ -1698,8 +1709,12 @@ namespace wolvrix::lib::transform
             // Iterate over all graphs
             for (const auto &graphEntry : design().graphs())
             {
+                if (activeGraphs && !activeGraphs->contains(graphEntry.first)) continue;
                 wolvrix::lib::grh::Graph &graph = *graphEntry.second;
-                ingest::node::requireValid(graph);
+                if (auto *cache = getSessionValue<ingest::node::ValidationCache>("firrtl.node.validation"))
+                    ingest::node::requireValid(graph, *cache);
+                else
+                    ingest::node::requireValid(graph);
 
                 // Create per-graph context with fresh state
                 GraphFoldContext ctx{
@@ -1716,6 +1731,7 @@ namespace wolvrix::lib::transform
                 if (graphChanged)
                 {
                     ++changedGraphs;
+                    changedGraphNames.insert(graphEntry.first);
                 }
                 totalDedupedConstants += ctx.dedupedConstants;
                 totalFoldedOps += ctx.foldedOpsCount;
@@ -1723,11 +1739,25 @@ namespace wolvrix::lib::transform
                 totalDeadConstants += ctx.deadConstantsRemoved;
                 totalUnsignedCmp += ctx.unsignedCmpSimplified;
                 totalOpsErased += ctx.opsErased;
+                stats_.constantsVisited += ctx.constantsVisited;
+                stats_.worklistEnqueued += ctx.worklistEnqueued;
+                stats_.worklistPopped += ctx.worklistPopped;
+                stats_.sliceCandidates += ctx.sliceCandidates;
+                stats_.comparisonCandidates += ctx.comparisonCandidates;
+                stats_.deadConstantCandidates += ctx.deadConstantCandidates;
             }
 
             if (failed)
             {
                 result.failed = true;
+            }
+
+            if (dirty) {
+                for (const auto& graph : changedGraphNames) {
+                    dirty->enqueue("redundant-elim", graph);
+                    dirty->enqueue("dead-code-elim", graph);
+                    if (needsRevisit_) dirty->enqueue("const-fold", graph);
+                }
             }
 
             std::string message = "graphs=" + std::to_string(graphCount);
@@ -1747,6 +1777,14 @@ namespace wolvrix::lib::transform
             message.append(std::to_string(totalOpsErased));
             message.append(result.failed ? ", failed=true" : ", failed=false");
             logDebug(std::move(message));
+            stats_.graphs = graphCount;
+            stats_.changedGraphs = changedGraphs;
+            stats_.foldedOps = totalFoldedOps;
+            stats_.dedupedConstants = totalDedupedConstants;
+            stats_.simplifiedSlices = totalSimplifiedSlices;
+            stats_.deadConstants = totalDeadConstants;
+            stats_.unsignedComparisons = totalUnsignedCmp;
+            stats_.opsErased = totalOpsErased;
             return result;
         }
         catch (const std::exception &ex)

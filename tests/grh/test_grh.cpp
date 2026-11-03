@@ -4,11 +4,13 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace wolvrix::lib::grh;
@@ -43,6 +45,117 @@ namespace
             actual->column == expected.column && actual->endLine == expected.endLine &&
             actual->endColumn == expected.endColumn && actual->origin == expected.origin &&
             actual->pass == expected.pass && actual->note == expected.note;
+    }
+
+    int parallelGraphMutation() {
+        Design design;
+        auto pendingLeft = design.createUnpublishedGraph("left");
+        auto pendingRight = design.createUnpublishedGraph("right");
+        auto& left = *pendingLeft;
+        auto& right = *pendingRight;
+        const auto* leftAddress = &left;
+        const auto* rightAddress = &right;
+        const auto leftId = left.id(), rightId = right.id();
+        if (!design.graphs().empty() || !design.graphOrder().empty() ||
+            design.findGraph("left") || design.findGraph("right"))
+            return fail("unpublished graphs entered the design catalog before publication");
+        const auto before = design.revision();
+        {
+            auto scope = design.parallelGraphMutation();
+            const auto during = design.revision();
+            if (during <= before) return fail("parallel mutation entry did not invalidate prior revisions");
+            if (!expectThrows([&] { auto nested = design.parallelGraphMutation(); }) ||
+                design.revision() != during)
+                return fail("nested parallel mutation scope was accepted or changed the revision");
+
+            const auto populate = [](Graph& graph) {
+                for (int index = 0; index < 128; ++index) {
+                    const auto value = graph.createValue(graph.internSymbol("value" + std::to_string(index)), 8, false);
+                    const auto op = graph.createOperation(OperationKind::kConstant);
+                    graph.addResult(op, value);
+                    graph.setAttr(op, "constValue", std::string("8'b00000000"));
+                }
+                graph.setMetadata("worker", std::string(graph.symbol()));
+            };
+            auto leftWorker = std::async(std::launch::async, [&] { populate(left); });
+            auto rightWorker = std::async(std::launch::async, [&] { populate(right); });
+            leftWorker.get();
+            rightWorker.get();
+            if (design.revision() != during)
+                return fail("parallel graph mutations updated the shared design revision");
+        }
+        if (design.revision() <= before + 1 || left.operations().size() != 128 || right.values().size() != 128 ||
+            left.id() != leftId || right.id() != rightId ||
+            left.metadata("worker") != AttributeValue(std::string("left")) ||
+            right.metadata("worker") != AttributeValue(std::string("right")))
+            return fail("parallel mutation exit lost graph state, graph identity or revision invalidation");
+
+        const auto leftValue = left.findValue("value127");
+        const auto rightValue = right.findValue("value127");
+        const auto beforeInvalidPublication = design.revision();
+        Design foreign;
+        if (!expectThrows([&] { design.publishGraph(nullptr); }) ||
+            !expectThrows([&] { design.publishGraph(foreign.createUnpublishedGraph("foreign")); }) ||
+            !expectThrows([&] { design.publishGraph(std::make_unique<Graph>(design, "left", rightId)); }) ||
+            !design.graphs().empty() || !design.graphOrder().empty() ||
+            design.revision() != beforeInvalidPublication)
+            return fail("invalid publication was accepted or changed the design catalog");
+        auto& publishedRight = design.publishGraph(std::move(pendingRight));
+        auto& publishedLeft = design.publishGraph(std::move(pendingLeft));
+        if (&publishedRight != rightAddress || &publishedLeft != leftAddress ||
+            publishedLeft.id() != leftId || publishedRight.id() != rightId ||
+            publishedLeft.findValue("value127") != leftValue || publishedRight.findValue("value127") != rightValue ||
+            design.graphOrder() != std::vector<std::string>{"right", "left"})
+            return fail("graph publication copied contents or changed graph/value identity");
+        if (!expectThrows([&] { design.publishGraph(std::make_unique<Graph>(design, "left", leftId)); }))
+            return fail("graph publication accepted a duplicate catalog name");
+
+        try {
+            auto scope = design.parallelGraphMutation();
+            left.setMetadata("unwound", true);
+            throw std::runtime_error("scope unwind");
+        } catch (const std::runtime_error&) {}
+        const auto afterScope = design.revision();
+        left.setMetadata("serial", true);
+        if (design.revision() <= afterScope)
+            return fail("parallel mutation scope did not restore serial revision tracking after unwinding");
+        return 0;
+    }
+
+    int unpublishedGraphPublication() {
+        Design regular;
+        Design deferred;
+        regular.createGraph("wrapper");
+        deferred.createGraph("wrapper");
+        std::vector<std::unique_ptr<Graph>> pending;
+        for (int index = 0; index < 48; ++index)
+            pending.push_back(deferred.createUnpublishedGraph("module" + std::to_string(index)));
+        if (deferred.graphs().size() != 1 || deferred.graphOrder() != std::vector<std::string>{"wrapper"})
+            return fail("unpublished allocation changed existing catalog entries");
+
+        const auto hashOrder = [](const Design& design) {
+            std::vector<std::string> names;
+            for (const auto& entry : design.graphs()) names.push_back(entry.first);
+            return names;
+        };
+        for (std::size_t remaining = pending.size(); remaining > 0; --remaining) {
+            const auto index = remaining - 1;
+            regular.createGraph(pending[index]->symbol());
+            deferred.publishGraph(std::move(pending[index]));
+            if (index == 24) {
+                regular.deleteGraph("wrapper");
+                deferred.deleteGraph("wrapper");
+            }
+            if (regular.graphOrder() != deferred.graphOrder() || hashOrder(regular) != hashOrder(deferred))
+                return fail("deferred publication changed catalog iteration after matching insertion/deletion events");
+        }
+
+        {
+            auto discarded = deferred.createUnpublishedGraph("discarded");
+        }
+        if (deferred.findGraph("discarded") || !expectThrows([&] { deferred.createGraph("discarded"); }))
+            return fail("discarded unpublished graph did not retain its documented name reservation");
+        return 0;
     }
 
     int freezeOwnership()
@@ -126,6 +239,8 @@ int main()
     try
     {
         if (freezeOwnership() != 0) return 1;
+        if (parallelGraphMutation() != 0) return 1;
+        if (unpublishedGraphPublication() != 0) return 1;
         {
             Design ordered;
             auto& last = ordered.createGraph("z");

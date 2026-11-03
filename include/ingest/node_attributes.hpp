@@ -4,6 +4,8 @@
 #include "core/grh.hpp"
 
 #include <span>
+#include <deque>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -51,6 +53,43 @@ struct Attributes {
     bool operator==(const Attributes&) const = default;
 };
 
+using NodeKeyId = uint32_t;
+
+// Transient canonical key storage used by flattening and other hot paths.
+// Persistence still uses the existing schema-v2 strings; IDs are valid only
+// for the lifetime of this interner.
+class NodeKeyInterner {
+public:
+    NodeKeyInterner() = default;
+    NodeKeyInterner(const NodeKeyInterner& other);
+    NodeKeyInterner& operator=(const NodeKeyInterner& other);
+    NodeKeyInterner(NodeKeyInterner&& other);
+    NodeKeyInterner& operator=(NodeKeyInterner&& other);
+
+    NodeKeyId intern(std::string_view key);
+    std::string_view value(NodeKeyId id) const;
+    std::size_t size() const noexcept { return values_.size(); }
+    std::size_t bytes() const noexcept { return bytes_; }
+
+private:
+    struct Hash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view value) const noexcept { return std::hash<std::string_view>{}(value); }
+        std::size_t operator()(const std::string& value) const noexcept { return (*this)(std::string_view(value)); }
+    };
+    struct Equal {
+        using is_transparent = void;
+        bool operator()(std::string_view left, std::string_view right) const noexcept { return left == right; }
+    };
+    // deque keeps the character storage stable while ids_ borrows it. This
+    // avoids retaining a second owned copy of every canonical key.
+    std::unordered_map<std::string_view, NodeKeyId, Hash, Equal> ids_;
+    std::deque<std::string> values_;
+    std::size_t bytes_ = 0;
+
+    void rebuildIndex();
+};
+
 Attributes read(const grh::Graph& graph, grh::OperationId op);
 Attributes normalize(Attributes attributes);
 void write(grh::Graph& graph, grh::OperationId op, Attributes attributes);
@@ -71,12 +110,24 @@ void copyMembers(grh::Graph& graph, grh::OperationId from, grh::OperationId to);
 // graph attribute edits and recursive path changes cannot invalidate them.
 class QualificationContext {
 public:
+    struct Stats {
+        std::size_t lookups = 0;
+        std::size_t hits = 0;
+        std::size_t misses = 0;
+        std::size_t inputBytes = 0;
+        std::size_t outputBytes = 0;
+    };
+
     explicit QualificationContext(std::span<const std::string> instancePath);
+    const Stats& stats() const noexcept { return stats_; }
 private:
     friend void copyQualified(const grh::Graph&, grh::OperationId,
                               grh::Graph&, grh::OperationId, QualificationContext&);
     const std::vector<std::string> instancePath_;
-    std::unordered_map<std::string, std::string> qualified_;
+    NodeKeyInterner sourceKeys_;
+    NodeKeyInterner qualifiedKeys_;
+    std::unordered_map<NodeKeyId, NodeKeyId> qualified_;
+    Stats stats_;
 };
 void qualify(grh::Graph& graph, grh::OperationId op, std::span<const std::string> instancePath);
 void qualify(grh::Graph& graph, grh::OperationId op, QualificationContext& context);
@@ -123,13 +174,38 @@ struct Inspection {
     std::string report(const grh::Graph& graph) const;
 };
 
+// A short-lived validation result cache for transformation pipelines. Graph
+// mutations advance the owning design revision, so a cached result is only
+// reusable while both the graph identity and revision remain unchanged.
+struct ValidationCache {
+    struct Entry {
+        uint64_t instance = 0;
+        uint64_t revision = 0;
+        grh::GraphId graph;
+        std::vector<std::string> errors;
+    };
+    bool populated = false;
+    std::size_t hits = 0;
+    std::size_t misses = 0;
+    std::unordered_map<uint64_t, Entry> entries;
+
+    void clear() {
+        populated = false;
+        hits = 0;
+        misses = 0;
+        entries.clear();
+    }
+};
+
 Inspection inspect(const grh::Graph& graph);
 // Validate node attributes while collecting every diagnostic, without
 // materializing the inspection census (node records, roots, or fragments).
 // This is the appropriate entry point for passes that only need to reject
 // malformed annotations.
 std::vector<std::string> scanAttributeErrors(const grh::Graph& graph);
+std::vector<std::string> scanAttributeErrors(const grh::Graph& graph, ValidationCache& cache);
 void requireValid(const grh::Graph& graph);
+void requireValid(const grh::Graph& graph, ValidationCache& cache);
 
 // Establish only at source construction, never to upgrade a loaded checkpoint.
 void establishPolicy(grh::Graph& graph);

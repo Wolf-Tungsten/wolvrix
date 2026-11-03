@@ -36,6 +36,11 @@ namespace wolvrix::lib::transform
             std::size_t operationsCloned = 0;
             std::size_t instanceOperations = 0;
             std::size_t annotatedOperations = 0;
+            std::size_t qualificationLookups = 0;
+            std::size_t qualificationHits = 0;
+            std::size_t qualificationMisses = 0;
+            std::size_t qualificationInputBytes = 0;
+            std::size_t qualificationOutputBytes = 0;
             std::size_t pendingAttributes = 0;
             std::size_t generateGroups = 0;
             std::chrono::nanoseconds freeze{};
@@ -115,7 +120,11 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::OperationId op;
             std::string key;
             std::string oldValue;
+            wolvrix::lib::grh::SymbolId sourceSymbol;
         };
+
+        // Each map belongs to one source graph and one expanded instance.
+        using SymbolRenameMap = std::unordered_map<uint32_t, wolvrix::lib::grh::SymbolId>;
 
         bool isOpSymbolReferenceAttr(std::string_view key)
         {
@@ -528,7 +537,9 @@ namespace wolvrix::lib::transform
             {
                 return std::string(base);
             }
-            std::string out(prefix);
+            std::string out;
+            out.reserve(prefix.size() + base.size() + 1);
+            out.append(prefix);
             out.push_back('$');
             out.append(base);
             return out;
@@ -554,16 +565,19 @@ namespace wolvrix::lib::transform
 
         wolvrix::lib::grh::SymbolId internUniqueSymbol(wolvrix::lib::grh::Graph &graph, const std::string &base)
         {
-            std::string candidate = base;
+            if (const auto symbol = graph.internSymbol(base); symbol.valid())
+            {
+                return symbol;
+            }
             int suffix = 0;
             while (true)
             {
+                const std::string candidate = base + "_" + std::to_string(++suffix);
                 wolvrix::lib::grh::SymbolId sym = graph.internSymbol(candidate);
                 if (sym.valid())
                 {
                     return sym;
                 }
-                candidate = base + "_" + std::to_string(++suffix);
             }
         }
 
@@ -1089,8 +1103,8 @@ namespace wolvrix::lib::transform
         bool propagateGenerateGroups(const wolvrix::lib::grh::Graph &source,
                                      wolvrix::lib::grh::Graph &target,
                                      const std::string &prefix,
-                                     const std::unordered_map<std::string, std::string> &valueRename,
-                                     const std::unordered_map<std::string, std::string> &opRename,
+                                     const SymbolRenameMap &valueRename,
+                                     const SymbolRenameMap &opRename,
                                      InlineState &state)
         {
             auto lookupOrIntern = [&](std::string_view text) -> wolvrix::lib::grh::SymbolId {
@@ -1117,34 +1131,26 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const std::string oldText = std::string(source.symbolText(srcSym));
-                    if (oldText.empty())
+                    if (source.symbolText(srcSym).empty())
                     {
                         continue;
                     }
-                    std::string_view newText;
-                    if (auto it = valueRename.find(oldText); it != valueRename.end())
+                    wolvrix::lib::grh::SymbolId dstSym;
+                    if (auto it = valueRename.find(srcSym.value); it != valueRename.end())
                     {
-                        newText = it->second;
+                        dstSym = it->second;
                     }
-                    else if (auto it = opRename.find(oldText); it != opRename.end())
+                    else if (auto it = opRename.find(srcSym.value); it != opRename.end())
                     {
-                        newText = it->second;
+                        dstSym = it->second;
                     }
                     else
                     {
                         // Symbol was dropped while inlining (port mapping, etc.).
                         continue;
                     }
-                    const wolvrix::lib::grh::SymbolId dstSym = target.lookupSymbol(newText);
-                    if (!dstSym.valid())
-                    {
-                        state.graphError(source,
-                                         "Flatten generate group member missing after rename: " +
-                                             std::string(newText));
-                        state.failed = true;
-                        return false;
-                    }
+                    // Entries are created only from successfully interned
+                    // target symbols, whose IDs survive later value renames.
                     newMembers.push_back(dstSym);
                 }
                 if (newMembers.empty())
@@ -1272,7 +1278,7 @@ namespace wolvrix::lib::transform
             // FIRRTL definitions have no groups, so avoid retaining a second
             // pair of long strings for every cloned intermediate value.
             const bool trackValueRename = !source.generateGroups().empty();
-            std::unordered_map<std::string, std::string> valueRename;
+            SymbolRenameMap valueRename;
             const auto valuesStarted = state.profile ? FlattenClock::now() : FlattenClock::time_point{};
             state.metrics.valuesVisited += source.values().size();
             for (const auto valueId : source.values())
@@ -1315,8 +1321,7 @@ namespace wolvrix::lib::transform
                 ++state.metrics.valuesCloned;
                 if (trackValueRename && !sourceName.empty())
                 {
-                    valueRename.emplace(std::string(sourceName),
-                                        std::string(target.symbolText(newSym)));
+                    valueRename.emplace(sourceSym.value, newSym);
                 }
                 state.changed = true;
             }
@@ -1353,7 +1358,7 @@ namespace wolvrix::lib::transform
                 state.metrics.symbols += FlattenClock::now() - symbolsStarted;
             }
 
-            std::unordered_map<std::string, std::string> opRename;
+            SymbolRenameMap opRename;
             opRename.reserve(neededOpSymbols.size());
             std::vector<PendingAttr> pendingAttrs;
 
@@ -1363,13 +1368,14 @@ namespace wolvrix::lib::transform
                 if (const auto *strValue = std::get_if<std::string>(&value);
                     strValue && isOpSymbolReferenceAttr(key))
                 {
-                    auto it = opRename.find(*strValue);
+                    const auto sourceSymbol = source.lookupSymbol(*strValue);
+                    auto it = opRename.find(sourceSymbol.value);
                     if (it != opRename.end())
                     {
-                        target.setAttr(newOp, key, it->second);
+                        target.setAttr(newOp, key, std::string(target.symbolText(it->second)));
                         return;
                     }
-                    pendingAttrs.push_back(PendingAttr{newOp, key, *strValue});
+                    pendingAttrs.push_back(PendingAttr{newOp, key, *strValue, sourceSymbol});
                 }
                 target.setAttr(newOp, key, value);
             };
@@ -1453,7 +1459,7 @@ namespace wolvrix::lib::transform
                         }
                         if (neededOpSymbols.contains(op.symbol().value))
                         {
-                            opRename.emplace(opName, opName);
+                            opRename.emplace(op.symbol().value, existingOp.symbol());
                         }
                         continue;
                     }
@@ -1486,7 +1492,7 @@ namespace wolvrix::lib::transform
                     }
                     if (neededOpSymbols.contains(op.symbol().value))
                     {
-                        opRename.emplace(opName, opName);
+                        opRename.emplace(op.symbol().value, sym);
                     }
                     state.changed = true;
                     continue;
@@ -1515,7 +1521,7 @@ namespace wolvrix::lib::transform
                     const std::string_view newOpName = target.symbolText(newSym);
                     if (!newOpName.empty())
                     {
-                        opRename.emplace(std::string(sourceName), std::string(newOpName));
+                        opRename.emplace(sourceSym.value, newSym);
                     }
                 }
 
@@ -1642,14 +1648,14 @@ namespace wolvrix::lib::transform
             {
                 for (const auto &pending : pendingAttrs)
                 {
-                    auto it = opRename.find(pending.oldValue);
+                    auto it = opRename.find(pending.sourceSymbol.value);
                     if (it == opRename.end())
                     {
                         state.graphError(source, "Flatten unresolved symbol reference: " + pending.oldValue);
                         state.failed = true;
                         break;
                     }
-                    target.setAttr(pending.op, pending.key, it->second);
+                    target.setAttr(pending.op, pending.key, std::string(target.symbolText(it->second)));
                 }
             }
 
@@ -1667,6 +1673,13 @@ namespace wolvrix::lib::transform
                     propagateGenerateGroups(source, target, prefix, valueRename, opRename, state);
                 }
             }
+
+            const auto qualificationStats = nodeQualification.stats();
+            state.metrics.qualificationLookups += qualificationStats.lookups;
+            state.metrics.qualificationHits += qualificationStats.hits;
+            state.metrics.qualificationMisses += qualificationStats.misses;
+            state.metrics.qualificationInputBytes += qualificationStats.inputBytes;
+            state.metrics.qualificationOutputBytes += qualificationStats.outputBytes;
 
             state.stack.erase(&source);
             return !state.failed;
@@ -1728,6 +1741,11 @@ namespace wolvrix::lib::transform
                  " ops-cloned=" + std::to_string(metrics.operationsCloned) +
                  " instance-ops=" + std::to_string(metrics.instanceOperations) +
                  " annotated-ops=" + std::to_string(metrics.annotatedOperations) +
+                 " qualification-lookups=" + std::to_string(metrics.qualificationLookups) +
+                 " qualification-hits=" + std::to_string(metrics.qualificationHits) +
+                 " qualification-misses=" + std::to_string(metrics.qualificationMisses) +
+                 " qualification-input-bytes=" + std::to_string(metrics.qualificationInputBytes) +
+                 " qualification-output-bytes=" + std::to_string(metrics.qualificationOutputBytes) +
                  " pending-attrs=" + std::to_string(metrics.pendingAttributes) +
                  " generate-groups=" + std::to_string(metrics.generateGroups) +
                  " freeze-ms=" + std::to_string(millis(metrics.freeze)) +

@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -131,6 +132,43 @@ namespace wolvrix::lib::transform
         bool changed = false;
         bool failed = false;
         std::vector<std::string> artifacts;
+    };
+
+    // A deterministic graph-level worklist shared by the passes that form a
+    // fixed-point pipeline.  The first invocation seeds every graph; later
+    // invocations consume only graphs that a preceding pass actually changed.
+    // Passes still retain their complete-graph behavior when no worklist is
+    // installed (standalone callers and legacy pipelines).
+    struct DirtyWorklist
+    {
+        using GraphNames = std::unordered_set<std::string>;
+        std::unordered_map<std::string, GraphNames> pending;
+        bool active = false;
+
+        void seed(const wolvrix::lib::grh::Design& design,
+                  std::initializer_list<std::string_view> passIds)
+        {
+            active = true;
+            GraphNames graphs;
+            graphs.reserve(design.graphs().size());
+            for (const auto& entry : design.graphs()) graphs.insert(entry.first);
+            for (const auto pass : passIds) pending[std::string(pass)] = graphs;
+        }
+
+        std::optional<GraphNames> take(std::string_view passId)
+        {
+            if (!active) return std::nullopt;
+            const auto found = pending.find(std::string(passId));
+            if (found == pending.end()) return std::nullopt;
+            GraphNames result = std::move(found->second);
+            pending.erase(found);
+            return result;
+        }
+
+        void enqueue(std::string_view passId, std::string_view graph)
+        {
+            pending[std::string(passId)].insert(std::string(graph));
+        }
     };
 
     inline wolvrix::lib::grh::SrcLoc makeTransformSrcLoc(std::string_view passId,

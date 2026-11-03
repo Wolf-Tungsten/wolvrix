@@ -16,6 +16,37 @@ namespace wolvrix::lib::transform::grhsim::detail {
 using namespace grh;
 using Owner = std::vector<std::string>;
 
+// Per-round counters used to explain convergence cost without changing the
+// rewrite contract.  The counters are deliberately kept on the transient
+// Scope rather than in Graph metadata, so profiling never affects identity or
+// serialized output.
+struct SimplifyMetrics {
+    std::size_t foldVisits = 0;
+    std::size_t foldChanges = 0;
+    std::size_t constantLookups = 0;
+    std::size_t canonicalizeVisits = 0;
+    std::size_t canonicalizeChanges = 0;
+    std::size_t muxVisits = 0;
+    std::size_t muxChains = 0;
+    std::size_t muxChanges = 0;
+    std::size_t cseKeys = 0;
+    std::size_t cseMerges = 0;
+    std::size_t nodeMerges = 0;
+    std::size_t aliases = 0;
+    std::size_t dceVisited = 0;
+    std::size_t dceEnqueued = 0;
+    std::size_t dceErased = 0;
+    std::size_t topoVisited = 0;
+    std::size_t topoEnqueued = 0;
+    std::size_t topoRebuilds = 0;
+    std::size_t ownersVisited = 0;
+    std::size_t ownersSkipped = 0;
+    std::size_t cseKeyInterns = 0;
+    std::size_t cseKeyBytes = 0;
+
+    void reset() noexcept { *this = {}; }
+};
+
 inline bool supports(std::string_view dialect) {
     return dialect == "grh" || dialect == "grhsim" || dialect == "grhsim.cpu";
 }
@@ -179,15 +210,18 @@ struct Scope {
     const std::unordered_set<uint32_t>* sharedAnchors = nullptr;
     std::optional<std::span<const OperationId>> members;
     const bool verifiedUnpartitioned;
+    SimplifyMetrics* metrics = nullptr;
+    ingest::node::NodeKeyInterner* keyInterner = nullptr;
     std::unordered_set<OperationId, OperationIdHash> erased;
 
     Scope(Graph& graph, const Owner& partition, std::optional<std::span<const OperationId>> members = std::nullopt,
           const std::unordered_set<uint32_t>* sharedAnchors = nullptr, const Owner* sharedPartition = nullptr,
-          bool verifiedUnpartitioned = false)
+          bool verifiedUnpartitioned = false, SimplifyMetrics* metrics = nullptr,
+          ingest::node::NodeKeyInterner* keyInterner = nullptr)
         : graph(graph), ownedPartition(sharedPartition ? Owner{} : partition),
           partition(sharedPartition ? *sharedPartition : ownedPartition),
           sharedAnchors(sharedAnchors), members(members),
-          verifiedUnpartitioned(verifiedUnpartitioned && this->partition.empty()) {
+          verifiedUnpartitioned(verifiedUnpartitioned && this->partition.empty()), metrics(metrics), keyInterner(keyInterner) {
         if (!sharedAnchors) {
             for (const auto symbol : graph.declaredSymbols()) anchors.insert(symbol.value);
             for (const auto& group : graph.generateGroups())
@@ -252,6 +286,7 @@ struct Scope {
             erased.insert(op);
             graph.eraseValue(result);
         }
+        if (metrics) ++metrics->aliases;
         return true;
     }
     bool dce(ingest::node::DeadRootBatch* sharedDeadRoots = nullptr) {
@@ -259,8 +294,10 @@ struct Scope {
         auto& deadRoots = sharedDeadRoots ? *sharedDeadRoots : localDeadRoots;
         bool changed = false;
         auto queue = operations();
+        if (metrics) metrics->dceEnqueued += queue.size();
         while (!queue.empty()) {
             const auto op = queue.back(); queue.pop_back();
+            if (metrics) ++metrics->dceVisited;
             if (!contains(op) || anchored(op)) continue;
             const auto effect = operationEffect(graph, op);
             if (effect != OpEffect::Pure && effect != OpEffect::ReadState) continue;
@@ -274,7 +311,11 @@ struct Scope {
             if (!graph.eraseOp(op)) continue;
             erased.insert(op);
             for (const auto value : results) graph.eraseValue(value);
-            for (const auto arg : args) if (const auto producer = graph.valueDef(arg)) queue.push_back(producer);
+            for (const auto arg : args) if (const auto producer = graph.valueDef(arg)) {
+                queue.push_back(producer);
+                if (metrics) ++metrics->dceEnqueued;
+            }
+            if (metrics) ++metrics->dceErased;
             changed = true;
         }
         if (!sharedDeadRoots) deadRoots.flush();
